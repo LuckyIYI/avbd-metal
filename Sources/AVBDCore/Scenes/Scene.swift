@@ -95,6 +95,15 @@ public struct PhysicsScene {
     }
 
     public mutating func addJoint(_ j: SceneJoint) { joints.append(j) }
+
+    /// Adds an inert joint slot for interactive dragging (stiffness 0 keeps
+    /// it disabled until GPUSolver.setDrag activates it). Returns its index.
+    @discardableResult
+    public mutating func addDragSlot() -> Int {
+        joints.append(SceneJoint(bodyA: -1, bodyB: 0, rA: .zero, rB: .zero,
+                                 stiffnessLin: 0, stiffnessAng: 0))
+        return joints.count - 1
+    }
     public mutating func addSpring(_ s: SceneSpring) { springs.append(s) }
 
     /// Build a CPU reference solver from this scene.

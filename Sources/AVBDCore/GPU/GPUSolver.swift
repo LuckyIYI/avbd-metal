@@ -692,6 +692,11 @@ public final class GPUSolver {
         return Quat(real: p[i].w, imag: F3(p[i].x, p[i].y, p[i].z))
     }
 
+    public func bodyMass(_ i: Int) -> Float {
+        let p = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        return p[i].w
+    }
+
     public func bodyVelocity(_ i: Int) -> F3 {
         let p = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return F3(p[i].x, p[i].y, p[i].z)
@@ -701,6 +706,92 @@ public final class GPUSolver {
         let p = velAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return F3(p[i].x, p[i].y, p[i].z)
     }
+
+    // MARK: - Interaction & rendering support
+
+    /// Activate / update a drag joint. Scenes add an inert slot via
+    /// PhysicsScene.addDragSlot() (stiffness 0 keeps it disabled until used).
+    public func setDrag(jointIndex: Int, body: Int?, worldTarget: F3, localAnchor: F3,
+                        stiffness: Float = 5000) {
+        guard jointIndex < numJoints else { return }
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: numJoints)
+        var j = jp[jointIndex]
+        if let body {
+            j.header = SIMD4(0xFFFFFFFF, UInt32(body), 0, 0)   // active, soft
+            j.rA = SIMD4(worldTarget, stiffness)
+            j.rB = SIMD4(localAnchor, 0)
+            j.C0Ang = SIMD4(0, 0, 0, Float.greatestFiniteMagnitude)
+            // soft (finite) constraint: no flags, penalty ramps to stiffness
+            j.penaltyLin = SIMD4(repeating: 0)
+            j.penaltyLin = SIMD4(1, 1, 1, 0)
+            j.lambdaLin = .zero
+        } else {
+            j.header.z = 1   // broken = disabled
+            j.penaltyLin = .zero
+            j.lambdaLin = .zero
+        }
+        jp[jointIndex] = j
+    }
+
+    /// Ray-cast against body OBBs (CPU, shared buffers). Returns (body, local hit).
+    public func pick(origin: F3, dir: F3) -> (body: Int, local: F3)? {
+        let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let sh = shape.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        var bestT = Float.infinity
+        var best: (Int, F3)? = nil
+        for i in 0..<numBodies where pl[i].w > 0 {
+            let q = Quat(real: pa[i].w, imag: F3(pa[i].x, pa[i].y, pa[i].z))
+            let inv = q.conjugate
+            let o = inv.act(origin - F3(pl[i].x, pl[i].y, pl[i].z))
+            let d = inv.act(dir)
+            let half = F3(sh[i].x, sh[i].y, sh[i].z) * 0.5
+            var tEnter: Float = 0
+            var tExit = Float.infinity
+            var hit = true
+            for k in 0..<3 {
+                if abs(d[k]) < 1e-6 {
+                    if o[k] < -half[k] || o[k] > half[k] { hit = false; break }
+                    continue
+                }
+                var t0 = (-half[k] - o[k]) / d[k]
+                var t1 = (half[k] - o[k]) / d[k]
+                if t0 > t1 { swap(&t0, &t1) }
+                tEnter = max(tEnter, t0)
+                tExit = min(tExit, t1)
+                if tEnter > tExit { hit = false; break }
+            }
+            if !hit { continue }
+            let t = tEnter >= 0 ? tEnter : tExit
+            if t >= 0 && t < bestT {
+                bestT = t
+                best = (i, o + d * t)
+            }
+        }
+        return best
+    }
+
+    /// Encode instance-transform building into a render command buffer.
+    public func encodeBuildInstances(_ cmd: MTLCommandBuffer, instances: MTLBuffer,
+                                     colorMode: UInt32 = 0) {
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        var nb = UInt32(numBodies)
+        var cm = colorMode
+        let p = ps("build_instances")
+        enc.setComputePipelineState(p)
+        enc.setBuffer(posLin, offset: 0, index: 0)
+        enc.setBuffer(posAng, offset: 0, index: 1)
+        enc.setBuffer(shape, offset: 0, index: 2)
+        enc.setBuffer(instances, offset: 0, index: 3)
+        enc.setBytes(&nb, length: 4, index: 4)
+        enc.setBytes(&cm, length: 4, index: 5)
+        enc.setBuffer(colorsA, offset: 0, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: (numBodies + 255) / 256, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    public var bodyCount: Int { numBodies }
 
     /// Max constraint error: hard-joint violation + contact penetration depth.
     public func maxConstraintError() -> Float {
