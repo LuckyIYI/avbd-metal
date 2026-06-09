@@ -151,28 +151,40 @@ public enum Demos {
     }
 
     /// Lightweight cards held by friction (paper Fig. 6 style).
+    /// Each level: Λ-pairs of cards leaning against each other (~20° off
+    /// vertical), bridged by flat separator cards that carry the next level.
     public static func cardhouse(levels: Int) -> PhysicsScene {
         var s = PhysicsScene(name: "cardhouse")
         addGround(&s, friction: 0.9)
-        let cardW: Float = 1.2, cardT: Float = 0.05
-        let lean: Float = 0.35
+        let cardW: Float = 1.2, cardT: Float = 0.05, depth: Float = 1.0
+        let theta: Float = 1.22                     // ~70° from the ground
+        let footSpan = cardW * cos(theta)           // horizontal span per card
+        let H = cardW * sin(theta)                  // apex height
+        let pitch = 2 * footSpan + 0.15             // distance between apexes
+        let yAxis = F3(0, 1, 0)
+
         for level in 0..<levels {
-            let z = Float(level) * (cardW * 0.92 + cardT)
             let n = levels - level
+            let z0 = Float(level) * (H + cardT)
+            let x0 = -Float(n - 1) * pitch / 2      // first apex x
             for i in 0..<n {
-                let x = Float(i) * cardW * 1.3 - Float(n) * cardW * 0.65
-                let qa = Quat(angle: lean, axis: F3(0, 1, 0))
-                let qb = Quat(angle: -lean, axis: F3(0, 1, 0))
-                _ = s.addBody(size: F3(cardW, 1.0, cardT), density: 0.2, friction: 0.9,
-                              position: F3(x - 0.25, 0, z + cardW * 0.46), rotation: qa)
-                _ = s.addBody(size: F3(cardW, 1.0, cardT), density: 0.2, friction: 0.9,
-                              position: F3(x + 0.25, 0, z + cardW * 0.46), rotation: qb)
+                let cx = x0 + Float(i) * pitch
+                // left card: foot at cx-footSpan, apex at cx (local +x runs up-slope)
+                _ = s.addBody(size: F3(cardW, depth, cardT), density: 0.2, friction: 0.9,
+                              position: F3(cx - footSpan / 2, 0, z0 + H / 2),
+                              rotation: Quat(angle: -theta, axis: yAxis))
+                // right card: foot at cx+footSpan, apex at cx
+                _ = s.addBody(size: F3(cardW, depth, cardT), density: 0.2, friction: 0.9,
+                              position: F3(cx + footSpan / 2, 0, z0 + H / 2),
+                              rotation: Quat(angle: theta, axis: yAxis))
             }
+            // flat separators spanning adjacent apexes
             if level < levels - 1 {
                 for i in 0..<(n - 1) {
-                    let x = Float(i) * cardW * 1.3 - Float(n) * cardW * 0.65 + cardW * 0.65
-                    _ = s.addBody(size: F3(cardW * 1.2, 1.0, cardT), density: 0.2, friction: 0.9,
-                                  position: F3(x, 0, z + cardW * 0.92 + cardT / 2))
+                    let cx = x0 + (Float(i) + 0.5) * pitch
+                    _ = s.addBody(size: F3(pitch * 1.05, depth, cardT), density: 0.2,
+                                  friction: 0.9,
+                                  position: F3(cx, 0, z0 + H + cardT / 2))
                 }
             }
         }

@@ -141,6 +141,21 @@ final class ConvergenceTests: XCTestCase {
         }
     }
 
+    /// Paper Fig. 6: lightweight card house held only by static friction.
+    func testCardHouseStands() throws {
+        let scene = Demos.cardhouse(levels: 4)
+        let solver = try GPUSolver(scene: scene)
+        for _ in 0..<300 { solver.step() }
+        // Top pair (last two bodies) center height: 3*(H+T) + H/2 ≈ 4.10
+        let H: Float = 1.2 * sin(1.22), T: Float = 0.05
+        let expected = 3 * (H + T) + H / 2
+        for i in [scene.bodies.count - 2, scene.bodies.count - 1] {
+            let z = solver.bodyPosition(i).z
+            XCTAssertEqual(z, expected, accuracy: 0.15,
+                           "top card \(i) should stand at z≈\(expected) (got \(z))")
+        }
+    }
+
     /// Determinism: same scene, same steps -> bitwise-equal positions.
     func testDeterminismGPU() throws {
         func run() throws -> [F3] {
