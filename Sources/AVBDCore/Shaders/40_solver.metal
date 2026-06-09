@@ -147,7 +147,8 @@ kernel void color_iterate(
     if (posLin[gid].w <= 0.0f) { colorsOut[gid] = 0; return; }
 
     uint myColor = colorsIn[gid];
-    uint maskLo = 0, maskHi = 0;        // used colors of smaller-index neighbors
+    uint maskLo = 0, maskHi = 0;        // colors of smaller-index neighbors
+    uint allLo = 0, allHi = 0;          // colors of all dynamic neighbors
     bool conflict = false;
 
     uint s = adjStart[gid], e = s + adjCount[gid];
@@ -155,9 +156,11 @@ kernel void color_iterate(
         uint nb = otherBody(joints, springs, manifolds, adjList[k], gid);
         if (nb == WORLD_BODY || posLin[nb].w <= 0.0f) continue;
         uint nc = colorsIn[nb];
+        uint lo = nc < 32 ? (1u << nc) : 0;
+        uint hi = (nc >= 32 && nc < 64) ? (1u << (nc - 32)) : 0;
+        allLo |= lo; allHi |= hi;
         if (nb < gid) {
-            if (nc < 32) maskLo |= (1u << nc);
-            else if (nc < 64) maskHi |= (1u << (nc - 32));
+            maskLo |= lo; maskHi |= hi;
             if (nc == myColor) conflict = true;
         }
     }
@@ -174,7 +177,14 @@ kernel void color_iterate(
         colorsOut[gid] = min(newColor, uint(MAX_COLORS - 1));
         atomic_fetch_or_explicit(&changedFlag[0], 1u, memory_order_relaxed);
     } else {
-        colorsOut[gid] = myColor;
+        // Compaction: take the smallest color free w.r.t. ALL dynamic
+        // neighbors when it is below the current one. Keeps the palette
+        // dense so the solver loop dispatches few colors; any transient
+        // conflict is fixed by the smaller-index rule next round.
+        uint freeLo = ~allLo;
+        uint best = freeLo != 0 ? ctz(freeLo)
+                  : (~allHi != 0 ? 32 + ctz(~allHi) : myColor);
+        colorsOut[gid] = best < myColor ? best : myColor;
     }
 }
 
@@ -483,8 +493,8 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
 }
 
 kernel void primal_solve(
-    device const float4* posLin     [[buffer(0)]],
-    device const float4* posAng     [[buffer(1)]],
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
     device const float4* initLin    [[buffer(2)]],
     device const float4* initAng    [[buffer(3)]],
     device const float4* inertLin   [[buffer(4)]],
@@ -499,9 +509,7 @@ kernel void primal_solve(
     device const uint* colorList    [[buffer(13)]],
     device const uint* colorStart   [[buffer(14)]],
     constant uint& colorIndex       [[buffer(15)]],
-    device float4* newPosLin        [[buffer(16)]],
-    device float4* newPosAng        [[buffer(17)]],
-    constant SimParams& P           [[buffer(18)]],
+    constant SimParams& P           [[buffer(16)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorIndex];
@@ -538,27 +546,13 @@ kernel void primal_solve(
     float3 dxLin = float3(0), dxAng = float3(0);
     solve6x6(acc.lhsLin, acc.lhsAng, acc.lhsCross, -acc.rhsLin, -acc.rhsAng, dxLin, dxAng);
 
-    newPosLin[body] = float4(pl.xyz + dxLin, mass);
-    newPosAng[body] = q_addw(posAng[body], dxAng);
+    // Direct write: bodies within one color are non-adjacent except in the
+    // rare same-color-conflict case, where this degrades to a Jacobi update
+    // (paper Sec. 4) — aligned 16B stores keep neighbor reads consistent.
+    posLin[body] = float4(pl.xyz + dxLin, mass);
+    posAng[body] = q_addw(posAng[body], dxAng);
 }
 
-kernel void primal_apply(
-    device float4* posLin           [[buffer(0)]],
-    device float4* posAng           [[buffer(1)]],
-    device const float4* newPosLin  [[buffer(2)]],
-    device const float4* newPosAng  [[buffer(3)]],
-    device const uint* colorList    [[buffer(4)]],
-    device const uint* colorStart   [[buffer(5)]],
-    constant uint& colorIndex       [[buffer(6)]],
-    uint tid                        [[thread_position_in_grid]])
-{
-    uint s = colorStart[colorIndex];
-    uint e = colorStart[colorIndex + 1];
-    if (s + tid >= e) return;
-    uint body = colorList[s + tid];
-    posLin[body] = newPosLin[body];
-    posAng[body] = newPosAng[body];
-}
 
 // ----------------------------------------------------------------------------
 // Dual update — one thread per joint, plus one per manifold.
