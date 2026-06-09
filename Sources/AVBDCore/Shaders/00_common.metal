@@ -90,16 +90,38 @@ inline float3 xform(float3 p, float4 q, float3 v) { return q_rotate(q, v) + p; }
 // 6x6 SPD solve via LDL^T (port of reference maths.h)
 // aCross = lower-left block: rows angular, cols linear
 // ----------------------------------------------------------------------------
+// Fast-math-safe finiteness test (isfinite() folds to true under -ffast-math)
+inline bool finite_bits(float x) {
+    return (as_type<uint>(x) & 0x7F800000u) != 0x7F800000u;
+}
+inline bool finite3(float3 v) {
+    return finite_bits(v.x) && finite_bits(v.y) && finite_bits(v.z);
+}
+
 inline void solve6x6(M3 aLin, M3 aAng, M3 aCross,
                      float3 bLin, float3 bAng,
                      thread float3 &xLin, thread float3 &xAng)
 {
-    float A11 = aLin.r0.x;
-    float A21 = aLin.r1.x, A22 = aLin.r1.y;
-    float A31 = aLin.r2.x, A32 = aLin.r2.y, A33 = aLin.r2.z;
-    float A41 = aCross.r0.x, A42 = aCross.r0.y, A43 = aCross.r0.z, A44 = aAng.r0.x;
-    float A51 = aCross.r1.x, A52 = aCross.r1.y, A53 = aCross.r1.z, A54 = aAng.r1.x, A55 = aAng.r1.y;
-    float A61 = aCross.r2.x, A62 = aCross.r2.y, A63 = aCross.r2.z, A64 = aAng.r2.x, A65 = aAng.r2.y, A66 = aAng.r2.z;
+    // Jacobi (diagonal) preconditioning: solve (SAS)(S^-1 x) = S b with
+    // S = diag(1/sqrt(A_ii)). Makes the LDL^T factorization scale-invariant,
+    // which is essential in fp32 when penalty terms (up to 1e10) meet tiny
+    // rod inertias in the same block.
+    float s1 = rsqrt(max(aLin.r0.x, 1e-30f));
+    float s2 = rsqrt(max(aLin.r1.y, 1e-30f));
+    float s3 = rsqrt(max(aLin.r2.z, 1e-30f));
+    float s4 = rsqrt(max(aAng.r0.x, 1e-30f));
+    float s5 = rsqrt(max(aAng.r1.y, 1e-30f));
+    float s6 = rsqrt(max(aAng.r2.z, 1e-30f));
+
+    float A11 = 1.0f;
+    float A21 = aLin.r1.x * s2 * s1, A22 = 1.0f;
+    float A31 = aLin.r2.x * s3 * s1, A32 = aLin.r2.y * s3 * s2, A33 = 1.0f;
+    float A41 = aCross.r0.x * s4 * s1, A42 = aCross.r0.y * s4 * s2, A43 = aCross.r0.z * s4 * s3, A44 = 1.0f;
+    float A51 = aCross.r1.x * s5 * s1, A52 = aCross.r1.y * s5 * s2, A53 = aCross.r1.z * s5 * s3, A54 = aAng.r1.x * s5 * s4, A55 = 1.0f;
+    float A61 = aCross.r2.x * s6 * s1, A62 = aCross.r2.y * s6 * s2, A63 = aCross.r2.z * s6 * s3, A64 = aAng.r2.x * s6 * s4, A65 = aAng.r2.y * s6 * s5, A66 = 1.0f;
+
+    bLin = float3(bLin.x * s1, bLin.y * s2, bLin.z * s3);
+    bAng = float3(bAng.x * s4, bAng.y * s5, bAng.z * s6);
 
     float L21 = A21 / A11;
     float L31 = A31 / A11;
@@ -107,30 +129,34 @@ inline void solve6x6(M3 aLin, M3 aAng, M3 aCross,
     float L51 = A51 / A11;
     float L61 = A61 / A11;
 
-    float D1 = A11;
-    float D2 = A22 - L21*L21*D1;
+    // Preconditioned matrix has unit diagonal, so pivots are O(1); anything
+    // below this floor is numerically rank-deficient — clamp for a damped,
+    // stable quasi-Newton step instead of an explosive one.
+    float pivotEps = 1e-6f;
+    float D1 = max(A11, pivotEps);
+    float D2 = max(A22 - L21*L21*D1, pivotEps);
 
     float L32 = (A32 - L21*L31*D1) / D2;
     float L42 = (A42 - L21*L41*D1) / D2;
     float L52 = (A52 - L21*L51*D1) / D2;
     float L62 = (A62 - L21*L61*D1) / D2;
 
-    float D3 = A33 - (L31*L31*D1 + L32*L32*D2);
+    float D3 = max(A33 - (L31*L31*D1 + L32*L32*D2), pivotEps);
 
     float L43 = (A43 - L31*L41*D1 - L32*L42*D2) / D3;
     float L53 = (A53 - L31*L51*D1 - L32*L52*D2) / D3;
     float L63 = (A63 - L31*L61*D1 - L32*L62*D2) / D3;
 
-    float D4 = A44 - (L41*L41*D1 + L42*L42*D2 + L43*L43*D3);
+    float D4 = max(A44 - (L41*L41*D1 + L42*L42*D2 + L43*L43*D3), pivotEps);
 
     float L54 = (A54 - L41*L51*D1 - L42*L52*D2 - L43*L53*D3) / D4;
     float L64 = (A64 - L41*L61*D1 - L42*L62*D2 - L43*L63*D3) / D4;
 
-    float D5 = A55 - (L51*L51*D1 + L52*L52*D2 + L53*L53*D3 + L54*L54*D4);
+    float D5 = max(A55 - (L51*L51*D1 + L52*L52*D2 + L53*L53*D3 + L54*L54*D4), pivotEps);
 
     float L65 = (A65 - L51*L61*D1 - L52*L62*D2 - L53*L63*D3 - L54*L64*D4) / D5;
 
-    float D6 = A66 - (L61*L61*D1 + L62*L62*D2 + L63*L63*D3 + L64*L64*D4 + L65*L65*D5);
+    float D6 = max(A66 - (L61*L61*D1 + L62*L62*D2 + L63*L63*D3 + L64*L64*D4 + L65*L65*D5), pivotEps);
 
     float y1 = bLin.x;
     float y2 = bLin.y - L21*y1;
@@ -152,6 +178,10 @@ inline void solve6x6(M3 aLin, M3 aAng, M3 aCross,
     xLin.z = z3 - L43*xAng.x - L53*xAng.y - L63*xAng.z;
     xLin.y = z2 - L32*xLin.z - L42*xAng.x - L52*xAng.y - L62*xAng.z;
     xLin.x = z1 - L21*xLin.y - L31*xLin.z - L41*xAng.x - L51*xAng.y - L61*xAng.z;
+
+    // Undo preconditioning: x = S y
+    xLin = float3(xLin.x * s1, xLin.y * s2, xLin.z * s3);
+    xAng = float3(xAng.x * s4, xAng.y * s5, xAng.z * s6);
 }
 
 // Orthonormal basis: rows (n, t1, t2), matches CPU orthonormalBasis

@@ -28,7 +28,8 @@ make build
 
 In the app: drag bodies with the mouse, ⌥-drag orbits, right-drag pans,
 scroll zooms. All AVBD parameters (iterations, α, β, γ, gravity, time scale)
-are live-tunable.
+are live-tunable. Every demo has Small/Medium/Large/Giant/Colossal sizes
+(CLI: `--scale 1/2/4/8/16`) for stress testing.
 
 ## Architecture
 
@@ -69,11 +70,15 @@ Shader sources are concatenated in filename order and compiled at runtime
 (`00_common` math/types, `10_scan`, `20_broadphase`, `30_narrowphase`,
 `40_solver`, `50_render`).
 
-### Gotcha worth knowing
+### Gotchas worth knowing
 
-Metal fast math folds `isinf()` to false. Hard-constraint and fracture
-checks use explicit flag bits (`JointGPU.header.w`) instead of storing
-infinities.
+- Metal fast math folds `isinf()`/`isfinite()` — hard-constraint and
+  fracture checks use explicit flag bits (`JointGPU.header.w`), and the
+  NaN guard in the primal kernel tests exponent bits directly.
+- The 6×6 LDLᵀ is Jacobi-preconditioned (unit diagonal) so fp32 survives
+  penalty (10¹⁰) vs. tiny-rod-inertia scale gaps; pivots are clamped and
+  the primal step is trust-region capped (body radius / 0.5 rad per
+  iteration), which only engages in violent transients.
 
 ## Performance (M1 Ultra, release)
 
@@ -89,7 +94,7 @@ infinities.
 
 | | Default | Meaning |
 |---|---|---|
-| β | 10⁴ (lin) / 10² (ang) | Penalty ramp speed; convergence rate only, not the converged result |
+| β | 5×10³ (lin) / 10² (ang) | Penalty ramp speed; convergence rate only, not the converged result. Too high destabilizes long chains under the parallel (colored) solver |
 | α | 0.99 | Stabilization: portion of pre-existing error ignored (prevents explosive correction) |
 | γ | 0.999 | Warm-start decay for k and λ |
 | iterations | 10 | Per-frame primal/dual sweeps |

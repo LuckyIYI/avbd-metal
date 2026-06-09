@@ -195,10 +195,11 @@ public final class GPUSolver {
         }
         source = "#include <metal_stdlib>\nusing namespace metal;\n" + source
         let options = MTLCompileOptions()
+        let fastMath = ProcessInfo.processInfo.environment["AVBD_SAFE_MATH"] == nil
         if #available(macOS 15.0, *) {
-            options.mathMode = .fast
+            options.mathMode = fastMath ? .fast : .safe
         } else {
-            options.fastMathEnabled = true
+            options.fastMathEnabled = fastMath
         }
         return try device.makeLibrary(source: source, options: options)
     }
@@ -622,6 +623,7 @@ public final class GPUSolver {
                 enc.setBuffer(colorStart, offset: 0, index: 14)
                 enc.setBytes(&cIdx, length: 4, index: 15)
                 enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
+                enc.setBuffer(shape, offset: 0, index: 17)
                 enc.dispatchThreadgroups(indirectBuffer: colorArgs,
                                          indirectBufferOffset: c * 12,
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))

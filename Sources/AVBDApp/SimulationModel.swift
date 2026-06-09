@@ -13,7 +13,7 @@ final class SimulationModel: ObservableObject {
     // Live-tunable solver settings
     @Published var iterations: Double = 10 { didSet { push() } }
     @Published var alpha: Double = 0.99 { didSet { push() } }
-    @Published var betaLin: Double = 10000 { didSet { push() } }
+    @Published var betaLin: Double = 5000 { didSet { push() } }
     @Published var gamma: Double = 0.999 { didSet { push() } }
     @Published var gravity: Double = -10 { didSet { push() } }
     @Published var timeScale: Double = 1.0

@@ -7,18 +7,21 @@ public enum Demos {
         ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile", "spring", "cardhouse", "fracture"]
     }
 
+    /// Every demo scales for stress testing: 1 = small (original size),
+    /// 2 = medium, 4 = large, 8 = giant.
     public static func make(_ name: String, scale: Int = 1) -> PhysicsScene? {
+        let s = max(1, scale)
         switch name {
-        case "ground": return ground()
-        case "stack": return stack(height: 10 * scale)
-        case "wall": return wall(width: 8 * scale, height: 6 * scale)
-        case "pyramid": return pyramid(base: 8 * scale)
-        case "pendulum": return pendulum(links: 20, massRatio: 100)
-        case "chain": return chain(links: 30 * scale)
-        case "boxpile": return boxpile(count: 200 * scale * scale)
-        case "spring": return springRatio()
-        case "cardhouse": return cardhouse(levels: 4)
-        case "fracture": return fractureWall()
+        case "ground": return ground(count: s * s)
+        case "stack": return stack(height: 10 * s)
+        case "wall": return wall(width: 8 * s, height: 6 * s)
+        case "pyramid": return pyramid(base: 8 * s)
+        case "pendulum": return pendulum(links: 20 * s, massRatio: 100)
+        case "chain": return chain(links: 30 * s)
+        case "boxpile": return boxpile(count: 200 * s * s)
+        case "spring": return springRatio(blocks: 2 + s)
+        case "cardhouse": return cardhouse(levels: 3 + s)
+        case "fracture": return fractureWall(width: 10 * s, height: 8 * s)
         default: return nil
         }
     }
@@ -28,10 +31,19 @@ public enum Demos {
                       position: F3(0, 0, -1))
     }
 
-    public static func ground() -> PhysicsScene {
+    public static func ground(count: Int = 1) -> PhysicsScene {
         var s = PhysicsScene(name: "ground")
         addGround(&s)
-        _ = s.addBody(size: F3(1, 1, 1), density: 1, friction: 0.5, position: F3(0, 0, 3))
+        let side = Int(Double(count).squareRoot().rounded(.up))
+        var placed = 0
+        for j in 0..<side {
+            for i in 0..<side where placed < count {
+                _ = s.addBody(size: F3(1, 1, 1), density: 1, friction: 0.5,
+                              position: F3(Float(i - side / 2) * 1.5,
+                                           Float(j - side / 2) * 1.5, 3))
+                placed += 1
+            }
+        }
         return s
     }
 
@@ -139,14 +151,21 @@ public enum Demos {
         return s
     }
 
-    /// Three blocks connected by springs with a 10,000x stiffness ratio (paper Fig. 2).
-    public static func springRatio() -> PhysicsScene {
+    /// Chain of blocks connected by springs of alternating stiffness with a
+    /// 10,000x ratio (paper Fig. 2/4). More blocks = harder test.
+    public static func springRatio(blocks: Int = 3) -> PhysicsScene {
         var s = PhysicsScene(name: "spring")
-        let top = s.addBody(size: F3(1, 1, 0.5), density: 0, friction: 0.5, position: F3(0, 0, 10))
-        let mid = s.addBody(size: F3(1, 1, 0.5), density: 1, friction: 0.5, position: F3(0, 0, 8))
-        let bot = s.addBody(size: F3(1, 1, 0.5), density: 1, friction: 0.5, position: F3(0, 0, 6))
-        s.addSpring(SceneSpring(bodyA: top, bodyB: mid, rA: .zero, rB: .zero, stiffness: 1e6))
-        s.addSpring(SceneSpring(bodyA: mid, bodyB: bot, rA: .zero, rB: .zero, stiffness: 1e2))
+        let zTop = Float(4 + 2 * blocks)
+        var prev = s.addBody(size: F3(1, 1, 0.5), density: 0, friction: 0.5,
+                             position: F3(0, 0, zTop))
+        for i in 1..<blocks {
+            let b = s.addBody(size: F3(1, 1, 0.5), density: 1, friction: 0.5,
+                              position: F3(0, 0, zTop - Float(i) * 2))
+            let stiff: Float = i % 2 == 1 ? 1e6 : 1e2
+            s.addSpring(SceneSpring(bodyA: prev, bodyB: b, rA: .zero, rB: .zero,
+                                    stiffness: stiff))
+            prev = b
+        }
         return s
     }
 
@@ -192,11 +211,10 @@ public enum Demos {
     }
 
     /// Wall of bricks with breakable attachments + a heavy ball (paper Fig. 13).
-    public static func fractureWall() -> PhysicsScene {
+    public static func fractureWall(width: Int = 10, height: Int = 8) -> PhysicsScene {
         var s = PhysicsScene(name: "fracture")
         addGround(&s)
         let bw: Float = 1, bh: Float = 0.5, bd: Float = 0.5
-        let width = 10, height = 8
         var grid: [[Int]] = []
         for j in 0..<height {
             var row: [Int] = []
@@ -227,9 +245,11 @@ public enum Demos {
                 }
             }
         }
-        // heavy ball with momentum
-        _ = s.addBody(size: F3(2, 2, 2), density: 4, friction: 0.5,
-                      position: F3(0, -15, 3), velocity: F3(0, 30, 0))
+        // heavy ball with momentum, sized with the wall
+        let ballSize = 2 * Float(width) / 10
+        _ = s.addBody(size: F3(repeating: ballSize), density: 4, friction: 0.5,
+                      position: F3(0, -15, Float(height) * bh * 0.4),
+                      velocity: F3(0, 30, 0))
         return s
     }
 }

@@ -10,7 +10,7 @@ public struct SimParamsGPU {
     public var dt: Float = 1.0 / 60.0
     public var gravity: Float = -10.0
     public var alpha: Float = 0.99
-    public var betaLin: Float = 10000.0
+    public var betaLin: Float = 5000.0
     public var betaAng: Float = 100.0
     public var gamma: Float = 0.999
     public var numBodies: UInt32 = 0

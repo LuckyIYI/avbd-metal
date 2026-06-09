@@ -510,6 +510,7 @@ kernel void primal_solve(
     device const uint* colorStart   [[buffer(14)]],
     constant uint& colorIndex       [[buffer(15)]],
     constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorIndex];
@@ -545,6 +546,22 @@ kernel void primal_solve(
 
     float3 dxLin = float3(0), dxAng = float3(0);
     solve6x6(acc.lhsLin, acc.lhsAng, acc.lhsCross, -acc.rhsLin, -acc.rhsAng, dxLin, dxAng);
+
+    // Skip the update if the solve produced non-finite values (paper: VBD
+    // skips updates with non-PD Hessians; with the pivot clamp this should
+    // be unreachable, but one poisoned position would NaN the whole island).
+    if (!finite3(dxLin) || !finite3(dxAng)) return;
+
+    // Trust region: VBD with line search guarantees descent (paper Sec 2.2);
+    // we cap the step instead, which only engages in violent transients
+    // (e.g. a long free-falling chain snapping taut) where a single Newton
+    // step on the rotational nonlinearity would overshoot and inject energy.
+    float maxLin = shape[body].w;           // body bounding radius per iteration
+    float lin2 = dot(dxLin, dxLin);
+    if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
+    float ang2 = dot(dxAng, dxAng);
+    const float maxAng = 0.5f;              // ~29 deg per iteration
+    if (ang2 > maxAng * maxAng) dxAng *= maxAng * rsqrt(ang2);
 
     // Direct write: bodies within one color are non-adjacent except in the
     // rare same-color-conflict case, where this degrades to a Jacobi update

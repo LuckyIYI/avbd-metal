@@ -46,8 +46,12 @@ struct ContentView: View {
                     Picker("Scene", selection: $model.demoName) {
                         ForEach(Demos.all, id: \.self) { Text($0) }
                     }
-                    Picker("Scale", selection: $model.scale) {
-                        ForEach([1, 2, 3, 4, 6, 8], id: \.self) { Text("\($0)x") }
+                    Picker("Size", selection: $model.scale) {
+                        Text("Small").tag(1)
+                        Text("Medium").tag(2)
+                        Text("Large").tag(4)
+                        Text("Giant").tag(8)
+                        Text("Colossal").tag(16)
                     }
                     HStack {
                         Button(model.running ? "Pause" : "Play") {
