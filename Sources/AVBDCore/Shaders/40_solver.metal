@@ -340,7 +340,7 @@ inline void stampJoint(device const JointGPU& j, uint self,
         float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
         float3 C = pA - pB;
-        if (isinf(j.rA.w)) C -= j.C0Lin.xyz * alpha;
+        if (j.header.w & 1) C -= j.C0Lin.xyz * alpha;
 
         float3 F = penLin * C + j.lambdaLin.xyz;
         float jsign = isA ? 1.0f : -1.0f;
@@ -371,7 +371,7 @@ inline void stampJoint(device const JointGPU& j, uint self,
     if (dot(penAng, penAng) > 0.0f) {
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
         float3 C = q_sub(qA, posAng[b]) * torqueArm;
-        if (isinf(j.rB.w)) C -= j.C0Ang.xyz * alpha;
+        if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
 
         float3 F = penAng * C + j.lambdaAng.xyz;
         float s = (isA ? 1.0f : -1.0f) * torqueArm;
@@ -585,7 +585,7 @@ kernel void dual_joints(
         float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
         float3 C = pA - pB;
-        if (isinf(stiffLin)) {
+        if (j.header.w & 1) {
             C -= j.C0Lin.xyz * P.alpha;
             j.lambdaLin.xyz = penLin * C + j.lambdaLin.xyz;
         }
@@ -597,7 +597,7 @@ kernel void dual_joints(
     if (dot(penAng, penAng) > 0.0f) {
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
         float3 C = q_sub(qA, posAng[b]) * torqueArm;
-        if (isinf(stiffAng)) {
+        if (j.header.w & 2) {
             C -= j.C0Ang.xyz * P.alpha;
             j.lambdaAng.xyz = penAng * C + j.lambdaAng.xyz;
         }
@@ -605,10 +605,10 @@ kernel void dual_joints(
         j.penaltyAng.xyz = min(penAng + fabs(C) * P.betaAng, cap);
     }
 
-    // Fracture
+    // Fracture (flagged joints only; avoids inf comparisons under fast math)
     float fracture = j.C0Ang.w;
     float3 la = j.lambdaAng.xyz;
-    if (dot(la, la) > fracture * fracture) {
+    if ((j.header.w & 4) && dot(la, la) > fracture * fracture) {
         j.penaltyLin = float4(0);
         j.penaltyAng = float4(0);
         j.lambdaLin = float4(0);

@@ -267,13 +267,20 @@ public final class GPUSolver {
         for (i, j) in scene.joints.enumerated() {
             var g = JointGPU()
             let aIdx: UInt32 = j.bodyA >= 0 ? UInt32(j.bodyA) : 0xFFFFFFFF
-            g.header = SIMD4(aIdx, UInt32(j.bodyB), 0, 0)
-            g.rA = SIMD4(j.rA, j.stiffnessLin)
-            g.rB = SIMD4(j.rB, j.stiffnessAng)
+            // Flag bits avoid inf comparisons under fast math:
+            // 1 = hard linear, 2 = hard angular, 4 = breakable
+            var flags: UInt32 = 0
+            if j.stiffnessLin.isInfinite { flags |= 1 }
+            if j.stiffnessAng.isInfinite { flags |= 2 }
+            if j.fracture.isFinite { flags |= 4 }
+            g.header = SIMD4(aIdx, UInt32(j.bodyB), 0, flags)
+            let bigK: Float = 3.0e10
+            g.rA = SIMD4(j.rA, min(j.stiffnessLin, bigK))
+            g.rB = SIMD4(j.rB, min(j.stiffnessAng, bigK))
             let sizeA = j.bodyA >= 0 ? scene.bodies[j.bodyA].size : .zero
             let torqueArm = length_squared(sizeA + scene.bodies[j.bodyB].size)
             g.C0Lin = SIMD4(0, 0, 0, torqueArm)
-            g.C0Ang = SIMD4(0, 0, 0, j.fracture)
+            g.C0Ang = SIMD4(0, 0, 0, min(j.fracture, 3.0e18))
             jp[i] = g
         }
 

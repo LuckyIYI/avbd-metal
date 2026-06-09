@@ -1,4 +1,165 @@
 import AVBDCore
 import Foundation
+import simd
 
-print("avbd headless CLI — work in progress")
+// avbd — headless CLI for the Metal AVBD solver.
+//
+// Usage:
+//   avbd run <demo> [--frames N] [--iterations N] [--cpu] [--json] [--scale N]
+//            [--dt T] [--watch BODY] [--stats-every N]
+//   avbd bench <demo> [--frames N] [--scale N] [--iterations N]
+//   avbd list
+//   avbd parity <demo> [--frames N]
+
+struct Options {
+    var frames = 300
+    var iterations: Int? = nil
+    var scale = 1
+    var dt: Float? = nil
+    var useCPU = false
+    var json = false
+    var watch: Int? = nil
+    var statsEvery = 60
+}
+
+func parseOptions(_ args: [String]) -> Options {
+    var o = Options()
+    var i = 0
+    while i < args.count {
+        switch args[i] {
+        case "--frames": i += 1; o.frames = Int(args[i]) ?? o.frames
+        case "--iterations": i += 1; o.iterations = Int(args[i])
+        case "--scale": i += 1; o.scale = Int(args[i]) ?? 1
+        case "--dt": i += 1; o.dt = Float(args[i])
+        case "--cpu": o.useCPU = true
+        case "--json": o.json = true
+        case "--watch": i += 1; o.watch = Int(args[i])
+        case "--stats-every": i += 1; o.statsEvery = Int(args[i]) ?? 60
+        default: break
+        }
+        i += 1
+    }
+    return o
+}
+
+func fail(_ msg: String) -> Never {
+    FileHandle.standardError.write(("error: " + msg + "\n").data(using: .utf8)!)
+    exit(1)
+}
+
+func makeScene(_ name: String, _ o: Options) -> PhysicsScene {
+    guard var scene = Demos.make(name, scale: o.scale) else {
+        fail("unknown demo '\(name)'. Available: \(Demos.all.joined(separator: ", "))")
+    }
+    if let it = o.iterations { scene.settings.iterations = it }
+    if let dt = o.dt { scene.settings.dt = dt }
+    return scene
+}
+
+let args = Array(CommandLine.arguments.dropFirst())
+guard let command = args.first else {
+    print("""
+    avbd — Augmented Vertex Block Descent (Metal)
+
+    Commands:
+      run <demo>     Simulate a demo scene headlessly
+      bench <demo>   Benchmark ms/frame
+      parity <demo>  Compare GPU vs CPU trajectories
+      list           List demo scenes
+
+    Options: --frames N --iterations N --scale N --dt T --cpu --json --watch BODY --stats-every N
+    """)
+    exit(0)
+}
+
+switch command {
+case "list":
+    for d in Demos.all { print(d) }
+
+case "run":
+    guard args.count > 1 else { fail("usage: avbd run <demo>") }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let scene = makeScene(args[1], o)
+
+    if o.useCPU {
+        let solver = scene.makeCPUSolver()
+        let t0 = Date()
+        for f in 0..<o.frames {
+            solver.step()
+            if !o.json && (f + 1) % o.statsEvery == 0 {
+                let err = solver.maxConstraintError()
+                print(String(format: "frame %5d  err %.5f  forces %d", f + 1, err, solver.forces.count))
+            }
+        }
+        let ms = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
+        let err = solver.maxConstraintError()
+        if o.json {
+            print("{\"backend\":\"cpu\",\"demo\":\"\(scene.name)\",\"frames\":\(o.frames),\"msPerFrame\":\(ms),\"maxConstraintError\":\(err)}")
+        } else {
+            print(String(format: "cpu: %d bodies, %.3f ms/frame, final err %.5f",
+                         scene.bodies.count, ms, err))
+        }
+    } else {
+        let solver = try GPUSolver(scene: scene)
+        let t0 = Date()
+        for f in 0..<o.frames {
+            solver.step()
+            if !o.json && (f + 1) % o.statsEvery == 0 {
+                let err = solver.maxConstraintError()
+                var extra = ""
+                if let w = o.watch {
+                    let p = solver.bodyPosition(w)
+                    extra = String(format: "  body%d (%.3f, %.3f, %.3f)", w, p.x, p.y, p.z)
+                }
+                let colors = solver.lastColorCounts.filter { $0 > 0 }.count
+                print(String(format: "frame %5d  err %.5f  pairs %5d  colors %2d%@",
+                             f + 1, err, solver.lastNumPairs, colors, extra))
+            }
+        }
+        let ms = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
+        let err = solver.maxConstraintError()
+        if o.json {
+            print("{\"backend\":\"gpu\",\"demo\":\"\(scene.name)\",\"bodies\":\(scene.bodies.count),\"frames\":\(o.frames),\"msPerFrame\":\(ms),\"maxConstraintError\":\(err),\"pairs\":\(solver.lastNumPairs)}")
+        } else {
+            print(String(format: "gpu: %d bodies, %.3f ms/frame, final err %.5f, %d pairs",
+                         scene.bodies.count, ms, err, solver.lastNumPairs))
+        }
+    }
+
+case "bench":
+    guard args.count > 1 else { fail("usage: avbd bench <demo>") }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let scene = makeScene(args[1], o)
+    let solver = try GPUSolver(scene: scene)
+    // warmup
+    for _ in 0..<10 { solver.step() }
+    let t0 = Date()
+    for _ in 0..<o.frames { solver.step() }
+    let ms = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
+    print(String(format: "%@: %d bodies, %d iterations, %.3f ms/frame (%.1f FPS)",
+                 scene.name, scene.bodies.count, scene.settings.iterations, ms, 1000 / ms))
+
+case "parity":
+    guard args.count > 1 else { fail("usage: avbd parity <demo>") }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let scene = makeScene(args[1], o)
+    let cpu = scene.makeCPUSolver()
+    let gpu = try GPUSolver(scene: scene)
+    var maxDiff: Float = 0
+    for f in 0..<o.frames {
+        cpu.step()
+        gpu.step()
+        var diff: Float = 0
+        for i in 0..<scene.bodies.count {
+            diff = max(diff, length(cpu.bodies[i].positionLin - gpu.bodyPosition(i)))
+        }
+        maxDiff = max(maxDiff, diff)
+        if (f + 1) % o.statsEvery == 0 {
+            print(String(format: "frame %5d  maxDiff %.5f", f + 1, diff))
+        }
+    }
+    print(String(format: "max position divergence over %d frames: %.5f", o.frames, maxDiff))
+
+default:
+    fail("unknown command '\(command)'")
+}

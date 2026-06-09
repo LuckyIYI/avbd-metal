@@ -197,7 +197,8 @@ public enum Demos {
             grid.append(row)
         }
         // breakable joints between neighbors
-        let fractureForce: Float = 800
+        // Settle-phase joint torques are ~0.003; ball impact peaks at ~500.
+        let fractureForce: Float = 100
         for j in 0..<height {
             for i in 0..<width {
                 if i + 1 < width {
