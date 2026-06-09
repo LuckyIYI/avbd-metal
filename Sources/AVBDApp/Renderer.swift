@@ -18,8 +18,8 @@ struct RenderInstance {
 
 struct Uniforms {
     float4x4 viewProj;
-    float3 lightDir;
-    float3 eye;
+    float4 lightDir;    // xyz used
+    float4 eye;         // xyz used
 };
 
 struct VOut {
@@ -81,11 +81,11 @@ fragment float4 box_fragment(VOut in [[stage_in]],
                              constant Uniforms& U [[buffer(1)]])
 {
     float3 n = normalize(in.normal);
-    float ndl = max(dot(n, -U.lightDir), 0.0);
+    float ndl = max(dot(n, -U.lightDir.xyz), 0.0);
     float3 ambient = float3(0.35);
     float3 lit = in.color.rgb * (ambient + float3(0.75) * ndl);
     // cheap distance fade for depth perception
-    float d = length(in.world - U.eye);
+    float d = length(in.world - U.eye.xyz);
     lit = mix(lit, float3(0.62, 0.67, 0.75), clamp(d / 400.0, 0.0, 0.6));
     return float4(lit, 1.0);
 }
@@ -122,10 +122,8 @@ fragment float4 grid_fragment(GridOut in [[stage_in]]) {
 
 struct Uniforms {
     var viewProj: simd_float4x4
-    var lightDir: F3
-    var pad0: Float = 0
-    var eye: F3
-    var pad1: Float = 0
+    var lightDir: SIMD4<Float>
+    var eye: SIMD4<Float>
 }
 
 final class Renderer: NSObject, MTKViewDelegate {
@@ -230,9 +228,11 @@ final class Renderer: NSObject, MTKViewDelegate {
                                     colorMode: model.colorByGraphColor ? 1 : 0)
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
+        let l = normalize(F3(0.4, 0.25, -0.85))
+        let e = eyePosition
         var U = Uniforms(viewProj: projectionMatrix(aspect: aspect) * viewMatrix,
-                         lightDir: normalize(F3(0.4, 0.25, -0.85)),
-                         eye: eyePosition)
+                         lightDir: SIMD4(l, 0),
+                         eye: SIMD4(e, 0))
 
         rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0.62, green: 0.67, blue: 0.75, alpha: 1)
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
