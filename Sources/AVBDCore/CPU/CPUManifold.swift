@@ -24,10 +24,19 @@ public final class CPUManifold: CPUForce {
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)
     }
 
+    func anchorWorld(_ body: CPURigid, _ r: F3) -> F3 {
+        body.shape == .sphere ? body.positionLin + r
+                              : transform(body.positionLin, body.positionAng, r)
+    }
+
+    func anchorOffsetWorld(_ body: CPURigid, _ r: F3) -> F3 {
+        body.shape == .sphere ? r : rotate(body.positionAng, r)
+    }
+
     func currentPenetration(_ i: Int) -> Float {
         guard let bodyA, let bodyB else { return 0 }
-        let xA = transform(bodyA.positionLin, bodyA.positionAng, contacts[i].rA)
-        let xB = transform(bodyB.positionLin, bodyB.positionAng, contacts[i].rB)
+        let xA = anchorWorld(bodyA, contacts[i].rA)
+        let xB = anchorWorld(bodyB, contacts[i].rB)
         return dot(basis.0, xA - xB) + AVBDConstants.collisionMargin
     }
 
@@ -38,13 +47,16 @@ public final class CPUManifold: CPUForce {
         var newContacts: [ContactPoint] = []
         let count = Self.collide(bodyA, bodyB, &newContacts, &basis)
 
-        // Merge old contact data via feature keys (warm-start persistence)
+        // Merge old contact data via feature keys (warm-start persistence).
+        // Stick anchors are never restored for spheres: anchors rotate with
+        // the body, which is wrong for rolling contacts.
+        let anySphere = bodyA.shape == .sphere || bodyB.shape == .sphere
         for i in 0..<count {
             for old in contacts where old.featureKey == newContacts[i].featureKey {
                 let newRA = newContacts[i].rA
                 let newRB = newContacts[i].rB
                 newContacts[i] = old
-                if !old.stick {
+                if !old.stick || anySphere {
                     newContacts[i].rA = newRA
                     newContacts[i].rB = newRB
                 }
@@ -54,8 +66,8 @@ public final class CPUManifold: CPUForce {
         contacts = newContacts
 
         for i in 0..<contacts.count {
-            let xA = transform(bodyA.positionLin, bodyA.positionAng, contacts[i].rA)
-            let xB = transform(bodyB.positionLin, bodyB.positionAng, contacts[i].rB)
+            let xA = anchorWorld(bodyA, contacts[i].rA)
+            let xB = anchorWorld(bodyB, contacts[i].rB)
             let d = xA - xB
             contacts[i].C0 = F3(dot(basis.0, d) + AVBDConstants.collisionMargin,
                                 dot(basis.1, d), dot(basis.2, d))
@@ -104,8 +116,8 @@ public final class CPUManifold: CPUForce {
         let isA = body === bodyA
 
         for i in 0..<contacts.count {
-            let rAW = rotate(bodyA.positionAng, contacts[i].rA)
-            let rBW = rotate(bodyB.positionAng, contacts[i].rB)
+            let rAW = anchorOffsetWorld(bodyA, contacts[i].rA)
+            let rBW = anchorOffsetWorld(bodyB, contacts[i].rB)
             let (F, _, _, _) = forceAndC(i, alpha, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW)
 
             let s: Float = isA ? 1 : -1
@@ -135,8 +147,8 @@ public final class CPUManifold: CPUForce {
         let dqBAng = quatSub(bodyB.positionAng, bodyB.initialAng)
 
         for i in 0..<contacts.count {
-            let rAW = rotate(bodyA.positionAng, contacts[i].rA)
-            let rBW = rotate(bodyB.positionAng, contacts[i].rB)
+            let rAW = anchorOffsetWorld(bodyA, contacts[i].rA)
+            let rBW = anchorOffsetWorld(bodyB, contacts[i].rB)
             let (F, C, frictionScale, bounds) =
                 forceAndC(i, alpha, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW)
 
@@ -148,9 +160,9 @@ public final class CPUManifold: CPUForce {
             }
             if frictionScale <= bounds {
                 contacts[i].penalty[1] = min(contacts[i].penalty[1] + solver.betaLin * abs(C[1]),
-                                             AVBDConstants.penaltyMax)
+                                             AVBDConstants.penaltyMaxTangent)
                 contacts[i].penalty[2] = min(contacts[i].penalty[2] + solver.betaLin * abs(C[2]),
-                                             AVBDConstants.penaltyMax)
+                                             AVBDConstants.penaltyMaxTangent)
                 contacts[i].stick = length(SIMD2<Float>(C[1], C[2])) < AVBDConstants.stickThresh
             }
         }

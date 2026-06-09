@@ -62,6 +62,12 @@ vertex VOut box_vertex(uint vid [[vertex_id]],
                        constant Uniforms& U [[buffer(1)]])
 {
     RenderInstance inst = instances[iid];
+    if (inst.color.w != 0.0) {       // sphere instance: collapse in box pass
+        VOut o;
+        o.position = float4(0, 0, -2, 1);
+        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
+        return o;
+    }
     float3 p = cubeVerts[vid];
     float3 n = cubeNormals[vid / 6];
     float4 world = inst.model * float4(p, 1);
@@ -88,6 +94,46 @@ fragment float4 box_fragment(VOut in [[stage_in]],
     float d = length(in.world - U.eye.xyz);
     lit = mix(lit, float3(0.62, 0.67, 0.75), clamp(d / 400.0, 0.0, 0.6));
     return float4(lit, 1.0);
+}
+
+// Analytic UV sphere: STACKS x SLICES quads, 6 verts each
+#define SPH_STACKS 12
+#define SPH_SLICES 18
+
+vertex VOut sphere_vertex(uint vid [[vertex_id]],
+                          uint iid [[instance_id]],
+                          device const RenderInstance* instances [[buffer(0)]],
+                          constant Uniforms& U [[buffer(1)]])
+{
+    RenderInstance inst = instances[iid];
+    if (inst.color.w == 0.0) {       // box instance: collapse in sphere pass
+        VOut o;
+        o.position = float4(0, 0, -2, 1);
+        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
+        return o;
+    }
+    uint quad = vid / 6;
+    uint corner = vid % 6;
+    uint stack = quad / SPH_SLICES;
+    uint slice = quad % SPH_SLICES;
+    // two triangles: (0,0),(1,0),(1,1) and (0,0),(1,1),(0,1)
+    uint2 off[6] = { uint2(0,0), uint2(1,0), uint2(1,1), uint2(0,0), uint2(1,1), uint2(0,1) };
+    float v = float(stack + off[corner].y) / float(SPH_STACKS);   // 0..1 pole to pole
+    float u = float(slice + off[corner].x) / float(SPH_SLICES);
+    float phi = v * M_PI_F;
+    float theta = u * 2.0 * M_PI_F;
+    float3 n = float3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
+    float3 p = n * 0.5;              // unit-diameter sphere
+    float4 world = inst.model * float4(p, 1);
+    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
+                            normalize(inst.model[1].xyz),
+                            normalize(inst.model[2].xyz));
+    VOut o;
+    o.position = U.viewProj * world;
+    o.normal = rot * n;
+    o.world = world.xyz;
+    o.color = float4(inst.color.rgb, 1);
+    return o;
 }
 
 // Ground grid lines
@@ -130,6 +176,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     let queue: MTLCommandQueue
     var boxPipeline: MTLRenderPipelineState!
+    var spherePipeline: MTLRenderPipelineState!
     var gridPipeline: MTLRenderPipelineState!
     var depthState: MTLDepthStencilState!
     var instances: MTLBuffer?
@@ -156,6 +203,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
         desc.depthAttachmentPixelFormat = .depth32Float
         boxPipeline = try device.makeRenderPipelineState(descriptor: desc)
+
+        let sdesc = MTLRenderPipelineDescriptor()
+        sdesc.vertexFunction = lib.makeFunction(name: "sphere_vertex")
+        sdesc.fragmentFunction = lib.makeFunction(name: "box_fragment")
+        sdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        sdesc.depthAttachmentPixelFormat = .depth32Float
+        spherePipeline = try device.makeRenderPipelineState(descriptor: sdesc)
 
         let gdesc = MTLRenderPipelineDescriptor()
         gdesc.vertexFunction = lib.makeFunction(name: "grid_vertex")
@@ -247,6 +301,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 36, instanceCount: count)
+
+        enc.setRenderPipelineState(spherePipeline)
+        enc.setVertexBuffer(instances, offset: 0, index: 0)
+        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                           vertexCount: 12 * 18 * 6, instanceCount: count)
         enc.endEncoding()
 
         cmd.present(drawable)

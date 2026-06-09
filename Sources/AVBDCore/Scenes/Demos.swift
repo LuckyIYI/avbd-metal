@@ -4,7 +4,9 @@ import simd
 
 public enum Demos {
     public static var all: [String] {
-        ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile", "spring", "cardhouse", "fracture"]
+        ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
+         "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
+         "swirl", "treadmill", "jenga", "dominoes"]
     }
 
     /// Every demo scales for stress testing: 1 = small (original size),
@@ -22,6 +24,13 @@ public enum Demos {
         case "spring": return springRatio(blocks: 2 + s)
         case "cardhouse": return cardhouse(levels: 3 + s)
         case "fracture": return fractureWall(width: 10 * s, height: 8 * s)
+        case "bridge": return bridge(planks: 16 * s, drops: 4 * s)
+        case "tensegrity": return tensegrity(towers: s)
+        case "chainmail": return chainmail(rings: 5 + s, drops: 3 * s)
+        case "swirl": return swirl(turns: 2 + s, balls: 40 * s)
+        case "treadmill": return treadmill(boxes: 12 * s)
+        case "jenga": return jenga(levels: 18 * s)
+        case "dominoes": return dominoes(count: 80 * s)
         default: return nil
         }
     }

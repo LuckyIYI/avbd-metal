@@ -201,10 +201,134 @@ kernel void np_collide(
 
     float3 delta = B.center - A.center;
 
+    device ManifoldGPU& outM = manifolds[gid];
+
+    // --- Sphere branches (shape.w < 0 marks spheres) ---
+    bool sphA = shape[ia].w < 0.0f;
+    bool sphB = shape[ib].w < 0.0f;
+    NPContact contacts[MAX_CONTACTS];
+    int count = 0;
+    float3 nrm;     // points from B toward A
+
+    if (sphA || sphB) {
+        float rA = shape[ia].x * 0.5f;
+        float rB = shape[ib].x * 0.5f;
+        if (sphA && sphB) {
+            float3 d = A.center - B.center;
+            float dist = length(d);
+            if (dist > rA + rB + COLLISION_MARGIN) {
+                outM.header = uint4(ia, ib, 0, 0);
+                return;
+            }
+            nrm = dist > 1e-9f ? d / dist : float3(0, 0, 1);
+            contacts[0].xA = A.center - nrm * rA;
+            contacts[0].xB = B.center + nrm * rB;
+            contacts[0].feature = 0;
+            count = 1;
+        } else {
+            // one sphere, one box
+            bool sIsA = sphA;
+            float r = sIsA ? rA : rB;
+            thread const NPBox& box = sIsA ? B : A;
+            float4 qBox = sIsA ? qB : qA;
+            float3 sphereC = sIsA ? A.center : B.center;
+
+            float4 qc = q_conj(qBox);
+            float3 local = q_rotate(qc, sphereC - box.center);
+            float3 half3_ = box.half3_;
+            float3 clamped = clamp(local, -half3_, half3_);
+
+            float3 nLocal;
+            float3 qLocal;
+            if (all(clamped == local)) {
+                float3 pen = half3_ - fabs(local);
+                int axis = 0;
+                if (pen.y < pen[axis]) axis = 1;
+                if (pen.z < pen[axis]) axis = 2;
+                float3 n = float3(0);
+                n[axis] = local[axis] >= 0.0f ? 1.0f : -1.0f;
+                nLocal = n;
+                qLocal = local;
+                qLocal[axis] = n[axis] * half3_[axis];
+            } else {
+                float3 d = local - clamped;
+                float dist = length(d);
+                if (dist > r + COLLISION_MARGIN) {
+                    outM.header = uint4(ia, ib, 0, 0);
+                    return;
+                }
+                nLocal = d / max(dist, 1e-9f);
+                qLocal = clamped;
+            }
+
+            float3 nW = q_rotate(qBox, nLocal);      // box -> sphere
+            float3 qW = q_rotate(qBox, qLocal) + box.center;
+            float3 xSphere = sphereC - nW * r;
+
+            nrm = sIsA ? nW : -nW;                   // B -> A
+            contacts[0].xA = sIsA ? xSphere : qW;
+            contacts[0].xB = sIsA ? qW : xSphere;
+            contacts[0].feature = 0;
+            count = 1;
+        }
+
+        // shared tail: warm-start + write. Sphere anchors are stored as
+        // WORLD-space offsets (rotation-invariant): a spinning ball would
+        // swing a material anchor away from the contact mid-step, breaking
+        // the normal constraint. header.w bits: 1 active, 2 A-sphere,
+        // 4 B-sphere.
+        float3 t1, t2;
+        orthonormal(nrm, t1, t2);
+        float friction = sqrt(props[ia].w * props[ib].w);
+        int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
+
+        uint flags = 1u | (sphA ? 2u : 0u) | (sphB ? 4u : 0u);
+        outM.header = uint4(ia, ib, uint(count), flags);
+        outM.basisN = float4(nrm, friction);
+        outM.basisT1 = float4(t1, 0);
+
+        float4 qAc = q_conj(qA);
+        float4 qBc = q_conj(qB);
+        float warm = P.alpha * P.gamma;
+        for (int i = 0; i < count; i++) {
+            float3 rA_ = sphA ? (contacts[i].xA - pA4.xyz)
+                              : q_rotate(qAc, contacts[i].xA - pA4.xyz);
+            float3 rB_ = sphB ? (contacts[i].xB - pB4.xyz)
+                              : q_rotate(qBc, contacts[i].xB - pB4.xyz);
+            float3 lambda = float3(0);
+            float3 penalty = float3(0);
+            float stick = 0.0f;
+            if (prevIdx >= 0) {
+                device const ManifoldGPU& pm = prevManifolds[prevIdx];
+                uint pn = pm.header.z;
+                for (uint j = 0; j < pn; j++) {
+                    if (as_type<uint>(pm.contacts[j].rA.w) == contacts[i].feature) {
+                        lambda = pm.contacts[j].lambda.xyz;
+                        penalty = pm.contacts[j].penalty.xyz;
+                        // NOTE: no stick-anchor restoration for spheres —
+                        // anchors rotate with the body, which is wrong for
+                        // rolling contacts and drags the ball into the floor.
+                        break;
+                    }
+                }
+            }
+            float3 xAw = sphA ? pA4.xyz + rA_ : xform(pA4.xyz, qA, rA_);
+            float3 xBw = sphB ? pB4.xyz + rB_ : xform(pB4.xyz, qB, rB_);
+            float3 d = xAw - xBw;
+            float3 C0 = float3(dot(nrm, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+            lambda *= warm;
+            penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
+            outM.contacts[i].rA = float4(rA_, as_type<float>(contacts[i].feature));
+            outM.contacts[i].rB = float4(rB_, stick);
+            outM.contacts[i].C0 = float4(C0, 0);
+            outM.contacts[i].lambda = float4(lambda, 0);
+            outM.contacts[i].penalty = float4(penalty, 0);
+        }
+        return;
+    }
+
     NPAxisBest bestFace; bestFace.valid = false; bestFace.separation = -FLT_MAX;
     NPAxisBest bestEdge; bestEdge.valid = false; bestEdge.separation = -FLT_MAX;
-
-    device ManifoldGPU& outM = manifolds[gid];
 
     bool separated = false;
     for (int i = 0; i < 3 && !separated; i++) {
@@ -230,10 +354,8 @@ kernel void np_collide(
         if (0.95f * bestEdge.separation > bestFace.separation + 0.01f) best = bestEdge;
     }
 
-    // Build contacts
-    NPContact contacts[MAX_CONTACTS];
+    // Build contacts (arrays declared above)
     float3 midpoints[MAX_CONTACTS];
-    int count = 0;
 
     if (best.type == 2) {
         // Edge-edge
@@ -311,7 +433,7 @@ kernel void np_collide(
     }
 
     // Basis: normal points from B toward A (reference uses -normalAB)
-    float3 nrm = -best.normalAB;
+    nrm = -best.normalAB;
     float3 t1, t2;
     orthonormal(nrm, t1, t2);
 

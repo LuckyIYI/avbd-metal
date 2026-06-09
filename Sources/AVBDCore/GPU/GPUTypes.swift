@@ -23,6 +23,10 @@ public struct SimParamsGPU {
     public var gridHashSize: UInt32 = 0
     public var numHashed: UInt32 = 0
     public var numGlobals: UInt32 = 0
+    public var maxSpeed: Float = 100
+    public var pad0: Float = 0
+    public var pad1: Float = 0
+    public var pad2: Float = 0
 }
 
 public struct JointGPU {

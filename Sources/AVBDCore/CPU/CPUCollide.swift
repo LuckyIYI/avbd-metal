@@ -271,10 +271,101 @@ private func buildEdgeContact(_ bodyA: CPURigid, _ bodyB: CPURigid,
 }
 
 extension CPUManifold {
-    /// SAT OBB-OBB collision. Returns contact count; fills basis (rows n, t1, t2).
+    /// Shape-dispatching collision. Returns contact count; fills basis
+    /// (rows n, t1, t2) with the normal pointing from B toward A.
     static func collide(_ bodyA: CPURigid, _ bodyB: CPURigid,
                         _ contacts: inout [ContactPoint],
                         _ basisOut: inout (F3, F3, F3)) -> Int {
+        switch (bodyA.shape, bodyB.shape) {
+        case (.sphere, .sphere):
+            return collideSphereSphere(bodyA, bodyB, &contacts, &basisOut)
+        case (.sphere, .box):
+            return collideSphereBox(bodyA, bodyB, sphereIsA: true, &contacts, &basisOut)
+        case (.box, .sphere):
+            return collideSphereBox(bodyB, bodyA, sphereIsA: false, &contacts, &basisOut)
+        case (.box, .box):
+            return collideBoxBox(bodyA, bodyB, &contacts, &basisOut)
+        }
+    }
+
+    static func collideSphereSphere(_ a: CPURigid, _ b: CPURigid,
+                                    _ contacts: inout [ContactPoint],
+                                    _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let rA = a.size.x / 2, rB = b.size.x / 2
+        let d = a.positionLin - b.positionLin
+        let dist = length(d)
+        if dist > rA + rB + AVBDConstants.collisionMargin { return 0 }
+        let n = dist > 1e-9 ? d / dist : F3(0, 0, 1)   // B -> A
+        basisOut = orthonormalBasis(n)
+        var c = ContactPoint()
+        c.featureKey = 0
+        let xA = a.positionLin - n * rA
+        let xB = b.positionLin + n * rB
+        // world-space offsets for spheres (rotation-invariant anchors)
+        c.rA = xA - a.positionLin
+        c.rB = xB - b.positionLin
+        contacts.append(c)
+        return 1
+    }
+
+    /// sphere vs box; `sphereIsA` says whether the sphere is manifold body A.
+    static func collideSphereBox(_ sphere: CPURigid, _ box: CPURigid, sphereIsA: Bool,
+                                 _ contacts: inout [ContactPoint],
+                                 _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let r = sphere.size.x / 2
+        let half = box.size * 0.5
+        let qc = box.positionAng.conjugate
+        let local = qc.act(sphere.positionLin - box.positionLin)
+        let clamped = simd_clamp(local, -half, half)
+
+        var nLocal: F3
+        var qLocal: F3
+        if clamped == local {
+            // center inside the box: push out along min-penetration face
+            let pen = half - abs(local)
+            var axis = 0
+            if pen.y < pen[axis] { axis = 1 }
+            if pen.z < pen[axis] { axis = 2 }
+            var n = F3.zero
+            n[axis] = local[axis] >= 0 ? 1 : -1
+            nLocal = n
+            qLocal = local
+            qLocal[axis] = n[axis] * half[axis]
+        } else {
+            let d = local - clamped
+            let dist = length(d)
+            if dist > r + AVBDConstants.collisionMargin { return 0 }
+            nLocal = d / max(dist, 1e-9)
+            qLocal = clamped
+        }
+
+        let nW = box.positionAng.act(nLocal)        // box -> sphere
+        let qW = transform(box.positionLin, box.positionAng, qLocal)
+        let xSphere = sphere.positionLin - nW * r
+        // Manifold normal must point B -> A
+        let n = sphereIsA ? nW : -nW
+        basisOut = orthonormalBasis(n)
+        var c = ContactPoint()
+        c.featureKey = 0
+        let xA = sphereIsA ? xSphere : qW
+        let xB = sphereIsA ? qW : xSphere
+        let bodyA = sphereIsA ? sphere : box
+        let bodyB = sphereIsA ? box : sphere
+        // sphere side: world offset; box side: material (local) anchor
+        c.rA = bodyA.shape == .sphere ? xA - bodyA.positionLin
+                                      : rotate(bodyA.positionAng.conjugate, xA - bodyA.positionLin)
+        c.rB = bodyB.shape == .sphere ? xB - bodyB.positionLin
+                                      : rotate(bodyB.positionAng.conjugate, xB - bodyB.positionLin)
+        contacts.append(c)
+        return 1
+    }
+
+    /// SAT OBB-OBB collision. Returns contact count; fills basis (rows n, t1, t2).
+    static func collideBoxBox(_ bodyA: CPURigid, _ bodyB: CPURigid,
+                              _ contacts: inout [ContactPoint],
+                              _ basisOut: inout (F3, F3, F3)) -> Int {
         let boxA = OBB(bodyA)
         let boxB = OBB(bodyB)
         let delta = boxB.center - boxA.center

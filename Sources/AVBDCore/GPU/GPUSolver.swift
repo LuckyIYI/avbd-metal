@@ -46,6 +46,7 @@ public final class GPUSolver {
     var pairs: MTLBuffer
     var exclusions: MTLBuffer
     var numExclusions: UInt32 = 0
+    var spinners: [SceneSpinner] = []
 
     // Persistence map
     var mapKeyA, mapKeyB, mapVal: MTLBuffer
@@ -150,6 +151,7 @@ public final class GPUSolver {
 
         try buildPipelines()
         try upload(scene: scene)
+        self.spinners = scene.spinners
     }
 
     public enum AVBDError: Error {
@@ -219,20 +221,32 @@ public final class GPUSolver {
 
         var radii: [Float] = []
         for (i, b) in scene.bodies.enumerated() {
-            let mass = b.density > 0 ? b.size.x * b.size.y * b.size.z * b.density : 0
-            let moment = F3(
-                (b.size.y * b.size.y + b.size.z * b.size.z) / 12 * mass,
-                (b.size.x * b.size.x + b.size.z * b.size.z) / 12 * mass,
-                (b.size.x * b.size.x + b.size.y * b.size.y) / 12 * mass
-            )
-            let radius = length(b.size * 0.5)
+            let mass: Float
+            let moment: F3
+            let radius: Float
+            switch b.shape {
+            case .box:
+                mass = b.density > 0 ? b.size.x * b.size.y * b.size.z * b.density : 0
+                moment = F3(
+                    (b.size.y * b.size.y + b.size.z * b.size.z) / 12 * mass,
+                    (b.size.x * b.size.x + b.size.z * b.size.z) / 12 * mass,
+                    (b.size.x * b.size.x + b.size.y * b.size.y) / 12 * mass
+                )
+                radius = length(b.size * 0.5)
+            case .sphere:
+                let r = b.size.x / 2
+                mass = b.density > 0 ? 4.0 / 3.0 * Float.pi * r * r * r * b.density : 0
+                moment = F3(repeating: 0.4 * mass * r * r)
+                radius = r
+            }
             pl[i] = SIMD4(b.position, mass)
             pa[i] = SIMD4(b.rotation.imag, b.rotation.real)
             vl[i] = SIMD4(b.velocity, 0)
             va[i] = .zero
             pv[i] = SIMD4(b.velocity, 0)
             pr[i] = SIMD4(moment, b.friction)
-            sh[i] = SIMD4(b.size, radius)
+            // shape.w < 0 marks a sphere; |w| is the bounding radius
+            sh[i] = SIMD4(b.size, b.shape == .sphere ? -radius : radius)
             colA[i] = UInt32(i % AVBD_MAX_COLORS)  // initial guess; refined per frame
             colB[i] = colA[i]
             if mass > 0 { radii.append(radius) }
@@ -244,10 +258,11 @@ public final class GPUSolver {
         let threshold = medianRadius * 4
         var hashed: [UInt32] = []
         var globals: [UInt32] = []
+        // Only oversized bodies go to the brute-forced global list; normal
+        // sized statics live in the spatial hash like everything else.
         for (i, b) in scene.bodies.enumerated() {
-            let radius = length(b.size * 0.5)
-            let isStatic = !(b.density > 0)
-            if isStatic || radius > threshold {
+            let radius = b.shape == .sphere ? b.size.x / 2 : length(b.size * 0.5)
+            if radius > threshold {
                 globals.append(UInt32(i))
             } else {
                 hashed.append(UInt32(i))
@@ -256,7 +271,7 @@ public final class GPUSolver {
         // Cell size: 2x the max hashed radius (sphere-bound broadphase)
         var maxHashedRadius: Float = 0.5
         for i in hashed {
-            maxHashedRadius = max(maxHashedRadius, sh[Int(i)].w)
+            maxHashedRadius = max(maxHashedRadius, abs(sh[Int(i)].w))
         }
 
         hashedIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashed.count))
@@ -337,6 +352,9 @@ public final class GPUSolver {
         params.gridHashSize = UInt32(gridHashSize)
         params.numHashed = UInt32(hashed.count)
         params.numGlobals = UInt32(globals.count)
+        // Anti-tunneling: cap speed so nothing crosses the thinnest static
+        // geometry in one frame. Heuristic: a couple of cells per step.
+        params.maxSpeed = max(30, 1.5 * params.cellSize / settings.dt * 0.5)
     }
 
     // MARK: - Dispatch helpers
@@ -412,6 +430,7 @@ public final class GPUSolver {
     public func step() {
         syncParams()
         frameIndex += 1
+        advanceSpinners()
 
         // ---- Command buffer 1: collision + warm start + adjacency + coloring
         guard let cmd1 = queue.makeCommandBuffer() else { return }
@@ -682,6 +701,19 @@ public final class GPUSolver {
         swap(&manifolds, &prevManifolds)
     }
 
+    /// Advance kinematic spinners (static bodies with prescribed rotation).
+    private func advanceSpinners() {
+        guard !spinners.isEmpty else { return }
+        let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        for sp in spinners {
+            let q = Quat(real: pa[sp.body].w,
+                         imag: F3(pa[sp.body].x, pa[sp.body].y, pa[sp.body].z))
+            let dq = Quat(angle: sp.omega * settings.dt, axis: sp.axis)
+            let nq = (dq * q).normalized
+            pa[sp.body] = SIMD4(nq.imag, nq.real)
+        }
+    }
+
     // MARK: - State access (shared memory)
 
     public func bodyPosition(_ i: Int) -> F3 {
@@ -747,6 +779,20 @@ public final class GPUSolver {
             let inv = q.conjugate
             let o = inv.act(origin - F3(pl[i].x, pl[i].y, pl[i].z))
             let d = inv.act(dir)
+            if sh[i].w < 0 {
+                // sphere: |o + t d| = r
+                let r = -sh[i].w
+                let b = dot(o, d)
+                let cc = dot(o, o) - r * r
+                let disc = b * b - cc
+                if disc < 0 { continue }
+                let t = -b - disc.squareRoot()
+                if t >= 0 && t < bestT {
+                    bestT = t
+                    best = (i, o + d * t)
+                }
+                continue
+            }
             let half = F3(sh[i].x, sh[i].y, sh[i].z) * 0.5
             var tEnter: Float = 0
             var tExit = Float.infinity

@@ -93,7 +93,7 @@ kernel void bp_gen_pairs(
     if (gid >= P.numHashed) return;
     uint a = hashedIdx[gid];
     float3 pa = posLin[a].xyz;
-    float ra = shape[a].w;
+    float ra = fabs(shape[a].w);
     bool aDyn = posLin[a].w > 0.0f;
 
     // 27 neighbor cells
@@ -107,7 +107,7 @@ kernel void bp_gen_pairs(
             uint b = cellBodies[k];
             if (b <= a) continue;   // each pair once
             if (!aDyn && posLin[b].w <= 0.0f) continue;
-            float rb = shape[b].w;
+            float rb = fabs(shape[b].w);
             float3 dp = pa - posLin[b].xyz;
             float r = ra + rb;
             if (dot(dp, dp) > r * r) continue;
@@ -121,7 +121,7 @@ kernel void bp_gen_pairs(
     for (uint g = 0; g < P.numGlobals; g++) {
         uint b = globalIdx[g];
         if (!aDyn && posLin[b].w <= 0.0f) continue;
-        float rb = shape[b].w;
+        float rb = fabs(shape[b].w);
         float3 dp = pa - posLin[b].xyz;
         float r = ra + rb;
         if (dot(dp, dp) > r * r) continue;
@@ -147,14 +147,14 @@ kernel void bp_gen_global_pairs(
     if (gid >= P.numGlobals) return;
     uint a = globalIdx[gid];
     float3 pa = posLin[a].xyz;
-    float ra = shape[a].w;
+    float ra = fabs(shape[a].w);
     // Skip static-static early (neither can move)
     bool aDyn = posLin[a].w > 0.0f;
 
     for (uint g = gid + 1; g < P.numGlobals; g++) {
         uint b = globalIdx[g];
         if (!aDyn && posLin[b].w <= 0.0f) continue;
-        float rb = shape[b].w;
+        float rb = fabs(shape[b].w);
         float3 dp = pa - posLin[b].xyz;
         float r = ra + rb;
         if (dot(dp, dp) > r * r) continue;

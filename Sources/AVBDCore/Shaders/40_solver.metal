@@ -456,6 +456,8 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
     uint a = m.header.x, b = m.header.y;
     uint n = m.header.z;
     bool isA = self == a;
+    bool sphA = (m.header.w & 2u) != 0;
+    bool sphB = (m.header.w & 4u) != 0;
 
     float3 dqALin = posLin[a].xyz - initLin[a].xyz;
     float3 dqAAng = q_sub(posAng[a], initAng[a]);
@@ -467,8 +469,8 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
     float3 t2 = cross(nrm, t1);
 
     for (uint i = 0; i < n; i++) {
-        float3 rAW = q_rotate(posAng[a], m.contacts[i].rA.xyz);
-        float3 rBW = q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate(posAng[b], m.contacts[i].rB.xyz);
 
         float3 C; float fs, bnd;
         float3 F = contactForceC(m, i, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW, alpha, C, fs, bnd);
@@ -556,7 +558,7 @@ kernel void primal_solve(
     // we cap the step instead, which only engages in violent transients
     // (e.g. a long free-falling chain snapping taut) where a single Newton
     // step on the rotational nonlinearity would overshoot and inject energy.
-    float maxLin = shape[body].w;           // body bounding radius per iteration
+    float maxLin = fabs(shape[body].w);     // body bounding radius per iteration
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
     float ang2 = dot(dxAng, dxAng);
@@ -645,14 +647,16 @@ kernel void dual_manifolds(
     if (n == 0) return;
 
     uint a = m.header.x, b = m.header.y;
+    bool sphA = (m.header.w & 2u) != 0;
+    bool sphB = (m.header.w & 4u) != 0;
     float3 dqALin = posLin[a].xyz - initLin[a].xyz;
     float3 dqAAng = q_sub(posAng[a], initAng[a]);
     float3 dqBLin = posLin[b].xyz - initLin[b].xyz;
     float3 dqBAng = q_sub(posAng[b], initAng[b]);
 
     for (uint i = 0; i < n; i++) {
-        float3 rAW = q_rotate(posAng[a], m.contacts[i].rA.xyz);
-        float3 rBW = q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate(posAng[b], m.contacts[i].rB.xyz);
 
         float3 C; float fs, bnd;
         float3 F = contactForceC(m, i, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW, P.alpha, C, fs, bnd);
@@ -664,8 +668,8 @@ kernel void dual_manifolds(
             pen.x = min(pen.x + P.betaLin * fabs(C.x), PENALTY_MAX);
         }
         if (fs <= bnd) {
-            pen.y = min(pen.y + P.betaLin * fabs(C.y), PENALTY_MAX);
-            pen.z = min(pen.z + P.betaLin * fabs(C.z), PENALTY_MAX);
+            pen.y = min(pen.y + P.betaLin * fabs(C.y), PENALTY_MAX_T);
+            pen.z = min(pen.z + P.betaLin * fabs(C.z), PENALTY_MAX_T);
             m.contacts[i].rB.w = length(C.yz) < STICK_THRESH ? 1.0f : 0.0f;
         }
         m.contacts[i].penalty = float4(pen, 0);
@@ -690,7 +694,11 @@ kernel void finalize_velocities(
     if (gid >= P.numBodies) return;
     prevVelLin[gid] = velLin[gid];
     if (posLin[gid].w > 0.0f) {
-        velLin[gid] = float4((posLin[gid].xyz - initLin[gid].xyz) / P.dt, 0);
+        float3 v = (posLin[gid].xyz - initLin[gid].xyz) / P.dt;
+        // Safety clamp: prevents tunneling of violently flung bodies
+        float s2 = dot(v, v);
+        if (s2 > P.maxSpeed * P.maxSpeed) v *= P.maxSpeed * rsqrt(s2);
+        velLin[gid] = float4(v, 0);
         velAng[gid] = float4(q_sub(posAng[gid], initAng[gid]) / P.dt, 0);
     }
 }
@@ -730,9 +738,13 @@ kernel void diag_error(
         device const ManifoldGPU& m = manifolds[gid - P.numJoints];
         uint n = m.header.z;
         uint a = m.header.x, b = m.header.y;
+        bool sphA = (m.header.w & 2u) != 0;
+        bool sphB = (m.header.w & 4u) != 0;
         for (uint i = 0; i < n; i++) {
-            float3 xA = xform(posLin[a].xyz, posAng[a], m.contacts[i].rA.xyz);
-            float3 xB = xform(posLin[b].xyz, posAng[b], m.contacts[i].rB.xyz);
+            float3 xA = sphA ? posLin[a].xyz + m.contacts[i].rA.xyz
+                             : xform(posLin[a].xyz, posAng[a], m.contacts[i].rA.xyz);
+            float3 xB = sphB ? posLin[b].xyz + m.contacts[i].rB.xyz
+                             : xform(posLin[b].xyz, posAng[b], m.contacts[i].rB.xyz);
             float pen = dot(m.basisN.xyz, xA - xB) + COLLISION_MARGIN;
             err = max(err, max(0.0f, -pen));
         }

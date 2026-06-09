@@ -8,6 +8,7 @@ import simd
 public enum AVBDConstants {
     public static let penaltyMin: Float = 1.0
     public static let penaltyMax: Float = 1.0e10
+    public static let penaltyMaxTangent: Float = 1.0e6
     public static let collisionMargin: Float = 0.01
     public static let stickThresh: Float = 0.00001
 }
@@ -27,11 +28,13 @@ public final class CPURigid {
     public var moment: F3
     public var friction: Float
     public var radius: Float
+    public var shape: BodyShape
     public var forces: [CPUForce] = []
     public let index: Int
 
     public init(index: Int, size: F3, density: Float, friction: Float, position: F3,
-                rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero) {
+                rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
+                shape: BodyShape = .box) {
         self.index = index
         self.size = size
         self.friction = friction
@@ -39,14 +42,24 @@ public final class CPURigid {
         self.positionAng = rotation
         self.velocityLin = velocity
         self.prevVelocityLin = velocity
-        let m = size.x * size.y * size.z * density
-        self.mass = density > 0 ? m : 0
-        self.moment = F3(
-            (size.y * size.y + size.z * size.z) / 12 * m,
-            (size.x * size.x + size.z * size.z) / 12 * m,
-            (size.x * size.x + size.y * size.y) / 12 * m
-        )
-        self.radius = length(size * 0.5)
+        self.shape = shape
+        switch shape {
+        case .box:
+            let m = size.x * size.y * size.z * density
+            self.mass = density > 0 ? m : 0
+            self.moment = F3(
+                (size.y * size.y + size.z * size.z) / 12 * m,
+                (size.x * size.x + size.z * size.z) / 12 * m,
+                (size.x * size.x + size.y * size.y) / 12 * m
+            )
+            self.radius = length(size * 0.5)
+        case .sphere:
+            let r = size.x / 2
+            let m = density > 0 ? 4.0 / 3.0 * Float.pi * r * r * r * density : 0
+            self.mass = m
+            self.moment = F3(repeating: 0.4 * m * r * r)
+            self.radius = r
+        }
     }
 
     public func constrainedTo(_ other: CPURigid) -> Bool {
@@ -89,14 +102,16 @@ public final class CPUSolver {
 
     public private(set) var bodies: [CPURigid] = []
     public var forces: [CPUForce] = []
+    public var spinners: [SceneSpinner] = []
 
     public init() {}
 
     @discardableResult
     public func addBody(size: F3, density: Float, friction: Float, position: F3,
-                        rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero) -> CPURigid {
+                        rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
+                        shape: BodyShape = .box) -> CPURigid {
         let b = CPURigid(index: bodies.count, size: size, density: density, friction: friction,
-                         position: position, rotation: rotation, velocity: velocity)
+                         position: position, rotation: rotation, velocity: velocity, shape: shape)
         bodies.append(b)
         return b
     }
@@ -123,6 +138,12 @@ public final class CPUSolver {
     }
 
     public func step() {
+        for sp in spinners {
+            let body = bodies[sp.body]
+            let dq = Quat(angle: sp.omega * dt, axis: sp.axis)
+            body.positionAng = (dq * body.positionAng).normalized
+        }
+
         // Broadphase: O(n^2) sphere check (reference path; GPU uses spatial hash)
         for i in 0..<bodies.count {
             for j in (i + 1)..<bodies.count {

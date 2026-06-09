@@ -10,6 +10,10 @@ using namespace metal;
 
 #define PENALTY_MIN 1.0f
 #define PENALTY_MAX 1.0e10f
+// Tangential (friction) penalty cap: friction force is cone-bounded, so
+// stiffness beyond ~1e6 adds nothing physically but destroys the fp32
+// conditioning of the rolling mode (linear/angular cancellation).
+#define PENALTY_MAX_T 1.0e6f
 #define COLLISION_MARGIN 0.01f
 #define STICK_THRESH 0.00001f
 #define MAX_COLORS 64
@@ -211,6 +215,8 @@ struct SimParams {
     uint gridHashSize;      // pow2
     uint numHashed;         // bodies in spatial hash
     uint numGlobals;        // oversized/static bodies tested brute-force
+    float maxSpeed;         // velocity clamp (anti-tunneling safety)
+    float pad0, pad1, pad2;
 };
 
 struct JointGPU {

@@ -54,5 +54,6 @@ kernel void build_instances(
     float3 c = pl.w > 0.0f
         ? palette(colorMode == 1 ? colors[gid] : gid)
         : float3(0.45f, 0.45f, 0.48f);
-    out[gid].color = float4(c, 1);
+    // color.w: 0 = box, 1 = sphere (renderer splits draw passes on this)
+    out[gid].color = float4(c, shape[gid].w < 0.0f ? 1.0f : 0.0f);
 }
