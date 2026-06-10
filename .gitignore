@@ -4,3 +4,5 @@ refs/
 node_modules/
 metal-refs/
 prototype2d/
+.xcbuild/
+runs/
