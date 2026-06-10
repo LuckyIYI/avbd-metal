@@ -65,7 +65,7 @@ public final class PushTEnv: RoboticsEnv {
         s.settings.iterations = 16
         s.settings.betaLin = 20000
         s.settings.lambdaMax = 600
-        Demos.addGround(&s, friction: 0.9)
+        Demos.addGround(&s, friction: 1.3)
 
         var rng = SplitMix64(seed: seed)
         let side = Int(ceil(Double(numEnvs).squareRoot()))
@@ -123,10 +123,10 @@ public final class PushTEnv: RoboticsEnv {
         let byaw = (rng.nextFloat() - 0.5) * 2 * .pi
         let q = Quat(angle: byaw, axis: F3(0, 0, 1))
         let blockC = c + F3(bx, by, 0)
-        let bar = s.addBody(size: F3(1.0, 0.25, 0.18), density: 3.0, friction: 0.8,
+        let bar = s.addBody(size: F3(1.0, 0.25, 0.18), density: 3.0, friction: 1.1,
                             position: blockC + q.act(F3(0, 0.125, 0)) + F3(0, 0, 0.09),
                             rotation: q)
-        let stem = s.addBody(size: F3(0.25, 0.65, 0.18), density: 3.0, friction: 0.8,
+        let stem = s.addBody(size: F3(0.25, 0.65, 0.18), density: 3.0, friction: 1.1,
                              position: blockC + q.act(F3(0, -0.325, 0)) + F3(0, 0, 0.09),
                              rotation: q)
         let mid = (s.bodies[bar].position + s.bodies[stem].position) * 0.5
@@ -152,13 +152,13 @@ public final class PushTEnv: RoboticsEnv {
 
     public var spec: EnvSpec {
         EnvSpec(numEnvs: numEnvs, actionDim: 2,
-                actionLow: [-2.6, -2.6], actionHigh: [2.6, 2.6],
+                actionLow: [-3.0, -3.0], actionHigh: [3.0, 3.0],
                 obsShape: [obsRes, obsRes, 3])
     }
 
     // ---- control ----
     public func setTipTarget(_ env: Int, _ p: SIMD2<Float>) {
-        let pc = simd_clamp(p, SIMD2(-2.7, -2.7), SIMD2(2.7, 2.7))
+        let pc = simd_clamp(p, SIMD2(-3.02, -3.02), SIMD2(3.02, 3.02))
         let world = refs[env].center + F3(pc.x, pc.y, Self.tipHeight)
         solver.setJointWorldAnchor(refs[env].dragJoint, point: world)
     }
@@ -265,7 +265,7 @@ public final class PushTEnv: RoboticsEnv {
             let push = min(0.08, d * 0.30)
             target = bp + dir * push
         }
-        return simd_clamp(target, SIMD2(-2.6, -2.6), SIMD2(2.6, 2.6))
+        return simd_clamp(target, SIMD2(-3.0, -3.0), SIMD2(3.0, 3.0))
     }
 
     public func success(_ env: Int, posTol: Float = 0.25, yawTol: Float = .pi) -> Bool {

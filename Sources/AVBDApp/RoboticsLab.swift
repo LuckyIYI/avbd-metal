@@ -112,10 +112,13 @@ final class RoboticsModel: ObservableObject, RenderableModel {
         }
         tipTarget = SIMD2(1.4, 0)
         episodes += 1
+        settleGrace = 12        // let contacts settle before control engages
         lastStepTime = CACurrentMediaTime()
     }
 
 
+
+    private var settleGrace = 0
 
     func tickIfRunning() {
         guard running, let env, let solver else { return }
@@ -123,27 +126,37 @@ final class RoboticsModel: ObservableObject, RenderableModel {
         let elapsed = min(now - lastStepTime, 0.1)
         lastStepTime = now
         stepAccumulator += elapsed
-        let dt = Double(solver.settings.dt)
-        var steps = 0
-        while stepAccumulator >= dt && steps < 4 {
+        // one CONTROL tick = 4 physics substeps, all through env.step()'s
+        // rate-limited actuator path — same cadence the training pipeline
+        // uses; driving the actuator per-substep made the oracle whip
+        let controlDt = Double(solver.settings.dt) * 4
+        var ticks = 0
+        while stepAccumulator >= controlDt && ticks < 2 {
             env.tipSpeedLimit = Float(speedLimit)
-            switch mode {
-            case .manual:
-                env.setTipTarget(0, tipTarget)
-            case .oracle:
-                env.setTipTarget(0, env.oracleAction(0))
-            case .policy:
-                if let act = policyAction?(env) {
-                    env.setTipTarget(0, act * 2)
-                } else {
-                    policyStatus = "policy unavailable: build with `make app-ml` and train a model first"
+            if settleGrace > 0 {
+                settleGrace -= 1
+                env.step(actions: [env.tipPos(0)], substeps: 4)
+            } else {
+                let action: SIMD2<Float>
+                switch mode {
+                case .manual:
+                    action = tipTarget
+                case .oracle:
+                    action = env.oracleAction(0)
+                case .policy:
+                    if let act = policyAction?(env) {
+                        action = act * 2
+                    } else {
+                        policyStatus = "policy unavailable: build with `make app-ml` and train a model first"
+                        action = env.tipPos(0)
+                    }
                 }
+                env.step(actions: [action], substeps: 4)
             }
-            solver.step()
-            stepAccumulator -= dt
-            steps += 1
+            stepAccumulator -= controlDt
+            ticks += 1
         }
-        if steps == 4 { stepAccumulator = 0 }
+        if ticks == 2 { stepAccumulator = 0 }
 
         frame += 1
         if frame % 8 == 0 { refreshDebug() }
