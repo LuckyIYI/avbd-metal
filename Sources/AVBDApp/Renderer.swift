@@ -1,5 +1,15 @@
 import Metal
 import MetalKit
+
+/// What the renderer needs from a driving model — lets the same renderer
+/// serve both the physics playground and the Robotics Lab.
+@MainActor
+protocol RenderableModel {
+    var solver: GPUSolver? { get }
+    var colorByGraphColor: Bool { get }
+    var statsText: String { get }
+    func tickIfRunning()
+}
 import AVBDCore
 import simd
 
@@ -544,7 +554,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     let device: MTLDevice
     let queue: MTLCommandQueue
-    weak var model: SimulationModel?
+    weak var model: (AnyObject & RenderableModel)?
 
     var boxP, sphereP, torusP, capsuleP: MTLRenderPipelineState!
     var boxPre, spherePre, torusPre, capsulePre, floorPreP: MTLRenderPipelineState!
@@ -565,7 +575,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     var viewportSize = SIMD2<Float>(1, 1)
     private var framesDrawn = 0
 
-    init(device: MTLDevice, model: SimulationModel) throws {
+    init(device: MTLDevice, model: AnyObject & RenderableModel) throws {
         self.device = device
         self.queue = device.makeCommandQueue()!
         self.model = model

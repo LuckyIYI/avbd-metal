@@ -9,6 +9,69 @@ import AVBDCore
 // End-to-end Push-T pipeline: parallel data collection from the AVBD
 // simulator, LeWM training, and CEM planning in latent space.
 
+/// Stateful LeWM + CEM planner for interactive use (the Robotics Lab).
+public final class LeWMPlanner {
+    let model: LeWorldModel
+    var mu: MLXArray
+    var zGoal: MLXArray? = nil
+    var goalEnvSeedStamp: Int = -1
+    let horizon = 6
+    let candidates = 128
+    let elites = 16
+    let cemIters = 2
+
+    public init(modelPath: String) throws {
+        model = LeWorldModel()
+        let weights = try loadArrays(url: URL(fileURLWithPath: "\(modelPath)/lewm.safetensors"))
+        try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(model)
+        mu = MLXArray.zeros([horizon, 2])
+    }
+
+    /// One MPC step from the env's current pixels. Returns action in [-1,1].
+    public func action(_ env: PushTEnv) -> SIMD2<Float>? {
+        let res = env.obsRes
+        if zGoal == nil || goalEnvSeedStamp != env.refs[0].tip {
+            // render the goal embedding once per episode
+            let r = env.refs[0]
+            let savedBar = (env.solver.bodyPosition(r.blockBar), env.solver.bodyRotation(r.blockBar))
+            let savedStem = (env.solver.bodyPosition(r.blockStem), env.solver.bodyRotation(r.blockStem))
+            let gq = Quat(angle: r.goalYaw, axis: F3(0, 0, 1))
+            let gc = r.center + F3(r.goalPos.x, r.goalPos.y, 0)
+            env.solver.setBodyPose(r.blockBar, position: gc + gq.act(F3(0, 0.125, 0)) + F3(0, 0, 0.09), rotation: gq)
+            env.solver.setBodyPose(r.blockStem, position: gc + gq.act(F3(0, -0.325, 0)) + F3(0, 0, 0.09), rotation: gq)
+            zGoal = model.encoder(PushTPipeline.obsArray(env, res))
+            eval(zGoal!)
+            env.solver.setBodyPose(r.blockBar, position: savedBar.0, rotation: savedBar.1)
+            env.solver.setBodyPose(r.blockStem, position: savedStem.0, rotation: savedStem.1)
+            goalEnvSeedStamp = r.tip
+        }
+        let z0 = model.encoder(PushTPipeline.obsArray(env, res))
+        var sigma = MLXArray.ones([horizon, 2]) * 0.5
+        for _ in 0..<cemIters {
+            let noise = MLXRandom.normal([candidates, horizon, 2])
+            let acts = clip(mu.expandedDimensions(axis: 0) + noise * sigma.expandedDimensions(axis: 0),
+                            min: -1, max: 1)
+            var z = tiled(z0, repetitions: [candidates, 1])
+            var cost = MLXArray.zeros([candidates])
+            for h in 0..<horizon {
+                z = model.predictor(z, acts[0..., h, 0...])
+                cost = cost + mean((z - zGoal!).square(), axis: -1)
+                    * (h == horizon - 1 ? 2.0 : 0.3)
+            }
+            eval(cost)
+            let order = argSort(cost)
+            let elite = acts[order[0..<elites], 0..., 0...]
+            mu = mean(elite, axis: 0)
+            sigma = sqrt(variance(elite, axis: 0)) + 0.02
+        }
+        eval(mu)
+        let a = SIMD2(mu[0, 0].item(Float.self), mu[0, 1].item(Float.self))
+        mu = concatenated([mu[1..., 0...], MLXArray.zeros([1, 2])], axis: 0)
+        return a
+    }
+}
+
 public enum PushTPipeline {
 
     // ---------------- data collection ----------------
@@ -210,34 +273,8 @@ public enum PushTPipeline {
             let env = try PushTEnv(numEnvs: 1, seed: seed &+ UInt64(ep) * 7)
             let r = env.refs[0]
             for _ in 0..<controlSteps {
-                let (bp, _) = env.blockPose(0)
-                let tp = env.tipPos(0)
-                let toGoal = r.goalPos - bp
-                if length(toGoal) < 0.05 { break }
-                let dir = normalize(toGoal)
-                let behind = bp - dir * 0.42
-                // two-phase: reach the behind-point (detouring only if the
-                // straight path clips the block), then push through
-                let target: SIMD2<Float>
-                if length(tp - behind) > 0.20 {
-                    let toB = behind - tp
-                    let t = simd_clamp(dot(bp - tp, toB) / max(dot(toB, toB), 1e-6), 0, 1)
-                    let closest = tp + toB * t
-                    if length(closest - bp) < 0.33 {
-                        let side = SIMD2(-dir.y, dir.x)
-                        let sgn: Float = dot(tp - bp, side) >= 0 ? 1 : -1
-                        target = bp + side * (sgn * 0.8)
-                    } else {
-                        target = behind
-                    }
-                } else {
-                    let push = min(0.10, length(toGoal) * 0.4)
-                    target = bp + dir * push
-                }
-                env.step(actions: [simd_clamp(target, SIMD2(-1.95, -1.95), SIMD2(1.95, 1.95))])
-                if episodes == 1 {
-                    print("  tip (\(String(format: "%.2f", tp.x)), \(String(format: "%.2f", tp.y))) block (\(String(format: "%.2f", bp.x)), \(String(format: "%.2f", bp.y))) target (\(String(format: "%.2f", target.x)), \(String(format: "%.2f", target.y)))")
-                }
+                let target = env.oracleAction(0)
+                env.step(actions: [target])
                 if env.success(0) { break }
             }
             let ok = env.success(0)
@@ -248,7 +285,7 @@ public enum PushTPipeline {
         print("oracle success rate: \(successes)/\(episodes)")
     }
 
-    static func obsArray(_ env: PushTEnv, _ res: Int) -> MLXArray {
+    public static func obsArray(_ env: PushTEnv, _ res: Int) -> MLXArray {
         let obs = env.observations()
         let arr = MLXArray([UInt8](obs))
         return arr.reshaped([1, res, res, 3]).asType(.float32) / 255.0

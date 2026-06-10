@@ -34,7 +34,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "AVBDApp",
-            dependencies: ["AVBDCore"]
+            dependencies: ["AVBDCore", "AVBDLearn"]
         ),
         .testTarget(
             name: "AVBDTests",

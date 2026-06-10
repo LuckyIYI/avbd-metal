@@ -276,6 +276,35 @@ public final class PushTEnv {
         return UnsafeBufferPointer(start: ptr, count: numEnvs * obsRes * obsRes * 3)
     }
 
+    /// Greedy geometric push controller (shared by CLI eval and the
+    /// Robotics Lab): returns the next tip target for env `e`.
+    public func oracleAction(_ e: Int) -> SIMD2<Float> {
+        let r = refs[e]
+        let (bp, _) = blockPose(e)
+        let tp = tipPos(e)
+        let toGoal = r.goalPos - bp
+        if length(toGoal) < 0.05 { return tp }
+        let dir = normalize(toGoal)
+        let behind = bp - dir * 0.42
+        let target: SIMD2<Float>
+        if length(tp - behind) > 0.20 {
+            let toB = behind - tp
+            let t = simd_clamp(dot(bp - tp, toB) / max(dot(toB, toB), 1e-6), 0, 1)
+            let closest = tp + toB * t
+            if length(closest - bp) < 0.33 {
+                let side = SIMD2(-dir.y, dir.x)
+                let sgn: Float = dot(tp - bp, side) >= 0 ? 1 : -1
+                target = bp + side * (sgn * 0.8)
+            } else {
+                target = behind
+            }
+        } else {
+            let push = min(0.10, length(toGoal) * 0.4)
+            target = bp + dir * push
+        }
+        return simd_clamp(target, SIMD2(-1.95, -1.95), SIMD2(1.95, 1.95))
+    }
+
     public func success(_ env: Int, posTol: Float = 0.22, yawTol: Float = 0.4) -> Bool {
         let (p, yaw) = blockPose(env)
         let r = refs[env]

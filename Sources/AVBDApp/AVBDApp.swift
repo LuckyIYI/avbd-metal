@@ -26,14 +26,20 @@ struct AVBDApp: App {
 
 struct ContentView: View {
     @ObservedObject var model: SimulationModel
+    @StateObject var robotics = RoboticsModel()
 
     var body: some View {
-        HSplitView {
-            MetalView(model: model)
-                .frame(minWidth: 600)
-            controls
-                .frame(width: 280)
-                .padding(12)
+        TabView {
+            HSplitView {
+                MetalView(model: model)
+                    .frame(minWidth: 600)
+                controls
+                    .frame(width: 280)
+                    .padding(12)
+            }
+            .tabItem { Text("Playground") }
+            RoboticsLabView(model: robotics)
+                .tabItem { Text("Robotics Lab") }
         }
     }
 
@@ -79,9 +85,7 @@ struct ContentView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
 
-                Text(model.demoName == "pusht"
-                     ? "Click/drag the floor: the arm chases\nyour cursor. Push the T onto the\ngreen target! ⌥-drag orbits."
-                     : "Drag bodies with the mouse.\n⌥-drag orbits, scroll zooms,\nspace/right-drag pans.")
+                Text("Drag bodies with the mouse.\n⌥-drag orbits, scroll zooms,\nspace/right-drag pans.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
@@ -176,24 +180,9 @@ final class InteractiveMTKView: MTKView {
         return r.ray(at: p, in: bounds.size)
     }
 
-    private func pushtCommand(_ event: NSEvent) -> Bool {
-        guard let c = coordinator, let env = c.model.pushtEnv,
-              let (o, d) = rayAt(event), d.z < -1e-4 else {
-            return coordinator?.model.pushtEnv != nil
-        }
-        // intersect the finger's working plane and command the tip there
-        let t = (0.42 - o.z) / d.z
-        let hit = o + d * t
-        let local = hit - env.refs[0].center
-        c.model.pushtTarget = simd_clamp(SIMD2(local.x, local.y),
-                                         SIMD2(-1.95, -1.95), SIMD2(1.95, 1.95))
-        return true
-    }
-
     override func mouseDown(with event: NSEvent) {
         guard let c = coordinator else { return }
         if event.modifierFlags.contains(.option) || spaceDown { return }
-        if pushtCommand(event) { return }
         if let (o, d) = rayAt(event) {
             c.model.beginDrag(origin: o, dir: d)
             c.dragging = true
@@ -204,8 +193,6 @@ final class InteractiveMTKView: MTKView {
         guard let c = coordinator, let r = c.renderer else { return }
         if spaceDown {
             pan(event)
-        } else if c.model.pushtEnv != nil && !event.modifierFlags.contains(.option) {
-            _ = pushtCommand(event)
         } else if event.modifierFlags.contains(.option) || !c.dragging {
             r.azimuth -= Float(event.deltaX) * 0.008
             r.elevation = min(max(r.elevation + Float(event.deltaY) * 0.008, -1.5), 1.55)

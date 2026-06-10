@@ -396,12 +396,7 @@ extension Demos {
                     let p = at + q.act(F3(lx, 0, Float(h) * brick.z + brick.z / 2))
                     let b = s.addBody(size: bsize * 0.93, density: 0.8,
                                       friction: 0.85, position: p, rotation: q)
-                    if h > 0 {
-                        for u in below where abs(s.bodies[u].position.x - p.x) < brick.x
-                            && abs(s.bodies[u].position.y - p.y) < brick.x {
-                            mortar(u, b, fracture: unbreakable ? .infinity : 60)
-                        }
-                    }
+     
                     row.append(b)
                 }
                 below = row
@@ -414,10 +409,6 @@ extension Demos {
                     let m = s.addBody(size: F3(brick.x * 0.7, brick.y, brick.z * 0.9) ,
                                       density: 0.6, friction: 0.85,
                                       position: p, rotation: q)
-                    for u in below where abs(s.bodies[u].position.x - p.x) < brick.x
-                        && abs(s.bodies[u].position.y - p.y) < brick.x {
-                        mortar(u, m, fracture: 50)
-                    }
                 }
             }
         }
