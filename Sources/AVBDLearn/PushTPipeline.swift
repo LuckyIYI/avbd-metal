@@ -282,7 +282,11 @@ public enum PushTPipeline {
             let ok = env.success(0)
             successes += ok ? 1 : 0
             let (bp, byaw) = env.blockPose(0)
-            print("oracle ep \(ep): \(ok ? "SUCCESS" : "fail") block (\(String(format: "%.2f", bp.x)), \(String(format: "%.2f", bp.y))) yaw \(String(format: "%.2f", byaw))")
+            let dGoal = length(bp - env.refs[0].goalPos)
+            let nearWall = max(abs(bp.x), abs(bp.y)) > 2.45
+            let cls = ok ? "SUCCESS" : (nearWall ? "fail[WALL-PINNED]"
+                : dGoal < 0.45 ? "fail[NEAR-MISS]" : "fail[OPEN-FLOOR]")
+            print("oracle ep \(ep): \(cls) dist \(String(format: "%.2f", dGoal)) block (\(String(format: "%.2f", bp.x)), \(String(format: "%.2f", bp.y))) yaw \(String(format: "%.2f", byaw))")
         }
         print("oracle success rate: \(successes)/\(episodes)")
     }

@@ -78,12 +78,21 @@ public final class PushTEnv: RoboticsEnv {
                 let r = refs[e]
                 let gq = Quat(angle: r.goalYaw, axis: F3(0, 0, 1))
                 let gc = c + F3(r.goalPos.x, r.goalPos.y, 0)
-                _ = s.addBody(size: F3(1.0, 0.25, 0.1), density: 0, friction: 0.9,
-                              position: gc + gq.act(F3(0, 0.125, 0)) + F3(0, 0, -0.038),
-                              rotation: gq)
-                _ = s.addBody(size: F3(0.25, 0.65, 0.1), density: 0, friction: 0.9,
-                              position: gc + gq.act(F3(0, -0.325, 0)) + F3(0, 0, -0.038),
-                              rotation: gq)
+                // VISUAL-ONLY target: the marker plates must never collide
+                // with the block (or the block can't slide onto its own
+                // goal!) — excluded pairwise below
+                let m1 = s.addBody(size: F3(1.0, 0.25, 0.1), density: 0, friction: 0.9,
+                                   position: gc + gq.act(F3(0, 0.125, 0)) + F3(0, 0, -0.038),
+                                   rotation: gq)
+                let m2 = s.addBody(size: F3(0.25, 0.65, 0.1), density: 0, friction: 0.9,
+                                   position: gc + gq.act(F3(0, -0.325, 0)) + F3(0, 0, -0.038),
+                                   rotation: gq)
+                for m in [m1, m2] {
+                    for b in [r.blockBar, r.blockStem, r.tip] {
+                        s.addJoint(SceneJoint(bodyA: m, bodyB: b, rA: .zero, rB: .zero,
+                                              stiffnessLin: 0, stiffnessAng: 0))
+                    }
+                }
                 // cosmetic gantry frame
                 for sx in [Float(-1), 1] {
                     _ = s.addBody(size: F3(0.14, 0.14, 2.6), density: 0, friction: 0.3,
