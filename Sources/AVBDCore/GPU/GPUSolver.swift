@@ -570,6 +570,14 @@ public final class GPUSolver {
         va[i] = .zero
     }
 
+    /// Robotics: move a world-anchored joint's target point (Cartesian
+    /// position actuator — the joint's bounded force does the rest).
+    public func setJointWorldAnchor(_ jointIndex: Int, point: F3) {
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        jp[jointIndex].rA = SIMD4(point, jp[jointIndex].rA.w)
+    }
+
     /// Robotics: set a motor joint's target angle at runtime.
     public func setMotorTarget(_ jointIndex: Int, angle: Float) {
         sync()

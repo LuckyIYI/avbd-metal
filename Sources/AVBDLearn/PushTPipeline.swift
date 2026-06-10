@@ -92,19 +92,19 @@ public enum PushTPipeline {
         var actData = Data()
         obsData.reserveCapacity(numEnvs * steps * res * res * 3)
         for t in 0..<steps {
-            // waypoints that PUSH THROUGH the block (world models need to
-            // see block motion, which random walks barely produce)
-            for e in 0..<numEnvs where rng.nextFloat() < 0.15 {
+            // behavior mix (DAgger-style): mostly the goal-directed oracle
+            // (the world model must see SOLVING behavior), some exploration
+            for e in 0..<numEnvs {
                 let roll = rng.nextFloat()
-                if roll < 0.7 {
-                    let (bp, _) = env.blockPose(e)
-                    let tp = env.tipPos(e)
-                    let through = bp + normalize(bp - tp + SIMD2(1e-4, 0))
-                        * (0.55 + rng.nextFloat() * 0.5)
-                    let jitter = SIMD2<Float>(rng.nextFloat() - 0.5, rng.nextFloat() - 0.5) * 0.5
-                    targets[e] = simd_clamp(through + jitter, SIMD2(-1.9, -1.9), SIMD2(1.9, 1.9))
-                } else {
-                    targets[e] = SIMD2(rng.nextFloat() * 3.6 - 1.8, rng.nextFloat() * 3.6 - 1.8)
+                if roll < 0.65 {
+                    targets[e] = env.oracleAction(e)
+                } else if roll < 0.72 {
+                    targets[e] = SIMD2(rng.nextFloat() * 4.4 - 2.2,
+                                       rng.nextFloat() * 4.4 - 2.2)
+                } // else: keep previous waypoint
+                // episode hygiene: solved envs get a fresh layout
+                if env.success(e) {
+                    env.reset(e, seed: rng.next())
                 }
             }
             let obs = env.observations()
@@ -128,6 +128,7 @@ public enum PushTPipeline {
 
     // ---------------- training ----------------
     public static func train(dataPath: String, iters: Int, batch: Int = 256,
+                             latent: Int = 128, lr: Float = 3e-4,
                              lambda: Float = 0.5, modelPath: String) throws {
         let meta = try String(contentsOfFile: "\(dataPath)/meta.txt", encoding: .utf8)
             .split(separator: " ").map { Int($0)! }
@@ -137,8 +138,8 @@ public enum PushTPipeline {
         let frameBytes = res * res * 3
         print("dataset: \(numEnvs) envs x \(steps) steps")
 
-        let model = LeWorldModel()
-        let opt = AdamW(learningRate: 3e-4)
+        let model = LeWorldModel(latent: latent)
+        let opt = AdamW(learningRate: lr)
 
         let K = 3   // rollout depth
         func minibatch() -> [MLXArray] {
@@ -189,8 +190,9 @@ public enum PushTPipeline {
     }
 
     // ---------------- planning (latent MPC with CEM) ----------------
-    public static func solve(modelPath: String, episodes: Int, seed: UInt64 = 11) throws {
-        let model = LeWorldModel()
+    public static func solve(modelPath: String, episodes: Int, seed: UInt64 = 11,
+                             latent: Int = 128) throws {
+        let model = LeWorldModel(latent: latent)
         let weights = try loadArrays(url: URL(fileURLWithPath: "\(modelPath)/lewm.safetensors"))
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(model)
@@ -266,8 +268,8 @@ public enum PushTPipeline {
     /// Oracle: greedy geometric push controller (no learning). Establishes
     /// whether the task is feasible within the episode budget — separates
     /// environment/control issues from world-model issues.
-    public static func oracle(episodes: Int, seed: UInt64 = 11,
-                              controlSteps: Int = 160) throws {
+    public static func oracle(episodes: Int = 10, seed: UInt64 = 11,
+                              controlSteps: Int = 300) throws {
         var successes = 0
         for ep in 0..<episodes {
             let env = try PushTEnv(numEnvs: 1, seed: seed &+ UInt64(ep) * 7)

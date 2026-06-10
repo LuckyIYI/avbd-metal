@@ -3,6 +3,67 @@ import MetalKit
 import AVBDCore
 import simd
 
+/// Spawns and supervises the ML pipeline CLI (collect/train/solve) so the
+/// Lab can launch massively parallel sim + training runs with live logs.
+@MainActor
+final class TrainingRunner: ObservableObject {
+    @Published var log = "ready — pipeline runs use the xcodebuild CLI (make ml-tool)"
+    @Published var running = false
+    @Published var envs: Double = 128
+    @Published var steps: Double = 900
+    @Published var iters: Double = 3000
+    @Published var batch: Double = 256
+    @Published var latent: Double = 128
+    @Published var lr: Double = 3e-4
+    @Published var episodes: Double = 10
+    private var proc: Process?
+
+    var binary: String {
+        let x = ".xcbuild/Build/Products/Release/avbd"
+        return FileManager.default.fileExists(atPath: x) ? x : ".build/release/avbd"
+    }
+
+    func launch(_ phase: String) {
+        guard !running else { return }
+        var args: [String] = [phase]
+        switch phase {
+        case "collect":
+            args += ["--envs", "\(Int(envs))", "--frames", "\(Int(steps))"]
+        case "train-wm":
+            args += ["--frames", "\(Int(iters))", "--batch", "\(Int(batch))",
+                     "--latent", "\(Int(latent))", "--lr", "\(lr)"]
+        case "solve-pusht", "oracle-pusht":
+            args += ["--episodes", "\(Int(episodes))", "--latent", "\(Int(latent))"]
+        default: break
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: binary)
+        p.arguments = args
+        p.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let str = String(data: h.availableData, encoding: .utf8) ?? ""
+            guard !str.isEmpty else { return }
+            Task { @MainActor in
+                self?.log = String((self!.log + str).suffix(2400))
+            }
+        }
+        p.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                self?.running = false
+                self?.log += "\n[\(phase) exited \(proc.terminationStatus)]"
+            }
+        }
+        log = "$ avbd \(args.joined(separator: " "))\n"
+        do { try p.run(); running = true; proc = p }
+        catch { log += "launch failed: \(error.localizedDescription)" }
+    }
+
+    func stop() { proc?.terminate() }
+}
+
 // The Robotics Lab: a dedicated view for manipulation experiments and for
 // debugging learned world models — separate from the physics playground.
 
@@ -16,8 +77,8 @@ final class RoboticsModel: ObservableObject, RenderableModel {
 
     @Published var mode: DriveMode = .manual
     @Published var running = true
-    @Published var motorTorque: Double = 260 { didSet { applyMotorSettings() } }
-    @Published var speedLimit: Double = 0.05
+    @Published var pusherForceNote = "force-limited Cartesian actuator"
+    @Published var speedLimit: Double = 0.16
     @Published var topView = false { didSet { applyCamera?() } }
     var applyCamera: (() -> Void)? = nil
     @Published var statsText = ""
@@ -48,19 +109,13 @@ final class RoboticsModel: ObservableObject, RenderableModel {
         } else {
             env = try? PushTEnv(numEnvs: 1, seed: UInt64.random(in: 1...999_999),
                                 goalMarkers: true)
-            applyMotorSettings()
         }
         tipTarget = SIMD2(1.4, 0)
         episodes += 1
         lastStepTime = CACurrentMediaTime()
     }
 
-    func applyMotorSettings() {
-        guard let env else { return }
-        for j in env.refs[0].motorJoints {
-            env.solver.setMotorTorque(j, torque: Float(motorTorque))
-        }
-    }
+
 
     func tickIfRunning() {
         guard running, let env, let solver else { return }
@@ -71,7 +126,7 @@ final class RoboticsModel: ObservableObject, RenderableModel {
         let dt = Double(solver.settings.dt)
         var steps = 0
         while stepAccumulator >= dt && steps < 4 {
-            env.jointSpeedLimit = Float(speedLimit)
+            env.tipSpeedLimit = Float(speedLimit)
             switch mode {
             case .manual:
                 env.setTipTarget(0, tipTarget)
@@ -102,15 +157,14 @@ final class RoboticsModel: ObservableObject, RenderableModel {
         guard let env else { return }
         let (bp, byaw) = env.blockPose(0)
         let r = env.refs[0]
-        let js = r.motorJoints
-        let angles = js.map { env.solver.motorAngle($0) }
+        let tp = env.tipPos(0)
         statsText = String(format: """
             block (%.2f, %.2f)  yaw %.2f
             goal  (%.2f, %.2f)  dist %.2f
-            joints  yaw %.2f  shoulder %.2f  elbow %.2f
+            tool head (%.2f, %.2f)
             episodes %d   solved %d
             """, bp.x, bp.y, byaw, r.goalPos.x, r.goalPos.y,
-            length(bp - r.goalPos), angles[0], angles[1], angles[2],
+            length(bp - r.goalPos), tp.x, tp.y,
             episodes, solves)
 
         // what the model sees: the actual observation tensor as an image
@@ -132,6 +186,7 @@ final class RoboticsModel: ObservableObject, RenderableModel {
 
 struct RoboticsLabView: View {
     @ObservedObject var model: RoboticsModel
+    @StateObject var trainer = TrainingRunner()
 
     var body: some View {
         HSplitView {
@@ -162,9 +217,10 @@ struct RoboticsLabView: View {
                 }
 
                 GroupBox("Robot settings") {
-                    slider("Motor torque", $model.motorTorque, 60...900)
-                    slider("Joint speed limit", $model.speedLimit, 0.01...0.15)
+                    slider("Tool-head speed", $model.speedLimit, 0.04...0.4)
                     Toggle("Top-down camera", isOn: $model.topView)
+                    Text(model.pusherForceNote).font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
 
                 if model.mode == .policy {
@@ -189,7 +245,36 @@ struct RoboticsLabView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
 
-                Text("Manual mode: click/drag the floor —\nthe arm chases your cursor.")
+                GroupBox("Training (parallel sim + MLX)") {
+                    slider("Parallel envs", $trainer.envs, 16...1024)
+                    slider("Collect steps", $trainer.steps, 100...4000)
+                    slider("Train iters", $trainer.iters, 200...20000)
+                    slider("Batch size", $trainer.batch, 32...1024)
+                    slider("Latent dim", $trainer.latent, 32...512)
+                    slider("Eval episodes", $trainer.episodes, 5...50)
+                    HStack {
+                        Button("Collect") { trainer.launch("collect") }
+                        Button("Train") { trainer.launch("train-wm") }
+                        Button("Evaluate") { trainer.launch("solve-pusht") }
+                    }.disabled(trainer.running)
+                    HStack {
+                        Button("Oracle eval") { trainer.launch("oracle-pusht") }
+                            .disabled(trainer.running)
+                        if trainer.running {
+                            Button("Stop") { trainer.stop() }
+                        }
+                    }
+                    ScrollView {
+                        Text(trainer.log)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 130)
+                    .background(.black.opacity(0.85))
+                    .foregroundStyle(.green)
+                }
+
+                Text("Manual mode: click/drag the floor —\nthe tool head chases your cursor.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer()

@@ -22,6 +22,12 @@ struct Options {
     var json = false
     var watch: Int? = nil
     var statsEvery = 60
+    var envs = 64
+    var batch = 256
+    var latent = 128
+    var lr: Float = 3e-4
+    var lambda: Float = 0.5
+    var episodes = 10
 }
 
 func parseOptions(_ args: [String]) -> Options {
@@ -37,6 +43,12 @@ func parseOptions(_ args: [String]) -> Options {
         case "--json": o.json = true
         case "--watch": i += 1; o.watch = Int(args[i])
         case "--stats-every": i += 1; o.statsEvery = Int(args[i]) ?? 60
+        case "--envs": i += 1; o.envs = Int(args[i]) ?? 64
+        case "--batch": i += 1; o.batch = Int(args[i]) ?? 256
+        case "--latent": i += 1; o.latent = Int(args[i]) ?? 128
+        case "--lr": i += 1; o.lr = Float(args[i]) ?? 3e-4
+        case "--lambda": i += 1; o.lambda = Float(args[i]) ?? 0.5
+        case "--episodes": i += 1; o.episodes = Int(args[i]) ?? 10
         default: break
         }
         i += 1
@@ -130,21 +142,23 @@ case "run":
 
 case "collect":
     let o = parseOptions(Array(args.dropFirst(1)))
-    try PushTPipeline.collect(envs: o.scale > 1 ? o.scale : 64,
-                              steps: o.frames, path: "runs/pusht/data")
+    try PushTPipeline.collect(envs: o.envs, steps: o.frames,
+                              path: "runs/pusht/data")
 
 case "train-wm":
     let o = parseOptions(Array(args.dropFirst(1)))
     try PushTPipeline.train(dataPath: "runs/pusht/data", iters: o.frames,
-                            modelPath: "runs/pusht/model")
+                            batch: o.batch, latent: o.latent, lr: o.lr,
+                            lambda: o.lambda, modelPath: "runs/pusht/model")
 
 case "oracle-pusht":
     let o = parseOptions(Array(args.dropFirst(1)))
-    try PushTPipeline.oracle(episodes: max(1, o.frames / 100))
+    try PushTPipeline.oracle(episodes: o.episodes)
 
 case "solve-pusht":
     let o = parseOptions(Array(args.dropFirst(1)))
-    try PushTPipeline.solve(modelPath: "runs/pusht/model", episodes: max(1, o.frames / 100))
+    try PushTPipeline.solve(modelPath: "runs/pusht/model", episodes: o.episodes,
+                            latent: o.latent)
 
 case "bench":
     guard args.count > 1 else { fail("usage: avbd bench <demo>") }
