@@ -200,8 +200,12 @@ public final class GPUSolver {
 
     /// Concatenates the bundled .metal sources (filename order) and compiles.
     static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
-        let urls = (Bundle.module.urls(forResourcesWithExtension: "metal", subdirectory: nil) ?? [])
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        var urls = (Bundle.module.urls(forResourcesWithExtension: "metal", subdirectory: nil) ?? [])
+        if urls.isEmpty {   // .copy resource rule keeps the Shaders/ subdir
+            urls = Bundle.module.urls(forResourcesWithExtension: "metal",
+                                      subdirectory: "Shaders") ?? []
+        }
+        urls.sort { $0.lastPathComponent < $1.lastPathComponent }
         precondition(!urls.isEmpty, "no .metal resources found in bundle")
         var source = ""
         for url in urls {
@@ -347,6 +351,9 @@ public final class GPUSolver {
             g.restRel = SIMD4(rel.imag, rel.real)
             if let axis = j.hingeAxis {
                 g.hingeAxis = SIMD4(axis, 1)
+                if j.motorTorque > 0 {
+                    g.motor = SIMD4(j.motorTarget, j.motorTorque, 0, 400)
+                }
             }
             // soft (finite) joints ARE their stiffness from frame one; only
             // hard (AL) constraints ramp from PENALTY_MIN per the paper
@@ -522,6 +529,69 @@ public final class GPUSolver {
     // work, and CPU access to shared buffers syncs lazily ----
     private var inflight: [MTLCommandBuffer] = []
     private let statsLock = NSLock()
+
+    /// Robotics: render parallel Push-T pixel observations via the
+    /// analytic top-down compute kernel. envTable: PushTEnvGPU records.
+    public func renderPushTObs(envTable: MTLBuffer, numEnvs: Int,
+                               out: MTLBuffer, res: Int) {
+        guard let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else { return }
+        let p = ps("pusht_obs")
+        enc.setComputePipelineState(p)
+        enc.setBuffer(posLin, offset: 0, index: 0)
+        enc.setBuffer(posAng, offset: 0, index: 1)
+        enc.setBuffer(envTable, offset: 0, index: 2)
+        enc.setBuffer(out, offset: 0, index: 3)
+        var r32 = UInt32(res)
+        enc.setBytes(&r32, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: (res + 7) / 8, height: (res + 7) / 8,
+                                         depth: numEnvs),
+                                 threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+    }
+
+    public var metalDevice: MTLDevice { device }
+
+    /// Robotics: teleport a body (resets its velocity).
+    public func setBodyPose(_ i: Int, position: F3, rotation: Quat) {
+        sync()
+        let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let vl = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let va = velAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        pl[i] = SIMD4(position, pl[i].w)
+        pa[i] = SIMD4(rotation.imag, rotation.real)
+        vl[i] = .zero
+        va[i] = .zero
+    }
+
+    /// Robotics: set a motor joint's target angle at runtime.
+    public func setMotorTarget(_ jointIndex: Int, angle: Float) {
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        jp[jointIndex].motor.x = angle
+    }
+
+    /// Robotics: read a motor joint's current twist angle.
+    public func motorAngle(_ jointIndex: Int) -> Float {
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        let j = jp[jointIndex]
+        let a = j.header.x
+        let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let qB = Quat(real: pa[Int(j.header.y)].w,
+                      imag: F3(pa[Int(j.header.y)].x, pa[Int(j.header.y)].y, pa[Int(j.header.y)].z))
+        let qA: Quat = a == 0xFFFFFFFF
+            ? Quat(real: 1, imag: .zero)
+            : Quat(real: pa[Int(a)].w, imag: F3(pa[Int(a)].x, pa[Int(a)].y, pa[Int(a)].z))
+        let rest = Quat(real: j.restRel.w, imag: F3(j.restRel.x, j.restRel.y, j.restRel.z))
+        var r = (qA * rest).inverse * qB
+        if r.real < 0 { r = Quat(real: -r.real, imag: -r.imag) }
+        let axis = F3(j.hingeAxis.x, j.hingeAxis.y, j.hingeAxis.z)
+        return 2 * atan2(dot(r.imag, axis), r.real)
+    }
 
     /// Debug: worst joints by linear lambda, with endpoints.
     public func debugWorstJoints(_ n: Int = 5) -> [(Int, Int, Float)] {

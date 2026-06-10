@@ -348,6 +348,10 @@ kernel void warmstart_joints(
         c0a = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
     }
     j.C0Ang = float4(c0a, j.C0Ang.w);
+    if (j.motor.w > 0.0f) {
+        j.motor.z *= P.alpha * P.gamma;                       // lambda
+        j.motor.w = clamp(j.motor.w * P.gamma, 50.0f, 2.0e5f); // penalty
+    }
 
     float warm = P.alpha * P.gamma;
     float stiffLin = j.rA.w;
@@ -475,6 +479,26 @@ inline void stampJoint(device const JointGPU& j, uint self,
             float3 F = penAng * C + j.lambdaAng.xyz;
             acc.lhsAng = m3_add(acc.lhsAng, m3_diag(penAng * (s * s)));
             acc.rhsAng += F * (-s);
+
+            // MOTOR (servo): drive the twist angle about the hinge axis
+            // toward the target, with bounded lambda = torque limit (the
+            // paper's bounded-multiplier machinery, like friction)
+            if (j.motor.w > 0.0f) {
+                float4 r = q_mul(q_inv(q_mul(qA, j.restRel)), posAng[b]);
+                if (r.w < 0.0f) r = -r;
+                float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
+                float Cm = twist - j.motor.x;
+                // wrap to [-pi, pi]
+                Cm = Cm - 6.2831853f * floor((Cm + 3.14159265f) / 6.2831853f);
+                float Fm = clamp(j.motor.w * Cm + j.motor.z,
+                                 -j.motor.y, j.motor.y);
+                // jacobian of twist wrt world rotation of self: +-axis
+                float sm = (self == a) ? -1.0f : 1.0f;
+                float3 axW = aB;
+                acc.lhsAng = m3_add(acc.lhsAng,
+                                    m3_scale(m3_outer(axW, axW), j.motor.w));
+                acc.rhsAng += axW * (Fm * sm);
+            }
         } else {
             if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
             float3 F = penAng * C + j.lambdaAng.xyz;
@@ -811,6 +835,17 @@ static inline void dual_joint_one(
             float3 aB = q_rotate(posAng[b], j.hingeAxis.xyz);
             float3 aA = q_rotate(q_mul(qA, j.restRel), j.hingeAxis.xyz);
             C = cross(aA, aB) * torqueArm;
+            if (j.motor.w > 0.0f) {
+                float4 qAr = a == WORLD_BODY ? j.restRel : q_mul(posAng[a], j.restRel);
+                float4 r = q_mul(q_inv(qAr), posAng[b]);
+                if (r.w < 0.0f) r = -r;
+                float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
+                float Cm = twist - j.motor.x;
+                Cm = Cm - 6.2831853f * floor((Cm + 3.14159265f) / 6.2831853f);
+                j.motor.z = clamp(j.motor.w * Cm + j.motor.z,
+                                  -j.motor.y, j.motor.y);
+                j.motor.w = min(j.motor.w + fabs(Cm) * P.betaAng, 2.0e5f);
+            }
         } else {
             C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
         }

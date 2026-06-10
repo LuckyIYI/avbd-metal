@@ -54,11 +54,16 @@ public struct SceneJoint {
     /// Hinge axis in body B's LOCAL frame. When set, the angular constraint
     /// leaves rotation about this axis free (1-DOF revolute joint).
     public var hingeAxis: F3?
+    /// Servo motor on the hinge: drive the twist angle toward motorTarget
+    /// with |lambda| bounded by motorTorque. 0 torque = no motor.
+    public var motorTarget: Float
+    public var motorTorque: Float
 
     public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
                 stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
                 fracture: Float = .infinity, fractureLinear: Bool = false,
-                hingeAxis: F3? = nil) {
+                hingeAxis: F3? = nil, motorTarget: Float = 0,
+                motorTorque: Float = 0) {
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
@@ -68,6 +73,8 @@ public struct SceneJoint {
         self.fracture = fracture
         self.fractureLinear = fractureLinear
         self.hingeAxis = hingeAxis.map(normalize)
+        self.motorTarget = motorTarget
+        self.motorTorque = motorTorque
     }
 }
 

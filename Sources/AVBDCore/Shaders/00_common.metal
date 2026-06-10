@@ -242,6 +242,8 @@ struct JointGPU {
     float4 penaltyAng;
     float4 restRel;     // rest relative rotation qA^-1 * qB (quaternion)
     float4 hingeAxis;   // xyz: axis in B local; w != 0 -> 1-DOF hinge
+    float4 motor;       // x = target angle, y = max |lambda| (torque limit),
+                        // z = lambda, w = penalty (0 = no motor)
 };
 
 struct SpringGPU {

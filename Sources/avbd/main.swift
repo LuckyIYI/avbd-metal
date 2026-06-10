@@ -1,4 +1,5 @@
 import AVBDCore
+import AVBDLearn
 import Metal
 import Foundation
 import simd
@@ -126,6 +127,24 @@ case "run":
                          scene.bodies.count, ms, err, solver.lastNumPairs))
         }
     }
+
+case "collect":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.collect(envs: o.scale > 1 ? o.scale : 64,
+                              steps: o.frames, path: "runs/pusht/data")
+
+case "train-wm":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.train(dataPath: "runs/pusht/data", iters: o.frames,
+                            modelPath: "runs/pusht/model")
+
+case "oracle-pusht":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.oracle(episodes: max(1, o.frames / 100))
+
+case "solve-pusht":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.solve(modelPath: "runs/pusht/model", episodes: max(1, o.frames / 100))
 
 case "bench":
     guard args.count > 1 else { fail("usage: avbd bench <demo>") }

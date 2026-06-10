@@ -38,3 +38,8 @@ bench: build
 
 clean:
 	rm -rf .build AVBD.app
+
+# ML tool: MLX requires xcodebuild (SwiftPM cannot compile its Metal shaders)
+ml-tool:
+	xcodebuild -scheme avbd -configuration Release -destination 'platform=macOS' -derivedDataPath .xcbuild build -quiet
+	@echo "binary: .xcbuild/Build/Products/Release/avbd"
