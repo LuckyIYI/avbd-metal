@@ -67,5 +67,8 @@ kernel void build_instances(
         ? palette(colorMode == 1 ? colors[gid] : gid)
         : float3(0.58f, 0.60f, 0.66f);
     out[gid].color = float4(c, float(st));
-    out[gid].params = float4(shape[gid].x, shape[gid].y, 0, 0);
+    // params.z = bounding radius (blob shadow size), w = shadow strength
+    // (statics cast none — they're scenery)
+    out[gid].params = float4(shape[gid].x, shape[gid].y, shape[gid].w,
+                             pl.w > 0.0f ? 1.0f : 0.0f);
 }

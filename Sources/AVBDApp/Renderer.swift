@@ -84,27 +84,62 @@ vertex VOut box_vertex(uint vid [[vertex_id]],
     return o;
 }
 
+// ---------- PBR (metallic-roughness, GGX + Schlick) + ACES ----------
+inline float3 acesTonemap(float3 x) {
+    // Narkowicz ACES approximation
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+#define HORIZON_COL float3(0.93, 0.94, 0.96)
+#define SUN_COL (float3(1.0, 0.96, 0.88) * 3.2)
+#define SKY_IRR float3(0.62, 0.66, 0.72)
+#define GND_IRR float3(0.52, 0.50, 0.47)
+
+inline float3 pbrShade(float3 albedo, float3 n, float3 world, float3 eye, float3 L,
+                       float rough, float metal)
+{
+    float3 V = normalize(eye - world);
+    float3 H = normalize(L + V);
+    float NdL = max(dot(n, L), 0.0);
+    float NdV = max(dot(n, V), 1e-4);
+    float NdH = max(dot(n, H), 0.0);
+    float HdV = max(dot(H, V), 0.0);
+
+    float a2 = rough * rough; a2 *= a2;
+    float dDen = NdH * NdH * (a2 - 1.0) + 1.0;
+    float D = a2 / (M_PI_F * dDen * dDen);
+    float k = (rough + 1.0); k = k * k / 8.0;
+    float G = (NdV / (NdV * (1.0 - k) + k)) * (NdL / (NdL * (1.0 - k) + k));
+    float3 F0 = mix(float3(0.04), albedo, metal);
+    float3 F = F0 + (1.0 - F0) * pow(1.0 - HdV, 5.0);
+    float3 spec = D * G * F / max(4.0 * NdV * NdL, 1e-4);
+    float3 kd = (1.0 - F) * (1.0 - metal);
+
+    float3 direct = (kd * albedo / M_PI_F + spec) * SUN_COL * NdL;
+
+    // hemispheric irradiance + fresnel-weighted sky reflection
+    float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
+    float3 ambient = kd * albedo * irr;
+    float3 R = reflect(-V, n);
+    float3 skyRef = mix(HORIZON_COL * 0.9, float3(0.72, 0.78, 0.88),
+                        clamp(R.z, 0.0, 1.0));
+    float fr = pow(1.0 - NdV, 5.0);
+    ambient += skyRef * (F0 + (1.0 - F0) * fr) * (1.0 - rough * 0.7) * 0.5;
+
+    return direct + ambient;
+}
+
 fragment float4 box_fragment(VOut in [[stage_in]],
                              constant Uniforms& U [[buffer(1)]])
 {
     float3 n = normalize(in.normal);
-    float3 L = -U.lightDir.xyz;
-    float ndl = max(dot(n, L), 0.0);
-    // hemispheric ambient: sky from above, ground bounce from below
-    float3 skyA = float3(0.46, 0.54, 0.66);
-    float3 gndA = float3(0.42, 0.40, 0.38);
-    float3 ambient = mix(gndA, skyA, n.z * 0.5 + 0.5);
-    // soft specular
-    float3 V = normalize(U.eye.xyz - in.world);
-    float3 H = normalize(L + V);
-    float spec = pow(max(dot(n, H), 0.0), 32.0) * 0.25;
-    float3 lit = in.color.rgb * (ambient + float3(0.95, 0.92, 0.85) * ndl)
-               + float3(spec);
-    // horizon fog matching the sky
+    float3 lit = pbrShade(in.color.rgb, n, in.world, U.eye.xyz,
+                          -U.lightDir.xyz, 0.42, 0.0);
     float d = length(in.world - U.eye.xyz);
-    float fog = 1.0 - exp(-d * 0.012);
-    lit = mix(lit, float3(0.87, 0.93, 1.00), fog * fog);
-    return float4(lit, 1.0);
+    float fog = 1.0 - exp(-d * 0.010);
+    lit = mix(lit, HORIZON_COL, fog * fog);
+    return float4(acesTonemap(lit), 1.0);
 }
 
 // Analytic UV sphere: STACKS x SLICES quads, 6 verts each
@@ -237,6 +272,48 @@ vertex VOut capsule_vertex(uint vid [[vertex_id]],
     return o;
 }
 
+// --- Soft blob shadows: one ground quad per body, radial falloff ---
+struct ShadowOut {
+    float4 position [[position]];
+    float2 local;
+    float strength;
+};
+
+vertex ShadowOut shadow_vertex(uint vid [[vertex_id]],
+                               uint iid [[instance_id]],
+                               device const RenderInstance* instances [[buffer(0)]],
+                               constant Uniforms& U [[buffer(1)]])
+{
+    RenderInstance inst = instances[iid];
+    float r = inst.params.z;               // bounding radius
+    float3 c = inst.model[3].xyz;
+    float h = max(c.z - r * 0.5, 0.0);     // height above ground
+    float strength = inst.params.w * clamp(1.0 - h / 7.0, 0.0, 1.0) * 0.42;
+    float size = r * (1.25 + h * 0.08);
+    float2 corners[6] = {
+        float2(-1,-1), float2(1,-1), float2(1,1),
+        float2(-1,-1), float2(1,1), float2(-1,1)
+    };
+    float2 l = corners[vid];
+    ShadowOut o;
+    if (strength < 0.01 || r <= 0.0) {
+        o.position = float4(0, 0, -2, 1);
+        o.local = float2(0); o.strength = 0;
+        return o;
+    }
+    float3 p = float3(c.xy + l * size, 0.012);
+    o.position = U.viewProj * float4(p, 1);
+    o.local = l;
+    o.strength = strength;
+    return o;
+}
+
+fragment float4 shadow_fragment(ShadowOut in [[stage_in]]) {
+    float d = length(in.local);
+    float a = in.strength * smoothstep(1.0, 0.25, d);
+    return float4(0.18, 0.20, 0.26, a);
+}
+
 // --- Sky: fullscreen gradient (drawn first, no depth) ---
 struct SkyOut { float4 position [[position]]; float2 uv; };
 
@@ -250,13 +327,13 @@ vertex SkyOut sky_vertex(uint vid [[vertex_id]]) {
 
 fragment float4 sky_fragment(SkyOut in [[stage_in]]) {
     float t = clamp(in.uv.y * 0.5 + 0.5, 0.0, 1.0);
-    float3 horizon = float3(0.87, 0.93, 1.00);
-    float3 zenith  = float3(0.42, 0.65, 0.95);
-    float3 c = mix(horizon, zenith, pow(t, 1.4));
-    // subtle sun glow upper-left
+    float3 horizon = float3(0.93, 0.94, 0.96);
+    float3 zenith  = float3(0.72, 0.78, 0.87);
+    float3 c = mix(horizon, zenith, pow(t, 1.6));
+    // soft warm sun glow upper-left
     float2 sunDir = float2(-0.45, 0.55);
-    float glow = exp(-3.5 * distance(in.uv, sunDir));
-    c += float3(0.25, 0.22, 0.16) * glow;
+    float glow = exp(-3.0 * distance(in.uv, sunDir));
+    c += float3(0.20, 0.17, 0.11) * glow;
     return float4(c, 1);
 }
 
@@ -269,7 +346,7 @@ struct FloorOut {
 vertex FloorOut floor_vertex(uint vid [[vertex_id]],
                              constant Uniforms& U [[buffer(1)]])
 {
-    const float E = 1200.0;
+    const float E = 4000.0;
     float2 corners[6] = {
         float2(-E,-E), float2(E,-E), float2(E,E),
         float2(-E,-E), float2(E,E), float2(-E,E)
@@ -287,20 +364,27 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     // anti-aliased checker via filter-width smoothing
     float2 c = in.world.xy / 2.0;
     float2 fw = fwidth(c);
-    // integrate the square wave over the pixel footprint (per axis)
     float2 fc = fract(c);
     float2 aa = clamp((fc - 0.5) / max(fw, 0.0001) + 0.5, 0.0, 1.0)
               - clamp(fc / max(fw, 0.0001) - 0.0, 0.0, 1.0) + 1.0;
-    float2 sq = abs(aa - 1.0);    // ~ square wave with AA
+    float2 sq = abs(aa - 1.0);
     float checker = abs(sq.x - sq.y);
-    float3 tileA = float3(0.88, 0.89, 0.92);
-    float3 tileB = float3(0.69, 0.74, 0.82);
+    float3 tileA = float3(0.90, 0.905, 0.92);
+    float3 tileB = float3(0.72, 0.755, 0.80);
+    float3 avg = (tileA + tileB) * 0.5;
     float3 col = mix(tileA, tileB, checker);
-    // soft warm tint near center, cool far
+
+    // distance "blur": melt the checker toward its average long before the
+    // fog finishes — reads as depth-of-field fuzziness, kills the moire
     float d = length(in.world.xy - U.eye.xy);
-    float3 horizon = float3(0.87, 0.93, 1.00);
-    float fog = 1.0 - exp(-d * 0.012);
-    col = mix(col, horizon, fog * fog);
+    float blur = 1.0 - exp(-d * 0.022);
+    col = mix(col, avg, blur);
+
+    // full fog into the horizon color: by ~350m the floor IS the sky, so
+    // there is no visible horizon step anywhere
+    float3 horizon = float3(0.93, 0.94, 0.96);
+    float fog = 1.0 - exp(-d * 0.011);
+    col = mix(col, horizon, smoothstep(0.0, 1.0, fog));
     return float4(col, 1);
 }
 """
@@ -320,9 +404,11 @@ final class Renderer: NSObject, MTKViewDelegate {
     var capsulePipeline: MTLRenderPipelineState!
     var skyPipeline: MTLRenderPipelineState!
     var floorPipeline: MTLRenderPipelineState!
+    var shadowPipeline: MTLRenderPipelineState!
     static let sampleCount = 4
     var depthState: MTLDepthStencilState!
     var noDepthState: MTLDepthStencilState!
+    var noWriteDepthState: MTLDepthStencilState!
     var instances: MTLBuffer?
 
     weak var model: SimulationModel?
@@ -358,6 +444,17 @@ final class Renderer: NSObject, MTKViewDelegate {
         skyPipeline = try pipe("sky_vertex", "sky_fragment")
         floorPipeline = try pipe("floor_vertex", "floor_fragment")
 
+        let shd = MTLRenderPipelineDescriptor()
+        shd.vertexFunction = lib.makeFunction(name: "shadow_vertex")
+        shd.fragmentFunction = lib.makeFunction(name: "shadow_fragment")
+        shd.colorAttachments[0].pixelFormat = .bgra8Unorm
+        shd.colorAttachments[0].isBlendingEnabled = true
+        shd.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        shd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        shd.depthAttachmentPixelFormat = .depth32Float
+        shd.rasterSampleCount = Self.sampleCount
+        shadowPipeline = try device.makeRenderPipelineState(descriptor: shd)
+
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
@@ -367,6 +464,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         nd.depthCompareFunction = .always
         nd.isDepthWriteEnabled = false
         noDepthState = device.makeDepthStencilState(descriptor: nd)
+
+        let nw = MTLDepthStencilDescriptor()
+        nw.depthCompareFunction = .less
+        nw.isDepthWriteEnabled = false
+        noWriteDepthState = device.makeDepthStencilState(descriptor: nw)
     }
 
     var viewMatrix: simd_float4x4 {
@@ -446,6 +548,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+        // soft blob shadows (read depth, don't write)
+        enc.setDepthStencilState(noWriteDepthState)
+        enc.setRenderPipelineState(shadowPipeline)
+        enc.setVertexBuffer(instances, offset: 0, index: 0)
+        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: count)
+        enc.setDepthStencilState(depthState)
 
         enc.setRenderPipelineState(boxPipeline)
         enc.setVertexBuffer(instances, offset: 0, index: 0)
