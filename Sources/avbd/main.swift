@@ -163,7 +163,9 @@ case "oracle-pusht":
 case "solve-pusht":
     let o = parseOptions(Array(args.dropFirst(1)))
     try PushTPipeline.solve(modelPath: "runs/pusht/model", episodes: o.episodes,
-                            latent: o.latent)
+                            seed: UInt64(o.watch ?? 11),
+                            latent: o.latent, debug: args.contains("--debug"),
+                            oracleNull: args.contains("--oracle-null"))
 
 case "bench":
     guard args.count > 1 else { fail("usage: avbd bench <demo>") }

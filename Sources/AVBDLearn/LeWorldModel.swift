@@ -19,8 +19,8 @@ public final class LeWMEncoder: Module, UnaryLayer {
     @ModuleInfo var c4: Conv2d
     @ModuleInfo var head: Linear
 
-    public init(latent: Int = 128) {
-        c1 = Conv2d(inputChannels: 3, outputChannels: 32, kernelSize: 4, stride: 2, padding: 1)
+    public init(latent: Int = 128, inChannels: Int = 6) {
+        c1 = Conv2d(inputChannels: inChannels, outputChannels: 32, kernelSize: 4, stride: 2, padding: 1)
         c2 = Conv2d(inputChannels: 32, outputChannels: 64, kernelSize: 4, stride: 2, padding: 1)
         c3 = Conv2d(inputChannels: 64, outputChannels: 128, kernelSize: 4, stride: 2, padding: 1)
         c4 = Conv2d(inputChannels: 128, outputChannels: 128, kernelSize: 4, stride: 2, padding: 1)
@@ -62,9 +62,11 @@ public final class LeWorldModel: Module {
     @ModuleInfo public var predictor: LeWMPredictor
     public let latent: Int
 
-    public init(latent: Int = 128, actionDim: Int = 2) {
+    /// stack: number of consecutive frames per observation (velocity
+    /// observability — single frames make dynamics fundamentally ambiguous)
+    public init(latent: Int = 128, actionDim: Int = 2, stack: Int = 2) {
         self.latent = latent
-        encoder = LeWMEncoder(latent: latent)
+        encoder = LeWMEncoder(latent: latent, inChannels: 3 * stack)
         predictor = LeWMPredictor(latent: latent, actionDim: actionDim)
     }
 

@@ -303,7 +303,7 @@ public final class PushTEnv: RoboticsEnv {
                 var g = PushTEnvGPU()
                 g.ids = SIMD4(UInt32(r.tip), UInt32(r.blockBar), UInt32(r.blockStem), 0)
                 g.frame = SIMD4(r.center.x, r.center.y, r.goalPos.x, r.goalPos.y)
-                g.goal = SIMD4(r.goalYaw, 2.6, 0, 0)
+                g.goal = SIMD4(r.goalYaw, 3.25, 0, 0)   // window covers the FULL arena
                 t[e] = g
             }
         }
