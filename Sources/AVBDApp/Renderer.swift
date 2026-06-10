@@ -24,6 +24,8 @@ struct Uniforms {
     float4 screen;      // x,y = drawable size; z = px per world unit at d=1
     float4 camRight;    // xyz: world dir of screen +x
     float4 camUp;       // xyz: world dir of UV +y (down on screen)
+    float4x4 prevViewProj;
+    float4 temporal;    // x = per-frame noise offset, y = history blend
 };
 
 struct VOut {
@@ -269,8 +271,10 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     // sin-hash, so residual error is high-frequency and blurs away cleanly
     float2 px = floor(in.position.xy);
     float ign = fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
-    float ang = ign * M_PI_F;
-    float stepJit = fract(ign * 7.0);
+    // golden-ratio rotation per frame: the temporal pass averages 1/blend
+    // frames of differently-rotated estimates into a converged result
+    float ang = fract(ign + U.temporal.x) * M_PI_F;
+    float stepJit = fract(ign * 7.0 + U.temporal.x * 5.0);
 
     const int SLICES = 3;
     const int STEPS = 6;
@@ -337,6 +341,40 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     ao = pow(ao, 1.25);    // slight contrast shaping
     ao = mix(1.0, ao, farFade);
     return float4(ao, ao, ao, 1);
+}
+
+fragment float4 temporal_fragment(FSOut in [[stage_in]],
+                                  constant Uniforms& U [[buffer(1)]],
+                                  texture2d<float> rawAO [[texture(0)]],
+                                  texture2d<float> histAO [[texture(1)]],
+                                  texture2d<float> posTex [[texture(2)]],
+                                  texture2d<float> prevPosTex [[texture(3)]])
+{
+    // temporal accumulation with reprojection: find this pixel's world
+    // point in the previous frame, reuse its accumulated AO unless the
+    // surface was occluded/moved (world-position mismatch -> reject).
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge);
+    constexpr sampler lsmp(filter::linear, address::clamp_to_edge);
+    float cur = rawAO.sample(smp, in.uv).r;
+    float4 P4 = posTex.sample(smp, in.uv);
+    if (P4.w < 0.5 || U.temporal.y >= 1.0) return float4(cur);
+    float3 P = P4.xyz;
+
+    float4 clipPrev = U.prevViewProj * float4(P, 1.0);
+    if (clipPrev.w <= 0.0) return float4(cur);
+    float2 ndc = clipPrev.xy / clipPrev.w;
+    float2 uvPrev = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return float4(cur);
+
+    float4 Q4 = prevPosTex.sample(smp, uvPrev);
+    if (Q4.w < 0.5) return float4(cur);
+    // disocclusion / moving-body test: same surface point last frame?
+    float reuse = saturate(1.0 - length(Q4.xyz - P) * 14.0);
+    if (reuse <= 0.0) return float4(cur);
+
+    float hist = histAO.sample(lsmp, uvPrev).r;
+    float blend = mix(1.0, U.temporal.y, reuse);   // partial trust on the edge
+    return float4(mix(hist, cur, blend));
 }
 
 fragment float4 blur_fragment(FSOut in [[stage_in]],
@@ -492,6 +530,8 @@ struct Uniforms {
     var screen: SIMD4<Float>
     var camRight: SIMD4<Float>
     var camUp: SIMD4<Float>
+    var prevViewProj: simd_float4x4
+    var temporal: SIMD4<Float>
 }
 
 let SPHV = 12 * 18 * 6
@@ -508,10 +548,13 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     var boxP, sphereP, torusP, capsuleP: MTLRenderPipelineState!
     var boxPre, spherePre, torusPre, capsulePre, floorPreP: MTLRenderPipelineState!
-    var skyP, floorP, shadowP, ssaoP, blurP: MTLRenderPipelineState!
+    var skyP, floorP, shadowP, ssaoP, blurP, temporalP: MTLRenderPipelineState!
     var depthState, noDepthState, noWriteDepthState: MTLDepthStencilState!
 
     var posTex, normTex, aoTexA, aoTexB, preDepthTex: MTLTexture?
+    var histTex, prevPosTex: MTLTexture?
+    var prevVP: simd_float4x4?
+    var frameIdx: UInt32 = 0
     var targetSize = SIMD2<Int>(0, 0)
     var instances: MTLBuffer?
 
@@ -567,6 +610,8 @@ final class Renderer: NSObject, MTKViewDelegate {
                          colorFormats: [.r8Unorm], depth: .invalid)
         blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
+        temporalP = try pipe("fs_vertex", "temporal_fragment", samples: 1,
+                             colorFormats: [.r8Unorm], depth: .invalid)
 
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
@@ -600,6 +645,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         normTex = tex(.rgba16Float)
         aoTexA = tex(.r8Unorm)
         aoTexB = tex(.r8Unorm)
+        histTex = tex(.r8Unorm)
+        prevPosTex = tex(.rgba32Float)
+        prevVP = nil                      // resize invalidates history
         let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                                                           width: w, height: h,
                                                           mipmapped: false)
@@ -671,12 +719,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         let fwd = normalize(target - eyePosition)
         let camR = normalize(cross(fwd, F3(0, 0, 1)))
         let camU = cross(camR, fwd)          // screen +y in UV space is DOWN
-        var U = Uniforms(viewProj: projectionMatrix(aspect: aspect) * viewMatrix,
+        let vp = projectionMatrix(aspect: aspect) * viewMatrix
+        let noiseOff = Float(frameIdx % 64) * 0.6180339887
+        var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(normalize(F3(0.4, 0.25, -0.85)), 0),
                          eye: SIMD4(eyePosition, 0),
                          screen: SIMD4(viewportSize.x, viewportSize.y, pxPerUnit, 0),
                          camRight: SIMD4(camR, 0),
-                         camUp: SIMD4(-camU, 0))
+                         camUp: SIMD4(-camU, 0),
+                         prevViewProj: prevVP ?? vp,
+                         temporal: SIMD4(noiseOff.truncatingRemainder(dividingBy: 1),
+                                         prevVP == nil ? 1.0 : 0.12, 0, 0))
+        frameIdx &+= 1
 
         // ---- 1. prepass: world pos + normals ----
         let pre = MTLRenderPassDescriptor()
@@ -721,20 +775,41 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.endEncoding()
         }
 
-        // ---- 3. depth-aware blur x2 (ping-pong A -> B -> A) ----
-        for (srcT, dstT) in [(aoTexA, aoTexB), (aoTexB, aoTexA)] {
-            let blurPass = MTLRenderPassDescriptor()
-            blurPass.colorAttachments[0].texture = dstT
-            blurPass.colorAttachments[0].loadAction = .dontCare
-            blurPass.colorAttachments[0].storeAction = .store
-            if let enc = cmd.makeRenderCommandEncoder(descriptor: blurPass) {
-                enc.setRenderPipelineState(blurP)
-                enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.setFragmentTexture(srcT, index: 0)
-                enc.setFragmentTexture(posTex, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-                enc.endEncoding()
-            }
+        // ---- 3a. temporal resolve: raw A + reprojected history -> B ----
+        let tPass = MTLRenderPassDescriptor()
+        tPass.colorAttachments[0].texture = aoTexB
+        tPass.colorAttachments[0].loadAction = .dontCare
+        tPass.colorAttachments[0].storeAction = .store
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: tPass) {
+            enc.setRenderPipelineState(temporalP)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexA, index: 0)
+            enc.setFragmentTexture(histTex, index: 1)
+            enc.setFragmentTexture(posTex, index: 2)
+            enc.setFragmentTexture(prevPosTex, index: 3)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
+        }
+        // ---- 3b. save history (resolved AO + world positions) ----
+        if let blit = cmd.makeBlitCommandEncoder(),
+           let hist = histTex, let pp = prevPosTex {
+            blit.copy(from: aoTexB, to: hist)
+            blit.copy(from: posTex, to: pp)
+            blit.endEncoding()
+        }
+        prevVP = vp
+        // ---- 3c. one depth-aware spatial blur: B -> A ----
+        let blurPass = MTLRenderPassDescriptor()
+        blurPass.colorAttachments[0].texture = aoTexA
+        blurPass.colorAttachments[0].loadAction = .dontCare
+        blurPass.colorAttachments[0].storeAction = .store
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: blurPass) {
+            enc.setRenderPipelineState(blurP)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexB, index: 0)
+            enc.setFragmentTexture(posTex, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
         }
 
         // ---- 4. main pass ----
