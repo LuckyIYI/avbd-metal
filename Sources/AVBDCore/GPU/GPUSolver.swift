@@ -23,6 +23,7 @@ public final class GPUSolver {
     let numBodies: Int
     let numJoints: Int
     let numSprings: Int
+    let numTets: Int
     let maxPairs: Int
     let mapCapacity: Int
     let gridHashSize: Int
@@ -43,6 +44,7 @@ public final class GPUSolver {
     var prevManifolds: MTLBuffer   // previous frame (swapped)
 
     // Broadphase
+    var tets: MTLBuffer
     var hashedIdx, globalIdx: MTLBuffer
     var cellCount, cellStart, cellBodies: MTLBuffer
     var bodyCellSlot: MTLBuffer
@@ -90,6 +92,7 @@ public final class GPUSolver {
         self.numBodies = scene.bodies.count
         self.numJoints = scene.joints.count
         self.numSprings = scene.springs.count
+        self.numTets = scene.tets.count
         self.maxPairs = max(64, scene.bodies.count * maxPairsPerBody)
         self.mapCapacity = Self.nextPow2(2 * maxPairs)
         self.gridHashSize = Self.nextPow2(max(64, 2 * numBodies))
@@ -119,6 +122,7 @@ public final class GPUSolver {
 
         joints = try makeBuf(max(1, numJoints) * MemoryLayout<JointGPU>.stride, "joints")
         springs = try makeBuf(max(1, numSprings) * MemoryLayout<SpringGPU>.stride, "springs")
+        tets = try makeBuf(max(1, numTets) * MemoryLayout<TetGPU>.stride, "tets")
         manifolds = try makeBuf(maxPairs * MemoryLayout<ManifoldGPU>.stride, "manifolds")
         prevManifolds = try makeBuf(maxPairs * MemoryLayout<ManifoldGPU>.stride, "prevManifolds")
 
@@ -138,7 +142,7 @@ public final class GPUSolver {
         degrees = try makeBuf(nb * 4, "degrees")
         adjStart = try makeBuf(nb * 4, "adjStart")
         adjCursor = try makeBuf(nb * 4, "adjCursor")
-        adjList = try makeBuf(2 * (numJoints + numSprings + maxPairs) * 4, "adjList")
+        adjList = try makeBuf((2 * (numJoints + numSprings + maxPairs) + 4 * numTets) * 4, "adjList")
         colorsA = try makeBuf(nb * 4, "colorsA")
         colorsB = try makeBuf(nb * 4, "colorsB")
         bodySlot = try makeBuf(nb * 4, "bodySlot")
@@ -272,7 +276,7 @@ public final class GPUSolver {
             va[i] = .zero
             pv[i] = SIMD4(b.velocity, 0)
             pr[i] = SIMD4(moment, b.friction)
-            sh[i] = SIMD4(b.size, radius)
+            sh[i] = SIMD4(b.size, b.isParticle ? -radius : radius)
             switch b.shape {
             case .box: st[i] = 0
             case .sphere: st[i] = 1
@@ -343,6 +347,14 @@ public final class GPUSolver {
             if let axis = j.hingeAxis {
                 g.hingeAxis = SIMD4(axis, 1)
             }
+            // soft (finite) joints ARE their stiffness from frame one; only
+            // hard (AL) constraints ramp from PENALTY_MIN per the paper
+            if j.stiffnessLin > 0 && j.stiffnessLin.isFinite {
+                g.penaltyLin = SIMD4(repeating: min(j.stiffnessLin, 1e9))
+            }
+            if j.stiffnessAng > 0 && j.stiffnessAng.isFinite {
+                g.penaltyAng = SIMD4(repeating: min(j.stiffnessAng, 1e9))
+            }
             jp[i] = g
         }
 
@@ -350,7 +362,7 @@ public final class GPUSolver {
         let sp = springs.contents().bindMemory(to: SpringGPU.self, capacity: max(1, numSprings))
         for (i, s) in scene.springs.enumerated() {
             var g = SpringGPU()
-            g.header = SIMD4(UInt32(s.bodyA), UInt32(s.bodyB), 0, 0)
+            g.header = SIMD4(UInt32(s.bodyA), UInt32(s.bodyB), s.hard ? 1 : 0, 0)
             var rest = s.rest
             if rest < 0 {
                 let a = scene.bodies[s.bodyA], b = scene.bodies[s.bodyB]
@@ -361,6 +373,28 @@ public final class GPUSolver {
             g.rA = SIMD4(s.rA, s.stiffness)
             g.rB = SIMD4(s.rB, rest)
             sp[i] = g
+        }
+
+        let tp = tets.contents().bindMemory(to: TetGPU.self, capacity: max(1, numTets))
+        for (i, t) in scene.tets.enumerated() {
+            var g = TetGPU()
+            g.ids = SIMD4(UInt32(t.ids.0), UInt32(t.ids.1), UInt32(t.ids.2), UInt32(t.ids.3))
+            // rest matrix Dm from spawn positions; DmInv rows + material
+            let x0 = scene.bodies[t.ids.0].position
+            let d0 = scene.bodies[t.ids.1].position - x0
+            let d1 = scene.bodies[t.ids.2].position - x0
+            let d2 = scene.bodies[t.ids.3].position - x0
+            let vol = abs(dot(d0, cross(d1, d2))) / 6
+            let Dm = simd_float3x3(columns: (d0, d1, d2))
+            let DmInv = Dm.inverse
+            // rows of DmInv
+            let r0 = F3(DmInv.columns.0.x, DmInv.columns.1.x, DmInv.columns.2.x)
+            let r1 = F3(DmInv.columns.0.y, DmInv.columns.1.y, DmInv.columns.2.y)
+            let r2 = F3(DmInv.columns.0.z, DmInv.columns.1.z, DmInv.columns.2.z)
+            g.r0 = SIMD4(r0, vol)
+            g.r1 = SIMD4(r1, t.mu * vol)
+            g.r2 = SIMD4(r2, t.lambda * vol)
+            tp[i] = g
         }
 
         // Collision exclusions: sorted (min,max) pairs of jointed/springed bodies
@@ -390,6 +424,7 @@ public final class GPUSolver {
         params.numBodies = UInt32(numBodies)
         params.numJoints = UInt32(numJoints)
         params.numSprings = UInt32(numSprings)
+        params.numTets = UInt32(numTets)
         params.mapCapacity = UInt32(mapCapacity)
         params.maxManifolds = UInt32(maxPairs)
         params.maxPairs = UInt32(maxPairs)
@@ -486,6 +521,13 @@ public final class GPUSolver {
     // work, and CPU access to shared buffers syncs lazily ----
     private var inflight: [MTLCommandBuffer] = []
     private let statsLock = NSLock()
+
+    /// Debug: current body colors (post-step, canonical buffer).
+    public func debugColors() -> [Int] {
+        sync()
+        let c = colorsA.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        return (0..<numBodies).map { Int(c[$0]) }
+    }
 
     /// Wait for all committed steps (no-op when already complete).
     public func sync() {
@@ -646,11 +688,12 @@ public final class GPUSolver {
 
         stage("warmstart")
         // Warm start joints (before body prediction; uses start-of-step poses)
-        dispatch1D(enc, "warmstart_joints", numJoints) { e in
+        dispatch1D(enc, "warmstart_joints", numJoints + numSprings) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.posAng, offset: 0, index: 1)
             e.setBuffer(self.joints, offset: 0, index: 2)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 3)
+            e.setBuffer(self.springs, offset: 0, index: 4)
         }
         dispatch1D(enc, "warmstart_bodies", numBodies) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -680,6 +723,7 @@ public final class GPUSolver {
             e.setBuffer(self.degrees, offset: 0, index: 4)
             e.setBuffer(self.counters, offset: 0, index: 5)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
+            e.setBuffer(self.tets, offset: 0, index: 7)
         }
         encodeScan(enc, input: degrees, output: adjStart, count: numBodies)
         dispatch1D(enc, "adj_copy_cursor", numBodies) { e in
@@ -696,12 +740,16 @@ public final class GPUSolver {
             e.setBuffer(self.adjList, offset: 0, index: 5)
             e.setBuffer(self.counters, offset: 0, index: 6)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
+            e.setBuffer(self.tets, offset: 0, index: 8)
         }
 
         stage("coloring")
-        // Coloring (8 Jacobi rounds, ping-pong)
+        // Coloring (Jacobi rounds, ping-pong). Dense soft-body graphs
+        // (cloth: degree ~16) need more rounds to clear conflicts —
+        // uncleared conflicts mean connected bodies update simultaneously,
+        // which INJECTS energy into stiff constraint networks.
         var src = colorsA, dst = colorsB
-        for _ in 0..<8 {
+        for _ in 0..<20 {
             dispatch1D(enc, "color_iterate", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.joints, offset: 0, index: 1)
@@ -714,6 +762,7 @@ public final class GPUSolver {
                 e.setBuffer(dst, offset: 0, index: 8)
                 e.setBuffer(self.changedFlag, offset: 0, index: 9)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 10)
+                e.setBuffer(self.tets, offset: 0, index: 11)
             }
             swap(&src, &dst)
         }
@@ -769,6 +818,7 @@ public final class GPUSolver {
             enc.setBuffer(counters, offset: 0, index: 15)
             enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
             enc.setBuffer(shape, offset: 0, index: 17)
+            enc.setBuffer(tets, offset: 0, index: 18)
             let w = persistPSO.threadExecutionWidth
             let tg = min(persistPSO.maxTotalThreadsPerThreadgroup,
                          ((max(numBodies, 64) + w - 1) / w) * w)
@@ -802,6 +852,7 @@ public final class GPUSolver {
                 enc.setBuffer(colorStart, offset: 0, index: 14)
                 enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
                 enc.setBuffer(shape, offset: 0, index: 17)
+                enc.setBuffer(tets, offset: 0, index: 18)
             }
             _ = it
             for c in 0..<colorBound {
@@ -821,6 +872,7 @@ public final class GPUSolver {
                 e.setBuffer(self.manifolds, offset: 0, index: 5)
                 e.setBuffer(self.counters, offset: 0, index: 6)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
+                e.setBuffer(self.springs, offset: 0, index: 8)
             }
         }
 

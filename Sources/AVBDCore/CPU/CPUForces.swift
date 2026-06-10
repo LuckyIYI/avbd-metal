@@ -32,6 +32,12 @@ public final class CPUJoint: CPUForce {
         self.stiffnessAng = stiffnessAng
         self.fracture = fracture
         self.torqueArm = length_squared((bodyA?.size ?? .zero) + bodyB.size)
+        if stiffnessLin > 0 && stiffnessLin.isFinite {
+            penaltyLin = F3(repeating: min(stiffnessLin, 1e9))
+        }
+        if stiffnessAng > 0 && stiffnessAng.isFinite {
+            penaltyAng = F3(repeating: min(stiffnessAng, 1e9))
+        }
         let qA0 = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
         self.restRel = (qA0.inverse * bodyB.positionAng).normalized
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)
@@ -158,6 +164,10 @@ public final class CPUSpring: CPUForce {
     public var rA: F3, rB: F3
     public var rest: Float
     public var stiffness: Float
+    public var hard = false
+    var lambda: Float = 0
+    var penalty: Float = 0
+    var C0: Float = 0
 
     init(solver: CPUSolver, bodyA: CPURigid, bodyB: CPURigid, rA: F3, rB: F3,
          stiffness: Float, rest: Float) {
@@ -174,6 +184,28 @@ public final class CPUSpring: CPUForce {
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)
     }
 
+    override func initialize() -> Bool {
+        guard hard, let bodyA, let bodyB else { return true }
+        let pA = transform(bodyA.positionLin, bodyA.positionAng, rA)
+        let pB = transform(bodyB.positionLin, bodyB.positionAng, rB)
+        C0 = length(pA - pB) - rest
+        lambda *= solver.alpha * solver.gamma
+        penalty = min(simd_clamp(penalty * solver.gamma,
+                                 AVBDConstants.penaltyMin, AVBDConstants.penaltyMax),
+                      stiffness)
+        return true
+    }
+
+    override func updateDual(_ alpha: Float) {
+        guard hard, let bodyA, let bodyB else { return }
+        let pA = transform(bodyA.positionLin, bodyA.positionAng, rA)
+        let pB = transform(bodyB.positionLin, bodyB.positionAng, rB)
+        let C = length(pA - pB) - rest - C0 * alpha
+        lambda = simd_clamp(penalty * C + lambda, -solver.lambdaMax, solver.lambdaMax)
+        penalty = min(penalty + abs(C) * solver.betaLin,
+                      min(stiffness, AVBDConstants.penaltyMax))
+    }
+
     override func updatePrimal(_ body: CPURigid, _ alpha: Float,
                                _ lhsLin: inout Mat3Rows, _ lhsAng: inout Mat3Rows, _ lhsCross: inout Mat3Rows,
                                _ rhsLin: inout F3, _ rhsAng: inout F3) {
@@ -185,16 +217,23 @@ public final class CPUSpring: CPUForce {
         if dLen <= 1e-6 { return }
 
         let n = d / dLen
-        let f = stiffness * (dLen - rest)
+        var k = stiffness
+        var f: Float
+        if hard {
+            k = penalty
+            f = penalty * (dLen - rest - C0 * alpha) + lambda
+        } else {
+            f = stiffness * (dLen - rest)
+        }
 
         let isA = body === bodyA
         let rWorld = isA ? rotate(bodyA.positionAng, rA) : rotate(bodyB.positionAng, rB)
         let jLin = isA ? n : -n
         let jAng = isA ? cross(rWorld, n) : -cross(rWorld, n)
 
-        lhsLin += outerRows(jLin, jLin) * stiffness
-        lhsAng += outerRows(jAng, jAng) * stiffness
-        lhsCross += outerRows(jAng, jLin) * stiffness
+        lhsLin += outerRows(jLin, jLin) * k
+        lhsAng += outerRows(jAng, jAng) * k
+        lhsCross += outerRows(jAng, jLin) * k
         rhsLin += jLin * f
         rhsAng += jAng * f
     }

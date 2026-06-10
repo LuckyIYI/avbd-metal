@@ -29,6 +29,7 @@ public final class CPURigid {
     public var friction: Float
     public var radius: Float
     public var shape: BodyShape
+    public var isParticle = false
     public var forces: [CPUForce] = []
     public let index: Int
 
@@ -224,6 +225,12 @@ public final class CPUSolver {
                 }
 
                 var dxLin = F3.zero, dxAng = F3.zero
+                if body.isParticle {
+                    // 3-DOF particle: zero the angular system (3x3 solve)
+                    lhsAng = .identity
+                    lhsCross = Mat3Rows(.zero, .zero, .zero)
+                    rhsAng = .zero
+                }
                 solve6x6(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, &dxLin, &dxAng)
                 body.positionLin += dxLin
                 body.positionAng = quatAdd(body.positionAng, dxAng)

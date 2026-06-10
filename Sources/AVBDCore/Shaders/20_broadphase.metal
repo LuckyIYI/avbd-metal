@@ -180,10 +180,10 @@ kernel void bp_finalize_pairs(
     dispatchArgs[0] = (n + 63) / 64;
     dispatchArgs[1] = 1;
     dispatchArgs[2] = 1;
-    dispatchArgs[3] = (P.numJoints + P.numSprings + n + 63) / 64;
+    dispatchArgs[3] = (P.numJoints + P.numSprings + n + P.numTets + 63) / 64;
     dispatchArgs[4] = 1;
     dispatchArgs[5] = 1;
-    dispatchArgs[6] = (P.numJoints + n + 63) / 64;
+    dispatchArgs[6] = (P.numJoints + P.numSprings + n + 63) / 64;
     dispatchArgs[7] = 1;
     dispatchArgs[8] = 1;
 }

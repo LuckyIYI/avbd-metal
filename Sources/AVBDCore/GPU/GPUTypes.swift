@@ -26,7 +26,7 @@ public struct SimParamsGPU {
     public var maxSpeed: Float = 100
     public var lambdaMax: Float = 1.0e6
     public var iterations: UInt32 = 0
-    public var pad2: Float = 0
+    public var numTets: UInt32 = 0
 }
 
 public struct JointGPU {
@@ -43,10 +43,18 @@ public struct JointGPU {
     public var hingeAxis: SIMD4<Float> = .zero
 }
 
+public struct TetGPU {
+    public var ids: SIMD4<UInt32> = .zero
+    public var r0: SIMD4<Float> = .zero
+    public var r1: SIMD4<Float> = .zero
+    public var r2: SIMD4<Float> = .zero
+}
+
 public struct SpringGPU {
-    public var header: SIMD4<UInt32> = .zero
+    public var header: SIMD4<UInt32> = .zero  // bodyA, bodyB, hard flag
     public var rA: SIMD4<Float> = .zero       // w = stiffness
     public var rB: SIMD4<Float> = .zero       // w = rest
+    public var dual: SIMD4<Float> = .zero     // lambda, penalty, C0
 }
 
 public struct ContactGPU {

@@ -277,8 +277,8 @@ kernel void np_collide(
     device ManifoldGPU& outM = manifolds[gid];
 
     // --- shape type dispatch (0 box, 1 sphere, 2 torus, 3 capsule) ---
-    uint stA = shapeType[ia];
-    uint stB = shapeType[ib];
+    uint stA = shapeType[ia] & SHAPE_KIND_MASK;
+    uint stB = shapeType[ib] & SHAPE_KIND_MASK;
     bool sphA = stA == 1;
     bool sphB = stB == 1;
     bool torA = stA == 2;

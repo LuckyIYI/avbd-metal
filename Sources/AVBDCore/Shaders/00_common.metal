@@ -17,12 +17,16 @@ using namespace metal;
 #define COLLISION_MARGIN 0.01f
 #define STICK_THRESH 0.00001f
 #define MAX_COLORS 64
+// shapeType encoding: low nibble = shape kind, bit 4 = particle (3-DOF)
+#define SHAPE_KIND_MASK 0xFu
+#define SHAPE_PARTICLE  0x10u
 #define MAX_CONTACTS 8
 
 // Force kinds packed into adjacency entries (top 3 bits)
 #define FK_JOINT 0u
 #define FK_SPRING 1u
 #define FK_MANIFOLD 2u
+#define FK_TET 3u
 #define ADJ_KIND_SHIFT 28
 #define ADJ_INDEX_MASK 0x0FFFFFFFu
 
@@ -223,7 +227,7 @@ struct SimParams {
     float maxSpeed;         // velocity clamp (anti-tunneling safety)
     float lambdaMax;        // dual variable bound (paper Sec 4)
     uint iterations;        // solver iterations (persistent kernel path)
-    float pad1;
+    uint numTets;
 };
 
 struct JointGPU {
@@ -241,9 +245,18 @@ struct JointGPU {
 };
 
 struct SpringGPU {
-    uint4 header;       // bodyA, bodyB, pad, pad
-    float4 rA;          // w = stiffness
-    float4 rB;          // w = rest
+    uint4 header;       // bodyA, bodyB, hard flag, pad
+    float4 rA;          // w = stiffness (soft) / penalty cap (hard)
+    float4 rB;          // w = rest length
+    float4 dual;        // x = lambda, y = penalty, z = C0, w = pad
+};
+
+// Stable Neo-Hookean tetrahedron (Smith et al. 2018) on 3-DOF particles.
+struct TetGPU {
+    uint4 ids;          // 4 particle body indices
+    float4 r0;          // DmInv row 0; w = rest volume
+    float4 r1;          // DmInv row 1; w = mu  * volume
+    float4 r2;          // DmInv row 2; w = lambda * volume
 };
 
 struct ContactGPU {

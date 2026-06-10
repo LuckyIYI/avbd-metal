@@ -18,6 +18,10 @@ public struct SceneBody {
     public var rotation: Quat
     public var velocity: F3
     public var shape: BodyShape
+    /// 3-DOF particle (paper: vertices with M = mI, 3x3 blocks). Collides
+    /// as a sphere of `size.x/2` (cloth/soft thickness) but carries no
+    /// rotational state.
+    public var isParticle: Bool = false
 
     public init(size: F3, density: Float, friction: Float, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
@@ -61,6 +65,19 @@ public struct SceneJoint {
     }
 }
 
+/// Stable Neo-Hookean tetrahedron over four 3-DOF particles.
+public struct SceneTet {
+    public var ids: (Int, Int, Int, Int)
+    public var mu: Float
+    public var lambda: Float
+
+    public init(ids: (Int, Int, Int, Int), mu: Float, lambda: Float) {
+        self.ids = ids
+        self.mu = mu
+        self.lambda = lambda
+    }
+}
+
 public struct SceneSpring {
     public var bodyA: Int
     public var bodyB: Int
@@ -68,14 +85,19 @@ public struct SceneSpring {
     public var rB: F3
     public var stiffness: Float
     public var rest: Float          // < 0: use current distance
+    /// Hard rod: inextensible distance element handled with the augmented
+    /// Lagrangian dual machinery (paper's hard constraints).
+    public var hard: Bool
 
-    public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3, stiffness: Float, rest: Float = -1) {
+    public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3, stiffness: Float,
+                rest: Float = -1, hard: Bool = false) {
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
         self.rB = rB
         self.stiffness = stiffness
         self.rest = rest
+        self.hard = hard
     }
 }
 
@@ -115,6 +137,7 @@ public struct PhysicsScene {
     public var bodies: [SceneBody] = []
     public var joints: [SceneJoint] = []
     public var springs: [SceneSpring] = []
+    public var tets: [SceneTet] = []
     public var spinners: [SceneSpinner] = []
     public var settings = SimSettings()
 
@@ -168,7 +191,23 @@ public struct PhysicsScene {
                                  stiffnessLin: 0, stiffnessAng: 0))
         return joints.count - 1
     }
+    /// Add a 3-DOF particle (soft-body vertex). `mass` is explicit since
+    /// particles represent lumped vertex mass, not volume.
+    @discardableResult
+    public mutating func addParticle(radius: Float, mass: Float, friction: Float = 0.5,
+                                     position: F3, velocity: F3 = .zero) -> Int {
+        // density chosen so the sphere volume formula reproduces `mass`
+        let vol = 4.0 / 3.0 * Float.pi * radius * radius * radius
+        var b = SceneBody(size: F3(repeating: radius * 2), density: mass / vol,
+                          friction: friction, position: position,
+                          velocity: velocity, shape: .sphere)
+        b.isParticle = true
+        bodies.append(b)
+        return bodies.count - 1
+    }
+
     public mutating func addSpring(_ s: SceneSpring) { springs.append(s) }
+    public mutating func addTet(_ t: SceneTet) { tets.append(t) }
 
     /// Build a CPU reference solver from this scene.
     public func makeCPUSolver() -> CPUSolver {
@@ -183,9 +222,10 @@ public struct PhysicsScene {
         solver.lambdaMax = settings.lambdaMax
 
         for b in bodies {
-            solver.addBody(size: b.size, density: b.density, friction: b.friction,
-                           position: b.position, rotation: b.rotation, velocity: b.velocity,
-                           shape: b.shape)
+            let rb = solver.addBody(size: b.size, density: b.density, friction: b.friction,
+                                    position: b.position, rotation: b.rotation,
+                                    velocity: b.velocity, shape: b.shape)
+            rb.isParticle = b.isParticle
         }
         for j in joints {
             let cj = solver.addJoint(j.bodyA >= 0 ? solver.bodies[j.bodyA] : nil,
@@ -197,8 +237,10 @@ public struct PhysicsScene {
             cj.hingeAxis = j.hingeAxis
         }
         for s in springs {
-            solver.addSpring(solver.bodies[s.bodyA], solver.bodies[s.bodyB],
-                             rA: s.rA, rB: s.rB, stiffness: s.stiffness, rest: s.rest)
+            let sp = solver.addSpring(solver.bodies[s.bodyA], solver.bodies[s.bodyB],
+                                      rA: s.rA, rB: s.rB, stiffness: s.stiffness,
+                                      rest: s.rest)
+            sp.hard = s.hard
         }
         solver.spinners = spinners
         return solver

@@ -31,10 +31,11 @@ kernel void adj_count(
     device atomic_uint* degrees     [[buffer(4)]],
     device const atomic_uint* counters [[buffer(5)]],
     constant SimParams& P           [[buffer(6)]],
+    device const TetGPU* tets       [[buffer(7)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    uint total = P.numJoints + P.numSprings + numPairs;
+    uint total = P.numJoints + P.numSprings + numPairs + P.numTets;
     if (gid >= total) return;
 
     uint a = WORLD_BODY, b = WORLD_BODY;
@@ -46,11 +47,21 @@ kernel void adj_count(
         uint s = gid - P.numJoints;
         a = springs[s].header.x;
         b = springs[s].header.y;
-    } else {
+    } else if (gid < P.numJoints + P.numSprings + numPairs) {
         uint m = gid - P.numJoints - P.numSprings;
         if (manifolds[m].header.z == 0) return; // inactive
         a = manifolds[m].header.x;
         b = manifolds[m].header.y;
+    } else {
+        // tet: one adjacency entry per vertex
+        uint t = gid - P.numJoints - P.numSprings - numPairs;
+        uint4 ids = tets[t].ids;
+        for (uint k = 0; k < 4; k++) {
+            uint v = ids[k];
+            if (bodyDynamic(posLin, v))
+                atomic_fetch_add_explicit(&degrees[v], 1u, memory_order_relaxed);
+        }
+        return;
     }
     if (bodyDynamic(posLin, a)) atomic_fetch_add_explicit(&degrees[a], 1u, memory_order_relaxed);
     if (bodyDynamic(posLin, b)) atomic_fetch_add_explicit(&degrees[b], 1u, memory_order_relaxed);
@@ -76,10 +87,11 @@ kernel void adj_scatter(
     device uint* adjList            [[buffer(5)]],
     device const atomic_uint* counters [[buffer(6)]],
     constant SimParams& P           [[buffer(7)]],
+    device const TetGPU* tets       [[buffer(8)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    uint total = P.numJoints + P.numSprings + numPairs;
+    uint total = P.numJoints + P.numSprings + numPairs + P.numTets;
     if (gid >= total) return;
 
     uint a = WORLD_BODY, b = WORLD_BODY;
@@ -94,12 +106,24 @@ kernel void adj_scatter(
         a = springs[s].header.x;
         b = springs[s].header.y;
         entry = (FK_SPRING << ADJ_KIND_SHIFT) | s;
-    } else {
+    } else if (gid < P.numJoints + P.numSprings + numPairs) {
         uint m = gid - P.numJoints - P.numSprings;
         if (manifolds[m].header.z == 0) return;
         a = manifolds[m].header.x;
         b = manifolds[m].header.y;
         entry = (FK_MANIFOLD << ADJ_KIND_SHIFT) | m;
+    } else {
+        uint t = gid - P.numJoints - P.numSprings - numPairs;
+        uint4 ids = tets[t].ids;
+        entry = (FK_TET << ADJ_KIND_SHIFT) | t;
+        for (uint k = 0; k < 4; k++) {
+            uint v = ids[k];
+            if (bodyDynamic(posLin, v)) {
+                uint slot = atomic_fetch_add_explicit(&cursor[v], 1u, memory_order_relaxed);
+                adjList[slot] = entry;
+            }
+        }
+        return;
     }
     if (bodyDynamic(posLin, a)) {
         uint slot = atomic_fetch_add_explicit(&cursor[a], 1u, memory_order_relaxed);
@@ -129,6 +153,45 @@ inline uint otherBody(device const JointGPU* joints,
     return a == self ? b : a;
 }
 
+// Accumulate the neighbor-color masks for one adjacency entry; tets
+// conflict with all 3 other vertices.
+inline void neighborColors(device const JointGPU* joints,
+                           device const SpringGPU* springs,
+                           device const ManifoldGPU* manifolds,
+                           device const TetGPU* tets,
+                           device const float4* posLin,
+                           device const uint* colorsIn,
+                           uint entry, uint self, uint myColor,
+                           thread uint& maskLo, thread uint& maskHi,
+                           thread uint& allLo, thread uint& allHi,
+                           thread bool& conflict) {
+    uint kind = entry >> ADJ_KIND_SHIFT;
+    uint idx = entry & ADJ_INDEX_MASK;
+    uint nbs[3];
+    uint n = 0;
+    if (kind == FK_TET) {
+        uint4 ids = tets[idx].ids;
+        for (uint k = 0; k < 4; k++) {
+            if (ids[k] != self && n < 3) { nbs[n++] = ids[k]; }
+        }
+    } else {
+        nbs[0] = otherBody(joints, springs, manifolds, entry, self);
+        n = 1;
+    }
+    for (uint k = 0; k < n; k++) {
+        uint nb = nbs[k];
+        if (nb == WORLD_BODY || posLin[nb].w <= 0.0f) continue;
+        uint nc = colorsIn[nb];
+        uint lo = nc < 32 ? (1u << nc) : 0;
+        uint hi = (nc >= 32 && nc < 64) ? (1u << (nc - 32)) : 0;
+        allLo |= lo; allHi |= hi;
+        if (nb < self) {
+            maskLo |= lo; maskHi |= hi;
+            if (nc == myColor) conflict = true;
+        }
+    }
+}
+
 kernel void color_iterate(
     device const float4* posLin     [[buffer(0)]],
     device const JointGPU* joints   [[buffer(1)]],
@@ -141,6 +204,7 @@ kernel void color_iterate(
     device uint* colorsOut          [[buffer(8)]],
     device atomic_uint* changedFlag [[buffer(9)]],
     constant SimParams& P           [[buffer(10)]],
+    device const TetGPU* tets       [[buffer(11)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -153,16 +217,9 @@ kernel void color_iterate(
 
     uint s = adjStart[gid], e = s + adjCount[gid];
     for (uint k = s; k < e; k++) {
-        uint nb = otherBody(joints, springs, manifolds, adjList[k], gid);
-        if (nb == WORLD_BODY || posLin[nb].w <= 0.0f) continue;
-        uint nc = colorsIn[nb];
-        uint lo = nc < 32 ? (1u << nc) : 0;
-        uint hi = (nc >= 32 && nc < 64) ? (1u << (nc - 32)) : 0;
-        allLo |= lo; allHi |= hi;
-        if (nb < gid) {
-            maskLo |= lo; maskHi |= hi;
-            if (nc == myColor) conflict = true;
-        }
+        neighborColors(joints, springs, manifolds, tets, posLin, colorsIn,
+                       adjList[k], gid, myColor,
+                       maskLo, maskHi, allLo, allHi, conflict);
     }
 
     if (conflict) {
@@ -254,9 +311,23 @@ kernel void warmstart_joints(
     device const float4* posAng     [[buffer(1)]],
     device JointGPU* joints         [[buffer(2)]],
     constant SimParams& P           [[buffer(3)]],
+    device SpringGPU* springs       [[buffer(4)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    if (gid >= P.numJoints) return;
+    if (gid >= P.numJoints) {
+        uint si = gid - P.numJoints;
+        if (si >= P.numSprings) return;
+        device SpringGPU& sp = springs[si];
+        if (sp.header.z == 0) return;          // soft springs have no dual
+        uint a = sp.header.x, b = sp.header.y;
+        float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
+        float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
+        sp.dual.z = length(pA - pB) - sp.rB.w;                 // C0
+        sp.dual.x *= P.alpha * P.gamma;                        // lambda
+        sp.dual.y = min(clamp(sp.dual.y * P.gamma, PENALTY_MIN, PENALTY_MAX),
+                        sp.rA.w);                              // penalty
+        return;
+    }
     device JointGPU& j = joints[gid];
     if (j.header.z != 0) return;    // broken
 
@@ -415,7 +486,7 @@ inline void stampJoint(device const JointGPU& j, uint self,
 
 inline void stampSpring(device const SpringGPU& sp, uint self,
                         device const float4* posLin, device const float4* posAng,
-                        thread PrimalAccum& acc)
+                        thread PrimalAccum& acc, float alpha)
 {
     uint a = sp.header.x, b = sp.header.y;
     float stiffness = sp.rA.w;
@@ -428,7 +499,16 @@ inline void stampSpring(device const SpringGPU& sp, uint self,
     if (dLen <= 1.0e-6f) return;
 
     float3 n = d / dLen;
-    float f = stiffness * (dLen - rest);
+    float f;
+    if (sp.header.z != 0) {
+        // hard rod (AL): inextensible distance element — the same dual
+        // machinery as hard joints, 1-D along the current axis
+        float C = dLen - rest - sp.dual.z * alpha;
+        stiffness = sp.dual.y;                 // ramped penalty
+        f = stiffness * C + sp.dual.x;         // + lambda
+    } else {
+        f = stiffness * (dLen - rest);
+    }
 
     bool isA = self == a;
     float3 rW = isA ? q_rotate(posAng[a], sp.rA.xyz) : q_rotate(posAng[b], sp.rB.xyz);
@@ -440,6 +520,62 @@ inline void stampSpring(device const SpringGPU& sp, uint self,
     acc.lhsCross = m3_add(acc.lhsCross, m3_scale(m3_outer(jAng, jLin), stiffness));
     acc.rhsLin += jLin * f;
     acc.rhsAng += jAng * f;
+}
+
+// Stable Neo-Hookean tetrahedron (Smith et al. 2018):
+//   Psi = mu/2 (Ic - 3) + lambda/2 (J - alphaT)^2,  alphaT = 1 + mu/lambda
+// PK1: P = mu F + lambda (J - alphaT) dJ/dF.
+// Per-vertex SPD Hessian approximation (VBD-style):
+//   H_i = vol (mu |w_i|^2 I + lambda g_i g_i^T),  g_i = dJdF w_i,
+// dropping the indefinite second derivative of J.
+inline void stampTet(device const TetGPU& t, uint self,
+                     device const float4* posLin,
+                     thread PrimalAccum& acc)
+{
+    float3 x0 = posLin[t.ids.x].xyz;
+    float3 x1 = posLin[t.ids.y].xyz;
+    float3 x2 = posLin[t.ids.z].xyz;
+    float3 x3 = posLin[t.ids.w].xyz;
+    float muV = t.r1.w;
+    float lamV = t.r2.w;
+    float alphaT = 1.0f + muV / max(lamV, 1e-9f);
+
+    // F = Ds * DmInv  (columns d0..d2; DmInv rows in r0..r2)
+    float3 d0 = x1 - x0, d1 = x2 - x0, d2 = x3 - x0;
+    float3 m0 = t.r0.xyz, m1 = t.r1.xyz, m2 = t.r2.xyz;   // DmInv rows
+    // F column j = d0*DmInv[0][j] + d1*DmInv[1][j] + d2*DmInv[2][j]
+    float3 f0 = d0 * m0.x + d1 * m1.x + d2 * m2.x;
+    float3 f1 = d0 * m0.y + d1 * m1.y + d2 * m2.y;
+    float3 f2 = d0 * m0.z + d1 * m1.z + d2 * m2.z;
+
+    float J = dot(f0, cross(f1, f2));
+    float3 j0 = cross(f1, f2);          // dJ/dF columns
+    float3 j1 = cross(f2, f0);
+    float3 j2 = cross(f0, f1);
+
+    float s2 = lamV * (J - alphaT);
+    // PK1 columns (scaled by volume via muV/lamV which premultiply vol)
+    float3 p0 = muV * f0 + s2 * j0;
+    float3 p1 = muV * f1 + s2 * j1;
+    float3 p2 = muV * f2 + s2 * j2;
+
+    // self's weight vector w = DmInv^T column for vertices 1..3, or the
+    // negated sum for vertex 0
+    float3 w;
+    if (self == t.ids.y)      w = float3(m0.x, m0.y, m0.z);
+    else if (self == t.ids.z) w = float3(m1.x, m1.y, m1.z);
+    else if (self == t.ids.w) w = float3(m2.x, m2.y, m2.z);
+    else                      w = -float3(m0.x + m1.x + m2.x,
+                                          m0.y + m1.y + m2.y,
+                                          m0.z + m1.z + m2.z);
+
+    // gradient on self = P * w (P columns p0..p2)
+    float3 grad = p0 * w.x + p1 * w.y + p2 * w.z;
+    float3 g = j0 * w.x + j1 * w.y + j2 * w.z;       // dJ/dx_self
+
+    acc.rhsLin += grad;
+    acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(muV * dot(w, w))));
+    acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(g, g), lamV));
 }
 
 // Shared contact force computation (Taylor series constraint, Sec 4 + Eq 13-15)
@@ -533,6 +669,7 @@ static inline void primal_one(
     device const uint* adjList,
     constant SimParams& P,
     device const float4* shape,
+    device const TetGPU* tets,
     uint body)
 {
 
@@ -556,10 +693,21 @@ static inline void primal_one(
         if (kind == FK_JOINT) {
             stampJoint(joints[idx], body, posLin, posAng, P.alpha, acc);
         } else if (kind == FK_SPRING) {
-            stampSpring(springs[idx], body, posLin, posAng, acc);
+            stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
+        } else if (kind == FK_TET) {
+            stampTet(tets[idx], body, posLin, acc);
         } else {
             stampManifold(manifolds[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
         }
+    }
+
+    // 3-DOF particles (paper: M = mI, 3x3 blocks): no angular DOFs.
+    // Encoded as shape.w < 0; zeroing the angular system reduces the
+    // 6x6 LDL to the linear 3x3 block exactly.
+    if (shape[body].w < 0.0f) {
+        acc.lhsAng = m3_identity();
+        acc.lhsCross = m3_zero();
+        acc.rhsAng = float3(0);
     }
 
     float3 dxLin = float3(0), dxAng = float3(0);
@@ -615,6 +763,7 @@ kernel void primal_solve(
     constant uint& colorIndex       [[buffer(15)]],
     constant SimParams& P           [[buffer(16)]],
     device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorIndex];
@@ -622,7 +771,7 @@ kernel void primal_solve(
     if (s + tid >= e) return;
     primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
                joints, springs, manifolds, adjStart, adjCount, adjList,
-               P, shape, colorList[s + tid]);
+               P, shape, tets, colorList[s + tid]);
 }
 
 static inline void dual_joint_one(
@@ -746,13 +895,27 @@ kernel void dual_all(
     device ManifoldGPU* manifolds   [[buffer(5)]],
     device const atomic_uint* counters [[buffer(6)]],
     constant SimParams& P           [[buffer(7)]],
+    device SpringGPU* springs       [[buffer(8)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid < P.numJoints) {
         dual_joint_one(posLin, posAng, joints, P, gid);
         return;
     }
-    uint mi = gid - P.numJoints;
+    uint si = gid - P.numJoints;
+    if (si < P.numSprings) {
+        device SpringGPU& sp = springs[si];
+        if (sp.header.z == 0) return;
+        uint a = sp.header.x, b = sp.header.y;
+        float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
+        float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
+        float C = length(pA - pB) - sp.rB.w - sp.dual.z * P.alpha;
+        sp.dual.x = clamp(sp.dual.y * C + sp.dual.x, -P.lambdaMax, P.lambdaMax);
+        sp.dual.y = min(sp.dual.y + fabs(C) * P.betaLin,
+                        min(sp.rA.w, PENALTY_MAX));
+        return;
+    }
+    uint mi = si - P.numSprings;
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
     if (mi >= numPairs) return;
     if (manifolds[mi].header.z == 0) return;
@@ -772,7 +935,7 @@ kernel void solve_persistent(
     device const float4* inertAng   [[buffer(5)]],
     device const float4* props      [[buffer(6)]],
     device JointGPU* joints         [[buffer(7)]],
-    device const SpringGPU* springs [[buffer(8)]],
+    device SpringGPU* springs       [[buffer(8)]],
     device ManifoldGPU* manifolds   [[buffer(9)]],
     device const uint* adjStart     [[buffer(10)]],
     device const uint* adjCount     [[buffer(11)]],
@@ -782,11 +945,12 @@ kernel void solve_persistent(
     device const atomic_uint* counters [[buffer(15)]],
     constant SimParams& P           [[buffer(16)]],
     device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
     uint tid                        [[thread_position_in_threadgroup]],
     uint tgSize                     [[threads_per_threadgroup]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    uint dualTotal = P.numJoints + numPairs;
+    uint dualTotal = P.numJoints + P.numSprings + numPairs;
     for (uint iter = 0; iter < P.iterations; iter++) {
         for (uint c = 0; c < MAX_COLORS; c++) {
             uint s0 = colorStart[c];
@@ -795,7 +959,8 @@ kernel void solve_persistent(
             for (uint i = s0 + tid; i < e0; i += tgSize) {
                 primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
                            props, joints, springs, manifolds,
-                           adjStart, adjCount, adjList, P, shape, colorList[i]);
+                           adjStart, adjCount, adjList, P, shape, tets,
+                           colorList[i]);
             }
             threadgroup_barrier(mem_flags::mem_device);
         }
@@ -803,8 +968,20 @@ kernel void solve_persistent(
             if (g < P.numJoints) {
                 if (joints[g].header.z == 0)
                     dual_joint_one(posLin, posAng, joints, P, g);
+            } else if (g < P.numJoints + P.numSprings) {
+                device SpringGPU& sp = springs[g - P.numJoints];
+                if (sp.header.z != 0) {
+                    uint a = sp.header.x, b = sp.header.y;
+                    float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
+                    float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
+                    float C = length(pA - pB) - sp.rB.w - sp.dual.z * P.alpha;
+                    sp.dual.x = clamp(sp.dual.y * C + sp.dual.x,
+                                      -P.lambdaMax, P.lambdaMax);
+                    sp.dual.y = min(sp.dual.y + fabs(C) * P.betaLin,
+                                    min(sp.rA.w, PENALTY_MAX));
+                }
             } else {
-                uint mi = g - P.numJoints;
+                uint mi = g - P.numJoints - P.numSprings;
                 if (manifolds[mi].header.z != 0)
                     dual_manifold_one(posLin, posAng, initLin, initAng,
                                       manifolds, P, mi);
