@@ -332,6 +332,7 @@ public final class GPUSolver {
             if j.stiffnessLin.isInfinite { flags |= 1 }
             if j.stiffnessAng.isInfinite { flags |= 2 }
             if j.fracture.isFinite { flags |= 4 }
+            if j.fractureLinear { flags |= 8 }
             g.header = SIMD4(aIdx, UInt32(j.bodyB), 0, flags)
             let bigK: Float = 3.0e10
             g.rA = SIMD4(j.rA, min(j.stiffnessLin, bigK))
@@ -521,6 +522,39 @@ public final class GPUSolver {
     // work, and CPU access to shared buffers syncs lazily ----
     private var inflight: [MTLCommandBuffer] = []
     private let statsLock = NSLock()
+
+    /// Debug: worst joints by linear lambda, with endpoints.
+    public func debugWorstJoints(_ n: Int = 5) -> [(Int, Int, Float)] {
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        var all: [(Int, Int, Float)] = []
+        for i in 0..<numJoints where jp[i].header.z == 0 {
+            let l = length(F3(jp[i].lambdaLin.x, jp[i].lambdaLin.y, jp[i].lambdaLin.z))
+            all.append((Int(jp[i].header.x), Int(jp[i].header.y), l))
+        }
+        return Array(all.sorted { $0.2 > $1.2 }.prefix(n))
+    }
+
+    /// Debug: count of broken (fractured) joints.
+    public func debugBrokenJoints() -> Int {
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        var n = 0
+        for i in 0..<numJoints where jp[i].header.z != 0 { n += 1 }
+        return n
+    }
+
+    /// Debug: max joint lambda magnitudes (lin, ang) across live joints.
+    public func debugMaxLambda() -> (Float, Float) {
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        var ml: Float = 0, ma: Float = 0
+        for i in 0..<numJoints where jp[i].header.z == 0 {
+            ml = max(ml, length(F3(jp[i].lambdaLin.x, jp[i].lambdaLin.y, jp[i].lambdaLin.z)))
+            ma = max(ma, length(F3(jp[i].lambdaAng.x, jp[i].lambdaAng.y, jp[i].lambdaAng.z)))
+        }
+        return (ml, ma)
+    }
 
     /// Debug: current body colors (post-step, canonical buffer).
     public func debugColors() -> [Int] {

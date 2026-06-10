@@ -47,13 +47,18 @@ public struct SceneJoint {
     public var stiffnessLin: Float
     public var stiffnessAng: Float
     public var fracture: Float
+    /// Include linear lambda in the fracture criterion (tension release,
+    /// e.g. sling straps). Default false: linear lambda is penalty-scaled
+    /// and spikes transiently on hard welds, so it would pop mortar.
+    public var fractureLinear: Bool
     /// Hinge axis in body B's LOCAL frame. When set, the angular constraint
     /// leaves rotation about this axis free (1-DOF revolute joint).
     public var hingeAxis: F3?
 
     public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
                 stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
-                fracture: Float = .infinity, hingeAxis: F3? = nil) {
+                fracture: Float = .infinity, fractureLinear: Bool = false,
+                hingeAxis: F3? = nil) {
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
@@ -61,6 +66,7 @@ public struct SceneJoint {
         self.stiffnessLin = stiffnessLin
         self.stiffnessAng = stiffnessAng
         self.fracture = fracture
+        self.fractureLinear = fractureLinear
         self.hingeAxis = hingeAxis.map(normalize)
     }
 }
@@ -235,6 +241,7 @@ public struct PhysicsScene {
                                      stiffnessAng: j.stiffnessAng,
                                      fracture: j.fracture)
             cj.hingeAxis = j.hingeAxis
+            cj.fractureLinear = j.fractureLinear
         }
         for s in springs {
             let sp = solver.addSpring(solver.bodies[s.bodyA], solver.bodies[s.bodyB],

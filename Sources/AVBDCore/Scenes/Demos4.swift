@@ -333,16 +333,46 @@ extension Demos {
                       position: F3(-1.9, oy, pivotZ + 2.9))
     }
 
+    /// diagnostic: build one castle structure type in isolation
+    static func buildCastlePiece(_ s: inout PhysicsScene, variant: Int) {
+        buildCastleImpl(&s, nT: 1, pieceOnly: variant)
+    }
+
     static func buildCastle(_ s: inout PhysicsScene, nT: Int) {
-        // downrange at +x: the spoon throws over the top of the arc, in the
-        // direction the counterweight-driven rotation carries the tip.
-        // Width and wall height grow with the battery size.
+        buildCastleImpl(&s, nT: nT, pieceOnly: -1)
+    }
+
+    static nonisolated(unsafe) var unbreakable = false
+
+    static func buildCastleImpl(_ s: inout PhysicsScene, nT: Int, pieceOnly: Int) {
+        // A proper medieval castle downrange at +x: tall curtain walls with
+        // crenellated battlements, a gatehouse with a real gate opening,
+        // round-ish corner towers with merlon crowns, and an inner keep.
+        // All weak-mortar fracture brick construction.
         let cx: Float = 26
-        let halfW: Float = 5.2 + Float(nT - 1) * 3.5
-        let frontLen = Int(2 * halfW / 1.1) - 1
-        let wallH = 6 + (nT - 1)
+        let halfW: Float = 5.6 + Float(nT - 1) * 3.5
         let brick = F3(1.1, 0.55, 0.55)
-        func wall(_ at: F3, len: Int, height: Int, yaw: Float) {
+
+        /// weld with MIDPOINT anchors: zero rest error, so lambda stays
+        /// honest (center-to-center anchors carry a permanent C0(1-alpha)
+        /// bias that ratchets lambda to the cap on perfectly static walls)
+        func mortar(_ u: Int, _ b: Int, fracture: Float) {
+            let bu = s.bodies[u], bb = s.bodies[b]
+            let mid = (bu.position + bb.position) * 0.5
+            s.addJoint(SceneJoint(bodyA: u, bodyB: b,
+                                  rA: bu.rotation.inverse.act(mid - bu.position),
+                                  rB: bb.rotation.inverse.act(mid - bb.position),
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity,
+                                  fracture: fracture))
+            s.addJoint(SceneJoint(bodyA: u, bodyB: b, rA: .zero, rB: .zero,
+                                  stiffnessLin: 0, stiffnessAng: 0))
+        }
+        let wallH = 7 + (nT - 1)              // taller than before
+
+        /// brick wall with optional crenellation and an optional gate gap
+        /// (gap given in brick-columns at the wall center, gapH rows tall)
+        func wall(_ at: F3, len: Int, height: Int, yaw: Float,
+                  crenellated: Bool = true, gateW: Int = 0, gateH: Int = 0) {
             let q = Quat(angle: yaw, axis: F3(0, 0, 1))
             var below: [Int] = []
             for h in 0..<height {
@@ -350,35 +380,122 @@ extension Demos {
                 let off: Float = h % 2 == 0 ? 0 : brick.x / 2
                 for i in 0..<len {
                     let lx = -Float(len - 1) / 2 * brick.x + Float(i) * brick.x + off
+                    // gate opening: skip bricks in the central columns below
+                    // gateH (the row above acts as the lintel)
+                    if gateW > 0 && h < gateH && abs(lx) < Float(gateW) * brick.x / 2 {
+                        continue
+                    }
                     let p = at + q.act(F3(lx, 0, Float(h) * brick.z + brick.z / 2))
-                    let b = s.addBody(size: brick * 0.98, density: 0.8,
+                    let b = s.addBody(size: brick * 0.93, density: 0.8,
                                       friction: 0.85, position: p, rotation: q)
-                    // weak mortar: shears under boulder impact
                     if h > 0 {
                         for u in below where abs(s.bodies[u].position.x - p.x) < brick.x
                             && abs(s.bodies[u].position.y - p.y) < brick.x {
-                            s.addJoint(SceneJoint(bodyA: u, bodyB: b,
-                                                  rA: .zero, rB: .zero,
-                                                  stiffnessLin: .infinity,
-                                                  stiffnessAng: .infinity,
-                                                  fracture: 60))
+                            mortar(u, b, fracture: unbreakable ? .infinity : 60)
                         }
                     }
                     row.append(b)
                 }
                 below = row
             }
-        }
-        wall(F3(cx, 0, 0), len: frontLen, height: wallH, yaw: .pi / 2)
-        wall(F3(cx + 5, halfW, 0), len: 8, height: wallH - 1, yaw: 0)
-        wall(F3(cx + 5, -halfW, 0), len: 8, height: wallH - 1, yaw: 0)
-        wall(F3(cx + 10, 0, 0), len: frontLen, height: wallH - 1, yaw: .pi / 2)
-        // corner towers
-        for ty in [-halfW, halfW] {
-            for tx in [cx, Float(cx + 10)] {
-                wall(F3(tx, ty, 0), len: 3, height: wallH + 2, yaw: .pi / 4)
+            // battlements: merlons every other brick on top
+            if crenellated {
+                for i in stride(from: 0, to: len, by: 2) {
+                    let lx = -Float(len - 1) / 2 * brick.x + Float(i) * brick.x
+                    let p = at + q.act(F3(lx, 0, Float(height) * brick.z + brick.z * 0.45))
+                    let m = s.addBody(size: F3(brick.x * 0.7, brick.y, brick.z * 0.9) ,
+                                      density: 0.6, friction: 0.85,
+                                      position: p, rotation: q)
+                    for u in below where abs(s.bodies[u].position.x - p.x) < brick.x
+                        && abs(s.bodies[u].position.y - p.y) < brick.x {
+                        mortar(u, m, fracture: 50)
+                    }
+                }
             }
         }
+
+        /// corner tower: square brick shaft, taller than the walls, merlon
+        /// crown on top
+        func tower(_ at: F3, height: Int) {
+            // flat-stacked 2x2 shaft: full face contact every layer (rotated
+            // star plans rest on corner points and topple themselves)
+            let tb = F3(0.66, 0.66, 0.5)
+            var below: [Int] = []
+            for h in 0..<height {
+                var row: [Int] = []
+                for gx in [Float(-0.34), 0.34] {
+                    for gy in [Float(-0.34), 0.34] {
+                        let p = at + F3(gx, gy, Float(h) * tb.z + tb.z / 2)
+                        let b = s.addBody(size: tb * 0.93, density: 0.85,
+                                          friction: 0.9, position: p)
+                        if h > 0 {
+                            for u in below
+                                where distance(s.bodies[u].position, p) < 0.8 {
+                                mortar(u, b, fracture: 90)
+                            }
+                        }
+                        row.append(b)
+                    }
+                }
+                below = row
+            }
+            // merlon crown on the rim
+            for (mx, my) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+                let p = at + F3(Float(mx), Float(my), Float(height) * 0.5 + 0.21)
+                let m = s.addBody(size: F3(0.34, 0.34, 0.42), density: 0.6,
+                                  friction: 0.9, position: p)
+                for u in below where distance(s.bodies[u].position, p) < 0.9 {
+                    mortar(u, m, fracture: 50)
+                }
+            }
+        }
+
+        let frontLen = Int(2 * halfW / 1.1) - 1
+        if pieceOnly == 0 {
+            wall(F3(cx, 0, 0), len: 10, height: wallH, yaw: .pi / 2)
+            return
+        }
+        if pieceOnly == 3 {
+            unbreakable = true
+            wall(F3(cx, 0, 0), len: 10, height: wallH, yaw: .pi / 2)
+            unbreakable = false
+            return
+        }
+        if pieceOnly == 1 {
+            tower(F3(cx, 0, 0), height: wallH + 8)
+            return
+        }
+        if pieceOnly == 2 {
+            wall(F3(cx + 7.5, 2.3, 0), len: 4, height: wallH + 2, yaw: .pi / 2)
+            wall(F3(cx + 7.5, -2.3, 0), len: 4, height: wallH + 2, yaw: .pi / 2)
+            wall(F3(cx + 5.3, 0, 0), len: 3, height: wallH + 2, yaw: 0)
+            wall(F3(cx + 9.7, 0, 0), len: 3, height: wallH + 2, yaw: 0)
+            return
+        }
+        // front curtain wall WITH GATEHOUSE: gate 2 columns wide, 4 rows tall
+        wall(F3(cx, 0, 0), len: frontLen, height: wallH, yaw: .pi / 2,
+             gateW: 2, gateH: 4)
+        // gatehouse flanking towers, proud of the wall face
+        tower(F3(cx - 2.3, 2.8, 0), height: wallH + 8)
+        tower(F3(cx - 2.3, -2.8, 0), height: wallH + 8)
+        // side + back curtain walls
+        wall(F3(cx + 6, halfW, 0), len: 10, height: wallH - 2, yaw: 0)
+        wall(F3(cx + 6, -halfW, 0), len: 10, height: wallH - 2, yaw: 0)
+        wall(F3(cx + 12, 0, 0), len: frontLen, height: wallH - 2, yaw: .pi / 2)
+        // corner towers, taller than everything, outside the wall corners
+        for sy in [Float(-1), 1] {
+            tower(F3(cx - 1.5, sy * (halfW + 1.6), 0), height: wallH + 8)
+            tower(F3(cx + 13.5, sy * (halfW + 1.6), 0), height: wallH + 8)
+        }
+        // inner keep: a stout crenellated block in the courtyard
+        wall(F3(cx + 7.5, 2.3, 0), len: 4, height: wallH + 2, yaw: .pi / 2,
+             crenellated: true)
+        wall(F3(cx + 7.5, -2.3, 0), len: 4, height: wallH + 2, yaw: .pi / 2,
+             crenellated: true)
+        wall(F3(cx + 5.3, 0, 0), len: 3, height: wallH + 2, yaw: 0,
+             crenellated: true)
+        wall(F3(cx + 9.7, 0, 0), len: 3, height: wallH + 2, yaw: 0,
+             crenellated: true)
     }
 }
 

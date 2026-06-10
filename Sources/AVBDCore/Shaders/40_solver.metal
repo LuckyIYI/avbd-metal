@@ -824,11 +824,13 @@ static inline void dual_joint_one(
     }
 
     // Fracture (flagged joints only; avoids inf comparisons under fast math).
-    // Linear tension counts too: ball-joint slings carry pure linear lambda.
+    // Angular lambda by default; linear lambda only when bit 8 is set
+    // (tension releases like slings) — linear lambda is penalty-scaled and
+    // spikes transiently on hard welds.
     float fracture = j.C0Ang.w;
     float3 la = j.lambdaAng.xyz;
-    float3 ll = j.lambdaLin.xyz;
-    if ((j.header.w & 4) && dot(la, la) + dot(ll, ll) > fracture * fracture) {
+    float lin2 = (j.header.w & 8) ? length_squared(j.lambdaLin.xyz) : 0.0f;
+    if ((j.header.w & 4) && dot(la, la) + lin2 > fracture * fracture) {
         j.penaltyLin = float4(0);
         j.penaltyAng = float4(0);
         j.lambdaLin = float4(0);

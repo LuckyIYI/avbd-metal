@@ -18,6 +18,7 @@ public final class CPUJoint: CPUForce {
     public var stiffnessLin: Float, stiffnessAng: Float, fracture: Float
     public var torqueArm: Float
     public var broken = false
+    public var fractureLinear = false
     /// Rest relative rotation captured at creation: the angular constraint
     /// preserves the spawn alignment instead of forcing qA == qB.
     public var restRel: Quat
@@ -150,7 +151,8 @@ public final class CPUJoint: CPUForce {
             penaltyAng = simd_min(penaltyAng + abs(C) * solver.betaAng, F3(repeating: cap))
         }
 
-        if length_squared(lambdaAng) + length_squared(lambdaLin) > fracture * fracture {
+        let lin2 = fractureLinear ? length_squared(lambdaLin) : 0
+        if length_squared(lambdaAng) + lin2 > fracture * fracture {
             penaltyLin = .zero
             penaltyAng = .zero
             lambdaLin = .zero
