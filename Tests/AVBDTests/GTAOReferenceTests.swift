@@ -211,6 +211,10 @@ final class GTAOReferenceTests: XCTestCase {
             let mean = vals.reduce(0, +) / Float(vals.count)
             let spread = vals.map { abs($0 - mean) }.max() ?? 0
             print("\(name): GT=\(String(format: "%.3f", gt)) gtao=\(vals.map { String(format: "%.3f", $0) }.joined(separator: " ")) mean=\(String(format: "%.3f", mean)) spread=\(String(format: "%.3f", spread))")
+            XCTAssertLessThan(abs(mean - gt), 0.1,
+                              "\(name): GTAO mean deviates from ray-traced GT")
+            XCTAssertLessThan(spread, 0.08,
+                              "\(name): GTAO must not depend on camera pose")
             _ = N
         }
     }
