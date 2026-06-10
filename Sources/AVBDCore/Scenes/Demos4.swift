@@ -49,6 +49,10 @@ extension Demos {
                                   rA: ba.rotation.inverse.act(world - ba.position),
                                   rB: bb.rotation.inverse.act(world - bb.position),
                                   stiffnessLin: .infinity, stiffnessAng: .infinity))
+            // welded parts overlap by design: exclude their mutual collision
+            // or the contacts fight the weld and the piece jitters/jumps
+            s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
+                                  stiffnessLin: 0, stiffnessAng: 0))
         }
         func box(_ size: F3, _ at: F3, d: Float = 0.45, yaw: Float = 0) -> Int {
             s.addBody(size: size, density: d, friction: 0.7, position: at,
