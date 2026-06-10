@@ -367,7 +367,7 @@ extension Demos {
             s.addJoint(SceneJoint(bodyA: u, bodyB: b, rA: .zero, rB: .zero,
                                   stiffnessLin: 0, stiffnessAng: 0))
         }
-        let wallH = 7 + (nT - 1)              // taller than before
+        let wallH = 10 + (nT - 1)             // properly tall curtain walls
 
         /// brick wall with optional crenellation and an optional gate gap
         /// (gap given in brick-columns at the wall center, gapH rows tall)
@@ -380,13 +380,21 @@ extension Demos {
                 let off: Float = h % 2 == 0 ? 0 : brick.x / 2
                 for i in 0..<len {
                     let lx = -Float(len - 1) / 2 * brick.x + Float(i) * brick.x + off
-                    // gate opening: skip bricks in the central columns below
-                    // gateH (the row above acts as the lintel)
-                    if gateW > 0 && h < gateH && abs(lx) < Float(gateW) * brick.x / 2 {
-                        continue
-                    }
+                    // stepped corbel ARCH over the gate: opening narrows row
+                    // by row above gateH
+                    let gw: Float
+                    if gateW > 0 && h < gateH { gw = Float(gateW) }
+                    else if gateW > 0 && h == gateH { gw = Float(gateW) - 0.9 }
+                    else if gateW > 0 && h == gateH + 1 { gw = Float(gateW) - 1.6 }
+                    else { gw = 0 }
+                    if gw > 0 && abs(lx) < gw * brick.x / 2 { continue }
+                    // arrow slits: skip slim openings on an upper course
+                    if height > 6 && h == height - 3 && i % 4 == 1 { continue }
+                    // string course: a protruding (deeper) decorative row
+                    let deep = height > 6 && h == height - 4
+                    let bsize = deep ? F3(brick.x, brick.y * 1.4, brick.z) : brick
                     let p = at + q.act(F3(lx, 0, Float(h) * brick.z + brick.z / 2))
-                    let b = s.addBody(size: brick * 0.93, density: 0.8,
+                    let b = s.addBody(size: bsize * 0.93, density: 0.8,
                                       friction: 0.85, position: p, rotation: q)
                     if h > 0 {
                         for u in below where abs(s.bodies[u].position.x - p.x) < brick.x

@@ -16,6 +16,7 @@ final class SimulationModel: ObservableObject {
     @Published var betaLin: Double = 5000 { didSet { push() } }
     @Published var gamma: Double = 0.999 { didSet { push() } }
     @Published var gravity: Double = -10 { didSet { push() } }
+    private var adopting = false
     @Published var timeScale: Double = 1.0
 
     // Stats (updated as sim runs)
@@ -37,11 +38,16 @@ final class SimulationModel: ObservableObject {
     func reset() {
         guard var scene = Demos.make(demoName, scale: scale) else { return }
         dragJoint = scene.addDragSlot()
-        scene.settings.iterations = Int(iterations)
-        scene.settings.alpha = Float(alpha)
-        scene.settings.betaLin = Float(betaLin)
-        scene.settings.gamma = Float(gamma)
-        scene.settings.gravity = Float(gravity)
+        // ADOPT the scene's tuned settings into the sliders (each demo is
+        // tuned; overriding with stale slider state crumbles e.g. the
+        // castle, which needs its own iterations/beta)
+        adopting = true
+        iterations = Double(scene.settings.iterations)
+        alpha = Double(scene.settings.alpha)
+        betaLin = Double(scene.settings.betaLin)
+        gamma = Double(scene.settings.gamma)
+        gravity = Double(scene.settings.gravity)
+        adopting = false
         do {
             solver = try GPUSolver(scene: scene)
         } catch {
@@ -53,7 +59,7 @@ final class SimulationModel: ObservableObject {
     }
 
     private func push() {
-        guard let solver else { return }
+        guard !adopting, let solver else { return }
         solver.settings.iterations = Int(iterations)
         solver.settings.alpha = Float(alpha)
         solver.settings.betaLin = Float(betaLin)
