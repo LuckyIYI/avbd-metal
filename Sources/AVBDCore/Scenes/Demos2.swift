@@ -60,62 +60,107 @@ extension Demos {
         return s
     }
 
-    /// Three-strut tensegrity prism: rigid struts suspended purely by
-    /// pre-tensioned cables (springs). It should settle, hover, and wobble
-    /// elastically when poked.
+    /// Tensegrity sculpture: a floating C-frame that hangs entirely on
+    /// chains. The short center chain (in tension, hidden in plain sight)
+    /// carries the weight from the static arm's tip; the long outer chains
+    /// only prevent tipping. No springs, no tricks — pure chain tension.
     public static func tensegrity(towers: Int = 1) -> PhysicsScene {
         var s = PhysicsScene(name: "tensegrity")
-        addGround(&s, friction: 0.9)
+        s.settings.iterations = 20
+        s.settings.lambdaMax = 4000
+        addGround(&s, friction: 0.8)
 
-        let R: Float = 1.0
-        let H: Float = 1.6
-        let strutLen: Float = 2.5
-        let cableK: Float = 3e4
-        let preTension: Float = 0.99    // barely taut; gravity provides the rest
+        /// chain of capsule links between two anchor points on two bodies
+        func addChain(from bodyA: Int, _ rA: F3, to bodyB: Int, _ rB: F3,
+                      slack: Float = 1.01) {
+            let pA = s.bodies[bodyA].position + s.bodies[bodyA].rotation.act(rA)
+            let pB = s.bodies[bodyB].position + s.bodies[bodyB].rotation.act(rB)
+            let span = pB - pA
+            let dist = length(span)
+            // quantize the link count, then stretch links so the chain spans
+            // the gap EXACTLY (times slack): taut from frame one, no snap
+            let n = max(2, Int((dist * slack) / 0.30 + 0.5))
+            let linkLen = dist * slack / Float(n)
+            let dir = span / dist
+            // orientation: capsule local z along the chain
+            let axis = cross(F3(0, 0, 1), dir)
+            let q: Quat = length(axis) < 1e-5
+                ? Quat(real: 1, imag: .zero)
+                : Quat(angle: acos(simd_clamp(dot(F3(0, 0, 1), dir), -1, 1)),
+                       axis: normalize(axis))
+            var prev = bodyA
+            var prevAnchor = rA
+            for k in 0..<n {
+                let t = (Float(k) + 0.5) / Float(n)
+                let link = s.addCapsule(length: linkLen * 0.72, radius: 0.045,
+                                        density: 2, friction: 0.3,
+                                        position: pA + dir * (dist * slack * t), rotation: q)
+                s.addJoint(SceneJoint(bodyA: prev, bodyB: link,
+                                      rA: prevAnchor, rB: F3(0, 0, -linkLen / 2)))
+                // links of one chain never collide with each other
+                s.addJoint(SceneJoint(bodyA: prev, bodyB: link, rA: .zero, rB: .zero,
+                                      stiffnessLin: 0, stiffnessAng: 0))
+                prev = link
+                prevAnchor = F3(0, 0, linkLen / 2)
+            }
+            s.addJoint(SceneJoint(bodyA: prev, bodyB: bodyB,
+                                  rA: prevAnchor, rB: rB))
+            s.addJoint(SceneJoint(bodyA: prev, bodyB: bodyB, rA: .zero, rB: .zero,
+                                  stiffnessLin: 0, stiffnessAng: 0))
+        }
 
         for tower in 0..<towers {
-            let baseZ = Float(0.2)
-            let cx = Float(tower) * 4
-            var bottoms: [F3] = []
-            var tops: [F3] = []
-            for k in 0..<3 {
-                let a = Float(k) * 2 * .pi / 3
-                bottoms.append(F3(cx + R * cos(a), R * sin(a), baseZ))
-                let at = a + 5 * .pi / 6   // 150° twist
-                tops.append(F3(cx + R * cos(at), R * sin(at), baseZ + H))
-            }
+            let ox = Float(tower) * 6
 
-            var struts: [Int] = []
-            for k in 0..<3 {
-                let b = bottoms[k], t = tops[k]
-                let mid = (b + t) / 2
-                let dir = normalize(t - b)
-                // rotation aligning local +z to dir
-                let zAxis = F3(0, 0, 1)
-                let c = dot(zAxis, dir)
-                let axis = cross(zAxis, dir)
-                let rot: Quat = length(axis) < 1e-5
-                    ? Quat(real: 1, imag: .zero)
-                    : Quat(angle: acos(simd_clamp(c, -1, 1)), axis: normalize(axis))
-                struts.append(s.addBody(size: F3(0.12, 0.12, strutLen), density: 1,
-                                        friction: 0.6, position: mid, rotation: rot))
-            }
+            // ---- static lower structure: base, post, inward arm ----
+            let base = s.addBody(size: F3(3.0, 3.0, 0.22), density: 0, friction: 0.8,
+                                 position: F3(ox, 0, 0.11))
+            _ = s.addBody(size: F3(0.34, 0.34, 2.7), density: 0, friction: 0.5,
+                          position: F3(ox + 0.75, 0, 1.57))
+            let armS = s.addBody(size: F3(1.8, 0.34, 0.3), density: 0, friction: 0.5,
+                                 position: F3(ox + 0.0, 0, 3.05))
+            // static tip hangs the center chain at its -x end
+            _ = armS
 
-            func cable(_ sa: Int, _ ea: F3, _ sb: Int, _ eb: F3) {
-                let pa = s.bodies[sa].position + s.bodies[sa].rotation.act(ea)
-                let pb = s.bodies[sb].position + s.bodies[sb].rotation.act(eb)
-                s.addSpring(SceneSpring(bodyA: sa, bodyB: sb, rA: ea, rB: eb,
-                                        stiffness: cableK,
-                                        rest: length(pa - pb) * preTension))
+            // ---- floating upper structure: welded C-frame ----
+            // lower hook (under the static tip), arm out, post up, top bar over
+            let hookP = F3(ox - 0.75, 0, 2.30)
+            // mass distribution matters: the heavy left side gives a strong
+            // restoring moment about the hook, keeping the outer chains taut
+            let hook = s.addBody(size: F3(0.32, 0.32, 0.32), density: 3, friction: 0.4,
+                                 position: hookP)
+            let armF = s.addBody(size: F3(1.2, 0.3, 0.28), density: 3, friction: 0.4,
+                                 position: hookP + F3(-0.74, 0, 0))
+            let postF = s.addBody(size: F3(0.3, 0.3, 2.3), density: 3, friction: 0.4,
+                                  position: F3(ox - 1.62, 0, 3.57))
+            let barF = s.addBody(size: F3(3.1, 0.3, 0.28), density: 0.5, friction: 0.4,
+                                 position: F3(ox - 0.2, 0, 4.84))
+            func weld(_ a: Int, _ b: Int, _ world: F3) {
+                let ba = s.bodies[a], bb = s.bodies[b]
+                s.addJoint(SceneJoint(bodyA: a, bodyB: b,
+                                      rA: ba.rotation.inverse.act(world - ba.position),
+                                      rB: bb.rotation.inverse.act(world - bb.position),
+                                      stiffnessLin: .infinity, stiffnessAng: .infinity))
             }
-            let bot = F3(0, 0, -strutLen / 2)
-            let top = F3(0, 0, strutLen / 2)
-            for k in 0..<3 {
-                let n = (k + 1) % 3
-                cable(struts[k], bot, struts[n], bot)   // bottom triangle
-                cable(struts[k], top, struts[n], top)   // top triangle
-                cable(struts[k], top, struts[n], bot)   // saddle: t_k - b_{k+1}
+            weld(hook, armF, hookP + F3(-0.18, 0, 0))
+            weld(armF, postF, F3(ox - 1.62, 0, 2.3))
+            weld(postF, barF, F3(ox - 1.62, 0, 4.78))
+
+            // ---- chains ----
+            // center chain: static arm tip DOWN to the floating hook — this
+            // single short chain carries the whole floating frame
+            addChain(from: armS, F3(-0.82, 0, -0.15),
+                     to: hook, F3(0, 0, 0.16), slack: 1.0)
+            // outer chains: floating bar's far end down to the base corners
+            // (carry the tipping moment), plus a third chain on the left —
+            // together with the center chain they fully cage the frame:
+            // every rotation direction tightens at least one chain
+            for sy in [Float(-1), 1] {
+                addChain(from: barF, F3(1.45, sy * 0.1, 0.0),
+                         to: base, F3(1.25, sy * 1.25, 0.11), slack: 1.0)
             }
+            addChain(from: barF, F3(-1.45, 0, 0.0),
+                     to: base, F3(-1.35, 0, 0.11), slack: 1.0)
         }
         return s
     }

@@ -255,12 +255,15 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     const float R = 1.1;                                  // world AO radius
     float pxRadius = clamp(U.screen.z * R / max(dist, 0.5), 4.0, 110.0);
 
-    // stable per-pixel slice rotation (screen-position hash, no flicker)
-    float ang = fract(sin(dot(floor(in.position.xy), float2(12.9898, 78.233)))
-                      * 43758.5453) * M_PI_F;
+    // interleaved gradient noise: much better spectral distribution than a
+    // sin-hash, so residual error is high-frequency and blurs away cleanly
+    float2 px = floor(in.position.xy);
+    float ign = fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
+    float ang = ign * M_PI_F;
+    float stepJit = fract(ign * 7.0);
 
-    const int SLICES = 2;
-    const int STEPS = 5;
+    const int SLICES = 3;
+    const int STEPS = 6;
     float occlusion = 0.0;
 
     for (int sl = 0; sl < SLICES; sl++) {
@@ -274,8 +277,9 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
         for (int side = 0; side < 2; side++) {
             float sgn = side == 0 ? 1.0 : -1.0;
             for (int st = 1; st <= STEPS; st++) {
-                float t = (float(st) - 0.5) / float(STEPS);
-                float2 uv2 = in.uv + sgn * dirPx * (t * t * pxRadius) / U.screen.xy;
+                float t = (float(st) - 1.0 + stepJit) / float(STEPS);
+                t = max(t, 0.02);
+                float2 uv2 = in.uv + sgn * dirPx * (t * pxRadius) / U.screen.xy;
                 float4 Q4 = posTex.sample(smp, uv2);
                 if (Q4.w < 0.5) continue;
                 float3 w = Q4.xyz - P;
@@ -317,23 +321,35 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
         occlusion += projLen * (a1 + a2);
     }
     float ao = clamp(occlusion / float(SLICES), 0.0, 1.0);
-    ao = pow(ao, 1.3);     // slight contrast shaping
+    ao = pow(ao, 1.25);    // slight contrast shaping
     return float4(ao, ao, ao, 1);
 }
 
 fragment float4 blur_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
-                              texture2d<float> src [[texture(0)]])
+                              texture2d<float> src [[texture(0)]],
+                              texture2d<float> posTex [[texture(1)]])
 {
-    constexpr sampler smp(filter::linear, address::clamp_to_edge);
+    // depth-aware 5x5 blur: averages AO noise without bleeding across
+    // geometric edges (weights collapse when world distance jumps)
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     float2 px = 1.0 / U.screen.xy;
-    float s = 0.0;
-    for (int y = -1; y <= 2; y++) {
-        for (int x = -1; x <= 2; x++) {
-            s += src.sample(smp, in.uv + float2(float(x) - 0.5, float(y) - 0.5) * px).r;
+    float4 c4 = posTex.sample(smp, in.uv);
+    if (c4.w < 0.5) return float4(1);
+    float3 cP = c4.xyz;
+    float acc = 0.0, wsum = 0.0;
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            float2 uv2 = in.uv + float2(float(x), float(y)) * px;
+            float4 q4 = posTex.sample(smp, uv2);
+            if (q4.w < 0.5) continue;
+            float d = length(q4.xyz - cP);
+            float w = exp(-d * d * 6.0);
+            acc += src.sample(smp, uv2).r * w;
+            wsum += w;
         }
     }
-    return float4(s / 16.0);
+    return float4(wsum > 0.0 ? acc / wsum : 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -680,17 +696,20 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.endEncoding()
         }
 
-        // ---- 3. blur AO ----
-        let blurPass = MTLRenderPassDescriptor()
-        blurPass.colorAttachments[0].texture = aoTexB
-        blurPass.colorAttachments[0].loadAction = .dontCare
-        blurPass.colorAttachments[0].storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: blurPass) {
-            enc.setRenderPipelineState(blurP)
-            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.setFragmentTexture(aoTexA, index: 0)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc.endEncoding()
+        // ---- 3. depth-aware blur x2 (ping-pong A -> B -> A) ----
+        for (srcT, dstT) in [(aoTexA, aoTexB), (aoTexB, aoTexA)] {
+            let blurPass = MTLRenderPassDescriptor()
+            blurPass.colorAttachments[0].texture = dstT
+            blurPass.colorAttachments[0].loadAction = .dontCare
+            blurPass.colorAttachments[0].storeAction = .store
+            if let enc = cmd.makeRenderCommandEncoder(descriptor: blurPass) {
+                enc.setRenderPipelineState(blurP)
+                enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentTexture(srcT, index: 0)
+                enc.setFragmentTexture(posTex, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                enc.endEncoding()
+            }
         }
 
         // ---- 4. main pass ----
@@ -704,7 +723,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setRenderPipelineState(floorP)
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.setFragmentTexture(aoTexB, index: 0)
+        enc.setFragmentTexture(aoTexA, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
         enc.setDepthStencilState(noWriteDepthState)
@@ -720,7 +739,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(instances, offset: 0, index: 0)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.setFragmentTexture(aoTexB, index: 0)
+            enc.setFragmentTexture(aoTexA, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: verts, instanceCount: count)
         }
