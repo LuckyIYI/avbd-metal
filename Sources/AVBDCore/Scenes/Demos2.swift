@@ -125,15 +125,18 @@ extension Demos {
             // ---- floating upper structure: welded C-frame ----
             // lower hook (under the static tip), arm out, post up, top bar over
             let hookP = F3(ox - 0.75, 0, 2.30)
-            // mass distribution matters: the heavy left side gives a strong
-            // restoring moment about the hook, keeping the outer chains taut
-            let hook = s.addBody(size: F3(0.32, 0.32, 0.32), density: 3, friction: 0.4,
+            // mass distribution is the whole trick: the hanging frame is only
+            // stable if its CG sits BELOW the hook (else it's an inverted
+            // pendulum and capsizes through the unrestrained direction) and
+            // LEFT of it (so gravity's moment keeps the outer chains taut).
+            // Heavy bottom arm, feather-light everything above.
+            let hook = s.addBody(size: F3(0.32, 0.32, 0.32), density: 15, friction: 0.4,
                                  position: hookP)
-            let armF = s.addBody(size: F3(1.2, 0.3, 0.28), density: 3, friction: 0.4,
+            let armF = s.addBody(size: F3(1.2, 0.34, 0.34), density: 15, friction: 0.4,
                                  position: hookP + F3(-0.74, 0, 0))
-            let postF = s.addBody(size: F3(0.3, 0.3, 2.3), density: 3, friction: 0.4,
+            let postF = s.addBody(size: F3(0.3, 0.3, 2.3), density: 0.12, friction: 0.4,
                                   position: F3(ox - 1.62, 0, 3.57))
-            let barF = s.addBody(size: F3(3.1, 0.3, 0.28), density: 0.5, friction: 0.4,
+            let barF = s.addBody(size: F3(3.1, 0.3, 0.28), density: 0.12, friction: 0.4,
                                  position: F3(ox - 0.2, 0, 4.84))
             func weld(_ a: Int, _ b: Int, _ world: F3) {
                 let ba = s.bodies[a], bb = s.bodies[b]
@@ -142,25 +145,28 @@ extension Demos {
                                       rB: bb.rotation.inverse.act(world - bb.position),
                                       stiffnessLin: .infinity, stiffnessAng: .infinity))
             }
+            // crossbar at the bar's far end (like the original): the two
+            // outer chains attach at its tips, wide apart in y — that spread
+            // blocks the roll mode about the hook-to-anchor axis
+            let crossF = s.addBody(size: F3(0.3, 1.9, 0.26), density: 0.12, friction: 0.4,
+                                   position: F3(ox + 1.3, 0, 4.84))
             weld(hook, armF, hookP + F3(-0.18, 0, 0))
             weld(armF, postF, F3(ox - 1.62, 0, 2.3))
             weld(postF, barF, F3(ox - 1.62, 0, 4.78))
+            weld(barF, crossF, F3(ox + 1.3, 0, 4.84))
 
             // ---- chains ----
             // center chain: static arm tip DOWN to the floating hook — this
             // single short chain carries the whole floating frame
             addChain(from: armS, F3(-0.82, 0, -0.15),
                      to: hook, F3(0, 0, 0.16), slack: 1.0)
-            // outer chains: floating bar's far end down to the base corners
-            // (carry the tipping moment), plus a third chain on the left —
-            // together with the center chain they fully cage the frame:
-            // every rotation direction tightens at least one chain
+            // three ropes total: the center chain carries the weight, the two
+            // outer chains (crossbar tips -> base corners) carry the tipping
+            // moment — gravity's moment about the hook keeps them taut
             for sy in [Float(-1), 1] {
-                addChain(from: barF, F3(1.45, sy * 0.1, 0.0),
+                addChain(from: crossF, F3(0, sy * 0.85, 0),
                          to: base, F3(1.25, sy * 1.25, 0.11), slack: 1.0)
             }
-            addChain(from: barF, F3(-1.45, 0, 0.0),
-                     to: base, F3(-1.35, 0, 0.11), slack: 1.0)
         }
         return s
     }
