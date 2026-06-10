@@ -6,7 +6,7 @@ public enum Demos {
     public static var all: [String] {
         ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
          "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
-         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "cloth", "softbody", "android"]
+         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "cloth", "softbody", "android", "pusht"]
     }
 
     /// Every demo scales for stress testing: 1 = small (original size),

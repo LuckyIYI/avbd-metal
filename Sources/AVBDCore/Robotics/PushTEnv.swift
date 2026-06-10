@@ -34,7 +34,7 @@ public final class PushTEnv {
     static let L2: Float = 1.05            // elbow link length
     static let tipHeight: Float = 0.42
 
-    public init(numEnvs: Int, seed: UInt64 = 1) throws {
+    public init(numEnvs: Int, seed: UInt64 = 1, goalMarkers: Bool = false) throws {
         self.numEnvs = numEnvs
         var s = PhysicsScene(name: "pusht")
         s.settings.iterations = 16
@@ -49,6 +49,19 @@ public final class PushTEnv {
             let cy = Float(e / side) * envPitch
             let c = F3(cx, cy, 0)
             refs.append(Self.buildOne(&s, center: c, rng: &rng))
+            if goalMarkers {
+                // visual goal T: static plates sunk into the floor (top
+                // sliver visible, no meaningful bump)
+                let r = refs[e]
+                let gq = Quat(angle: r.goalYaw, axis: F3(0, 0, 1))
+                let gc = c + F3(r.goalPos.x, r.goalPos.y, 0)
+                _ = s.addBody(size: F3(1.0, 0.25, 0.1), density: 0, friction: 0.9,
+                              position: gc + gq.act(F3(0, 0.125, 0)) + F3(0, 0, -0.038),
+                              rotation: gq)
+                _ = s.addBody(size: F3(0.25, 0.65, 0.1), density: 0, friction: 0.9,
+                              position: gc + gq.act(F3(0, -0.325, 0)) + F3(0, 0, -0.038),
+                              rotation: gq)
+            }
         }
         scene = s
         solver = try GPUSolver(scene: s)

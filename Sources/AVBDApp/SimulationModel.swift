@@ -35,7 +35,20 @@ final class SimulationModel: ObservableObject {
         reset()
     }
 
+    var pushtEnv: PushTEnv? = nil
+    var pushtTarget = SIMD2<Float>(1.4, 0)
+
     func reset() {
+        if demoName == "pusht" {
+            pushtEnv = try? PushTEnv(numEnvs: 1, seed: UInt64.random(in: 1...9999),
+                                     goalMarkers: true)
+            solver = pushtEnv?.solver
+            pushtTarget = SIMD2(1.4, 0)
+            dragJoint = -1
+            lastStepTime = CACurrentMediaTime()
+            return
+        }
+        pushtEnv = nil
         guard var scene = Demos.make(demoName, scale: scale) else { return }
         dragJoint = scene.addDragSlot()
         // ADOPT the scene's tuned settings into the sliders (each demo is
@@ -79,6 +92,9 @@ final class SimulationModel: ObservableObject {
         var steps = 0
         while stepAccumulator >= dt && steps < 4 {
             let t0 = CACurrentMediaTime()
+            if let env = pushtEnv {
+                env.setTipTarget(0, pushtTarget)
+            }
             solver.step()
             let ms = (CACurrentMediaTime() - t0) * 1000
             msEMA = msEMA == 0 ? ms : msEMA * 0.95 + ms * 0.05
@@ -93,6 +109,13 @@ final class SimulationModel: ObservableObject {
             statsText = String(
                 format: "%d bodies   %.2f ms/step   %d pairs   %d colors",
                 solver.bodyCount, msEMA, solver.lastNumPairs, colors)
+            if let env = pushtEnv {
+                let (bp, byaw) = env.blockPose(0)
+                let d = length(bp - env.refs[0].goalPos)
+                statsText += env.success(0)
+                    ? "\n\u{1F3C6} SOLVED! Reset for a new layout."
+                    : String(format: "\nblock->goal %.2f m, yaw %.2f rad", d, byaw - env.refs[0].goalYaw)
+            }
         }
     }
 
