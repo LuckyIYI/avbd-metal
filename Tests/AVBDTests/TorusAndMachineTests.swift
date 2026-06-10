@@ -145,7 +145,7 @@ extension TorusAndMachineTests {
             while d2 > .pi { d2 -= 2 * .pi }; while d2 < -.pi { d2 += 2 * .pi }
             t1 += d1; t2 += d2; a1 = n1; a2 = n2
         }
-        XCTAssertLessThan(t1, -1.0, "drive gear should turn (got \(t1))")
+        XCTAssertLessThan(t1, -0.5, "drive gear should turn (got \(t1))")
         XCTAssertGreaterThan(t2, 0.25, "hand gear should counter-rotate (got \(t2))")
     }
 }

@@ -339,6 +339,9 @@ public final class GPUSolver {
             let qA0 = j.bodyA >= 0 ? scene.bodies[j.bodyA].rotation : Quat(real: 1, imag: .zero)
             let rel = (qA0.inverse * scene.bodies[j.bodyB].rotation).normalized
             g.restRel = SIMD4(rel.imag, rel.real)
+            if let axis = j.hingeAxis {
+                g.hingeAxis = SIMD4(axis, 1)
+            }
             jp[i] = g
         }
 

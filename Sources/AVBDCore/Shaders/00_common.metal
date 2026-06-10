@@ -231,6 +231,7 @@ struct JointGPU {
     float4 penaltyLin;
     float4 penaltyAng;
     float4 restRel;     // rest relative rotation qA^-1 * qB (quaternion)
+    float4 hingeAxis;   // xyz: axis in B local; w != 0 -> 1-DOF hinge
 };
 
 struct SpringGPU {

@@ -617,55 +617,36 @@ extension Demos {
     static func addGear(_ s: inout PhysicsScene, center: F3, R: Float, teeth: Int,
                         phase: Float = 0, handLen: Float = 0) -> Int {
         let qWheel = Quat(angle: .pi / 2, axis: F3(1, 0, 0))   // axis -> y
-        let hubR: Float = 0.27, hubTube: Float = 0.115
-        let axleR: Float = 0.11
 
-        // static axle + static retention flanges (no joints needed)
-        _ = s.addCapsule(length: 1.1, radius: axleR, density: 0, friction: 0.02,
-                         position: center, rotation: qWheel)
-        for sy in [Float(-1), 1] {
-            _ = s.addBody(size: F3(0.52, 0.09, 0.52), density: 0, friction: 0.02,
-                          position: center + F3(0, sy * 0.42, 0))
-        }
-
-        // double-hub bearing
-        let hub = s.addTorus(major: hubR, minor: hubTube, density: 1,
-                             friction: 0.005, position: center + F3(0, -0.12, 0),
-                             rotation: qWheel)
-        let hub2 = s.addTorus(major: hubR, minor: hubTube, density: 1,
-                              friction: 0.005, position: center + F3(0, 0.12, 0),
-                              rotation: qWheel)
-        s.addJoint(SceneJoint(bodyA: hub, bodyB: hub2,
-                              rA: F3(hubR, 0, -0.12), rB: F3(hubR, 0, 0.12),
-                              stiffnessLin: .infinity, stiffnessAng: .infinity))
-
-        // spokes + rim (light flywheel: coasts well on the bearings)
+        // rim on a world HINGE joint (1-DOF revolute about its own axis):
+        // simpler and stiffer than the contact bearing for machinery
         let rim = s.addTorus(major: R, minor: 0.1, density: 0.35, friction: 0.3,
                              position: center, rotation: qWheel)
+        s.addJoint(SceneJoint(bodyA: -1, bodyB: rim, rA: center, rB: .zero,
+                              stiffnessLin: .infinity, stiffnessAng: .infinity,
+                              hingeAxis: F3(0, 0, 1)))    // torus local z
+
+        // decorative axle (static, visual)
+        _ = s.addCapsule(length: 0.9, radius: 0.09, density: 0, friction: 0.1,
+                         position: center, rotation: qWheel)
+
+        // spokes (welded, decorative + carry the hand)
+        let hubR: Float = 0.18
         let spokeLen = R - hubR + 0.1
         for k in 0..<3 {
             let a = Float(k) * 2 * .pi / 3 + phase
             let dir = F3(cos(a), 0, sin(a))
-            let spoke = s.addBody(size: F3(spokeLen, 0.06, 0.06), density: 0.6,
+            let spoke = s.addBody(size: F3(spokeLen, 0.06, 0.06), density: 0.3,
                                   friction: 0.1,
                                   position: center + dir * (hubR + R) / 2,
                                   rotation: Quat(angle: -a, axis: F3(0, 1, 0)))
-            s.addJoint(SceneJoint(bodyA: hub, bodyB: spoke,
-                                  rA: F3(cos(a) * hubR, sin(a) * hubR, -0.12),
-                                  rB: F3(-spokeLen / 2 + 0.05, 0, 0),
-                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
-            s.addJoint(SceneJoint(bodyA: spoke, bodyB: rim,
-                                  rA: F3(spokeLen / 2 - 0.05, 0, 0),
-                                  rB: F3(cos(a) * R, sin(a) * R, 0),
+            s.addJoint(SceneJoint(bodyA: rim, bodyB: spoke,
+                                  rA: F3(cos(a) * R, sin(a) * R, 0),
+                                  rB: F3(spokeLen / 2 - 0.05, 0, 0),
                                   stiffnessLin: .infinity, stiffnessAng: .infinity))
         }
-        s.addJoint(SceneJoint(bodyA: hub, bodyB: rim, rA: .zero, rB: .zero,
-                              stiffnessLin: 0, stiffnessAng: 0))
-        s.addJoint(SceneJoint(bodyA: hub2, bodyB: rim, rA: .zero, rB: .zero,
-                              stiffnessLin: 0, stiffnessAng: 0))
 
-        // sphere teeth welded around the rim: round teeth can never butt
-        // tip-to-tip — they always deflect into the next gap (self-meshing)
+        // sphere teeth welded around the rim (round teeth can't tip-butt)
         let toothR: Float = 0.18
         for k in 0..<teeth {
             let a = Float(k) / Float(teeth) * 2 * .pi + phase
@@ -681,8 +662,7 @@ extension Demos {
 
         // clock hand hard-attached to the rim
         if handLen > 0 {
-            // outboard of the static cap flanges (caps at |y| 0.375..0.465)
-            let handY: Float = 0.62
+            let handY: Float = 0.45
             let hand = s.addBody(size: F3(handLen, 0.1, 0.14), density: 0.3,
                                  friction: 0.1,
                                  position: center + F3(handLen / 2, handY, 0))
@@ -727,33 +707,17 @@ extension Demos {
                               rB: .zero,
                               stiffnessLin: .infinity, stiffnessAng: .infinity))
 
-        // rocker lever in the pin's plane (y = -0.55), on its own bearing
+        // rocker lever on a world hinge in the pin's plane (y = -0.55)
         let leverY: Float = -0.55
         let pivot = F3(-2.6, leverY, 2.6)
-        let qWheel = Quat(angle: .pi / 2, axis: F3(1, 0, 0))
         _ = s.addCapsule(length: 1.1, radius: 0.11, density: 0, friction: 0.02,
-                         position: pivot, rotation: qWheel)
-        for sy in [Float(-1), 1] {
-            _ = s.addBody(size: F3(0.52, 0.09, 0.52), density: 0, friction: 0.02,
-                          position: pivot + F3(0, sy * 0.42, 0))
-        }
-        let lhub = s.addTorus(major: 0.27, minor: 0.115, density: 1, friction: 0.02,
-                              position: pivot + F3(0, -0.12, 0), rotation: qWheel)
-        let lhub2 = s.addTorus(major: 0.27, minor: 0.115, density: 1, friction: 0.02,
-                               position: pivot + F3(0, 0.12, 0), rotation: qWheel)
-        s.addJoint(SceneJoint(bodyA: lhub, bodyB: lhub2,
-                              rA: F3(0.27, 0, -0.12), rB: F3(0.27, 0, 0.12),
-                              stiffnessLin: .infinity, stiffnessAng: .infinity))
+                         position: pivot, rotation: Quat(angle: .pi / 2, axis: F3(1, 0, 0)))
         let lever = s.addBody(size: F3(4.4, 0.5, 0.15), density: 0.35, friction: 0.4,
                               position: pivot + F3(0, 0, 0.42))
-        s.addJoint(SceneJoint(bodyA: lhub, bodyB: lever,
-                              rA: F3(0, 0.42, -0.12), rB: .zero,
-                              stiffnessLin: .infinity, stiffnessAng: .infinity))
-        s.addJoint(SceneJoint(bodyA: lhub, bodyB: lever,
-                              rA: F3(1.0, 0.42, -0.12), rB: F3(1.0, 0, 0),
-                              stiffnessLin: .infinity, stiffnessAng: .infinity))
-        s.addJoint(SceneJoint(bodyA: lhub2, bodyB: lever, rA: .zero, rB: .zero,
-                              stiffnessLin: 0, stiffnessAng: 0))
+        s.addJoint(SceneJoint(bodyA: -1, bodyB: lever,
+                              rA: pivot + F3(0, 0, 0.42), rB: .zero,
+                              stiffnessLin: .infinity, stiffnessAng: .infinity,
+                              hingeAxis: F3(0, 1, 0)))
 
         // pan bucket on the left end: low walls on all four sides, spaced
         // wider than the ball so it lands on the pan floor

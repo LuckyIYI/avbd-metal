@@ -267,7 +267,12 @@ kernel void warmstart_joints(
     float torqueArm = j.C0Lin.w;
 
     j.C0Lin = float4(pA - pB, torqueArm);
-    j.C0Ang = float4(q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm, j.C0Ang.w);
+    float3 c0a = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
+    if (j.hingeAxis.w != 0.0f) {
+        float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
+        c0a -= ax * dot(ax, c0a);
+    }
+    j.C0Ang = float4(c0a, j.C0Ang.w);
 
     float warm = P.alpha * P.gamma;
     float stiffLin = j.rA.w;
@@ -381,12 +386,25 @@ inline void stampJoint(device const JointGPU& j, uint self,
     if (dot(penAng, penAng) > 0.0f) {
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
         float3 C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
-        if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
-
-        float3 F = penAng * C + j.lambdaAng.xyz;
         float s = (isA ? 1.0f : -1.0f) * torqueArm;
-        acc.lhsAng = m3_add(acc.lhsAng, m3_diag(penAng * (s * s)));
-        acc.rhsAng += F * s;
+        if (j.hingeAxis.w != 0.0f) {
+            // 1-DOF hinge: project constraint, force, and stiffness so the
+            // rotation about the axis stays completely free
+            float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
+            C -= ax * dot(ax, C);
+            if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
+            float3 F = penAng * C + j.lambdaAng.xyz;
+            F -= ax * dot(ax, F);
+            float k = (penAng.x + penAng.y + penAng.z) / 3.0f * (s * s);
+            M3 P = m3_add(m3_diag(float3(k)), m3_scale(m3_outer(ax, ax), -k));
+            acc.lhsAng = m3_add(acc.lhsAng, P);
+            acc.rhsAng += F * s;
+        } else {
+            if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
+            float3 F = penAng * C + j.lambdaAng.xyz;
+            acc.lhsAng = m3_add(acc.lhsAng, m3_diag(penAng * (s * s)));
+            acc.rhsAng += F * s;
+        }
     }
 }
 
@@ -614,10 +632,19 @@ kernel void dual_joints(
     if (dot(penAng, penAng) > 0.0f) {
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
         float3 C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
+        if (j.hingeAxis.w != 0.0f) {
+            float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
+            C -= ax * dot(ax, C);
+        }
         if (j.header.w & 2) {
             C -= j.C0Ang.xyz * P.alpha;
-            j.lambdaAng.xyz = clamp(penAng * C + j.lambdaAng.xyz,
-                                    -P.lambdaMax, P.lambdaMax);
+            float3 lam = clamp(penAng * C + j.lambdaAng.xyz,
+                               -P.lambdaMax, P.lambdaMax);
+            if (j.hingeAxis.w != 0.0f) {
+                float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
+                lam -= ax * dot(ax, lam);
+            }
+            j.lambdaAng.xyz = lam;
         }
         float cap = min(stiffAng, PENALTY_MAX);
         j.penaltyAng.xyz = min(penAng + fabs(C) * P.betaAng, cap);

@@ -21,6 +21,8 @@ public final class CPUJoint: CPUForce {
     /// Rest relative rotation captured at creation: the angular constraint
     /// preserves the spawn alignment instead of forcing qA == qB.
     public var restRel: Quat
+    /// Hinge axis in B local (nil = full weld). Rotation about it stays free.
+    public var hingeAxis: F3? = nil
 
     init(solver: CPUSolver, bodyA: CPURigid?, bodyB: CPURigid, rA: F3, rB: F3,
          stiffnessLin: Float, stiffnessAng: Float, fracture: Float) {
@@ -44,7 +46,13 @@ public final class CPUJoint: CPUForce {
     func currentCAng() -> F3 {
         guard let bodyB else { return .zero }
         let qA = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
-        return quatSub((qA * restRel).normalized, bodyB.positionAng) * torqueArm
+        var C = quatSub((qA * restRel).normalized, bodyB.positionAng) * torqueArm
+        if let axisL = hingeAxis {
+            // project out the free rotation about the hinge axis
+            let axisW = bodyB.positionAng.act(axisL)
+            C -= axisW * dot(axisW, C)
+        }
+        return C
     }
 
     override func initialize() -> Bool {
@@ -106,11 +114,20 @@ public final class CPUJoint: CPUForce {
         if length_squared(penaltyAng) > 0 {
             var C = currentCAng()
             if stiffnessAng.isInfinite { C -= C0Ang * alpha }
-            let F = penaltyAng * C + lambdaAng
+            var F = penaltyAng * C + lambdaAng
 
             let s: Float = (isA ? 1 : -1) * torqueArm
-            // jAng = s * I, so J^T K J = s^2 K and J^T F = s * F
-            lhsAng += Mat3Rows.diagonal(penaltyAng * (s * s))
+            if let axisL = hingeAxis {
+                // hinge: no stiffness or force about the free axis
+                let a = bodyB.positionAng.act(axisL)
+                F -= a * dot(a, F)
+                let k = (penaltyAng.x + penaltyAng.y + penaltyAng.z) / 3 * (s * s)
+                var P = Mat3Rows.diagonal(F3(repeating: k))
+                P += outerRows(a, a) * (-k)
+                lhsAng += P
+            } else {
+                lhsAng += Mat3Rows.diagonal(penaltyAng * (s * s))
+            }
             rhsAng += F * s
         }
     }

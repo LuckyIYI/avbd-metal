@@ -40,6 +40,7 @@ public struct JointGPU {
     public var penaltyLin: SIMD4<Float> = .zero
     public var penaltyAng: SIMD4<Float> = .zero
     public var restRel: SIMD4<Float> = SIMD4(0, 0, 0, 1)
+    public var hingeAxis: SIMD4<Float> = .zero
 }
 
 public struct SpringGPU {

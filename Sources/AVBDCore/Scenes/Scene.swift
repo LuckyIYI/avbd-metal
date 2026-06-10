@@ -43,10 +43,13 @@ public struct SceneJoint {
     public var stiffnessLin: Float
     public var stiffnessAng: Float
     public var fracture: Float
+    /// Hinge axis in body B's LOCAL frame. When set, the angular constraint
+    /// leaves rotation about this axis free (1-DOF revolute joint).
+    public var hingeAxis: F3?
 
     public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
                 stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
-                fracture: Float = .infinity) {
+                fracture: Float = .infinity, hingeAxis: F3? = nil) {
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
@@ -54,6 +57,7 @@ public struct SceneJoint {
         self.stiffnessLin = stiffnessLin
         self.stiffnessAng = stiffnessAng
         self.fracture = fracture
+        self.hingeAxis = hingeAxis.map(normalize)
     }
 }
 
@@ -184,10 +188,13 @@ public struct PhysicsScene {
                            shape: b.shape)
         }
         for j in joints {
-            solver.addJoint(j.bodyA >= 0 ? solver.bodies[j.bodyA] : nil, solver.bodies[j.bodyB],
-                            rA: j.rA, rB: j.rB,
-                            stiffnessLin: j.stiffnessLin, stiffnessAng: j.stiffnessAng,
-                            fracture: j.fracture)
+            let cj = solver.addJoint(j.bodyA >= 0 ? solver.bodies[j.bodyA] : nil,
+                                     solver.bodies[j.bodyB],
+                                     rA: j.rA, rB: j.rB,
+                                     stiffnessLin: j.stiffnessLin,
+                                     stiffnessAng: j.stiffnessAng,
+                                     fracture: j.fracture)
+            cj.hingeAxis = j.hingeAxis
         }
         for s in springs {
             solver.addSpring(solver.bodies[s.bodyA], solver.bodies[s.bodyB],

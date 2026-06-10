@@ -6,7 +6,7 @@ public enum Demos {
     public static var all: [String] {
         ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
          "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
-         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock"]
+         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun"]
     }
 
     /// Every demo scales for stress testing: 1 = small (original size),
@@ -33,6 +33,7 @@ public enum Demos {
         case "dominoes": return dominoes(count: 80 * s)
         case "car": return car(trackScale: s)
         case "gearclock": return gearclock(scale: s)
+        case "marblerun": return marblerun(marbles: 10 * s)
         default: return nil
         }
     }
