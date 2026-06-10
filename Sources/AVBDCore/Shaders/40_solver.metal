@@ -517,31 +517,24 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
     }
 }
 
-kernel void primal_solve(
-    device float4* posLin           [[buffer(0)]],
-    device float4* posAng           [[buffer(1)]],
-    device const float4* initLin    [[buffer(2)]],
-    device const float4* initAng    [[buffer(3)]],
-    device const float4* inertLin   [[buffer(4)]],
-    device const float4* inertAng   [[buffer(5)]],
-    device const float4* props      [[buffer(6)]],
-    device const JointGPU* joints   [[buffer(7)]],
-    device const SpringGPU* springs [[buffer(8)]],
-    device const ManifoldGPU* manifolds [[buffer(9)]],
-    device const uint* adjStart     [[buffer(10)]],
-    device const uint* adjCount     [[buffer(11)]],
-    device const uint* adjList      [[buffer(12)]],
-    device const uint* colorList    [[buffer(13)]],
-    device const uint* colorStart   [[buffer(14)]],
-    constant uint& colorIndex       [[buffer(15)]],
-    constant SimParams& P           [[buffer(16)]],
-    device const float4* shape      [[buffer(17)]],
-    uint tid                        [[thread_position_in_grid]])
+static inline void primal_one(
+    device float4* posLin,
+    device float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device const float4* inertLin,
+    device const float4* inertAng,
+    device const float4* props,
+    device const JointGPU* joints,
+    device const SpringGPU* springs,
+    device const ManifoldGPU* manifolds,
+    device const uint* adjStart,
+    device const uint* adjCount,
+    device const uint* adjList,
+    constant SimParams& P,
+    device const float4* shape,
+    uint body)
 {
-    uint s = colorStart[colorIndex];
-    uint e = colorStart[colorIndex + 1];
-    if (s + tid >= e) return;
-    uint body = colorList[s + tid];
 
     float4 pl = posLin[body];
     float mass = pl.w;
@@ -603,14 +596,42 @@ kernel void primal_solve(
 // Dual update — one thread per joint, plus one per manifold.
 // ----------------------------------------------------------------------------
 
-kernel void dual_joints(
-    device const float4* posLin     [[buffer(0)]],
-    device const float4* posAng     [[buffer(1)]],
-    device JointGPU* joints         [[buffer(2)]],
-    constant SimParams& P           [[buffer(3)]],
-    uint gid                        [[thread_position_in_grid]])
+kernel void primal_solve(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device const JointGPU* joints   [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    constant uint& colorIndex       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    uint tid                        [[thread_position_in_grid]])
 {
-    if (gid >= P.numJoints) return;
+    uint s = colorStart[colorIndex];
+    uint e = colorStart[colorIndex + 1];
+    if (s + tid >= e) return;
+    primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
+               joints, springs, manifolds, adjStart, adjCount, adjList,
+               P, shape, colorList[s + tid]);
+}
+
+static inline void dual_joint_one(
+    device const float4* posLin,
+    device const float4* posAng,
+    device JointGPU* joints,
+    constant SimParams& P,
+    uint gid)
+{
     device JointGPU& j = joints[gid];
     if (j.header.z != 0) return;
 
@@ -665,18 +686,15 @@ kernel void dual_joints(
     }
 }
 
-kernel void dual_manifolds(
-    device const float4* posLin     [[buffer(0)]],
-    device const float4* posAng     [[buffer(1)]],
-    device const float4* initLin    [[buffer(2)]],
-    device const float4* initAng    [[buffer(3)]],
-    device ManifoldGPU* manifolds   [[buffer(4)]],
-    device const atomic_uint* counters [[buffer(5)]],
-    constant SimParams& P           [[buffer(6)]],
-    uint gid                        [[thread_position_in_grid]])
+static inline void dual_manifold_one(
+    device const float4* posLin,
+    device const float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device ManifoldGPU* manifolds,
+    constant SimParams& P,
+    uint gid)
 {
-    uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    if (gid >= numPairs) return;
     device ManifoldGPU& m = manifolds[gid];
     uint n = m.header.z;
     if (n == 0) return;
@@ -711,6 +729,86 @@ kernel void dual_manifolds(
             m.contacts[i].rB.w = length(C.yz) < STICK_THRESH ? 1.0f : 0.0f;
         }
         m.contacts[i].penalty = float4(pen, 0);
+    }
+}
+
+// Fused dual update: one dispatch covers joints then contact manifolds.
+// Small scenes with many iterations are dispatch-bound; merging the two
+// kernels halves the per-iteration barrier count.
+kernel void dual_all(
+    device const float4* posLin     [[buffer(0)]],
+    device const float4* posAng     [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device JointGPU* joints         [[buffer(4)]],
+    device ManifoldGPU* manifolds   [[buffer(5)]],
+    device const atomic_uint* counters [[buffer(6)]],
+    constant SimParams& P           [[buffer(7)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid < P.numJoints) {
+        dual_joint_one(posLin, posAng, joints, P, gid);
+        return;
+    }
+    uint mi = gid - P.numJoints;
+    uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
+    if (mi >= numPairs) return;
+    if (manifolds[mi].header.z == 0) return;
+    dual_manifold_one(posLin, posAng, initLin, initAng, manifolds, P, mi);
+}
+
+// Persistent solver for small scenes: ALL iterations x colors x dual updates
+// in a single dispatch of one threadgroup. Scenes with few bodies and many
+// iterations are dominated by per-dispatch launch/barrier latency (~40us
+// each); this replaces hundreds of dispatches with threadgroup barriers.
+kernel void solve_persistent(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device JointGPU* joints         [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device ManifoldGPU* manifolds   [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    device const atomic_uint* counters [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    uint tid                        [[thread_position_in_threadgroup]],
+    uint tgSize                     [[threads_per_threadgroup]])
+{
+    uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
+    uint dualTotal = P.numJoints + numPairs;
+    for (uint iter = 0; iter < P.iterations; iter++) {
+        for (uint c = 0; c < MAX_COLORS; c++) {
+            uint s0 = colorStart[c];
+            uint e0 = colorStart[c + 1];
+            if (s0 == e0) continue;
+            for (uint i = s0 + tid; i < e0; i += tgSize) {
+                primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
+                           props, joints, springs, manifolds,
+                           adjStart, adjCount, adjList, P, shape, colorList[i]);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        for (uint g = tid; g < dualTotal; g += tgSize) {
+            if (g < P.numJoints) {
+                if (joints[g].header.z == 0)
+                    dual_joint_one(posLin, posAng, joints, P, g);
+            } else {
+                uint mi = g - P.numJoints;
+                if (manifolds[mi].header.z != 0)
+                    dual_manifold_one(posLin, posAng, initLin, initAng,
+                                      manifolds, P, mi);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 

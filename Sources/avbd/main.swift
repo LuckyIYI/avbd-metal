@@ -1,4 +1,5 @@
 import AVBDCore
+import Metal
 import Foundation
 import simd
 
@@ -133,11 +134,37 @@ case "bench":
     let solver = try GPUSolver(scene: scene)
     // warmup
     for _ in 0..<10 { solver.step() }
+    if args.contains("--capture") {
+        let mgr = MTLCaptureManager.shared()
+        let cd = MTLCaptureDescriptor()
+        cd.captureObject = solver.device
+        cd.destination = .gpuTraceDocument
+        cd.outputURL = URL(fileURLWithPath: "avbd-\(scene.name).gputrace")
+        try mgr.startCapture(with: cd)
+        for _ in 0..<3 { solver.step() }
+        mgr.stopCapture()
+        print("wrote avbd-\(scene.name).gputrace (open in Xcode)")
+    }
+    solver.profiling = args.contains("--profile")
+    solver.resetProfile()
     let t0 = Date()
     for _ in 0..<o.frames { solver.step() }
     let ms = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
     print(String(format: "%@: %d bodies, %d iterations, %.3f ms/frame (%.1f FPS)",
                  scene.name, scene.bodies.count, scene.settings.iterations, ms, 1000 / ms))
+    if solver.profiling, solver.profileFrames > 0 {
+        let n = Double(solver.profileFrames)
+        let total = solver.profileNS.values.reduce(0, +)
+        print(String(format: "GPU stage breakdown (%d frames, %.3f ms GPU/frame):",
+                     solver.profileFrames, total / n / 1e6))
+        for (name, ns) in solver.profileNS.sorted(by: { $0.value > $1.value }) {
+            print(String(format: "  %-20s %8.3f ms  %5.1f%%",
+                         (name as NSString).utf8String!, ns / n / 1e6,
+                         ns / total * 100))
+        }
+        print(String(format: "  pairs %d  colors %d",
+                     solver.lastNumPairs, solver.lastMaxColorUsed + 1))
+    }
 
 case "parity":
     guard args.count > 1 else { fail("usage: avbd parity <demo>") }

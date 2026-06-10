@@ -222,7 +222,8 @@ struct SimParams {
     uint numGlobals;        // oversized/static bodies tested brute-force
     float maxSpeed;         // velocity clamp (anti-tunneling safety)
     float lambdaMax;        // dual variable bound (paper Sec 4)
-    float pad0, pad1;
+    uint iterations;        // solver iterations (persistent kernel path)
+    float pad1;
 };
 
 struct JointGPU {

@@ -73,7 +73,7 @@ public final class GPUSolver {
     public private(set) var lastColorCounts: [Int] = []
     public private(set) var lastNumPairs: Int = 0
     // Start pessimistic so the first frame covers every possible color.
-    var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
+    public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
 
     public init(scene: PhysicsScene, device: MTLDevice? = nil,
@@ -416,6 +416,7 @@ public final class GPUSolver {
         params.betaAng = settings.betaAng
         params.gamma = settings.gamma
         params.lambdaMax = settings.lambdaMax
+        params.iterations = UInt32(settings.iterations)
     }
 
     private func dispatch1D(_ enc: MTLComputeCommandEncoder, _ name: String, _ count: Int,
@@ -472,6 +473,31 @@ public final class GPUSolver {
 
     // MARK: - Step
 
+    // ---- GPU profiling: per-stage timestamps (encoder-boundary sampling,
+    // the only granularity Apple GPUs support) ----
+    public var profiling = false
+    public private(set) var profileNS: [String: Double] = [:]
+    public private(set) var profileFrames = 0
+    private var counterBuf: MTLCounterSampleBuffer?
+    private var stageNames: [String] = []
+
+    public func resetProfile() {
+        profileNS = [:]
+        profileFrames = 0
+    }
+
+    private func makeCounterBuf() -> MTLCounterSampleBuffer? {
+        if let counterBuf { return counterBuf }
+        guard let set = device.counterSets?.first(where: { $0.name.lowercased().contains("timestamp") })
+        else { return nil }
+        let d = MTLCounterSampleBufferDescriptor()
+        d.counterSet = set
+        d.storageMode = .shared
+        d.sampleCount = 128
+        counterBuf = try? device.makeCounterSampleBuffer(descriptor: d)
+        return counterBuf
+    }
+
     public func step() {
         syncParams()
         frameIndex += 1
@@ -486,7 +512,30 @@ public final class GPUSolver {
             blit.endEncoding()
         }
 
-        guard let enc = cmd1.makeComputeCommandEncoder() else { return }
+        let sampleBuf = profiling ? makeCounterBuf() : nil
+        stageNames = []
+        func makeEncoder(_ name: String) -> MTLComputeCommandEncoder? {
+            guard let sampleBuf, stageNames.count < 63 else {
+                let e = cmd1.makeComputeCommandEncoder()
+                e?.label = name
+                return e
+            }
+            let pd = MTLComputePassDescriptor()
+            let att = pd.sampleBufferAttachments[0]!
+            att.sampleBuffer = sampleBuf
+            att.startOfEncoderSampleIndex = stageNames.count * 2
+            att.endOfEncoderSampleIndex = stageNames.count * 2 + 1
+            stageNames.append(name)
+            let e = cmd1.makeComputeCommandEncoder(descriptor: pd)
+            e?.label = name
+            return e
+        }
+        guard var enc = makeEncoder("broadphase") else { return }
+        func stage(_ name: String) {
+            guard profiling else { return }
+            enc.endEncoding()
+            enc = makeEncoder(name) ?? enc
+        }
         var P = params
         var nExcl = numExclusions
 
@@ -536,6 +585,7 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 2)
         }
 
+        stage("narrowphase")
         // Narrowphase (warm-start from prev manifolds + map)
         dispatchIndirect(enc, "np_collide", argsOffset: 0) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -554,6 +604,7 @@ public final class GPUSolver {
             e.setBuffer(self.spinVel, offset: 0, index: 13)
         }
 
+        stage("persistence-map")
         // Rebuild persistence map from THIS frame's manifolds (for next frame)
         dispatch1D(enc, "pm_clear", mapCapacity) { e in
             e.setBuffer(self.mapKeyA, offset: 0, index: 0)
@@ -569,6 +620,7 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
         }
 
+        stage("warmstart")
         // Warm start joints (before body prediction; uses start-of-step poses)
         dispatch1D(enc, "warmstart_joints", numJoints) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -589,6 +641,7 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 9)
         }
 
+        stage("adjacency")
         // Adjacency
         var nb32 = UInt32(numBodies)
         dispatch1D(enc, "adj_clear_degrees", numBodies) { e in
@@ -621,6 +674,7 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
         }
 
+        stage("coloring")
         // Coloring (8 Jacobi rounds, ping-pong)
         var src = colorsA, dst = colorsB
         for _ in 0..<8 {
@@ -666,12 +720,47 @@ public final class GPUSolver {
         // no CPU sync mid-step. The color loop bound comes from the previous
         // frame (colors change slowly; stale bound is safe since dispatch
         // size always comes from the GPU-side colorArgs).
-        let colorBound = min(AVBD_MAX_COLORS, max(lastMaxColorUsed + 2, 12))
-        for _ in 0..<settings.iterations {
-            for c in 0..<colorBound {
-                var cIdx = UInt32(c)
-                let p = ps("primal_solve")
-                enc.setComputePipelineState(p)
+        stage("solver-iterations")
+        let persistPSO = ps("solve_persistent")
+        if numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
+            // small scene: the whole solve loop in ONE dispatch — hundreds
+            // of per-dispatch launch/barrier latencies become threadgroup
+            // barriers (see kernel comment)
+            enc.setComputePipelineState(persistPSO)
+            enc.setBuffer(posLin, offset: 0, index: 0)
+            enc.setBuffer(posAng, offset: 0, index: 1)
+            enc.setBuffer(initLin, offset: 0, index: 2)
+            enc.setBuffer(initAng, offset: 0, index: 3)
+            enc.setBuffer(inertLin, offset: 0, index: 4)
+            enc.setBuffer(inertAng, offset: 0, index: 5)
+            enc.setBuffer(props, offset: 0, index: 6)
+            enc.setBuffer(joints, offset: 0, index: 7)
+            enc.setBuffer(springs, offset: 0, index: 8)
+            enc.setBuffer(manifolds, offset: 0, index: 9)
+            enc.setBuffer(adjStart, offset: 0, index: 10)
+            enc.setBuffer(degrees, offset: 0, index: 11)
+            enc.setBuffer(adjList, offset: 0, index: 12)
+            enc.setBuffer(colorList, offset: 0, index: 13)
+            enc.setBuffer(colorStart, offset: 0, index: 14)
+            enc.setBuffer(counters, offset: 0, index: 15)
+            enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
+            enc.setBuffer(shape, offset: 0, index: 17)
+            let w = persistPSO.threadExecutionWidth
+            let tg = min(persistPSO.maxTotalThreadsPerThreadgroup,
+                         ((max(numBodies, 64) + w - 1) / w) * w)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
+        } else {
+        // tight bound: +1 headroom over what the colorer actually produced
+        // last frame (a stale bound only delays a few bodies by one frame;
+        // every extra slot costs an empty dispatch + barrier per iteration)
+        let colorBound = min(AVBD_MAX_COLORS, max(lastMaxColorUsed + 2, 4))
+        let primalPSO = ps("primal_solve")
+        for it in 0..<settings.iterations {
+            enc.setComputePipelineState(primalPSO)
+            do {
+                // rebind each iteration (dual_all clobbers low indices), but
+                // hoisted out of the color loop: only cIdx changes per color
                 enc.setBuffer(posLin, offset: 0, index: 0)
                 enc.setBuffer(posAng, offset: 0, index: 1)
                 enc.setBuffer(initLin, offset: 0, index: 2)
@@ -687,31 +776,32 @@ public final class GPUSolver {
                 enc.setBuffer(adjList, offset: 0, index: 12)
                 enc.setBuffer(colorList, offset: 0, index: 13)
                 enc.setBuffer(colorStart, offset: 0, index: 14)
-                enc.setBytes(&cIdx, length: 4, index: 15)
                 enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
                 enc.setBuffer(shape, offset: 0, index: 17)
+            }
+            _ = it
+            for c in 0..<colorBound {
+                var cIdx = UInt32(c)
+                enc.setBytes(&cIdx, length: 4, index: 15)
                 enc.dispatchThreadgroups(indirectBuffer: colorArgs,
                                          indirectBufferOffset: c * 12,
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
             }
 
-            dispatch1D(enc, "dual_joints", numJoints) { e in
-                e.setBuffer(self.posLin, offset: 0, index: 0)
-                e.setBuffer(self.posAng, offset: 0, index: 1)
-                e.setBuffer(self.joints, offset: 0, index: 2)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 3)
-            }
-            dispatchIndirect(enc, "dual_manifolds", argsOffset: 0) { e in
+            dispatchIndirect(enc, "dual_all", argsOffset: 6) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.posAng, offset: 0, index: 1)
                 e.setBuffer(self.initLin, offset: 0, index: 2)
                 e.setBuffer(self.initAng, offset: 0, index: 3)
-                e.setBuffer(self.manifolds, offset: 0, index: 4)
-                e.setBuffer(self.counters, offset: 0, index: 5)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
+                e.setBuffer(self.joints, offset: 0, index: 4)
+                e.setBuffer(self.manifolds, offset: 0, index: 5)
+                e.setBuffer(self.counters, offset: 0, index: 6)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
             }
         }
 
+        }
+        stage("finalize")
         dispatch1D(enc, "finalize_velocities", numBodies) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.posAng, offset: 0, index: 1)
@@ -726,6 +816,27 @@ public final class GPUSolver {
         enc.endEncoding()
         cmd1.commit()
         cmd1.waitUntilCompleted()
+
+        if profiling, let sampleBuf,
+           let data = try? sampleBuf.resolveCounterRange(0..<(stageNames.count * 2)) {
+            data.withUnsafeBytes { raw in
+                let ts = raw.bindMemory(to: UInt64.self)
+                // calibrate raw GPU ticks to the command buffer's wall time
+                var sum: Double = 0
+                var deltas: [Double] = []
+                for i in 0..<stageNames.count {
+                    let d = Double(ts[i * 2 + 1] &- ts[i * 2])
+                    deltas.append(d)
+                    sum += d
+                }
+                let wallNS = (cmd1.gpuEndTime - cmd1.gpuStartTime) * 1e9
+                let k = sum > 0 ? wallNS / sum : 0
+                for (i, name) in stageNames.enumerated() {
+                    profileNS[name, default: 0] += deltas[i] * k
+                }
+            }
+            profileFrames += 1
+        }
 
         // Keep canonical colors in colorsA for next frame
         if finalColors !== colorsA {

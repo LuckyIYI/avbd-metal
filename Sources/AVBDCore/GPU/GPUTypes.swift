@@ -25,7 +25,7 @@ public struct SimParamsGPU {
     public var numGlobals: UInt32 = 0
     public var maxSpeed: Float = 100
     public var lambdaMax: Float = 1.0e6
-    public var pad0a: Float = 0
+    public var iterations: UInt32 = 0
     public var pad2: Float = 0
 }
 
