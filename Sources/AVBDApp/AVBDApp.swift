@@ -79,7 +79,7 @@ struct ContentView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
 
-                Text("Drag bodies with the mouse.\n⌥-drag orbits, scroll zooms.")
+                Text("Drag bodies with the mouse.\n⌥-drag orbits, scroll zooms,\nspace/right-drag pans.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
@@ -147,8 +147,25 @@ struct MetalView: NSViewRepresentable {
 
 final class InteractiveMTKView: MTKView {
     weak var coordinator: MetalView.Coordinator?
+    private var spaceDown = false
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 { spaceDown = true } else { super.keyDown(with: event) }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == 49 { spaceDown = false } else { super.keyUp(with: event) }
+    }
+
+    private func pan(_ event: NSEvent) {
+        guard let r = coordinator?.renderer else { return }
+        let s = r.distance * 0.0015
+        let right = F3(-sin(r.azimuth), cos(r.azimuth), 0)
+        r.target -= right * Float(event.deltaX) * s
+        r.target += F3(0, 0, 1) * Float(event.deltaY) * s
+    }
 
     private func rayAt(_ event: NSEvent) -> (F3, F3)? {
         guard let r = coordinator?.renderer else { return nil }
@@ -159,7 +176,7 @@ final class InteractiveMTKView: MTKView {
 
     override func mouseDown(with event: NSEvent) {
         guard let c = coordinator else { return }
-        if event.modifierFlags.contains(.option) { return }
+        if event.modifierFlags.contains(.option) || spaceDown { return }
         if let (o, d) = rayAt(event) {
             c.model.beginDrag(origin: o, dir: d)
             c.dragging = true
@@ -168,7 +185,9 @@ final class InteractiveMTKView: MTKView {
 
     override func mouseDragged(with event: NSEvent) {
         guard let c = coordinator, let r = c.renderer else { return }
-        if event.modifierFlags.contains(.option) || !c.dragging {
+        if spaceDown {
+            pan(event)
+        } else if event.modifierFlags.contains(.option) || !c.dragging {
             r.azimuth -= Float(event.deltaX) * 0.008
             r.elevation = min(max(r.elevation + Float(event.deltaY) * 0.008, -1.5), 1.55)
         } else if let (o, d) = rayAt(event) {
@@ -182,14 +201,7 @@ final class InteractiveMTKView: MTKView {
     }
 
     override func rightMouseDragged(with event: NSEvent) {
-        guard let r = coordinator?.renderer else { return }
-        // pan target in view plane
-        let s = r.distance * 0.0015
-        let azim = r.azimuth
-        let right = F3(-sin(azim), cos(azim), 0)
-        let upish = F3(0, 0, 1)
-        r.target -= right * Float(event.deltaX) * s
-        r.target += upish * Float(event.deltaY) * s
+        pan(event)
     }
 
     override func scrollWheel(with event: NSEvent) {
