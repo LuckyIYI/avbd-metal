@@ -145,7 +145,7 @@ final class RoboticsModel: ObservableObject, RenderableModel {
                     action = env.oracleAction(0)
                 case .policy:
                     if let act = policyAction?(env) {
-                        action = act * 2
+                        action = act * 3
                     } else {
                         policyStatus = "policy unavailable: build with `make app-ml` and train a model first"
                         action = env.tipPos(0)

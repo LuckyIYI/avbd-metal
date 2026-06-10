@@ -151,6 +151,11 @@ case "train-wm":
                             batch: o.batch, latent: o.latent, lr: o.lr,
                             lambda: o.lambda, modelPath: "runs/pusht/model")
 
+case "probe-wm":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.probe(dataPath: "runs/pusht/data",
+                            modelPath: "runs/pusht/model", latent: o.latent)
+
 case "oracle-pusht":
     let o = parseOptions(Array(args.dropFirst(1)))
     try PushTPipeline.oracle(episodes: o.episodes)
