@@ -7,31 +7,135 @@ extension Demos {
 
     /// Hanging plank bridge ("навесной мост"): plank chain anchored to two
     /// static platforms, with heavy boxes dropped onto the middle.
-    public static func bridge(planks: Int = 16, drops: Int = 4) -> PhysicsScene {
+    /// Suspension bridge with real construction: towers, main catenary
+    /// cables (capsule-link ropes pinned at tower saddles, anchored to the
+    /// ground), vertical hanger ropes carrying a segmented deck. The deck
+    /// hangs entirely on rope tension, like the real thing.
+    public static func bridge(planks: Int = 14, drops: Int = 4) -> PhysicsScene {
         var s = PhysicsScene(name: "bridge")
-        addGround(&s)
-        let plankLen: Float = 1.0, plankW: Float = 2.0, plankT: Float = 0.15
-        let span = Float(planks) * plankLen
-        let deckZ: Float = 5
+        s.settings.iterations = 20
+        s.settings.lambdaMax = 6000
+        addGround(&s, friction: 0.8)
 
-        // platforms
-        _ = s.addBody(size: F3(4, 4, deckZ), density: 0, friction: 0.8,
-                      position: F3(-span / 2 - 2, 0, deckZ / 2))
-        _ = s.addBody(size: F3(4, 4, deckZ), density: 0, friction: 0.8,
-                      position: F3(span / 2 + 2, 0, deckZ / 2))
+        let plankLen: Float = 1.3, plankW: Float = 2.6, plankT: Float = 0.14
+        let span = Float(planks) * plankLen           // suspended main span
+        let deckZ: Float = 2.6
+        let towerX = span / 2 + 0.6
+        let towerTopZ: Float = 7.4
+        let anchorX = towerX + 4.2
+        let cableY = plankW / 2 + 0.12                // cables run outside the deck
+        let sag: Float = 2.9                           // mid-span cable droop
 
-        // plank chain, anchored at both ends to world
+        // ---- towers: two legs + crossbeam per side, static ----
+        for tx in [-towerX, towerX] {
+            for ty in [-cableY, cableY] {
+                _ = s.addBody(size: F3(0.45, 0.45, towerTopZ), density: 0, friction: 0.5,
+                              position: F3(tx, ty, towerTopZ / 2))
+            }
+            _ = s.addBody(size: F3(0.45, cableY * 2 + 0.45, 0.4), density: 0, friction: 0.5,
+                          position: F3(tx, 0, towerTopZ - 1.1))
+            // ground anchor blocks
+            for ax in [anchorX, -anchorX] where (ax > 0) == (tx > 0) {
+                _ = s.addBody(size: F3(1.2, cableY * 2 + 0.6, 0.7), density: 0, friction: 0.8,
+                              position: F3(ax, 0, 0.35))
+            }
+        }
+
+        /// rope of capsule links along a world polyline. Ends are pinned to
+        /// (body, localAnchor) pairs; body -1 pins to the world at the
+        /// polyline end point.
+        func addRope(_ pts: [F3], radius: Float, density: Float,
+                     pinA: (Int, F3)? = (-1, .zero),
+                     pinB: (Int, F3)? = (-1, .zero)) -> [Int] {
+            var links: [Int] = []
+            var prev = -3                       // -3 = nothing yet
+            var prevAnchor = F3.zero
+            for k in 0..<(pts.count - 1) {
+                let a = pts[k]
+                let b = pts[k + 1]
+                let d = b - a
+                let len = length(d)
+                let dir = d / len
+                let axis = cross(F3(0, 0, 1), dir)
+                var q = Quat(real: 1, imag: .zero)
+                if length(axis) > 1e-5 {
+                    let c = simd_clamp(dot(F3(0, 0, 1), dir), -1, 1)
+                    q = Quat(angle: acos(c), axis: normalize(axis))
+                }
+                let mid = (a + b) * 0.5
+                let link = s.addCapsule(length: len * 0.8, radius: radius,
+                                        density: density, friction: 0.3,
+                                        position: mid, rotation: q)
+                let rB = F3(0, 0, -len / 2)
+                if prev == -3 {
+                    if let (pb, pr) = pinA {
+                        let rA = pb < 0 ? pts[0] : pr
+                        s.addJoint(SceneJoint(bodyA: pb, bodyB: link, rA: rA, rB: rB))
+                    }
+                } else {
+                    s.addJoint(SceneJoint(bodyA: prev, bodyB: link,
+                                          rA: prevAnchor, rB: rB))
+                    s.addJoint(SceneJoint(bodyA: prev, bodyB: link, rA: .zero, rB: .zero,
+                                          stiffnessLin: 0, stiffnessAng: 0))
+                }
+                links.append(link)
+                prev = link
+                prevAnchor = F3(0, 0, len / 2)
+            }
+            if let (pb, pr) = pinB {
+                let rB2 = pb < 0 ? pts[pts.count - 1] : pr
+                s.addJoint(SceneJoint(bodyA: pb, bodyB: links.last!,
+                                      rA: rB2, rB: prevAnchor))
+            }
+            return links
+        }
+
+        // ---- main cables: anchor -> tower saddle -> catenary -> saddle -> anchor
+        func cableHeight(_ x: Float) -> Float {
+            towerTopZ - sag * (1 - (x / towerX) * (x / towerX))
+        }
+        var cableLinks: [[Int]] = []   // per side: links of the suspended part
+        var cableXs: [Float] = []      // x of each suspended sample midpoint
+        for sy in [Float(-1), 1] {
+            let y = sy * cableY
+            // side span: anchor up to the saddle (straight, 5 segments)
+            var pts: [F3] = []
+            let pA = F3(sy * anchorX, y, 0.45)
+            let pB = F3(sy * towerX, y, towerTopZ)
+            for k in 0...5 {
+                let t = Float(k) / 5
+                pts.append(pA + (pB - pA) * t)
+            }
+            _ = addRope(pts, radius: 0.07, density: 3)
+            // main span: catenary between the saddles, fine sampling
+            pts = []
+            let nSamp = planks * 2
+            for k in 0...nSamp {
+                let t: Float = Float(k) / Float(nSamp)
+                let x: Float = -towerX + t * 2 * towerX
+                pts.append(F3(x, y, cableHeight(x)))
+            }
+            let links = addRope(pts, radius: 0.07, density: 3)
+            if sy > 0 {
+                cableXs = (0..<links.count).map { (i: Int) -> Float in
+                    let t: Float = (Float(i) + 0.5) / Float(nSamp)
+                    return -towerX + t * 2 * towerX
+                }
+            }
+            cableLinks.append(links)
+        }
+
+        // ---- deck: segmented planks hinged edge to edge ----
+        var plankIdx: [Int] = []
         var prev = -1
-        var first = -1
         for i in 0..<planks {
             let x = -span / 2 + (Float(i) + 0.5) * plankLen
-            let idx = s.addBody(size: F3(plankLen * 0.98, plankW, plankT),
-                                density: 0.8, friction: 0.8,
+            let idx = s.addBody(size: F3(plankLen * 0.97, plankW, plankT),
+                                density: 0.7, friction: 0.8,
                                 position: F3(x, 0, deckZ))
-            if i == 0 { first = idx }
+            plankIdx.append(idx)
             if prev >= 0 {
-                // hinge along the shared edge: two ball joints across the width
-                for yo in [-plankW * 0.4, plankW * 0.4] {
+                for yo in [-plankW * 0.42, plankW * 0.42] {
                     s.addJoint(SceneJoint(bodyA: prev, bodyB: idx,
                                           rA: F3(plankLen / 2, yo, 0),
                                           rB: F3(-plankLen / 2, yo, 0)))
@@ -39,22 +143,52 @@ extension Demos {
             }
             prev = idx
         }
-        // world anchors at platform edges
-        for yo in [-plankW * 0.4, plankW * 0.4] {
-            s.addJoint(SceneJoint(bodyA: -1, bodyB: first,
-                                  rA: F3(-span / 2, yo, deckZ),
-                                  rB: F3(-plankLen / 2, yo, 0)))
-            s.addJoint(SceneJoint(bodyA: -1, bodyB: prev,
-                                  rA: F3(span / 2, yo, deckZ),
-                                  rB: F3(plankLen / 2, yo, 0)))
+        // deck ends tied to short static ramps at the towers
+        for (endIdx, sx) in [(plankIdx[0], Float(-1)), (plankIdx[planks - 1], 1)] {
+            let ramp = s.addBody(size: F3(1.6, plankW, 0.3), density: 0, friction: 0.8,
+                                 position: F3(sx * (span / 2 + 0.85), 0, deckZ - 0.1))
+            for yo in [-plankW * 0.42, plankW * 0.42] {
+                s.addJoint(SceneJoint(bodyA: ramp, bodyB: endIdx,
+                                      rA: F3(-sx * 0.8, yo, 0.1),
+                                      rB: F3(sx * plankLen / 2, yo, 0)))
+            }
+        }
+
+        // ---- hangers: vertical ropes from cable links down to plank edges
+        for (sideIdx, sy) in [Float(-1), 1].enumerated() {
+            let links = cableLinks[sideIdx]
+            for (i, plank) in plankIdx.enumerated() {
+                let px = -span / 2 + (Float(i) + 0.5) * plankLen
+                var best = 0
+                var bestD = Float.greatestFiniteMagnitude
+                for (li, lx) in cableXs.enumerated() where abs(lx - px) < bestD {
+                    bestD = abs(lx - px)
+                    best = li
+                }
+                let cl = links[best]
+                let top = s.bodies[cl].position
+                let bot = F3(px, sy * plankW * 0.46, deckZ + plankT / 2)
+                let hgt = top.z - bot.z
+                if hgt < 0.3 { continue }
+                let n = max(1, Int(hgt / 0.55 + 0.5))
+                var hp: [F3] = []
+                let topP = F3(top.x, sy * cableY, top.z)
+                for k in 0...n {
+                    let t = Float(k) / Float(n)
+                    hp.append(topP + (bot - topP) * t)
+                }
+                _ = addRope(hp, radius: 0.045, density: 2,
+                            pinA: (cl, F3(0, 0, 0)),
+                            pinB: (plank, F3(0, sy * plankW * 0.46, plankT / 2)))
+            }
         }
 
         // cargo dropped on the middle
         var rng = SplitMix64(seed: 7)
         for k in 0..<drops {
-            _ = s.addBody(size: F3(repeating: 0.8), density: 2, friction: 0.6,
+            _ = s.addBody(size: F3(repeating: 0.8), density: 1.5, friction: 0.6,
                           position: F3((rng.nextFloat() - 0.5) * span * 0.4,
-                                       (rng.nextFloat() - 0.5) * plankW * 0.5,
+                                       (rng.nextFloat() - 0.5) * plankW * 0.4,
                                        deckZ + 3 + Float(k) * 1.5))
         }
         return s
