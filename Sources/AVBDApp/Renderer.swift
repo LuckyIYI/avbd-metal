@@ -3,9 +3,9 @@ import MetalKit
 import AVBDCore
 import simd
 
-// Instanced-box renderer for AVBD body state. Instance transforms are built
-// on the GPU (build_instances kernel in AVBDCore); this file owns the render
-// pipeline, camera, and a ground grid.
+// Renderer: PBR (GGX metallic-roughness) + ACES, sRGB-correct framebuffer,
+// SSAO (Alchemy-style, world-position prepass), soft blob shadows,
+// horizon-only fog, analytic instanced geometry for box/sphere/torus/capsule.
 
 let renderShaderSource = """
 #include <metal_stdlib>
@@ -13,243 +13,144 @@ using namespace metal;
 
 struct RenderInstance {
     float4x4 model;
-    float4 color;       // w = shape type (0 box, 1 sphere, 2 torus)
-    float4 params;      // torus: x = major R, y = minor r
+    float4 color;       // rgb albedo (sRGB), w = shape type (0 box 1 sphere 2 torus 3 capsule)
+    float4 params;      // torus/capsule dims; z = bounding radius, w = dynamic flag
 };
 
 struct Uniforms {
     float4x4 viewProj;
-    float4 lightDir;    // xyz used
-    float4 eye;         // xyz used
+    float4 lightDir;    // xyz
+    float4 eye;         // xyz
+    float4 screen;      // x,y = drawable size; z = px per world unit at d=1
 };
 
 struct VOut {
     float4 position [[position]];
     float3 normal;
     float3 world;
-    float4 color;
+    float3 albedo;
 };
 
-// Unit cube (centered, size 1): 36 verts, position+normal
+#define HORIZON_LIN float3(0.78, 0.81, 0.85)
+#define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4)
+#define SKY_IRR float3(0.30, 0.33, 0.38)
+#define GND_IRR float3(0.20, 0.185, 0.17)
+
+inline float3 srgbToLin(float3 c) { return c * c * (0.7 + 0.3 * c); } // fast approx
+
+inline float horizonFog(float d) {
+    // fog ONLY near the horizon: nothing below 90m, full by 420m
+    return smoothstep(90.0, 420.0, d);
+}
+
+inline float3 acesTonemap(float3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Geometry vertex shaders (analytic instanced shapes)
+// ---------------------------------------------------------------------------
 constant float3 cubeVerts[36] = {
-    // +X
     float3(0.5,-0.5,-0.5), float3(0.5, 0.5,-0.5), float3(0.5, 0.5, 0.5),
     float3(0.5,-0.5,-0.5), float3(0.5, 0.5, 0.5), float3(0.5,-0.5, 0.5),
-    // -X
     float3(-0.5,-0.5, 0.5), float3(-0.5, 0.5, 0.5), float3(-0.5, 0.5,-0.5),
     float3(-0.5,-0.5, 0.5), float3(-0.5, 0.5,-0.5), float3(-0.5,-0.5,-0.5),
-    // +Y
     float3(-0.5, 0.5,-0.5), float3(-0.5, 0.5, 0.5), float3(0.5, 0.5, 0.5),
     float3(-0.5, 0.5,-0.5), float3(0.5, 0.5, 0.5), float3(0.5, 0.5,-0.5),
-    // -Y
     float3(-0.5,-0.5, 0.5), float3(-0.5,-0.5,-0.5), float3(0.5,-0.5,-0.5),
     float3(-0.5,-0.5, 0.5), float3(0.5,-0.5,-0.5), float3(0.5,-0.5, 0.5),
-    // +Z
     float3(-0.5,-0.5, 0.5), float3(0.5,-0.5, 0.5), float3(0.5, 0.5, 0.5),
     float3(-0.5,-0.5, 0.5), float3(0.5, 0.5, 0.5), float3(-0.5, 0.5, 0.5),
-    // -Z
     float3(0.5,-0.5,-0.5), float3(-0.5,-0.5,-0.5), float3(-0.5, 0.5,-0.5),
     float3(0.5,-0.5,-0.5), float3(-0.5, 0.5,-0.5), float3(0.5, 0.5,-0.5),
 };
-
 constant float3 cubeNormals[6] = {
     float3(1,0,0), float3(-1,0,0), float3(0,1,0),
     float3(0,-1,0), float3(0,0,1), float3(0,0,-1),
 };
 
-vertex VOut box_vertex(uint vid [[vertex_id]],
-                       uint iid [[instance_id]],
+inline VOut collapse() {
+    VOut o;
+    o.position = float4(0, 0, -2, 1);
+    o.normal = float3(0); o.world = float3(0); o.albedo = float3(0);
+    return o;
+}
+
+inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) {
+    float4 world = inst.model * float4(p, 1);
+    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
+                            normalize(inst.model[1].xyz),
+                            normalize(inst.model[2].xyz));
+    VOut o;
+    o.position = U.viewProj * world;
+    o.normal = rot * n;
+    o.world = world.xyz;
+    o.albedo = srgbToLin(inst.color.rgb);
+    return o;
+}
+
+vertex VOut box_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
                        device const RenderInstance* instances [[buffer(0)]],
                        constant Uniforms& U [[buffer(1)]])
 {
     RenderInstance inst = instances[iid];
-    if (inst.color.w != 0.0) {       // non-box instance: collapse in box pass
-        VOut o;
-        o.position = float4(0, 0, -2, 1);
-        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
-        return o;
-    }
-    float3 p = cubeVerts[vid];
-    float3 n = cubeNormals[vid / 6];
-    float4 world = inst.model * float4(p, 1);
-    // normal via rotation part (columns normalized to undo size scaling)
-    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
-                            normalize(inst.model[1].xyz),
-                            normalize(inst.model[2].xyz));
-    VOut o;
-    o.position = U.viewProj * world;
-    o.normal = rot * n;
-    o.world = world.xyz;
-    o.color = inst.color;
-    return o;
+    if (inst.color.w != 0.0) return collapse();
+    return emit(cubeVerts[vid], cubeNormals[vid / 6], inst, U);
 }
 
-// ---------- PBR (metallic-roughness, GGX + Schlick) + ACES ----------
-inline float3 acesTonemap(float3 x) {
-    // Narkowicz ACES approximation
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
-}
-
-#define HORIZON_COL float3(0.93, 0.94, 0.96)
-#define SUN_COL (float3(1.0, 0.96, 0.88) * 3.2)
-#define SKY_IRR float3(0.62, 0.66, 0.72)
-#define GND_IRR float3(0.52, 0.50, 0.47)
-
-inline float3 pbrShade(float3 albedo, float3 n, float3 world, float3 eye, float3 L,
-                       float rough, float metal)
-{
-    float3 V = normalize(eye - world);
-    float3 H = normalize(L + V);
-    float NdL = max(dot(n, L), 0.0);
-    float NdV = max(dot(n, V), 1e-4);
-    float NdH = max(dot(n, H), 0.0);
-    float HdV = max(dot(H, V), 0.0);
-
-    float a2 = rough * rough; a2 *= a2;
-    float dDen = NdH * NdH * (a2 - 1.0) + 1.0;
-    float D = a2 / (M_PI_F * dDen * dDen);
-    float k = (rough + 1.0); k = k * k / 8.0;
-    float G = (NdV / (NdV * (1.0 - k) + k)) * (NdL / (NdL * (1.0 - k) + k));
-    float3 F0 = mix(float3(0.04), albedo, metal);
-    float3 F = F0 + (1.0 - F0) * pow(1.0 - HdV, 5.0);
-    float3 spec = D * G * F / max(4.0 * NdV * NdL, 1e-4);
-    float3 kd = (1.0 - F) * (1.0 - metal);
-
-    float3 direct = (kd * albedo / M_PI_F + spec) * SUN_COL * NdL;
-
-    // hemispheric irradiance + fresnel-weighted sky reflection
-    float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
-    float3 ambient = kd * albedo * irr;
-    float3 R = reflect(-V, n);
-    float3 skyRef = mix(HORIZON_COL * 0.9, float3(0.72, 0.78, 0.88),
-                        clamp(R.z, 0.0, 1.0));
-    float fr = pow(1.0 - NdV, 5.0);
-    ambient += skyRef * (F0 + (1.0 - F0) * fr) * (1.0 - rough * 0.7) * 0.5;
-
-    return direct + ambient;
-}
-
-fragment float4 box_fragment(VOut in [[stage_in]],
-                             constant Uniforms& U [[buffer(1)]])
-{
-    float3 n = normalize(in.normal);
-    float3 lit = pbrShade(in.color.rgb, n, in.world, U.eye.xyz,
-                          -U.lightDir.xyz, 0.42, 0.0);
-    float d = length(in.world - U.eye.xyz);
-    float fog = 1.0 - exp(-d * 0.010);
-    lit = mix(lit, HORIZON_COL, fog * fog);
-    return float4(acesTonemap(lit), 1.0);
-}
-
-// Analytic UV sphere: STACKS x SLICES quads, 6 verts each
 #define SPH_STACKS 12
 #define SPH_SLICES 18
-
-vertex VOut sphere_vertex(uint vid [[vertex_id]],
-                          uint iid [[instance_id]],
+vertex VOut sphere_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
                           device const RenderInstance* instances [[buffer(0)]],
                           constant Uniforms& U [[buffer(1)]])
 {
     RenderInstance inst = instances[iid];
-    if (inst.color.w != 1.0) {       // non-sphere: collapse in sphere pass
-        VOut o;
-        o.position = float4(0, 0, -2, 1);
-        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
-        return o;
-    }
-    uint quad = vid / 6;
-    uint corner = vid % 6;
-    uint stack = quad / SPH_SLICES;
-    uint slice = quad % SPH_SLICES;
-    // two triangles: (0,0),(1,0),(1,1) and (0,0),(1,1),(0,1)
+    if (inst.color.w != 1.0) return collapse();
+    uint quad = vid / 6, corner = vid % 6;
+    uint stack = quad / SPH_SLICES, slice = quad % SPH_SLICES;
     uint2 off[6] = { uint2(0,0), uint2(1,0), uint2(1,1), uint2(0,0), uint2(1,1), uint2(0,1) };
-    float v = float(stack + off[corner].y) / float(SPH_STACKS);   // 0..1 pole to pole
+    float v = float(stack + off[corner].y) / float(SPH_STACKS);
     float u = float(slice + off[corner].x) / float(SPH_SLICES);
-    float phi = v * M_PI_F;
-    float theta = u * 2.0 * M_PI_F;
+    float phi = v * M_PI_F, theta = u * 2.0 * M_PI_F;
     float3 n = float3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
-    float3 p = n * 0.5;              // unit-diameter sphere
-    float4 world = inst.model * float4(p, 1);
-    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
-                            normalize(inst.model[1].xyz),
-                            normalize(inst.model[2].xyz));
-    VOut o;
-    o.position = U.viewProj * world;
-    o.normal = rot * n;
-    o.world = world.xyz;
-    o.color = float4(inst.color.rgb, 1);
-    return o;
+    return emit(n * 0.5, n, inst, U);
 }
 
-// Analytic torus: RINGS x SIDES quads
 #define TOR_RINGS 24
 #define TOR_SIDES 12
-
-vertex VOut torus_vertex(uint vid [[vertex_id]],
-                         uint iid [[instance_id]],
+vertex VOut torus_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
                          device const RenderInstance* instances [[buffer(0)]],
                          constant Uniforms& U [[buffer(1)]])
 {
     RenderInstance inst = instances[iid];
-    if (inst.color.w != 2.0) {       // non-torus: collapse in torus pass
-        VOut o;
-        o.position = float4(0, 0, -2, 1);
-        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
-        return o;
-    }
-    uint quad = vid / 6;
-    uint corner = vid % 6;
-    uint ring = quad / TOR_SIDES;
-    uint side = quad % TOR_SIDES;
+    if (inst.color.w != 2.0) return collapse();
+    uint quad = vid / 6, corner = vid % 6;
+    uint ring = quad / TOR_SIDES, side = quad % TOR_SIDES;
     uint2 off[6] = { uint2(0,0), uint2(1,0), uint2(1,1), uint2(0,0), uint2(1,1), uint2(0,1) };
     float u = float(ring + off[corner].x) / float(TOR_RINGS) * 2.0 * M_PI_F;
     float v = float(side + off[corner].y) / float(TOR_SIDES) * 2.0 * M_PI_F;
-    float R = inst.params.x;
-    float r = inst.params.y;
-    float3 spine = float3(R * cos(u), R * sin(u), 0);
+    float R = inst.params.x, r = inst.params.y;
     float3 n = float3(cos(u) * cos(v), sin(u) * cos(v), sin(v));
-    float3 p = spine + n * r;
-    float4 world = inst.model * float4(p, 1);
-    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
-                            normalize(inst.model[1].xyz),
-                            normalize(inst.model[2].xyz));
-    VOut o;
-    o.position = U.viewProj * world;
-    o.normal = rot * n;
-    o.world = world.xyz;
-    o.color = float4(inst.color.rgb, 1);
-    return o;
+    float3 p = float3(R * cos(u), R * sin(u), 0) + n * r;
+    return emit(p, n, inst, U);
 }
 
-// Analytic capsule: cylinder (RINGS_C x SLICES_C) + two hemisphere caps
 #define CAP_SLICES 16
 #define CAP_STACKS 6
-
-vertex VOut capsule_vertex(uint vid [[vertex_id]],
-                           uint iid [[instance_id]],
+vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
                            device const RenderInstance* instances [[buffer(0)]],
                            constant Uniforms& U [[buffer(1)]])
 {
     RenderInstance inst = instances[iid];
-    if (inst.color.w != 3.0) {
-        VOut o;
-        o.position = float4(0, 0, -2, 1);
-        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
-        return o;
-    }
-    float halfL = inst.params.x * 0.5;
-    float r = inst.params.y;
-    // total stacks: CAP_STACKS (bottom cap) + 1 (cylinder) + CAP_STACKS (top)
-    uint quad = vid / 6;
-    uint corner = vid % 6;
-    uint stack = quad / CAP_SLICES;
-    uint slice = quad % CAP_SLICES;
+    if (inst.color.w != 3.0) return collapse();
+    float halfL = inst.params.x * 0.5, r = inst.params.y;
+    uint quad = vid / 6, corner = vid % 6;
+    uint stack = quad / CAP_SLICES, slice = quad % CAP_SLICES;
     uint2 off[6] = { uint2(0,0), uint2(1,0), uint2(1,1), uint2(0,0), uint2(1,1), uint2(0,1) };
     uint sIdx = stack + off[corner].y;
     float u = float(slice + off[corner].x) / float(CAP_SLICES) * 2.0 * M_PI_F;
-    float phi;      // -pi/2..pi/2 latitude
-    float zoff;
+    float phi, zoff;
     if (sIdx <= CAP_STACKS) {
         phi = -M_PI_F / 2.0 + float(sIdx) / float(CAP_STACKS) * (M_PI_F / 2.0);
         zoff = -halfL;
@@ -259,89 +160,153 @@ vertex VOut capsule_vertex(uint vid [[vertex_id]],
         zoff = halfL;
     }
     float3 n = float3(cos(phi) * cos(u), cos(phi) * sin(u), sin(phi));
-    float3 p = n * r + float3(0, 0, zoff);
-    float4 world = inst.model * float4(p, 1);
-    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
-                            normalize(inst.model[1].xyz),
-                            normalize(inst.model[2].xyz));
-    VOut o;
-    o.position = U.viewProj * world;
-    o.normal = rot * n;
-    o.world = world.xyz;
-    o.color = float4(inst.color.rgb, 1);
-    return o;
+    return emit(n * r + float3(0, 0, zoff), n, inst, U);
 }
 
-// --- Soft blob shadows: one ground quad per body, radial falloff ---
-struct ShadowOut {
-    float4 position [[position]];
-    float2 local;
-    float strength;
-};
-
-vertex ShadowOut shadow_vertex(uint vid [[vertex_id]],
-                               uint iid [[instance_id]],
-                               device const RenderInstance* instances [[buffer(0)]],
-                               constant Uniforms& U [[buffer(1)]])
+// ---------------------------------------------------------------------------
+// PBR main fragment (samples the SSAO texture)
+// ---------------------------------------------------------------------------
+fragment float4 pbr_fragment(VOut in [[stage_in]],
+                             constant Uniforms& U [[buffer(1)]],
+                             texture2d<float> aoTex [[texture(0)]])
 {
-    RenderInstance inst = instances[iid];
-    float r = inst.params.z;               // bounding radius
-    float3 c = inst.model[3].xyz;
-    float h = max(c.z - r * 0.5, 0.0);     // height above ground
-    float strength = inst.params.w * clamp(1.0 - h / 7.0, 0.0, 1.0) * 0.42;
-    float size = r * (1.25 + h * 0.08);
-    float2 corners[6] = {
-        float2(-1,-1), float2(1,-1), float2(1,1),
-        float2(-1,-1), float2(1,1), float2(-1,1)
-    };
-    float2 l = corners[vid];
-    ShadowOut o;
-    if (strength < 0.01 || r <= 0.0) {
-        o.position = float4(0, 0, -2, 1);
-        o.local = float2(0); o.strength = 0;
-        return o;
-    }
-    float3 p = float3(c.xy + l * size, 0.012);
-    o.position = U.viewProj * float4(p, 1);
-    o.local = l;
-    o.strength = strength;
-    return o;
+    constexpr sampler smp(filter::linear);
+    float ao = aoTex.sample(smp, in.position.xy / U.screen.xy).r;
+
+    float3 n = normalize(in.normal);
+    float3 L = -U.lightDir.xyz;
+    float3 V = normalize(U.eye.xyz - in.world);
+    float3 H = normalize(L + V);
+    float NdL = max(dot(n, L), 0.0);
+    float NdV = max(dot(n, V), 1e-4);
+    float NdH = max(dot(n, H), 0.0);
+    float HdV = max(dot(H, V), 0.0);
+
+    const float rough = 0.45;
+    float a2 = rough * rough; a2 *= a2;
+    float dDen = NdH * NdH * (a2 - 1.0) + 1.0;
+    float D = a2 / (M_PI_F * dDen * dDen);
+    float k = (rough + 1.0); k = k * k / 8.0;
+    float G = (NdV / (NdV * (1.0 - k) + k)) * (NdL / (NdL * (1.0 - k) + k));
+    float3 F0 = float3(0.04);
+    float3 F = F0 + (1.0 - F0) * pow(1.0 - HdV, 5.0);
+    float3 spec = D * G * F / max(4.0 * NdV * NdL, 1e-4);
+
+    float3 direct = (in.albedo / M_PI_F * (1.0 - F) + spec) * SUN_COL * NdL;
+
+    float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
+    float3 ambient = in.albedo * irr;
+    float3 R = reflect(-V, n);
+    float3 skyRef = mix(HORIZON_LIN, float3(0.42, 0.48, 0.58), clamp(R.z, 0.0, 1.0));
+    ambient += skyRef * (F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0)) * 0.30;
+    ambient *= ao;
+
+    float3 lit = direct + ambient;
+    float fog = horizonFog(length(in.world - U.eye.xyz));
+    lit = mix(lit, HORIZON_LIN, fog);
+    return float4(acesTonemap(lit), 1.0);
 }
 
-fragment float4 shadow_fragment(ShadowOut in [[stage_in]]) {
-    float d = length(in.local);
-    float a = in.strength * smoothstep(1.0, 0.25, d);
-    return float4(0.18, 0.20, 0.26, a);
-}
-
-// --- Sky: fullscreen gradient (drawn first, no depth) ---
-struct SkyOut { float4 position [[position]]; float2 uv; };
-
-vertex SkyOut sky_vertex(uint vid [[vertex_id]]) {
-    float2 p = float2((vid << 1) & 2, vid & 2) * 2.0 - 1.0;   // fullscreen tri
-    SkyOut o;
-    o.position = float4(p, 1.0, 1.0);
-    o.uv = p;
-    return o;
-}
-
-fragment float4 sky_fragment(SkyOut in [[stage_in]]) {
-    float t = clamp(in.uv.y * 0.5 + 0.5, 0.0, 1.0);
-    float3 horizon = float3(0.93, 0.94, 0.96);
-    float3 zenith  = float3(0.72, 0.78, 0.87);
-    float3 c = mix(horizon, zenith, pow(t, 1.6));
-    // soft warm sun glow upper-left
-    float2 sunDir = float2(-0.45, 0.55);
-    float glow = exp(-3.0 * distance(in.uv, sunDir));
-    c += float3(0.20, 0.17, 0.11) * glow;
-    return float4(c, 1);
-}
-
-// --- Checkerboard floor: huge quad, AA checker, fades into the horizon ---
-struct FloorOut {
-    float4 position [[position]];
-    float3 world;
+// ---------------------------------------------------------------------------
+// Prepass: world position + normal into two attachments (for SSAO)
+// ---------------------------------------------------------------------------
+struct PreOut {
+    float4 pos  [[color(0)]];   // xyz world, w = 1 (geometry present)
+    float4 norm [[color(1)]];
 };
+
+fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
+    PreOut o;
+    o.pos = float4(in.world, 1.0);
+    o.norm = float4(normalize(in.normal), 0);
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// SSAO (Alchemy / point-based estimator over a spiral kernel)
+// ---------------------------------------------------------------------------
+struct FSOut { float4 position [[position]]; float2 uv; };
+
+vertex FSOut fs_vertex(uint vid [[vertex_id]]) {
+    float2 p = float2((vid << 1) & 2, vid & 2) * 2.0 - 1.0;
+    FSOut o;
+    o.position = float4(p, 1.0, 1.0);
+    o.uv = p * float2(0.5, -0.5) + 0.5;
+    return o;
+}
+
+fragment float4 ssao_fragment(FSOut in [[stage_in]],
+                              constant Uniforms& U [[buffer(1)]],
+                              texture2d<float> posTex [[texture(0)]],
+                              texture2d<float> normTex [[texture(1)]])
+{
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge);
+    float4 P4 = posTex.sample(smp, in.uv);
+    if (P4.w < 0.5) return float4(1);
+    float3 P = P4.xyz;
+    float3 N = normTex.sample(smp, in.uv).xyz;
+    float dist = length(P - U.eye.xyz);
+
+    // world-space AO radius, projected to a pixel radius
+    const float R = 0.9;
+    float pxRadius = clamp(U.screen.z * R / max(dist, 0.5), 3.0, 90.0);
+
+    // stable per-pixel rotation (position-hash, no temporal flicker)
+    float ang = fract(sin(dot(floor(in.position.xy), float2(12.9898, 78.233)))
+                      * 43758.5453) * 6.2831853;
+    float ca = cos(ang), sa = sin(ang);
+
+    const int NS = 10;
+    float occ = 0.0;
+    for (int i = 0; i < NS; i++) {
+        float t = (float(i) + 0.5) / float(NS);
+        float a = t * 6.2831853 * 2.0;     // 2 spiral turns
+        float rad = t * pxRadius;
+        float2 off = float2(cos(a) * ca - sin(a) * sa,
+                            cos(a) * sa + sin(a) * ca) * rad;
+        float2 uv2 = in.uv + off / U.screen.xy;
+        float4 Q4 = posTex.sample(smp, uv2);
+        if (Q4.w < 0.5) continue;
+        float3 v = Q4.xyz - P;
+        float d2 = dot(v, v);
+        // Alchemy estimator: occlusion from samples above the surface
+        occ += max(0.0, dot(N, v) - 0.02 * dist) / (d2 + 0.08);
+    }
+    float ao = clamp(1.0 - occ * (1.6 / float(NS)), 0.0, 1.0);
+    ao = pow(ao, 1.4);
+    return float4(ao, ao, ao, 1);
+}
+
+fragment float4 blur_fragment(FSOut in [[stage_in]],
+                              constant Uniforms& U [[buffer(1)]],
+                              texture2d<float> src [[texture(0)]])
+{
+    constexpr sampler smp(filter::linear, address::clamp_to_edge);
+    float2 px = 1.0 / U.screen.xy;
+    float s = 0.0;
+    for (int y = -1; y <= 2; y++) {
+        for (int x = -1; x <= 2; x++) {
+            s += src.sample(smp, in.uv + float2(float(x) - 0.5, float(y) - 0.5) * px).r;
+        }
+    }
+    return float4(s / 16.0);
+}
+
+// ---------------------------------------------------------------------------
+// Sky (whitish), floor (AA checker, melts then fogs), blob shadows
+// ---------------------------------------------------------------------------
+fragment float4 sky_fragment(FSOut in [[stage_in]]) {
+    float t = 1.0 - in.uv.y;
+    float3 horizon = HORIZON_LIN;
+    float3 zenith  = float3(0.50, 0.56, 0.66);
+    float3 c = mix(horizon, zenith, pow(clamp(t, 0.0, 1.0), 1.7));
+    float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
+    float glow = exp(-3.0 * distance(ndc, float2(-0.45, 0.55)));
+    c += float3(0.30, 0.25, 0.16) * glow;
+    return float4(acesTonemap(c), 1);
+}
+
+struct FloorOut { float4 position [[position]]; float3 world; };
 
 vertex FloorOut floor_vertex(uint vid [[vertex_id]],
                              constant Uniforms& U [[buffer(1)]])
@@ -358,34 +323,87 @@ vertex FloorOut floor_vertex(uint vid [[vertex_id]],
     return o;
 }
 
+struct FloorPre {
+    float4 pos  [[color(0)]];
+    float4 norm [[color(1)]];
+};
+fragment FloorPre floor_prepass_fragment(FloorOut in [[stage_in]]) {
+    FloorPre o;
+    o.pos = float4(in.world, 1.0);
+    o.norm = float4(0, 0, 1, 0);
+    return o;
+}
+
 fragment float4 floor_fragment(FloorOut in [[stage_in]],
-                               constant Uniforms& U [[buffer(1)]])
+                               constant Uniforms& U [[buffer(1)]],
+                               texture2d<float> aoTex [[texture(0)]])
 {
-    // anti-aliased checker via filter-width smoothing
+    constexpr sampler smp(filter::linear);
+    float ao = aoTex.sample(smp, in.position.xy / U.screen.xy).r;
+
     float2 c = in.world.xy / 2.0;
     float2 fw = fwidth(c);
     float2 fc = fract(c);
     float2 aa = clamp((fc - 0.5) / max(fw, 0.0001) + 0.5, 0.0, 1.0)
-              - clamp(fc / max(fw, 0.0001) - 0.0, 0.0, 1.0) + 1.0;
+              - clamp(fc / max(fw, 0.0001), 0.0, 1.0) + 1.0;
     float2 sq = abs(aa - 1.0);
     float checker = abs(sq.x - sq.y);
-    float3 tileA = float3(0.90, 0.905, 0.92);
-    float3 tileB = float3(0.72, 0.755, 0.80);
+    float3 tileA = srgbToLin(float3(0.93, 0.93, 0.94));
+    float3 tileB = srgbToLin(float3(0.62, 0.66, 0.72));
+    float3 albedo = mix(tileA, tileB, checker);
     float3 avg = (tileA + tileB) * 0.5;
-    float3 col = mix(tileA, tileB, checker);
 
-    // distance "blur": melt the checker toward its average long before the
-    // fog finishes — reads as depth-of-field fuzziness, kills the moire
     float d = length(in.world.xy - U.eye.xy);
-    float blur = 1.0 - exp(-d * 0.022);
-    col = mix(col, avg, blur);
+    // melt the pattern with distance (anti-moire softness)
+    albedo = mix(albedo, avg, smoothstep(25.0, 160.0, d));
 
-    // full fog into the horizon color: by ~350m the floor IS the sky, so
-    // there is no visible horizon step anywhere
-    float3 horizon = float3(0.93, 0.94, 0.96);
-    float fog = 1.0 - exp(-d * 0.011);
-    col = mix(col, horizon, smoothstep(0.0, 1.0, fog));
-    return float4(col, 1);
+    float3 L = -U.lightDir.xyz;
+    float NdL = max(L.z, 0.0);
+    float3 lit = albedo * (SKY_IRR * 1.1 * ao + SUN_COL / M_PI_F * NdL * 0.85);
+
+    float fog = horizonFog(d);
+    lit = mix(lit, HORIZON_LIN, fog);
+    return float4(acesTonemap(lit), 1);
+}
+
+struct ShadowOut {
+    float4 position [[position]];
+    float2 local;
+    float strength;
+};
+
+vertex ShadowOut shadow_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                               device const RenderInstance* instances [[buffer(0)]],
+                               constant Uniforms& U [[buffer(1)]])
+{
+    RenderInstance inst = instances[iid];
+    float r = inst.params.z;
+    float3 c = inst.model[3].xyz;
+    float h = max(c.z - r * 0.5, 0.0);
+    float strength = inst.params.w * clamp(1.0 - h / 8.0, 0.0, 1.0) * 0.26;
+    float size = r * (1.45 + h * 0.10);
+    float2 corners[6] = {
+        float2(-1,-1), float2(1,-1), float2(1,1),
+        float2(-1,-1), float2(1,1), float2(-1,1)
+    };
+    ShadowOut o;
+    if (strength < 0.012 || r <= 0.0) {
+        o.position = float4(0, 0, -2, 1);
+        o.local = float2(0); o.strength = 0;
+        return o;
+    }
+    float3 p = float3(c.xy + corners[vid] * size, 0.03);
+    o.position = U.viewProj * float4(p, 1);
+    o.local = corners[vid];
+    o.strength = strength;
+    return o;
+}
+
+fragment float4 shadow_fragment(ShadowOut in [[stage_in]]) {
+    float d = length(in.local);
+    // wide gaussian falloff: soft penumbra, no hard rim
+    float a = in.strength * exp(-d * d * 3.2);
+    return float4(0.05, 0.06, 0.09, a);
 }
 """
 
@@ -393,32 +411,36 @@ struct Uniforms {
     var viewProj: simd_float4x4
     var lightDir: SIMD4<Float>
     var eye: SIMD4<Float>
+    var screen: SIMD4<Float>
 }
 
+let SPHV = 12 * 18 * 6
+let TORV = 24 * 12 * 6
+let CAPV = (2 * 6 + 1) * 16 * 6
+
 final class Renderer: NSObject, MTKViewDelegate {
+    static let sampleCount = 4
+    static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
+
     let device: MTLDevice
     let queue: MTLCommandQueue
-    var boxPipeline: MTLRenderPipelineState!
-    var spherePipeline: MTLRenderPipelineState!
-    var torusPipeline: MTLRenderPipelineState!
-    var capsulePipeline: MTLRenderPipelineState!
-    var skyPipeline: MTLRenderPipelineState!
-    var floorPipeline: MTLRenderPipelineState!
-    var shadowPipeline: MTLRenderPipelineState!
-    static let sampleCount = 4
-    var depthState: MTLDepthStencilState!
-    var noDepthState: MTLDepthStencilState!
-    var noWriteDepthState: MTLDepthStencilState!
-    var instances: MTLBuffer?
-
     weak var model: SimulationModel?
 
-    // Orbit camera
+    var boxP, sphereP, torusP, capsuleP: MTLRenderPipelineState!
+    var boxPre, spherePre, torusPre, capsulePre, floorPreP: MTLRenderPipelineState!
+    var skyP, floorP, shadowP, ssaoP, blurP: MTLRenderPipelineState!
+    var depthState, noDepthState, noWriteDepthState: MTLDepthStencilState!
+
+    var posTex, normTex, aoTexA, aoTexB, preDepthTex: MTLTexture?
+    var targetSize = SIMD2<Int>(0, 0)
+    var instances: MTLBuffer?
+
     var azimuth: Float = 0.9
     var elevation: Float = 0.35
     var distance: Float = 30
     var target = F3(0, 0, 3)
     var viewportSize = SIMD2<Float>(1, 1)
+    private var framesDrawn = 0
 
     init(device: MTLDevice, model: SimulationModel) throws {
         self.device = device
@@ -427,33 +449,44 @@ final class Renderer: NSObject, MTKViewDelegate {
         super.init()
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
-        func pipe(_ v: String, _ f: String) throws -> MTLRenderPipelineState {
+        func pipe(_ v: String, _ f: String, samples: Int = Renderer.sampleCount,
+                  blend: Bool = false,
+                  colorFormats: [MTLPixelFormat] = [Renderer.colorFormat],
+                  depth: MTLPixelFormat = .depth32Float) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
-            d.vertexFunction = lib.makeFunction(name: v)
-            d.fragmentFunction = lib.makeFunction(name: f)
-            d.colorAttachments[0].pixelFormat = .bgra8Unorm
-            d.depthAttachmentPixelFormat = .depth32Float
-            d.rasterSampleCount = Self.sampleCount
+            d.vertexFunction = lib.makeFunction(name: v)!
+            d.fragmentFunction = lib.makeFunction(name: f)!
+            for (i, fmt) in colorFormats.enumerated() {
+                d.colorAttachments[i].pixelFormat = fmt
+                if blend && i == 0 {
+                    d.colorAttachments[i].isBlendingEnabled = true
+                    d.colorAttachments[i].sourceRGBBlendFactor = .sourceAlpha
+                    d.colorAttachments[i].destinationRGBBlendFactor = .oneMinusSourceAlpha
+                }
+            }
+            d.depthAttachmentPixelFormat = depth
+            d.rasterSampleCount = samples
             return try device.makeRenderPipelineState(descriptor: d)
         }
-        boxPipeline = try pipe("box_vertex", "box_fragment")
 
-        spherePipeline = try pipe("sphere_vertex", "box_fragment")
-        torusPipeline = try pipe("torus_vertex", "box_fragment")
-        capsulePipeline = try pipe("capsule_vertex", "box_fragment")
-        skyPipeline = try pipe("sky_vertex", "sky_fragment")
-        floorPipeline = try pipe("floor_vertex", "floor_fragment")
+        boxP = try pipe("box_vertex", "pbr_fragment")
+        sphereP = try pipe("sphere_vertex", "pbr_fragment")
+        torusP = try pipe("torus_vertex", "pbr_fragment")
+        capsuleP = try pipe("capsule_vertex", "pbr_fragment")
+        skyP = try pipe("fs_vertex", "sky_fragment")
+        floorP = try pipe("floor_vertex", "floor_fragment")
+        shadowP = try pipe("shadow_vertex", "shadow_fragment", blend: true)
 
-        let shd = MTLRenderPipelineDescriptor()
-        shd.vertexFunction = lib.makeFunction(name: "shadow_vertex")
-        shd.fragmentFunction = lib.makeFunction(name: "shadow_fragment")
-        shd.colorAttachments[0].pixelFormat = .bgra8Unorm
-        shd.colorAttachments[0].isBlendingEnabled = true
-        shd.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        shd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        shd.depthAttachmentPixelFormat = .depth32Float
-        shd.rasterSampleCount = Self.sampleCount
-        shadowPipeline = try device.makeRenderPipelineState(descriptor: shd)
+        let preFmt: [MTLPixelFormat] = [.rgba32Float, .rgba16Float]
+        boxPre = try pipe("box_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+        spherePre = try pipe("sphere_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+        torusPre = try pipe("torus_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+        capsulePre = try pipe("capsule_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+        floorPreP = try pipe("floor_vertex", "floor_prepass_fragment", samples: 1, colorFormats: preFmt)
+        ssaoP = try pipe("fs_vertex", "ssao_fragment", samples: 1,
+                         colorFormats: [.r8Unorm], depth: .invalid)
+        blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
+                         colorFormats: [.r8Unorm], depth: .invalid)
 
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
@@ -471,24 +504,46 @@ final class Renderer: NSObject, MTKViewDelegate {
         noWriteDepthState = device.makeDepthStencilState(descriptor: nw)
     }
 
+    private func ensureTargets(_ size: CGSize) {
+        let w = max(Int(size.width), 4), h = max(Int(size.height), 4)
+        if targetSize == SIMD2(w, h), posTex != nil { return }
+        targetSize = SIMD2(w, h)
+        func tex(_ fmt: MTLPixelFormat) -> MTLTexture {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt,
+                                                             width: w, height: h,
+                                                             mipmapped: false)
+            d.usage = [.renderTarget, .shaderRead]
+            d.storageMode = .private
+            return device.makeTexture(descriptor: d)!
+        }
+        posTex = tex(.rgba32Float)
+        normTex = tex(.rgba16Float)
+        aoTexA = tex(.r8Unorm)
+        aoTexB = tex(.r8Unorm)
+        let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                          width: w, height: h,
+                                                          mipmapped: false)
+        dd.usage = .renderTarget
+        dd.storageMode = .private
+        preDepthTex = device.makeTexture(descriptor: dd)
+    }
+
+    // MARK: - Camera
+
     var viewMatrix: simd_float4x4 {
-        let eye = eyePosition
-        return lookAt(eye: eye, center: target, up: F3(0, 0, 1))
+        lookAt(eye: eyePosition, center: target, up: F3(0, 0, 1))
     }
 
     var eyePosition: F3 {
-        target + F3(
-            distance * cos(elevation) * cos(azimuth),
-            distance * cos(elevation) * sin(azimuth),
-            distance * sin(elevation)
-        )
+        target + F3(distance * cos(elevation) * cos(azimuth),
+                    distance * cos(elevation) * sin(azimuth),
+                    distance * sin(elevation))
     }
 
     func projectionMatrix(aspect: Float) -> simd_float4x4 {
         perspective(fovY: 50 * .pi / 180, aspect: aspect, near: 0.1, far: 1000)
     }
 
-    /// Ray through screen point in world space.
     func ray(at point: CGPoint, in size: CGSize) -> (origin: F3, dir: F3) {
         let aspect = Float(size.width / max(size.height, 1))
         let ndcX = Float(point.x / size.width) * 2 - 1
@@ -507,6 +562,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         viewportSize = SIMD2(Float(size.width), Float(size.height))
     }
 
+    // MARK: - Frame
+
     func draw(in view: MTKView) {
         guard let model,
               let solver = model.solver,
@@ -515,74 +572,114 @@ final class Renderer: NSObject, MTKViewDelegate {
               let cmd = queue.makeCommandBuffer() else { return }
 
         model.tickIfRunning()
+        ensureTargets(view.drawableSize)
 
         let count = solver.bodyCount
         let stride = MemoryLayout<simd_float4x4>.stride + 32
-        let needed = count * stride
         if instances == nil || instances!.length < count * stride {
-            instances = device.makeBuffer(length: max(256, count * stride), options: .storageModePrivate)
+            instances = device.makeBuffer(length: max(256, count * stride),
+                                          options: .storageModePrivate)
         }
-        _ = needed
-        guard let instances else { return }
+        guard let instances, let posTex, let normTex, let aoTexA, let aoTexB,
+              let preDepthTex else { return }
 
         solver.encodeBuildInstances(cmd, instances: instances,
                                     colorMode: model.colorByGraphColor ? 1 : 0)
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
-        let l = normalize(F3(0.4, 0.25, -0.85))
-        let e = eyePosition
+        let pxPerUnit = viewportSize.y * 0.5 / tan(25 * Float.pi / 180)
         var U = Uniforms(viewProj: projectionMatrix(aspect: aspect) * viewMatrix,
-                         lightDir: SIMD4(l, 0),
-                         eye: SIMD4(e, 0))
+                         lightDir: SIMD4(normalize(F3(0.4, 0.25, -0.85)), 0),
+                         eye: SIMD4(eyePosition, 0),
+                         screen: SIMD4(viewportSize.x, viewportSize.y, pxPerUnit, 0))
 
-        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0.87, green: 0.93, blue: 1.0, alpha: 1)
+        // ---- 1. prepass: world pos + normals ----
+        let pre = MTLRenderPassDescriptor()
+        pre.colorAttachments[0].texture = posTex
+        pre.colorAttachments[0].loadAction = .clear
+        pre.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        pre.colorAttachments[0].storeAction = .store
+        pre.colorAttachments[1].texture = normTex
+        pre.colorAttachments[1].loadAction = .clear
+        pre.colorAttachments[1].storeAction = .store
+        pre.depthAttachment.texture = preDepthTex
+        pre.depthAttachment.loadAction = .clear
+        pre.depthAttachment.clearDepth = 1
+        pre.depthAttachment.storeAction = .dontCare
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: pre) {
+            enc.setDepthStencilState(depthState)
+            enc.setRenderPipelineState(floorPreP)
+            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
+                               (torusPre!, TORV), (capsulePre!, CAPV)] {
+                enc.setRenderPipelineState(p)
+                enc.setVertexBuffer(instances, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: verts, instanceCount: count)
+            }
+            enc.endEncoding()
+        }
+
+        // ---- 2. SSAO ----
+        let aoPass = MTLRenderPassDescriptor()
+        aoPass.colorAttachments[0].texture = aoTexA
+        aoPass.colorAttachments[0].loadAction = .dontCare
+        aoPass.colorAttachments[0].storeAction = .store
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: aoPass) {
+            enc.setRenderPipelineState(ssaoP)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(posTex, index: 0)
+            enc.setFragmentTexture(normTex, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
+        }
+
+        // ---- 3. blur AO ----
+        let blurPass = MTLRenderPassDescriptor()
+        blurPass.colorAttachments[0].texture = aoTexB
+        blurPass.colorAttachments[0].loadAction = .dontCare
+        blurPass.colorAttachments[0].storeAction = .store
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: blurPass) {
+            enc.setRenderPipelineState(blurP)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexA, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
+        }
+
+        // ---- 4. main pass ----
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
-        // sky first (depth test/write off via noDepth state)
         enc.setDepthStencilState(noDepthState)
-        enc.setRenderPipelineState(skyPipeline)
+        enc.setRenderPipelineState(skyP)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 
         enc.setDepthStencilState(depthState)
-        enc.setRenderPipelineState(floorPipeline)
+        enc.setRenderPipelineState(floorP)
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.setFragmentTexture(aoTexB, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
-        // soft blob shadows (read depth, don't write)
         enc.setDepthStencilState(noWriteDepthState)
-        enc.setRenderPipelineState(shadowPipeline)
+        enc.setRenderPipelineState(shadowP)
         enc.setVertexBuffer(instances, offset: 0, index: 0)
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: count)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
+                           instanceCount: count)
+
         enc.setDepthStencilState(depthState)
-
-        enc.setRenderPipelineState(boxPipeline)
-        enc.setVertexBuffer(instances, offset: 0, index: 0)
-        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 36, instanceCount: count)
-
-        enc.setRenderPipelineState(spherePipeline)
-        enc.setVertexBuffer(instances, offset: 0, index: 0)
-        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                           vertexCount: 12 * 18 * 6, instanceCount: count)
-
-        enc.setRenderPipelineState(torusPipeline)
-        enc.setVertexBuffer(instances, offset: 0, index: 0)
-        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                           vertexCount: 24 * 12 * 6, instanceCount: count)
-
-        enc.setRenderPipelineState(capsulePipeline)
-        enc.setVertexBuffer(instances, offset: 0, index: 0)
-        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                           vertexCount: (2 * 6 + 1) * 16 * 6, instanceCount: count)
+        for (p, verts) in [(boxP!, 36), (sphereP!, SPHV), (torusP!, TORV), (capsuleP!, CAPV)] {
+            enc.setRenderPipelineState(p)
+            enc.setVertexBuffer(instances, offset: 0, index: 0)
+            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexB, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: verts, instanceCount: count)
+        }
         enc.endEncoding()
 
         cmd.present(drawable)
@@ -590,13 +687,10 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         framesDrawn += 1
         if framesDrawn == 30, ProcessInfo.processInfo.environment["AVBD_MARKER"] != nil {
-            // Smoke-test hook: prove the render loop is alive and the sim ran.
             let info = "frames=30 bodies=\(count) stats=\(model.statsText)"
             try? info.write(toFile: "/tmp/avbd_render_marker.txt", atomically: true, encoding: .utf8)
         }
     }
-
-    private var framesDrawn = 0
 }
 
 func lookAt(eye: F3, center: F3, up: F3) -> simd_float4x4 {

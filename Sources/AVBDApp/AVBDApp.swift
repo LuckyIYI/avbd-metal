@@ -121,7 +121,7 @@ struct MetalView: NSViewRepresentable {
     func makeNSView(context: Context) -> InteractiveMTKView {
         let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()!
         let view = InteractiveMTKView(frame: .zero, device: device)
-        view.colorPixelFormat = .bgra8Unorm
+        view.colorPixelFormat = Renderer.colorFormat
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = Renderer.sampleCount
         view.preferredFramesPerSecond = 60
