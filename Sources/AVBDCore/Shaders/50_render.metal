@@ -6,7 +6,8 @@ using namespace metal;
 
 struct RenderInstance {
     float4x4 model;     // column-major, includes size scaling
-    float4 color;
+    float4 color;       // w = shape type (0 box, 1 sphere, 2 torus)
+    float4 params;      // torus: x = major R, y = minor r
 };
 
 inline float3x3 q_to_mat(float4 q) {
@@ -37,12 +38,15 @@ kernel void build_instances(
     constant uint& numBodies        [[buffer(4)]],
     constant uint& colorMode        [[buffer(5)]],   // 0 index, 1 graph color
     device const uint* colors       [[buffer(6)]],
+    device const uint* shapeType    [[buffer(7)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= numBodies) return;
     float4 pl = posLin[gid];
     float3x3 R = q_to_mat(posAng[gid]);
-    float3 sz = shape[gid].xyz;
+    uint st = shapeType[gid];
+    // torus: unit-scale model (geometry sized in the vertex shader)
+    float3 sz = st == 2 ? float3(1) : shape[gid].xyz;
 
     float4x4 m;
     m[0] = float4(R[0] * sz.x, 0);
@@ -54,6 +58,6 @@ kernel void build_instances(
     float3 c = pl.w > 0.0f
         ? palette(colorMode == 1 ? colors[gid] : gid)
         : float3(0.45f, 0.45f, 0.48f);
-    // color.w: 0 = box, 1 = sphere (renderer splits draw passes on this)
-    out[gid].color = float4(c, shape[gid].w < 0.0f ? 1.0f : 0.0f);
+    out[gid].color = float4(c, float(st));
+    out[gid].params = float4(shape[gid].x, shape[gid].y, 0, 0);
 }

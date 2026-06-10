@@ -285,6 +285,16 @@ extension CPUManifold {
             return collideSphereBox(bodyB, bodyA, sphereIsA: false, &contacts, &basisOut)
         case (.box, .box):
             return collideBoxBox(bodyA, bodyB, &contacts, &basisOut)
+        case (.torus, .sphere):
+            return collideTorusSphere(bodyA, bodyB, torusIsA: true, &contacts, &basisOut)
+        case (.sphere, .torus):
+            return collideTorusSphere(bodyB, bodyA, torusIsA: false, &contacts, &basisOut)
+        case (.torus, .box):
+            return collideTorusBox(bodyA, bodyB, torusIsA: true, &contacts, &basisOut)
+        case (.box, .torus):
+            return collideTorusBox(bodyB, bodyA, torusIsA: false, &contacts, &basisOut)
+        case (.torus, .torus):
+            return collideTorusTorus(bodyA, bodyB, &contacts, &basisOut)
         }
     }
 
@@ -406,6 +416,210 @@ extension CPUManifold {
             buildFaceManifold(bodyA, bodyB, boxA, boxB, true, best.indexA, best.normalAB, &contacts)
         } else {
             buildFaceManifold(bodyA, bodyB, boxA, boxB, false, best.indexB, best.normalAB, &contacts)
+        }
+        return contacts.count
+    }
+}
+
+// MARK: - Torus collision (implicit surface, alternating projection)
+
+/// Closest point on the torus SPINE circle (local frame: circle of radius R
+/// in the xy-plane) to a local-space point.
+@inline(__always)
+private func projectToSpine(_ p: F3, _ R: Float) -> F3 {
+    var d = F3(p.x, p.y, 0)
+    let len = length(d)
+    if len < 1e-6 { d = F3(1, 0, 0) } else { d /= len }
+    return d * R
+}
+
+extension CPUManifold {
+    /// Exact torus-sphere: project sphere center onto spine; tube vs sphere.
+    static func collideTorusSphere(_ torus: CPURigid, _ sphere: CPURigid, torusIsA: Bool,
+                                   _ contacts: inout [ContactPoint],
+                                   _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let R = torus.size.x, r = torus.size.y
+        let rs = sphere.size.x / 2
+        let qc = torus.positionAng.conjugate
+        let local = qc.act(sphere.positionLin - torus.positionLin)
+        let spine = projectToSpine(local, R)
+        let d = local - spine
+        let dist = length(d)
+        if dist > r + rs + AVBDConstants.collisionMargin { return 0 }
+        let nLocal = dist > 1e-6 ? d / dist : F3(0, 0, 1)
+        let nW = torus.positionAng.act(nLocal)          // torus -> sphere
+        let xTorus = torus.positionLin + torus.positionAng.act(spine + nLocal * r)
+        let xSphere = sphere.positionLin - nW * rs
+
+        let n = torusIsA ? -nW : nW                     // B -> A
+        basisOut = orthonormalBasis(n)
+        var c = ContactPoint()
+        c.featureKey = 0
+        let (bodyA, xA, xB) = torusIsA ? (torus, xTorus, xSphere) : (sphere, xSphere, xTorus)
+        let bodyB = torusIsA ? sphere : torus
+        // both shapes are round: world-space offsets
+        c.rA = xA - bodyA.positionLin
+        c.rB = xB - bodyB.positionLin
+        contacts.append(c)
+        return 1
+    }
+
+    /// Torus-box via alternating projection: seed points around the spine,
+    /// project box<->spine until converged; keep up to 4 distinct contacts
+    /// (a torus resting flat on a box needs a multi-point base).
+    static func collideTorusBox(_ torus: CPURigid, _ box: CPURigid, torusIsA: Bool,
+                                _ contacts: inout [ContactPoint],
+                                _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let R = torus.size.x, r = torus.size.y
+        let half = box.size * 0.5
+        // work in box-local space; transform the spine circle there
+        let qbc = box.positionAng.conjugate
+        let c0 = qbc.act(torus.positionLin - box.positionLin)
+        let axis = qbc.act(torus.positionAng.act(F3(0, 0, 1)))
+        var u = abs(axis.x) > abs(axis.z) ? F3(-axis.y, axis.x, 0) : F3(0, -axis.z, axis.y)
+        u = normalize(u)
+        let v = cross(axis, u)
+
+        func spinePoint(_ a: Float) -> F3 { c0 + (u * cos(a) + v * sin(a)) * R }
+        func projectToSpineBL(_ p: F3) -> F3 {
+            var d = p - c0
+            d -= axis * dot(axis, d)
+            let len = length(d)
+            return len < 1e-6 ? c0 + u * R : c0 + d / len * R
+        }
+
+        var found: [(q: F3, b: F3, n: F3, dist: Float)] = []
+        var bestSep = Float.greatestFiniteMagnitude
+        for seed in 0..<8 {
+            var q = spinePoint(Float(seed) / 8 * 2 * .pi)
+            var b = F3.zero
+            for _ in 0..<5 {
+                b = simd_clamp(q, -half, half)
+                q = projectToSpineBL(b)
+            }
+            var d = q - b
+            var dist = length(d)
+            var n: F3
+            if dist < 1e-6 {
+                // spine intersects the box: face ejection with TRUE depth
+                let pen = half - abs(b)
+                var axisI = 0
+                if pen.y < pen[axisI] { axisI = 1 }
+                if pen.z < pen[axisI] { axisI = 2 }
+                n = F3.zero
+                n[axisI] = b[axisI] >= 0 ? 1 : -1
+                b = q + n * pen[axisI]  // box surface point (true depth)
+                dist = 0
+            } else {
+                n = d / dist
+            }
+            bestSep = min(bestSep, dist - r)
+            if dist - r > AVBDConstants.collisionMargin { continue }
+            // dedup by spine point
+            if found.contains(where: { length($0.q - q) < 0.25 * R }) { continue }
+            if found.count < 4 { found.append((q, b, n, dist)) }
+            _ = d
+        }
+        if found.isEmpty { return 0 }
+
+        // shared normal: average (they're near-parallel for resting contact);
+        // per-contact points keep their own geometry
+        var nAvg = F3.zero
+        for f in found { nAvg += f.n }
+        nAvg = normalize(nAvg)
+        let nW = box.positionAng.act(nAvg)              // box -> torus
+        let n = torusIsA ? -nW : nW                     // B -> A
+        basisOut = orthonormalBasis(n)
+
+        for (i, f) in found.enumerated() {
+            let xTorusL = f.q - f.n * min(r, max(f.dist, 0))  // torus surface toward box
+            let xTorus = box.positionLin + box.positionAng.act(f.q) - nW * r
+            _ = xTorusL
+            let xBox = box.positionLin + box.positionAng.act(f.b)
+            var c = ContactPoint()
+            c.featureKey = Int32(i)
+            let (bodyA, xA, xB) = torusIsA ? (torus, xTorus, xBox) : (box, xBox, xTorus)
+            let bodyB = torusIsA ? box : torus
+            c.rA = bodyA.shape == .box ? rotate(bodyA.positionAng.conjugate, xA - bodyA.positionLin)
+                                       : xA - bodyA.positionLin
+            c.rB = bodyB.shape == .box ? rotate(bodyB.positionAng.conjugate, xB - bodyB.positionLin)
+                                       : xB - bodyB.positionLin
+            contacts.append(c)
+        }
+        return contacts.count
+    }
+
+    /// Torus-torus: alternating projection between the two spine circles
+    /// from several seeds; multiple contacts support interlocked rings.
+    static func collideTorusTorus(_ a: CPURigid, _ b: CPURigid,
+                                  _ contacts: inout [ContactPoint],
+                                  _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let Ra = a.size.x, ra = a.size.y
+        let Rb = b.size.x, rb = b.size.y
+        // world-space circle frames
+        let ca = a.positionLin
+        let axa = a.positionAng.act(F3(0, 0, 1))
+        let cb = b.positionLin
+        let axb = b.positionAng.act(F3(0, 0, 1))
+        var ua = abs(axa.x) > abs(axa.z) ? F3(-axa.y, axa.x, 0) : F3(0, -axa.z, axa.y)
+        ua = normalize(ua)
+        let va = cross(axa, ua)
+
+        func projA(_ p: F3) -> F3 {
+            var d = p - ca
+            d -= axa * dot(axa, d)
+            let l = length(d)
+            return l < 1e-6 ? ca + ua * Ra : ca + d / l * Ra
+        }
+        func projB(_ p: F3) -> F3 {
+            var d = p - cb
+            d -= axb * dot(axb, d)
+            let l = length(d)
+            return l < 1e-6 ? cb + normalize(cross(axb, axa + F3(0.01, 0, 0))) * Rb
+                            : cb + d / l * Rb
+        }
+
+        var found: [(pa: F3, pb: F3)] = []
+        for seed in 0..<8 {
+            let ang = Float(seed) / 8 * 2 * .pi
+            var qa = ca + (ua * cos(ang) + va * sin(ang)) * Ra
+            var qb = F3.zero
+            for _ in 0..<6 {
+                qb = projB(qa)
+                qa = projA(qb)
+            }
+            if length(qa - qb) > ra + rb + AVBDConstants.collisionMargin { continue }
+            if found.contains(where: { length($0.pa - qa) < 0.25 * Ra }) { continue }
+            if found.count < 4 { found.append((qa, qb)) }
+        }
+        if found.isEmpty { return 0 }
+
+        // basis from the deepest contact's normal (b -> a)
+        var deep = found[0]
+        var minD = Float.greatestFiniteMagnitude
+        for f in found {
+            let d = length(f.pa - f.pb)
+            if d < minD { minD = d; deep = f }
+        }
+        var n = deep.pa - deep.pb
+        let nl = length(n)
+        n = nl > 1e-6 ? n / nl : F3(0, 0, 1)
+        basisOut = orthonormalBasis(n)
+
+        for (i, f) in found.enumerated() {
+            var nf = f.pa - f.pb
+            let l = length(nf)
+            nf = l > 1e-6 ? nf / l : n
+            var c = ContactPoint()
+            c.featureKey = Int32(i)
+            let xA = f.pa - nf * ra
+            let xB = f.pb + nf * rb
+            c.rA = xA - a.positionLin     // round: world offsets
+            c.rB = xB - b.positionLin
+            contacts.append(c)
         }
         return contacts.count
     }

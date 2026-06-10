@@ -216,7 +216,8 @@ struct SimParams {
     uint numHashed;         // bodies in spatial hash
     uint numGlobals;        // oversized/static bodies tested brute-force
     float maxSpeed;         // velocity clamp (anti-tunneling safety)
-    float pad0, pad1, pad2;
+    float lambdaMax;        // dual variable bound (paper Sec 4)
+    float pad0, pad1;
 };
 
 struct JointGPU {

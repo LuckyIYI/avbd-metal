@@ -32,6 +32,8 @@ public final class GPUSolver {
     var posLin, posAng, initLin, initAng, inertLin, inertAng: MTLBuffer
     var velLin, velAng, prevVelLin: MTLBuffer
     var props, shape: MTLBuffer
+    var shapeType: MTLBuffer       // 0 box, 1 sphere, 2 torus
+    var spinVel: MTLBuffer         // angular velocity of kinematic spinners
 
     // Constraints
     var joints: MTLBuffer
@@ -111,6 +113,8 @@ public final class GPUSolver {
         prevVelLin = try makeBuf(nb * 16, "prevVelLin")
         props = try makeBuf(nb * 16, "props")
         shape = try makeBuf(nb * 16, "shape")
+        shapeType = try makeBuf(nb * 4, "shapeType")
+        spinVel = try makeBuf(nb * 16, "spinVel")
 
         joints = try makeBuf(max(1, numJoints) * MemoryLayout<JointGPU>.stride, "joints")
         springs = try makeBuf(max(1, numSprings) * MemoryLayout<SpringGPU>.stride, "springs")
@@ -152,6 +156,13 @@ public final class GPUSolver {
         try buildPipelines()
         try upload(scene: scene)
         self.spinners = scene.spinners
+        // expose spinner angular velocity to the contact solver so friction
+        // sees the kinematic surface motion
+        memset(spinVel.contents(), 0, spinVel.length)
+        let sv = spinVel.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        for sp in scene.spinners {
+            sv[sp.body] = SIMD4(sp.axis * sp.omega, 1)
+        }
     }
 
     public enum AVBDError: Error {
@@ -216,6 +227,7 @@ public final class GPUSolver {
         let pv = prevVelLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pr = props.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let sh = shape.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let st = shapeType.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         let colA = colorsA.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         let colB = colorsB.contents().bindMemory(to: UInt32.self, capacity: numBodies)
 
@@ -238,6 +250,13 @@ public final class GPUSolver {
                 mass = b.density > 0 ? 4.0 / 3.0 * Float.pi * r * r * r * b.density : 0
                 moment = F3(repeating: 0.4 * mass * r * r)
                 radius = r
+            case .torus:
+                let R = b.size.x, r = b.size.y
+                mass = b.density > 0 ? 2 * Float.pi * Float.pi * R * r * r * b.density : 0
+                let iDia = mass * (R * R / 2 + 5 * r * r / 8)
+                let iAxis = mass * (R * R + 3 * r * r / 4)
+                moment = F3(iDia, iDia, iAxis)
+                radius = R + r
             }
             pl[i] = SIMD4(b.position, mass)
             pa[i] = SIMD4(b.rotation.imag, b.rotation.real)
@@ -245,8 +264,8 @@ public final class GPUSolver {
             va[i] = .zero
             pv[i] = SIMD4(b.velocity, 0)
             pr[i] = SIMD4(moment, b.friction)
-            // shape.w < 0 marks a sphere; |w| is the bounding radius
-            sh[i] = SIMD4(b.size, b.shape == .sphere ? -radius : radius)
+            sh[i] = SIMD4(b.size, radius)
+            st[i] = b.shape == .box ? 0 : (b.shape == .sphere ? 1 : 2)
             colA[i] = UInt32(i % AVBD_MAX_COLORS)  // initial guess; refined per frame
             colB[i] = colA[i]
             if mass > 0 { radii.append(radius) }
@@ -261,7 +280,12 @@ public final class GPUSolver {
         // Only oversized bodies go to the brute-forced global list; normal
         // sized statics live in the spatial hash like everything else.
         for (i, b) in scene.bodies.enumerated() {
-            let radius = b.shape == .sphere ? b.size.x / 2 : length(b.size * 0.5)
+            let radius: Float
+            switch b.shape {
+            case .sphere: radius = b.size.x / 2
+            case .torus: radius = b.size.x + b.size.y
+            case .box: radius = length(b.size * 0.5)
+            }
             if radius > threshold {
                 globals.append(UInt32(i))
             } else {
@@ -271,7 +295,7 @@ public final class GPUSolver {
         // Cell size: 2x the max hashed radius (sphere-bound broadphase)
         var maxHashedRadius: Float = 0.5
         for i in hashed {
-            maxHashedRadius = max(maxHashedRadius, abs(sh[Int(i)].w))
+            maxHashedRadius = max(maxHashedRadius, sh[Int(i)].w)
         }
 
         hashedIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashed.count))
@@ -371,6 +395,7 @@ public final class GPUSolver {
         params.betaLin = settings.betaLin
         params.betaAng = settings.betaAng
         params.gamma = settings.gamma
+        params.lambdaMax = settings.lambdaMax
     }
 
     private func dispatch1D(_ enc: MTLComputeCommandEncoder, _ name: String, _ count: Int,
@@ -505,6 +530,8 @@ public final class GPUSolver {
             e.setBuffer(self.mapKeyB, offset: 0, index: 9)
             e.setBuffer(self.mapVal, offset: 0, index: 10)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
+            e.setBuffer(self.shapeType, offset: 0, index: 12)
+            e.setBuffer(self.spinVel, offset: 0, index: 13)
         }
 
         // Rebuild persistence map from THIS frame's manifolds (for next frame)
@@ -772,6 +799,7 @@ public final class GPUSolver {
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let sh = shape.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let st = shapeType.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         var bestT = Float.infinity
         var best: (Int, F3)? = nil
         for i in 0..<numBodies where pl[i].w > 0 {
@@ -779,9 +807,10 @@ public final class GPUSolver {
             let inv = q.conjugate
             let o = inv.act(origin - F3(pl[i].x, pl[i].y, pl[i].z))
             let d = inv.act(dir)
-            if sh[i].w < 0 {
-                // sphere: |o + t d| = r
-                let r = -sh[i].w
+            let stp = shapeType.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+            if stp[i] != 0 {
+                // sphere/torus: pick against bounding sphere (good enough for grab)
+                let r = sh[i].w
                 let b = dot(o, d)
                 let cc = dot(o, o) - r * r
                 let disc = b * b - cc
@@ -834,6 +863,7 @@ public final class GPUSolver {
         enc.setBytes(&nb, length: 4, index: 4)
         enc.setBytes(&cm, length: 4, index: 5)
         enc.setBuffer(colorsA, offset: 0, index: 6)
+        enc.setBuffer(shapeType, offset: 0, index: 7)
         enc.dispatchThreadgroups(MTLSize(width: (numBodies + 255) / 256, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.endEncoding()

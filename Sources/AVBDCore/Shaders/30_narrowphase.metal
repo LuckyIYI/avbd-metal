@@ -167,6 +167,71 @@ inline bool npAddContact(thread NPContact* contacts, thread int& count,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Torus collision helpers (implicit surface, alternating projection)
+// ---------------------------------------------------------------------------
+
+
+// Kinematic spinner surfaces move between steps but contact anchors are
+// re-detected each frame, so friction alone cannot convey. Shift the
+// tangential constraint target by the known surface displacement so the
+// friction constraint tracks the moving surface.
+inline float2 spinSurfaceShift(float4 wA, float4 wB,
+                               float3 rAoff, float3 rBoff,
+                               float3 t1, float3 t2, float dt, float alpha) {
+    float3 sA = wA.w != 0.0f ? cross(wA.xyz, rAoff) * dt : float3(0);
+    float3 sB = wB.w != 0.0f ? cross(wB.xyz, rBoff) * dt : float3(0);
+    float3 rel = sB - sA;
+    // C0 is alpha-discounted by the solver (it treats it as pre-existing
+    // error); the surface shift is a TARGET, so pre-compensate.
+    float k = 1.0f / max(1.0f - alpha, 0.01f);
+    return float2(dot(t1, rel), dot(t2, rel)) * k;
+}
+
+struct TorusFrame {
+    float3 center;      // world
+    float3 axis;        // world (unit)
+    float3 u, v;        // spine plane basis
+    float R, r;
+};
+
+inline TorusFrame torusFrame(float3 pos, float4 q, float R, float r) {
+    TorusFrame t;
+    t.center = pos;
+    t.axis = q_rotate(q, float3(0, 0, 1));
+    t.u = abs(t.axis.x) > abs(t.axis.z) ? float3(-t.axis.y, t.axis.x, 0)
+                                        : float3(0, -t.axis.z, t.axis.y);
+    t.u = normalize(t.u);
+    t.v = cross(t.axis, t.u);
+    t.R = R;
+    t.r = r;
+    return t;
+}
+
+// stable contact feature: quantized spine angle in the torus body frame
+inline uint torusFeature(TorusFrame t, float3 spinePoint) {
+    float3 d = spinePoint - t.center;
+    float au = dot(d, t.u);
+    float av = dot(d, t.v);
+    float ang = atan2(av, au) + M_PI_F;
+    return uint(clamp(ang / (2.0f * M_PI_F) * 8.0f, 0.0f, 7.999f));
+}
+
+inline float3 torusProjSpine(TorusFrame t, float3 p) {
+    float3 d = p - t.center;
+    d -= t.axis * dot(t.axis, d);
+    float l = length(d);
+    return l < 1e-6f ? t.center + t.u * t.R : t.center + d / l * t.R;
+}
+
+// number of contacts written into scratch (xA on first shape, xB on second)
+struct TorusHit {
+    float3 xT;          // point on torus surface
+    float3 xO;          // point on other shape
+    float3 n;           // other -> torus
+    uint feature;
+};
+
 kernel void np_collide(
     device const float4* posLin     [[buffer(0)]],
     device const float4* posAng     [[buffer(1)]],
@@ -180,6 +245,8 @@ kernel void np_collide(
     device const uint* mapKeyB      [[buffer(9)]],
     device const uint* mapVal       [[buffer(10)]],
     constant SimParams& P           [[buffer(11)]],
+    device const uint* shapeType    [[buffer(12)]],
+    device const float4* spinVel    [[buffer(13)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
@@ -203,9 +270,206 @@ kernel void np_collide(
 
     device ManifoldGPU& outM = manifolds[gid];
 
-    // --- Sphere branches (shape.w < 0 marks spheres) ---
-    bool sphA = shape[ia].w < 0.0f;
-    bool sphB = shape[ib].w < 0.0f;
+    // --- shape type dispatch (0 box, 1 sphere, 2 torus) ---
+    uint stA = shapeType[ia];
+    uint stB = shapeType[ib];
+    bool sphA = stA == 1;
+    bool sphB = stB == 1;
+    bool torA = stA == 2;
+    bool torB = stB == 2;
+
+    if (torA || torB) {
+        TorusHit hits[4];
+        int nHits = 0;
+        bool tIsA = torA;
+        uint it = tIsA ? ia : ib;       // torus body
+        uint io = tIsA ? ib : ia;       // other body
+        float4 qT = tIsA ? qA : qB;
+        float4 qO = tIsA ? qB : qA;
+        float3 pT = tIsA ? pA4.xyz : pB4.xyz;
+        float3 pO = tIsA ? pB4.xyz : pA4.xyz;
+        TorusFrame T = torusFrame(pT, qT, shape[it].x, shape[it].y);
+
+        uint otherType = tIsA ? stB : stA;
+        // detection margin: catch fast approaches before deep penetration
+        float detectM = max(COLLISION_MARGIN, 0.8f * T.r);
+
+        if (otherType == 1) {
+            // torus - sphere (exact closed form)
+            float rs = shape[io].x * 0.5f;
+            float3 spine = torusProjSpine(T, pO);
+            float3 d = pO - spine;
+            float dist = length(d);
+            if (dist <= T.r + rs + detectM) {
+                float3 n = dist > 1e-6f ? d / dist : float3(0, 0, 1); // torus -> sphere
+                hits[0].xT = spine + n * T.r;
+                hits[0].xO = pO - n * rs;
+                hits[0].n = -n;          // other -> torus
+                hits[0].feature = 0;
+                nHits = 1;
+            }
+        } else {
+            // torus vs torus/box: sample the spine densely; each sample has
+            // an EXACT closest point on the other shape. Pick the deepest
+            // angularly-spread candidates, then refine with two alternating
+            // projection steps. Deterministic and stable.
+            #define NSAMP 32
+            float dists[NSAMP];
+            float3 closest[NSAMP];
+            bool isBox = otherType == 0;
+            TorusFrame T2;
+            float4 qOc = q_conj(qO);
+            float3 halfO = shape[io].xyz * 0.5f;
+            float otherR = 0.0f;
+            if (!isBox) {
+                T2 = torusFrame(pO, qO, shape[io].x, shape[io].y);
+                otherR = T2.r;
+            }
+
+            for (int i = 0; i < NSAMP; i++) {
+                float ang = float(i) / float(NSAMP) * 2.0f * M_PI_F;
+                float3 q = T.center + (T.u * cos(ang) + T.v * sin(ang)) * T.R;
+                float3 b;
+                if (isBox) {
+                    b = q_rotate(qO, clamp(q_rotate(qOc, q - pO), -halfO, halfO)) + pO;
+                } else {
+                    b = torusProjSpine(T2, q);
+                }
+                closest[i] = b;
+                dists[i] = distance(q, b);
+            }
+
+            // greedy: deepest first, then deepest with >=45 deg separation
+            bool used[NSAMP];
+            for (int i = 0; i < NSAMP; i++) used[i] = false;
+            for (int pick = 0; pick < 4; pick++) {
+                int best = -1;
+                float bd = FLT_MAX;
+                for (int i = 0; i < NSAMP; i++) {
+                    if (used[i]) continue;
+                    if (dists[i] < bd) { bd = dists[i]; best = i; }
+                }
+                if (best < 0) break;
+                if (bd - T.r - otherR > detectM) break;
+                // mask neighbors within 45 deg
+                for (int k = -3; k <= 3; k++) {
+                    used[(best + k + NSAMP) % NSAMP] = true;
+                }
+
+                // refine: two alternating projection steps from this sample
+                float ang = float(best) / float(NSAMP) * 2.0f * M_PI_F;
+                float3 q = T.center + (T.u * cos(ang) + T.v * sin(ang)) * T.R;
+                float3 b = closest[best];
+                for (int it2 = 0; it2 < 2; it2++) {
+                    q = torusProjSpine(T, b);
+                    if (isBox) {
+                        b = q_rotate(qO, clamp(q_rotate(qOc, q - pO), -halfO, halfO)) + pO;
+                    } else {
+                        b = torusProjSpine(T2, q);
+                    }
+                }
+                float3 d = q - b;
+                float dist = length(d);
+                float3 n;
+                float3 xO_ = b;
+                if (dist < 1e-6f) {
+                    if (isBox) {
+                        // spine inside the box: face ejection with true depth
+                        float3 lb = q_rotate(qOc, q - pO);
+                        float3 pen = halfO - fabs(lb);
+                        int axisI = 0;
+                        if (pen.y < pen[axisI]) axisI = 1;
+                        if (pen.z < pen[axisI]) axisI = 2;
+                        float3 nl = float3(0);
+                        nl[axisI] = lb[axisI] >= 0.0f ? 1.0f : -1.0f;
+                        n = q_rotate(qO, nl);
+                        xO_ = q + n * pen[axisI];
+                    } else {
+                        n = normalize(cross(T.axis, T2.axis) + float3(1e-4f, 0, 0));
+                    }
+                } else {
+                    if (dist - T.r - otherR > detectM) continue;
+                    n = d / dist;                   // other -> torus
+                }
+                hits[nHits].xT = q - n * T.r;
+                hits[nHits].xO = xO_ + (isBox ? float3(0) : n * otherR);
+                hits[nHits].n = n;
+                hits[nHits].feature = uint(best);
+                nHits++;
+            }
+            #undef NSAMP
+        }
+
+        if (nHits == 0) {
+            outM.header = uint4(ia, ib, 0, 0);
+            return;
+        }
+
+        // deepest-contact normal defines the basis; nrm points B -> A
+        int deep = 0;
+        float minD = FLT_MAX;
+        for (int h = 0; h < nHits; h++) {
+            float d = distance(hits[h].xT, hits[h].xO);
+            if (d < minD) { minD = d; deep = h; }
+        }
+        float3 nTorus = hits[deep].n;                  // other -> torus
+        float3 nrmT = tIsA ? nTorus : -nTorus;         // B -> A
+
+        float3 t1, t2;
+        orthonormal(nrmT, t1, t2);
+        float friction = sqrt(props[ia].w * props[ib].w);
+        int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
+
+        bool roundA = stA != 0;
+        bool roundB = stB != 0;
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        outM.header = uint4(ia, ib, uint(nHits), flags);
+        outM.basisN = float4(nrmT, friction);
+        outM.basisT1 = float4(t1, 0);
+
+        float4 qAc = q_conj(qA);
+        float4 qBc = q_conj(qB);
+        float warm = P.alpha * P.gamma;
+        for (int i = 0; i < nHits; i++) {
+            float3 xAw = tIsA ? hits[i].xT : hits[i].xO;
+            float3 xBw = tIsA ? hits[i].xO : hits[i].xT;
+            float3 rA_ = roundA ? (xAw - pA4.xyz) : q_rotate(qAc, xAw - pA4.xyz);
+            float3 rB_ = roundB ? (xBw - pB4.xyz) : q_rotate(qBc, xBw - pB4.xyz);
+            float3 lambda = float3(0);
+            float3 penalty = float3(0);
+            if (prevIdx >= 0) {
+                // proximity match: contacts on round shapes wander around
+                // the tube, so exact feature IDs flicker; inherit the
+                // nearest previous contact's dual state instead.
+                device const ManifoldGPU& pm = prevManifolds[prevIdx];
+                uint pn = pm.header.z;
+                float bestD = 1.1f * shape[it].x;       // generous: keep dual
+                                                        // state through yanks
+                int bestJ = -1;
+                for (uint j = 0; j < pn; j++) {
+                    float dj = distance(pm.contacts[j].rA.xyz, rA_);
+                    if (dj < bestD) { bestD = dj; bestJ = int(j); }
+                }
+                if (bestJ >= 0) {
+                    lambda = pm.contacts[bestJ].lambda.xyz;
+                    penalty = pm.contacts[bestJ].penalty.xyz;
+                }
+            }
+            float3 d = xAw - xBw;
+            float3 C0 = float3(dot(nrmT, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+            C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
+                                      xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
+            lambda *= warm;
+            penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
+            outM.contacts[i].rA = float4(rA_, as_type<float>(hits[i].feature));
+            outM.contacts[i].rB = float4(rB_, 0.0f);
+            outM.contacts[i].C0 = float4(C0, 0);
+            outM.contacts[i].lambda = float4(lambda, 0);
+            outM.contacts[i].penalty = float4(penalty, 0);
+        }
+        return;
+    }
+
     NPContact contacts[MAX_CONTACTS];
     int count = 0;
     float3 nrm;     // points from B toward A
@@ -299,23 +563,28 @@ kernel void np_collide(
             float3 penalty = float3(0);
             float stick = 0.0f;
             if (prevIdx >= 0) {
+                // proximity match (see torus tail): inherit nearest previous
+                // contact's dual state; no stick-anchor restoration for
+                // rolling shapes.
                 device const ManifoldGPU& pm = prevManifolds[prevIdx];
                 uint pn = pm.header.z;
+                float bestD = 0.5f * max(rA, rB);
+                int bestJ = -1;
                 for (uint j = 0; j < pn; j++) {
-                    if (as_type<uint>(pm.contacts[j].rA.w) == contacts[i].feature) {
-                        lambda = pm.contacts[j].lambda.xyz;
-                        penalty = pm.contacts[j].penalty.xyz;
-                        // NOTE: no stick-anchor restoration for spheres —
-                        // anchors rotate with the body, which is wrong for
-                        // rolling contacts and drags the ball into the floor.
-                        break;
-                    }
+                    float dj = distance(pm.contacts[j].rA.xyz, rA_);
+                    if (dj < bestD) { bestD = dj; bestJ = int(j); }
+                }
+                if (bestJ >= 0) {
+                    lambda = pm.contacts[bestJ].lambda.xyz;
+                    penalty = pm.contacts[bestJ].penalty.xyz;
                 }
             }
             float3 xAw = sphA ? pA4.xyz + rA_ : xform(pA4.xyz, qA, rA_);
             float3 xBw = sphB ? pB4.xyz + rB_ : xform(pB4.xyz, qB, rB_);
             float3 d = xAw - xBw;
             float3 C0 = float3(dot(nrm, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+            C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
+                                      xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
             lambda *= warm;
             penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
             outM.contacts[i].rA = float4(rA_, as_type<float>(contacts[i].feature));
@@ -480,6 +749,8 @@ kernel void np_collide(
         float3 xBw = xform(pB4.xyz, qB, rB);
         float3 d = xAw - xBw;
         float3 C0 = float3(dot(nrm, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+        C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
+                                  xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
 
         // Warm-start (Eq. 19)
         lambda *= warm;

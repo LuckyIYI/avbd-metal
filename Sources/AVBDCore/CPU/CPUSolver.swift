@@ -59,6 +59,15 @@ public final class CPURigid {
             self.mass = m
             self.moment = F3(repeating: 0.4 * m * r * r)
             self.radius = r
+        case .torus:
+            let R = size.x, r = size.y
+            let m = density > 0 ? 2 * Float.pi * Float.pi * R * r * r * density : 0
+            self.mass = m
+            // solid torus: I_axis = m(R^2 + 3/4 r^2); I_diameter = m(R^2/2 + 5/8 r^2)
+            let iDia = m * (R * R / 2 + 5 * r * r / 8)
+            let iAxis = m * (R * R + 3 * r * r / 4)
+            self.moment = F3(iDia, iDia, iAxis)
+            self.radius = R + r
         }
     }
 
@@ -99,6 +108,7 @@ public final class CPUSolver {
     public var betaLin: Float = 5000.0
     public var betaAng: Float = 100.0
     public var gamma: Float = 0.999
+    public var lambdaMax: Float = 1.0e6
 
     public private(set) var bodies: [CPURigid] = []
     public var forces: [CPUForce] = []
@@ -232,6 +242,7 @@ public final class CPUSolver {
         var err: Float = 0
         for force in forces {
             if let j = force as? CPUJoint {
+                if j.stiffnessLin == 0 && j.stiffnessAng == 0 { continue }
                 err = max(err, length(j.currentCLin()))
             } else if let m = force as? CPUManifold {
                 for c in 0..<m.numContacts {

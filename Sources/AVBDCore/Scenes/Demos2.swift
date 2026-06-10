@@ -120,238 +120,232 @@ extension Demos {
         return s
     }
 
-    /// Chainmail sheet from interlocking rigid square rings (each ring is
-    /// four bars welded by hard joints), plus primitives dropped on top.
+    /// Chainmail sheet from interlocking REAL torus rings (one rigid torus
+    /// body per ring, exact implicit collision). The perimeter hangs from
+    /// posts; boxes and balls are dropped onto the sheet.
     public static func chainmail(rings: Int = 6, drops: Int = 3) -> PhysicsScene {
         var s = PhysicsScene(name: "chainmail")
-        s.settings.iterations = 20      // deep contact chains need convergence
+        s.settings.iterations = 25
+        s.settings.betaLin = 20000  // fast contact stiffening for snap loads
+        s.settings.lambdaMax = 1500 // wedged links must not stockpile force
         addGround(&s, friction: 0.6)
 
-        let L: Float = 1.1          // ring outer side
-        let c: Float = 0.2          // bar cross-section (thick: interlocks
-                                    // survive deeper transient penetration)
+        // Threading geometry: the connector tube crosses the flat ring's
+        // plane at |pitch/2 - R| from its center; that offset + r must stay
+        // under the hole radius (R - r) or the rings spawn interpenetrating.
+        let R: Float = 0.45         // major (spine) radius
+        let r: Float = 0.15         // minor (tube) radius
         let sheetZ: Float = 8.0
-
-        /// Welded square ring in a plane. orient: 0 = flat (xy), 1 = vertical
-        /// xz, 2 = vertical yz. Returns body indices.
-        func addRing(center: F3, orient: Int) -> [Int] {
-            // bars in ring-local frame: square in xy plane
-            let half = L / 2
-            let barLen = L
-            var bodies: [Int] = []
-            let q: Quat
-            switch orient {
-            case 1: q = Quat(angle: .pi / 2, axis: F3(1, 0, 0))   // xy -> xz
-            case 2: q = (Quat(angle: .pi / 2, axis: F3(0, 1, 0)) * Quat(angle: .pi / 2, axis: F3(1, 0, 0))).normalized
-            default: q = Quat(real: 1, imag: .zero)
-            }
-            // local bar definitions: (center offset, size)
-            let bars: [(F3, F3)] = [
-                (F3(0, -half + c / 2, 0), F3(barLen, c, c)),    // bottom (along x)
-                (F3(0, half - c / 2, 0), F3(barLen, c, c)),     // top
-                (F3(-half + c / 2, 0, 0), F3(c, barLen - 2 * c, c)),  // left (along y)
-                (F3(half - c / 2, 0, 0), F3(c, barLen - 2 * c, c)),   // right
-            ]
-            for (off, size) in bars {
-                bodies.append(s.addBody(size: size, density: 1, friction: 0.4,
-                                        position: center + q.act(off), rotation: q))
-            }
-            // weld corners. Corner points in RING-local frame; bar-local
-            // anchor = corner - bar center offset (bars share the ring
-            // rotation, so local frames are translated copies).
-            let cp = half - c / 2
-            let corners: [(Int, Int, F3)] = [
-                (0, 2, F3(-cp, -cp, 0)),    // bottom + left
-                (0, 3, F3(cp, -cp, 0)),     // bottom + right
-                (1, 2, F3(-cp, cp, 0)),     // top + left
-                (1, 3, F3(cp, cp, 0)),      // top + right
-            ]
-            for (a, b, corner) in corners {
-                s.addJoint(SceneJoint(bodyA: bodies[a], bodyB: bodies[b],
-                                      rA: corner - bars[a].0, rB: corner - bars[b].0,
-                                      stiffnessLin: .infinity, stiffnessAng: .infinity))
-            }
-            // exclude the two non-jointed bar pairs (parallel bars) — they
-            // never touch but share the ring; keep collisions off within ring
-            s.addJoint(SceneJoint(bodyA: bodies[0], bodyB: bodies[1],
-                                  rA: .zero, rB: .zero, stiffnessLin: 0, stiffnessAng: 0))
-            s.addJoint(SceneJoint(bodyA: bodies[2], bodyB: bodies[3],
-                                  rA: .zero, rB: .zero, stiffnessLin: 0, stiffnessAng: 0))
-            return bodies
-        }
-
-        // corner posts ("sticks") that pin the sheet corners in the air
-        let pitch = L * 1.25   // tight weave: less slack, less sag
+        let pitch: Float = 1.15     // (1.15/2-0.45)+0.15 = 0.275 < 0.30 ok
         let n = rings
         let extent = Float(n - 1) * pitch / 2
-        var cornerRingCenters: [F3] = []
+
+        // posts at corners (visual support for the anchors)
         for sx in [Float(-1), 1] {
             for sy in [Float(-1), 1] {
-                let cx = sx * extent, cy = sy * extent
-                cornerRingCenters.append(F3(cx, cy, sheetZ))
-                // post under each corner, slightly outward
                 _ = s.addBody(size: F3(0.25, 0.25, sheetZ + 0.5), density: 0,
                               friction: 0.5,
-                              position: F3(cx + sx * 0.9, cy + sy * 0.9,
+                              position: F3(sx * (extent + 0.9), sy * (extent + 0.9),
                                            (sheetZ + 0.5) / 2))
             }
         }
-        var cornerBars = [Int?](repeating: nil, count: 4)
-        var edgeAnchors: [(Int, F3)] = []      // (bar body, world anchor)
-        let mid = (n - 1) / 2
+
+        let qFlat = Quat(real: 1, imag: .zero)                       // xy plane
+        let qX = Quat(angle: .pi / 2, axis: F3(1, 0, 0))             // xz plane
+        let qY = (Quat(angle: .pi / 2, axis: F3(0, 0, 1)) * qX).normalized  // yz plane
+
+        var anchors: [(Int, F3)] = []
         for j in 0..<n {
             for i in 0..<n {
-                let center = F3(Float(i) * pitch - Float(n - 1) * pitch / 2,
-                                Float(j) * pitch - Float(n - 1) * pitch / 2,
-                                sheetZ)
-                let ringBodies = addRing(center: center, orient: 0)
-                if (i == 0 || i == n - 1) && (j == 0 || j == n - 1) {
-                    let ri = (i == 0 ? 0 : 2) + (j == 0 ? 0 : 1)
-                    cornerBars[ri] = ringBodies[0]
-                } else if (i == mid && (j == 0 || j == n - 1))
-                       || (j == mid && (i == 0 || i == n - 1)) {
-                    // mid-edge anchors keep the perimeter from folding in
-                    edgeAnchors.append((ringBodies[0],
-                                        center + F3(0, -L / 2 + c / 2, 0)))
+                let cx = Float(i) * pitch - extent
+                let cy = Float(j) * pitch - extent
+                let ring = s.addTorus(major: R, minor: r, density: 1, friction: 0.3,
+                                      position: F3(cx, cy, sheetZ), rotation: qFlat)
+                if i == 0 || i == n - 1 || j == 0 || j == n - 1 {
+                    // two anchor points so the perimeter rings can't flip
+                    anchors.append((ring, F3(cx + R, cy, sheetZ)))
+                    anchors.append((ring, F3(cx - R, cy, sheetZ)))
                 }
                 if i + 1 < n {
-                    _ = addRing(center: center + F3(pitch / 2, 0, 0), orient: 1)
+                    _ = s.addTorus(major: R, minor: r, density: 1, friction: 0.3,
+                                   position: F3(cx + pitch / 2, cy, sheetZ), rotation: qX)
                 }
                 if j + 1 < n {
-                    _ = addRing(center: center + F3(0, pitch / 2, 0), orient: 2)
+                    _ = s.addTorus(major: R, minor: r, density: 1, friction: 0.3,
+                                   position: F3(cx, cy + pitch / 2, sheetZ), rotation: qY)
                 }
             }
         }
-
-        // tie each corner ring's bottom bar to world at the sheet height —
-        // the visible posts stand right next to the anchors, "holding" them
-        for (ri, center) in cornerRingCenters.enumerated() {
-            if let bar = cornerBars[ri] {
-                let barWorld = center + F3(0, -L / 2 + c / 2, 0)
-                s.addJoint(SceneJoint(bodyA: -1, bodyB: bar,
-                                      rA: barWorld, rB: .zero))
-            }
-        }
-        for (bar, anchor) in edgeAnchors {
-            s.addJoint(SceneJoint(bodyA: -1, bodyB: bar, rA: anchor, rB: .zero))
+        var flip = false
+        for (ring, anchor) in anchors {
+            s.addJoint(SceneJoint(bodyA: -1, bodyB: ring, rA: anchor,
+                                  rB: F3(flip ? -R : R, 0, 0)))
+            flip.toggle()
         }
 
         // primitives falling on top: mixed boxes and balls
         var rng = SplitMix64(seed: 11)
         for k in 0..<drops {
-            let sz = 0.8 + rng.nextFloat() * 0.8
+            let sz = 0.9 + rng.nextFloat() * 0.7
+            // drop AFTER the sheet's own settle transient (high spawn = late
+            // arrival), or impacts superpose with the settling oscillation
             let pos = F3((rng.nextFloat() - 0.5) * Float(n) * pitch * 0.5,
                          (rng.nextFloat() - 0.5) * Float(n) * pitch * 0.5,
                          sheetZ + 3 + Float(k) * 2)
             if k % 2 == 0 {
-                _ = s.addSphere(diameter: sz, density: 1.5, friction: 0.5, position: pos)
+                _ = s.addSphere(diameter: sz, density: 1.0, friction: 0.5, position: pos)
             } else {
-                _ = s.addBody(size: F3(repeating: sz), density: 1.5, friction: 0.5,
+                _ = s.addBody(size: F3(repeating: sz), density: 1.0, friction: 0.5,
                               position: pos)
             }
         }
         return s
     }
 
-    /// Vortex funnel ("swirl"): balls launched tangentially orbit a banked
-    /// cone, spiral inward as friction bleeds energy, and drop through the
-    /// center hole. Built from wedged static plates.
-    public static func swirl(turns: Int = 3, balls: Int = 40) -> PhysicsScene {
+    /// Waterpark tube slide: a banked U-channel spiraling down; balls are
+    /// released at the top, race down the chute, and shoot out the runout.
+    public static func swirl(turns: Int = 3, balls: Int = 30) -> PhysicsScene {
         var s = PhysicsScene(name: "swirl")
-        addGround(&s, friction: 0.3)
+        addGround(&s, friction: 0.4)
 
-        let plates = 20
-        let holeR: Float = 1.4
-        let rimR: Float = 5.6
-        let cone: Float = 0.38             // funnel slope (rad)
-        let baseZ: Float = 2.6             // hole height above ground
-        let rm = (holeR + rimR) / 2
-        let radialLen = (rimR - holeR) / cos(cone) + 0.3
+        let R: Float = 5.0                  // slide radius
+        let dropPerTurn: Float = 4.6
+        let nTurns = Float(turns)
+        let segs = Int(nTurns * 30)
+        let topZ = nTurns * dropPerTurn + 2.5
+        let chanW: Float = 1.5              // channel floor width
+        let wallTilt: Float = 0.85          // side plates angle (rad)
+        let slope = atan(dropPerTurn / (2 * .pi * R))
 
-        for k in 0..<plates {
-            let a = Float(k) / Float(plates) * 2 * .pi
-            let mid = F3(rm * cos(a), rm * sin(a), baseZ + (rm - holeR) * tan(cone))
-            // plate local x = radial, y = tangent
-            let qYaw = Quat(angle: a, axis: F3(0, 0, 1))
-            let tangentAxis = F3(-sin(a), cos(a), 0)
-            let qCone = Quat(angle: -cone, axis: tangentAxis)  // outer edge up
-            let width = 2 * .pi * rm / Float(plates) * 1.18
-            _ = s.addBody(size: F3(radialLen, width, 0.2), density: 0, friction: 0.25,
-                          position: mid, rotation: (qCone * qYaw).normalized)
-        }
-        // outer rim wall to keep fast balls in
-        for k in 0..<plates {
-            let a = (Float(k) + 0.5) / Float(plates) * 2 * .pi
-            let z = baseZ + (rimR - holeR) * tan(cone) + 0.8
+        for k in 0..<segs {
+            let t = Float(k) / 30.0          // turns travelled
+            let a = t * 2 * .pi
+            let z = topZ - t * dropPerTurn
+            let cpos = F3(R * cos(a), R * sin(a), z)
             let qYaw = Quat(angle: a + .pi / 2, axis: F3(0, 0, 1))
-            _ = s.addBody(size: F3(2 * .pi * rimR / Float(plates) * 1.18, 0.2, 2.0),
-                          density: 0, friction: 0.05,
-                          position: F3(rimR * cos(a), rimR * sin(a), z), rotation: qYaw)
-        }
+            let radial = F3(cos(a), sin(a), 0)
+            let tangent = F3(-sin(a), cos(a), 0)
+            let qSlope = Quat(angle: -slope, axis: radial)      // descend along +tangent
+            let qBank = Quat(angle: -0.22, axis: tangent)       // mild bank toward mid-lane
+            let qSeg = (qBank * qSlope * qYaw).normalized
 
-        // balls: tangential launch onto the funnel
-        var rng = SplitMix64(seed: 3)
-        for k in 0..<balls {
-            let a0 = Float(k) / Float(balls) * 2 * .pi
-            let r0 = 3.6 + rng.nextFloat() * 1.2
-            let z0 = baseZ + (r0 - holeR) * tan(cone) + 1.0 + Float(k % 5) * 0.5
-            let speed = 4.5 + rng.nextFloat() * 2
-            _ = s.addSphere(diameter: 0.7, density: 1, friction: 0.25,
-                            position: F3(r0 * cos(a0), r0 * sin(a0), z0),
-                            velocity: F3(-sin(a0), cos(a0), 0) * speed)
-        }
-        _ = turns
-        return s
-    }
-
-    /// Treadmill: a row of kinematically spinning rollers conveys boxes.
-    /// The surface motion comes purely from collisions with the rotating
-    /// rollers (friction drag), not from scripted box velocities.
-    public static func treadmill(boxes: Int = 12) -> PhysicsScene {
-        var s = PhysicsScene(name: "treadmill")
-        addGround(&s)
-
-        let rollerCount = 8
-        let rollerSpacing: Float = 1.4
-        let beltY: Float = 0
-        let beltZ: Float = 1.2
-
-        // Crossed paddle wheels: contact anchors can't convey via friction
-        // from a kinematic surface (anchors re-detect each frame), so the
-        // conveying is honest mechanics — paddles push boxes along.
-        for i in 0..<rollerCount {
-            let x = Float(i) * rollerSpacing - Float(rollerCount - 1) * rollerSpacing / 2
-            for half in 0..<2 {
-                let q = Quat(angle: Float(half) * .pi / 2 + Float(i) * 0.4,
-                             axis: F3(0, 1, 0))
-                let idx = s.addBody(size: F3(1.6, 5.0, 0.25), density: 0, friction: 0.3,
-                                    position: F3(x, beltY, beltZ), rotation: q)
-                s.addSpinner(SceneSpinner(body: idx, axis: F3(0, 1, 0), omega: 3.0))
+            // channel floor
+            _ = s.addBody(size: F3(1.25, chanW, 0.18), density: 0, friction: 0.25,
+                          position: cpos, rotation: qSeg)
+            // side plates (angled up-and-out), in segment-local frame
+            for side in [Float(-1), 1] {
+                let qSide = (qSeg * Quat(angle: side * wallTilt, axis: F3(1, 0, 0))).normalized
+                let off = qSeg.act(F3(0, side * (chanW / 2 + 0.32), 0.32))
+                _ = s.addBody(size: F3(1.25, 1.0, 0.15), density: 0, friction: 0.15,
+                              position: cpos + off, rotation: qSide)
             }
         }
 
-        // slick bed under the paddle wheels: boxes settle on it inside the
-        // paddle sweep and get pushed along mechanically
-        _ = s.addBody(size: F3(Float(rollerCount) * rollerSpacing + 2, 5.0, 0.7),
-                      density: 0, friction: 0.05,
-                      position: F3(0, beltY, 0.35))
+        // balls released at the slide entrance with a push down the chute
+        var rng = SplitMix64(seed: 5)
+        for k in 0..<balls {
+            // spread along the first half-turn so they don't pile up
+            let t0f = Float(k % 12) / 30.0
+            let a0 = 0.15 + t0f * 2 * .pi
+            let t0 = F3(-sin(a0), cos(a0), 0)
+            _ = s.addSphere(diameter: 0.55, density: 1, friction: 0.2,
+                            position: F3(R * cos(a0), R * sin(a0),
+                                         topZ - t0f * dropPerTurn + 0.8 + Float(k / 12) * 0.7)
+                                + F3((rng.nextFloat() - 0.5) * 0.4,
+                                     (rng.nextFloat() - 0.5) * 0.4, 0),
+                            velocity: t0 * 5)
+        }
+        return s
+    }
 
-        // side rails
-        for yo in [Float(-2.8), 2.8] {
-            _ = s.addBody(size: F3(Float(rollerCount) * rollerSpacing + 1, 0.3, 1.6),
-                          density: 0, friction: 0.1,
-                          position: F3(0, yo, beltZ + 0.5))
+    /// Conveyor treadmill: a closed loop of hinged planks (a real belt)
+    /// wrapped around two spinning paddle wheels. The wheels engage the
+    /// belt's inner surface mechanically and drive it around; boxes ride
+    /// the moving belt.
+    public static func treadmill(boxes: Int = 8) -> PhysicsScene {
+        var s = PhysicsScene(name: "treadmill")
+        addGround(&s)
+
+        let wheelX: Float = 2.6          // wheel centers at ±wheelX
+        let wheelZ: Float = 2.6
+        let wrapR: Float = 1.0           // belt wrap radius around wheels
+        let beltW: Float = 3.2
+        let span = 2 * wheelX
+        let circumference = 2 * span + 2 * .pi * wrapR
+        let plankCount = 26
+        let plankLen = circumference / Float(plankCount)
+
+        // belt path: top span (+x), right wrap, bottom span (-x), left wrap
+        func pathPoint(_ sIn: Float) -> (F3, Float) {   // (pos, pitch about y)
+            var t = sIn.truncatingRemainder(dividingBy: circumference)
+            if t < 0 { t += circumference }
+            if t < span {
+                return (F3(-wheelX + t, 0, wheelZ + wrapR), 0)
+            }
+            t -= span
+            if t < .pi * wrapR {
+                let a = .pi / 2 - t / wrapR     // from +90 (top) to -90 (bottom)
+                return (F3(wheelX + wrapR * cos(a), 0, wheelZ + wrapR * sin(a)),
+                        .pi / 2 - a)
+            }
+            t -= .pi * wrapR
+            if t < span {
+                return (F3(wheelX - t, 0, wheelZ - wrapR), .pi)
+            }
+            t -= span
+            let a = -.pi / 2 - t / wrapR        // from -90 back to -270 (top)
+            return (F3(-wheelX + wrapR * cos(a), 0, wheelZ + wrapR * sin(a)),
+                    .pi / 2 - a)
         }
 
-        // boxes dropped at the upstream end, conveyed by roller friction
+        var planks: [Int] = []
+        for i in 0..<plankCount {
+            let sMid = (Float(i) + 0.5) * plankLen
+            let (pos, pitch) = pathPoint(sMid)
+            let q = Quat(angle: pitch, axis: F3(0, 1, 0))
+            let plank = s.addBody(size: F3(plankLen * 0.98, beltW, 0.1),
+                                  density: 0.6, friction: 0.9,
+                                  position: pos, rotation: q)
+            planks.append(plank)
+        }
+        // hinge consecutive planks (closed loop), two joints across the width
+        for i in 0..<plankCount {
+            let nx = (i + 1) % plankCount
+            for yo in [-beltW * 0.4, beltW * 0.4] {
+                s.addJoint(SceneJoint(bodyA: planks[i], bodyB: planks[nx],
+                                      rA: F3(plankLen / 2, yo, 0),
+                                      rB: F3(-plankLen / 2, yo, 0)))
+            }
+        }
+
+        // Kinematic octagon drums: the contact solver now understands
+        // spinner surface velocity, so plain friction drives the belt.
+        for wx in [-wheelX, wheelX] {
+            for k in 0..<4 {
+                let idx = s.addBody(size: F3(2 * (wrapR - 0.06), beltW * 0.8, 0.3),
+                                    density: 0, friction: 1.2,
+                                    position: F3(wx, 0, wheelZ),
+                                    rotation: Quat(angle: Float(k) * .pi / 4,
+                                                   axis: F3(0, 1, 0)))
+                s.addSpinner(SceneSpinner(body: idx, axis: F3(0, 1, 0), omega: 1.2))
+            }
+        }
+
+        // slick beds: under the top span (carrying side) and under the
+        // bottom span (return side), like a conveyor's support + return bed
+        _ = s.addBody(size: F3(span - 2.6, beltW, 0.25), density: 0, friction: 0.02,
+                      position: F3(0, 0, wheelZ + wrapR - 0.26))
+        _ = s.addBody(size: F3(span - 2.6, beltW, 0.25), density: 0, friction: 0.02,
+                      position: F3(0, 0, wheelZ - wrapR - 0.45))
+
+        // cargo dropped onto the upstream end of the belt
         var rng = SplitMix64(seed: 21)
         for k in 0..<boxes {
-            _ = s.addBody(size: F3(repeating: 0.55 + rng.nextFloat() * 0.3),
-                          density: 1, friction: 0.8,
-                          position: F3(-Float(rollerCount - 2) * rollerSpacing / 2
-                                           + (rng.nextFloat() - 0.5),
-                                       (rng.nextFloat() - 0.5) * 3.5,
-                                       beltZ + 1.5 + Float(k) * 0.9))
+            _ = s.addBody(size: F3(repeating: 0.5 + rng.nextFloat() * 0.25),
+                          density: 0.8, friction: 0.9,
+                          position: F3(-wheelX + 0.7 + (rng.nextFloat() - 0.5) * 0.6,
+                                       (rng.nextFloat() - 0.5) * (beltW - 1),
+                                       wheelZ + wrapR + 1.0 + Float(k) * 0.8))
         }
         return s
     }

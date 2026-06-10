@@ -3,9 +3,10 @@ import simd
 // Backend-agnostic scene description, consumed by both the CPU reference
 // solver and the Metal GPU solver (and by tests for parity checks).
 
-public enum BodyShape {
+public enum BodyShape: Equatable {
     case box
     case sphere     // size.x = diameter (size.y/z ignored)
+    case torus      // size.x = major (spine) radius, size.y = minor (tube) radius
 }
 
 public struct SceneBody {
@@ -20,7 +21,10 @@ public struct SceneBody {
     public init(size: F3, density: Float, friction: Float, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
                 shape: BodyShape = .box) {
-        self.size = shape == .sphere ? F3(repeating: size.x) : size
+        switch shape {
+        case .sphere: self.size = F3(repeating: size.x)
+        default: self.size = size
+        }
         self.density = density
         self.friction = friction
         self.position = position
@@ -93,6 +97,10 @@ public struct SimSettings {
     public var betaLin: Float = 5000.0
     public var betaAng: Float = 100.0
     public var gamma: Float = 0.999
+    /// Dual variable bound (paper Sec. 4): prevents unbounded force
+    /// accumulation when conflicting contacts cannot all be satisfied
+    /// (e.g. wedged chainmail links). Large = effectively off.
+    public var lambdaMax: Float = 1.0e6
 
     public init() {}
 }
@@ -126,6 +134,15 @@ public struct PhysicsScene {
                 position: position, velocity: velocity, shape: .sphere)
     }
 
+    @discardableResult
+    public mutating func addTorus(major: Float, minor: Float, density: Float,
+                                  friction: Float, position: F3,
+                                  rotation: Quat = Quat(real: 1, imag: .zero),
+                                  velocity: F3 = .zero) -> Int {
+        addBody(size: F3(major, minor, 0), density: density, friction: friction,
+                position: position, rotation: rotation, velocity: velocity, shape: .torus)
+    }
+
     public mutating func addJoint(_ j: SceneJoint) { joints.append(j) }
     public mutating func addSpinner(_ sp: SceneSpinner) { spinners.append(sp) }
 
@@ -149,6 +166,7 @@ public struct PhysicsScene {
         solver.betaLin = settings.betaLin
         solver.betaAng = settings.betaAng
         solver.gamma = settings.gamma
+        solver.lambdaMax = settings.lambdaMax
 
         for b in bodies {
             solver.addBody(size: b.size, density: b.density, friction: b.friction,

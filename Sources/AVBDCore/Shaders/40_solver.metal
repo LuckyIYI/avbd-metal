@@ -558,7 +558,10 @@ kernel void primal_solve(
     // we cap the step instead, which only engages in violent transients
     // (e.g. a long free-falling chain snapping taut) where a single Newton
     // step on the rotational nonlinearity would overshoot and inject energy.
-    float maxLin = fabs(shape[body].w);     // body bounding radius per iteration
+    // 0.35x bounding radius per iteration: still generous for free motion
+    // (iterations multiply), but a single step can no longer carry a body
+    // clean through a thin contact (e.g. chainmail tube pull-through)
+    float maxLin = 0.35f * fabs(shape[body].w);
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
     float ang2 = dot(dxAng, dxAng);
@@ -600,7 +603,8 @@ kernel void dual_joints(
         float3 C = pA - pB;
         if (j.header.w & 1) {
             C -= j.C0Lin.xyz * P.alpha;
-            j.lambdaLin.xyz = penLin * C + j.lambdaLin.xyz;
+            j.lambdaLin.xyz = clamp(penLin * C + j.lambdaLin.xyz,
+                                    -P.lambdaMax, P.lambdaMax);
         }
         float cap = min(stiffLin, PENALTY_MAX);
         j.penaltyLin.xyz = min(penLin + fabs(C) * P.betaLin, cap);
@@ -612,7 +616,8 @@ kernel void dual_joints(
         float3 C = q_sub(qA, posAng[b]) * torqueArm;
         if (j.header.w & 2) {
             C -= j.C0Ang.xyz * P.alpha;
-            j.lambdaAng.xyz = penAng * C + j.lambdaAng.xyz;
+            j.lambdaAng.xyz = clamp(penAng * C + j.lambdaAng.xyz,
+                                    -P.lambdaMax, P.lambdaMax);
         }
         float cap = min(stiffAng, PENALTY_MAX);
         j.penaltyAng.xyz = min(penAng + fabs(C) * P.betaAng, cap);
@@ -661,6 +666,9 @@ kernel void dual_manifolds(
         float3 C; float fs, bnd;
         float3 F = contactForceC(m, i, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW, P.alpha, C, fs, bnd);
 
+        // bound the dual (paper Sec 4): conflicting contacts otherwise ramp
+        // each other's lambda without limit until the stored force explodes
+        F.x = max(F.x, -P.lambdaMax);
         m.contacts[i].lambda = float4(F, 0);
 
         float3 pen = m.contacts[i].penalty.xyz;
@@ -728,7 +736,8 @@ kernel void diag_error(
     float err = 0.0f;
     if (gid < P.numJoints) {
         device const JointGPU& j = joints[gid];
-        if (j.header.z == 0) {
+        // skip broken joints and inert exclusion-only joints (stiffness 0)
+        if (j.header.z == 0 && (j.rA.w > 0.0f || j.rB.w > 0.0f)) {
             uint a = j.header.x, b = j.header.y;
             float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
             float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);

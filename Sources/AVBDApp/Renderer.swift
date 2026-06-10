@@ -13,7 +13,8 @@ using namespace metal;
 
 struct RenderInstance {
     float4x4 model;
-    float4 color;
+    float4 color;       // w = shape type (0 box, 1 sphere, 2 torus)
+    float4 params;      // torus: x = major R, y = minor r
 };
 
 struct Uniforms {
@@ -62,7 +63,7 @@ vertex VOut box_vertex(uint vid [[vertex_id]],
                        constant Uniforms& U [[buffer(1)]])
 {
     RenderInstance inst = instances[iid];
-    if (inst.color.w != 0.0) {       // sphere instance: collapse in box pass
+    if (inst.color.w != 0.0) {       // non-box instance: collapse in box pass
         VOut o;
         o.position = float4(0, 0, -2, 1);
         o.normal = float3(0); o.world = float3(0); o.color = float4(0);
@@ -106,7 +107,7 @@ vertex VOut sphere_vertex(uint vid [[vertex_id]],
                           constant Uniforms& U [[buffer(1)]])
 {
     RenderInstance inst = instances[iid];
-    if (inst.color.w == 0.0) {       // box instance: collapse in sphere pass
+    if (inst.color.w != 1.0) {       // non-sphere: collapse in sphere pass
         VOut o;
         o.position = float4(0, 0, -2, 1);
         o.normal = float3(0); o.world = float3(0); o.color = float4(0);
@@ -124,6 +125,46 @@ vertex VOut sphere_vertex(uint vid [[vertex_id]],
     float theta = u * 2.0 * M_PI_F;
     float3 n = float3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
     float3 p = n * 0.5;              // unit-diameter sphere
+    float4 world = inst.model * float4(p, 1);
+    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
+                            normalize(inst.model[1].xyz),
+                            normalize(inst.model[2].xyz));
+    VOut o;
+    o.position = U.viewProj * world;
+    o.normal = rot * n;
+    o.world = world.xyz;
+    o.color = float4(inst.color.rgb, 1);
+    return o;
+}
+
+// Analytic torus: RINGS x SIDES quads
+#define TOR_RINGS 24
+#define TOR_SIDES 12
+
+vertex VOut torus_vertex(uint vid [[vertex_id]],
+                         uint iid [[instance_id]],
+                         device const RenderInstance* instances [[buffer(0)]],
+                         constant Uniforms& U [[buffer(1)]])
+{
+    RenderInstance inst = instances[iid];
+    if (inst.color.w != 2.0) {       // non-torus: collapse in torus pass
+        VOut o;
+        o.position = float4(0, 0, -2, 1);
+        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
+        return o;
+    }
+    uint quad = vid / 6;
+    uint corner = vid % 6;
+    uint ring = quad / TOR_SIDES;
+    uint side = quad % TOR_SIDES;
+    uint2 off[6] = { uint2(0,0), uint2(1,0), uint2(1,1), uint2(0,0), uint2(1,1), uint2(0,1) };
+    float u = float(ring + off[corner].x) / float(TOR_RINGS) * 2.0 * M_PI_F;
+    float v = float(side + off[corner].y) / float(TOR_SIDES) * 2.0 * M_PI_F;
+    float R = inst.params.x;
+    float r = inst.params.y;
+    float3 spine = float3(R * cos(u), R * sin(u), 0);
+    float3 n = float3(cos(u) * cos(v), sin(u) * cos(v), sin(v));
+    float3 p = spine + n * r;
     float4 world = inst.model * float4(p, 1);
     float3x3 rot = float3x3(normalize(inst.model[0].xyz),
                             normalize(inst.model[1].xyz),
@@ -177,6 +218,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let queue: MTLCommandQueue
     var boxPipeline: MTLRenderPipelineState!
     var spherePipeline: MTLRenderPipelineState!
+    var torusPipeline: MTLRenderPipelineState!
     var gridPipeline: MTLRenderPipelineState!
     var depthState: MTLDepthStencilState!
     var instances: MTLBuffer?
@@ -210,6 +252,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         sdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
         sdesc.depthAttachmentPixelFormat = .depth32Float
         spherePipeline = try device.makeRenderPipelineState(descriptor: sdesc)
+
+        let tdesc = MTLRenderPipelineDescriptor()
+        tdesc.vertexFunction = lib.makeFunction(name: "torus_vertex")
+        tdesc.fragmentFunction = lib.makeFunction(name: "box_fragment")
+        tdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        tdesc.depthAttachmentPixelFormat = .depth32Float
+        torusPipeline = try device.makeRenderPipelineState(descriptor: tdesc)
 
         let gdesc = MTLRenderPipelineDescriptor()
         gdesc.vertexFunction = lib.makeFunction(name: "grid_vertex")
@@ -270,8 +319,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         model.tickIfRunning()
 
         let count = solver.bodyCount
-        let needed = count * MemoryLayout<simd_float4x4>.stride + count * 16
-        let stride = MemoryLayout<simd_float4x4>.stride + 16
+        let stride = MemoryLayout<simd_float4x4>.stride + 32
+        let needed = count * stride
         if instances == nil || instances!.length < count * stride {
             instances = device.makeBuffer(length: max(256, count * stride), options: .storageModePrivate)
         }
@@ -308,6 +357,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0,
                            vertexCount: 12 * 18 * 6, instanceCount: count)
+
+        enc.setRenderPipelineState(torusPipeline)
+        enc.setVertexBuffer(instances, offset: 0, index: 0)
+        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                           vertexCount: 24 * 12 * 6, instanceCount: count)
         enc.endEncoding()
 
         cmd.present(drawable)

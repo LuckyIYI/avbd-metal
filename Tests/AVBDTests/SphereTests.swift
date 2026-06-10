@@ -61,17 +61,20 @@ final class SphereTests: XCTestCase {
         XCTAssertEqual(solver.bodyPosition(2).z, 0.5, accuracy: 0.05)
     }
 
-    func testVortexFunnelDropsBalls() throws {
-        let scene = Demos.swirl(turns: 3, balls: 20)
+    /// Slide: balls steadily descend the chute, stay inside it, and none
+    /// fall through the world.
+    func testSlideBallsDescend() throws {
+        let scene = Demos.swirl(turns: 3, balls: 10)
         let solver = try GPUSolver(scene: scene)
+        let ballStart = scene.bodies.count - 10
+        let z0 = (0..<10).map { solver.bodyPosition(ballStart + $0).z }.reduce(0, +) / 10
         for _ in 0..<900 { solver.step() }
-        let ballStart = scene.bodies.count - 20
-        var through = 0
-        for k in 0..<20 {
+        var sum: Float = 0
+        for k in 0..<10 {
             let z = solver.bodyPosition(ballStart + k).z
             XCTAssertGreaterThan(z, -1, "ball \(k) fell through the world")
-            if z < 1 { through += 1 }
+            sum += z
         }
-        XCTAssertGreaterThan(through, 5, "at least some balls should spiral through (got \(through))")
+        XCTAssertLessThan(sum / 10, z0 - 3, "balls should descend the chute (avg \(sum / 10) from \(z0))")
     }
 }

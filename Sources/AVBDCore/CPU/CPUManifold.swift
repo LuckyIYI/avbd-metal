@@ -25,12 +25,12 @@ public final class CPUManifold: CPUForce {
     }
 
     func anchorWorld(_ body: CPURigid, _ r: F3) -> F3 {
-        body.shape == .sphere ? body.positionLin + r
+        body.shape != .box ? body.positionLin + r
                               : transform(body.positionLin, body.positionAng, r)
     }
 
     func anchorOffsetWorld(_ body: CPURigid, _ r: F3) -> F3 {
-        body.shape == .sphere ? r : rotate(body.positionAng, r)
+        body.shape != .box ? r : rotate(body.positionAng, r)
     }
 
     func currentPenetration(_ i: Int) -> Float {
@@ -50,7 +50,7 @@ public final class CPUManifold: CPUForce {
         // Merge old contact data via feature keys (warm-start persistence).
         // Stick anchors are never restored for spheres: anchors rotate with
         // the body, which is wrong for rolling contacts.
-        let anySphere = bodyA.shape == .sphere || bodyB.shape == .sphere
+        let anySphere = bodyA.shape != .box || bodyB.shape != .box
         for i in 0..<count {
             for old in contacts where old.featureKey == newContacts[i].featureKey {
                 let newRA = newContacts[i].rA
@@ -65,12 +65,24 @@ public final class CPUManifold: CPUForce {
         }
         contacts = newContacts
 
+        // kinematic spinner surface motion (see GPU spinSurfaceShift)
+        var wA = F3.zero, wB = F3.zero
+        for sp in solver.spinners {
+            if solver.bodies[sp.body] === bodyA { wA = sp.axis * sp.omega }
+            if solver.bodies[sp.body] === bodyB { wB = sp.axis * sp.omega }
+        }
         for i in 0..<contacts.count {
             let xA = anchorWorld(bodyA, contacts[i].rA)
             let xB = anchorWorld(bodyB, contacts[i].rB)
             let d = xA - xB
             contacts[i].C0 = F3(dot(basis.0, d) + AVBDConstants.collisionMargin,
                                 dot(basis.1, d), dot(basis.2, d))
+            let sA = cross(wA, xA - bodyA.positionLin) * solver.dt
+            let sB = cross(wB, xB - bodyB.positionLin) * solver.dt
+            // pre-compensate the solver's alpha discount (shift is a target)
+            let rel = (sB - sA) / max(1 - solver.alpha, 0.01)
+            contacts[i].C0.y -= dot(basis.1, rel)
+            contacts[i].C0.z -= dot(basis.2, rel)
 
             contacts[i].lambda *= solver.alpha * solver.gamma
             contacts[i].penalty = simd_clamp(contacts[i].penalty * solver.gamma,
@@ -152,7 +164,9 @@ public final class CPUManifold: CPUForce {
             let (F, C, frictionScale, bounds) =
                 forceAndC(i, alpha, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW)
 
-            contacts[i].lambda = F
+            var Fb = F
+            Fb[0] = max(Fb[0], -solver.lambdaMax)
+            contacts[i].lambda = Fb
 
             if F[0] < 0 {
                 contacts[i].penalty[0] = min(contacts[i].penalty[0] + solver.betaLin * abs(C[0]),
