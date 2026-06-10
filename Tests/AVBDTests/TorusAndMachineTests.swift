@@ -39,12 +39,16 @@ final class TorusAndMachineTests: XCTestCase {
         XCTAssertGreaterThan(solver.bodyPosition(2).z, 0.8, "ball should rest inside the ring")
     }
 
-    func testChainmailHangsAndCatches() throws {
+    /// Mail hangs purely mechanically: rings rest on post pegs, no world
+    /// constraints on the cloth at all.
+    func testChainmailHangsOnPegs() throws {
         let scene = Demos.chainmail(rings: 5, drops: 3)
+        var ringIdx: [Int] = []
+        for (i, b) in scene.bodies.enumerated() where b.shape == .torus { ringIdx.append(i) }
         let solver = try GPUSolver(scene: scene)
-        for _ in 0..<600 { solver.step() }
-        for i in 5..<(scene.bodies.count - 3) {
-            XCTAssertGreaterThan(solver.bodyPosition(i).z, 5.0, "ring \(i) fell out of the sheet")
+        for _ in 0..<700 { solver.step() }
+        for i in ringIdx {
+            XCTAssertGreaterThan(solver.bodyPosition(i).z, 4.5, "ring \(i) fell out of the sheet")
         }
         var caught = 0
         for i in (scene.bodies.count - 3)..<scene.bodies.count where solver.bodyPosition(i).z > 4 { caught += 1 }
@@ -64,20 +68,17 @@ final class TorusAndMachineTests: XCTestCase {
         XCTAssertGreaterThan(solver.bodyVelocity(1).x, 0.3, "box must ride the roller")
     }
 
-    /// Conveyor: a hinged plank loop around kinematic drums carries cargo.
-    func testConveyorBelt() throws {
-        let scene = Demos.treadmill(boxes: 4)
+    /// Roller conveyor: motorized spinning rollers carry boxes downstream.
+    func testRollerConveyor() throws {
+        let scene = Demos.treadmill(boxes: 5)
         let solver = try GPUSolver(scene: scene)
-        let boxStart = scene.bodies.count - 4
+        let boxStart = scene.bodies.count - 5
         var x0: Float = 0
-        for f in 0..<600 {
+        for f in 0..<360 {
             solver.step()
-            if f == 149 { x0 = (0..<4).map { solver.bodyPosition(boxStart + $0).x }.reduce(0,+) / 4 }
+            if f == 89 { x0 = (0..<5).map { solver.bodyPosition(boxStart + $0).x }.reduce(0,+) / 5 }
         }
-        let x1 = (0..<4).map { solver.bodyPosition(boxStart + $0).x }.reduce(0,+) / 4
-        XCTAssertGreaterThan(x1 - x0, 2.0, "belt must convey boxes (+\(x1 - x0))")
-        for i in 1...26 {
-            XCTAssertGreaterThan(solver.bodyPosition(i).z, 0.5, "belt plank \(i) must stay on the machine")
-        }
+        let x1 = (0..<5).map { solver.bodyPosition(boxStart + $0).x }.reduce(0,+) / 5
+        XCTAssertGreaterThan(x1 - x0, 1.0, "rollers must convey boxes (+\(x1 - x0))")
     }
 }

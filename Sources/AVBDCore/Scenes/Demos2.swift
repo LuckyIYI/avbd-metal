@@ -120,9 +120,11 @@ extension Demos {
         return s
     }
 
-    /// Chainmail sheet from interlocking REAL torus rings (one rigid torus
-    /// body per ring, exact implicit collision). The perimeter hangs from
-    /// posts; boxes and balls are dropped onto the sheet.
+    /// Chainmail from interlocking torus rings, hung PURELY MECHANICALLY:
+    /// no world constraints on the cloth. Perimeter rings are threaded
+    /// around flexible posts (segmented stacks joined by hard constraints,
+    /// so they bend slightly but hold straight) and rest on small
+    /// orthogonal cross-sticks welded near the post tops.
     public static func chainmail(rings: Int = 6, drops: Int = 3) -> PhysicsScene {
         var s = PhysicsScene(name: "chainmail")
         s.settings.iterations = 25
@@ -130,42 +132,85 @@ extension Demos {
         s.settings.lambdaMax = 1500 // wedged links must not stockpile force
         addGround(&s, friction: 0.6)
 
-        // Threading geometry: the connector tube crosses the flat ring's
-        // plane at |pitch/2 - R| from its center; that offset + r must stay
-        // under the hole radius (R - r) or the rings spawn interpenetrating.
         let R: Float = 0.45         // major (spine) radius
         let r: Float = 0.15         // minor (tube) radius
         let sheetZ: Float = 8.0
         let pitch: Float = 1.15     // (1.15/2-0.45)+0.15 = 0.275 < 0.30 ok
         let n = rings
         let extent = Float(n - 1) * pitch / 2
+        let mid = (n - 1) / 2
 
-        // posts at corners (visual support for the anchors)
-        for sx in [Float(-1), 1] {
-            for sy in [Float(-1), 1] {
-                _ = s.addBody(size: F3(0.25, 0.25, sheetZ + 0.5), density: 0,
-                              friction: 0.5,
-                              position: F3(sx * (extent + 0.9), sy * (extent + 0.9),
-                                           (sheetZ + 0.5) / 2))
+        /// Flexible post through (x, y): static base + hard-jointed segment
+        /// stack + welded orthogonal peg sticks just below the sheet height.
+        func addPost(x: Float, y: Float) {
+            let segH: Float = 1.6
+            let cross: Float = 0.22
+            let pegZ = sheetZ - 0.3
+            let topZ = sheetZ + 1.0
+            var prev = s.addBody(size: F3(cross, cross, segH), density: 0,
+                                 friction: 0.4, position: F3(x, y, segH / 2))
+            var z = segH
+            while z < topZ {
+                let h = min(segH, topZ - z)
+                let seg = s.addBody(size: F3(cross, cross, h), density: 4,
+                                    friction: 0.4, position: F3(x, y, z + h / 2))
+                // hard weld: bends a little under load, holds mostly straight
+                s.addJoint(SceneJoint(bodyA: prev, bodyB: seg,
+                                      rA: F3(0, 0, s.bodies[prev].size.z / 2),
+                                      rB: F3(0, 0, -h / 2),
+                                      stiffnessLin: .infinity, stiffnessAng: .infinity))
+                prev = seg
+                z += h
+            }
+            // orthogonal peg sticks (a small +) welded to the carrying segment
+            let segTopZ = z
+            let pegHost = prev
+            let hostC = F3(x, y, segTopZ - min(segH, segTopZ) / 2)
+            _ = hostC
+            for axis in 0..<2 {
+                let size = axis == 0 ? F3(1.1, 0.14, 0.14) : F3(0.14, 1.1, 0.14)
+                let peg = s.addBody(size: size, density: 2, friction: 0.5,
+                                    position: F3(x, y, pegZ))
+                // weld peg to the post segment at the peg height
+                let segCenterZ = s.bodies[pegHost].position.z
+                s.addJoint(SceneJoint(bodyA: pegHost, bodyB: peg,
+                                      rA: F3(0, 0, pegZ - segCenterZ), rB: .zero,
+                                      stiffnessLin: .infinity, stiffnessAng: .infinity))
+                s.addJoint(SceneJoint(bodyA: pegHost, bodyB: peg,
+                                      rA: F3(0, 0, pegZ - segCenterZ)
+                                          + (axis == 0 ? F3(0.4, 0, 0) : F3(0, 0.4, 0)),
+                                      rB: axis == 0 ? F3(0.4, 0, 0) : F3(0, 0.4, 0),
+                                      stiffnessLin: .infinity, stiffnessAng: .infinity))
             }
         }
 
-        let qFlat = Quat(real: 1, imag: .zero)                       // xy plane
-        let qX = Quat(angle: .pi / 2, axis: F3(1, 0, 0))             // xz plane
-        let qY = (Quat(angle: .pi / 2, axis: F3(0, 0, 1)) * qX).normalized  // yz plane
+        // posts at the perimeter corner + mid-edge ring positions
+        var postCells: Set<Int> = []
+        for j in 0..<n {
+            for i in 0..<n {
+                let corner = (i == 0 || i == n - 1) && (j == 0 || j == n - 1)
+                let edgeMid = (i == mid && (j == 0 || j == n - 1))
+                           || (j == mid && (i == 0 || i == n - 1))
+                if corner || edgeMid { postCells.insert(j * n + i) }
+            }
+        }
+        for cell in postCells {
+            let i = cell % n, j = cell / n
+            addPost(x: Float(i) * pitch - extent, y: Float(j) * pitch - extent)
+        }
 
-        var anchors: [(Int, F3)] = []
+        let qFlat = Quat(real: 1, imag: .zero)
+        let qX = Quat(angle: .pi / 2, axis: F3(1, 0, 0))
+        let qY = (Quat(angle: .pi / 2, axis: F3(0, 0, 1)) * qX).normalized
+
         for j in 0..<n {
             for i in 0..<n {
                 let cx = Float(i) * pitch - extent
                 let cy = Float(j) * pitch - extent
-                let ring = s.addTorus(major: R, minor: r, density: 1, friction: 0.3,
-                                      position: F3(cx, cy, sheetZ), rotation: qFlat)
-                if i == 0 || i == n - 1 || j == 0 || j == n - 1 {
-                    // two anchor points so the perimeter rings can't flip
-                    anchors.append((ring, F3(cx + R, cy, sheetZ)))
-                    anchors.append((ring, F3(cx - R, cy, sheetZ)))
-                }
+                // rings at post cells spawn threaded AROUND the post, just
+                // above the peg; gravity drops them onto the cross-sticks
+                _ = s.addTorus(major: R, minor: r, density: 1, friction: 0.3,
+                               position: F3(cx, cy, sheetZ), rotation: qFlat)
                 if i + 1 < n {
                     _ = s.addTorus(major: R, minor: r, density: 1, friction: 0.3,
                                    position: F3(cx + pitch / 2, cy, sheetZ), rotation: qX)
@@ -176,22 +221,14 @@ extension Demos {
                 }
             }
         }
-        var flip = false
-        for (ring, anchor) in anchors {
-            s.addJoint(SceneJoint(bodyA: -1, bodyB: ring, rA: anchor,
-                                  rB: F3(flip ? -R : R, 0, 0)))
-            flip.toggle()
-        }
 
-        // primitives falling on top: mixed boxes and balls
+        // primitives falling on top (after the sheet settles onto the pegs)
         var rng = SplitMix64(seed: 11)
         for k in 0..<drops {
             let sz = 0.9 + rng.nextFloat() * 0.7
-            // drop AFTER the sheet's own settle transient (high spawn = late
-            // arrival), or impacts superpose with the settling oscillation
-            let pos = F3((rng.nextFloat() - 0.5) * Float(n) * pitch * 0.5,
-                         (rng.nextFloat() - 0.5) * Float(n) * pitch * 0.5,
-                         sheetZ + 3 + Float(k) * 2)
+            let pos = F3((rng.nextFloat() - 0.5) * Float(n) * pitch * 0.4,
+                         (rng.nextFloat() - 0.5) * Float(n) * pitch * 0.4,
+                         sheetZ + 4 + Float(k) * 2)
             if k % 2 == 0 {
                 _ = s.addSphere(diameter: sz, density: 1.0, friction: 0.5, position: pos)
             } else {
@@ -258,94 +295,50 @@ extension Demos {
         return s
     }
 
-    /// Conveyor treadmill: a closed loop of hinged planks (a real belt)
-    /// wrapped around two spinning paddle wheels. The wheels engage the
-    /// belt's inner surface mechanically and drive it around; boxes ride
-    /// the moving belt.
-    public static func treadmill(boxes: Int = 8) -> PhysicsScene {
+    /// Roller conveyor: the surface IS spinning blocks on motors — a row of
+    /// octagonal rollers (kinematic spinners); spin-aware contact friction
+    /// conveys whatever rides on them.
+    public static func treadmill(boxes: Int = 10) -> PhysicsScene {
         var s = PhysicsScene(name: "treadmill")
         addGround(&s)
 
-        let wheelX: Float = 2.6          // wheel centers at ±wheelX
-        let wheelZ: Float = 2.6
-        let wrapR: Float = 1.0           // belt wrap radius around wheels
-        let beltW: Float = 3.2
-        let span = 2 * wheelX
-        let circumference = 2 * span + 2 * .pi * wrapR
-        let plankCount = 26
-        let plankLen = circumference / Float(plankCount)
+        let rollerCount = 10
+        let spacing: Float = 1.05
+        let rollerZ: Float = 1.1
+        let rollerW: Float = 5.0
+        let diam: Float = 0.95
 
-        // belt path: top span (+x), right wrap, bottom span (-x), left wrap
-        func pathPoint(_ sIn: Float) -> (F3, Float) {   // (pos, pitch about y)
-            var t = sIn.truncatingRemainder(dividingBy: circumference)
-            if t < 0 { t += circumference }
-            if t < span {
-                return (F3(-wheelX + t, 0, wheelZ + wrapR), 0)
-            }
-            t -= span
-            if t < .pi * wrapR {
-                let a = .pi / 2 - t / wrapR     // from +90 (top) to -90 (bottom)
-                return (F3(wheelX + wrapR * cos(a), 0, wheelZ + wrapR * sin(a)),
-                        .pi / 2 - a)
-            }
-            t -= .pi * wrapR
-            if t < span {
-                return (F3(wheelX - t, 0, wheelZ - wrapR), .pi)
-            }
-            t -= span
-            let a = -.pi / 2 - t / wrapR        // from -90 back to -270 (top)
-            return (F3(-wheelX + wrapR * cos(a), 0, wheelZ + wrapR * sin(a)),
-                    .pi / 2 - a)
-        }
-
-        var planks: [Int] = []
-        for i in 0..<plankCount {
-            let sMid = (Float(i) + 0.5) * plankLen
-            let (pos, pitch) = pathPoint(sMid)
-            let q = Quat(angle: pitch, axis: F3(0, 1, 0))
-            let plank = s.addBody(size: F3(plankLen * 0.98, beltW, 0.1),
-                                  density: 0.6, friction: 0.9,
-                                  position: pos, rotation: q)
-            planks.append(plank)
-        }
-        // hinge consecutive planks (closed loop), two joints across the width
-        for i in 0..<plankCount {
-            let nx = (i + 1) % plankCount
-            for yo in [-beltW * 0.4, beltW * 0.4] {
-                s.addJoint(SceneJoint(bodyA: planks[i], bodyB: planks[nx],
-                                      rA: F3(plankLen / 2, yo, 0),
-                                      rB: F3(-plankLen / 2, yo, 0)))
-            }
-        }
-
-        // Kinematic octagon drums: the contact solver now understands
-        // spinner surface velocity, so plain friction drives the belt.
-        for wx in [-wheelX, wheelX] {
+        for i in 0..<rollerCount {
+            let x = Float(i) * spacing - Float(rollerCount - 1) * spacing / 2
+            // proper octagonal roller: 4 slabs with thickness = diam*cos(22.5°)
+            // (regular octagon = intersection of 4 such slabs) -> only ~8%
+            // radius ripple, smooth ride
             for k in 0..<4 {
-                let idx = s.addBody(size: F3(2 * (wrapR - 0.06), beltW * 0.8, 0.3),
-                                    density: 0, friction: 1.2,
-                                    position: F3(wx, 0, wheelZ),
+                let idx = s.addBody(size: F3(diam, rollerW, diam * 0.924), density: 0,
+                                    friction: 1.0,
+                                    position: F3(x, 0, rollerZ),
                                     rotation: Quat(angle: Float(k) * .pi / 4,
                                                    axis: F3(0, 1, 0)))
-                s.addSpinner(SceneSpinner(body: idx, axis: F3(0, 1, 0), omega: 1.2))
+                s.addSpinner(SceneSpinner(body: idx, axis: F3(0, 1, 0), omega: 2.5))
             }
         }
 
-        // slick beds: under the top span (carrying side) and under the
-        // bottom span (return side), like a conveyor's support + return bed
-        _ = s.addBody(size: F3(span - 2.6, beltW, 0.25), density: 0, friction: 0.02,
-                      position: F3(0, 0, wheelZ + wrapR - 0.26))
-        _ = s.addBody(size: F3(span - 2.6, beltW, 0.25), density: 0, friction: 0.02,
-                      position: F3(0, 0, wheelZ - wrapR - 0.45))
+        // side rails
+        for yo in [Float(-2.7), 2.7] {
+            _ = s.addBody(size: F3(Float(rollerCount) * spacing + 1.5, 0.25, 1.4),
+                          density: 0, friction: 0.05,
+                          position: F3(0, yo, rollerZ + 0.6))
+        }
 
-        // cargo dropped onto the upstream end of the belt
+        // cargo dropped at the upstream end
         var rng = SplitMix64(seed: 21)
         for k in 0..<boxes {
-            _ = s.addBody(size: F3(repeating: 0.5 + rng.nextFloat() * 0.25),
-                          density: 0.8, friction: 0.9,
-                          position: F3(-wheelX + 0.7 + (rng.nextFloat() - 0.5) * 0.6,
-                                       (rng.nextFloat() - 0.5) * (beltW - 1),
-                                       wheelZ + wrapR + 1.0 + Float(k) * 0.8))
+            _ = s.addBody(size: F3(repeating: 0.5 + rng.nextFloat() * 0.3),
+                          density: 0.8, friction: 0.8,
+                          position: F3(-Float(rollerCount - 2) * spacing / 2
+                                           + Float(k % 3) * 0.9,
+                                       (rng.nextFloat() - 0.5) * 4,
+                                       rollerZ + 1.3 + Float(k / 3) * 0.9))
         }
         return s
     }
