@@ -17,14 +17,18 @@ extension Demos {
         s.settings.lambdaMax = 6000
         addGround(&s, friction: 0.8)
 
+        // longer bridges are also taller: deck elevation, towers, and sag
+        // grow with the span like real suspension bridges
+        let lengthScale = Float(planks) / 14
+        let hScale = max(1, sqrt(lengthScale))
         let plankLen: Float = 1.3, plankW: Float = 2.6, plankT: Float = 0.14
         let span = Float(planks) * plankLen           // suspended main span
-        let deckZ: Float = 2.6
+        let deckZ: Float = 2.6 * hScale
         let towerX = span / 2 + 0.6
-        let towerTopZ: Float = 7.4
-        let anchorX = towerX + 4.2
+        let towerTopZ: Float = deckZ + 3.2 + 1.6 * lengthScale
+        let anchorX = towerX + 3.2 + 1.0 * lengthScale
         let cableY = plankW / 2 + 0.12                // cables run outside the deck
-        let sag: Float = 2.9                           // mid-span cable droop
+        let sag: Float = (towerTopZ - deckZ) * 0.62    // mid-span cable droop
 
         // ---- towers: two legs + crossbeam per side, static ----
         for tx in [-towerX, towerX] {
