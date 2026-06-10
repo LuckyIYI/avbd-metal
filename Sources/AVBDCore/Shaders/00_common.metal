@@ -79,9 +79,14 @@ inline float3 q_rotate(float4 q, float3 v) {
     float3 t = 2.0f * cross(q.xyz, v);
     return v + q.w * t + cross(q.xyz, t);
 }
-// q_a - q_b in tangent space (Eq. 20)
+// q_a - q_b in tangent space (Eq. 20). The relative quaternion is
+// canonicalized to the w >= 0 hemisphere: without this, a freely spinning
+// hinge crossing 180 deg of relative rotation flips the constraint
+// gradient's sign (double cover) and the joint explodes.
 inline float3 q_sub(float4 a, float4 b) {
-    return q_mul(a, q_inv(b)).xyz * 2.0f;
+    float4 r = q_mul(a, q_inv(b));
+    if (r.w < 0.0f) r = -r;
+    return r.xyz * 2.0f;
 }
 // q + w (Eq. 21)
 inline float4 q_addw(float4 q, float3 w) {

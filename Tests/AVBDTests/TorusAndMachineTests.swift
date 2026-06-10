@@ -109,9 +109,9 @@ extension TorusAndMachineTests {
         let solver = try GPUSolver(scene: scene)
         for _ in 0..<1500 { solver.step() }
         let p = solver.bodyPosition(1)
-        // pace varies run to run; require meaningful descent + integrity
-        XCTAssertGreaterThan(p.x, 0.0, "car should descend the track (x=\(p.x))")
-        XCTAssertLessThan(p.z, 5.5, "car should be well down the track (z=\(p.z))")
+        // chaotic lateral drift varies run to run; require the schuss itself
+        XCTAssertGreaterThan(p.x, 3.0, "car should descend the drop (x=\(p.x))")
+        XCTAssertLessThan(p.z, 6.0, "car should be near the bottom (z=\(p.z))")
         for o in outers {
             XCTAssertLessThan(distance(solver.bodyPosition(o), p), 1.6,
                               "wheels must stay on their bearings")

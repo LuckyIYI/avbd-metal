@@ -447,15 +447,16 @@ extension Demos {
     /// body — retained by an end cap, spinning freely as a real bearing —
     /// with spokes out to an outer torus that is the tire. The car rolls
     /// down a curly banked track on inertia alone.
-    /// Assemble the mechanical car at `carPos`. Returns the chassis index.
+    /// Assemble the car at `carPos`. Wheels are welded composites (hub torus,
+    /// three spokes, tire torus) attached to the chassis by 1-DOF HINGE
+    /// joints — they spin freely about their axles. Returns the chassis index.
     @discardableResult
     public static func buildCar(_ s: inout PhysicsScene, carPos: F3, v0: F3,
                                 rot: Quat = Quat(real: 1, imag: .zero)) -> Int {
-        let wheelR: Float = 0.5         // outer torus major radius
-        let tire: Float = 0.13          // outer tube radius
-        let hubR: Float = 0.27          // inner torus major radius
-        let hubTube: Float = 0.115      // thick tube: deep penetration budget
-        let axleR: Float = 0.11         // round axle (capsule), hole 0.155
+        let wheelR: Float = 0.5         // tire major radius
+        let tire: Float = 0.13
+        let hubR: Float = 0.22
+        let hubTube: Float = 0.09
 
         func place(_ off: F3) -> F3 { carPos + rot.act(off) }
         func orient(_ q: Quat) -> Quat { (rot * q).normalized }
@@ -466,85 +467,70 @@ extension Demos {
 
         let qWheel = Quat(angle: .pi / 2, axis: F3(1, 0, 0))   // torus axis -> y
 
-        for sx in [Float(-1), 1] {          // front/back
-            for sy in [Float(-1), 1] {      // left/right
+        for sx in [Float(-1), 1] {
+            for sy in [Float(-1), 1] {
                 let wheelC = place(F3(sx * 0.95, sy * 0.85, 0))
 
-                // round axle (capsule along y) welded to the chassis
-                let qAxle = Quat(angle: .pi / 2, axis: F3(1, 0, 0))   // z -> y
-                let axle = s.addCapsule(length: 0.55, radius: axleR,
-                                        density: 2, friction: 0.02,
-                                        position: place(F3(sx * 0.95, sy * 0.825, 0)),
+                // decorative stub axle welded to the chassis
+                let qAxle = Quat(angle: .pi / 2, axis: F3(1, 0, 0))
+                let axle = s.addCapsule(length: 0.62, radius: 0.08,
+                                        density: 2, friction: 0.1,
+                                        position: place(F3(sx * 0.95, sy * 0.80, 0)),
                                         rotation: orient(qAxle), velocity: v0)
-                // capsule local +z maps to world -y under qAxle
                 s.addJoint(SceneJoint(bodyA: chassis, bodyB: axle,
-                                      rA: F3(sx * 0.95, sy * 0.55, 0),
-                                      rB: F3(0, 0, sy * 0.275),
-                                      stiffnessLin: .infinity, stiffnessAng: .infinity))
-                // end cap so the hub can't slide off
-                let cap = s.addBody(size: F3(0.52, 0.09, 0.52), density: 2,
-                                    friction: 0.02,
-                                    position: place(F3(sx * 0.95, sy * 1.14, 0)),
-                                    rotation: orient(qId), velocity: v0)
-                s.addJoint(SceneJoint(bodyA: axle, bodyB: cap,
-                                      rA: F3(0, 0, -sy * 0.275), rB: F3(0, -sy * 0.04, 0),
+                                      rA: F3(sx * 0.95, sy * 0.49, 0),
+                                      rB: F3(0, 0, sy * 0.31),
                                       stiffnessLin: .infinity, stiffnessAng: .infinity))
 
-                // hubs: TWO inner tori around the axle, spaced like a real
-                // double-row bearing — a single thin hub can cant and wedge
+                // hub torus, HINGED to the chassis (free spin about its axis)
                 let hub = s.addTorus(major: hubR, minor: hubTube, density: 1.5,
-                                     friction: 0.02,
-                                     position: wheelC + rot.act(F3(0, -sy * 0.12, 0)),
+                                     friction: 0.1, position: wheelC,
                                      rotation: orient(qWheel), velocity: v0)
-                let hub2 = s.addTorus(major: hubR, minor: hubTube, density: 1.5,
-                                      friction: 0.02,
-                                      position: wheelC + rot.act(F3(0, sy * 0.12, 0)),
-                                      rotation: orient(qWheel), velocity: v0)
-                // local z maps to world -y under qWheel: anchors flipped
-                s.addJoint(SceneJoint(bodyA: hub, bodyB: hub2,
-                                      rA: F3(hubR, 0, -sy * 0.12), rB: F3(hubR, 0, sy * 0.12),
-                                      stiffnessLin: .infinity, stiffnessAng: .infinity))
-                // tire: outer torus
+                s.addJoint(SceneJoint(bodyA: chassis, bodyB: hub,
+                                      rA: F3(sx * 0.95, sy * 0.85, 0), rB: .zero,
+                                      stiffnessLin: .infinity, stiffnessAng: .infinity,
+                                      hingeAxis: F3(0, 0, 1)))   // torus local axis
+
+                // tire + spokes welded into the wheel composite
                 let outer = s.addTorus(major: wheelR, minor: tire, density: 1,
-                                       friction: 1.2, position: wheelC,
+                                       friction: 0.5, position: wheelC,
                                        rotation: orient(qWheel), velocity: v0)
-                // spokes: three sticks welded hub -> tire
                 for k in 0..<3 {
                     let a = Float(k) * 2 * .pi / 3
-                    let dir = rot.act(F3(cos(a), 0, sin(a)))    // wheel plane
+                    let dir = rot.act(F3(cos(a), 0, sin(a)))
+                    let spokeLen = wheelR - hubR + 0.1
                     let mid = wheelC + dir * (hubR + wheelR) / 2
-                    let spoke = s.addBody(size: F3(wheelR - hubR + 0.1, 0.06, 0.06),
+                    let spoke = s.addBody(size: F3(spokeLen, 0.06, 0.06),
                                           density: 1, friction: 0.1,
                                           position: mid,
                                           rotation: orient(Quat(angle: -a, axis: F3(0, 1, 0))),
                                           velocity: v0)
-                    // weld to hub at hub rim (hub1 sits -0.12 off the wheel
-                    // plane; world +y = hub-local -z under qWheel)
                     s.addJoint(SceneJoint(bodyA: hub, bodyB: spoke,
-                                          rA: F3(cos(a) * hubR, sin(a) * hubR, -sy * 0.12),
-                                          rB: F3(-(wheelR - hubR + 0.1) / 2 + 0.05, 0, 0),
+                                          rA: F3(cos(a) * hubR, sin(a) * hubR, 0),
+                                          rB: F3(-spokeLen / 2 + 0.05, 0, 0),
                                           stiffnessLin: .infinity, stiffnessAng: .infinity))
                     s.addJoint(SceneJoint(bodyA: spoke, bodyB: outer,
-                                          rA: F3((wheelR - hubR + 0.1) / 2 - 0.05, 0, 0),
+                                          rA: F3(spokeLen / 2 - 0.05, 0, 0),
                                           rB: F3(cos(a) * wheelR, sin(a) * wheelR, 0),
                                           stiffnessLin: .infinity, stiffnessAng: .infinity))
-                }
-                // exclusions: same-assembly parts that come close but must
-                // never collide (hubs/tire, spokes vs axle+cap+chassis)
-                for h in [hub, hub2] {
-                    s.addJoint(SceneJoint(bodyA: h, bodyB: outer, rA: .zero, rB: .zero,
-                                          stiffnessLin: 0, stiffnessAng: 0))
-                }
-                // NOTE: hub-chassis collisions stay ON — the chassis side is
-                // the natural inner retention flange of the bearing
-                let spokeStart = s.bodies.count - 3
-                for sp in spokeStart..<s.bodies.count {
-                    for other in [axle, cap, chassis, hub2] {
+                    // spokes never collide with the chassis/axle
+                    let sp = s.bodies.count - 1
+                    for other in [chassis, axle] {
                         s.addJoint(SceneJoint(bodyA: other, bodyB: sp,
                                               rA: .zero, rB: .zero,
                                               stiffnessLin: 0, stiffnessAng: 0))
                     }
                 }
+                // wheel parts never collide with their own axle/chassis
+                for part in [hub, outer] {
+                    for other in [chassis, axle] {
+                        s.addJoint(SceneJoint(bodyA: other, bodyB: part,
+                                              rA: .zero, rB: .zero,
+                                              stiffnessLin: 0, stiffnessAng: 0))
+                    }
+                }
+                s.addJoint(SceneJoint(bodyA: hub, bodyB: outer, rA: .zero, rB: .zero,
+                                      stiffnessLin: 0, stiffnessAng: 0))
             }
         }
         return chassis
@@ -553,10 +539,12 @@ extension Demos {
     public static func car(trackScale: Int = 1) -> PhysicsScene {
         var s = PhysicsScene(name: "car")
         s.settings.iterations = 20
-        s.settings.betaLin = 20000      // bearings need fast contact stiffening
+        s.settings.betaLin = 20000
+        s.settings.lambdaMax = 1200     // wall-seam wedges must not stockpile
+                                        // force and launch the car
         addGround(&s, friction: 0.6)
 
-        let chassisZ0: Float = 10.47
+        let chassisZ0: Float = 7.2
         let startX: Float = -20.0
         let wheelR: Float = 0.5
         // flat launch platform start: car spawns resting on its wheels
@@ -568,41 +556,86 @@ extension Demos {
         struct Seg { var len: Float; var turn: Float; var pitch: Float; var bank: Float }
         let L = Float(max(1, trackScale))
         let segs: [Seg] = [
-            Seg(len: 5, turn: 0, pitch: -0.01, bank: 0),    // launch platform
-            Seg(len: 16, turn: 0, pitch: -0.38, bank: 0),
-            Seg(len: 10 * L, turn: -.pi / 2, pitch: -0.10, bank: -0.3),
-            Seg(len: 7, turn: 0, pitch: -0.18, bank: 0),
-            Seg(len: 10 * L, turn: .pi / 2, pitch: -0.10, bank: 0.3),
-            Seg(len: 12, turn: 0, pitch: -0.03, bank: 0),
+            // straight schuss: platform -> drop -> long runout. Unsteered
+            // rigid cars corner and jump chaotically; this stays honest.
+            Seg(len: 5, turn: 0, pitch: -0.01, bank: 0),
+            Seg(len: 12 * L, turn: 0, pitch: -0.15, bank: 0),
+            Seg(len: 30, turn: 0, pitch: -0.012, bank: 0),
         ]
 
-        var pos = F3(startX - 1.5, 0, chassisZ0 - wheelR - 0.2)
-        var heading: Float = 0
+        // three passes: collect per-sample (turn, pitch, bank) targets,
+        // SMOOTH pitch and bank (kinked pitch = concave ridges across the
+        // lane that eat all the car's energy), then integrate positions
+        var targets: [(Float, Float, Float)] = []   // dHeading, pitch, bank
         let step: Float = 0.9
         for seg in segs {
             let n = Int(seg.len / step)
-            for k in 0..<n {
-                let dHeading = seg.turn / Float(max(1, n))
-                heading += dHeading
-                let dir = F3(cos(heading), sin(heading), 0)
-                pos += dir * step + F3(0, 0, sin(seg.pitch) * step)
-                if pos.z < 0.1 { pos.z = 0.1 }
-
-                let qYaw = Quat(angle: heading, axis: F3(0, 0, 1))
-                let right = F3(sin(heading), -cos(heading), 0)
-                let qPitch = Quat(angle: seg.pitch, axis: right)
-                let qBank = Quat(angle: seg.bank, axis: dir)
-                let q = (qBank * qPitch * qYaw).normalized
-                _ = s.addBody(size: F3(1.35, 3.2, 0.16), density: 0, friction: 0.8,
-                              position: pos, rotation: q)
-                // side walls
-                for wside in [Float(-1), 1] {
-                    let woff = q.act(F3(0, wside * 1.65, 0.3))
-                    let qWall = (q * Quat(angle: wside * 0.15, axis: F3(1, 0, 0))).normalized
-                    _ = s.addBody(size: F3(1.35, 0.14, 0.7), density: 0, friction: 0.1,
-                                  position: pos + woff, rotation: qWall)
+            for _ in 0..<n {
+                targets.append((seg.turn / Float(max(1, n)), seg.pitch, seg.bank))
+            }
+        }
+        func smooth(_ v: [Float]) -> [Float] {
+            var out = v
+            for i in 0..<v.count {
+                var acc: Float = 0; var cnt: Float = 0
+                for j in max(0, i - 5)...min(v.count - 1, i + 5) {
+                    acc += v[j]; cnt += 1
                 }
-                _ = k
+                out[i] = acc / cnt
+            }
+            return out
+        }
+        let pitches = smooth(targets.map { $0.1 })
+        let banksArr = smooth(targets.map { $0.2 })
+
+        var samples: [(F3, Float, Float, Float)] = []
+        var pos = F3(startX - 1.5, 0, chassisZ0 - wheelR - 0.2)
+        var heading: Float = 0
+        for (i, t) in targets.enumerated() {
+            heading += t.0
+            // exact 3D unit step along the slat plane: consecutive slats are
+            // perfectly coplanar on straights (no micro-ridges to bounce on)
+            let cp = cos(pitches[i]), sp = sin(pitches[i])
+            let d3 = F3(cos(heading) * cp, sin(heading) * cp, sp)
+            pos += d3 * step
+            if pos.z < 0.1 { pos.z = 0.1 }
+            samples.append((pos, heading, pitches[i], banksArr[i]))
+        }
+        for (i, sm) in samples.enumerated() {
+            let (p, hdg, pitch, _) = sm
+            let bank = samples[i].3
+            _ = bank
+            let qYaw = Quat(angle: hdg, axis: F3(0, 0, 1))
+            let right = F3(sin(hdg), -cos(hdg), 0)
+            let dir = F3(cos(hdg), sin(hdg), 0)
+            let qPitch = Quat(angle: pitch, axis: right)
+            let qBank = Quat(angle: samples[i].3, axis: dir)
+            let q = (qBank * qPitch * qYaw).normalized
+            _ = s.addBody(size: F3(1.35, 3.2, 0.16), density: 0, friction: 0.8,
+                          position: p, rotation: q)
+            // pinewood-derby center guide rail: the wheels straddle it with
+            // little play, keeping the unsteered car laterally captured
+            _ = s.addBody(size: F3(1.35, 1.18, 0.26), density: 0, friction: 0.03,
+                          position: p + q.act(F3(0, 0, 0.21)), rotation: q)
+            for wside in [Float(-1), 1] {
+                // tall near-vertical guide walls (an outward tilt becomes a
+                // launch ramp at speed), slick so the car grinds smoothly
+                let woff = q.act(F3(0, wside * 1.74, 0.62))
+                let qWall = (q * Quat(angle: wside * 0.06, axis: F3(1, 0, 0))).normalized
+                _ = s.addBody(size: F3(1.7, 0.14, 1.6), density: 0, friction: 0.03,
+                              position: p + woff, rotation: qWall)
+            }
+        }
+        // parking pocket at the runout end: a grippy patch + end bumper
+        if let last = samples.last {
+            let endP = last.0
+            _ = s.addBody(size: F3(6, 3.4, 0.16), density: 0, friction: 1.4,
+                          position: endP + F3(3.2, 0, 0))
+            _ = s.addBody(size: F3(0.3, 3.4, 1.2), density: 0, friction: 0.5,
+                          position: endP + F3(6.4, 0, 0.55))
+            for wside in [Float(-1), 1] {
+                _ = s.addBody(size: F3(6.6, 0.14, 1.2), density: 0, friction: 0.05,
+                              position: endP + F3(3.2, wside * 1.74, 0.55))
             }
         }
         return s
@@ -646,17 +679,22 @@ extension Demos {
                                   stiffnessLin: .infinity, stiffnessAng: .infinity))
         }
 
-        // sphere teeth welded around the rim (round teeth can't tip-butt)
-        let toothR: Float = 0.18
+        // squared teeth like a real gear: radial boxes welded to the rim.
+        // Tooth width = ~40% of the pitch arc so the gaps swallow the
+        // mating teeth; hinge-fixed centers keep the mesh aligned.
+        let toothLen: Float = 0.34
+        let pitchArc = 2 * .pi * R / Float(teeth)
+        let toothW = pitchArc * 0.40
         for k in 0..<teeth {
             let a = Float(k) / Float(teeth) * 2 * .pi + phase
             let dir = F3(cos(a), 0, sin(a))
-            let orbit = R + 0.16
-            let tooth = s.addSphere(diameter: 2 * toothR, density: 0.35, friction: 0.25,
-                                    position: center + dir * orbit)
+            let tooth = s.addBody(size: F3(toothLen, 0.42, toothW), density: 0.35,
+                                  friction: 0.15,
+                                  position: center + dir * (R + toothLen / 2),
+                                  rotation: Quat(angle: -a, axis: F3(0, 1, 0)))
             s.addJoint(SceneJoint(bodyA: rim, bodyB: tooth,
-                                  rA: F3(cos(a) * orbit, sin(a) * orbit, 0),
-                                  rB: .zero,
+                                  rA: F3(cos(a) * R, sin(a) * R, 0),
+                                  rB: F3(-toothLen / 2, 0, 0),
                                   stiffnessLin: .infinity, stiffnessAng: .infinity))
         }
 
@@ -689,9 +727,9 @@ extension Demos {
 
         // gear train in the xz-plane (axles along y)
         let g1c = F3(0, 0, 3.4)
-        let g2c = F3(2.34, 0, 3.4)        // ball-mesh engagement ~0.24
+        let g2c = F3(2.40, 0, 3.4)        // tooth tips overlap ~0.18
         _ = addGear(&s, center: g1c, R: 1.25, teeth: 12)
-        _ = addGear(&s, center: g2c, R: 0.65, teeth: 6, phase: 0.25, handLen: 1.5)
+        _ = addGear(&s, center: g2c, R: 0.65, teeth: 6, phase: 0.524, handLen: 1.5)
 
         // crank pin on the big gear's face (offset from the teeth plane):
         // the lever lifts this pin instead of poking between teeth

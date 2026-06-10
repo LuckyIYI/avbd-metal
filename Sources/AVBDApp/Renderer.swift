@@ -240,40 +240,84 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
                               texture2d<float> posTex [[texture(0)]],
                               texture2d<float> normTex [[texture(1)]])
 {
+    // GTAO (Jimenez et al. 2016): per pixel, march 2 slices through screen
+    // space, find the two horizon angles per slice, clamp them to the
+    // normal hemisphere, and integrate the visible cosine-weighted arc
+    // analytically. Ground-truth-matching AO for uniform sky visibility.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     float4 P4 = posTex.sample(smp, in.uv);
     if (P4.w < 0.5) return float4(1);
     float3 P = P4.xyz;
-    float3 N = normTex.sample(smp, in.uv).xyz;
-    float dist = length(P - U.eye.xyz);
+    float3 N = normalize(normTex.sample(smp, in.uv).xyz);
+    float3 V = normalize(U.eye.xyz - P);
+    float dist = length(U.eye.xyz - P);
 
-    // world-space AO radius, projected to a pixel radius
-    const float R = 0.9;
-    float pxRadius = clamp(U.screen.z * R / max(dist, 0.5), 3.0, 90.0);
+    const float R = 1.1;                                  // world AO radius
+    float pxRadius = clamp(U.screen.z * R / max(dist, 0.5), 4.0, 110.0);
 
-    // stable per-pixel rotation (position-hash, no temporal flicker)
+    // stable per-pixel slice rotation (screen-position hash, no flicker)
     float ang = fract(sin(dot(floor(in.position.xy), float2(12.9898, 78.233)))
-                      * 43758.5453) * 6.2831853;
-    float ca = cos(ang), sa = sin(ang);
+                      * 43758.5453) * M_PI_F;
 
-    const int NS = 10;
-    float occ = 0.0;
-    for (int i = 0; i < NS; i++) {
-        float t = (float(i) + 0.5) / float(NS);
-        float a = t * 6.2831853 * 2.0;     // 2 spiral turns
-        float rad = t * pxRadius;
-        float2 off = float2(cos(a) * ca - sin(a) * sa,
-                            cos(a) * sa + sin(a) * ca) * rad;
-        float2 uv2 = in.uv + off / U.screen.xy;
-        float4 Q4 = posTex.sample(smp, uv2);
-        if (Q4.w < 0.5) continue;
-        float3 v = Q4.xyz - P;
-        float d2 = dot(v, v);
-        // Alchemy estimator: occlusion from samples above the surface
-        occ += max(0.0, dot(N, v) - 0.02 * dist) / (d2 + 0.08);
+    const int SLICES = 2;
+    const int STEPS = 5;
+    float occlusion = 0.0;
+
+    for (int sl = 0; sl < SLICES; sl++) {
+        float phi = ang + float(sl) * (M_PI_F / float(SLICES));
+        float2 dirPx = float2(cos(phi), sin(phi));
+
+        // find horizons on both sides; remember a world-space tangent for
+        // the slice plane (from real reconstructed geometry)
+        float cosH[2] = { -1.0, -1.0 };
+        float3 sliceTan = float3(0);
+        for (int side = 0; side < 2; side++) {
+            float sgn = side == 0 ? 1.0 : -1.0;
+            for (int st = 1; st <= STEPS; st++) {
+                float t = (float(st) - 0.5) / float(STEPS);
+                float2 uv2 = in.uv + sgn * dirPx * (t * t * pxRadius) / U.screen.xy;
+                float4 Q4 = posTex.sample(smp, uv2);
+                if (Q4.w < 0.5) continue;
+                float3 w = Q4.xyz - P;
+                float l = length(w);
+                if (l < 1e-4) continue;
+                float c = dot(w / l, V);
+                // distance falloff: fade samples beyond the AO radius
+                float fade = saturate(1.0 - (l - R) / R);
+                c = mix(-1.0, c, fade);
+                if (c > cosH[side]) {
+                    cosH[side] = c;
+                    if (length_squared(sliceTan) < 1e-6) {
+                        float3 tp = w - V * dot(w, V);
+                        if (length_squared(tp) > 1e-6) sliceTan = sgn * normalize(tp);
+                    }
+                }
+            }
+        }
+        if (length_squared(sliceTan) < 1e-6) { occlusion += 1.0; continue; }
+
+        // project N into the slice plane (spanned by V and sliceTan)
+        float3 sliceN = cross(V, sliceTan);
+        float3 projN = N - sliceN * dot(N, sliceN);
+        float projLen = length(projN);
+        if (projLen < 1e-4) { occlusion += 1.0; continue; }
+        float3 pn = projN / projLen;
+        float cosNV = clamp(dot(pn, V), -1.0, 1.0);
+        float n = acos(cosNV) * (dot(pn, sliceTan) >= 0.0 ? 1.0 : -1.0);
+
+        // signed horizon angles in the slice plane (side 0 = +tangent)
+        float h1 =  acos(clamp(cosH[0], -1.0, 1.0));     // toward +tan
+        float h2 = -acos(clamp(cosH[1], -1.0, 1.0));     // toward -tan
+        h1 = n + min(h1 - n,  M_PI_F / 2.0);
+        h2 = n + max(h2 - n, -M_PI_F / 2.0);
+
+        // analytic cosine-weighted visible arc (paper eq. inner integral)
+        float a1 = 0.25 * (-cos(2.0 * h1 - n) + cosNV + 2.0 * h1 * sin(n));
+        float a2 = 0.25 * (-cos(2.0 * h2 - n) + cosNV + 2.0 * h2 * sin(n));
+        occlusion += projLen * (a1 + a2);
     }
-    float ao = clamp(1.0 - occ * (1.6 / float(NS)), 0.0, 1.0);
-    ao = pow(ao, 1.4);
+    float ao = clamp(occlusion / float(SLICES), 0.0, 1.0);
+    ao = pow(ao, 1.3);     // slight contrast shaping
     return float4(ao, ao, ao, 1);
 }
 

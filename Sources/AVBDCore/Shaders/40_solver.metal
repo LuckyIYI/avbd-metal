@@ -267,10 +267,14 @@ kernel void warmstart_joints(
     float torqueArm = j.C0Lin.w;
 
     j.C0Lin = float4(pA - pB, torqueArm);
-    float3 c0a = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
+    float3 c0a;
     if (j.hingeAxis.w != 0.0f) {
-        float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
-        c0a -= ax * dot(ax, c0a);
+        // hinge: axis-alignment error, invariant to spin about the axis
+        float3 aB = q_rotate(posAng[b], j.hingeAxis.xyz);
+        float3 aA = q_rotate(q_mul(qA, j.restRel), j.hingeAxis.xyz);
+        c0a = cross(aA, aB) * torqueArm;
+    } else {
+        c0a = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
     }
     j.C0Ang = float4(c0a, j.C0Ang.w);
 
@@ -388,17 +392,18 @@ inline void stampJoint(device const JointGPU& j, uint self,
         float3 C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
         float s = (isA ? 1.0f : -1.0f) * torqueArm;
         if (j.hingeAxis.w != 0.0f) {
-            // 1-DOF hinge: project constraint, force, and stiffness so the
-            // rotation about the axis stays completely free
-            float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
-            C -= ax * dot(ax, C);
+            // 1-DOF hinge: axis-alignment constraint C = cross(aA, aB).
+            // Spin-invariant — unlike quaternion differences, the gradient
+            // never degenerates as the wheel revolves. NOTE the Jacobian
+            // signs are OPPOSITE to the weld convention:
+            // dC/dthetaA = -P, dC/dthetaB = +P.
+            float3 aB = q_rotate(posAng[b], j.hingeAxis.xyz);
+            float3 aA = q_rotate(q_mul(qA, j.restRel), j.hingeAxis.xyz);
+            C = cross(aA, aB) * torqueArm;
             if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
             float3 F = penAng * C + j.lambdaAng.xyz;
-            F -= ax * dot(ax, F);
-            float k = (penAng.x + penAng.y + penAng.z) / 3.0f * (s * s);
-            M3 P = m3_add(m3_diag(float3(k)), m3_scale(m3_outer(ax, ax), -k));
-            acc.lhsAng = m3_add(acc.lhsAng, P);
-            acc.rhsAng += F * s;
+            acc.lhsAng = m3_add(acc.lhsAng, m3_diag(penAng * (s * s)));
+            acc.rhsAng += F * (-s);
         } else {
             if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
             float3 F = penAng * C + j.lambdaAng.xyz;
@@ -631,20 +636,18 @@ kernel void dual_joints(
     float3 penAng = j.penaltyAng.xyz;
     if (dot(penAng, penAng) > 0.0f) {
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
-        float3 C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
+        float3 C;
         if (j.hingeAxis.w != 0.0f) {
-            float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
-            C -= ax * dot(ax, C);
+            float3 aB = q_rotate(posAng[b], j.hingeAxis.xyz);
+            float3 aA = q_rotate(q_mul(qA, j.restRel), j.hingeAxis.xyz);
+            C = cross(aA, aB) * torqueArm;
+        } else {
+            C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
         }
         if (j.header.w & 2) {
             C -= j.C0Ang.xyz * P.alpha;
-            float3 lam = clamp(penAng * C + j.lambdaAng.xyz,
-                               -P.lambdaMax, P.lambdaMax);
-            if (j.hingeAxis.w != 0.0f) {
-                float3 ax = q_rotate(posAng[b], j.hingeAxis.xyz);
-                lam -= ax * dot(ax, lam);
-            }
-            j.lambdaAng.xyz = lam;
+            j.lambdaAng.xyz = clamp(penAng * C + j.lambdaAng.xyz,
+                                    -P.lambdaMax, P.lambdaMax);
         }
         float cap = min(stiffAng, PENALTY_MAX);
         j.penaltyAng.xyz = min(penAng + fabs(C) * P.betaAng, cap);

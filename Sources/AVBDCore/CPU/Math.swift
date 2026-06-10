@@ -46,8 +46,10 @@ public typealias Quat = simd_quatf
 //   q_a - q_b := 2 * vec(q_a * q_b^-1)
 //   q + w    := normalize(q + 0.5 * quat(w,0) * q)
 @inlinable public func quatSub(_ a: Quat, _ b: Quat) -> F3 {
+    // canonicalize to w >= 0: avoids the double-cover gradient sign flip
+    // when a hinge spins past 180 deg of relative rotation
     let d = a * b.inverse
-    return d.imag * 2
+    return (d.real < 0 ? -d.imag : d.imag) * 2
 }
 
 @inlinable public func quatAdd(_ q: Quat, _ w: F3) -> Quat {
