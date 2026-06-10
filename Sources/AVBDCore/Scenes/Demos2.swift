@@ -295,50 +295,94 @@ extension Demos {
         return s
     }
 
-    /// Roller conveyor: the surface IS spinning blocks on motors — a row of
-    /// octagonal rollers (kinematic spinners); spin-aware contact friction
-    /// conveys whatever rides on them.
-    public static func treadmill(boxes: Int = 10) -> PhysicsScene {
+    /// Conveyor treadmill: a closed loop of hinged planks (a real belt)
+    /// wrapped around two spinning paddle wheels. The wheels engage the
+    /// belt's inner surface mechanically and drive it around; boxes ride
+    /// the moving belt.
+    public static func treadmill(boxes: Int = 8) -> PhysicsScene {
         var s = PhysicsScene(name: "treadmill")
         addGround(&s)
 
-        let rollerCount = 10
-        let spacing: Float = 1.05
-        let rollerZ: Float = 1.1
-        let rollerW: Float = 5.0
-        let diam: Float = 0.95
+        let wheelX: Float = 2.6          // wheel centers at ±wheelX
+        let wheelZ: Float = 2.6
+        let wrapR: Float = 1.0           // belt wrap radius around wheels
+        let beltW: Float = 3.2
+        let span = 2 * wheelX
+        let circumference = 2 * span + 2 * .pi * wrapR
+        let plankCount = 26
+        let plankLen = circumference / Float(plankCount)
 
-        for i in 0..<rollerCount {
-            let x = Float(i) * spacing - Float(rollerCount - 1) * spacing / 2
-            // proper octagonal roller: 4 slabs with thickness = diam*cos(22.5°)
-            // (regular octagon = intersection of 4 such slabs) -> only ~8%
-            // radius ripple, smooth ride
-            for k in 0..<4 {
-                let idx = s.addBody(size: F3(diam, rollerW, diam * 0.924), density: 0,
-                                    friction: 1.0,
-                                    position: F3(x, 0, rollerZ),
-                                    rotation: Quat(angle: Float(k) * .pi / 4,
-                                                   axis: F3(0, 1, 0)))
-                s.addSpinner(SceneSpinner(body: idx, axis: F3(0, 1, 0), omega: 2.5))
+        // belt path: top span (+x), right wrap, bottom span (-x), left wrap
+        func pathPoint(_ sIn: Float) -> (F3, Float) {   // (pos, pitch about y)
+            var t = sIn.truncatingRemainder(dividingBy: circumference)
+            if t < 0 { t += circumference }
+            if t < span {
+                return (F3(-wheelX + t, 0, wheelZ + wrapR), 0)
+            }
+            t -= span
+            if t < .pi * wrapR {
+                let a = .pi / 2 - t / wrapR     // from +90 (top) to -90 (bottom)
+                return (F3(wheelX + wrapR * cos(a), 0, wheelZ + wrapR * sin(a)),
+                        .pi / 2 - a)
+            }
+            t -= .pi * wrapR
+            if t < span {
+                return (F3(wheelX - t, 0, wheelZ - wrapR), .pi)
+            }
+            t -= span
+            let a = -.pi / 2 - t / wrapR        // from -90 back to -270 (top)
+            return (F3(-wheelX + wrapR * cos(a), 0, wheelZ + wrapR * sin(a)),
+                    .pi / 2 - a)
+        }
+
+        var planks: [Int] = []
+        for i in 0..<plankCount {
+            let sMid = (Float(i) + 0.5) * plankLen
+            let (pos, pitch) = pathPoint(sMid)
+            let q = Quat(angle: pitch, axis: F3(0, 1, 0))
+            let plank = s.addBody(size: F3(plankLen * 0.98, beltW, 0.1),
+                                  density: 0.6, friction: 0.9,
+                                  position: pos, rotation: q)
+            planks.append(plank)
+        }
+        // hinge consecutive planks (closed loop), two joints across the width
+        for i in 0..<plankCount {
+            let nx = (i + 1) % plankCount
+            for yo in [-beltW * 0.4, beltW * 0.4] {
+                s.addJoint(SceneJoint(bodyA: planks[i], bodyB: planks[nx],
+                                      rA: F3(plankLen / 2, yo, 0),
+                                      rB: F3(-plankLen / 2, yo, 0)))
             }
         }
 
-        // side rails
-        for yo in [Float(-2.7), 2.7] {
-            _ = s.addBody(size: F3(Float(rollerCount) * spacing + 1.5, 0.25, 1.4),
-                          density: 0, friction: 0.05,
-                          position: F3(0, yo, rollerZ + 0.6))
+        // Kinematic octagon drums: the contact solver now understands
+        // spinner surface velocity, so plain friction drives the belt.
+        for wx in [-wheelX, wheelX] {
+            for k in 0..<4 {
+                let idx = s.addBody(size: F3(2 * (wrapR - 0.06), beltW * 0.8, 0.3),
+                                    density: 0, friction: 1.2,
+                                    position: F3(wx, 0, wheelZ),
+                                    rotation: Quat(angle: Float(k) * .pi / 4,
+                                                   axis: F3(0, 1, 0)))
+                s.addSpinner(SceneSpinner(body: idx, axis: F3(0, 1, 0), omega: 1.2))
+            }
         }
 
-        // cargo dropped at the upstream end
+        // slick beds: under the top span (carrying side) and under the
+        // bottom span (return side), like a conveyor's support + return bed
+        _ = s.addBody(size: F3(span - 2.6, beltW, 0.25), density: 0, friction: 0.02,
+                      position: F3(0, 0, wheelZ + wrapR - 0.26))
+        _ = s.addBody(size: F3(span - 2.6, beltW, 0.25), density: 0, friction: 0.02,
+                      position: F3(0, 0, wheelZ - wrapR - 0.45))
+
+        // cargo dropped onto the upstream end of the belt
         var rng = SplitMix64(seed: 21)
         for k in 0..<boxes {
-            _ = s.addBody(size: F3(repeating: 0.5 + rng.nextFloat() * 0.3),
-                          density: 0.8, friction: 0.8,
-                          position: F3(-Float(rollerCount - 2) * spacing / 2
-                                           + Float(k % 3) * 0.9,
-                                       (rng.nextFloat() - 0.5) * 4,
-                                       rollerZ + 1.3 + Float(k / 3) * 0.9))
+            _ = s.addBody(size: F3(repeating: 0.5 + rng.nextFloat() * 0.25),
+                          density: 0.8, friction: 0.9,
+                          position: F3(-wheelX + 0.7 + (rng.nextFloat() - 0.5) * 0.6,
+                                       (rng.nextFloat() - 0.5) * (beltW - 1),
+                                       wheelZ + wrapR + 1.0 + Float(k) * 0.8))
         }
         return s
     }
@@ -561,6 +605,183 @@ extension Demos {
                 _ = k
             }
         }
+        return s
+    }
+}
+
+extension Demos {
+    /// A free-spinning gear on a static capsule axle: double torus-hub
+    /// bearing (like the car wheel), three spokes, a rim, and N teeth
+    /// welded around it. Returns the rim body index.
+    @discardableResult
+    static func addGear(_ s: inout PhysicsScene, center: F3, R: Float, teeth: Int,
+                        phase: Float = 0, handLen: Float = 0) -> Int {
+        let qWheel = Quat(angle: .pi / 2, axis: F3(1, 0, 0))   // axis -> y
+        let hubR: Float = 0.27, hubTube: Float = 0.115
+        let axleR: Float = 0.11
+
+        // static axle + static retention flanges (no joints needed)
+        _ = s.addCapsule(length: 1.1, radius: axleR, density: 0, friction: 0.02,
+                         position: center, rotation: qWheel)
+        for sy in [Float(-1), 1] {
+            _ = s.addBody(size: F3(0.52, 0.09, 0.52), density: 0, friction: 0.02,
+                          position: center + F3(0, sy * 0.42, 0))
+        }
+
+        // double-hub bearing
+        let hub = s.addTorus(major: hubR, minor: hubTube, density: 1,
+                             friction: 0.005, position: center + F3(0, -0.12, 0),
+                             rotation: qWheel)
+        let hub2 = s.addTorus(major: hubR, minor: hubTube, density: 1,
+                              friction: 0.005, position: center + F3(0, 0.12, 0),
+                              rotation: qWheel)
+        s.addJoint(SceneJoint(bodyA: hub, bodyB: hub2,
+                              rA: F3(hubR, 0, -0.12), rB: F3(hubR, 0, 0.12),
+                              stiffnessLin: .infinity, stiffnessAng: .infinity))
+
+        // spokes + rim (light flywheel: coasts well on the bearings)
+        let rim = s.addTorus(major: R, minor: 0.1, density: 0.35, friction: 0.3,
+                             position: center, rotation: qWheel)
+        let spokeLen = R - hubR + 0.1
+        for k in 0..<3 {
+            let a = Float(k) * 2 * .pi / 3 + phase
+            let dir = F3(cos(a), 0, sin(a))
+            let spoke = s.addBody(size: F3(spokeLen, 0.06, 0.06), density: 0.6,
+                                  friction: 0.1,
+                                  position: center + dir * (hubR + R) / 2,
+                                  rotation: Quat(angle: -a, axis: F3(0, 1, 0)))
+            s.addJoint(SceneJoint(bodyA: hub, bodyB: spoke,
+                                  rA: F3(cos(a) * hubR, sin(a) * hubR, -0.12),
+                                  rB: F3(-spokeLen / 2 + 0.05, 0, 0),
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+            s.addJoint(SceneJoint(bodyA: spoke, bodyB: rim,
+                                  rA: F3(spokeLen / 2 - 0.05, 0, 0),
+                                  rB: F3(cos(a) * R, sin(a) * R, 0),
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+        }
+        s.addJoint(SceneJoint(bodyA: hub, bodyB: rim, rA: .zero, rB: .zero,
+                              stiffnessLin: 0, stiffnessAng: 0))
+        s.addJoint(SceneJoint(bodyA: hub2, bodyB: rim, rA: .zero, rB: .zero,
+                              stiffnessLin: 0, stiffnessAng: 0))
+
+        // sphere teeth welded around the rim: round teeth can never butt
+        // tip-to-tip — they always deflect into the next gap (self-meshing)
+        let toothR: Float = 0.18
+        for k in 0..<teeth {
+            let a = Float(k) / Float(teeth) * 2 * .pi + phase
+            let dir = F3(cos(a), 0, sin(a))
+            let orbit = R + 0.16
+            let tooth = s.addSphere(diameter: 2 * toothR, density: 0.35, friction: 0.25,
+                                    position: center + dir * orbit)
+            s.addJoint(SceneJoint(bodyA: rim, bodyB: tooth,
+                                  rA: F3(cos(a) * orbit, sin(a) * orbit, 0),
+                                  rB: .zero,
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+        }
+
+        // clock hand hard-attached to the rim
+        if handLen > 0 {
+            // outboard of the static cap flanges (caps at |y| 0.375..0.465)
+            let handY: Float = 0.62
+            let hand = s.addBody(size: F3(handLen, 0.1, 0.14), density: 0.3,
+                                 friction: 0.1,
+                                 position: center + F3(handLen / 2, handY, 0))
+            s.addJoint(SceneJoint(bodyA: rim, bodyB: hand,
+                                  rA: F3(0, 0, -handY), rB: F3(-handLen / 2, 0, 0),
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+            s.addJoint(SceneJoint(bodyA: rim, bodyB: hand,
+                                  rA: F3(handLen * 0.7, 0, -handY),
+                                  rB: F3(handLen * 0.2, 0, 0),
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+        }
+        return rim
+    }
+
+    /// Gravity-powered gear clock: no motors anywhere. A ball drops onto a
+    /// lever; the lever's far end pushes the big gear's teeth; tooth
+    /// collisions transfer the motion to a smaller gear that carries a
+    /// clock hand. Pure collision + friction mechanics.
+    public static func gearclock(scale: Int = 1) -> PhysicsScene {
+        var s = PhysicsScene(name: "gearclock")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        addGround(&s, friction: 0.6)
+
+        // gear train in the xz-plane (axles along y)
+        let g1c = F3(0, 0, 3.4)
+        let g2c = F3(2.34, 0, 3.4)        // ball-mesh engagement ~0.24
+        _ = addGear(&s, center: g1c, R: 1.25, teeth: 12)
+        _ = addGear(&s, center: g2c, R: 0.65, teeth: 6, phase: 0.25, handLen: 1.5)
+
+        // crank pin on the big gear's face (offset from the teeth plane):
+        // the lever lifts this pin instead of poking between teeth
+        let pinAngle: Float = 3.32      // rad: pin floats just above the lever
+        let pinR: Float = 0.95
+        let rims = s.bodies.enumerated().filter { $0.element.shape == .torus && abs($0.element.size.x - 1.25) < 0.01 }
+        let rim1 = rims[0].offset
+        let pinPos = g1c + F3(pinR * cos(pinAngle), -0.5, pinR * sin(pinAngle))
+        let pin = s.addBody(size: F3(0.16, 0.5, 0.16), density: 0.6, friction: 0.01,
+                            position: pinPos)
+        s.addJoint(SceneJoint(bodyA: rim1, bodyB: pin,
+                              rA: F3(pinR * cos(pinAngle), pinR * sin(pinAngle), 0.5),
+                              rB: .zero,
+                              stiffnessLin: .infinity, stiffnessAng: .infinity))
+
+        // rocker lever in the pin's plane (y = -0.55), on its own bearing
+        let leverY: Float = -0.55
+        let pivot = F3(-2.6, leverY, 2.6)
+        let qWheel = Quat(angle: .pi / 2, axis: F3(1, 0, 0))
+        _ = s.addCapsule(length: 1.1, radius: 0.11, density: 0, friction: 0.02,
+                         position: pivot, rotation: qWheel)
+        for sy in [Float(-1), 1] {
+            _ = s.addBody(size: F3(0.52, 0.09, 0.52), density: 0, friction: 0.02,
+                          position: pivot + F3(0, sy * 0.42, 0))
+        }
+        let lhub = s.addTorus(major: 0.27, minor: 0.115, density: 1, friction: 0.02,
+                              position: pivot + F3(0, -0.12, 0), rotation: qWheel)
+        let lhub2 = s.addTorus(major: 0.27, minor: 0.115, density: 1, friction: 0.02,
+                               position: pivot + F3(0, 0.12, 0), rotation: qWheel)
+        s.addJoint(SceneJoint(bodyA: lhub, bodyB: lhub2,
+                              rA: F3(0.27, 0, -0.12), rB: F3(0.27, 0, 0.12),
+                              stiffnessLin: .infinity, stiffnessAng: .infinity))
+        let lever = s.addBody(size: F3(4.4, 0.5, 0.15), density: 0.35, friction: 0.4,
+                              position: pivot + F3(0, 0, 0.42))
+        s.addJoint(SceneJoint(bodyA: lhub, bodyB: lever,
+                              rA: F3(0, 0.42, -0.12), rB: .zero,
+                              stiffnessLin: .infinity, stiffnessAng: .infinity))
+        s.addJoint(SceneJoint(bodyA: lhub, bodyB: lever,
+                              rA: F3(1.0, 0.42, -0.12), rB: F3(1.0, 0, 0),
+                              stiffnessLin: .infinity, stiffnessAng: .infinity))
+        s.addJoint(SceneJoint(bodyA: lhub2, bodyB: lever, rA: .zero, rB: .zero,
+                              stiffnessLin: 0, stiffnessAng: 0))
+
+        // pan bucket on the left end: low walls on all four sides, spaced
+        // wider than the ball so it lands on the pan floor
+        let panX: Float = -2.6 - 1.8
+        for xo in [Float(-0.72), 0.72] {
+            let wall = s.addBody(size: F3(0.12, 0.74, 0.4), density: 0.4, friction: 0.4,
+                                 position: F3(panX + xo, leverY, pivot.z + 0.42 + 0.25))
+            s.addJoint(SceneJoint(bodyA: lever, bodyB: wall,
+                                  rA: F3(panX + xo - pivot.x, 0, 0.175), rB: F3(0, 0, -0.15),
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+        }
+        for yo in [Float(-0.31), 0.31] {
+            let wall = s.addBody(size: F3(1.32, 0.12, 0.4), density: 0.4, friction: 0.4,
+                                 position: F3(panX, leverY + yo, pivot.z + 0.42 + 0.25))
+            s.addJoint(SceneJoint(bodyA: lever, bodyB: wall,
+                                  rA: F3(panX - pivot.x, yo, 0.175), rB: F3(0, 0, -0.15),
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+        }
+        // static rest stop under the gear-side lever end (lever level at rest)
+        _ = s.addBody(size: F3(0.3, 1.0, 2.3), density: 0, friction: 0.1,
+                      position: F3(-0.7, leverY, 1.75))
+
+        // the trigger: a heavy box dropped from high — the lever whips and
+        // kicks the crank pin, spinning the gear train up to coast
+        _ = s.addBody(size: F3(1.0, 1.0, 1.0), density: 8, friction: 0.8,
+                      position: F3(panX, leverY, 7.0))
+
+        _ = scale
         return s
     }
 }

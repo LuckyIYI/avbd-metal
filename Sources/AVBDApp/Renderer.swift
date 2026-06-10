@@ -88,12 +88,22 @@ fragment float4 box_fragment(VOut in [[stage_in]],
                              constant Uniforms& U [[buffer(1)]])
 {
     float3 n = normalize(in.normal);
-    float ndl = max(dot(n, -U.lightDir.xyz), 0.0);
-    float3 ambient = float3(0.35);
-    float3 lit = in.color.rgb * (ambient + float3(0.75) * ndl);
-    // cheap distance fade for depth perception
+    float3 L = -U.lightDir.xyz;
+    float ndl = max(dot(n, L), 0.0);
+    // hemispheric ambient: sky from above, ground bounce from below
+    float3 skyA = float3(0.46, 0.54, 0.66);
+    float3 gndA = float3(0.42, 0.40, 0.38);
+    float3 ambient = mix(gndA, skyA, n.z * 0.5 + 0.5);
+    // soft specular
+    float3 V = normalize(U.eye.xyz - in.world);
+    float3 H = normalize(L + V);
+    float spec = pow(max(dot(n, H), 0.0), 32.0) * 0.25;
+    float3 lit = in.color.rgb * (ambient + float3(0.95, 0.92, 0.85) * ndl)
+               + float3(spec);
+    // horizon fog matching the sky
     float d = length(in.world - U.eye.xyz);
-    lit = mix(lit, float3(0.62, 0.67, 0.75), clamp(d / 400.0, 0.0, 0.6));
+    float fog = 1.0 - exp(-d * 0.012);
+    lit = mix(lit, float3(0.87, 0.93, 1.00), fog * fog);
     return float4(lit, 1.0);
 }
 
@@ -227,33 +237,71 @@ vertex VOut capsule_vertex(uint vid [[vertex_id]],
     return o;
 }
 
-// Ground grid lines
-struct GridOut { float4 position [[position]]; float4 color; };
+// --- Sky: fullscreen gradient (drawn first, no depth) ---
+struct SkyOut { float4 position [[position]]; float2 uv; };
 
-vertex GridOut grid_vertex(uint vid [[vertex_id]],
-                           constant Uniforms& U [[buffer(1)]])
-{
-    int line = int(vid) / 2;
-    int end = int(vid) % 2;
-    const int half_ = 40;
-    const float spacing = 2.0;
-    float4 p;
-    if (line <= 2 * half_) {
-        float x = float(line - half_) * spacing;
-        p = float4(x, (end == 0 ? -half_ : half_) * spacing, 0.011, 1);
-    } else {
-        float y = float(line - 3 * half_ - 1) * spacing;
-        p = float4((end == 0 ? -half_ : half_) * spacing, y, 0.011, 1);
-    }
-    GridOut o;
-    o.position = U.viewProj * p;
-    float major = (line % 5 == 0) ? 0.30 : 0.16;
-    o.color = float4(float3(major), 1);
+vertex SkyOut sky_vertex(uint vid [[vertex_id]]) {
+    float2 p = float2((vid << 1) & 2, vid & 2) * 2.0 - 1.0;   // fullscreen tri
+    SkyOut o;
+    o.position = float4(p, 1.0, 1.0);
+    o.uv = p;
     return o;
 }
 
-fragment float4 grid_fragment(GridOut in [[stage_in]]) {
-    return in.color;
+fragment float4 sky_fragment(SkyOut in [[stage_in]]) {
+    float t = clamp(in.uv.y * 0.5 + 0.5, 0.0, 1.0);
+    float3 horizon = float3(0.87, 0.93, 1.00);
+    float3 zenith  = float3(0.42, 0.65, 0.95);
+    float3 c = mix(horizon, zenith, pow(t, 1.4));
+    // subtle sun glow upper-left
+    float2 sunDir = float2(-0.45, 0.55);
+    float glow = exp(-3.5 * distance(in.uv, sunDir));
+    c += float3(0.25, 0.22, 0.16) * glow;
+    return float4(c, 1);
+}
+
+// --- Checkerboard floor: huge quad, AA checker, fades into the horizon ---
+struct FloorOut {
+    float4 position [[position]];
+    float3 world;
+};
+
+vertex FloorOut floor_vertex(uint vid [[vertex_id]],
+                             constant Uniforms& U [[buffer(1)]])
+{
+    const float E = 1200.0;
+    float2 corners[6] = {
+        float2(-E,-E), float2(E,-E), float2(E,E),
+        float2(-E,-E), float2(E,E), float2(-E,E)
+    };
+    float3 p = float3(corners[vid], 0.005);
+    FloorOut o;
+    o.position = U.viewProj * float4(p, 1);
+    o.world = p;
+    return o;
+}
+
+fragment float4 floor_fragment(FloorOut in [[stage_in]],
+                               constant Uniforms& U [[buffer(1)]])
+{
+    // anti-aliased checker via filter-width smoothing
+    float2 c = in.world.xy / 2.0;
+    float2 fw = fwidth(c);
+    // integrate the square wave over the pixel footprint (per axis)
+    float2 fc = fract(c);
+    float2 aa = clamp((fc - 0.5) / max(fw, 0.0001) + 0.5, 0.0, 1.0)
+              - clamp(fc / max(fw, 0.0001) - 0.0, 0.0, 1.0) + 1.0;
+    float2 sq = abs(aa - 1.0);    // ~ square wave with AA
+    float checker = abs(sq.x - sq.y);
+    float3 tileA = float3(0.88, 0.89, 0.92);
+    float3 tileB = float3(0.69, 0.74, 0.82);
+    float3 col = mix(tileA, tileB, checker);
+    // soft warm tint near center, cool far
+    float d = length(in.world.xy - U.eye.xy);
+    float3 horizon = float3(0.87, 0.93, 1.00);
+    float fog = 1.0 - exp(-d * 0.012);
+    col = mix(col, horizon, fog * fog);
+    return float4(col, 1);
 }
 """
 
@@ -270,8 +318,11 @@ final class Renderer: NSObject, MTKViewDelegate {
     var spherePipeline: MTLRenderPipelineState!
     var torusPipeline: MTLRenderPipelineState!
     var capsulePipeline: MTLRenderPipelineState!
-    var gridPipeline: MTLRenderPipelineState!
+    var skyPipeline: MTLRenderPipelineState!
+    var floorPipeline: MTLRenderPipelineState!
+    static let sampleCount = 4
     var depthState: MTLDepthStencilState!
+    var noDepthState: MTLDepthStencilState!
     var instances: MTLBuffer?
 
     weak var model: SimulationModel?
@@ -290,45 +341,32 @@ final class Renderer: NSObject, MTKViewDelegate {
         super.init()
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = lib.makeFunction(name: "box_vertex")
-        desc.fragmentFunction = lib.makeFunction(name: "box_fragment")
-        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        desc.depthAttachmentPixelFormat = .depth32Float
-        boxPipeline = try device.makeRenderPipelineState(descriptor: desc)
+        func pipe(_ v: String, _ f: String) throws -> MTLRenderPipelineState {
+            let d = MTLRenderPipelineDescriptor()
+            d.vertexFunction = lib.makeFunction(name: v)
+            d.fragmentFunction = lib.makeFunction(name: f)
+            d.colorAttachments[0].pixelFormat = .bgra8Unorm
+            d.depthAttachmentPixelFormat = .depth32Float
+            d.rasterSampleCount = Self.sampleCount
+            return try device.makeRenderPipelineState(descriptor: d)
+        }
+        boxPipeline = try pipe("box_vertex", "box_fragment")
 
-        let sdesc = MTLRenderPipelineDescriptor()
-        sdesc.vertexFunction = lib.makeFunction(name: "sphere_vertex")
-        sdesc.fragmentFunction = lib.makeFunction(name: "box_fragment")
-        sdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        sdesc.depthAttachmentPixelFormat = .depth32Float
-        spherePipeline = try device.makeRenderPipelineState(descriptor: sdesc)
-
-        let tdesc = MTLRenderPipelineDescriptor()
-        tdesc.vertexFunction = lib.makeFunction(name: "torus_vertex")
-        tdesc.fragmentFunction = lib.makeFunction(name: "box_fragment")
-        tdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        tdesc.depthAttachmentPixelFormat = .depth32Float
-        torusPipeline = try device.makeRenderPipelineState(descriptor: tdesc)
-
-        let cdesc = MTLRenderPipelineDescriptor()
-        cdesc.vertexFunction = lib.makeFunction(name: "capsule_vertex")
-        cdesc.fragmentFunction = lib.makeFunction(name: "box_fragment")
-        cdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        cdesc.depthAttachmentPixelFormat = .depth32Float
-        capsulePipeline = try device.makeRenderPipelineState(descriptor: cdesc)
-
-        let gdesc = MTLRenderPipelineDescriptor()
-        gdesc.vertexFunction = lib.makeFunction(name: "grid_vertex")
-        gdesc.fragmentFunction = lib.makeFunction(name: "grid_fragment")
-        gdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        gdesc.depthAttachmentPixelFormat = .depth32Float
-        gridPipeline = try device.makeRenderPipelineState(descriptor: gdesc)
+        spherePipeline = try pipe("sphere_vertex", "box_fragment")
+        torusPipeline = try pipe("torus_vertex", "box_fragment")
+        capsulePipeline = try pipe("capsule_vertex", "box_fragment")
+        skyPipeline = try pipe("sky_vertex", "sky_fragment")
+        floorPipeline = try pipe("floor_vertex", "floor_fragment")
 
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
         depthState = device.makeDepthStencilState(descriptor: dd)
+
+        let nd = MTLDepthStencilDescriptor()
+        nd.depthCompareFunction = .always
+        nd.isDepthWriteEnabled = false
+        noDepthState = device.makeDepthStencilState(descriptor: nd)
     }
 
     var viewMatrix: simd_float4x4 {
@@ -395,13 +433,19 @@ final class Renderer: NSObject, MTKViewDelegate {
                          lightDir: SIMD4(l, 0),
                          eye: SIMD4(e, 0))
 
-        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0.62, green: 0.67, blue: 0.75, alpha: 1)
+        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0.87, green: 0.93, blue: 1.0, alpha: 1)
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
-        enc.setDepthStencilState(depthState)
 
-        enc.setRenderPipelineState(gridPipeline)
+        // sky first (depth test/write off via noDepth state)
+        enc.setDepthStencilState(noDepthState)
+        enc.setRenderPipelineState(skyPipeline)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+
+        enc.setDepthStencilState(depthState)
+        enc.setRenderPipelineState(floorPipeline)
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: 2 * (2 * 81))
+        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
         enc.setRenderPipelineState(boxPipeline)
         enc.setVertexBuffer(instances, offset: 0, index: 0)

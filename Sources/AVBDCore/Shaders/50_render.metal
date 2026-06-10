@@ -23,11 +23,12 @@ inline float3x3 q_to_mat(float4 q) {
 }
 
 inline float3 palette(uint i) {
-    // Golden-ratio hue cycling, decent saturation/brightness
+    // Golden-ratio hue cycling, cheerful pastel-bright tones
     float h = fract(float(i) * 0.61803398875f);
-    float3 k = float3(5.0f, 3.0f, 1.0f);
-    float3 p = abs(fract(h + k / 6.0f) * 6.0f - 3.0f) - 1.0f;
-    return mix(float3(0.35f), clamp(p, 0.0f, 1.0f), 0.75f);
+    float3 p = abs(fract(h + float3(5.0f, 3.0f, 1.0f) / 6.0f) * 6.0f - 3.0f) - 1.0f;
+    float3 hue = clamp(p, 0.0f, 1.0f);
+    // lift toward white a touch, keep punch
+    return mix(float3(0.92f), hue, 0.62f) * 0.98f;
 }
 
 kernel void build_instances(
@@ -55,9 +56,16 @@ kernel void build_instances(
     m[3] = float4(pl.xyz, 1);
     out[gid].model = m;
 
+    // hide the giant ground slab (the checkerboard floor replaces it)
+    if (st == 0 && pl.w <= 0.0f && shape[gid].x > 150.0f) {
+        out[gid].model = float4x4(0.0f);
+        out[gid].color = float4(0);
+        out[gid].params = float4(0);
+        return;
+    }
     float3 c = pl.w > 0.0f
         ? palette(colorMode == 1 ? colors[gid] : gid)
-        : float3(0.45f, 0.45f, 0.48f);
+        : float3(0.58f, 0.60f, 0.66f);
     out[gid].color = float4(c, float(st));
     out[gid].params = float4(shape[gid].x, shape[gid].y, 0, 0);
 }

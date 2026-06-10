@@ -123,6 +123,7 @@ struct MetalView: NSViewRepresentable {
         let view = InteractiveMTKView(frame: .zero, device: device)
         view.colorPixelFormat = .bgra8Unorm
         view.depthStencilPixelFormat = .depth32Float
+        view.sampleCount = Renderer.sampleCount
         view.preferredFramesPerSecond = 60
         let renderer = try! Renderer(device: device, model: model)
         context.coordinator.renderer = renderer

@@ -118,3 +118,34 @@ extension TorusAndMachineTests {
         }
     }
 }
+
+extension TorusAndMachineTests {
+    /// Gravity-powered gear clock: a falling box whips a lever, the lever
+    /// kicks a crank pin, and tooth collisions drive the gear train. No
+    /// motors anywhere; the hand gear must advance and counter-rotate.
+    func testGearClockRuns() throws {
+        let scene = Demos.gearclock()
+        var rim1 = -1, rim2 = -1
+        for (i, b) in scene.bodies.enumerated() where b.shape == .torus {
+            if abs(b.size.x - 1.25) < 0.01 { rim1 = i }
+            if abs(b.size.x - 0.65) < 0.01 { rim2 = i }
+        }
+        let solver = try GPUSolver(scene: scene)
+        func angle(_ i: Int) -> Float {
+            let x = solver.bodyRotation(i).act(F3(1, 0, 0))
+            return atan2(x.z, x.x)
+        }
+        var a1 = angle(rim1), a2 = angle(rim2)
+        var t1: Float = 0, t2: Float = 0
+        for _ in 0..<1500 {
+            solver.step()
+            let n1 = angle(rim1), n2 = angle(rim2)
+            var d1 = n1 - a1, d2 = n2 - a2
+            while d1 > .pi { d1 -= 2 * .pi }; while d1 < -.pi { d1 += 2 * .pi }
+            while d2 > .pi { d2 -= 2 * .pi }; while d2 < -.pi { d2 += 2 * .pi }
+            t1 += d1; t2 += d2; a1 = n1; a2 = n2
+        }
+        XCTAssertLessThan(t1, -1.0, "drive gear should turn (got \(t1))")
+        XCTAssertGreaterThan(t2, 0.25, "hand gear should counter-rotate (got \(t2))")
+    }
+}
