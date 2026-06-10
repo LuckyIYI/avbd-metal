@@ -157,9 +157,14 @@ extension Demos {
 
         // ---------- the wrecking machine ----------
         // static gantry: base, mast, jib reaching over toward the building
-        let mastX: Float = 13.5
-        let jibTipX: Float = 9.0
-        let jibZ: Float = Float(nF) * floorH + 3.4
+        let jibTipX: Float = 8.5
+        let jibZ: Float = Float(nF) * floorH + 4.6
+        let ballR: Float = 1.9                     // a properly giant ball
+        // chain reaches down to mid-height of the building
+        let chainLen: Float = jibZ - Float(nF) * floorH / 2 - ballR
+        let theta: Float = 1.1                     // hoist angle from vertical
+        // mast far enough back that the hoisted ball clears it
+        let mastX: Float = jibTipX + sin(theta) * (chainLen + ballR) + ballR + 1.2
         _ = s.addBody(size: F3(5.5, 5.5, 0.8), density: 0, friction: 0.8,
                       position: F3(mastX + 1.0, 0, 0.4))
         _ = s.addBody(size: F3(1.1, 1.1, jibZ), density: 0, friction: 0.5,
@@ -174,15 +179,14 @@ extension Demos {
         // chain from the jib tip, spawned hoisted AWAY from the building:
         // gravity does the rest
         let tip = F3(jibTipX, 0, jibZ)
-        let chainLen: Float = jibZ - Float(nF - 1) * floorH - 1.4
-        let theta: Float = 1.25                    // radians from vertical
-        let ballC = tip + F3(sin(theta) * chainLen, 0, -cos(theta) * chainLen)
-        let ball = s.addSphere(diameter: 1.9, density: 14, friction: 0.4,
+        let hang = chainLen + ballR               // pivot to ball center
+        let ballC = tip + F3(sin(theta) * hang, 0, -cos(theta) * hang)
+        let ball = s.addSphere(diameter: ballR * 2, density: 9, friction: 0.4,
                                position: ballC)
 
         let dir = normalize(ballC - tip)
         let n = max(3, Int(chainLen / 0.55 + 0.5))
-        let linkLen = (chainLen - 0.95) / Float(n)
+        let linkLen = chainLen / Float(n)
         var prev = -1
         var prevAnchor = tip
         let axis = cross(F3(0, 0, 1), dir)
@@ -208,7 +212,7 @@ extension Demos {
             prevAnchor = F3(0, 0, linkLen / 2)
         }
         s.addJoint(SceneJoint(bodyA: prev, bodyB: ball,
-                              rA: prevAnchor, rB: F3(0, 0, 0.95)))
+                              rA: prevAnchor, rB: F3(0, 0, ballR)))
         s.addJoint(SceneJoint(bodyA: prev, bodyB: ball, rA: .zero, rB: .zero,
                               stiffnessLin: 0, stiffnessAng: 0))
         return s
