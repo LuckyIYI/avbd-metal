@@ -69,6 +69,11 @@ extension Demos {
             weld(seat, back, p + q.act(F3(0, -0.32, 0.42)))
             weld(seat, armL, p + q.act(F3(-0.93, 0, 0.41)))
             weld(seat, armR, p + q.act(F3(0.93, 0, 0.41)))
+            // arms touch the back but aren't welded to it — exclude those too
+            for arm in [armL, armR] {
+                s.addJoint(SceneJoint(bodyA: back, bodyB: arm, rA: .zero, rB: .zero,
+                                      stiffnessLin: 0, stiffnessAng: 0))
+            }
         }
         func table(_ p: F3, top: F3 = F3(1.7, 1.0, 0.08), h: Float = 0.74) {
             let t = box(top, p + F3(0, 0, h - top.z / 2), d: 0.6)
@@ -97,6 +102,8 @@ extension Demos {
             let head = box(F3(0.12, 1.5, 0.75), p + q.act(F3(-1.0, 0, 0.375)), d: 0.5, yaw: yaw)
             weld(base, mat, p + q.act(F3(0, 0, 0.35)))
             weld(base, head, p + q.act(F3(-1.0, 0, 0.3)))
+            s.addJoint(SceneJoint(bodyA: mat, bodyB: head, rA: .zero, rB: .zero,
+                                  stiffnessLin: 0, stiffnessAng: 0))
         }
         func toilet(_ p: F3, yaw: Float = 0) {
             let q = Quat(angle: yaw, axis: F3(0, 0, 1))
