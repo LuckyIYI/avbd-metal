@@ -254,8 +254,16 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     float3 V = normalize(U.eye.xyz - P);
     float dist = length(U.eye.xyz - P);
 
-    const float R = 1.1;                                  // world AO radius
-    float pxRadius = clamp(U.screen.z * R / max(dist, 0.5), 4.0, 110.0);
+    const float R = 0.9;                                  // world AO radius
+    float pxRadius = U.screen.z * R / max(dist, 0.5);
+    // far away the radius collapses below sampling density — fade AO out
+    // instead of letting a few-pixel march invent large-scale occlusion
+    float farFade = saturate((pxRadius - 2.5) / 6.0);
+    if (farFade <= 0.0) return float4(1);
+    pxRadius = min(pxRadius, 96.0);
+    // the falloff must use the radius we ACTUALLY march (post-clamp), or
+    // near-camera AO reaches past its sampled range and over-darkens
+    float Reff = pxRadius * max(dist, 0.5) / U.screen.z;
 
     // interleaved gradient noise: much better spectral distribution than a
     // sin-hash, so residual error is high-frequency and blurs away cleanly
@@ -297,7 +305,7 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
                 float l = length(w);
                 if (l < 1e-4) continue;
                 float c = dot(w / l, V);
-                float fade = saturate(1.0 - (l - R) / R);
+                float fade = saturate(1.0 - (l - Reff) / Reff);
                 c = mix(-1.0, c, fade);
                 if (dot(w, omega) >= 0.0) cosH0 = max(cosH0, c);
                 else                      cosH1 = max(cosH1, c);
@@ -327,6 +335,7 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     }
     float ao = clamp(occlusion / float(SLICES), 0.0, 1.0);
     ao = pow(ao, 1.25);    // slight contrast shaping
+    ao = mix(1.0, ao, farFade);
     return float4(ao, ao, ao, 1);
 }
 
@@ -457,7 +466,11 @@ vertex ShadowOut shadow_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
         o.local = float2(0); o.strength = 0;
         return o;
     }
-    float3 p = float3(c.xy + corners[vid] * size, 0.03);
+    // lift scales with camera distance: a fixed 3cm offset falls below
+    // depth precision far away and the quad z-fights the floor (blinking)
+    float2 quadXY = c.xy + corners[vid] * size;
+    float lift = 0.02 + 0.004 * length(float3(quadXY, 0) - U.eye.xyz);
+    float3 p = float3(quadXY, lift);
     o.position = U.viewProj * float4(p, 1);
     o.local = corners[vid];
     o.strength = strength;
