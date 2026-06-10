@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import QuartzCore
 import simd
 
 // Metal GPU implementation of Augmented Vertex Block Descent.
@@ -481,6 +482,25 @@ public final class GPUSolver {
     private var counterBuf: MTLCounterSampleBuffer?
     private var stageNames: [String] = []
 
+    // ---- async pipelining: step() never blocks; the queue serializes GPU
+    // work, and CPU access to shared buffers syncs lazily ----
+    private var inflight: [MTLCommandBuffer] = []
+    private let statsLock = NSLock()
+
+    /// Wait for all committed steps (no-op when already complete).
+    public func sync() {
+        for c in inflight { c.waitUntilCompleted() }
+        inflight.removeAll()
+    }
+
+    /// Cap the pipeline depth: deeper queues make the async color-bound
+    /// readback stale enough to skip colors (observed physics regressions).
+    private func throttle() {
+        while inflight.count >= 2 {
+            inflight.removeFirst().waitUntilCompleted()
+        }
+    }
+
     public func resetProfile() {
         profileNS = [:]
         profileFrames = 0
@@ -501,6 +521,8 @@ public final class GPUSolver {
     public func step() {
         syncParams()
         frameIndex += 1
+        throttle()
+        if !spinners.isEmpty { sync() }   // spinner poses are CPU writes
         advanceSpinners()
 
         // ---- Command buffer 1: collision + warm start + adjacency + coloring
@@ -512,7 +534,7 @@ public final class GPUSolver {
             blit.endEncoding()
         }
 
-        let sampleBuf = profiling ? makeCounterBuf() : nil
+        let sampleBuf = makeCounterBuf()
         stageNames = []
         func makeEncoder(_ name: String) -> MTLComputeCommandEncoder? {
             guard let sampleBuf, stageNames.count < 63 else {
@@ -531,8 +553,10 @@ public final class GPUSolver {
             return e
         }
         guard var enc = makeEncoder("broadphase") else { return }
+        // ALWAYS split encoders at stage boundaries: measured 2.5-3x faster
+        // than one mega-encoder — intra-encoder hazard barriers over long
+        // dispatch chains drain the pipe far harder than encoder boundaries
         func stage(_ name: String) {
-            guard profiling else { return }
             enc.endEncoding()
             enc = makeEncoder(name) ?? enc
         }
@@ -814,8 +838,38 @@ public final class GPUSolver {
         }
 
         enc.endEncoding()
-        cmd1.commit()
-        cmd1.waitUntilCompleted()
+        // canonicalize colors on the GPU (was a CPU memcpy needing a sync)
+        if finalColors !== colorsA, let blit = cmd1.makeBlitCommandEncoder() {
+            blit.copy(from: finalColors, sourceOffset: 0,
+                      to: colorsA, destinationOffset: 0, size: numBodies * 4)
+            blit.endEncoding()
+        }
+        let readStats = { [weak self] in
+            guard let self else { return }
+            let ctr = self.counters.contents()
+                .bindMemory(to: UInt32.self, capacity: GPUCounters.total)
+            let pairs = Int(ctr[GPUCounters.pairs])
+            var counts: [Int] = []
+            var maxUsed = -1
+            for c in 0..<AVBD_MAX_COLORS {
+                let n = Int(ctr[GPUCounters.colorBase + c])
+                counts.append(n)
+                if n > 0 { maxUsed = c }
+            }
+            self.statsLock.lock()
+            self.lastNumPairs = pairs
+            self.lastColorCounts = counts
+            self.lastMaxColorUsed = maxUsed
+            self.statsLock.unlock()
+        }
+        if profiling {
+            cmd1.commit()
+            cmd1.waitUntilCompleted()
+        } else {
+            cmd1.addCompletedHandler { _ in readStats() }
+            cmd1.commit()
+            inflight.append(cmd1)
+        }
 
         if profiling, let sampleBuf,
            let data = try? sampleBuf.resolveCounterRange(0..<(stageNames.count * 2)) {
@@ -838,23 +892,7 @@ public final class GPUSolver {
             profileFrames += 1
         }
 
-        // Keep canonical colors in colorsA for next frame
-        if finalColors !== colorsA {
-            memcpy(colorsA.contents(), finalColors.contents(), numBodies * 4)
-        }
-
-        // Read back stats + next frame's color loop bound (shared memory)
-        let ctr = counters.contents().bindMemory(to: UInt32.self, capacity: GPUCounters.total)
-        lastNumPairs = Int(ctr[GPUCounters.pairs])
-        var colorCounts: [Int] = []
-        var maxColorUsed = -1
-        for c in 0..<AVBD_MAX_COLORS {
-            let n = Int(ctr[GPUCounters.colorBase + c])
-            colorCounts.append(n)
-            if n > 0 { maxColorUsed = c }
-        }
-        lastColorCounts = colorCounts
-        lastMaxColorUsed = maxColorUsed
+        if profiling { readStats() }
 
         swap(&manifolds, &prevManifolds)
     }
@@ -875,26 +913,31 @@ public final class GPUSolver {
     // MARK: - State access (shared memory)
 
     public func bodyPosition(_ i: Int) -> F3 {
+        sync()
         let p = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return F3(p[i].x, p[i].y, p[i].z)
     }
 
     public func bodyRotation(_ i: Int) -> Quat {
+        sync()
         let p = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return Quat(real: p[i].w, imag: F3(p[i].x, p[i].y, p[i].z))
     }
 
     public func bodyMass(_ i: Int) -> Float {
+        sync()
         let p = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return p[i].w
     }
 
     public func bodyVelocity(_ i: Int) -> F3 {
+        sync()
         let p = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return F3(p[i].x, p[i].y, p[i].z)
     }
 
     public func bodyAngularVelocity(_ i: Int) -> F3 {
+        sync()
         let p = velAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return F3(p[i].x, p[i].y, p[i].z)
     }
@@ -904,7 +947,9 @@ public final class GPUSolver {
     /// Activate / update a drag joint. Scenes add an inert slot via
     /// PhysicsScene.addDragSlot() (stiffness 0 keeps it disabled until used).
     public func setDrag(jointIndex: Int, body: Int?, worldTarget: F3, localAnchor: F3,
+
                         stiffness: Float = 5000) {
+        sync()
         guard jointIndex < numJoints else { return }
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: numJoints)
         var j = jp[jointIndex]
@@ -927,6 +972,7 @@ public final class GPUSolver {
 
     /// Ray-cast against body OBBs (CPU, shared buffers). Returns (body, local hit).
     public func pick(origin: F3, dir: F3) -> (body: Int, local: F3)? {
+        sync()
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let sh = shape.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -982,6 +1028,7 @@ public final class GPUSolver {
     /// Encode instance-transform building into a render command buffer.
     public func encodeBuildInstances(_ cmd: MTLCommandBuffer, instances: MTLBuffer,
                                      colorMode: UInt32 = 0) {
+        // no sync: instances are built on the GPU; queue order serializes
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         var nb = UInt32(numBodies)
         var cm = colorMode
@@ -1004,6 +1051,7 @@ public final class GPUSolver {
 
     /// Max constraint error: hard-joint violation + contact penetration depth.
     public func maxConstraintError() -> Float {
+        sync()
         syncParams()
         guard let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder() else { return 0 }

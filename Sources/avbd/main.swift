@@ -148,8 +148,17 @@ case "bench":
     solver.profiling = args.contains("--profile")
     solver.resetProfile()
     let t0 = Date()
-    for _ in 0..<o.frames { solver.step() }
+    var encodeS = 0.0
+    let syncEach = args.contains("--syncstep")
+    for _ in 0..<o.frames {
+        let e0 = Date()
+        solver.step()
+        if syncEach { solver.sync() }
+        encodeS += Date().timeIntervalSince(e0)
+    }
+    solver.sync()
     let ms = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
+    print(String(format: "  cpu encode: %.3f ms/frame", encodeS * 1000 / Double(o.frames)))
     print(String(format: "%@: %d bodies, %d iterations, %.3f ms/frame (%.1f FPS)",
                  scene.name, scene.bodies.count, scene.settings.iterations, ms, 1000 / ms))
     if solver.profiling, solver.profileFrames > 0 {
