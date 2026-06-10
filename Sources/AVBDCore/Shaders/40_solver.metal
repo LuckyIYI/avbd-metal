@@ -422,7 +422,8 @@ inline M3 geomStiffBallSocket(int k, float3 v) {
 
 inline void stampJoint(device const JointGPU& j, uint self,
                        device const float4* posLin, device const float4* posAng,
-                       float alpha, thread PrimalAccum& acc)
+                       device const float4* initAng, float alpha, float dt,
+                       thread PrimalAccum& acc)
 {
     uint a = j.header.x, b = j.header.y;
     bool isA = self == a;
@@ -482,22 +483,53 @@ inline void stampJoint(device const JointGPU& j, uint self,
 
             // MOTOR (servo): drive the twist angle about the hinge axis
             // toward the target, with bounded lambda = torque limit (the
-            // paper's bounded-multiplier machinery, like friction)
-            if (j.motor.w > 0.0f) {
+            // paper's bounded-multiplier machinery, like friction).
+            // A pure position spring oscillates — real actuators are
+            // damped, so add a dissipative term on the twist VELOCITY
+            // (measured against the start-of-step pose, implicit in dt).
+            if (j.motor.w > 0.0f || j.limits.x < j.limits.y) {
                 float4 r = q_mul(q_inv(q_mul(qA, j.restRel)), posAng[b]);
                 if (r.w < 0.0f) r = -r;
                 float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
+
+                // joint limits: stiff one-sided penalty (rarely active)
+                if (j.limits.x < j.limits.y) {
+                    float over = max(twist - j.limits.y, 0.0f)
+                               + min(twist - j.limits.x, 0.0f);
+                    if (over != 0.0f) {
+                        float kL = 4.0e4f;
+                        float FL = clamp(kL * over, -3000.0f, 3000.0f);
+                        float sm = (self == a) ? -1.0f : 1.0f;
+                        acc.lhsAng = m3_add(acc.lhsAng,
+                                            m3_scale(m3_outer(aB, aB), kL));
+                        acc.rhsAng += aB * (FL * sm);
+                    }
+                }
+                if (j.motor.w <= 0.0f) { C = C; }
+                else {
                 float Cm = twist - j.motor.x;
                 // wrap to [-pi, pi]
                 Cm = Cm - 6.2831853f * floor((Cm + 3.14159265f) / 6.2831853f);
-                float Fm = clamp(j.motor.w * Cm + j.motor.z,
+
+                // twist at start of step (for the damping velocity)
+                float4 qA0 = (a == WORLD_BODY) ? float4(0,0,0,1) : initAng[a];
+                float4 r0 = q_mul(q_inv(q_mul(qA0, j.restRel)), initAng[b]);
+                if (r0.w < 0.0f) r0 = -r0;
+                float twist0 = 2.0f * atan2(dot(r0.xyz, j.hingeAxis.xyz), r0.w);
+                float dTwist = twist - twist0;
+                dTwist = dTwist - 6.2831853f * floor((dTwist + 3.14159265f) / 6.2831853f);
+
+                // damping coefficient: ~2 sqrt(k I) would be critical; a
+                // fixed fraction of stiffness over the step works well here
+                float cD = 0.30f * j.motor.w * dt * 60.0f;   // scale-stable
+                float Fm = clamp(j.motor.w * Cm + j.motor.z + cD * dTwist,
                                  -j.motor.y, j.motor.y);
-                // jacobian of twist wrt world rotation of self: +-axis
                 float sm = (self == a) ? -1.0f : 1.0f;
                 float3 axW = aB;
                 acc.lhsAng = m3_add(acc.lhsAng,
-                                    m3_scale(m3_outer(axW, axW), j.motor.w));
+                                    m3_scale(m3_outer(axW, axW), j.motor.w + cD));
                 acc.rhsAng += axW * (Fm * sm);
+                }
             }
         } else {
             if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
@@ -715,7 +747,7 @@ static inline void primal_one(
         uint kind = entry >> ADJ_KIND_SHIFT;
         uint idx = entry & ADJ_INDEX_MASK;
         if (kind == FK_JOINT) {
-            stampJoint(joints[idx], body, posLin, posAng, P.alpha, acc);
+            stampJoint(joints[idx], body, posLin, posAng, initAng, P.alpha, P.dt, acc);
         } else if (kind == FK_SPRING) {
             stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
         } else if (kind == FK_TET) {

@@ -227,7 +227,7 @@ public enum PushTPipeline {
             // MPC loop
             let horizon = 6, candidates = 192, elites = 24, cemIters = 3
             var mu = MLXArray.zeros([horizon, 2])
-            for _ in 0..<60 {                       // control steps
+            for _ in 0..<140 {                      // control steps
                 let z0 = model.encoder(obsArray(env, res))
                 var sigma = MLXArray.ones([horizon, 2]) * 0.6
                 for _ in 0..<cemIters {

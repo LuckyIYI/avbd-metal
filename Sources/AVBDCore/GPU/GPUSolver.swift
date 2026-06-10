@@ -354,6 +354,9 @@ public final class GPUSolver {
                 if j.motorTorque > 0 {
                     g.motor = SIMD4(j.motorTarget, j.motorTorque, 0, 400)
                 }
+                if j.limitLo < j.limitHi {
+                    g.limits = SIMD4(j.limitLo, j.limitHi, 0, 0)
+                }
             }
             // soft (finite) joints ARE their stiffness from frame one; only
             // hard (AL) constraints ramp from PENALTY_MIN per the paper
@@ -572,6 +575,13 @@ public final class GPUSolver {
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
         jp[jointIndex].motor.x = angle
+    }
+
+    /// Robotics: set a motor joint's torque limit at runtime.
+    public func setMotorTorque(_ jointIndex: Int, torque: Float) {
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        jp[jointIndex].motor.y = torque
     }
 
     /// Robotics: read a motor joint's current twist angle.

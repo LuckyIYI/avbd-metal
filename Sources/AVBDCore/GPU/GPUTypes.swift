@@ -42,6 +42,7 @@ public struct JointGPU {
     public var restRel: SIMD4<Float> = SIMD4(0, 0, 0, 1)
     public var hingeAxis: SIMD4<Float> = .zero
     public var motor: SIMD4<Float> = .zero
+    public var limits: SIMD4<Float> = .zero
 }
 
 public struct TetGPU {

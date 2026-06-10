@@ -244,6 +244,7 @@ struct JointGPU {
     float4 hingeAxis;   // xyz: axis in B local; w != 0 -> 1-DOF hinge
     float4 motor;       // x = target angle, y = max |lambda| (torque limit),
                         // z = lambda, w = penalty (0 = no motor)
+    float4 limits;      // x = lo, y = hi (twist range; lo < hi enables)
 };
 
 struct SpringGPU {

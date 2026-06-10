@@ -9,15 +9,17 @@ import simd
 @MainActor
 final class RoboticsModel: ObservableObject, RenderableModel {
     enum DriveMode: String, CaseIterable {
-        case manual = "Manual (mouse)"
-        case joints = "Joint sliders"
+        case manual = "Manual (IK mouse)"
         case oracle = "Oracle"
         case policy = "LeWM policy"
     }
 
     @Published var mode: DriveMode = .manual
-    @Published var jointTargets: [Double] = [0, 0.5, 0.7]
     @Published var running = true
+    @Published var motorTorque: Double = 260 { didSet { applyMotorSettings() } }
+    @Published var speedLimit: Double = 0.05
+    @Published var topView = false { didSet { applyCamera?() } }
+    var applyCamera: (() -> Void)? = nil
     @Published var statsText = ""
     @Published var obsImage: CGImage? = nil
     @Published var episodes = 0
@@ -40,11 +42,24 @@ final class RoboticsModel: ObservableObject, RenderableModel {
     }
 
     func reset() {
-        env = try? PushTEnv(numEnvs: 1, seed: UInt64.random(in: 1...999_999),
-                            goalMarkers: true)
+        // in-place: production-style episode reset, no scene rebuild
+        if let env {
+            env.reset(0, seed: UInt64.random(in: 1...999_999_999))
+        } else {
+            env = try? PushTEnv(numEnvs: 1, seed: UInt64.random(in: 1...999_999),
+                                goalMarkers: true)
+            applyMotorSettings()
+        }
         tipTarget = SIMD2(1.4, 0)
         episodes += 1
         lastStepTime = CACurrentMediaTime()
+    }
+
+    func applyMotorSettings() {
+        guard let env else { return }
+        for j in env.refs[0].motorJoints {
+            env.solver.setMotorTorque(j, torque: Float(motorTorque))
+        }
     }
 
     func tickIfRunning() {
@@ -56,14 +71,10 @@ final class RoboticsModel: ObservableObject, RenderableModel {
         let dt = Double(solver.settings.dt)
         var steps = 0
         while stepAccumulator >= dt && steps < 4 {
+            env.jointSpeedLimit = Float(speedLimit)
             switch mode {
             case .manual:
                 env.setTipTarget(0, tipTarget)
-            case .joints:
-                let js = env.refs[0].motorJoints
-                for (k, j) in js.enumerated() {
-                    solver.setMotorTarget(j, angle: Float(jointTargets[k]))
-                }
             case .oracle:
                 env.setTipTarget(0, env.oracleAction(0))
             case .policy:
@@ -146,16 +157,14 @@ struct RoboticsLabView: View {
                     .pickerStyle(.radioGroup)
                     HStack {
                         Button(model.running ? "Pause" : "Run") { model.running.toggle() }
-                        Button("New episode") { model.reset() }
+                        Button("Reset episode") { model.reset() }
                     }
                 }
 
-                if model.mode == .joints {
-                    GroupBox("Joints") {
-                        slider("Base yaw", $model.jointTargets[0], -3.14...3.14)
-                        slider("Shoulder", $model.jointTargets[1], -0.4...1.4)
-                        slider("Elbow", $model.jointTargets[2], 0...2.2)
-                    }
+                GroupBox("Robot settings") {
+                    slider("Motor torque", $model.motorTorque, 60...900)
+                    slider("Joint speed limit", $model.speedLimit, 0.01...0.15)
+                    Toggle("Top-down camera", isOn: $model.topView)
                 }
 
                 if model.mode == .policy {
@@ -217,6 +226,18 @@ struct RoboticsMetalView: NSViewRepresentable {
         context.coordinator.renderer = renderer
         view.delegate = renderer
         view.coordinator = context.coordinator
+        model.applyCamera = { [weak renderer, weak model] in
+            guard let r = renderer, let m = model else { return }
+            if m.topView {
+                r.elevation = 1.52
+                r.azimuth = -.pi / 2
+                r.distance = 9
+            } else {
+                r.elevation = 0.6
+                r.azimuth = -.pi / 3
+                r.distance = 10
+            }
+        }
         return view
     }
 

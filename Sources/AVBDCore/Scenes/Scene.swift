@@ -58,12 +58,16 @@ public struct SceneJoint {
     /// with |lambda| bounded by motorTorque. 0 torque = no motor.
     public var motorTarget: Float
     public var motorTorque: Float
+    /// Hinge twist limits (radians). lo < hi enables; real arms have them —
+    /// without limits a decelerating arm can tumble over the top and wedge.
+    public var limitLo: Float
+    public var limitHi: Float
 
     public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
                 stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
                 fracture: Float = .infinity, fractureLinear: Bool = false,
                 hingeAxis: F3? = nil, motorTarget: Float = 0,
-                motorTorque: Float = 0) {
+                motorTorque: Float = 0, limitLo: Float = 1, limitHi: Float = -1) {
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
@@ -75,6 +79,8 @@ public struct SceneJoint {
         self.hingeAxis = hingeAxis.map(normalize)
         self.motorTarget = motorTarget
         self.motorTorque = motorTorque
+        self.limitLo = limitLo
+        self.limitHi = limitHi
     }
 }
 

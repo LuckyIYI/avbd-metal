@@ -1,6 +1,28 @@
 import simd
 import Metal
 
+// MARK: - Production env API (Isaac/MuJoCo-shaped)
+
+/// Action/observation specification for vectorized RL/world-model training.
+public struct EnvSpec {
+    public let numEnvs: Int
+    public let actionDim: Int
+    public let actionLow: [Float]
+    public let actionHigh: [Float]
+    public let obsShape: [Int]          // H, W, C (uint8 pixels)
+}
+
+/// Vectorized robotics environment: many replicas, one GPU solve.
+public protocol RoboticsEnv: AnyObject {
+    var spec: EnvSpec { get }
+    /// In-place reset of one env (teleport, no scene rebuild).
+    func reset(_ env: Int, seed: UInt64)
+    func resetAll(seed: UInt64)
+    func step(actions: [SIMD2<Float>], substeps: Int, maxStep: Float)
+    func observations() -> UnsafeBufferPointer<UInt8>
+    func success(_ env: Int, posTol: Float, yawTol: Float) -> Bool
+}
+
 public struct PushTEnvGPU {
     public var ids: SIMD4<UInt32> = .zero
     public var frame: SIMD4<Float> = .zero
@@ -13,7 +35,7 @@ public struct PushTEnvGPU {
 // limits) with a vertical pusher finger, and a T-shaped block on the floor
 // that must be pushed to a goal pose. All envs live in ONE PhysicsScene
 // tiled on a grid — a single AVBD GPU solve steps every env simultaneously.
-public final class PushTEnv {
+public final class PushTEnv: RoboticsEnv {
     public struct EnvRefs {
         public var motorJoints: [Int]      // yaw, shoulder, elbow
         public var tip: Int                // pusher finger body
@@ -34,12 +56,15 @@ public final class PushTEnv {
     static let L2: Float = 1.05            // elbow link length
     static let tipHeight: Float = 0.42
 
+    /// spawn poses of every body, for fast in-place resets
+    private var spawnPoses: [(F3, Quat)] = []
+
     public init(numEnvs: Int, seed: UInt64 = 1, goalMarkers: Bool = false) throws {
         self.numEnvs = numEnvs
         var s = PhysicsScene(name: "pusht")
         s.settings.iterations = 16
         s.settings.betaLin = 20000
-        s.settings.lambdaMax = 4000
+        s.settings.lambdaMax = 600
         Demos.addGround(&s, friction: 0.9)
 
         var rng = SplitMix64(seed: seed)
@@ -65,6 +90,58 @@ public final class PushTEnv {
         }
         scene = s
         solver = try GPUSolver(scene: s)
+        spawnPoses = s.bodies.map { ($0.position, $0.rotation) }
+    }
+
+    public var spec: EnvSpec {
+        EnvSpec(numEnvs: numEnvs, actionDim: 2,
+                actionLow: [-1.95, -1.95], actionHigh: [1.95, 1.95],
+                obsShape: [obsRes, obsRes, 3])
+    }
+
+    /// In-place reset: restore the arm to its spawn pose, home the servos,
+    /// and re-randomize the block within the working annulus. No rebuild —
+    /// safe to call per-episode at scale.
+    public func reset(_ e: Int, seed: UInt64) {
+        var rng = SplitMix64(seed: seed)
+        let r = refs[e]
+        // arm chain back to spawn
+        for b in [r.tip, r.blockBar, r.blockStem] + armBodies(e) {
+            let (p, q) = spawnPoses[b]
+            solver.setBodyPose(b, position: p, rotation: q)
+        }
+        // re-randomized block pose
+        let ang = rng.nextFloat() * 2 * .pi
+        let rad = 0.95 + rng.nextFloat() * 0.5
+        let byaw = (rng.nextFloat() - 0.5) * 2 * .pi
+        let q = Quat(angle: byaw, axis: F3(0, 0, 1))
+        let bc = r.center + F3(cos(ang) * rad, sin(ang) * rad, 0)
+        solver.setBodyPose(r.blockBar,
+                           position: bc + q.act(F3(0, 0.125, 0)) + F3(0, 0, 0.09),
+                           rotation: q)
+        solver.setBodyPose(r.blockStem,
+                           position: bc + q.act(F3(0, -0.325, 0)) + F3(0, 0, 0.09),
+                           rotation: q)
+        // servos to the exact teleported (spawn) pose: any mismatch between
+        // the command cache and the true configuration causes post-reset jams
+        let js = r.motorJoints
+        let spawn: [Float] = [0, 0, 0]      // arm spawns straight
+        for (k, j) in js.enumerated() { solver.setMotorTarget(j, angle: spawn[k]) }
+        if !motorCmd.isEmpty { motorCmd[e] = spawn }
+        if !radialCorr.isEmpty { radialCorr[e] = 0 }
+        // settle contacts before the caller resumes
+        for _ in 0..<3 { solver.step() }
+        if !commanded.isEmpty { commanded[e] = tipPos(e) }
+    }
+
+    public func resetAll(seed: UInt64) {
+        for e in 0..<numEnvs { reset(e, seed: seed &+ UInt64(e) &* 7919) }
+    }
+
+    /// bodies of env e's arm chain (hub + links), derived from the tip index
+    private func armBodies(_ e: Int) -> [Int] {
+        // build order per env: base(static), hub, l1, l2, tip
+        [refs[e].tip - 3, refs[e].tip - 2, refs[e].tip - 1]
     }
 
     static func buildOne(_ s: inout PhysicsScene, center c: F3,
@@ -92,7 +169,8 @@ public final class PushTEnv {
                               rA: F3(0, 0, 0), rB: F3(-L1 / 2, 0, 0),
                               stiffnessLin: .infinity, stiffnessAng: .infinity,
                               hingeAxis: F3(0, 1, 0),
-                              motorTarget: 0, motorTorque: 260))
+                              motorTarget: 0, motorTorque: 260,
+                              limitLo: -0.55, limitHi: 1.5))
         s.addJoint(SceneJoint(bodyA: hub, bodyB: l1, rA: .zero, rB: .zero,
                               stiffnessLin: 0, stiffnessAng: 0))
 
@@ -103,7 +181,8 @@ public final class PushTEnv {
                               rA: F3(L1 / 2, 0, 0), rB: F3(-L2 / 2, 0, 0),
                               stiffnessLin: .infinity, stiffnessAng: .infinity,
                               hingeAxis: F3(0, 1, 0),
-                              motorTarget: 0, motorTorque: 260))
+                              motorTarget: 0, motorTorque: 260,
+                              limitLo: -0.1, limitHi: 2.3))
         s.addJoint(SceneJoint(bodyA: l1, bodyB: l2, rA: .zero, rB: .zero,
                               stiffnessLin: 0, stiffnessAng: 0))
 
@@ -185,12 +264,29 @@ public final class PushTEnv {
     }
 
     private var motorCmd: [[Float]] = []
+    /// closed-loop radial correction (integral of measured radius error):
+    /// open-loop IK carries a chronic ~0.2 droop from gravity sag and the
+    /// welded finger's tilt — real arms close this loop, so do we
+    private var radialCorr: [Float] = []
+    /// per-substep joint speed limit (rad); Lab-tunable
+    public var jointSpeedLimit: Float = 0.05
 
     public func setTipTarget(_ env: Int, _ p: SIMD2<Float>) {
         if motorCmd.isEmpty {
             motorCmd = [[Float]](repeating: [0, 0.5, 0.7], count: numEnvs)
         }
-        var r = simd_clamp(length(p), 0.75, 1.95)
+        if radialCorr.isEmpty { radialCorr = [Float](repeating: 0, count: numEnvs) }
+        let rWant = simd_clamp(length(p), 0.5, 1.95)
+        // integrate the measured radial error (slow, stable gain) with
+        // anti-windup: freeze while loaded (near the block), or contact
+        // resistance winds the integrator and the push lurches on release
+        let rMeas = length(tipPos(env))
+        let (bp, _) = blockPose(env)
+        if length(tipPos(env) - bp) > 0.55 {
+            radialCorr[env] = simd_clamp(radialCorr[env] + 0.04 * (rWant - rMeas),
+                                         -0.45, 0.45)
+        }
+        var r = simd_clamp(rWant + radialCorr[env], 0.45, 1.95)
         let yaw = atan2(p.y, p.x)
         // turn-then-reach: while the yaw error is large, keep the arm
         // extended so the hanging finger sweeps OUTSIDE the base pillar
@@ -200,7 +296,7 @@ public final class PushTEnv {
         if abs(yawErr) > 0.45 { r = max(r, 1.25) }
         let (t1, t2) = Self.planarIK(r: r)
         // motor-space rate limit: the arm may never whip
-        let maxRate: Float = 0.05
+        let maxRate: Float = jointSpeedLimit
         let targets = [yaw, t1, t2]
         let js = refs[env].motorJoints
         for k in 0..<3 {
@@ -278,6 +374,13 @@ public final class PushTEnv {
 
     /// Greedy geometric push controller (shared by CLI eval and the
     /// Robotics Lab): returns the next tip target for env `e`.
+    /// clamp a waypoint into the arm's reachable annulus
+    static func annulus(_ p: SIMD2<Float>) -> SIMD2<Float> {
+        let l = length(p)
+        if l < 1e-5 { return SIMD2(0.55, 0) }
+        return p * (simd_clamp(l, 0.55, 1.9) / l)
+    }
+
     public func oracleAction(_ e: Int) -> SIMD2<Float> {
         let r = refs[e]
         let (bp, _) = blockPose(e)
@@ -302,10 +405,10 @@ public final class PushTEnv {
             let push = min(0.10, length(toGoal) * 0.4)
             target = bp + dir * push
         }
-        return simd_clamp(target, SIMD2(-1.95, -1.95), SIMD2(1.95, 1.95))
+        return Self.annulus(target)
     }
 
-    public func success(_ env: Int, posTol: Float = 0.22, yawTol: Float = 0.4) -> Bool {
+    public func success(_ env: Int, posTol: Float = 0.25, yawTol: Float = .pi) -> Bool {
         let (p, yaw) = blockPose(env)
         let r = refs[env]
         var dy = yaw - r.goalYaw
