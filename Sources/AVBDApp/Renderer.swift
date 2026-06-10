@@ -22,6 +22,8 @@ struct Uniforms {
     float4 lightDir;    // xyz
     float4 eye;         // xyz
     float4 screen;      // x,y = drawable size; z = px per world unit at d=1
+    float4 camRight;    // xyz: world dir of screen +x
+    float4 camUp;       // xyz: world dir of UV +y (down on screen)
 };
 
 struct VOut {
@@ -270,10 +272,19 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
         float phi = ang + float(sl) * (M_PI_F / float(SLICES));
         float2 dirPx = float2(cos(phi), sin(phi));
 
-        // find horizons on both sides; remember a world-space tangent for
-        // the slice plane (from real reconstructed geometry)
-        float cosH[2] = { -1.0, -1.0 };
-        float3 sliceTan = float3(0);
+        // ANALYTIC slice tangent: the world direction this screen-space
+        // march corresponds to, projected perpendicular to V. Deriving it
+        // from the camera basis (not from samples) keeps the slice plane
+        // exact and view-consistent.
+        float3 dirW = U.camRight.xyz * dirPx.x + U.camUp.xyz * dirPx.y;
+        float3 omega = dirW - V * dot(dirW, V);
+        float ol = length(omega);
+        if (ol < 1e-4) { occlusion += 1.0; continue; }
+        omega /= ol;
+
+        // horizon cosines per WORLD side of the slice (classified by the
+        // actual sample offset, so screen/UV orientation can't flip them)
+        float cosH0 = -1.0, cosH1 = -1.0;
         for (int side = 0; side < 2; side++) {
             float sgn = side == 0 ? 1.0 : -1.0;
             for (int st = 1; st <= STEPS; st++) {
@@ -286,36 +297,30 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
                 float l = length(w);
                 if (l < 1e-4) continue;
                 float c = dot(w / l, V);
-                // distance falloff: fade samples beyond the AO radius
                 float fade = saturate(1.0 - (l - R) / R);
                 c = mix(-1.0, c, fade);
-                if (c > cosH[side]) {
-                    cosH[side] = c;
-                    if (length_squared(sliceTan) < 1e-6) {
-                        float3 tp = w - V * dot(w, V);
-                        if (length_squared(tp) > 1e-6) sliceTan = sgn * normalize(tp);
-                    }
-                }
+                if (dot(w, omega) >= 0.0) cosH0 = max(cosH0, c);
+                else                      cosH1 = max(cosH1, c);
             }
         }
-        if (length_squared(sliceTan) < 1e-6) { occlusion += 1.0; continue; }
 
-        // project N into the slice plane (spanned by V and sliceTan)
-        float3 sliceN = cross(V, sliceTan);
+        // project N into the slice plane (spanned by V and omega)
+        float3 sliceN = cross(V, omega);
         float3 projN = N - sliceN * dot(N, sliceN);
         float projLen = length(projN);
         if (projLen < 1e-4) { occlusion += 1.0; continue; }
         float3 pn = projN / projLen;
         float cosNV = clamp(dot(pn, V), -1.0, 1.0);
-        float n = acos(cosNV) * (dot(pn, sliceTan) >= 0.0 ? 1.0 : -1.0);
+        float n = acos(cosNV) * (dot(pn, omega) >= 0.0 ? 1.0 : -1.0);
 
-        // signed horizon angles in the slice plane (side 0 = +tangent)
-        float h1 =  acos(clamp(cosH[0], -1.0, 1.0));     // toward +tan
-        float h2 = -acos(clamp(cosH[1], -1.0, 1.0));     // toward -tan
+        // signed horizon angles in the slice plane (+ = toward omega),
+        // clamped to the hemisphere around the projected normal
+        float h1 =  acos(clamp(cosH0, -1.0, 1.0));
+        float h2 = -acos(clamp(cosH1, -1.0, 1.0));
         h1 = n + min(h1 - n,  M_PI_F / 2.0);
         h2 = n + max(h2 - n, -M_PI_F / 2.0);
 
-        // analytic cosine-weighted visible arc (paper eq. inner integral)
+        // analytic cosine-weighted visible arc (GTAO inner integral)
         float a1 = 0.25 * (-cos(2.0 * h1 - n) + cosNV + 2.0 * h1 * sin(n));
         float a2 = 0.25 * (-cos(2.0 * h2 - n) + cosNV + 2.0 * h2 * sin(n));
         occlusion += projLen * (a1 + a2);
@@ -472,6 +477,8 @@ struct Uniforms {
     var lightDir: SIMD4<Float>
     var eye: SIMD4<Float>
     var screen: SIMD4<Float>
+    var camRight: SIMD4<Float>
+    var camUp: SIMD4<Float>
 }
 
 let SPHV = 12 * 18 * 6
@@ -648,10 +655,15 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
         let pxPerUnit = viewportSize.y * 0.5 / tan(25 * Float.pi / 180)
+        let fwd = normalize(target - eyePosition)
+        let camR = normalize(cross(fwd, F3(0, 0, 1)))
+        let camU = cross(camR, fwd)          // screen +y in UV space is DOWN
         var U = Uniforms(viewProj: projectionMatrix(aspect: aspect) * viewMatrix,
                          lightDir: SIMD4(normalize(F3(0.4, 0.25, -0.85)), 0),
                          eye: SIMD4(eyePosition, 0),
-                         screen: SIMD4(viewportSize.x, viewportSize.y, pxPerUnit, 0))
+                         screen: SIMD4(viewportSize.x, viewportSize.y, pxPerUnit, 0),
+                         camRight: SIMD4(camR, 0),
+                         camUp: SIMD4(-camU, 0))
 
         // ---- 1. prepass: world pos + normals ----
         let pre = MTLRenderPassDescriptor()
