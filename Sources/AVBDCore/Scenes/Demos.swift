@@ -33,7 +33,7 @@ public enum Demos {
         case "dominoes": return dominoes(count: 80 * s)
         case "car": return car(trackScale: s)
         case "gearclock": return gearclock(scale: s)
-        case "rubegoldberg": return rubegoldberg()
+        case "rubegoldberg": return rubegoldberg(scale: s)
         case "trebuchet": return trebuchet(castleScale: s)
         case "wreckingball": return wreckingball(floors: 2 + s)
         case "marblerun": return marblerun(marbles: 10 * s)
