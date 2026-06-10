@@ -45,8 +45,8 @@ kernel void build_instances(
     float4 pl = posLin[gid];
     float3x3 R = q_to_mat(posAng[gid]);
     uint st = shapeType[gid];
-    // torus: unit-scale model (geometry sized in the vertex shader)
-    float3 sz = st == 2 ? float3(1) : shape[gid].xyz;
+    // torus/capsule: unit-scale model (geometry sized in the vertex shader)
+    float3 sz = st >= 2 ? float3(1) : shape[gid].xyz;
 
     float4x4 m;
     m[0] = float4(R[0] * sz.x, 0);

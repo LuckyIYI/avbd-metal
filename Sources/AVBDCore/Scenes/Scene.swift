@@ -7,6 +7,7 @@ public enum BodyShape: Equatable {
     case box
     case sphere     // size.x = diameter (size.y/z ignored)
     case torus      // size.x = major (spine) radius, size.y = minor (tube) radius
+    case capsule    // size.x = cylinder length (along local z), size.y = radius
 }
 
 public struct SceneBody {
@@ -132,6 +133,15 @@ public struct PhysicsScene {
                                    position: F3, velocity: F3 = .zero) -> Int {
         addBody(size: F3(repeating: diameter), density: density, friction: friction,
                 position: position, velocity: velocity, shape: .sphere)
+    }
+
+    @discardableResult
+    public mutating func addCapsule(length: Float, radius: Float, density: Float,
+                                    friction: Float, position: F3,
+                                    rotation: Quat = Quat(real: 1, imag: .zero),
+                                    velocity: F3 = .zero) -> Int {
+        addBody(size: F3(length, radius, 0), density: density, friction: friction,
+                position: position, rotation: rotation, velocity: velocity, shape: .capsule)
     }
 
     @discardableResult

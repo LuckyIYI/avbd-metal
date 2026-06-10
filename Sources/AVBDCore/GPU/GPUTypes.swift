@@ -39,6 +39,7 @@ public struct JointGPU {
     public var lambdaAng: SIMD4<Float> = .zero
     public var penaltyLin: SIMD4<Float> = .zero
     public var penaltyAng: SIMD4<Float> = .zero
+    public var restRel: SIMD4<Float> = SIMD4(0, 0, 0, 1)
 }
 
 public struct SpringGPU {

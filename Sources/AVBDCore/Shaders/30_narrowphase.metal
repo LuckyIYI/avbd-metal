@@ -188,6 +188,12 @@ inline float2 spinSurfaceShift(float4 wA, float4 wB,
     return float2(dot(t1, rel), dot(t2, rel)) * k;
 }
 
+inline float3 npClosestOnSegment(float3 p, float3 a, float3 b) {
+    float3 ab = b - a;
+    float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-12f), 0.0f, 1.0f);
+    return a + ab * t;
+}
+
 struct TorusFrame {
     float3 center;      // world
     float3 axis;        // world (unit)
@@ -270,13 +276,163 @@ kernel void np_collide(
 
     device ManifoldGPU& outM = manifolds[gid];
 
-    // --- shape type dispatch (0 box, 1 sphere, 2 torus) ---
+    // --- shape type dispatch (0 box, 1 sphere, 2 torus, 3 capsule) ---
     uint stA = shapeType[ia];
     uint stB = shapeType[ib];
     bool sphA = stA == 1;
     bool sphB = stB == 1;
     bool torA = stA == 2;
     bool torB = stB == 2;
+    bool capA = stA == 3;
+    bool capB = stB == 3;
+
+    // capsule pairs not involving a torus: single-contact closest-point
+    if ((capA || capB) && !torA && !torB) {
+        bool cIsA = capA;
+        uint ic = cIsA ? ia : ib;
+        uint io = cIsA ? ib : ia;
+        float4 qC = cIsA ? qA : qB;
+        float4 qO = cIsA ? qB : qA;
+        float3 pC = cIsA ? pA4.xyz : pB4.xyz;
+        float3 pO = cIsA ? pB4.xyz : pA4.xyz;
+        float half_ = shape[ic].x * 0.5f;
+        float rc = shape[ic].y;
+        float3 axC = q_rotate(qC, float3(0, 0, 1));
+        float3 c0 = pC - axC * half_;
+        float3 c1 = pC + axC * half_;
+        uint otherType = cIsA ? stB : stA;
+
+        NPContact hits2[3];
+        int nh = 0;
+        float3 nCO = float3(0, 0, 1);    // capsule -> other
+
+        if (otherType == 1) {
+            float rs = shape[io].x * 0.5f;
+            float3 q = npClosestOnSegment(pO, c0, c1);
+            float3 d = pO - q;
+            float dist = length(d);
+            if (dist <= rc + rs + COLLISION_MARGIN) {
+                nCO = dist > 1e-6f ? d / dist : float3(0, 0, 1);
+                hits2[0].xA = q + nCO * rc;        // on capsule
+                hits2[0].xB = pO - nCO * rs;       // on sphere
+                hits2[0].feature = 0;
+                nh = 1;
+            }
+        } else if (otherType == 3) {
+            float halfO = shape[io].x * 0.5f;
+            float ro = shape[io].y;
+            float3 axO = q_rotate(qO, float3(0, 0, 1));
+            float3 o0 = pO - axO * halfO, o1 = pO + axO * halfO;
+            float3 qa, qb;
+            npClosestSegSeg(c0, c1, o0, o1, qa, qb);
+            float3 d = qb - qa;
+            float dist = length(d);
+            if (dist <= rc + ro + COLLISION_MARGIN) {
+                nCO = dist > 1e-6f ? d / dist : float3(0, 0, 1);
+                hits2[0].xA = qa + nCO * rc;
+                hits2[0].xB = qb - nCO * ro;
+                hits2[0].feature = 0;
+                nh = 1;
+            }
+        } else {
+            // capsule - box: alternating clamp <-> segment, 3 seeds
+            float4 qOc = q_conj(qO);
+            float3 halfO = shape[io].xyz * 0.5f;
+            float3 nAccum = float3(0);
+            for (int seedI = 0; seedI < 3 && nh < 3; seedI++) {
+                float t = float(seedI) * 0.5f;
+                float3 q = c0 + (c1 - c0) * t;
+                float3 bw = q;
+                for (int it2 = 0; it2 < 5; it2++) {
+                    float3 lb = clamp(q_rotate(qOc, q - pO), -halfO, halfO);
+                    bw = q_rotate(qO, lb) + pO;
+                    q = npClosestOnSegment(bw, c0, c1);
+                }
+                float3 d = bw - q;
+                float dist = length(d);
+                float3 n;
+                if (dist < 1e-6f) {
+                    float3 lb = q_rotate(qOc, q - pO);
+                    float3 pen = halfO - fabs(lb);
+                    int axisI = 0;
+                    if (pen.y < pen[axisI]) axisI = 1;
+                    if (pen.z < pen[axisI]) axisI = 2;
+                    float3 nl = float3(0);
+                    nl[axisI] = lb[axisI] >= 0.0f ? 1.0f : -1.0f;
+                    n = -q_rotate(qO, nl);            // capsule -> box
+                    bw = q - n * pen[axisI];
+                } else {
+                    if (dist - rc > COLLISION_MARGIN) continue;
+                    n = d / dist;
+                }
+                bool dup = false;
+                for (int h = 0; h < nh; h++) {
+                    if (distance(hits2[h].xA, q + n * rc) < 0.4f * rc + 0.05f) { dup = true; break; }
+                }
+                if (dup) continue;
+                hits2[nh].xA = q + n * rc;
+                hits2[nh].xB = bw;
+                hits2[nh].feature = uint(seedI);
+                nAccum += n;
+                nh++;
+            }
+            if (nh > 0) nCO = normalize(nAccum);
+        }
+
+        if (nh == 0) {
+            outM.header = uint4(ia, ib, 0, 0);
+            return;
+        }
+
+        float3 nrmC = cIsA ? -nCO : nCO;          // B -> A
+        float3 t1, t2;
+        orthonormal(nrmC, t1, t2);
+        float friction = sqrt(props[ia].w * props[ib].w);
+        int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
+        bool roundA = stA != 0;
+        bool roundB = stB != 0;
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        outM.header = uint4(ia, ib, uint(nh), flags);
+        outM.basisN = float4(nrmC, friction);
+        outM.basisT1 = float4(t1, 0);
+        float4 qAc = q_conj(qA);
+        float4 qBc = q_conj(qB);
+        float warm = P.alpha * P.gamma;
+        for (int i = 0; i < nh; i++) {
+            float3 xAw = cIsA ? hits2[i].xA : hits2[i].xB;
+            float3 xBw = cIsA ? hits2[i].xB : hits2[i].xA;
+            float3 rA_ = roundA ? (xAw - pA4.xyz) : q_rotate(qAc, xAw - pA4.xyz);
+            float3 rB_ = roundB ? (xBw - pB4.xyz) : q_rotate(qBc, xBw - pB4.xyz);
+            float3 lambda = float3(0);
+            float3 penalty = float3(0);
+            if (prevIdx >= 0) {
+                device const ManifoldGPU& pm = prevManifolds[prevIdx];
+                uint pn = pm.header.z;
+                float bestD = 0.6f * (shape[ic].y + 0.2f);
+                int bestJ = -1;
+                for (uint j = 0; j < pn; j++) {
+                    float dj = distance(pm.contacts[j].rA.xyz, rA_);
+                    if (dj < bestD) { bestD = dj; bestJ = int(j); }
+                }
+                if (bestJ >= 0) {
+                    lambda = pm.contacts[bestJ].lambda.xyz;
+                    penalty = pm.contacts[bestJ].penalty.xyz;
+                }
+            }
+            float3 d = xAw - xBw;
+            float3 C0 = float3(dot(nrmC, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+            C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
+                                      xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
+            lambda *= warm;
+            penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
+            outM.contacts[i].rA = float4(rA_, as_type<float>(hits2[i].feature));
+            outM.contacts[i].rB = float4(rB_, 0.0f);
+            outM.contacts[i].C0 = float4(C0, 0);
+            outM.contacts[i].lambda = float4(lambda, 0);
+            outM.contacts[i].penalty = float4(penalty, 0);
+        }
+        return;
+    }
 
     if (torA || torB) {
         TorusHit hits[4];
@@ -317,11 +473,19 @@ kernel void np_collide(
             float dists[NSAMP];
             float3 closest[NSAMP];
             bool isBox = otherType == 0;
+            bool isCap = otherType == 3;
             TorusFrame T2;
             float4 qOc = q_conj(qO);
             float3 halfO = shape[io].xyz * 0.5f;
             float otherR = 0.0f;
-            if (!isBox) {
+            float3 cs0 = float3(0), cs1 = float3(0);
+            if (isCap) {
+                float chalf = shape[io].x * 0.5f;
+                float3 axO = q_rotate(qO, float3(0, 0, 1));
+                cs0 = pO - axO * chalf;
+                cs1 = pO + axO * chalf;
+                otherR = shape[io].y;
+            } else if (!isBox) {
                 T2 = torusFrame(pO, qO, shape[io].x, shape[io].y);
                 otherR = T2.r;
             }
@@ -332,6 +496,8 @@ kernel void np_collide(
                 float3 b;
                 if (isBox) {
                     b = q_rotate(qO, clamp(q_rotate(qOc, q - pO), -halfO, halfO)) + pO;
+                } else if (isCap) {
+                    b = npClosestOnSegment(q, cs0, cs1);
                 } else {
                     b = torusProjSpine(T2, q);
                 }
@@ -364,6 +530,8 @@ kernel void np_collide(
                     q = torusProjSpine(T, b);
                     if (isBox) {
                         b = q_rotate(qO, clamp(q_rotate(qOc, q - pO), -halfO, halfO)) + pO;
+                    } else if (isCap) {
+                        b = npClosestOnSegment(q, cs0, cs1);
                     } else {
                         b = torusProjSpine(T2, q);
                     }
@@ -384,6 +552,8 @@ kernel void np_collide(
                         nl[axisI] = lb[axisI] >= 0.0f ? 1.0f : -1.0f;
                         n = q_rotate(qO, nl);
                         xO_ = q + n * pen[axisI];
+                    } else if (isCap) {
+                        n = normalize(cross(T.axis, normalize(cs1 - cs0)) + float3(1e-4f, 0, 0));
                     } else {
                         n = normalize(cross(T.axis, T2.axis) + float3(1e-4f, 0, 0));
                     }
@@ -392,7 +562,7 @@ kernel void np_collide(
                     n = d / dist;                   // other -> torus
                 }
                 hits[nHits].xT = q - n * T.r;
-                hits[nHits].xO = xO_ + (isBox ? float3(0) : n * otherR);
+                hits[nHits].xO = xO_ + ((isBox) ? float3(0) : n * otherR);
                 hits[nHits].n = n;
                 hits[nHits].feature = uint(best);
                 nHits++;

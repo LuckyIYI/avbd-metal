@@ -177,6 +177,56 @@ vertex VOut torus_vertex(uint vid [[vertex_id]],
     return o;
 }
 
+// Analytic capsule: cylinder (RINGS_C x SLICES_C) + two hemisphere caps
+#define CAP_SLICES 16
+#define CAP_STACKS 6
+
+vertex VOut capsule_vertex(uint vid [[vertex_id]],
+                           uint iid [[instance_id]],
+                           device const RenderInstance* instances [[buffer(0)]],
+                           constant Uniforms& U [[buffer(1)]])
+{
+    RenderInstance inst = instances[iid];
+    if (inst.color.w != 3.0) {
+        VOut o;
+        o.position = float4(0, 0, -2, 1);
+        o.normal = float3(0); o.world = float3(0); o.color = float4(0);
+        return o;
+    }
+    float halfL = inst.params.x * 0.5;
+    float r = inst.params.y;
+    // total stacks: CAP_STACKS (bottom cap) + 1 (cylinder) + CAP_STACKS (top)
+    uint quad = vid / 6;
+    uint corner = vid % 6;
+    uint stack = quad / CAP_SLICES;
+    uint slice = quad % CAP_SLICES;
+    uint2 off[6] = { uint2(0,0), uint2(1,0), uint2(1,1), uint2(0,0), uint2(1,1), uint2(0,1) };
+    uint sIdx = stack + off[corner].y;
+    float u = float(slice + off[corner].x) / float(CAP_SLICES) * 2.0 * M_PI_F;
+    float phi;      // -pi/2..pi/2 latitude
+    float zoff;
+    if (sIdx <= CAP_STACKS) {
+        phi = -M_PI_F / 2.0 + float(sIdx) / float(CAP_STACKS) * (M_PI_F / 2.0);
+        zoff = -halfL;
+    } else {
+        uint k = sIdx - CAP_STACKS - 1;
+        phi = float(k) / float(CAP_STACKS) * (M_PI_F / 2.0);
+        zoff = halfL;
+    }
+    float3 n = float3(cos(phi) * cos(u), cos(phi) * sin(u), sin(phi));
+    float3 p = n * r + float3(0, 0, zoff);
+    float4 world = inst.model * float4(p, 1);
+    float3x3 rot = float3x3(normalize(inst.model[0].xyz),
+                            normalize(inst.model[1].xyz),
+                            normalize(inst.model[2].xyz));
+    VOut o;
+    o.position = U.viewProj * world;
+    o.normal = rot * n;
+    o.world = world.xyz;
+    o.color = float4(inst.color.rgb, 1);
+    return o;
+}
+
 // Ground grid lines
 struct GridOut { float4 position [[position]]; float4 color; };
 
@@ -219,6 +269,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     var boxPipeline: MTLRenderPipelineState!
     var spherePipeline: MTLRenderPipelineState!
     var torusPipeline: MTLRenderPipelineState!
+    var capsulePipeline: MTLRenderPipelineState!
     var gridPipeline: MTLRenderPipelineState!
     var depthState: MTLDepthStencilState!
     var instances: MTLBuffer?
@@ -259,6 +310,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         tdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
         tdesc.depthAttachmentPixelFormat = .depth32Float
         torusPipeline = try device.makeRenderPipelineState(descriptor: tdesc)
+
+        let cdesc = MTLRenderPipelineDescriptor()
+        cdesc.vertexFunction = lib.makeFunction(name: "capsule_vertex")
+        cdesc.fragmentFunction = lib.makeFunction(name: "box_fragment")
+        cdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        cdesc.depthAttachmentPixelFormat = .depth32Float
+        capsulePipeline = try device.makeRenderPipelineState(descriptor: cdesc)
 
         let gdesc = MTLRenderPipelineDescriptor()
         gdesc.vertexFunction = lib.makeFunction(name: "grid_vertex")
@@ -364,6 +422,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0,
                            vertexCount: 24 * 12 * 6, instanceCount: count)
+
+        enc.setRenderPipelineState(capsulePipeline)
+        enc.setVertexBuffer(instances, offset: 0, index: 0)
+        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                           vertexCount: (2 * 6 + 1) * 16 * 6, instanceCount: count)
         enc.endEncoding()
 
         cmd.present(drawable)

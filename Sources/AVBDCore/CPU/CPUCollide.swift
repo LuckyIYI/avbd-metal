@@ -295,6 +295,20 @@ extension CPUManifold {
             return collideTorusBox(bodyB, bodyA, torusIsA: false, &contacts, &basisOut)
         case (.torus, .torus):
             return collideTorusTorus(bodyA, bodyB, &contacts, &basisOut)
+        case (.capsule, .sphere):
+            return collideCapsuleSphere(bodyA, bodyB, capsuleIsA: true, &contacts, &basisOut)
+        case (.sphere, .capsule):
+            return collideCapsuleSphere(bodyB, bodyA, capsuleIsA: false, &contacts, &basisOut)
+        case (.capsule, .box):
+            return collideCapsuleBox(bodyA, bodyB, capsuleIsA: true, &contacts, &basisOut)
+        case (.box, .capsule):
+            return collideCapsuleBox(bodyB, bodyA, capsuleIsA: false, &contacts, &basisOut)
+        case (.capsule, .capsule):
+            return collideCapsuleCapsule(bodyA, bodyB, &contacts, &basisOut)
+        case (.torus, .capsule):
+            return collideTorusCapsule(bodyA, bodyB, torusIsA: true, &contacts, &basisOut)
+        case (.capsule, .torus):
+            return collideTorusCapsule(bodyB, bodyA, torusIsA: false, &contacts, &basisOut)
         }
     }
 
@@ -619,6 +633,176 @@ extension CPUManifold {
             let xB = f.pb + nf * rb
             c.rA = xA - a.positionLin     // round: world offsets
             c.rB = xB - b.positionLin
+            contacts.append(c)
+        }
+        return contacts.count
+    }
+}
+
+// MARK: - Capsule collision (segment + radius)
+
+@inline(__always)
+private func capsuleSegment(_ c: CPURigid) -> (F3, F3, Float) {
+    let half = c.size.x / 2
+    let axis = c.positionAng.act(F3(0, 0, 1))
+    return (c.positionLin - axis * half, c.positionLin + axis * half, c.size.y)
+}
+
+@inline(__always)
+private func closestOnSegment(_ p: F3, _ a: F3, _ b: F3) -> F3 {
+    let ab = b - a
+    let t = simd_clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-12), 0, 1)
+    return a + ab * t
+}
+
+extension CPUManifold {
+    static func roundAnchor(_ body: CPURigid, _ x: F3) -> F3 {
+        body.shape == .box ? rotate(body.positionAng.conjugate, x - body.positionLin)
+                           : x - body.positionLin
+    }
+
+    static func collideCapsuleSphere(_ cap: CPURigid, _ sph: CPURigid, capsuleIsA: Bool,
+                                     _ contacts: inout [ContactPoint],
+                                     _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let (p0, p1, rc) = capsuleSegment(cap)
+        let rs = sph.size.x / 2
+        let q = closestOnSegment(sph.positionLin, p0, p1)
+        let d = sph.positionLin - q
+        let dist = length(d)
+        if dist > rc + rs + AVBDConstants.collisionMargin { return 0 }
+        let nCS = dist > 1e-6 ? d / dist : F3(0, 0, 1)   // capsule -> sphere
+        let n = capsuleIsA ? -nCS : nCS                   // B -> A
+        basisOut = orthonormalBasis(n)
+        var c = ContactPoint()
+        let xCap = q + nCS * rc
+        let xSph = sph.positionLin - nCS * rs
+        let (bodyA, xA, xB) = capsuleIsA ? (cap, xCap, xSph) : (sph, xSph, xCap)
+        let bodyB = capsuleIsA ? sph : cap
+        c.rA = roundAnchor(bodyA, xA)
+        c.rB = roundAnchor(bodyB, xB)
+        contacts.append(c)
+        return 1
+    }
+
+    static func collideCapsuleBox(_ cap: CPURigid, _ box: CPURigid, capsuleIsA: Bool,
+                                  _ contacts: inout [ContactPoint],
+                                  _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let (p0, p1, rc) = capsuleSegment(cap)
+        let half = box.size * 0.5
+        let qc = box.positionAng.conjugate
+
+        var found: [(q: F3, b: F3, n: F3)] = []
+        for seed in [Float(0), 0.5, 1] {
+            var q = p0 + (p1 - p0) * seed
+            var bw = F3.zero
+            for _ in 0..<5 {
+                let lb = simd_clamp(qc.act(q - box.positionLin), -half, half)
+                bw = box.positionAng.act(lb) + box.positionLin
+                q = closestOnSegment(bw, p0, p1)
+            }
+            var d = q - bw
+            var dist = length(d)
+            var n: F3
+            if dist < 1e-6 {
+                let lb = qc.act(q - box.positionLin)
+                let pen = half - abs(lb)
+                var axisI = 0
+                if pen.y < pen[axisI] { axisI = 1 }
+                if pen.z < pen[axisI] { axisI = 2 }
+                var nl = F3.zero
+                nl[axisI] = lb[axisI] >= 0 ? 1 : -1
+                n = box.positionAng.act(nl)
+                bw = q + n * pen[axisI]
+                dist = 0
+            } else {
+                if dist - rc > AVBDConstants.collisionMargin { continue }
+                n = d / dist
+            }
+            if found.contains(where: { length($0.q - q) < 0.3 * rc + 0.05 }) { continue }
+            found.append((q, bw, n))
+        }
+        if found.isEmpty { return 0 }
+        let nAvg = normalize(found.reduce(F3.zero) { $0 + $1.n })
+        let n = capsuleIsA ? -nAvg : nAvg
+        basisOut = orthonormalBasis(n)
+        for (i, f) in found.enumerated() {
+            var c = ContactPoint()
+            c.featureKey = Int32(i)
+            let xCap = f.q - f.n * rc
+            let (bodyA, xA, xB) = capsuleIsA ? (cap, xCap, f.b) : (box, f.b, xCap)
+            let bodyB = capsuleIsA ? box : cap
+            c.rA = roundAnchor(bodyA, xA)
+            c.rB = roundAnchor(bodyB, xB)
+            contacts.append(c)
+        }
+        return contacts.count
+    }
+
+    static func collideCapsuleCapsule(_ a: CPURigid, _ b: CPURigid,
+                                      _ contacts: inout [ContactPoint],
+                                      _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let (a0, a1, ra) = capsuleSegment(a)
+        let (b0, b1, rb) = capsuleSegment(b)
+        let (pa, pb) = closestPointsOnSegments(a0, a1, b0, b1)
+        let d = pa - pb
+        let dist = length(d)
+        if dist > ra + rb + AVBDConstants.collisionMargin { return 0 }
+        let n = dist > 1e-6 ? d / dist : F3(0, 0, 1)   // B -> A
+        basisOut = orthonormalBasis(n)
+        var c = ContactPoint()
+        c.rA = pa - n * ra - a.positionLin
+        c.rB = pb + n * rb - b.positionLin
+        contacts.append(c)
+        return 1
+    }
+
+    /// Torus spine sampled against the capsule segment (exact per sample) —
+    /// the round-on-round bearing pair.
+    static func collideTorusCapsule(_ torus: CPURigid, _ cap: CPURigid, torusIsA: Bool,
+                                    _ contacts: inout [ContactPoint],
+                                    _ basisOut: inout (F3, F3, F3)) -> Int {
+        contacts.removeAll(keepingCapacity: true)
+        let R = torus.size.x, rt = torus.size.y
+        let (p0, p1, rc) = capsuleSegment(cap)
+        let center = torus.positionLin
+        let axis = torus.positionAng.act(F3(0, 0, 1))
+        var u = abs(axis.x) > abs(axis.z) ? F3(-axis.y, axis.x, 0) : F3(0, -axis.z, axis.y)
+        u = normalize(u)
+        let v = cross(axis, u)
+
+        var found: [(q: F3, b: F3)] = []
+        var best: (q: F3, b: F3, dist: Float)? = nil
+        for k in 0..<32 {
+            let a = Float(k) / 32 * 2 * .pi
+            let q = center + (u * cos(a) + v * sin(a)) * R
+            let b = closestOnSegment(q, p0, p1)
+            let dist = length(q - b)
+            if best == nil || dist < best!.dist { best = (q, b, dist) }
+            if dist - rt - rc > AVBDConstants.collisionMargin { continue }
+            if found.contains(where: { length($0.q - q) < 0.35 * R }) { continue }
+            if found.count < 4 { found.append((q, b)) }
+        }
+        if found.isEmpty { return 0 }
+        var n = best!.q - best!.b
+        let l = length(n)
+        n = l > 1e-6 ? n / l : F3(0, 0, 1)               // capsule -> torus
+        let nBA = torusIsA ? n : -n                       // B -> A
+        basisOut = orthonormalBasis(nBA)
+        for (i, f) in found.enumerated() {
+            var nf = f.q - f.b
+            let lf = length(nf)
+            nf = lf > 1e-6 ? nf / lf : n
+            var c = ContactPoint()
+            c.featureKey = Int32(i)
+            let xT = f.q - nf * rt
+            let xC = f.b + nf * rc
+            let (bodyA, xA, xB) = torusIsA ? (torus, xT, xC) : (cap, xC, xT)
+            let bodyB = torusIsA ? cap : torus
+            c.rA = xA - bodyA.positionLin
+            c.rB = xB - bodyB.positionLin
             contacts.append(c)
         }
         return contacts.count

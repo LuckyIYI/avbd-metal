@@ -257,6 +257,13 @@ public final class GPUSolver {
                 let iAxis = mass * (R * R + 3 * r * r / 4)
                 moment = F3(iDia, iDia, iAxis)
                 radius = R + r
+            case .capsule:
+                let L = b.size.x, r = b.size.y
+                mass = b.density > 0 ? Float.pi * r * r * (L + 4 * r / 3) * b.density : 0
+                let iAxis = 0.5 * mass * r * r
+                let iPerp = mass * (L * L / 12 + r * r / 4)
+                moment = F3(iPerp, iPerp, iAxis)
+                radius = L / 2 + r
             }
             pl[i] = SIMD4(b.position, mass)
             pa[i] = SIMD4(b.rotation.imag, b.rotation.real)
@@ -265,7 +272,12 @@ public final class GPUSolver {
             pv[i] = SIMD4(b.velocity, 0)
             pr[i] = SIMD4(moment, b.friction)
             sh[i] = SIMD4(b.size, radius)
-            st[i] = b.shape == .box ? 0 : (b.shape == .sphere ? 1 : 2)
+            switch b.shape {
+            case .box: st[i] = 0
+            case .sphere: st[i] = 1
+            case .torus: st[i] = 2
+            case .capsule: st[i] = 3
+            }
             colA[i] = UInt32(i % AVBD_MAX_COLORS)  // initial guess; refined per frame
             colB[i] = colA[i]
             if mass > 0 { radii.append(radius) }
@@ -284,6 +296,7 @@ public final class GPUSolver {
             switch b.shape {
             case .sphere: radius = b.size.x / 2
             case .torus: radius = b.size.x + b.size.y
+            case .capsule: radius = b.size.x / 2 + b.size.y
             case .box: radius = length(b.size * 0.5)
             }
             if radius > threshold {
@@ -322,6 +335,10 @@ public final class GPUSolver {
             let torqueArm = length_squared(sizeA + scene.bodies[j.bodyB].size)
             g.C0Lin = SIMD4(0, 0, 0, torqueArm)
             g.C0Ang = SIMD4(0, 0, 0, min(j.fracture, 3.0e18))
+            // rest relative rotation: angular welds preserve spawn alignment
+            let qA0 = j.bodyA >= 0 ? scene.bodies[j.bodyA].rotation : Quat(real: 1, imag: .zero)
+            let rel = (qA0.inverse * scene.bodies[j.bodyB].rotation).normalized
+            g.restRel = SIMD4(rel.imag, rel.real)
             jp[i] = g
         }
 

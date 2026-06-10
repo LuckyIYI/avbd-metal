@@ -18,6 +18,9 @@ public final class CPUJoint: CPUForce {
     public var stiffnessLin: Float, stiffnessAng: Float, fracture: Float
     public var torqueArm: Float
     public var broken = false
+    /// Rest relative rotation captured at creation: the angular constraint
+    /// preserves the spawn alignment instead of forcing qA == qB.
+    public var restRel: Quat
 
     init(solver: CPUSolver, bodyA: CPURigid?, bodyB: CPURigid, rA: F3, rB: F3,
          stiffnessLin: Float, stiffnessAng: Float, fracture: Float) {
@@ -27,6 +30,8 @@ public final class CPUJoint: CPUForce {
         self.stiffnessAng = stiffnessAng
         self.fracture = fracture
         self.torqueArm = length_squared((bodyA?.size ?? .zero) + bodyB.size)
+        let qA0 = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
+        self.restRel = (qA0.inverse * bodyB.positionAng).normalized
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)
     }
 
@@ -39,7 +44,7 @@ public final class CPUJoint: CPUForce {
     func currentCAng() -> F3 {
         guard let bodyB else { return .zero }
         let qA = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
-        return quatSub(qA, bodyB.positionAng) * torqueArm
+        return quatSub((qA * restRel).normalized, bodyB.positionAng) * torqueArm
     }
 
     override func initialize() -> Bool {

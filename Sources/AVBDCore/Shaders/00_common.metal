@@ -221,7 +221,7 @@ struct SimParams {
 };
 
 struct JointGPU {
-    uint4 header;       // bodyA (WORLD_BODY=world), bodyB, broken flag, pad
+    uint4 header;       // bodyA (WORLD_BODY=world), bodyB, broken flag, flags
     float4 rA;          // w = stiffnessLin
     float4 rB;          // w = stiffnessAng
     float4 C0Lin;       // w = torqueArm
@@ -230,6 +230,7 @@ struct JointGPU {
     float4 lambdaAng;
     float4 penaltyLin;
     float4 penaltyAng;
+    float4 restRel;     // rest relative rotation qA^-1 * qB (quaternion)
 };
 
 struct SpringGPU {

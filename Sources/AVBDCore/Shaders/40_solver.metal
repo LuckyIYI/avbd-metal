@@ -267,7 +267,7 @@ kernel void warmstart_joints(
     float torqueArm = j.C0Lin.w;
 
     j.C0Lin = float4(pA - pB, torqueArm);
-    j.C0Ang = float4(q_sub(qA, posAng[b]) * torqueArm, j.C0Ang.w);
+    j.C0Ang = float4(q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm, j.C0Ang.w);
 
     float warm = P.alpha * P.gamma;
     float stiffLin = j.rA.w;
@@ -380,7 +380,7 @@ inline void stampJoint(device const JointGPU& j, uint self,
     float3 penAng = j.penaltyAng.xyz;
     if (dot(penAng, penAng) > 0.0f) {
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
-        float3 C = q_sub(qA, posAng[b]) * torqueArm;
+        float3 C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
         if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
 
         float3 F = penAng * C + j.lambdaAng.xyz;
@@ -613,7 +613,7 @@ kernel void dual_joints(
     float3 penAng = j.penaltyAng.xyz;
     if (dot(penAng, penAng) > 0.0f) {
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
-        float3 C = q_sub(qA, posAng[b]) * torqueArm;
+        float3 C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
         if (j.header.w & 2) {
             C -= j.C0Ang.xyz * P.alpha;
             j.lambdaAng.xyz = clamp(penAng * C + j.lambdaAng.xyz,

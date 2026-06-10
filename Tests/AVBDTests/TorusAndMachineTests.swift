@@ -82,3 +82,39 @@ final class TorusAndMachineTests: XCTestCase {
         XCTAssertGreaterThan(x1 - x0, 1.0, "rollers must convey boxes (+\(x1 - x0))")
     }
 }
+
+extension TorusAndMachineTests {
+    /// The torus hub hangs on a capsule axle at the exact analytic offset:
+    /// hole radius minus axle radius. The round-on-round bearing.
+    func testCapsuleTorusBearing() throws {
+        var scene = PhysicsScene(name: "rb")
+        scene.settings.iterations = 20
+        scene.settings.betaLin = 20000
+        _ = scene.addCapsule(length: 2.0, radius: 0.11, density: 0, friction: 0.02,
+                             position: F3(0, 0, 3), rotation: Quat(angle: .pi/2, axis: F3(1,0,0)))
+        _ = scene.addTorus(major: 0.27, minor: 0.115, density: 1.5, friction: 0.02,
+                           position: F3(0, 0, 3), rotation: Quat(angle: .pi/2, axis: F3(1,0,0)))
+        let solver = try GPUSolver(scene: scene)
+        for _ in 0..<300 { solver.step() }
+        // hang offset = (major - minor) - axleR = 0.155 - 0.11 = 0.045
+        XCTAssertEqual(solver.bodyPosition(1).z, 3 - 0.045, accuracy: 0.02)
+    }
+
+    /// Mechanical car (torus-on-capsule wheel bearings, no wheel joints)
+    /// descends the curly track intact and reaches the runout.
+    func testCarRollsDownTrack() throws {
+        let scene = Demos.car()
+        var outers: [Int] = []
+        for (i, b) in scene.bodies.enumerated() where b.shape == .torus && b.size.x > 0.4 { outers.append(i) }
+        let solver = try GPUSolver(scene: scene)
+        for _ in 0..<1500 { solver.step() }
+        let p = solver.bodyPosition(1)
+        // pace varies run to run; require meaningful descent + integrity
+        XCTAssertGreaterThan(p.x, 0.0, "car should descend the track (x=\(p.x))")
+        XCTAssertLessThan(p.z, 5.5, "car should be well down the track (z=\(p.z))")
+        for o in outers {
+            XCTAssertLessThan(distance(solver.bodyPosition(o), p), 1.6,
+                              "wheels must stay on their bearings")
+        }
+    }
+}

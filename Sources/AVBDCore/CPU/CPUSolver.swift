@@ -68,6 +68,14 @@ public final class CPURigid {
             let iAxis = m * (R * R + 3 * r * r / 4)
             self.moment = F3(iDia, iDia, iAxis)
             self.radius = R + r
+        case .capsule:
+            let L = size.x, r = size.y
+            let m = density > 0 ? Float.pi * r * r * (L + 4 * r / 3) * density : 0
+            self.mass = m
+            let iAxis = 0.5 * m * r * r
+            let iPerp = m * (L * L / 12 + r * r / 4)
+            self.moment = F3(iPerp, iPerp, iAxis)
+            self.radius = L / 2 + r
         }
     }
 
