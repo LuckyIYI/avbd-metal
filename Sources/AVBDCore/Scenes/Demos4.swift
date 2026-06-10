@@ -229,3 +229,248 @@ extension Demos {
         return s
     }
 }
+
+// MARK: - Trebuchet siege
+
+extension Demos {
+    /// Counterweight trebuchet vs a fracture-jointed castle. Gravity-only:
+    /// the cocked arm is released at t=0, the hung counterweight drops, the
+    /// chain sling whips the boulder around, and a breakable joint releases
+    /// it at the top of the whip.
+    public static func trebuchet(castleScale: Int = 1) -> PhysicsScene {
+        var s = PhysicsScene(name: "trebuchet")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        s.settings.lambdaMax = 80000
+        addGround(&s, friction: 0.9)
+
+        // ---------- the machine (at x ~ 0, throws toward -x) ----------
+        let pivotZ: Float = 4.2
+        let shortArm: Float = 1.5      // counterweight side (+x)
+        let longArm: Float = 5.2       // sling side (-x)
+
+        // A-frame: two static legs + crossbeam (the axle housing)
+        for sy in [Float(-1), 1] {
+            _ = s.addBody(size: F3(0.5, 0.5, pivotZ), density: 0, friction: 0.8,
+                          position: F3(0, sy * 1.5, pivotZ / 2))
+        }
+        let frame = s.addBody(size: F3(0.6, 3.6, 0.6), density: 0, friction: 0.5,
+                              position: F3(0, 0, pivotZ))
+
+        // throwing arm, spawned COCKED: long end down toward +x... rotated
+        // about the pivot so the counterweight end is UP. Arm local +x = long
+        // (sling) direction.
+        let cock: Float = 0.98          // radians above horizontal, long end down
+        let qArm = Quat(angle: -cock, axis: F3(0, 1, 0))
+        let armCenterOff = (longArm - shortArm) / 2   // pivot offset from center
+        let armC = F3(0, 0, pivotZ) + qArm.act(F3(-armCenterOff, 0, 0))
+        let arm = s.addBody(size: F3(longArm + shortArm, 0.4, 0.35), density: 2.5,
+                            friction: 0.5, position: armC, rotation: qArm)
+        s.addJoint(SceneJoint(bodyA: frame, bodyB: arm,
+                              rA: F3(0, 0, 0), rB: F3(armCenterOff, 0, 0),
+                              stiffnessLin: .infinity, stiffnessAng: .infinity,
+                              hingeAxis: F3(0, 1, 0)))
+        s.addJoint(SceneJoint(bodyA: frame, bodyB: arm, rA: .zero, rB: .zero,
+                              stiffnessLin: 0, stiffnessAng: 0))
+
+        // counterweight box HUNG from the short end (free-hanging CW is the
+        // efficient classic design)
+        let cwAnchor = F3(0, 0, pivotZ) + qArm.act(F3(shortArm, 0, 0))
+        let cwC = cwAnchor + F3(0, 0, -1.15)
+        let cw = s.addBody(size: F3(1.7, 1.7, 1.5), density: 10, friction: 0.6,
+                           position: cwC)
+        s.addJoint(SceneJoint(bodyA: arm, bodyB: cw,
+                              rA: F3(shortArm + armCenterOff, 0, 0),
+                              rB: F3(0, 0, 0.75 + 0.4)))
+        s.addJoint(SceneJoint(bodyA: arm, bodyB: cw, rA: .zero, rB: .zero,
+                              stiffnessLin: 0, stiffnessAng: 0))
+
+        // spoon cup at the long arm tip carrying the boulder; a static stop
+        // beam halts the arm mid-swing and the boulder departs ballistically
+        // (onager-style release: purely mechanical, no magic timing)
+        let tipW = F3(0, 0, pivotZ) + qArm.act(F3(-longArm, 0, 0))
+        let boulderR: Float = 0.55
+        func cupPart(_ size: F3, _ worldAt: F3) {
+            let part = s.addBody(size: size, density: 0.6, friction: 0.5,
+                                 position: worldAt, rotation: qArm)
+            s.addJoint(SceneJoint(bodyA: arm, bodyB: part,
+                                  rA: qArm.inverse.act(worldAt - armC),
+                                  rB: .zero,
+                                  stiffnessLin: .infinity, stiffnessAng: .infinity))
+            s.addJoint(SceneJoint(bodyA: arm, bodyB: part, rA: .zero, rB: .zero,
+                                  stiffnessLin: 0, stiffnessAng: 0))
+        }
+        // cup local frame = arm frame: bottom plate sits on the arm's
+        // swing-leading face, lips trail and flank
+        let up = qArm.act(F3(0, 0, 1))               // arm-local z in world
+        let out = qArm.act(F3(-1, 0, 0))             // along the long arm
+        cupPart(F3(1.5, 1.3, 0.12), tipW + up * 0.24)              // bottom
+        cupPart(F3(0.14, 1.3, 0.6), tipW - out * 0.72 + up * 0.55) // back lip
+        // low front lip: cages the boulder through the swing; the stop-beam
+        // deceleration throws it over
+        cupPart(F3(0.14, 1.3, 0.42), tipW + out * 0.72 + up * 0.46)
+        cupPart(F3(1.5, 0.12, 0.5), tipW + up * 0.5 + qArm.act(F3(0, 0.66, 0)))
+        cupPart(F3(1.5, 0.12, 0.5), tipW + up * 0.5 + qArm.act(F3(0, -0.66, 0)))
+        let boulder = s.addSphere(diameter: boulderR * 2, density: 3,
+                                  friction: 0.4,
+                                  position: tipW + up * (0.3 + boulderR))
+
+        // the stop: a static padded beam the arm slams into
+        _ = s.addBody(size: F3(0.7, 4.2, 0.7), density: 0, friction: 0.9,
+                      position: F3(-1.9, 0, pivotZ + 2.9))
+
+        // ---------- the castle (downrange at +x: the spoon throws over the
+        // top of the arc, in the direction the counterweight-driven rotation
+        // carries the tip) ----------
+        let cx: Float = 26
+        let brick = F3(1.1, 0.55, 0.55)
+        func wall(_ at: F3, len: Int, height: Int, yaw: Float) {
+            let q = Quat(angle: yaw, axis: F3(0, 0, 1))
+            var below: [Int] = []
+            for h in 0..<height {
+                var row: [Int] = []
+                let off: Float = h % 2 == 0 ? 0 : brick.x / 2
+                for i in 0..<len {
+                    let lx = -Float(len - 1) / 2 * brick.x + Float(i) * brick.x + off
+                    let p = at + q.act(F3(lx, 0, Float(h) * brick.z + brick.z / 2))
+                    let b = s.addBody(size: brick * 0.98, density: 0.8,
+                                      friction: 0.85, position: p, rotation: q)
+                    // weak mortar: shears under boulder impact
+                    if h > 0 {
+                        for u in below where abs(s.bodies[u].position.x - p.x) < brick.x
+                            && abs(s.bodies[u].position.y - p.y) < brick.x {
+                            s.addJoint(SceneJoint(bodyA: u, bodyB: b,
+                                                  rA: .zero, rB: .zero,
+                                                  stiffnessLin: .infinity,
+                                                  stiffnessAng: .infinity,
+                                                  fracture: 60))
+                        }
+                    }
+                    row.append(b)
+                }
+                below = row
+            }
+        }
+        wall(F3(cx, 0, 0), len: 10, height: 6, yaw: .pi / 2)          // front wall
+        wall(F3(cx + 5, 5.2, 0), len: 8, height: 5, yaw: 0)           // side walls
+        wall(F3(cx + 5, -5.2, 0), len: 8, height: 5, yaw: 0)
+        wall(F3(cx + 10, 0, 0), len: 10, height: 5, yaw: .pi / 2)     // back wall
+        // corner towers
+        for ty in [Float(-5.2), 5.2] {
+            for tx in [cx, cx + 10] {
+                wall(F3(tx, ty, 0), len: 3, height: 8, yaw: .pi / 4)
+            }
+        }
+        _ = castleScale
+        return s
+    }
+}
+
+// MARK: - Rube Goldberg machine
+
+extension Demos {
+    /// A causal cascade: marble rail -> drop chute -> growing domino run ->
+    /// seesaw catapult -> catch basin -> bowling ramp -> tower collapse.
+    public static func rubegoldberg() -> PhysicsScene {
+        var s = PhysicsScene(name: "rubegoldberg")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        s.settings.lambdaMax = 3000
+        addGround(&s, friction: 0.7)
+
+        func wall(_ size: F3, _ at: F3, yaw: Float = 0, pitch: Float = 0,
+                  friction: Float = 0.3) {
+            let q = (Quat(angle: yaw, axis: F3(0, 0, 1)) *
+                     Quat(angle: pitch, axis: F3(0, 1, 0))).normalized
+            _ = s.addBody(size: size, density: 0, friction: friction,
+                          position: at, rotation: q)
+        }
+
+        // ---- S1: elevated start rail (capsule pair) ----
+        let railLen: Float = 9.0
+        let drop: Float = 0.30                  // pitch of the start rail
+        let z0: Float = 4.4
+        let gap: Float = 0.42
+        let nSeg = Int(railLen / 0.7)
+        for k in 0..<nSeg {
+            let t = (Float(k) + 0.5) / Float(nSeg)
+            let x = t * railLen
+            let z = z0 - sin(drop) * railLen * t
+            let q = Quat(angle: drop, axis: F3(0, 1, 0))
+            for sy in [Float(-1), 1] {
+                _ = s.addBody(size: F3(0.78, 0.06, 0.06) * 1.0, density: 0,
+                              friction: 0.15,
+                              position: F3(x, sy * gap / 2, z),
+                              rotation: q)
+            }
+        }
+        let marble = s.addSphere(diameter: 0.6, density: 1.5, friction: 0.3,
+                                 position: F3(0.4, 0, z0 + 0.36),
+                                 velocity: F3(1.2, 0, 0))
+
+        // ---- S2: the rail feeds a raised TABLE ----
+        let endX = railLen + 0.2
+        let tableTop: Float = 1.30
+        _ = s.addBody(size: F3(8.6, 2.2, 0.18), density: 0, friction: 0.6,
+                      position: F3(endX + 4.1, 0, tableTop - 0.09))
+        for sy in [Float(-1), 1] {     // table-top guides
+            _ = s.addBody(size: F3(8.6, 0.1, 0.5), density: 0, friction: 0.2,
+                          position: F3(endX + 4.1, sy * 1.0, tableTop + 0.25))
+        }
+
+        // ---- S3: uniform domino run across the table ----
+        // (uniform height: growing chains jam into a leaning pile)
+        let dh: Float = 1.05
+        var dx = endX + 1.6
+        for _ in 0..<6 {
+            // 0.78h spacing + low friction: tighter packs jam into a
+            // mutually-leaning static wedge instead of falling
+            _ = s.addBody(size: F3(dh * 0.2, dh * 0.5, dh), density: 1.0,
+                          friction: 0.5,
+                          position: F3(dx, 0, tableTop + dh / 2))
+            dx += dh * 0.75
+        }
+
+        // ---- S4: the last domino's tip lands ON the ball's rear quadrant —
+        // the wedge squeeze squirts even a slow fall forward over the pin.
+        // Light ball: the table drop re-energizes it, mass is irrelevant.
+        let payload = s.addSphere(diameter: 0.8, density: 0.25, friction: 0.4,
+                                  position: F3(dx + 0.06, 0, tableTop + 0.4))
+        // no stop pin needed: the table is level, so the ball rests until
+        // nudged, then creeps to the edge — the drop supplies the energy
+
+        // ---- S5: catch ramp under the edge turns the fall into a strike.
+        // Gentle pitch + high catch point: minimal bounce, maximal roll.
+        let tableEnd = endX + 4.1 + 4.3
+        let rampPitch: Float = 0.32
+        let rLen: Float = 1.0 / sin(rampPitch)
+        let rampC = F3(tableEnd + 0.3, 0, 1.0)
+            + F3(cos(rampPitch), 0, -sin(rampPitch)) * (rLen / 2)
+        wall(F3(rLen, 1.7, 0.1), rampC, pitch: rampPitch, friction: 0.4)
+        let runoutX = tableEnd + 0.3 + rLen * cos(rampPitch)
+        for sy in [Float(-1), 1] {
+            wall(F3(6.0, 0.1, 0.6), F3(tableEnd + 2.6, sy * 0.92, 0.3),
+                 friction: 0.1)
+        }
+
+        // ---- S6: finale: a rank of tall thin monoliths (tipping angle
+        // ~6 degrees) felled by the ball, the last one dropping a perched
+        // golden ball — TA-DA.
+        let towerX = runoutX + 1.0
+        var mx = towerX
+        var monoliths: [Int] = []
+        for k in 0..<4 {
+            let h: Float = 1.8 + Float(k) * 0.15
+            monoliths.append(s.addBody(size: F3(0.16, 1.1, h), density: 0.12,
+                                       friction: 0.5,
+                                       position: F3(mx, 0, h / 2)))
+            mx += h * 0.62
+        }
+        let lastH: Float = 1.8 + 3 * 0.15
+        _ = s.addSphere(diameter: 0.5, density: 0.3, friction: 0.5,
+                        position: F3(mx - lastH * 0.62, 0, lastH + 0.25))
+
+        _ = marble; _ = payload
+        return s
+    }
+}

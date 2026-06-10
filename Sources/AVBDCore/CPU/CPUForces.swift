@@ -144,7 +144,7 @@ public final class CPUJoint: CPUForce {
             penaltyAng = simd_min(penaltyAng + abs(C) * solver.betaAng, F3(repeating: cap))
         }
 
-        if length_squared(lambdaAng) > fracture * fracture {
+        if length_squared(lambdaAng) + length_squared(lambdaLin) > fracture * fracture {
             penaltyLin = .zero
             penaltyAng = .zero
             lambdaLin = .zero

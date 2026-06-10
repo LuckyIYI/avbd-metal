@@ -674,10 +674,12 @@ static inline void dual_joint_one(
         j.penaltyAng.xyz = min(penAng + fabs(C) * P.betaAng, cap);
     }
 
-    // Fracture (flagged joints only; avoids inf comparisons under fast math)
+    // Fracture (flagged joints only; avoids inf comparisons under fast math).
+    // Linear tension counts too: ball-joint slings carry pure linear lambda.
     float fracture = j.C0Ang.w;
     float3 la = j.lambdaAng.xyz;
-    if ((j.header.w & 4) && dot(la, la) > fracture * fracture) {
+    float3 ll = j.lambdaLin.xyz;
+    if ((j.header.w & 4) && dot(la, la) + dot(ll, ll) > fracture * fracture) {
         j.penaltyLin = float4(0);
         j.penaltyAng = float4(0);
         j.lambdaLin = float4(0);
