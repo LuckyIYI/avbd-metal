@@ -710,7 +710,8 @@ kernel void soft_finalize(
     uint sc = atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed);
     sc = min(sc, P.maxSoft);
     atomic_store_explicit(&counters[CTR_SOFT], sc, memory_order_relaxed);
-    dispatchArgs[3] = (P.numJoints + P.numSprings + n + P.numTets + sc + 63) / 64;
+    dispatchArgs[3] = (P.numJoints + P.numSprings + n + P.numTets + sc
+                       + P.numMembranes + P.numBends + 63) / 64;
     dispatchArgs[4] = 1;
     dispatchArgs[5] = 1;
     dispatchArgs[6] = (P.numJoints + P.numSprings + n + sc + 63) / 64;

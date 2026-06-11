@@ -18,7 +18,9 @@ extension Demos {
                              friction: Float = 0.7,
                              structuralK: Float = 5000,
                              hardRods: Bool = true,
-                             shearK: Float = 60, bendK: Float = 8) -> [[Int]] {
+                             shearK: Float = 60, bendK: Float = 8,
+                             membraneMu: Float = 300,
+                             membraneBend: Float = 5e-4) -> [[Int]] {
         // experiment override: AVBD_SOFT_CLOTH forces stiff-spring structure
         let hardRods = hardRods
             && ProcessInfo.processInfo.environment["AVBD_SOFT_CLOTH"] == nil
@@ -48,24 +50,32 @@ extension Demos {
             for j in 0..<nv {
                 if i + 1 < nu { link(grid[i][j], grid[i + 1][j], structuralK, hard: hardRods) }
                 if j + 1 < nv { link(grid[i][j], grid[i][j + 1], structuralK, hard: hardRods) }
-                if i + 1 < nu && j + 1 < nv {
-                    link(grid[i][j], grid[i + 1][j + 1], shearK)
-                    link(grid[i + 1][j], grid[i][j + 1], shearK)
+                // membrane elements replace the crossed-diagonal/2-ring
+                // spring zoo with isotropic StVK shear + quadratic bending
+                if membraneMu <= 0 {
+                    if i + 1 < nu && j + 1 < nv {
+                        link(grid[i][j], grid[i + 1][j + 1], shearK)
+                        link(grid[i + 1][j], grid[i][j + 1], shearK)
+                    }
+                    if i + 2 < nu { link(grid[i][j], grid[i + 2][j], bendK) }
+                    if j + 2 < nv { link(grid[i][j], grid[i][j + 2], bendK) }
                 }
-                if i + 2 < nu { link(grid[i][j], grid[i + 2][j], bendK) }
-                if j + 2 < nv { link(grid[i][j], grid[i][j + 2], bendK) }
             }
         }
         for i in 0..<(nu - 1) {
             for j in 0..<(nv - 1) {
                 let v00 = grid[i][j], v10 = grid[i + 1][j]
                 let v01 = grid[i][j + 1], v11 = grid[i + 1][j + 1]
+                let tri: (Int, Int, Int) -> SceneTri = { a, b, c in
+                    SceneTri(ids: (a, b, c), mu: membraneMu,
+                             lambda: membraneMu, bend: membraneBend)
+                }
                 if (i + j) % 2 == 0 {
-                    s.addTri(SceneTri(ids: (v00, v10, v11)))
-                    s.addTri(SceneTri(ids: (v00, v11, v01)))
+                    s.addTri(tri(v00, v10, v11))
+                    s.addTri(tri(v00, v11, v01))
                 } else {
-                    s.addTri(SceneTri(ids: (v00, v10, v01)))
-                    s.addTri(SceneTri(ids: (v10, v11, v01)))
+                    s.addTri(tri(v00, v10, v01))
+                    s.addTri(tri(v10, v11, v01))
                 }
             }
         }
@@ -219,7 +229,8 @@ extension Demos {
 
     /// Drape quality scene: cloth falls over a sphere; folds should look
     /// like fabric, not crystal facets.
-    public static func drape(res: Int = 28, friction: Float = 0.6) -> PhysicsScene {
+    public static func drape(res: Int = 28, friction: Float = 0.6,
+                             membrane: Bool = true) -> PhysicsScene {
         var s = PhysicsScene(name: "drape")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
@@ -242,7 +253,8 @@ extension Demos {
             positions.append(row)
         }
         addClothGrid(&s, positions: positions, thickness: r,
-                     massPerNode: 0.008, friction: friction)
+                     massPerNode: 0.008, friction: friction,
+                     membraneMu: membrane ? 300 : 0)
         return s
     }
 
@@ -387,7 +399,7 @@ extension Demos {
             positions.append(row)
         }
         addClothGrid(&s, positions: positions, thickness: r,
-                     massPerNode: 0.01, friction: 0.8)
+                     massPerNode: 0.01, friction: 0.8, membraneMu: 300)
 
         _ = s.addBody(size: F3(0.45, 0.45, 0.45), density: 2, friction: 0.7,
                       position: F3(-0.1, 0.1, 2.6))

@@ -189,7 +189,7 @@ public final class GPUSolver {
         adjStart = try makeBuf(nb * 4, "adjStart")
         adjCursor = try makeBuf(nb * 4, "adjCursor")
         adjList = try makeBuf((2 * (numJoints + numSprings + maxPairs) + 4 * numTets
-                               + 4 * maxSoft) * 4, "adjList")
+                               + 4 * maxSoft + 3 * numTris + 4 * maxEdges) * 4, "adjList")
         colorsA = try makeBuf(nb * 4, "colorsA")
         colorsB = try makeBuf(nb * 4, "colorsB")
         bodySlot = try makeBuf(nb * 4, "bodySlot")
@@ -532,6 +532,109 @@ public final class GPUSolver {
             particleIdxBuf.contents().bindMemory(to: UInt32.self, capacity: particles.count)
                 .update(from: particles, count: particles.count)
         }
+        // ---- Membrane + bending elements (tris with material) ----
+        var mems: [MembraneGPU] = []
+        var bendEls: [BendGPU] = []
+        var edgeTris: [UInt64: [(Int, Int, Float)]] = [:]   // edge -> (tri, oppVert, bendK)
+        for t in scene.tris where t.mu > 0 {
+            let (i0, i1, i2) = t.ids
+            let x0 = scene.bodies[i0].position
+            let x1 = scene.bodies[i1].position
+            let x2 = scene.bodies[i2].position
+            let d1 = x1 - x0, d2 = x2 - x0
+            let nrm = cross(d1, d2)
+            let area = length(nrm) / 2
+            guard area > 1e-10 else { continue }
+            let e1 = normalize(d1)
+            let e2 = normalize(cross(normalize(nrm), e1))
+            // rest 2x2 (columns d1, d2 in the local frame) and its inverse
+            let a = dot(d1, e1), b = dot(d1, e2)
+            let c = dot(d2, e1), dd = dot(d2, e2)
+            let det = a * dd - b * c
+            guard abs(det) > 1e-12 else { continue }
+            // inverse, stored column-major (ia, ib, ic, id):
+            // F col1 = d0*ia + d1*ib, col2 = d0*ic + d1*id
+            let ia = dd / det, ib = -b / det
+            let ic = -c / det, id = a / det
+            var m = MembraneGPU()
+            m.ids = SIMD4(UInt32(i0), UInt32(i1), UInt32(i2), 0)
+            m.dm = SIMD4(ia, ib, ic, id)
+            m.mat = SIMD4(t.mu * area, t.lambda * area, area, 0)
+            mems.append(m)
+            if t.bend > 0 {
+                for (u, v, opp) in [(i0, i1, i2), (i1, i2, i0), (i0, i2, i1)] {
+                    let key = UInt64(min(u, v)) << 32 | UInt64(max(u, v))
+                    edgeTris[key, default: []].append((mems.count - 1, opp, t.bend))
+                }
+            }
+        }
+        // hinges: numeric rank-1 K from the INTRINSIC (unfolded) rest shape;
+        // null space of {constants, in-plane positions}, scaled to the
+        // cotangent convention (flap coefficient = sum of its triangle's
+        // edge-adjacent cotangents)
+        for (key, list) in edgeTris where list.count == 2 {
+            let v0 = Int(key >> 32), v1 = Int(key & 0xFFFFFFFF)
+            let (_, opp2, k1) = list[0]
+            let (_, opp3, k2) = list[1]
+            let p0 = scene.bodies[v0].position
+            let p1 = scene.bodies[v1].position
+            let L = distance(p0, p1)
+            guard L > 1e-9 else { continue }
+            // unfold both flaps into the plane from rest edge lengths
+            func unfold(_ opp: Int, side: Float) -> SIMD2<Float>? {
+                let l0 = distance(scene.bodies[opp].position, p0)
+                let l1 = distance(scene.bodies[opp].position, p1)
+                let ax = (L * L + l0 * l0 - l1 * l1) / (2 * L)
+                let h2 = l0 * l0 - ax * ax
+                guard h2 > 1e-12 else { return nil }
+                return SIMD2(ax, side * h2.squareRoot())
+            }
+            guard let q2 = unfold(opp2, side: 1), let q3 = unfold(opp3, side: -1)
+            else { continue }
+            let q0 = SIMD2<Float>(0, 0), q1 = SIMD2<Float>(L, 0)
+            // K = null space of rows {1,1,1,1}, {x...}, {y...} (generalized
+            // 4D cross product via 3x3 minors)
+            let r1 = SIMD4<Float>(1, 1, 1, 1)
+            let r2 = SIMD4<Float>(q0.x, q1.x, q2.x, q3.x)
+            let r3 = SIMD4<Float>(q0.y, q1.y, q2.y, q3.y)
+            func minor(_ c0: Int, _ c1: Int, _ c2: Int) -> Float {
+                let m = simd_float3x3(
+                    SIMD3(r1[c0], r2[c0], r3[c0]),
+                    SIMD3(r1[c1], r2[c1], r3[c1]),
+                    SIMD3(r1[c2], r2[c2], r3[c2]))
+                return m.determinant
+            }
+            var K = SIMD4<Float>(minor(1, 2, 3), -minor(0, 2, 3),
+                                 minor(0, 1, 3), -minor(0, 1, 2))
+            // scale: flap-2 coefficient = cot(angle at q0 in T1) + cot(at q1)
+            func cot(_ apex: SIMD2<Float>, _ a: SIMD2<Float>, _ b: SIMD2<Float>) -> Float {
+                let u = a - apex, v = b - apex
+                let cr = u.x * v.y - u.y * v.x
+                return abs(cr) > 1e-12 ? (u.x * v.x + u.y * v.y) / abs(cr) : 0
+            }
+            let want = cot(q0, q1, q2) + cot(q1, q0, q2)
+            guard abs(K.z) > 1e-12 else { continue }
+            K *= want / K.z
+            let a1 = abs((q1.x - q0.x) * q2.y) / 2     // unfolded areas
+            let a2 = abs((q1.x - q0.x) * q3.y) / 2
+            var bd = BendGPU()
+            bd.ids = SIMD4(UInt32(v0), UInt32(v1), UInt32(opp2), UInt32(opp3))
+            bd.K = K
+            bd.mat = SIMD4(3 * (k1 + k2) / 2 / max(a1 + a2, 1e-9), 0, 0, 0)
+            bendEls.append(bd)
+        }
+        if !mems.isEmpty {
+            membranes.contents().bindMemory(to: MembraneGPU.self, capacity: mems.count)
+                .update(from: mems, count: mems.count)
+        }
+        if !bendEls.isEmpty {
+            precondition(bendEls.count <= bends.length / MemoryLayout<BendGPU>.stride)
+            bends.contents().bindMemory(to: BendGPU.self, capacity: bendEls.count)
+                .update(from: bendEls, count: bendEls.count)
+        }
+        params.numMembranes = UInt32(mems.count)
+        params.numBends = UInt32(bendEls.count)
+
         // element grid cell size: 2x max element radius with stretch headroom
         params.elemCellSize = max(0.2, 2 * maxElemR * 1.5)
         params.elemHashSize = UInt32(elemHashSize)
@@ -1208,6 +1311,8 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
             e.setBuffer(self.tets, offset: 0, index: 7)
             e.setBuffer(self.softContacts, offset: 0, index: 8)
+            e.setBuffer(self.membranes, offset: 0, index: 9)
+            e.setBuffer(self.bends, offset: 0, index: 10)
         }
         encodeScan(enc, input: degrees, output: adjStart, count: numBodies)
         dispatch1D(enc, "adj_copy_cursor", numBodies) { e in
@@ -1226,6 +1331,8 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
             e.setBuffer(self.tets, offset: 0, index: 8)
             e.setBuffer(self.softContacts, offset: 0, index: 9)
+            e.setBuffer(self.membranes, offset: 0, index: 10)
+            e.setBuffer(self.bends, offset: 0, index: 11)
         }
 
         stage("coloring")
@@ -1249,6 +1356,8 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 10)
                 e.setBuffer(self.tets, offset: 0, index: 11)
                 e.setBuffer(self.softContacts, offset: 0, index: 12)
+                e.setBuffer(self.membranes, offset: 0, index: 13)
+                e.setBuffer(self.bends, offset: 0, index: 14)
             }
             swap(&src, &dst)
         }
@@ -1306,6 +1415,8 @@ public final class GPUSolver {
             enc.setBuffer(shape, offset: 0, index: 17)
             enc.setBuffer(tets, offset: 0, index: 18)
             enc.setBuffer(softContacts, offset: 0, index: 19)
+            enc.setBuffer(membranes, offset: 0, index: 20)
+            enc.setBuffer(bends, offset: 0, index: 21)
             let w = persistPSO.threadExecutionWidth
             let tg = min(persistPSO.maxTotalThreadsPerThreadgroup,
                          ((max(numBodies, 64) + w - 1) / w) * w)
@@ -1341,6 +1452,8 @@ public final class GPUSolver {
                 enc.setBuffer(shape, offset: 0, index: 17)
                 enc.setBuffer(tets, offset: 0, index: 18)
                 enc.setBuffer(softContacts, offset: 0, index: 19)
+                enc.setBuffer(membranes, offset: 0, index: 20)
+                enc.setBuffer(bends, offset: 0, index: 21)
             }
             _ = it
             for c in 0..<colorBound {

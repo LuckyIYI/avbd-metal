@@ -33,13 +33,34 @@ kernel void adj_count(
     constant SimParams& P           [[buffer(6)]],
     device const TetGPU* tets       [[buffer(7)]],
     device const SoftContactGPU* soft [[buffer(8)]],
+    device const MembraneGPU* membranes [[buffer(9)]],
+    device const BendGPU* bends     [[buffer(10)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
     uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
                        P.maxSoft);
-    uint total = P.numJoints + P.numSprings + numPairs + P.numTets + numSoft;
+    uint base = P.numJoints + P.numSprings + numPairs + P.numTets + numSoft;
+    uint total = base + P.numMembranes + P.numBends;
     if (gid >= total) return;
+    if (gid >= base) {
+        // membrane (3 slots) or bend (4 slots): degree per participant
+        uint mi = gid - base;
+        if (mi < P.numMembranes) {
+            uint4 ids = membranes[mi].ids;
+            for (uint k = 0; k < 3; k++) {
+                if (bodyDynamic(posLin, ids[k]))
+                    atomic_fetch_add_explicit(&degrees[ids[k]], 1u, memory_order_relaxed);
+            }
+        } else {
+            uint4 ids = bends[mi - P.numMembranes].ids;
+            for (uint k = 0; k < 4; k++) {
+                if (bodyDynamic(posLin, ids[k]))
+                    atomic_fetch_add_explicit(&degrees[ids[k]], 1u, memory_order_relaxed);
+            }
+        }
+        return;
+    }
 
     uint a = WORLD_BODY, b = WORLD_BODY;
     if (gid < P.numJoints) {
@@ -102,13 +123,40 @@ kernel void adj_scatter(
     constant SimParams& P           [[buffer(7)]],
     device const TetGPU* tets       [[buffer(8)]],
     device const SoftContactGPU* soft [[buffer(9)]],
+    device const MembraneGPU* membranes [[buffer(10)]],
+    device const BendGPU* bends     [[buffer(11)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
     uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
                        P.maxSoft);
-    uint total = P.numJoints + P.numSprings + numPairs + P.numTets + numSoft;
+    uint base = P.numJoints + P.numSprings + numPairs + P.numTets + numSoft;
+    uint total = base + P.numMembranes + P.numBends;
     if (gid >= total) return;
+    if (gid >= base) {
+        uint mi = gid - base;
+        if (mi < P.numMembranes) {
+            uint4 ids = membranes[mi].ids;
+            uint entry = (FK_MEMBRANE << ADJ_KIND_SHIFT) | mi;
+            for (uint k = 0; k < 3; k++) {
+                if (bodyDynamic(posLin, ids[k])) {
+                    uint slot = atomic_fetch_add_explicit(&cursor[ids[k]], 1u, memory_order_relaxed);
+                    adjList[slot] = entry;
+                }
+            }
+        } else {
+            uint bi = mi - P.numMembranes;
+            uint4 ids = bends[bi].ids;
+            uint entry = (FK_BEND << ADJ_KIND_SHIFT) | bi;
+            for (uint k = 0; k < 4; k++) {
+                if (bodyDynamic(posLin, ids[k])) {
+                    uint slot = atomic_fetch_add_explicit(&cursor[ids[k]], 1u, memory_order_relaxed);
+                    adjList[slot] = entry;
+                }
+            }
+        }
+        return;
+    }
 
     uint a = WORLD_BODY, b = WORLD_BODY;
     uint entry = 0;
@@ -188,6 +236,8 @@ inline void neighborColors(device const JointGPU* joints,
                            device const ManifoldGPU* manifolds,
                            device const TetGPU* tets,
                            device const SoftContactGPU* soft,
+                           device const MembraneGPU* membranes,
+                           device const BendGPU* bends,
                            device const float4* posLin,
                            device const uint* colorsIn,
                            uint entry, uint self, uint myColor,
@@ -207,6 +257,16 @@ inline void neighborColors(device const JointGPU* joints,
         uint4 ids = soft[idx].ids;
         for (uint k = 0; k < 4; k++) {
             if (ids[k] != self && ids[k] != WORLD_BODY && n < 3) { nbs[n++] = ids[k]; }
+        }
+    } else if (kind == FK_MEMBRANE) {
+        uint4 ids = membranes[idx].ids;
+        for (uint k = 0; k < 3; k++) {
+            if (ids[k] != self && n < 3) { nbs[n++] = ids[k]; }
+        }
+    } else if (kind == FK_BEND) {
+        uint4 ids = bends[idx].ids;
+        for (uint k = 0; k < 4; k++) {
+            if (ids[k] != self && n < 3) { nbs[n++] = ids[k]; }
         }
     } else {
         nbs[0] = otherBody(joints, springs, manifolds, entry, self);
@@ -240,6 +300,8 @@ kernel void color_iterate(
     constant SimParams& P           [[buffer(10)]],
     device const TetGPU* tets       [[buffer(11)]],
     device const SoftContactGPU* soft [[buffer(12)]],
+    device const MembraneGPU* membranes [[buffer(13)]],
+    device const BendGPU* bends     [[buffer(14)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -252,7 +314,8 @@ kernel void color_iterate(
 
     uint s = adjStart[gid], e = s + adjCount[gid];
     for (uint k = s; k < e; k++) {
-        neighborColors(joints, springs, manifolds, tets, soft, posLin, colorsIn,
+        neighborColors(joints, springs, manifolds, tets, soft, membranes, bends,
+                       posLin, colorsIn,
                        adjList[k], gid, myColor,
                        maskLo, maskHi, allLo, allHi, conflict);
     }
@@ -968,6 +1031,8 @@ static inline void primal_one(
     device const float4* shape,
     device const TetGPU* tets,
     device const SoftContactGPU* soft,
+    device const MembraneGPU* membranes,
+    device const BendGPU* bends,
     uint body)
 {
 
@@ -996,6 +1061,10 @@ static inline void primal_one(
             stampTet(tets[idx], body, posLin, acc);
         } else if (kind == FK_SOFT) {
             stampSoft(soft[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
+        } else if (kind == FK_MEMBRANE) {
+            stampMembrane(membranes[idx], body, posLin, acc);
+        } else if (kind == FK_BEND) {
+            stampBend(bends[idx], body, posLin, acc);
         } else {
             stampManifold(manifolds[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
         }
@@ -1065,6 +1134,8 @@ kernel void primal_solve(
     device const float4* shape      [[buffer(17)]],
     device const TetGPU* tets       [[buffer(18)]],
     device const SoftContactGPU* soft [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorIndex];
@@ -1072,7 +1143,7 @@ kernel void primal_solve(
     if (s + tid >= e) return;
     primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
                joints, springs, manifolds, adjStart, adjCount, adjList,
-               P, shape, tets, soft, colorList[s + tid]);
+               P, shape, tets, soft, membranes, bends, colorList[s + tid]);
 }
 
 // Tail pass: primal-update every body whose color is >= the CPU-encoded
@@ -1102,6 +1173,8 @@ kernel void primal_tail(
     device const float4* shape      [[buffer(17)]],
     device const TetGPU* tets       [[buffer(18)]],
     device const SoftContactGPU* soft [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorBound];
@@ -1109,7 +1182,7 @@ kernel void primal_tail(
     if (s + tid >= e) return;
     primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
                joints, springs, manifolds, adjStart, adjCount, adjList,
-               P, shape, tets, soft, colorList[s + tid]);
+               P, shape, tets, soft, membranes, bends, colorList[s + tid]);
 }
 
 // Dual update for one element contact: bounded normal dual (cap scaled to
@@ -1364,6 +1437,8 @@ kernel void solve_persistent(
     device const float4* shape      [[buffer(17)]],
     device const TetGPU* tets       [[buffer(18)]],
     device SoftContactGPU* soft     [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
     uint tid                        [[thread_position_in_threadgroup]],
     uint tgSize                     [[threads_per_threadgroup]])
 {
@@ -1380,7 +1455,7 @@ kernel void solve_persistent(
                 primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
                            props, joints, springs, manifolds,
                            adjStart, adjCount, adjList, P, shape, tets, soft,
-                           colorList[i]);
+                           membranes, bends, colorList[i]);
             }
             threadgroup_barrier(mem_flags::mem_device);
         }

@@ -7,7 +7,7 @@ public enum Demos {
         ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
          "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "cloth", "softbody", "android",
-         "clothfold", "boxoncloth", "hammock", "drape", "clothcombo",
+         "clothfold", "boxoncloth", "hammock", "drape", "drapem", "clothcombo",
          "flagwhip", "eecross"]
     }
 
@@ -44,6 +44,7 @@ public enum Demos {
         case "hammock": return hammock(res: res ?? (16 + 4 * s))
         case "drape": return drape(res: res ?? (22 + 6 * s))
         case "drape0": return drape(res: res ?? (22 + 6 * s), friction: 0)
+        case "drapem": return drape(res: res ?? (22 + 6 * s), membrane: true)
         case "clothcombo": return clothcombo(res: res ?? (16 + 4 * s))
         case "flagwhip": return flagwhip(res: res ?? (14 + 2 * s))
         case "eecross": return eecross().0

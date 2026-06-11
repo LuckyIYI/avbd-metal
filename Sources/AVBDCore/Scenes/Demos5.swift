@@ -29,18 +29,22 @@ extension Demos {
             }
             grid.append(row)
         }
-        // collision surface: one triangle pair per quad, alternating the
-        // diagonal so the mesh carries no preferred direction
+        // collision surface AND material: one StVK membrane pair per quad
+        // (alternating diagonal — no preferred direction), with quadratic
+        // bending across shared edges. Replaces the shear/bend spring zoo.
         for i in 0..<(nu - 1) {
             for j in 0..<(nv - 1) {
                 let v00 = grid[i][j], v10 = grid[i + 1][j]
                 let v01 = grid[i][j + 1], v11 = grid[i + 1][j + 1]
+                let tri: (Int, Int, Int) -> SceneTri = {
+                    SceneTri(ids: ($0, $1, $2), mu: 300, lambda: 300, bend: 5e-4)
+                }
                 if (i + j) % 2 == 0 {
-                    s.addTri(SceneTri(ids: (v00, v10, v11)))
-                    s.addTri(SceneTri(ids: (v00, v11, v01)))
+                    s.addTri(tri(v00, v10, v11))
+                    s.addTri(tri(v00, v11, v01))
                 } else {
-                    s.addTri(SceneTri(ids: (v00, v10, v01)))
-                    s.addTri(SceneTri(ids: (v10, v11, v01)))
+                    s.addTri(tri(v00, v10, v01))
+                    s.addTri(tri(v10, v11, v01))
                 }
             }
         }
@@ -62,16 +66,11 @@ extension Demos {
             s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
                                   stiffnessLin: 0, stiffnessAng: 0))
         }
+        _ = soft     // membrane elements carry shear + bending now
         for i in 0..<nu {
             for j in 0..<nv {
                 if i + 1 < nu { rod(grid[i][j], grid[i + 1][j]) }
                 if j + 1 < nv { rod(grid[i][j], grid[i][j + 1]) }
-                if i + 1 < nu && j + 1 < nv {
-                    soft(grid[i][j], grid[i + 1][j + 1], 60)
-                    soft(grid[i + 1][j], grid[i][j + 1], 60)
-                }
-                if i + 2 < nu { soft(grid[i][j], grid[i + 2][j], 8) }
-                if j + 2 < nv { soft(grid[i][j], grid[i][j + 2], 8) }
             }
         }
         return grid
