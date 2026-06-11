@@ -584,9 +584,14 @@ public final class GPUSolver {
         params.lambdaMax = settings.lambdaMax
         params.iterations = UInt32(settings.iterations)
         params.rodDecayPow = settings.rodDecayPow
+        params.particleDamping = settings.particleDamping
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
            let v = Float(env) {
             params.rodDecayPow = v
+        }
+        if let env = ProcessInfo.processInfo.environment["AVBD_PDAMP"],
+           let v = Float(env) {
+            params.particleDamping = v
         }
     }
 
@@ -779,8 +784,9 @@ public final class GPUSolver {
     /// - minGap: worst vertex-to-triangle-surface clearance among
     ///   non-topologically-adjacent pairs. 0 = surfaces touching; values
     ///   below -(rv+rt) mean a vertex CENTER crossed the midsurface.
-    /// - maxStretch: worst stiff-spring strain |len/rest - 1| (stiffness >=
-    ///   1000 selects structural edges; shear/bend sets are soft by design).
+    /// - maxStretch: worst stiff-spring EXTENSION max(len/rest - 1, 0)
+    ///   (stiffness >= 1000 or hard selects structural edges). Compression
+    ///   is buckling — folds — and intentionally free for tension-only rods.
     public func debugClothMetrics() -> (minGap: Float, maxStretch: Float) {
         sync()
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -854,10 +860,11 @@ public final class GPUSolver {
             let wb = F3(pl[b].x, pl[b].y, pl[b].z) + qb.act(F3(s.rB.x, s.rB.y, s.rB.z))
             let rest = s.rB.w
             if rest > 1e-6 {
-                let st = abs(distance(wa, wb) / rest - 1)
+                let st = max(distance(wa, wb) / rest - 1, 0)
                 if st > maxStretch {
                     maxStretch = st
                     lastWorstSpring = (a, b)
+                    lastWorstSpringIdx = i
                 }
             }
         }
@@ -866,6 +873,14 @@ public final class GPUSolver {
 
     /// Endpoints of the worst stiff spring from the last debugClothMetrics call.
     public private(set) var lastWorstSpring: (Int, Int) = (-1, -1)
+    public private(set) var lastWorstSpringIdx: Int = -1
+
+    /// Dual state of a spring/rod: (lambda, penalty, C0, rest).
+    public func debugSpringDual(_ i: Int) -> (Float, Float, Float, Float) {
+        sync()
+        let sp = springs.contents().bindMemory(to: SpringGPU.self, capacity: max(1, numSprings))
+        return (sp[i].dual.x, sp[i].dual.y, sp[i].dual.z, sp[i].rB.w)
+    }
 
     /// Count live soft contacts by kind (VT, RT, EE) — CPU read.
     public func debugSoftKinds() -> (vt: Int, rt: Int, ee: Int) {
@@ -1372,9 +1387,37 @@ public final class GPUSolver {
             e.setBuffer(self.velAng, offset: 0, index: 5)
             e.setBuffer(self.prevVelLin, offset: 0, index: 6)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
+            e.setBuffer(self.shape, offset: 0, index: 8)
         }
-
         enc.endEncoding()
+        var visc = settings.clothViscosity
+        if let env = ProcessInfo.processInfo.environment["AVBD_VISC"],
+           let v = Float(env) { visc = v }
+        if numTris > 0 && visc > 0 {
+            // scratch copy for the gather (inertLin is dead after the solve
+            // and rewritten by next frame's warmstart)
+            if let blit = cmd1.makeBlitCommandEncoder() {
+                blit.copy(from: velLin, sourceOffset: 0,
+                          to: inertLin, destinationOffset: 0, size: numBodies * 16)
+                blit.endEncoding()
+            }
+            if let e2 = cmd1.makeComputeCommandEncoder() {
+                let p = ps("smooth_particle_velocities")
+                e2.setComputePipelineState(p)
+                e2.setBuffer(velLin, offset: 0, index: 0)
+                e2.setBuffer(inertLin, offset: 0, index: 1)
+                e2.setBuffer(particleIdxBuf, offset: 0, index: 2)
+                e2.setBuffer(nbrStart, offset: 0, index: 3)
+                e2.setBuffer(nbrCount, offset: 0, index: 4)
+                e2.setBuffer(nbrList, offset: 0, index: 5)
+                e2.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
+                e2.setBytes(&visc, length: 4, index: 7)
+                e2.dispatchThreadgroups(MTLSize(width: (max(1, numParticles) + 63) / 64,
+                                                height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                e2.endEncoding()
+            }
+        }
         // canonicalize colors on the GPU (was a CPU memcpy needing a sync)
         if finalColors !== colorsA, let blit = cmd1.makeBlitCommandEncoder() {
             blit.copy(from: finalColors, sourceOffset: 0,

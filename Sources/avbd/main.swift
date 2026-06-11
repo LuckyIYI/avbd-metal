@@ -247,6 +247,11 @@ case "clothgate":
         let p1 = solver.bodyPosition(wa), p2 = solver.bodyPosition(wb)
         print(String(format: "worst spring %d-%d  (%.2f,%.2f,%.2f) - (%.2f,%.2f,%.2f)",
                      wa, wb, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z))
+        if solver.lastWorstSpringIdx >= 0 {
+            let (lam, pen, c0, rest) = solver.debugSpringDual(solver.lastWorstSpringIdx)
+            print(String(format: "  dual: lambda %.3f  penalty %.1f  C0 %.4f  rest %.4f  len %.4f",
+                         lam, pen, c0, rest, distance(p1, p2)))
+        }
     }
 
 case "collect":

@@ -170,6 +170,15 @@ public struct SimSettings {
     /// Carried lambda re-applied along rotated rod directions pumps the
     /// pendulum modes of swinging sheets.
     public var rodDecayPow: Float = 0
+    /// Per-second velocity damping applied to 3-DOF particles only (air
+    /// drag + internal viscosity of thin sheets). Inextensible cloth has
+    /// no material compliance to bleed energy through; without a touch of
+    /// drag, free skirts and hems flutter forever.
+    public var particleDamping: Float = 0
+    /// Internal sheet viscosity: per-frame blend of each particle velocity
+    /// toward its topological 1-ring average (0..1). Damps relative flutter
+    /// (bending-rate viscosity), preserves bulk motion.
+    public var clothViscosity: Float = 0
 
     public init() {}
 }

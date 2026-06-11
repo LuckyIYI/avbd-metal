@@ -153,6 +153,8 @@ extension Demos {
         var s = PhysicsScene(name: "cloth")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         s.settings.betaAng = 20000     // the pole's elastic bending must ramp
         s.settings.lambdaMax = 500
         addGround(&s, friction: 0.8)

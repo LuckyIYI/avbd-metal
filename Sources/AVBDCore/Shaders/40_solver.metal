@@ -359,8 +359,11 @@ kernel void warmstart_joints(
         float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
         // C0 alpha-shift only for pre-existing STRETCH: rods are tension-
-        // only, slack is not an error to stabilize away
-        sp.dual.z = max(length(pA - pB) - sp.rB.w, 0.0f);      // C0
+        // only, slack is not an error to stabilize away. Halved: full
+        // asymptotic forgiveness legitimizes standing stretch (closure 1%
+        // per frame loses to flutter re-stretching); rods spawn exact, so
+        // there is little pre-existing error to soften in the first place.
+        sp.dual.z = 0.5f * max(length(pA - pB) - sp.rB.w, 0.0f);  // C0
         float warm = P.alpha * P.gamma;
         if (P.rodDecayPow > 0.0f) {
             // The carried dual acted along LAST frame's rod direction; on a
@@ -1429,6 +1432,7 @@ kernel void finalize_velocities(
     device float4* velAng           [[buffer(5)]],
     device float4* prevVelLin       [[buffer(6)]],
     constant SimParams& P           [[buffer(7)]],
+    device const float4* shape      [[buffer(8)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -1438,9 +1442,42 @@ kernel void finalize_velocities(
         // Safety clamp: prevents tunneling of violently flung bodies
         float s2 = dot(v, v);
         if (s2 > P.maxSpeed * P.maxSpeed) v *= P.maxSpeed * rsqrt(s2);
+        // particle drag (thin-sheet air resistance; see SimParams)
+        if (shape[gid].w < 0.0f && P.particleDamping > 0.0f) {
+            v *= 1.0f / (1.0f + P.particleDamping * P.dt);
+        }
         velLin[gid] = float4(v, 0);
         velAng[gid] = float4(q_sub(posAng[gid], initAng[gid]) / P.dt, 0);
     }
+}
+
+// Internal viscosity for thin sheets: blend each particle's velocity toward
+// its topological 1-ring average (the reference cloth ships the same pass).
+// Damps RELATIVE jitter — the dominant dissipation of real fabric is
+// bending-rate viscosity — while bulk translation/rotation pass through.
+// Two-buffer read (prevVelLin holds the unsmoothed copy written below).
+kernel void smooth_particle_velocities(
+    device float4* velLin           [[buffer(0)]],
+    device const float4* velRead    [[buffer(1)]],
+    device const uint* particleIdx  [[buffer(2)]],
+    device const uint* nbrStart     [[buffer(3)]],
+    device const uint* nbrCount     [[buffer(4)]],
+    device const uint* nbrList      [[buffer(5)]],
+    constant SimParams& P           [[buffer(6)]],
+    constant float& weight          [[buffer(7)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= P.numParticles) return;
+    uint v = particleIdx[gid];
+    uint s = nbrStart[v], n = nbrCount[v];
+    if (n == 0) return;
+    float3 avg = float3(0);
+    for (uint k = s; k < s + n; k++) {
+        avg += velRead[nbrList[k]].xyz;
+    }
+    avg /= float(n);
+    float3 vel = velRead[v].xyz;
+    velLin[v] = float4(vel + (avg - vel) * weight, 0);
 }
 
 // ----------------------------------------------------------------------------

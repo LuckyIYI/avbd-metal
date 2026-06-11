@@ -80,6 +80,8 @@ extension Demos {
         var s = PhysicsScene(name: "clothfold")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         addGround(&s, friction: 0.9)
 
         let nu = max(18, res), nv = max(12, res / 2)
@@ -131,6 +133,8 @@ extension Demos {
         var s = PhysicsScene(name: "boxoncloth")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         addGround(&s, friction: 0.8)
 
         // pedestal: static box the cloth drapes over
@@ -172,6 +176,8 @@ extension Demos {
         var s = PhysicsScene(name: "hammock")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         addGround(&s, friction: 0.8)
 
         let nu = max(16, res), nv = max(10, res * 2 / 3)
@@ -217,6 +223,8 @@ extension Demos {
         var s = PhysicsScene(name: "drape")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         addGround(&s, friction: friction)
         _ = s.addSphere(diameter: 1.1, density: 0, friction: friction,
                         position: F3(0, 0, 1.0))
@@ -247,6 +255,8 @@ extension Demos {
         var s = PhysicsScene(name: "flagwhip")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         addGround(&s, friction: 0.6)
 
         let n = max(12, res)
@@ -291,6 +301,8 @@ extension Demos {
         var s = PhysicsScene(name: "eecross")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         addGround(&s, friction: 0.3)
 
         // A sits just above the ground: there is no room to wrap or swing
@@ -352,6 +364,8 @@ extension Demos {
         var s = PhysicsScene(name: "clothcombo")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
         s.settings.lambdaMax = 1.0e6
         addGround(&s, friction: 0.8)
 

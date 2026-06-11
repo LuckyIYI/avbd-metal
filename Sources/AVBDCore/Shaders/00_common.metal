@@ -250,6 +250,9 @@ struct SimParams {
     // Hard-rod lambda decay vs per-frame rod rotation: lambda *= cos(dtheta)^p.
     // 0 = off. Carried duals along rotated directions pump pendulum modes.
     float rodDecayPow;
+    // Per-second velocity damping for 3-DOF particles (air drag + internal
+    // viscosity of thin sheets — the reference cloth ships the same knob).
+    float particleDamping;
 };
 
 struct JointGPU {
