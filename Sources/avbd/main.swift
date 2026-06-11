@@ -143,7 +143,29 @@ case "run":
 case "collect":
     let o = parseOptions(Array(args.dropFirst(1)))
     try PushTPipeline.collect(envs: o.envs, steps: o.frames,
-                              path: "runs/pusht/data")
+                              path: "runs/pusht/data", bc: args.contains("--bc"))
+
+case "train-bc":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.trainBC(dataPath: "runs/pusht/data", iters: o.frames,
+                              batch: o.batch, latent: o.latent, lr: o.lr,
+                              modelPath: "runs/pusht/model")
+
+case "train-lawm":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try LatentActionPipeline.train(dataPath: "runs/pusht/data", iters: o.frames,
+                                   batch: o.batch, latent: o.latent, lr: o.lr,
+                                   modelPath: "runs/pusht/model")
+
+case "solve-lawm":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try LatentActionPipeline.solve(modelPath: "runs/pusht/model",
+                                   episodes: o.episodes, latent: o.latent)
+
+case "solve-bc":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.solveBC(modelPath: "runs/pusht/model",
+                              episodes: o.episodes, latent: o.latent)
 
 case "train-wm":
     let o = parseOptions(Array(args.dropFirst(1)))

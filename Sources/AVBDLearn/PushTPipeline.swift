@@ -79,7 +79,8 @@ public enum PushTPipeline {
     /// Random smooth waypoint policy across parallel envs. Saves
     /// (obs, action, next-obs implicit by sequence) as raw binary.
     public static func collect(envs numEnvs: Int, steps: Int,
-                               path: String, seed: UInt64 = 1) throws {
+                               path: String, seed: UInt64 = 1,
+                               bc: Bool = false) throws {
         let env = try PushTEnv(numEnvs: numEnvs, seed: seed)
         let res = env.obsRes
         var rng = SplitMix64(seed: seed &+ 99)
@@ -104,7 +105,8 @@ public enum PushTPipeline {
             // of windows unusable after the constancy filter)
             if t % 8 == 0 {
             for e in 0..<numEnvs {
-                let roll = rng.nextFloat()
+                var roll = rng.nextFloat()
+                if bc { roll = roll < 0.92 ? 0.0 : 0.95 }   // expert + DART noise
                 if roll < 0.50 {
                     targets[e] = env.oracleAction(e)
                 } else if roll < 0.70 {
@@ -603,5 +605,122 @@ extension PushTPipeline {
             let d = sqrt(mean((zr - zTrue).square())).item(Float.self)
             print(String(format: "  h=%d  rel.err %.3f", h + 1, d / refD))
         }
+    }
+}
+
+// MARK: - Behavior cloning (pixels -> action, oracle demonstrations)
+
+/// Goal-conditioned visuomotor policy: the LeWM encoder architecture with an
+/// action head. Pixels in, action out — no privileged state at inference.
+public final class BCPolicy: Module {
+    @ModuleInfo public var encoder: LeWMEncoder
+    @ModuleInfo var h1: Linear
+    @ModuleInfo var h2: Linear
+
+    public init(latent: Int = 192) {
+        encoder = LeWMEncoder(latent: latent, inChannels: 6)
+        h1 = Linear(latent, 256)
+        h2 = Linear(256, 2)
+    }
+
+    public func callAsFunction(_ obs: MLXArray) -> MLXArray {
+        tanh(h2(gelu(h1(encoder(obs)))))
+    }
+}
+
+extension PushTPipeline {
+    /// Train the BC policy on macro-boundary (stacked obs, expert action)
+    /// pairs from a --bc collection.
+    public static func trainBC(dataPath: String, iters: Int, batch: Int = 256,
+                               latent: Int = 192, lr: Float = 3e-4,
+                               modelPath: String) throws {
+        let meta = try String(contentsOfFile: "\(dataPath)/meta.txt", encoding: .utf8)
+            .split(separator: " ").map { Int($0)! }
+        let (numEnvs, steps, res) = (meta[0], meta[1], meta[2])
+        let obsRaw = try Data(contentsOf: URL(fileURLWithPath: "\(dataPath)/obs.bin"))
+        let actRaw = try Data(contentsOf: URL(fileURLWithPath: "\(dataPath)/act.bin"))
+        let frameBytes = res * res * 3
+
+        // macro decision points: t % 8 == 0, t >= 8 (need the prev frame)
+        var points: [(Int, Int)] = []
+        for e in 0..<numEnvs {
+            for t in stride(from: 8, to: steps, by: 8) { points.append((e, t)) }
+        }
+        print("BC dataset: \(points.count) macro decisions")
+
+        let policy = BCPolicy(latent: latent)
+        let opt = AdamW(learningRate: lr)
+        func minibatch() -> (MLXArray, MLXArray) {
+            var frames = [UInt8](); var acts = [Float]()
+            for _ in 0..<batch {
+                let (e, t) = points[Int.random(in: 0..<points.count)]
+                let offPrev = ((t - 1) * numEnvs + e) * frameBytes
+                frames.append(contentsOf: obsRaw[offPrev..<(offPrev + frameBytes)])
+                let off = (t * numEnvs + e) * frameBytes
+                frames.append(contentsOf: obsRaw[off..<(off + frameBytes)])
+                let aOff = (t * numEnvs + e) * 8
+                actRaw.withUnsafeBytes { raw in
+                    let f = raw.baseAddress!.advanced(by: aOff).assumingMemoryBound(to: Float.self)
+                    acts.append(f[0]); acts.append(f[1])
+                }
+            }
+            let o = MLXArray(frames).reshaped([batch, 2, res, res, 3]).asType(.float32) / 255.0
+            let stacked = concatenated([o[0..., 0, 0..., 0..., 0...],
+                                        o[0..., 1, 0..., 0..., 0...]], axis: 3)
+            return (stacked, MLXArray(acts).reshaped([batch, 2]))
+        }
+        let lossAndGrad = valueAndGrad(model: policy) {
+            (m: BCPolicy, args: [MLXArray]) -> [MLXArray] in
+            [mean((m(args[0]) - args[1]).square())]
+        }
+        for it in 0..<iters {
+            let (o, a) = minibatch()
+            let (loss, grads) = lossAndGrad(policy, [o, a])
+            opt.update(model: policy, gradients: grads)
+            eval(policy, opt)
+            if it % 100 == 0 {
+                print(String(format: "bc iter %5d  loss %.5f", it, loss[0].item(Float.self)))
+            }
+        }
+        try FileManager.default.createDirectory(atPath: modelPath, withIntermediateDirectories: true)
+        let flat = Dictionary(uniqueKeysWithValues:
+            policy.parameters().flattened().map { ($0.0, $0.1) })
+        try save(arrays: flat, url: URL(fileURLWithPath: "\(modelPath)/bc.safetensors"))
+        print("policy saved -> \(modelPath)/bc.safetensors")
+    }
+
+    /// Evaluate the BC policy: pixels in, action out, macro cadence.
+    public static func solveBC(modelPath: String, episodes: Int,
+                               seed: UInt64 = 11, latent: Int = 192) throws {
+        let policy = BCPolicy(latent: latent)
+        let weights = try loadArrays(url: URL(fileURLWithPath: "\(modelPath)/bc.safetensors"))
+        try policy.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(policy)
+
+        var successes = 0
+        for ep in 0..<episodes {
+            let env = try PushTEnv(numEnvs: 1, seed: seed &+ UInt64(ep) * 7)
+            let res = env.obsRes
+            var prevFrame = obsArray(env, res)
+            // settle one macro step so the stack is honest
+            env.step(actions: [env.tipPos(0)], substeps: 4)
+            for _ in 0..<60 {
+                let cur = obsArray(env, res)
+                let a = policy(concatenated([prevFrame, cur], axis: 3))
+                eval(a)
+                let act = SIMD2(a[0, 0].item(Float.self) * 3, a[0, 1].item(Float.self) * 3)
+                for k in 0..<8 {
+                    if k == 7 { prevFrame = obsArray(env, res) }
+                    env.step(actions: [act])
+                    if env.success(0) { break }
+                }
+                if env.success(0) { break }
+            }
+            let ok = env.success(0)
+            successes += ok ? 1 : 0
+            let (bp, _) = env.blockPose(0)
+            print("bc episode \(ep): \(ok ? "SUCCESS" : "fail") block (\(String(format: "%.2f", bp.x)), \(String(format: "%.2f", bp.y)))")
+        }
+        print("BC success rate: \(successes)/\(episodes)")
     }
 }
