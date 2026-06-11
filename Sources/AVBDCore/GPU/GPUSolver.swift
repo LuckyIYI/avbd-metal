@@ -27,6 +27,13 @@ public final class GPUSolver {
     let maxPairs: Int
     let mapCapacity: Int
     let gridHashSize: Int
+    // Cloth elements
+    let numTris: Int
+    var numEdges: Int = 0
+    var numParticles: Int = 0
+    let maxSoft: Int
+    let softMapCapacity: Int
+    let elemHashSize: Int
 
     var params = SimParamsGPU()
 
@@ -56,6 +63,15 @@ public final class GPUSolver {
     // Persistence map
     var mapKeyA, mapKeyB, mapVal: MTLBuffer
 
+    // Cloth elements: triangles/edges, topology CSR, element grid, soft
+    // contacts (double-buffered) + their persistence map
+    var trisBuf, edgesBuf, particleIdxBuf: MTLBuffer
+    var nbrStart, nbrCount, nbrList: MTLBuffer
+    var elemCellCount, elemCellStart, elemCells, elemSlot: MTLBuffer
+    var softContacts, prevSoftContacts: MTLBuffer
+    var softMapKeyA, softMapKeyB, softMapVal: MTLBuffer
+    var membranes, bends: MTLBuffer
+
     // Adjacency + coloring
     var degrees, adjStart, adjCursor, adjList: MTLBuffer
     var colorsA, colorsB, bodySlot, colorStart, colorList: MTLBuffer
@@ -75,6 +91,7 @@ public final class GPUSolver {
     // Cached per-frame color counts (read back once per step)
     public private(set) var lastColorCounts: [Int] = []
     public private(set) var lastNumPairs: Int = 0
+    public private(set) var lastNumSoft: Int = 0
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
@@ -96,6 +113,14 @@ public final class GPUSolver {
         self.maxPairs = max(64, scene.bodies.count * maxPairsPerBody)
         self.mapCapacity = Self.nextPow2(2 * maxPairs)
         self.gridHashSize = Self.nextPow2(max(64, 2 * numBodies))
+        self.numTris = scene.tris.count
+        // capacity bound: V-T (4/vertex) + rigid-T (4/tri) + E-E (2/edge,
+        // edges <= 3 per tri)
+        let particleEstimate = scene.bodies.lazy.filter { $0.isParticle }.count
+        self.maxSoft = numTris == 0 ? 1
+            : 4 * particleEstimate + 4 * numTris + 6 * numTris + 256
+        self.softMapCapacity = Self.nextPow2(max(64, 2 * maxSoft))
+        self.elemHashSize = Self.nextPow2(max(64, 2 * 4 * numTris))
 
         func makeBuf(_ length: Int, _ label: String) throws -> MTLBuffer {
             guard let b = dev.makeBuffer(length: max(16, length), options: .storageModeShared) else {
@@ -139,10 +164,32 @@ public final class GPUSolver {
         mapKeyB = try makeBuf(mapCapacity * 4, "mapKeyB")
         mapVal = try makeBuf(mapCapacity * 4, "mapVal")
 
+        // Cloth element buffers (edges/neighbors sized after derivation below;
+        // worst case edges = 3 per triangle)
+        let maxEdges = max(1, 3 * numTris)
+        trisBuf = try makeBuf(max(1, numTris) * 16, "tris")
+        edgesBuf = try makeBuf(maxEdges * 8, "edges")
+        particleIdxBuf = try makeBuf(nb * 4, "particleIdx")
+        nbrStart = try makeBuf(nb * 4, "nbrStart")
+        nbrCount = try makeBuf(nb * 4, "nbrCount")
+        nbrList = try makeBuf(max(1, numTris * 6) * 4, "nbrList")
+        elemCellCount = try makeBuf(elemHashSize * 4, "elemCellCount")
+        elemCellStart = try makeBuf(elemHashSize * 4, "elemCellStart")
+        elemCells = try makeBuf((numTris + maxEdges + 1) * 4, "elemCells")
+        elemSlot = try makeBuf((numTris + maxEdges + 1) * 8, "elemSlot")
+        softContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "softContacts")
+        prevSoftContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "prevSoftContacts")
+        softMapKeyA = try makeBuf(softMapCapacity * 4, "softMapKeyA")
+        softMapKeyB = try makeBuf(softMapCapacity * 4, "softMapKeyB")
+        softMapVal = try makeBuf(softMapCapacity * 4, "softMapVal")
+        membranes = try makeBuf(max(1, numTris) * MemoryLayout<MembraneGPU>.stride, "membranes")
+        bends = try makeBuf(max(1, maxEdges) * MemoryLayout<BendGPU>.stride, "bends")
+
         degrees = try makeBuf(nb * 4, "degrees")
         adjStart = try makeBuf(nb * 4, "adjStart")
         adjCursor = try makeBuf(nb * 4, "adjCursor")
-        adjList = try makeBuf((2 * (numJoints + numSprings + maxPairs) + 4 * numTets) * 4, "adjList")
+        adjList = try makeBuf((2 * (numJoints + numSprings + maxPairs) + 4 * numTets
+                               + 4 * maxSoft) * 4, "adjList")
         colorsA = try makeBuf(nb * 4, "colorsA")
         colorsB = try makeBuf(nb * 4, "colorsB")
         bodySlot = try makeBuf(nb * 4, "bodySlot")
@@ -153,7 +200,7 @@ public final class GPUSolver {
         counters = try makeBuf(GPUCounters.total * 4, "counters")
         dispatchArgs = try makeBuf(9 * 4, "dispatchArgs")
         colorArgs = try makeBuf(AVBD_MAX_COLORS * 3 * 4, "colorArgs")
-        let maxScanCount = max(gridHashSize, nb)
+        let maxScanCount = max(max(gridHashSize, elemHashSize), nb)
         scanBlockSums = try makeBuf(((maxScanCount + 1023) / 1024 + 1) * 4, "scanBlockSums")
         scanTotal = try makeBuf(4, "scanTotal")
         diag = try makeBuf(4, "diag")
@@ -425,11 +472,83 @@ public final class GPUSolver {
         }
         numExclusions = UInt32(sortedExcl.count)
 
+        // ---- Cloth element topology ----
+        // Triangles, unique edges, per-vertex topological neighborhoods (the
+        // V-T/E-E exclusion sets: vertices sharing a triangle), particle list.
+        let tp4 = trisBuf.contents().bindMemory(to: SIMD4<UInt32>.self,
+                                                capacity: max(1, numTris))
+        var edgeSet: Set<UInt64> = []
+        var nbrSets = [Set<Int>](repeating: [], count: numBodies)
+        var maxElemR: Float = 0
+        for (i, t) in scene.tris.enumerated() {
+            let (a, b, c) = t.ids
+            tp4[i] = SIMD4(UInt32(a), UInt32(b), UInt32(c), 0)
+            for (u, v) in [(a, b), (b, c), (a, c)] {
+                edgeSet.insert(UInt64(min(u, v)) << 32 | UInt64(max(u, v)))
+            }
+            nbrSets[a].formUnion([b, c]); nbrSets[b].formUnion([a, c])
+            nbrSets[c].formUnion([a, b])
+            let pa = scene.bodies[a].position, pb = scene.bodies[b].position
+            let pc = scene.bodies[c].position
+            let m = (pa + pb + pc) / 3
+            let thick = max(scene.bodies[a].size.x, max(scene.bodies[b].size.x,
+                                                        scene.bodies[c].size.x)) / 2
+            maxElemR = max(maxElemR, max(distance(m, pa), max(distance(m, pb),
+                                                              distance(m, pc))) + thick)
+        }
+        let sortedEdges = edgeSet.sorted()
+        numEdges = sortedEdges.count
+        let ep2 = edgesBuf.contents().bindMemory(to: SIMD2<UInt32>.self,
+                                                 capacity: max(1, numEdges))
+        for (i, key) in sortedEdges.enumerated() {
+            ep2[i] = SIMD2(UInt32(key >> 32), UInt32(key & 0xFFFFFFFF))
+            let a = scene.bodies[Int(key >> 32)], b = scene.bodies[Int(key & 0xFFFFFFFF)]
+            maxElemR = max(maxElemR, distance(a.position, b.position) / 2
+                           + max(a.size.x, b.size.x) / 2)
+        }
+        // CSR neighborhoods (sorted per vertex for binary search)
+        let nsP = nbrStart.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        let ncP = nbrCount.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        var flatNbrs: [UInt32] = []
+        for i in 0..<numBodies {
+            nsP[i] = UInt32(flatNbrs.count)
+            let sorted = nbrSets[i].sorted()
+            ncP[i] = UInt32(sorted.count)
+            flatNbrs.append(contentsOf: sorted.map(UInt32.init))
+        }
+        precondition(flatNbrs.count <= nbrList.length / 4,
+                     "neighbor CSR exceeded 6-per-triangle bound")
+        if !flatNbrs.isEmpty {
+            nbrList.contents().bindMemory(to: UInt32.self, capacity: flatNbrs.count)
+                .update(from: flatNbrs, count: flatNbrs.count)
+        }
+        // particle list: V-T query points (any 3-DOF particle, cloth or tet)
+        var particles: [UInt32] = []
+        for (i, b) in scene.bodies.enumerated() where b.isParticle {
+            particles.append(UInt32(i))
+        }
+        numParticles = numTris == 0 ? 0 : particles.count
+        if !particles.isEmpty {
+            particleIdxBuf.contents().bindMemory(to: UInt32.self, capacity: particles.count)
+                .update(from: particles, count: particles.count)
+        }
+        // element grid cell size: 2x max element radius with stretch headroom
+        params.elemCellSize = max(0.2, 2 * maxElemR * 1.5)
+        params.elemHashSize = UInt32(elemHashSize)
+        params.numTris = UInt32(numTris)
+        params.numEdges = 0          // E-E detection lands in phase 3
+        params.numParticles = UInt32(numParticles)
+        params.maxSoft = UInt32(maxSoft)
+        params.softMapCapacity = UInt32(softMapCapacity)
+
         // Clear manifolds + map
         memset(manifolds.contents(), 0, manifolds.length)
         memset(prevManifolds.contents(), 0, prevManifolds.length)
         memset(mapKeyA.contents(), 0, mapKeyA.length)
         memset(counters.contents(), 0, counters.length)
+        memset(softContacts.contents(), 0, softContacts.length)
+        memset(prevSoftContacts.contents(), 0, prevSoftContacts.length)
+        memset(softMapKeyA.contents(), 0, softMapKeyA.length)
 
         // Params
         params.numBodies = UInt32(numBodies)
@@ -651,6 +770,98 @@ public final class GPUSolver {
         return (0..<numBodies).map { Int(c[$0]) }
     }
 
+    /// Cloth diagnostics (CPU, brute force over the shared buffers):
+    /// - minGap: worst vertex-to-triangle-surface clearance among
+    ///   non-topologically-adjacent pairs. 0 = surfaces touching; values
+    ///   below -(rv+rt) mean a vertex CENTER crossed the midsurface.
+    /// - maxStretch: worst stiff-spring strain |len/rest - 1| (stiffness >=
+    ///   1000 selects structural edges; shear/bend sets are soft by design).
+    public func debugClothMetrics() -> (minGap: Float, maxStretch: Float) {
+        sync()
+        let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let sh = shape.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let tp = trisBuf.contents().bindMemory(to: SIMD4<UInt32>.self,
+                                               capacity: max(1, numTris))
+        let pidx = particleIdxBuf.contents().bindMemory(to: UInt32.self,
+                                                        capacity: max(1, numParticles))
+        let ns = nbrStart.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        let nc = nbrCount.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        let nl = nbrList.contents().bindMemory(to: UInt32.self,
+                                               capacity: max(1, nbrList.length / 4))
+
+        func closest(_ p: F3, _ a: F3, _ b: F3, _ c: F3) -> F3 {
+            let ab = b - a, ac = c - a, ap = p - a
+            let d1 = dot(ab, ap), d2 = dot(ac, ap)
+            if d1 <= 0 && d2 <= 0 { return a }
+            let bp = p - b
+            let d3 = dot(ab, bp), d4 = dot(ac, bp)
+            if d3 >= 0 && d4 <= d3 { return b }
+            let vc = d1 * d4 - d3 * d2
+            if vc <= 0 && d1 >= 0 && d3 <= 0 { return a + ab * (d1 / max(d1 - d3, 1e-12)) }
+            let cp = p - c
+            let d5 = dot(ab, cp), d6 = dot(ac, cp)
+            if d6 >= 0 && d5 <= d6 { return c }
+            let vb = d5 * d2 - d1 * d6
+            if vb <= 0 && d2 >= 0 && d6 <= 0 { return a + ac * (d2 / max(d2 - d6, 1e-12)) }
+            let va = d3 * d6 - d5 * d4
+            if va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0 {
+                let w = (d4 - d3) / max((d4 - d3) + (d5 - d6), 1e-12)
+                return b + (c - b) * w
+            }
+            let denom = va + vb + vc
+            if abs(denom) < 1e-20 { return a }
+            return a + ab * (vb / denom) + ac * (vc / denom)
+        }
+        func isNbr(_ v: Int, _ x: UInt32) -> Bool {
+            let s = Int(ns[v]), e = s + Int(nc[v])
+            for k in s..<e where nl[k] == x { return true }
+            return false
+        }
+
+        var minGap: Float = .greatestFiniteMagnitude
+        for g in 0..<numParticles {
+            let v = Int(pidx[g])
+            let p = F3(pl[v].x, pl[v].y, pl[v].z)
+            let rv = abs(sh[v].w)
+            for t in 0..<numTris {
+                let id = tp[t]
+                if id.x == UInt32(v) || id.y == UInt32(v) || id.z == UInt32(v) { continue }
+                if isNbr(v, id.x) || isNbr(v, id.y) || isNbr(v, id.z) { continue }
+                let a = F3(pl[Int(id.x)].x, pl[Int(id.x)].y, pl[Int(id.x)].z)
+                let b = F3(pl[Int(id.y)].x, pl[Int(id.y)].y, pl[Int(id.y)].z)
+                let c = F3(pl[Int(id.z)].x, pl[Int(id.z)].y, pl[Int(id.z)].z)
+                let q = closest(p, a, b, c)
+                let rt = max(abs(sh[Int(id.x)].w), max(abs(sh[Int(id.y)].w), abs(sh[Int(id.z)].w)))
+                minGap = min(minGap, distance(p, q) - (rv + rt))
+            }
+        }
+
+        var maxStretch: Float = 0
+        let sp = springs.contents().bindMemory(to: SpringGPU.self, capacity: max(1, numSprings))
+        let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        for i in 0..<numSprings {
+            let s = sp[i]
+            guard s.rA.w >= 1000 || s.header.z != 0 else { continue }
+            let a = Int(s.header.x), b = Int(s.header.y)
+            let qa = Quat(real: pa[a].w, imag: F3(pa[a].x, pa[a].y, pa[a].z))
+            let qb = Quat(real: pa[b].w, imag: F3(pa[b].x, pa[b].y, pa[b].z))
+            let wa = F3(pl[a].x, pl[a].y, pl[a].z) + qa.act(F3(s.rA.x, s.rA.y, s.rA.z))
+            let wb = F3(pl[b].x, pl[b].y, pl[b].z) + qb.act(F3(s.rB.x, s.rB.y, s.rB.z))
+            let rest = s.rB.w
+            if rest > 1e-6 {
+                let st = abs(distance(wa, wb) / rest - 1)
+                if st > maxStretch {
+                    maxStretch = st
+                    lastWorstSpring = (a, b)
+                }
+            }
+        }
+        return (minGap == .greatestFiniteMagnitude ? 0 : minGap, maxStretch)
+    }
+
+    /// Endpoints of the worst stiff spring from the last debugClothMetrics call.
+    public private(set) var lastWorstSpring: (Int, Int) = (-1, -1)
+
     /// Wait for all committed steps (no-op when already complete).
     public func sync() {
         for c in inflight { c.waitUntilCompleted() }
@@ -695,6 +906,9 @@ public final class GPUSolver {
         if let blit = cmd1.makeBlitCommandEncoder() {
             blit.fill(buffer: counters, range: 0..<counters.length, value: 0)
             blit.fill(buffer: cellCount, range: 0..<(gridHashSize * 4), value: 0)
+            if numTris > 0 {
+                blit.fill(buffer: elemCellCount, range: 0..<(elemHashSize * 4), value: 0)
+            }
             blit.endEncoding()
         }
 
@@ -808,6 +1022,93 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
         }
 
+        // ---- Cloth element contacts: bin triangles into the element grid,
+        // emit V-T and rigid-feature-T records (warm-started from the soft
+        // persistence map), then rebuild the map for next frame. Runs at
+        // start-of-step poses like the rigid narrowphase.
+        if numTris > 0 {
+            stage("cloth-detect")
+            dispatch1D(enc, "el_count", numTris + Int(P.numEdges)) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.trisBuf, offset: 0, index: 1)
+                e.setBuffer(self.edgesBuf, offset: 0, index: 2)
+                e.setBuffer(self.elemCellCount, offset: 0, index: 3)
+                e.setBuffer(self.elemSlot, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
+            }
+            encodeScan(enc, input: elemCellCount, output: elemCellStart, count: elemHashSize)
+            dispatch1D(enc, "el_scatter", numTris + Int(P.numEdges)) { e in
+                e.setBuffer(self.elemSlot, offset: 0, index: 0)
+                e.setBuffer(self.elemCellStart, offset: 0, index: 1)
+                e.setBuffer(self.elemCells, offset: 0, index: 2)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 3)
+            }
+            if ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
+            dispatch1D(enc, "vt_emit", numParticles) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.shape, offset: 0, index: 1)
+                e.setBuffer(self.props, offset: 0, index: 2)
+                e.setBuffer(self.velLin, offset: 0, index: 3)
+                e.setBuffer(self.particleIdxBuf, offset: 0, index: 4)
+                e.setBuffer(self.trisBuf, offset: 0, index: 5)
+                e.setBuffer(self.elemCellStart, offset: 0, index: 6)
+                e.setBuffer(self.elemCellCount, offset: 0, index: 7)
+                e.setBuffer(self.elemCells, offset: 0, index: 8)
+                e.setBuffer(self.nbrStart, offset: 0, index: 9)
+                e.setBuffer(self.nbrCount, offset: 0, index: 10)
+                e.setBuffer(self.nbrList, offset: 0, index: 11)
+                e.setBuffer(self.softContacts, offset: 0, index: 12)
+                e.setBuffer(self.counters, offset: 0, index: 13)
+                e.setBuffer(self.prevSoftContacts, offset: 0, index: 14)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 15)
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 16)
+                e.setBuffer(self.softMapVal, offset: 0, index: 17)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 18)
+            }
+            }
+            if ProcessInfo.processInfo.environment["AVBD_NO_RT"] == nil {
+            dispatch1D(enc, "rt_emit", numTris) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.posAng, offset: 0, index: 1)
+                e.setBuffer(self.shape, offset: 0, index: 2)
+                e.setBuffer(self.props, offset: 0, index: 3)
+                e.setBuffer(self.velLin, offset: 0, index: 4)
+                e.setBuffer(self.shapeType, offset: 0, index: 5)
+                e.setBuffer(self.trisBuf, offset: 0, index: 6)
+                e.setBuffer(self.cellStart, offset: 0, index: 7)
+                e.setBuffer(self.cellCount, offset: 0, index: 8)
+                e.setBuffer(self.cellBodies, offset: 0, index: 9)
+                e.setBuffer(self.globalIdx, offset: 0, index: 10)
+                e.setBuffer(self.exclusions, offset: 0, index: 11)
+                e.setBytes(&nExcl, length: 4, index: 12)
+                e.setBuffer(self.softContacts, offset: 0, index: 13)
+                e.setBuffer(self.counters, offset: 0, index: 14)
+                e.setBuffer(self.prevSoftContacts, offset: 0, index: 15)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 16)
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 17)
+                e.setBuffer(self.softMapVal, offset: 0, index: 18)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 19)
+            }
+            }
+            dispatch1D(enc, "soft_finalize", 1) { e in
+                e.setBuffer(self.counters, offset: 0, index: 0)
+                e.setBuffer(self.dispatchArgs, offset: 0, index: 1)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 2)
+            }
+            dispatch1D(enc, "softmap_clear", softMapCapacity) { e in
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 1)
+            }
+            dispatch1D(enc, "softmap_insert", maxSoft) { e in
+                e.setBuffer(self.softContacts, offset: 0, index: 0)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 1)
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 2)
+                e.setBuffer(self.softMapVal, offset: 0, index: 3)
+                e.setBuffer(self.counters, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
+            }
+        }
+
         stage("warmstart")
         // Warm start joints (before body prediction; uses start-of-step poses)
         dispatch1D(enc, "warmstart_joints", numJoints + numSprings) { e in
@@ -846,6 +1147,7 @@ public final class GPUSolver {
             e.setBuffer(self.counters, offset: 0, index: 5)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
             e.setBuffer(self.tets, offset: 0, index: 7)
+            e.setBuffer(self.softContacts, offset: 0, index: 8)
         }
         encodeScan(enc, input: degrees, output: adjStart, count: numBodies)
         dispatch1D(enc, "adj_copy_cursor", numBodies) { e in
@@ -863,6 +1165,7 @@ public final class GPUSolver {
             e.setBuffer(self.counters, offset: 0, index: 6)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
             e.setBuffer(self.tets, offset: 0, index: 8)
+            e.setBuffer(self.softContacts, offset: 0, index: 9)
         }
 
         stage("coloring")
@@ -885,6 +1188,7 @@ public final class GPUSolver {
                 e.setBuffer(self.changedFlag, offset: 0, index: 9)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 10)
                 e.setBuffer(self.tets, offset: 0, index: 11)
+                e.setBuffer(self.softContacts, offset: 0, index: 12)
             }
             swap(&src, &dst)
         }
@@ -941,6 +1245,7 @@ public final class GPUSolver {
             enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
             enc.setBuffer(shape, offset: 0, index: 17)
             enc.setBuffer(tets, offset: 0, index: 18)
+            enc.setBuffer(softContacts, offset: 0, index: 19)
             let w = persistPSO.threadExecutionWidth
             let tg = min(persistPSO.maxTotalThreadsPerThreadgroup,
                          ((max(numBodies, 64) + w - 1) / w) * w)
@@ -975,6 +1280,7 @@ public final class GPUSolver {
                 enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
                 enc.setBuffer(shape, offset: 0, index: 17)
                 enc.setBuffer(tets, offset: 0, index: 18)
+                enc.setBuffer(softContacts, offset: 0, index: 19)
             }
             _ = it
             for c in 0..<colorBound {
@@ -983,6 +1289,17 @@ public final class GPUSolver {
                 enc.dispatchThreadgroups(indirectBuffer: colorArgs,
                                          indirectBufferOffset: c * 12,
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+            }
+            // tail: bodies in colors >= colorBound (the async bound can be
+            // stale; skipped bodies would fly ballistic — see kernel comment)
+            do {
+                let p = ps("primal_tail")
+                enc.setComputePipelineState(p)
+                var cb = UInt32(colorBound)
+                enc.setBytes(&cb, length: 4, index: 15)
+                enc.dispatchThreadgroups(MTLSize(width: (numBodies + 63) / 64, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                enc.setComputePipelineState(primalPSO)
             }
 
             dispatchIndirect(enc, "dual_all", argsOffset: 6) { e in
@@ -995,6 +1312,7 @@ public final class GPUSolver {
                 e.setBuffer(self.counters, offset: 0, index: 6)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
                 e.setBuffer(self.springs, offset: 0, index: 8)
+                e.setBuffer(self.softContacts, offset: 0, index: 9)
             }
         }
 
@@ -1023,6 +1341,7 @@ public final class GPUSolver {
             let ctr = self.counters.contents()
                 .bindMemory(to: UInt32.self, capacity: GPUCounters.total)
             let pairs = Int(ctr[GPUCounters.pairs])
+            let softN = min(Int(ctr[GPUCounters.soft]), self.maxSoft)
             var counts: [Int] = []
             var maxUsed = -1
             for c in 0..<AVBD_MAX_COLORS {
@@ -1032,6 +1351,7 @@ public final class GPUSolver {
             }
             self.statsLock.lock()
             self.lastNumPairs = pairs
+            self.lastNumSoft = softN
             self.lastColorCounts = counts
             self.lastMaxColorUsed = maxUsed
             self.statsLock.unlock()
@@ -1069,6 +1389,7 @@ public final class GPUSolver {
         if profiling { readStats() }
 
         swap(&manifolds, &prevManifolds)
+        if numTris > 0 { swap(&softContacts, &prevSoftContacts) }
     }
 
     /// Advance kinematic spinners (static bodies with prescribed rotation).
@@ -1222,6 +1543,10 @@ public final class GPUSolver {
     }
 
     public var bodyCount: Int { numBodies }
+
+    /// Max threadgroup width of the persistent solver kernel (scenes at or
+    /// under this run the whole solve in one dispatch).
+    public var persistentCapacity: Int { ps("solve_persistent").maxTotalThreadsPerThreadgroup }
 
     /// Max constraint error: hard-joint violation + contact penetration depth.
     public func maxConstraintError() -> Float {

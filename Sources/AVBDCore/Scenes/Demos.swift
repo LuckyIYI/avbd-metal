@@ -6,12 +6,13 @@ public enum Demos {
     public static var all: [String] {
         ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
          "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
-         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "cloth", "softbody", "android"]
+         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "cloth", "softbody", "android",
+         "clothfold", "boxoncloth", "hammock", "drape", "clothcombo"]
     }
 
     /// Every demo scales for stress testing: 1 = small (original size),
-    /// 2 = medium, 4 = large, 8 = giant.
-    public static func make(_ name: String, scale: Int = 1) -> PhysicsScene? {
+    /// 2 = medium, 4 = large, 8 = giant. `res` overrides cloth resolution.
+    public static func make(_ name: String, scale: Int = 1, res: Int? = nil) -> PhysicsScene? {
         let s = max(1, scale)
         switch name {
         case "ground": return ground(count: s * s)
@@ -37,6 +38,12 @@ public enum Demos {
         case "android": return android(scale: s)
         case "cloth": return cloth(res: 12 + 4 * s)
         case "softbody": return softbody(count: 2 + s)
+        case "clothfold": return clothfold(res: res ?? (18 + 6 * s))
+        case "boxoncloth": return boxoncloth(res: res ?? (18 + 6 * s))
+        case "hammock": return hammock(res: res ?? (16 + 4 * s))
+        case "drape": return drape(res: res ?? (22 + 6 * s))
+        case "drape0": return drape(res: res ?? (22 + 6 * s), friction: 0)
+        case "clothcombo": return clothcombo(res: res ?? (16 + 4 * s))
         case "trebuchet": return trebuchet(castleScale: s)
         case "wreckingball": return wreckingball(floors: 2 + s)
         case "marblerun": return marblerun(marbles: 10 * s)

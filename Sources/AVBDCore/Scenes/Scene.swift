@@ -84,6 +84,25 @@ public struct SceneJoint {
     }
 }
 
+/// Cloth surface triangle over three 3-DOF particles. Triangles are the
+/// collision surface of thin soft bodies (V-T and E-E contacts, plus rigid
+/// features against the face), and — when mu > 0 — StVK membrane elements
+/// with quadratic bending across shared edges (bend > 0).
+public struct SceneTri {
+    public var ids: (Int, Int, Int)
+    public var mu: Float        // membrane shear/stretch stiffness (0 = contact only)
+    public var lambda: Float    // membrane area-preservation stiffness
+    public var bend: Float      // bending stiffness across shared edges
+
+    public init(ids: (Int, Int, Int), mu: Float = 0, lambda: Float = 0,
+                bend: Float = 0) {
+        self.ids = ids
+        self.mu = mu
+        self.lambda = lambda
+        self.bend = bend
+    }
+}
+
 /// Stable Neo-Hookean tetrahedron over four 3-DOF particles.
 public struct SceneTet {
     public var ids: (Int, Int, Int, Int)
@@ -157,6 +176,7 @@ public struct PhysicsScene {
     public var joints: [SceneJoint] = []
     public var springs: [SceneSpring] = []
     public var tets: [SceneTet] = []
+    public var tris: [SceneTri] = []
     public var spinners: [SceneSpinner] = []
     public var settings = SimSettings()
 
@@ -227,6 +247,7 @@ public struct PhysicsScene {
 
     public mutating func addSpring(_ s: SceneSpring) { springs.append(s) }
     public mutating func addTet(_ t: SceneTet) { tets.append(t) }
+    public mutating func addTri(_ t: SceneTri) { tris.append(t) }
 
     /// Build a CPU reference solver from this scene.
     public func makeCPUSolver() -> CPUSolver {

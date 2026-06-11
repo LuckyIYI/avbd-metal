@@ -32,10 +32,13 @@ kernel void adj_count(
     device const atomic_uint* counters [[buffer(5)]],
     constant SimParams& P           [[buffer(6)]],
     device const TetGPU* tets       [[buffer(7)]],
+    device const SoftContactGPU* soft [[buffer(8)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    uint total = P.numJoints + P.numSprings + numPairs + P.numTets;
+    uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                       P.maxSoft);
+    uint total = P.numJoints + P.numSprings + numPairs + P.numTets + numSoft;
     if (gid >= total) return;
 
     uint a = WORLD_BODY, b = WORLD_BODY;
@@ -52,13 +55,23 @@ kernel void adj_count(
         if (manifolds[m].header.z == 0) return; // inactive
         a = manifolds[m].header.x;
         b = manifolds[m].header.y;
-    } else {
+    } else if (gid < P.numJoints + P.numSprings + numPairs + P.numTets) {
         // tet: one adjacency entry per vertex
         uint t = gid - P.numJoints - P.numSprings - numPairs;
         uint4 ids = tets[t].ids;
         for (uint k = 0; k < 4; k++) {
             uint v = ids[k];
             if (bodyDynamic(posLin, v))
+                atomic_fetch_add_explicit(&degrees[v], 1u, memory_order_relaxed);
+        }
+        return;
+    } else {
+        // element contact: one adjacency entry per participating body
+        uint s = gid - P.numJoints - P.numSprings - numPairs - P.numTets;
+        uint4 ids = soft[s].ids;
+        for (uint k = 0; k < 4; k++) {
+            uint v = ids[k];
+            if (v != WORLD_BODY && bodyDynamic(posLin, v))
                 atomic_fetch_add_explicit(&degrees[v], 1u, memory_order_relaxed);
         }
         return;
@@ -88,10 +101,13 @@ kernel void adj_scatter(
     device const atomic_uint* counters [[buffer(6)]],
     constant SimParams& P           [[buffer(7)]],
     device const TetGPU* tets       [[buffer(8)]],
+    device const SoftContactGPU* soft [[buffer(9)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    uint total = P.numJoints + P.numSprings + numPairs + P.numTets;
+    uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                       P.maxSoft);
+    uint total = P.numJoints + P.numSprings + numPairs + P.numTets + numSoft;
     if (gid >= total) return;
 
     uint a = WORLD_BODY, b = WORLD_BODY;
@@ -112,13 +128,25 @@ kernel void adj_scatter(
         a = manifolds[m].header.x;
         b = manifolds[m].header.y;
         entry = (FK_MANIFOLD << ADJ_KIND_SHIFT) | m;
-    } else {
+    } else if (gid < P.numJoints + P.numSprings + numPairs + P.numTets) {
         uint t = gid - P.numJoints - P.numSprings - numPairs;
         uint4 ids = tets[t].ids;
         entry = (FK_TET << ADJ_KIND_SHIFT) | t;
         for (uint k = 0; k < 4; k++) {
             uint v = ids[k];
             if (bodyDynamic(posLin, v)) {
+                uint slot = atomic_fetch_add_explicit(&cursor[v], 1u, memory_order_relaxed);
+                adjList[slot] = entry;
+            }
+        }
+        return;
+    } else {
+        uint s = gid - P.numJoints - P.numSprings - numPairs - P.numTets;
+        uint4 ids = soft[s].ids;
+        entry = (FK_SOFT << ADJ_KIND_SHIFT) | s;
+        for (uint k = 0; k < 4; k++) {
+            uint v = ids[k];
+            if (v != WORLD_BODY && bodyDynamic(posLin, v)) {
                 uint slot = atomic_fetch_add_explicit(&cursor[v], 1u, memory_order_relaxed);
                 adjList[slot] = entry;
             }
@@ -153,12 +181,13 @@ inline uint otherBody(device const JointGPU* joints,
     return a == self ? b : a;
 }
 
-// Accumulate the neighbor-color masks for one adjacency entry; tets
-// conflict with all 3 other vertices.
+// Accumulate the neighbor-color masks for one adjacency entry; tets and
+// element contacts conflict with all other participating vertices.
 inline void neighborColors(device const JointGPU* joints,
                            device const SpringGPU* springs,
                            device const ManifoldGPU* manifolds,
                            device const TetGPU* tets,
+                           device const SoftContactGPU* soft,
                            device const float4* posLin,
                            device const uint* colorsIn,
                            uint entry, uint self, uint myColor,
@@ -173,6 +202,11 @@ inline void neighborColors(device const JointGPU* joints,
         uint4 ids = tets[idx].ids;
         for (uint k = 0; k < 4; k++) {
             if (ids[k] != self && n < 3) { nbs[n++] = ids[k]; }
+        }
+    } else if (kind == FK_SOFT) {
+        uint4 ids = soft[idx].ids;
+        for (uint k = 0; k < 4; k++) {
+            if (ids[k] != self && ids[k] != WORLD_BODY && n < 3) { nbs[n++] = ids[k]; }
         }
     } else {
         nbs[0] = otherBody(joints, springs, manifolds, entry, self);
@@ -205,6 +239,7 @@ kernel void color_iterate(
     device atomic_uint* changedFlag [[buffer(9)]],
     constant SimParams& P           [[buffer(10)]],
     device const TetGPU* tets       [[buffer(11)]],
+    device const SoftContactGPU* soft [[buffer(12)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -217,7 +252,7 @@ kernel void color_iterate(
 
     uint s = adjStart[gid], e = s + adjCount[gid];
     for (uint k = s; k < e; k++) {
-        neighborColors(joints, springs, manifolds, tets, posLin, colorsIn,
+        neighborColors(joints, springs, manifolds, tets, soft, posLin, colorsIn,
                        adjList[k], gid, myColor,
                        maskLo, maskHi, allLo, allHi, conflict);
     }
@@ -709,6 +744,99 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
     }
 }
 
+// ----------------------------------------------------------------------------
+// Element (soft) contacts: the unified 4-slot stencil. The constraint is the
+// rigid-contact Taylor form generalized to weighted point sets:
+//   C = C0 (1-alpha) + sum_i w_i [n|t1|t2].dq_i  (+ slot-0 angular terms when
+// slot 0 is a rigid body). Shared by primal stamp and dual update.
+// ----------------------------------------------------------------------------
+inline float3 softContactC(device const SoftContactGPU& sc,
+                           device const float4* posLin, device const float4* posAng,
+                           device const float4* initLin, device const float4* initAng,
+                           float alpha,
+                           thread float3& n, thread float3& t1, thread float3& t2,
+                           thread float3& rAW, thread bool& rigidA, thread bool& roundA)
+{
+    uint flags = as_type<uint>(sc.anchorA.w);
+    rigidA = (flags & SCF_RIGID_A) != 0;
+    roundA = (flags & 32u) != 0;
+    n = sc.normal.xyz;
+    orthonormal(n, t1, t2);
+    rAW = float3(0);
+
+    float3 C = sc.C0.xyz * (1.0f - alpha);
+    for (uint k = 0; k < 4; k++) {
+        uint b = sc.ids[k];
+        if (b == WORLD_BODY) continue;
+        float w = sc.weights[k];
+        float3 dq = posLin[b].xyz - initLin[b].xyz;
+        C += w * float3(dot(n, dq), dot(t1, dq), dot(t2, dq));
+        if (k == 0 && rigidA) {
+            rAW = roundA ? sc.anchorA.xyz : q_rotate(posAng[b], sc.anchorA.xyz);
+            float3 dqa = q_sub(posAng[b], initAng[b]);
+            C += w * float3(dot(cross(rAW, n), dqa),
+                            dot(cross(rAW, t1), dqa),
+                            dot(cross(rAW, t2), dqa));
+        }
+    }
+    return C;
+}
+
+inline float3 softContactForce(device const SoftContactGPU& sc, float3 C,
+                               thread float& frictionScale, thread float& bounds)
+{
+    float3 F = sc.penalty.xyz * C + sc.lambda.xyz;
+    F.x = min(F.x, 0.0f);
+    bounds = fabs(F.x) * sc.normal.w;
+    frictionScale = length(F.yz);
+    if (frictionScale > bounds && frictionScale > 0.0f) {
+        F.yz *= bounds / frictionScale;
+    }
+    return F;
+}
+
+inline void stampSoft(device const SoftContactGPU& sc, uint self,
+                      device const float4* posLin, device const float4* posAng,
+                      device const float4* initLin, device const float4* initAng,
+                      float alpha, thread PrimalAccum& acc)
+{
+    float3 n, t1, t2, rAW;
+    bool rigidA, roundA;
+    float3 C = softContactC(sc, posLin, posAng, initLin, initAng, alpha,
+                            n, t1, t2, rAW, rigidA, roundA);
+    float fs, bnd;
+    float3 F = softContactForce(sc, C, fs, bnd);
+
+    int slot = -1;
+    for (uint k = 0; k < 4; k++) {
+        if (sc.ids[k] == self) { slot = int(k); break; }
+    }
+    if (slot < 0) return;
+    float w = sc.weights[slot];
+
+    if (slot == 0 && rigidA) {
+        // 6-DOF rigid: full linear/angular/cross blocks like stampManifold
+        M3 jLin = M3{n * w, t1 * w, t2 * w};
+        M3 jAng = M3{cross(rAW, jLin.r0), cross(rAW, jLin.r1), cross(rAW, jLin.r2)};
+        M3 K = m3_diag(sc.penalty.xyz);
+        M3 jLinT = m3_transpose(jLin);
+        M3 jAngT = m3_transpose(jAng);
+        M3 jAngTk = m3_mulm(jAngT, K);
+        acc.lhsLin = m3_add(acc.lhsLin, m3_mulm(m3_mulm(jLinT, K), jLin));
+        acc.lhsAng = m3_add(acc.lhsAng, m3_mulm(jAngTk, jAng));
+        acc.lhsCross = m3_add(acc.lhsCross, m3_mulm(jAngTk, jLin));
+        acc.rhsLin += m3_mul(jLinT, F);
+        acc.rhsAng += m3_mul(jAngT, F);
+    } else {
+        // 3-DOF particle: linear block only
+        float w2 = w * w;
+        acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(n, n), sc.penalty.x * w2));
+        acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(t1, t1), sc.penalty.y * w2));
+        acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(t2, t2), sc.penalty.z * w2));
+        acc.rhsLin += (n * F.x + t1 * F.y + t2 * F.z) * w;
+    }
+}
+
 static inline void primal_one(
     device float4* posLin,
     device float4* posAng,
@@ -726,6 +854,7 @@ static inline void primal_one(
     constant SimParams& P,
     device const float4* shape,
     device const TetGPU* tets,
+    device const SoftContactGPU* soft,
     uint body)
 {
 
@@ -752,6 +881,8 @@ static inline void primal_one(
             stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
         } else if (kind == FK_TET) {
             stampTet(tets[idx], body, posLin, acc);
+        } else if (kind == FK_SOFT) {
+            stampSoft(soft[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
         } else {
             stampManifold(manifolds[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
         }
@@ -820,6 +951,7 @@ kernel void primal_solve(
     constant SimParams& P           [[buffer(16)]],
     device const float4* shape      [[buffer(17)]],
     device const TetGPU* tets       [[buffer(18)]],
+    device const SoftContactGPU* soft [[buffer(19)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorIndex];
@@ -827,7 +959,78 @@ kernel void primal_solve(
     if (s + tid >= e) return;
     primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
                joints, springs, manifolds, adjStart, adjCount, adjList,
-               P, shape, tets, colorList[s + tid]);
+               P, shape, tets, soft, colorList[s + tid]);
+}
+
+// Tail pass: primal-update every body whose color is >= the CPU-encoded
+// bound. The bound comes from an ASYNC readback and can be stale when the
+// palette grows (dense cloth piles); skipping those bodies leaves them
+// ballistic for a frame — they free-fall, ramp their contacts' penalties,
+// and the violent catch-up injects energy. Updating them together is a
+// Jacobi step (paper Sec. 4): safe, and the palette tail holds few bodies.
+kernel void primal_tail(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device const JointGPU* joints   [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    constant uint& colorBound       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device const SoftContactGPU* soft [[buffer(19)]],
+    uint tid                        [[thread_position_in_grid]])
+{
+    uint s = colorStart[colorBound];
+    uint e = colorStart[MAX_COLORS];
+    if (s + tid >= e) return;
+    primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
+               joints, springs, manifolds, adjStart, adjCount, adjList,
+               P, shape, tets, soft, colorList[s + tid]);
+}
+
+// Dual update for one element contact: bounded normal dual (cap scaled to
+// the participating masses at detection), friction-coned tangentials,
+// ramped penalties — the rigid-contact treatment on the 4-slot stencil.
+static inline void dual_soft_one(
+    device const float4* posLin,
+    device const float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device SoftContactGPU* soft,
+    constant SimParams& P,
+    uint gid)
+{
+    device SoftContactGPU& sc = soft[gid];
+    float3 n, t1, t2, rAW;
+    bool rigidA, roundA;
+    float3 C = softContactC(sc, posLin, posAng, initLin, initAng, P.alpha,
+                            n, t1, t2, rAW, rigidA, roundA);
+    float fs, bnd;
+    float3 F = softContactForce(sc, C, fs, bnd);
+
+    F.x = max(F.x, -sc.C0.w);           // bounded dual, mass-scaled cap
+    sc.lambda.xyz = F;
+
+    float3 pen = sc.penalty.xyz;
+    if (F.x < 0.0f) {
+        pen.x = min(pen.x + P.betaLin * fabs(C.x), PENALTY_MAX);
+    }
+    if (fs <= bnd) {
+        pen.y = min(pen.y + P.betaLin * fabs(C.y), PENALTY_MAX_T);
+        pen.z = min(pen.z + P.betaLin * fabs(C.z), PENALTY_MAX_T);
+    }
+    sc.penalty.xyz = pen;
 }
 
 static inline void dual_joint_one(
@@ -927,6 +1130,13 @@ static inline void dual_manifold_one(
     float3 dqBLin = posLin[b].xyz - initLin[b].xyz;
     float3 dqBAng = q_sub(posAng[b], initAng[b]);
 
+    // Dual bound scaled to the lighter participant: a gram-scale cloth node
+    // must not stockpile kilonewtons (paper Sec 4's bound made dimensional;
+    // wedged nodes otherwise ratchet lambda to the global cap and explode).
+    float mA = posLin[a].w, mB = posLin[b].w;
+    float minMass = min(mA > 0.0f ? mA : FLT_MAX, mB > 0.0f ? mB : FLT_MAX);
+    float lamCap = min(P.lambdaMax, max(10.0f, 1.0e5f * minMass));
+
     for (uint i = 0; i < n; i++) {
         float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate(posAng[a], m.contacts[i].rA.xyz);
         float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate(posAng[b], m.contacts[i].rB.xyz);
@@ -936,7 +1146,7 @@ static inline void dual_manifold_one(
 
         // bound the dual (paper Sec 4): conflicting contacts otherwise ramp
         // each other's lambda without limit until the stored force explodes
-        F.x = max(F.x, -P.lambdaMax);
+        F.x = max(F.x, -lamCap);
         m.contacts[i].lambda = float4(F, 0);
 
         float3 pen = m.contacts[i].penalty.xyz;
@@ -965,6 +1175,7 @@ kernel void dual_all(
     device const atomic_uint* counters [[buffer(6)]],
     constant SimParams& P           [[buffer(7)]],
     device SpringGPU* springs       [[buffer(8)]],
+    device SoftContactGPU* soft     [[buffer(9)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid < P.numJoints) {
@@ -986,9 +1197,16 @@ kernel void dual_all(
     }
     uint mi = si - P.numSprings;
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    if (mi >= numPairs) return;
-    if (manifolds[mi].header.z == 0) return;
-    dual_manifold_one(posLin, posAng, initLin, initAng, manifolds, P, mi);
+    if (mi < numPairs) {
+        if (manifolds[mi].header.z == 0) return;
+        dual_manifold_one(posLin, posAng, initLin, initAng, manifolds, P, mi);
+        return;
+    }
+    uint sci = mi - numPairs;
+    uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                       P.maxSoft);
+    if (sci >= numSoft) return;
+    dual_soft_one(posLin, posAng, initLin, initAng, soft, P, sci);
 }
 
 // Persistent solver for small scenes: ALL iterations x colors x dual updates
@@ -1015,11 +1233,14 @@ kernel void solve_persistent(
     constant SimParams& P           [[buffer(16)]],
     device const float4* shape      [[buffer(17)]],
     device const TetGPU* tets       [[buffer(18)]],
+    device SoftContactGPU* soft     [[buffer(19)]],
     uint tid                        [[thread_position_in_threadgroup]],
     uint tgSize                     [[threads_per_threadgroup]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
-    uint dualTotal = P.numJoints + P.numSprings + numPairs;
+    uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                       P.maxSoft);
+    uint dualTotal = P.numJoints + P.numSprings + numPairs + numSoft;
     for (uint iter = 0; iter < P.iterations; iter++) {
         for (uint c = 0; c < MAX_COLORS; c++) {
             uint s0 = colorStart[c];
@@ -1028,7 +1249,7 @@ kernel void solve_persistent(
             for (uint i = s0 + tid; i < e0; i += tgSize) {
                 primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
                            props, joints, springs, manifolds,
-                           adjStart, adjCount, adjList, P, shape, tets,
+                           adjStart, adjCount, adjList, P, shape, tets, soft,
                            colorList[i]);
             }
             threadgroup_barrier(mem_flags::mem_device);
@@ -1049,11 +1270,14 @@ kernel void solve_persistent(
                     sp.dual.y = min(sp.dual.y + fabs(C) * P.betaLin,
                                     min(sp.rA.w, PENALTY_MAX));
                 }
-            } else {
+            } else if (g < P.numJoints + P.numSprings + numPairs) {
                 uint mi = g - P.numJoints - P.numSprings;
                 if (manifolds[mi].header.z != 0)
                     dual_manifold_one(posLin, posAng, initLin, initAng,
                                       manifolds, P, mi);
+            } else {
+                uint sci = g - P.numJoints - P.numSprings - numPairs;
+                dual_soft_one(posLin, posAng, initLin, initAng, soft, P, sci);
             }
         }
         threadgroup_barrier(mem_flags::mem_device);

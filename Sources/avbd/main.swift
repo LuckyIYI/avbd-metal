@@ -21,6 +21,7 @@ struct Options {
     var useCPU = false
     var json = false
     var watch: Int? = nil
+    var res: Int? = nil
     var statsEvery = 60
     var envs = 64
     var batch = 256
@@ -42,6 +43,7 @@ func parseOptions(_ args: [String]) -> Options {
         case "--cpu": o.useCPU = true
         case "--json": o.json = true
         case "--watch": i += 1; o.watch = Int(args[i])
+        case "--res": i += 1; o.res = Int(args[i])
         case "--stats-every": i += 1; o.statsEvery = Int(args[i]) ?? 60
         case "--envs": i += 1; o.envs = Int(args[i]) ?? 64
         case "--batch": i += 1; o.batch = Int(args[i]) ?? 256
@@ -62,7 +64,7 @@ func fail(_ msg: String) -> Never {
 }
 
 func makeScene(_ name: String, _ o: Options) -> PhysicsScene {
-    guard var scene = Demos.make(name, scale: o.scale) else {
+    guard var scene = Demos.make(name, scale: o.scale, res: o.res) else {
         fail("unknown demo '\(name)'. Available: \(Demos.all.joined(separator: ", "))")
     }
     if let it = o.iterations { scene.settings.iterations = it }
@@ -140,6 +142,54 @@ case "run":
         }
     }
 
+case "clothgate":
+    // Cloth gate runner: step a demo and report element-contact metrics
+    // (worst V-T clearance, worst structural stretch, soft contact count).
+    guard args.count > 1 else { fail("usage: avbd clothgate <demo>") }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let scene = makeScene(args[1], o)
+    let solver = try GPUSolver(scene: scene)
+    print("bodies \(scene.bodies.count)  tris \(scene.tris.count)  persistent-capacity \(solver.persistentCapacity)")
+    var worstGap: Float = .greatestFiniteMagnitude
+    var worstStretch: Float = 0
+    var ke: Float = 0
+    for f in 0..<o.frames {
+        solver.step()
+        if (f + 1) % o.statsEvery == 0 || f == o.frames - 1 {
+            let (gap, stretch) = solver.debugClothMetrics()
+            // KE over particles (cloth energy envelope) + fastest node
+            ke = 0
+            var vmax: Float = 0
+            var fastest = -1
+            for b in 0..<scene.bodies.count where scene.bodies[b].isParticle {
+                let v = solver.bodyVelocity(b)
+                let s2 = length_squared(v)
+                ke += 0.5 * solver.bodyMass(b) * s2
+                if s2 > vmax * vmax { vmax = s2.squareRoot(); fastest = b }
+            }
+            var loc = ""
+            if fastest >= 0 {
+                let p = solver.bodyPosition(fastest)
+                loc = String(format: "  vmax %6.2f @%d (%.2f, %.2f, %.2f)",
+                             vmax, fastest, p.x, p.y, p.z)
+            }
+            if f > o.frames / 2 {       // settled-half metrics
+                worstGap = min(worstGap, gap)
+                worstStretch = max(worstStretch, stretch)
+            }
+            print(String(format: "frame %5d  gap %+.4f  stretch %.4f  soft %5d  pairs %5d  KE %.4f%@",
+                         f + 1, gap, stretch, solver.lastNumSoft, solver.lastNumPairs, ke, loc))
+        }
+    }
+    print(String(format: "settled-half: worstGap %+.4f  worstStretch %.4f",
+                 worstGap == .greatestFiniteMagnitude ? 0 : worstGap, worstStretch))
+    let (wa, wb) = solver.lastWorstSpring
+    if wa >= 0 {
+        let p1 = solver.bodyPosition(wa), p2 = solver.bodyPosition(wb)
+        print(String(format: "worst spring %d-%d  (%.2f,%.2f,%.2f) - (%.2f,%.2f,%.2f)",
+                     wa, wb, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z))
+    }
+
 case "collect":
     let o = parseOptions(Array(args.dropFirst(1)))
     try PushTPipeline.collect(envs: o.envs, steps: o.frames,
@@ -150,6 +200,13 @@ case "train-bc":
     try PushTPipeline.trainBC(dataPath: "runs/pusht/data", iters: o.frames,
                               batch: o.batch, latent: o.latent, lr: o.lr,
                               modelPath: "runs/pusht/model")
+
+case "collect-dagger":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PushTPipeline.collectDagger(envs: o.envs, steps: o.frames,
+                                    path: "runs/pusht/data",
+                                    policyPath: "runs/pusht/model",
+                                    latent: o.latent)
 
 case "train-lawm":
     let o = parseOptions(Array(args.dropFirst(1)))

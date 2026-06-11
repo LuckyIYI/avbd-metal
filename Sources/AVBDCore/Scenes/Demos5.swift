@@ -16,6 +16,9 @@ extension Demos {
                          spacing: Float, thickness: Float = 0.06,
                          massPerNode: Float = 0.02,
                          friction: Float = 0.7) -> [[Int]] {
+        // keep the contact skin below the topological-exclusion horizon:
+        // 2-ring rest distances start at ~spacing, so 2r must stay under it
+        let thickness = min(thickness, 0.38 * spacing)
         var grid: [[Int]] = []
         for i in 0..<nu {
             var row: [Int] = []
@@ -25,6 +28,21 @@ extension Demos {
                                          friction: friction, position: p))
             }
             grid.append(row)
+        }
+        // collision surface: one triangle pair per quad, alternating the
+        // diagonal so the mesh carries no preferred direction
+        for i in 0..<(nu - 1) {
+            for j in 0..<(nv - 1) {
+                let v00 = grid[i][j], v10 = grid[i + 1][j]
+                let v01 = grid[i][j + 1], v11 = grid[i + 1][j + 1]
+                if (i + j) % 2 == 0 {
+                    s.addTri(SceneTri(ids: (v00, v10, v11)))
+                    s.addTri(SceneTri(ids: (v00, v11, v01)))
+                } else {
+                    s.addTri(SceneTri(ids: (v00, v10, v01)))
+                    s.addTri(SceneTri(ids: (v10, v11, v01)))
+                }
+            }
         }
         func rod(_ a: Int, _ b: Int) {
             // stiff soft spring: VBD solves these implicitly without the

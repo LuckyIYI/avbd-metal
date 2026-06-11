@@ -610,6 +610,87 @@ extension PushTPipeline {
 
 // MARK: - Behavior cloning (pixels -> action, oracle demonstrations)
 
+extension PushTPipeline {
+    /// DAgger round: drive envs with the CURRENT policy (pixels-only), but
+    /// record the ORACLE's label at every step. Fixes compounding drift by
+    /// covering the states the policy actually visits. Appends to the
+    /// existing dataset (same env-grid layout, steps extended).
+    public static func collectDagger(envs numEnvs: Int, steps: Int,
+                                     path: String, policyPath: String,
+                                     latent: Int = 192, seed: UInt64 = 77) throws {
+        let meta = try String(contentsOfFile: "\(path)/meta.txt", encoding: .utf8)
+            .split(separator: " ").map { Int($0)! }
+        precondition(meta[0] == numEnvs, "DAgger must reuse the env count (\(meta[0]))")
+        let res = meta[2]
+
+        let policy = BCPolicy(latent: latent)
+        let weights = try loadArrays(url: URL(fileURLWithPath: "\(policyPath)/bc.safetensors"))
+        try policy.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(policy)
+
+        let env = try PushTEnv(numEnvs: numEnvs, seed: seed)
+        var rng = SplitMix64(seed: seed &+ 5)
+        var obsData = Data()
+        var actData = Data()
+        var stateData = Data()
+        var targets = (0..<numEnvs).map { _ in SIMD2<Float>(1.4, 0) }
+        var prev = [UInt8](env.observations())
+        for _ in 0..<10 { env.step(actions: targets) }
+
+        for t in 0..<steps {
+            let curBuf = [UInt8](env.observations())
+            if t % 8 == 0 {
+                // policy actions from pixels (batch all envs)
+                let pf = MLXArray(prev).reshaped([numEnvs, res, res, 3]).asType(.float32) / 255.0
+                let cf = MLXArray(curBuf).reshaped([numEnvs, res, res, 3]).asType(.float32) / 255.0
+                let acts = policy(concatenated([pf, cf], axis: 3))
+                eval(acts)
+                for e in 0..<numEnvs {
+                    if rng.nextFloat() < 0.10 {
+                        targets[e] = env.oracleAction(e)   // safety mix
+                    } else {
+                        targets[e] = SIMD2(acts[e, 0].item(Float.self) * 3,
+                                           acts[e, 1].item(Float.self) * 3)
+                    }
+                    if env.success(e) { env.reset(e, seed: rng.next()) }
+                }
+            }
+            obsData.append(contentsOf: curBuf)
+            for e in 0..<numEnvs {
+                // the LABEL is always the oracle's choice for this state
+                var label = env.oracleAction(e) / 3.0
+                withUnsafeBytes(of: &label) { actData.append(contentsOf: $0) }
+                let (bp, byaw) = env.blockPose(e)
+                let tp = env.tipPos(e)
+                var st: [Float] = [bp.x, bp.y, sin(byaw), cos(byaw), tp.x, tp.y]
+                st.withUnsafeBytes { stateData.append(contentsOf: $0) }
+            }
+            prev = curBuf
+            env.step(actions: targets)
+            if t % 100 == 0 { print("dagger step \(t)/\(steps)") }
+        }
+        // append. NOTE: the base collector writes one trailing extra obs
+        // block (the final next-obs) — truncate it first or every appended
+        // index is off by one step-block.
+        let frameBytes = res * res * 3
+        let obsH = FileHandle(forWritingAtPath: "\(path)/obs.bin")!
+        obsH.truncateFile(atOffset: UInt64(meta[1] * numEnvs * frameBytes))
+        obsH.seekToEndOfFile()
+        obsH.write(obsData)
+        obsH.closeFile()
+        for (file, data) in [("act.bin", actData), ("state.bin", stateData)] {
+            let h = FileHandle(forWritingAtPath: "\(path)/\(file)")!
+            h.seekToEndOfFile()
+            h.write(data)
+            h.closeFile()
+        }
+        let newSteps = meta[1] + steps
+        try "\(numEnvs) \(newSteps) \(res)".write(toFile: "\(path)/meta.txt",
+                                                   atomically: true, encoding: .utf8)
+        print("DAgger appended \(numEnvs * steps) labeled transitions (total steps \(newSteps))")
+    }
+}
+
 /// Goal-conditioned visuomotor policy: the LeWM encoder architecture with an
 /// action head. Pixels in, action out — no privileged state at inference.
 public final class BCPolicy: Module {

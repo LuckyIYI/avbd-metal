@@ -27,6 +27,16 @@ public struct SimParamsGPU {
     public var lambdaMax: Float = 1.0e6
     public var iterations: UInt32 = 0
     public var numTets: UInt32 = 0
+    // --- cloth / element pipeline (mirrors 00_common.metal) ---
+    public var numTris: UInt32 = 0
+    public var numEdges: UInt32 = 0
+    public var numParticles: UInt32 = 0
+    public var maxSoft: UInt32 = 0
+    public var softMapCapacity: UInt32 = 0
+    public var numMembranes: UInt32 = 0
+    public var numBends: UInt32 = 0
+    public var elemCellSize: Float = 1.0
+    public var elemHashSize: UInt32 = 0
 }
 
 public struct JointGPU {
@@ -50,6 +60,28 @@ public struct TetGPU {
     public var r0: SIMD4<Float> = .zero
     public var r1: SIMD4<Float> = .zero
     public var r2: SIMD4<Float> = .zero
+}
+
+public struct SoftContactGPU {
+    public var ids: SIMD4<UInt32> = .zero
+    public var normal: SIMD4<Float> = .zero
+    public var anchorA: SIMD4<Float> = .zero
+    public var weights: SIMD4<Float> = .zero
+    public var C0: SIMD4<Float> = .zero
+    public var lambda: SIMD4<Float> = .zero
+    public var penalty: SIMD4<Float> = .zero
+}
+
+public struct MembraneGPU {
+    public var ids: SIMD4<UInt32> = .zero
+    public var dm: SIMD4<Float> = .zero
+    public var mat: SIMD4<Float> = .zero
+}
+
+public struct BendGPU {
+    public var ids: SIMD4<UInt32> = .zero
+    public var K: SIMD4<Float> = .zero
+    public var mat: SIMD4<Float> = .zero
 }
 
 public struct SpringGPU {
@@ -80,6 +112,7 @@ public struct ManifoldGPU {
 // Counter layout (must match 00_common.metal)
 public enum GPUCounters {
     public static let pairs = 0
+    public static let soft = 1
     public static let colorBase = 8
     public static let total = 8 + 2 * AVBD_MAX_COLORS
 }

@@ -22,13 +22,22 @@ using namespace metal;
 #define SHAPE_PARTICLE  0x10u
 #define MAX_CONTACTS 8
 
-// Force kinds packed into adjacency entries (top 3 bits)
+// Force kinds packed into adjacency entries (top 4 bits)
 #define FK_JOINT 0u
 #define FK_SPRING 1u
 #define FK_MANIFOLD 2u
 #define FK_TET 3u
+#define FK_SOFT 4u          // element contact (V-T / E-E / rigid-T): 4-slot stencil
+#define FK_MEMBRANE 5u      // StVK triangle membrane element
+#define FK_BEND 6u          // quadratic (Bergou) bending element
 #define ADJ_KIND_SHIFT 28
 #define ADJ_INDEX_MASK 0x0FFFFFFFu
+
+// Soft-contact kinds (stored in SoftContactGPU flags)
+#define SC_VT 1u            // particle vertex vs cloth triangle
+#define SC_RT 2u            // rigid feature point vs cloth triangle
+#define SC_EE 3u            // cloth edge vs cloth edge
+#define SC_RE 4u            // rigid edge point vs cloth edge
 
 #define WORLD_BODY 0xFFFFFFFFu
 
@@ -228,6 +237,16 @@ struct SimParams {
     float lambdaMax;        // dual variable bound (paper Sec 4)
     uint iterations;        // solver iterations (persistent kernel path)
     uint numTets;
+    // --- cloth / element pipeline ---
+    uint numTris;           // cloth triangles (contact surface elements)
+    uint numEdges;          // unique cloth mesh edges (E-E contacts)
+    uint numParticles;      // entries in particleIdx (V-T query points)
+    uint maxSoft;           // soft contact capacity
+    uint softMapCapacity;   // soft persistence map size (pow2)
+    uint numMembranes;      // StVK membrane elements
+    uint numBends;          // quadratic bending elements
+    float elemCellSize;     // element grid cell size (>= 2x max element radius)
+    uint elemHashSize;      // element grid hash size (pow2)
 };
 
 struct JointGPU {
@@ -262,6 +281,40 @@ struct TetGPU {
     float4 r2;          // DmInv row 2; w = lambda * volume
 };
 
+// Element contact (V-T, E-E, rigid-feature-vs-element). ONE record per
+// contact point, up to 4 participating bodies with signed weights:
+//   C = C0 (1-alpha) + sum_i w_i [n|t1|t2] . dq_i  (+ slot-0 angular terms
+//   when slot 0 is a rigid body). Same bounded-dual / ramped-penalty /
+//   warm-start treatment as rigid manifold contacts.
+struct SoftContactGPU {
+    uint4 ids;          // body slots; WORLD_BODY = unused slot
+    float4 normal;      // xyz = contact normal (pushes slot 0 along +n), w = friction
+    float4 anchorA;     // xyz = slot-0 LOCAL anchor (rigid slot 0 only); w = flag bits
+    float4 weights;     // signed weight per slot (gradient_i = w_i * basis row)
+    float4 C0;          // xyz = (n,t1,t2) constraint at detection; w = lambda cap
+    float4 lambda;      // xyz = duals; w = persistence key A (bits)
+    float4 penalty;     // xyz = penalties; w = persistence key B (bits)
+};
+// anchorA.w flag bits
+#define SCF_RIGID_A 1u      // slot 0 is a 6-DOF rigid body (use anchorA)
+#define SCF_SIDE_NEG 2u     // sign memory: vertex started on -triN side
+#define SCF_KIND_SHIFT 2    // bits 2.. = SC_* kind
+
+// StVK triangle membrane element over 3 particles (phase: real elements).
+struct MembraneGPU {
+    uint4 ids;          // 3 particle indices + pad
+    float4 dm;          // inverse rest-shape 2x2 (column major: a c / b d)
+    float4 mat;         // x = mu*area, y = lambda*area, z = area
+};
+
+// Quadratic (Bergou) bending element: rank-1 Hessian K K^T * s over the
+// 4-vertex hinge stencil of an interior edge. Constant, SPD, isotropic.
+struct BendGPU {
+    uint4 ids;          // x0, x1 = edge ends; x2, x3 = opposite vertices
+    float4 K;           // cotangent coefficient vector
+    float4 mat;         // x = 3*kappa/(A1+A2)
+};
+
 struct ContactGPU {
     float4 rA;          // w = featureKey (as bits)
     float4 rB;          // w = stick flag
@@ -279,6 +332,7 @@ struct ManifoldGPU {
 
 // Counters layout (single uint buffer)
 #define CTR_PAIRS 0
+#define CTR_SOFT 1                 // element (soft) contact count
 #define CTR_COLOR_BASE 8           // MAX_COLORS entries
 #define CTR_SCATTER_BASE (8 + MAX_COLORS)  // MAX_COLORS scatter cursors
 #define CTR_TOTAL (8 + 2 * MAX_COLORS)
