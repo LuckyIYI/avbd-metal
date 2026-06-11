@@ -153,7 +153,9 @@ public enum PushTPipeline {
     // ---------------- training ----------------
     public static func train(dataPath: String, iters: Int, batch: Int = 256,
                              latent: Int = 128, lr: Float = 3e-4,
-                             lambda: Float = 0.5, modelPath: String) throws {
+                             lambda: Float = 0.5, modelPath: String,
+                             member: Int = -1) throws {
+        if member >= 0 { MLXRandom.seed(UInt64(1234 + member * 777)) }
         let meta = try String(contentsOfFile: "\(dataPath)/meta.txt", encoding: .utf8)
             .split(separator: " ").map { Int($0)! }
         let (numEnvs, steps, res) = (meta[0], meta[1], meta[2])
@@ -256,15 +258,39 @@ public enum PushTPipeline {
         try FileManager.default.createDirectory(atPath: modelPath, withIntermediateDirectories: true)
         let flat = Dictionary(uniqueKeysWithValues:
             model.parameters().flattened().map { ($0.0, $0.1) })
-        try save(arrays: flat, url: URL(fileURLWithPath: "\(modelPath)/lewm.safetensors"))
-        print("model saved -> \(modelPath)/lewm.safetensors")
+        let name = member >= 0 ? "lewm-\(member).safetensors" : "lewm.safetensors"
+        try save(arrays: flat, url: URL(fileURLWithPath: "\(modelPath)/\(name)"))
+        print("model saved -> \(modelPath)/\(name)")
     }
 
     // ---------------- planning (latent MPC with CEM) ----------------
     public static func solve(modelPath: String, episodes: Int, seed: UInt64 = 11,
                              latent: Int = 128, debug: Bool = false,
                              oracleNull: Bool = false) throws {
-        let model = LeWorldModel(latent: latent, stack: 2)
+        // load an ensemble if present (lewm-0/1/2...), else the single model.
+        // Disagreement across independently-initialized models marks the OOD
+        // regions the planner exploits (PETS-style epistemic penalty).
+        var models: [LeWorldModel] = []
+        for m in 0..<5 {
+            let url = URL(fileURLWithPath: "\(modelPath)/lewm-\(m).safetensors")
+            guard FileManager.default.fileExists(atPath: url.path) else { break }
+            let mm = LeWorldModel(latent: latent, stack: 2)
+            try mm.update(parameters: ModuleParameters.unflattened(try loadArrays(url: url)),
+                          verify: [.all])
+            eval(mm)
+            models.append(mm)
+        }
+        let model: LeWorldModel
+        if models.isEmpty {
+            print("(single model)")
+            model = LeWorldModel(latent: latent, stack: 2)
+            let weights = try loadArrays(url: URL(fileURLWithPath: "\(modelPath)/lewm.safetensors"))
+            try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+            eval(model)
+        } else {
+            print("(ensemble of \(models.count))")
+            model = models[0]
+        }
         // belief decoder (probe ridge matrix), for debug introspection only
         let probeW = try? loadArrays(url: URL(fileURLWithPath: "\(modelPath)/probe.safetensors"))["W"]
         func decodeBlock(_ z: MLXArray) -> SIMD2<Float> {
@@ -274,9 +300,6 @@ public enum PushTPipeline {
             eval(st)
             return SIMD2(st[0, 0].item(Float.self), st[0, 1].item(Float.self))
         }
-        let weights = try loadArrays(url: URL(fileURLWithPath: "\(modelPath)/lewm.safetensors"))
-        try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
-        eval(model)
 
         var successes = 0
         for ep in 0..<episodes {
@@ -303,11 +326,15 @@ public enum PushTPipeline {
                                          PushTEnv.tipHeight)
             env.solver.setBodyPose(r.tip, position: tipGoalP, rotation: savedTip.1)
             let g = obsArray(env, res)
-            let goalZs = [model.encoder(concatenated([g, g], axis: 3))]
+            let gStack = concatenated([g, g], axis: 3)
+            // each ensemble member lives in its OWN latent space: encode the
+            // goal separately per member
+            let goalZs = models.isEmpty ? [model.encoder(gStack)]
+                                        : models.map { $0.encoder(gStack) }
             env.solver.setBodyPose(r.tip, position: savedTip.0, rotation: savedTip.1)
-            let zGoal = mean(concatenated(goalZs.map { $0.expandedDimensions(axis: 0) },
-                                          axis: 0), axis: 0)
-            eval(zGoal)
+            let zGoalList = goalZs
+            let zGoal = goalZs[0]
+            for z in zGoalList { eval(z) }
             env.solver.setBodyPose(r.blockBar, position: savedBar.0, rotation: savedBar.1)
             env.solver.setBodyPose(r.blockStem, position: savedStem.0, rotation: savedStem.1)
 
@@ -321,7 +348,10 @@ public enum PushTPipeline {
             var prevFrame = obsArray(env, res)
             for _ in 0..<60 {                       // planning steps
                 let curFrame = obsArray(env, res)
-                let z0 = model.encoder(concatenated([prevFrame, curFrame], axis: 3))
+                let curStack = concatenated([prevFrame, curFrame], axis: 3)
+                let z0List = models.isEmpty ? [model.encoder(curStack)]
+                                            : models.map { $0.encoder(curStack) }
+                let z0 = z0List[0]
                 // HYBRID PLANNER (PLDM-style): CEM seeds a coarse solution,
                 // then GRADIENT DESCENT through the smooth predictor refines
                 // it — sampling alone cannot localize contact-making plans,
@@ -330,6 +360,25 @@ public enum PushTPipeline {
                 func planCost(_ acts: MLXArray) -> MLXArray {
                     // acts: (B, horizon, 2) in [-1, 1]
                     let B = acts.dim(0)
+                    if models.count >= 2 {
+                        // ensemble: each member rolls out in ITS OWN latent
+                        // space (own z0, own goal); disagreement across the
+                        // per-member costs marks epistemic uncertainty
+                        var dists = [MLXArray]()
+                        for (mi, mm) in models.enumerated() {
+                            var z = tiled(z0List[mi], repetitions: [B, 1])
+                            var c = MLXArray.zeros([B])
+                            for h in 0..<horizon {
+                                z = mm.predictor(z, acts[0..., h, 0...])
+                                let d = mean((z - zGoalList[mi]).square(), axis: -1)
+                                c = c + d * (h == horizon - 1 ? 2.0 : 0.3)
+                                c = c + abs(mean(z.square(), axis: -1) - 1.0) * 1.5
+                            }
+                            dists.append(c)
+                        }
+                        let stackC = concatenated(dists.map { $0.expandedDimensions(axis: 0) }, axis: 0)
+                        return mean(stackC, axis: 0) + sqrt(variance(stackC, axis: 0)) * 2.0
+                    }
                     var z = tiled(z0, repetitions: [B, 1])
                     var cost = MLXArray.zeros([B])
                     for h in 0..<horizon {

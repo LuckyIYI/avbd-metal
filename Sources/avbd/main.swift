@@ -147,9 +147,19 @@ case "collect":
 
 case "train-wm":
     let o = parseOptions(Array(args.dropFirst(1)))
-    try PushTPipeline.train(dataPath: "runs/pusht/data", iters: o.frames,
-                            batch: o.batch, latent: o.latent, lr: o.lr,
-                            lambda: o.lambda, modelPath: "runs/pusht/model")
+    if args.contains("--ensemble") {
+        for m in 0..<3 {
+            print("=== ensemble member \(m) ===")
+            try PushTPipeline.train(dataPath: "runs/pusht/data", iters: o.frames,
+                                    batch: o.batch, latent: o.latent, lr: o.lr,
+                                    lambda: o.lambda, modelPath: "runs/pusht/model",
+                                    member: m)
+        }
+    } else {
+        try PushTPipeline.train(dataPath: "runs/pusht/data", iters: o.frames,
+                                batch: o.batch, latent: o.latent, lr: o.lr,
+                                lambda: o.lambda, modelPath: "runs/pusht/model")
+    }
 
 case "probe-wm":
     let o = parseOptions(Array(args.dropFirst(1)))
