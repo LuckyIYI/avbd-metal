@@ -150,6 +150,30 @@ final class ClothTests: XCTestCase {
         XCTAssertLessThan(stretch, 0.02, "rods stay inextensible while whipping")
     }
 
+    /// Gate 4: tets + membrane cloth + rigid bodies in ONE unified solve,
+    /// stable at 20 iterations. Everything must come to rest with the cloth
+    /// draped over the soft block and the rigids resting on top.
+    func testCombinedTetClothRigidStable() throws {
+        let scene = Demos.clothcombo(res: 16)
+        XCTAssertEqual(scene.settings.iterations, 20)
+        let gpu = try GPUSolver(scene: scene)
+        for _ in 0..<600 { gpu.step() }
+        var ke: Float = 0
+        for b in 0..<scene.bodies.count where scene.bodies[b].isParticle {
+            ke += 0.5 * gpu.bodyMass(b) * length_squared(gpu.bodyVelocity(b))
+        }
+        XCTAssertLessThan(ke, 0.2, "combined scene must settle (KE \(ke))")
+        let (gap, stretch) = gpu.debugClothMetrics()
+        XCTAssertGreaterThan(gap, -0.06, "no cloth self-penetration in the pile")
+        XCTAssertLessThan(stretch, 0.02, "membrane cloth holds its weave")
+        // the dropped rigids must rest on the stack, not inside the ground
+        for b in (scene.bodies.count - 2)..<scene.bodies.count {
+            let p = gpu.bodyPosition(b)
+            XCTAssertGreaterThan(p.z, 0.1, "rigid body \(b) rests above ground")
+            XCTAssertLessThan(length(gpu.bodyVelocity(b)), 0.2, "rigid at rest")
+        }
+    }
+
     /// The drape must come to rest (the energy-injection regression test:
     /// stale color bounds / unbounded duals made piles thrash at m/s).
     func testDrapeSettles() throws {
