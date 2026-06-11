@@ -417,6 +417,14 @@ kernel void np_collide(
                 if (bestJ >= 0) {
                     lambda = pm.contacts[bestJ].lambda.xyz;
                     penalty = pm.contacts[bestJ].penalty.xyz;
+                    // transport the tangential dual into the new basis:
+                    // proximity-matched contacts slide around round shapes,
+                    // and a rotated basis misdirects the carried friction
+                    float3 t1o = pm.basisT1.xyz;
+                    float3 t2o = cross(pm.basisN.xyz, t1o);
+                    float3 lt = t1o * lambda.y + t2o * lambda.z;
+                    lambda.y = dot(t1, lt);
+                    lambda.z = dot(t2, lt);
                 }
             }
             float3 d = xAw - xBw;
@@ -623,6 +631,11 @@ kernel void np_collide(
                 if (bestJ >= 0) {
                     lambda = pm.contacts[bestJ].lambda.xyz;
                     penalty = pm.contacts[bestJ].penalty.xyz;
+                    float3 t1o = pm.basisT1.xyz;
+                    float3 t2o = cross(pm.basisN.xyz, t1o);
+                    float3 lt = t1o * lambda.y + t2o * lambda.z;
+                    lambda.y = dot(t1, lt);
+                    lambda.z = dot(t2, lt);
                 }
             }
             float3 d = xAw - xBw;
@@ -735,7 +748,11 @@ kernel void np_collide(
             if (prevIdx >= 0) {
                 // proximity match (see torus tail): inherit nearest previous
                 // contact's dual state; no stick-anchor restoration for
-                // rolling shapes.
+                // rolling shapes — EXCEPT particles: they carry no rotation,
+                // so their world-offset anchors cannot swing. Without the
+                // anchors, particles never latch static friction and creep
+                // forever under any standing tangential load (cloth corners
+                // pulled by a draped skirt jitter perpetually).
                 device const ManifoldGPU& pm = prevManifolds[prevIdx];
                 uint pn = pm.header.z;
                 float bestD = 0.5f * max(rA, rB);
@@ -747,6 +764,20 @@ kernel void np_collide(
                 if (bestJ >= 0) {
                     lambda = pm.contacts[bestJ].lambda.xyz;
                     penalty = pm.contacts[bestJ].penalty.xyz;
+                    float3 t1o = pm.basisT1.xyz;
+                    float3 t2o = cross(pm.basisN.xyz, t1o);
+                    float3 lt = t1o * lambda.y + t2o * lambda.z;
+                    lambda.y = dot(t1, lt);
+                    lambda.z = dot(t2, lt);
+                    bool partA = shape[ia].w < 0.0f;
+                    bool partB = shape[ib].w < 0.0f;
+                    if ((partA || !sphA) && (partB || !sphB)) {
+                        stick = pm.contacts[bestJ].rB.w;
+                        if (stick != 0.0f) {
+                            rA_ = pm.contacts[bestJ].rA.xyz;
+                            rB_ = pm.contacts[bestJ].rB.xyz;
+                        }
+                    }
                 }
             }
             float3 xAw = sphA ? pA4.xyz + rA_ : xform(pA4.xyz, qA, rA_);

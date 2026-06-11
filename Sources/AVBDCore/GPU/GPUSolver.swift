@@ -536,7 +536,7 @@ public final class GPUSolver {
         params.elemCellSize = max(0.2, 2 * maxElemR * 1.5)
         params.elemHashSize = UInt32(elemHashSize)
         params.numTris = UInt32(numTris)
-        params.numEdges = 0          // E-E detection lands in phase 3
+        params.numEdges = UInt32(numEdges)
         params.numParticles = UInt32(numParticles)
         params.maxSoft = UInt32(maxSoft)
         params.softMapCapacity = UInt32(softMapCapacity)
@@ -583,6 +583,11 @@ public final class GPUSolver {
         params.gamma = settings.gamma
         params.lambdaMax = settings.lambdaMax
         params.iterations = UInt32(settings.iterations)
+        params.rodDecayPow = settings.rodDecayPow
+        if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
+           let v = Float(env) {
+            params.rodDecayPow = v
+        }
     }
 
     private func dispatch1D(_ enc: MTLComputeCommandEncoder, _ name: String, _ count: Int,
@@ -862,6 +867,23 @@ public final class GPUSolver {
     /// Endpoints of the worst stiff spring from the last debugClothMetrics call.
     public private(set) var lastWorstSpring: (Int, Int) = (-1, -1)
 
+    /// Count live soft contacts by kind (VT, RT, EE) — CPU read.
+    public func debugSoftKinds() -> (vt: Int, rt: Int, ee: Int) {
+        sync()
+        let ctr = counters.contents().bindMemory(to: UInt32.self, capacity: GPUCounters.total)
+        // step() swapped buffers; the contacts of the LAST step live in prev
+        let n = min(Int(ctr[GPUCounters.soft]), maxSoft)
+        let sc = prevSoftContacts.contents().bindMemory(to: SoftContactGPU.self,
+                                                        capacity: max(1, maxSoft))
+        var vt = 0, rt = 0, ee = 0
+        for i in 0..<n {
+            let kind = (sc[i].anchorA.w.bitPattern >> 2) & 0x7
+            if kind == 1 { vt += 1 } else if kind == 2 { rt += 1 }
+            else if kind == 3 { ee += 1 }
+        }
+        return (vt, rt, ee)
+    }
+
     /// Wait for all committed steps (no-op when already complete).
     public func sync() {
         for c in inflight { c.waitUntilCompleted() }
@@ -1066,6 +1088,28 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 18)
             }
             }
+            if ProcessInfo.processInfo.environment["AVBD_NO_EE"] == nil {
+            dispatch1D(enc, "ee_emit", numEdges) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.shape, offset: 0, index: 1)
+                e.setBuffer(self.props, offset: 0, index: 2)
+                e.setBuffer(self.velLin, offset: 0, index: 3)
+                e.setBuffer(self.edgesBuf, offset: 0, index: 4)
+                e.setBuffer(self.elemCellStart, offset: 0, index: 5)
+                e.setBuffer(self.elemCellCount, offset: 0, index: 6)
+                e.setBuffer(self.elemCells, offset: 0, index: 7)
+                e.setBuffer(self.nbrStart, offset: 0, index: 8)
+                e.setBuffer(self.nbrCount, offset: 0, index: 9)
+                e.setBuffer(self.nbrList, offset: 0, index: 10)
+                e.setBuffer(self.softContacts, offset: 0, index: 11)
+                e.setBuffer(self.counters, offset: 0, index: 12)
+                e.setBuffer(self.prevSoftContacts, offset: 0, index: 13)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 14)
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 15)
+                e.setBuffer(self.softMapVal, offset: 0, index: 16)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 17)
+            }
+            }
             if ProcessInfo.processInfo.environment["AVBD_NO_RT"] == nil {
             dispatch1D(enc, "rt_emit", numTris) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -1117,6 +1161,7 @@ public final class GPUSolver {
             e.setBuffer(self.joints, offset: 0, index: 2)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 3)
             e.setBuffer(self.springs, offset: 0, index: 4)
+            e.setBuffer(self.velLin, offset: 0, index: 5)
         }
         dispatch1D(enc, "warmstart_bodies", numBodies) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)

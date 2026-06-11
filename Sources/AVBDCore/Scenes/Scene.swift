@@ -166,6 +166,10 @@ public struct SimSettings {
     /// accumulation when conflicting contacts cannot all be satisfied
     /// (e.g. wedged chainmail links). Large = effectively off.
     public var lambdaMax: Float = 1.0e6
+    /// Hard-rod dual decay exponent vs per-frame rod rotation (0 = off).
+    /// Carried lambda re-applied along rotated rod directions pumps the
+    /// pendulum modes of swinging sheets.
+    public var rodDecayPow: Float = 0
 
     public init() {}
 }

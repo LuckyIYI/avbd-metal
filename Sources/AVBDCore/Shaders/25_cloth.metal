@@ -13,7 +13,7 @@ using namespace metal;
 
 #define VT_MAX_PER_VERTEX 4u
 #define RT_MAX_PER_TRI 4u
-#define EE_MAX_PER_EDGE 2u
+#define EE_MAX_PER_EDGE 4u
 #define ELEM_EDGE_BIT 0x80000000u
 // E-E contacts only when both closest points are interior (endpoints are
 // covered by V-T); standard culling threshold.
@@ -193,7 +193,7 @@ inline void softEmit(device SoftContactGPU* soft,
                      constant SimParams& P,
                      uint4 ids, float4 weights,
                      float3 n, float friction, float3 anchorA,
-                     float C0n, float lamCap,
+                     float C0n, float lamCap, float minMass,
                      uint kind, bool rigidA, bool roundA, bool sideNeg,
                      uint keyA, uint keyB)
 {
@@ -203,8 +203,22 @@ inline void softEmit(device SoftContactGPU* soft,
     if (prev >= 0) {
         lam = prevSoft[prev].lambda.xyz * (P.alpha * P.gamma);
         pen = prevSoft[prev].penalty.xyz;
+        // transport the tangential dual between the old and new bases:
+        // contact normals rotate as cloth slides/folds, and a stale basis
+        // misdirects the carried friction every frame
+        float3 nOld = prevSoft[prev].normal.xyz;
+        float3 t1o, t2o, t1n, t2n;
+        orthonormal(nOld, t1o, t2o);
+        orthonormal(n, t1n, t2n);
+        float3 lt = t1o * lam.y + t2o * lam.z;
+        lam.y = dot(t1n, lt);
+        lam.z = dot(t2n, lt);
     }
-    pen = clamp(pen * P.gamma, PENALTY_MIN, PENALTY_MAX);
+    // Mass-aware floor: a brand-new contact at PENALTY_MIN=1 is invisible
+    // to a gram particle being dragged through in one frame; m/dt^2 makes
+    // the first iteration already deflect the approach without shock.
+    float penFloor = max(PENALTY_MIN, minMass / (P.dt * P.dt));
+    pen = clamp(pen * P.gamma, penFloor, PENALTY_MAX);
 
     uint slot = atomic_fetch_add_explicit(&counters[CTR_SOFT], 1u, memory_order_relaxed);
     if (slot >= P.maxSoft) return;
@@ -352,8 +366,139 @@ kernel void vt_emit(
                      float4(1.0f, -bary.x, -bary.y, -bary.z),
                      n, friction, float3(0),
                      g - hSum + COLLISION_MARGIN,
-                     softLambdaCap(P, minMass),
+                     softLambdaCap(P, minMass), minMass,
                      SC_VT, false, false, sMem < 0.0f, keyA, keyB);
+            emitted++;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// E-E: one thread per edge, scanning the element grid for other edges.
+// Interior-only (endpoint regions are covered by V-T), 1.5-ring exclusion
+// (rest clearances between near-topology edges sit at the contact skin).
+// ----------------------------------------------------------------------------
+inline void eeClosestSegSeg(float3 p0, float3 p1, float3 q0, float3 q1,
+                            thread float& s, thread float& t)
+{
+    float3 d1 = p1 - p0, d2 = q1 - q0, r = p0 - q0;
+    float a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
+    s = 0.0f; t = 0.0f;
+    if (a <= 1e-12f && e <= 1e-12f) return;
+    if (a <= 1e-12f) { t = clamp(f / e, 0.0f, 1.0f); return; }
+    float c = dot(d1, r);
+    if (e <= 1e-12f) { s = clamp(-c / a, 0.0f, 1.0f); return; }
+    float b = dot(d1, d2);
+    float denom = a * e - b * b;
+    if (fabs(denom) > 1e-12f) s = clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+    t = (b * s + f) / e;
+    if (t < 0.0f) { t = 0.0f; s = clamp(-c / a, 0.0f, 1.0f); }
+    else if (t > 1.0f) { t = 1.0f; s = clamp((b - c) / a, 0.0f, 1.0f); }
+}
+
+kernel void ee_emit(
+    device const float4* posLin     [[buffer(0)]],
+    device const float4* shape      [[buffer(1)]],
+    device const float4* props      [[buffer(2)]],
+    device const float4* velLin     [[buffer(3)]],
+    device const uint2* edges       [[buffer(4)]],
+    device const uint* elemCellStart [[buffer(5)]],
+    device const uint* elemCellCount [[buffer(6)]],
+    device const uint* cellElems    [[buffer(7)]],
+    device const uint* nbrStart     [[buffer(8)]],
+    device const uint* nbrCount     [[buffer(9)]],
+    device const uint* nbrList      [[buffer(10)]],
+    device SoftContactGPU* soft     [[buffer(11)]],
+    device atomic_uint* counters    [[buffer(12)]],
+    device const SoftContactGPU* prevSoft [[buffer(13)]],
+    device const atomic_uint* mapKeyA [[buffer(14)]],
+    device const uint* mapKeyB      [[buffer(15)]],
+    device const uint* mapVal       [[buffer(16)]],
+    constant SimParams& P           [[buffer(17)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= P.numEdges) return;
+    uint2 eA = edges[gid];
+    float3 a0 = posLin[eA.x].xyz, a1 = posLin[eA.y].xyz;
+    float3 mid = (a0 + a1) * 0.5f;
+    float rA = max(fabs(shape[eA.x].w), fabs(shape[eA.y].w));
+    float3 velA = (velLin[eA.x].xyz + velLin[eA.y].xyz) * 0.5f;
+    uint nsx = nbrStart[eA.x], nex = nsx + nbrCount[eA.x];
+    uint nsy = nbrStart[eA.y], ney = nsy + nbrCount[eA.y];
+
+    int3 cc = cellCoord(mid, P.elemCellSize);
+    uint emitted = 0;
+    for (int dz = -1; dz <= 1 && emitted < EE_MAX_PER_EDGE; dz++)
+    for (int dy = -1; dy <= 1 && emitted < EE_MAX_PER_EDGE; dy++)
+    for (int dx = -1; dx <= 1 && emitted < EE_MAX_PER_EDGE; dx++) {
+        uint h = cellHash(cc + int3(dx, dy, dz), P.elemHashSize);
+        uint s0 = elemCellStart[h], e0 = s0 + elemCellCount[h];
+        for (uint k = s0; k < e0 && emitted < EE_MAX_PER_EDGE; k++) {
+            uint entry = cellElems[k];
+            if (!(entry & ELEM_EDGE_BIT)) continue;
+            uint eBi = entry & ~ELEM_EDGE_BIT;
+            if (eBi <= gid) continue;               // each pair once
+            uint2 eB = edges[eBi];
+            // topological exclusion: shared vertex or 1.5-ring
+            if (eB.x == eA.x || eB.x == eA.y || eB.y == eA.x || eB.y == eA.y) continue;
+            if (nbrContains(nbrList, nsx, nex, eB.x) ||
+                nbrContains(nbrList, nsx, nex, eB.y) ||
+                nbrContains(nbrList, nsy, ney, eB.x) ||
+                nbrContains(nbrList, nsy, ney, eB.y)) continue;
+
+            float3 b0 = posLin[eB.x].xyz, b1 = posLin[eB.y].xyz;
+            float s, t;
+            eeClosestSegSeg(a0, a1, b0, b1, s, t);
+            // interior only: endpoint closest points are V-T territory
+            if (s < EE_INTERIOR_EPS || s > 1.0f - EE_INTERIOR_EPS ||
+                t < EE_INTERIOR_EPS || t > 1.0f - EE_INTERIOR_EPS) continue;
+
+            float3 cA = a0 + (a1 - a0) * s;
+            float3 cB = b0 + (b1 - b0) * t;
+            float3 d = cA - cB;
+            float dist = length(d);
+            float rB = max(fabs(shape[eB.x].w), fabs(shape[eB.y].w));
+            float hSum = rA + rB;
+            float3 velB = (velLin[eB.x].xyz + velLin[eB.y].xyz) * 0.5f;
+            float inflate = min(length(velA - velB) * P.dt, 0.3f * P.elemCellSize);
+            if (dist - hSum > COLLISION_MARGIN + inflate) continue;
+            if (dist < 1e-7f) continue;             // degenerate: let V-T handle
+
+            float3 nGeo = d / dist;
+            uint keyA = (SC_EE << 28) | gid;
+            uint keyB = eBi;
+            // Normal continuity is the sign memory here (no face to lean
+            // on): a flip vs the stored normal means the edges crossed —
+            // eject back through. Self-consistent: while crossed, the
+            // stored (ejection) normal keeps disagreeing with geometry.
+            float g = dist;
+            float3 n = nGeo;
+            int prev = softMapFind(mapKeyA, mapKeyB, mapVal, P.softMapCapacity,
+                                   keyA, keyB);
+            if (prev >= 0 && dot(nGeo, prevSoft[prev].normal.xyz) < 0.0f) {
+                n = -nGeo;
+                g = -dist;
+            }
+
+            float fric = sqrt(max(
+                (props[eA.x].w + props[eA.y].w) * 0.5f *
+                (props[eB.x].w + props[eB.y].w) * 0.5f, 0.0f));
+            float minMass = FLT_MAX;
+            float m0 = posLin[eA.x].w, m1 = posLin[eA.y].w;
+            float m2 = posLin[eB.x].w, m3 = posLin[eB.y].w;
+            if (m0 > 0.0f) minMass = min(minMass, m0);
+            if (m1 > 0.0f) minMass = min(minMass, m1);
+            if (m2 > 0.0f) minMass = min(minMass, m2);
+            if (m3 > 0.0f) minMass = min(minMass, m3);
+            if (minMass == FLT_MAX) continue;
+
+            softEmit(soft, counters, prevSoft, mapKeyA, mapKeyB, mapVal, P,
+                     uint4(eA.x, eA.y, eB.x, eB.y),
+                     float4(1.0f - s, s, -(1.0f - t), -t),
+                     n, fric, float3(0),
+                     g - hSum + COLLISION_MARGIN,
+                     softLambdaCap(P, minMass), minMass,
+                     SC_EE, false, false, false, keyA, keyB);
             emitted++;
         }
     }
@@ -517,7 +662,7 @@ kernel void rt_emit(
                              float4(1.0f, -bary.x, -bary.y, -bary.z),          \
                              n, friction, anchor,                              \
                              g - hSum + COLLISION_MARGIN,                      \
-                             softLambdaCap(P, minMass),                        \
+                             softLambdaCap(P, minMass), minMass,               \
                              SC_RT, true, roundA, sMem < 0.0f, keyA, keyB);    \
                     emitted++;                                                 \
                 }                                                              \

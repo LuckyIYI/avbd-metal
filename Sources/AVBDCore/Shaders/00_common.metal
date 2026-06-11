@@ -247,6 +247,9 @@ struct SimParams {
     uint numBends;          // quadratic bending elements
     float elemCellSize;     // element grid cell size (>= 2x max element radius)
     uint elemHashSize;      // element grid hash size (pow2)
+    // Hard-rod lambda decay vs per-frame rod rotation: lambda *= cos(dtheta)^p.
+    // 0 = off. Carried duals along rotated directions pump pendulum modes.
+    float rodDecayPow;
 };
 
 struct JointGPU {

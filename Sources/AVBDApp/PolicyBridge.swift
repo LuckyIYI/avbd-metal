@@ -26,15 +26,20 @@ enum PolicyBridge {
             model.policyStatus = "policy: MLX needs the xcodebuild app — run `make app-ml`"
             return
         }
-        let path = "runs/pusht/model/lewm.safetensors"
-        guard FileManager.default.fileExists(atPath: path) else {
-            model.policyStatus = "policy: no model at \(path) — run `avbd train-wm` first"
-            return
-        }
+        // prefer the trained BC visuomotor policy (90% on Push-T);
+        // fall back to the LeWM CEM planner
         do {
-            let planner = try LeWMPlanner(modelPath: "runs/pusht/model")
-            model.policyAction = { env in planner.action(env) }
-            model.policyStatus = "policy: LeWM loaded (CEM latent MPC)"
+            if FileManager.default.fileExists(atPath: "runs/pusht/model/bc.safetensors") {
+                let runner = try BCPolicyRunner(modelPath: "runs/pusht/model", latent: 192)
+                model.policyAction = { env in runner.action(env) }
+                model.policyStatus = "policy: BC visuomotor (pixels -> action)"
+            } else if FileManager.default.fileExists(atPath: "runs/pusht/model/lewm.safetensors") {
+                let planner = try LeWMPlanner(modelPath: "runs/pusht/model")
+                model.policyAction = { env in planner.action(env) }
+                model.policyStatus = "policy: LeWM loaded (CEM latent MPC)"
+            } else {
+                model.policyStatus = "policy: no model — train via the Training panel"
+            }
         } catch {
             model.policyStatus = "policy: MLX unavailable in this build — use `make app-ml` (\(error.localizedDescription))"
         }

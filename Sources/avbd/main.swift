@@ -142,6 +142,54 @@ case "run":
         }
     }
 
+case "rodexp":
+    // Inextensibility experiment: flagwhip under three structural-edge
+    // regimes. Reports per-window KE maxima (envelope must decay), worst
+    // structural stretch, and the rod dual magnitude.
+    let o = parseOptions(Array(args.dropFirst(1)))
+    let variants: [(String, Float, Bool, Float)] = [
+        ("stiff-5k", 5000, false, 0),          // current default (toy: stretches)
+        ("stiff-2e5", 2e5, false, 0),          // honest stiffness candidate
+        ("hard-rods", 0, true, 0),             // AL rods, no decay (pump repro)
+        ("hard-decay", 0, true, 16),           // AL rods + rotation decay
+    ]
+    let frames = o.frames > 300 ? o.frames : 3600
+    for (name, k, hard, decay) in variants {
+        var scene = Demos.flagwhip(res: o.res ?? 16,
+                                   structuralK: hard ? 5000 : k,
+                                   hardRods: hard)
+        scene.settings.rodDecayPow = decay
+        if let it = o.iterations { scene.settings.iterations = it }
+        let solver = try GPUSolver(scene: scene)
+        var windowMax: [Float] = []
+        var cur: Float = 0
+        var worstStretch: Float = 0
+        for f in 0..<frames {
+            solver.step()
+            if f % 10 == 0 {
+                var ke: Float = 0
+                for b in 0..<scene.bodies.count where scene.bodies[b].isParticle {
+                    ke += 0.5 * solver.bodyMass(b) * length_squared(solver.bodyVelocity(b))
+                }
+                cur = max(cur, ke)
+            }
+            if (f + 1) % 600 == 0 {
+                windowMax.append(cur)
+                cur = 0
+                if f > frames / 2 {
+                    let (_, st) = solver.debugClothMetrics()
+                    worstStretch = max(worstStretch, st)
+                }
+            }
+        }
+        let envelope = windowMax.map { String(format: "%.3f", $0) }.joined(separator: " ")
+        let growing = windowMax.count >= 3
+            && windowMax.last! > 1.5 * windowMax[1]
+        print(String(format: "%@: KE windows [%@] %@  stretch %.4f",
+                     name, envelope, growing ? "GROWING(PUMP)" : "decaying",
+                     worstStretch))
+    }
+
 case "clothgate":
     // Cloth gate runner: step a demo and report element-contact metrics
     // (worst V-T clearance, worst structural stretch, soft contact count).
@@ -172,6 +220,17 @@ case "clothgate":
                 let p = solver.bodyPosition(fastest)
                 loc = String(format: "  vmax %6.2f @%d (%.2f, %.2f, %.2f)",
                              vmax, fastest, p.x, p.y, p.z)
+            }
+            if ProcessInfo.processInfo.environment["AVBD_ZONES"] != nil {
+                var zk = [Float](repeating: 0, count: 3)
+                for b in 0..<scene.bodies.count where scene.bodies[b].isParticle {
+                    let z = solver.bodyPosition(b).z
+                    let v = solver.bodyVelocity(b)
+                    let e = 0.5 * solver.bodyMass(b) * length_squared(v)
+                    zk[z < 0.3 ? 0 : (z < 1.0 ? 1 : 2)] += e
+                }
+                loc += String(format: "  zones KE [pool %.3f skirt %.3f crown %.3f]",
+                              zk[0], zk[1], zk[2])
             }
             if f > o.frames / 2 {       // settled-half metrics
                 worstGap = min(worstGap, gap)

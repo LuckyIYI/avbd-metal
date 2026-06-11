@@ -45,11 +45,14 @@ extension Demos {
             }
         }
         func rod(_ a: Int, _ b: Int) {
-            // stiff soft spring: VBD solves these implicitly without the
-            // dual machinery; hard-AL rods on a swinging sheet were observed
-            // to pump the low-frequency pendulum modes
+            // hard AL rod: exact inextensibility. The historical "rods pump
+            // swinging sheets" observation was root-caused to the stale
+            // color-bound skip + unscaled dual caps (both fixed); the
+            // 60-second whip experiment shows a decaying KE envelope.
+            // Stiffness here is the PENALTY CAP — modest by design: lambda
+            // carries the rod tension, the penalty only conditions it.
             s.addSpring(SceneSpring(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
-                                    stiffness: 5000))
+                                    stiffness: 5000, hard: true))
             s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
                                   stiffnessLin: 0, stiffnessAng: 0))
         }

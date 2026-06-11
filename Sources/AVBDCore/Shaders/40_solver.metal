@@ -347,6 +347,7 @@ kernel void warmstart_joints(
     device JointGPU* joints         [[buffer(2)]],
     constant SimParams& P           [[buffer(3)]],
     device SpringGPU* springs       [[buffer(4)]],
+    device const float4* velLin     [[buffer(5)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numJoints) {
@@ -357,8 +358,24 @@ kernel void warmstart_joints(
         uint a = sp.header.x, b = sp.header.y;
         float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
-        sp.dual.z = length(pA - pB) - sp.rB.w;                 // C0
-        sp.dual.x *= P.alpha * P.gamma;                        // lambda
+        // C0 alpha-shift only for pre-existing STRETCH: rods are tension-
+        // only, slack is not an error to stabilize away
+        sp.dual.z = max(length(pA - pB) - sp.rB.w, 0.0f);      // C0
+        float warm = P.alpha * P.gamma;
+        if (P.rodDecayPow > 0.0f) {
+            // The carried dual acted along LAST frame's rod direction; on a
+            // rotating rod, re-applying it along the new direction does
+            // tangential work each frame (pendulum pump). Decay by the
+            // per-frame rotation, reconstructed from the velocities.
+            float3 d = pA - pB;
+            float3 dPrev = d - (velLin[a].xyz - velLin[b].xyz) * P.dt;
+            float dl = length(d), dpl = length(dPrev);
+            if (dl > 1e-7f && dpl > 1e-7f) {
+                float ct = clamp(dot(d / dl, dPrev / dpl), 0.0f, 1.0f);
+                warm *= pow(ct, P.rodDecayPow);
+            }
+        }
+        sp.dual.x *= warm;                                     // lambda
         sp.dual.y = min(clamp(sp.dual.y * P.gamma, PENALTY_MIN, PENALTY_MAX),
                         sp.rA.w);                              // penalty
         return;
@@ -592,11 +609,15 @@ inline void stampSpring(device const SpringGPU& sp, uint self,
     float3 n = d / dLen;
     float f;
     if (sp.header.z != 0) {
-        // hard rod (AL): inextensible distance element — the same dual
-        // machinery as hard joints, 1-D along the current axis
+        // hard rod (AL): TENSION-ONLY inextensible element. Cloth and rope
+        // are inextensible, not incompressible — a compressed rod buckles
+        // freely. Enforcing compression makes buckled pairs into perpetual
+        // oscillators: the push direction degenerates as dLen -> 0 and the
+        // remembered dual keeps firing along whatever direction emerges.
         float C = dLen - rest - sp.dual.z * alpha;
         stiffness = sp.dual.y;                 // ramped penalty
         f = stiffness * C + sp.dual.x;         // + lambda
+        if (f <= 0.0f) return;                 // slack: no force, no Hessian
     } else {
         f = stiffness * (dLen - rest);
     }
@@ -611,6 +632,20 @@ inline void stampSpring(device const SpringGPU& sp, uint self,
     acc.lhsCross = m3_add(acc.lhsCross, m3_scale(m3_outer(jAng, jLin), stiffness));
     acc.rhsLin += jLin * f;
     acc.rhsAng += jAng * f;
+
+    // Geometric (tension) stiffness: a TAUT element resists transverse
+    // motion with curvature f/len (I - nn^T). Dropping it (pure rank-1
+    // Gauss-Newton) leaves swinging taut networks with force-but-no-
+    // Hessian transversely — Newton steps overshoot wherever tension/len
+    // exceeds the m/dt^2 mass term, and the sheet pumps forever. Clamped
+    // to tension only (compression curvature is negative: skipping it is
+    // the safe Gauss-Newton choice).
+    float ft = max(f, 0.0f) / dLen;
+    if (ft > 0.0f) {
+        acc.lhsLin = m3_add(acc.lhsLin,
+                            m3_add(m3_diag(float3(ft)),
+                                   m3_scale(m3_outer(n, n), -ft)));
+    }
 }
 
 // Stable Neo-Hookean tetrahedron (Smith et al. 2018):
@@ -667,6 +702,81 @@ inline void stampTet(device const TetGPU& t, uint self,
     acc.rhsLin += grad;
     acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(muV * dot(w, w))));
     acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(g, g), lamV));
+}
+
+// StVK triangle membrane with a Gauss-Newton per-vertex Hessian.
+//   Psi = mu ||E||_F^2 + lambda/2 tr(E)^2,  E = (F^T F - I)/2  (2x2)
+// Forces are exact (P = F S, S = 2 mu E + lambda tr(E) I); the Hessian
+// keeps only the strain-gradient outer products (drops the indefinite
+// geometric term), which is SPD by construction and captures the in-plane
+// directional stiffness that diagonal lumping loses:
+//   dE11/dx_i = w.x f1, dE22/dx_i = w.y f2, dE12/dx_i = (w.x f2 + w.y f1)/2
+//   H_i = area [2mu(g11 g11^T + g22 g22^T) + 4mu g12 g12^T
+//               + lambda (g11+g22)(g11+g22)^T]
+inline void stampMembrane(device const MembraneGPU& mb, uint self,
+                          device const float4* posLin,
+                          thread PrimalAccum& acc)
+{
+    float3 x0 = posLin[mb.ids.x].xyz;
+    float3 x1 = posLin[mb.ids.y].xyz;
+    float3 x2 = posLin[mb.ids.z].xyz;
+    float muA = mb.mat.x;           // mu * area
+    float lamA = mb.mat.y;          // lambda * area
+
+    float3 d0 = x1 - x0, d1 = x2 - x0;
+    // DmInv = [a c; b d] column-major in mb.dm = (a, b, c, d)
+    float a = mb.dm.x, b = mb.dm.y, c = mb.dm.z, d = mb.dm.w;
+    float3 f1 = d0 * a + d1 * b;
+    float3 f2 = d0 * c + d1 * d;
+
+    float E11 = 0.5f * (dot(f1, f1) - 1.0f);
+    float E22 = 0.5f * (dot(f2, f2) - 1.0f);
+    float E12 = 0.5f * dot(f1, f2);
+    float trE = E11 + E22;
+    float S11 = 2.0f * muA * E11 + lamA * trE;   // premultiplied by area
+    float S22 = 2.0f * muA * E22 + lamA * trE;
+    float S12 = 2.0f * muA * E12;
+
+    // P = F S columns (area folded into S)
+    float3 p1 = f1 * S11 + f2 * S12;
+    float3 p2 = f1 * S12 + f2 * S22;
+
+    float2 w;
+    if (self == mb.ids.y)      w = float2(a, c);
+    else if (self == mb.ids.z) w = float2(b, d);
+    else                       w = float2(-a - b, -c - d);
+
+    acc.rhsLin += p1 * w.x + p2 * w.y;
+
+    float3 g11 = f1 * w.x;
+    float3 g22 = f2 * w.y;
+    float3 g12 = (f2 * w.x + f1 * w.y) * 0.5f;
+    float3 gtr = g11 + g22;
+    acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(g11, g11), 2.0f * muA));
+    acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(g22, g22), 2.0f * muA));
+    acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(g12, g12), 4.0f * muA));
+    acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(gtr, gtr), lamA));
+}
+
+// Quadratic (Bergou) bending: E = s/2 |sum_i K_i x_i|^2 over the 4-vertex
+// hinge stencil; rest cotangents make K annihilate the flat state. Constant
+// rank-1 SPD Hessian per vertex: s K_i^2 I — zero tuning, isotropic.
+inline void stampBend(device const BendGPU& bd, uint self,
+                      device const float4* posLin,
+                      thread PrimalAccum& acc)
+{
+    float s = bd.mat.x;
+    float3 m = posLin[bd.ids.x].xyz * bd.K.x
+             + posLin[bd.ids.y].xyz * bd.K.y
+             + posLin[bd.ids.z].xyz * bd.K.z
+             + posLin[bd.ids.w].xyz * bd.K.w;
+    float k;
+    if (self == bd.ids.x)      k = bd.K.x;
+    else if (self == bd.ids.y) k = bd.K.y;
+    else if (self == bd.ids.z) k = bd.K.z;
+    else                       k = bd.K.w;
+    acc.rhsLin += m * (s * k);
+    acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(s * k * k)));
 }
 
 // Shared contact force computation (Taylor series constraint, Sec 4 + Eq 13-15)
@@ -1022,9 +1132,12 @@ static inline void dual_soft_one(
     F.x = max(F.x, -sc.C0.w);           // bounded dual, mass-scaled cap
     sc.lambda.xyz = F;
 
+    // Normal penalty capped at 1e6 here: gram-scale stencils next to 1e10
+    // penalties leave Gauss-Seidel a stiffness ratio it cannot relax (the
+    // pile jitters forever). 1e6 still holds stacked layers at sub-mm C.
     float3 pen = sc.penalty.xyz;
     if (F.x < 0.0f) {
-        pen.x = min(pen.x + P.betaLin * fabs(C.x), PENALTY_MAX);
+        pen.x = min(pen.x + P.betaLin * fabs(C.x), PENALTY_MAX_T);
     }
     if (fs <= bnd) {
         pen.y = min(pen.y + P.betaLin * fabs(C.y), PENALTY_MAX_T);
@@ -1190,9 +1303,23 @@ kernel void dual_all(
         float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
         float C = length(pA - pB) - sp.rB.w - sp.dual.z * P.alpha;
-        sp.dual.x = clamp(sp.dual.y * C + sp.dual.x, -P.lambdaMax, P.lambdaMax);
-        sp.dual.y = min(sp.dual.y + fabs(C) * P.betaLin,
-                        min(sp.rA.w, PENALTY_MAX));
+        // Tension-only dual (lambda >= 0), mass-scaled cap at HALF the
+        // contact scale: when an inextensible weave fights a contact (taut
+        // hammock vs box corner) the contact wins — structure may stretch,
+        // bodies never tunnel.
+        float mA = posLin[a].w, mB = posLin[b].w;
+        float mMin = min(mA > 0.0f ? mA : FLT_MAX, mB > 0.0f ? mB : FLT_MAX);
+        float cap = min(P.lambdaMax, max(2.0f, 5.0e3f * mMin));
+        // leaky dual: under global coupling (a hanging chain cannot reach
+        // the alpha-target in one frame of sweeps) a perfect integrator
+        // ratchets lambda to the cap and limit-cycles the skirt. The leak
+        // pins steady-state lambda to actual need (C_ss ~ lambda*0.02/pen,
+        // sub-micron) and drains stockpiles in ~10 frames.
+        sp.dual.x = clamp(0.98f * sp.dual.x + sp.dual.y * C, 0.0f, cap);
+        if (C > 0.0f) {
+            sp.dual.y = min(sp.dual.y + C * P.betaLin,
+                            min(sp.rA.w, PENALTY_MAX));
+        }
         return;
     }
     uint mi = si - P.numSprings;
@@ -1265,10 +1392,15 @@ kernel void solve_persistent(
                     float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
                     float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
                     float C = length(pA - pB) - sp.rB.w - sp.dual.z * P.alpha;
-                    sp.dual.x = clamp(sp.dual.y * C + sp.dual.x,
-                                      -P.lambdaMax, P.lambdaMax);
-                    sp.dual.y = min(sp.dual.y + fabs(C) * P.betaLin,
-                                    min(sp.rA.w, PENALTY_MAX));
+                    float mA = posLin[a].w, mB = posLin[b].w;
+                    float mMin = min(mA > 0.0f ? mA : FLT_MAX,
+                                     mB > 0.0f ? mB : FLT_MAX);
+                    float cap = min(P.lambdaMax, max(2.0f, 5.0e3f * mMin));
+                    sp.dual.x = clamp(0.98f * sp.dual.x + sp.dual.y * C, 0.0f, cap);
+                    if (C > 0.0f) {
+                        sp.dual.y = min(sp.dual.y + C * P.betaLin,
+                                        min(sp.rA.w, PENALTY_MAX));
+                    }
                 }
             } else if (g < P.numJoints + P.numSprings + numPairs) {
                 uint mi = g - P.numJoints - P.numSprings;

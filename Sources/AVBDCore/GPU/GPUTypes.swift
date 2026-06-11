@@ -37,6 +37,7 @@ public struct SimParamsGPU {
     public var numBends: UInt32 = 0
     public var elemCellSize: Float = 1.0
     public var elemHashSize: UInt32 = 0
+    public var rodDecayPow: Float = 0
 }
 
 public struct JointGPU {

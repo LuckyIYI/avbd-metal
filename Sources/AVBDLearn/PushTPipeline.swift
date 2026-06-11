@@ -805,3 +805,26 @@ extension PushTPipeline {
         print("BC success rate: \(successes)/\(episodes)")
     }
 }
+
+/// Interactive runner for the BC policy (Robotics Lab policy mode).
+public final class BCPolicyRunner {
+    let policy: BCPolicy
+    var prevFrame: MLXArray? = nil
+
+    public init(modelPath: String, latent: Int = 192) throws {
+        policy = BCPolicy(latent: latent)
+        let w = try loadArrays(url: URL(fileURLWithPath: "\(modelPath)/bc.safetensors"))
+        try policy.update(parameters: ModuleParameters.unflattened(w), verify: [.all])
+        eval(policy)
+    }
+
+    /// Returns the action in [-1,1] (the Lab scales by 3).
+    public func action(_ env: PushTEnv) -> SIMD2<Float>? {
+        let cur = PushTPipeline.obsArray(env, env.obsRes)
+        let prev = prevFrame ?? cur
+        let a = policy(concatenated([prev, cur], axis: 3))
+        eval(a)
+        prevFrame = cur
+        return SIMD2(a[0, 0].item(Float.self), a[0, 1].item(Float.self))
+    }
+}

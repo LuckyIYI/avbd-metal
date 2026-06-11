@@ -1,3 +1,4 @@
+import Foundation
 import simd
 
 // Cloth gate scenes: surface-element collision (V-T, rigid-T, E-E),
@@ -7,14 +8,20 @@ import simd
 extension Demos {
 
     /// Low-level cloth builder over explicit node positions. Structural
-    /// edges are stiff springs, shear/bend the usual soft set, and every
-    /// quad contributes two collision triangles (alternating diagonal).
+    /// edges are HARD AL rods (exact inextensibility — the rod-pumping
+    /// experiment cleared them once the color-skip and dual-cap bugs were
+    /// fixed), shear/bend the usual soft set, and every quad contributes
+    /// two collision triangles (alternating diagonal).
     @discardableResult
     static func addClothGrid(_ s: inout PhysicsScene, positions: [[F3]],
                              thickness: Float, massPerNode: Float,
                              friction: Float = 0.7,
                              structuralK: Float = 5000,
+                             hardRods: Bool = true,
                              shearK: Float = 60, bendK: Float = 8) -> [[Int]] {
+        // experiment override: AVBD_SOFT_CLOTH forces stiff-spring structure
+        let hardRods = hardRods
+            && ProcessInfo.processInfo.environment["AVBD_SOFT_CLOTH"] == nil
         let nu = positions.count, nv = positions[0].count
         var grid: [[Int]] = []
         for i in 0..<nu {
@@ -25,16 +32,22 @@ extension Demos {
             }
             grid.append(row)
         }
-        func link(_ a: Int, _ b: Int, _ k: Float) {
+        let rodPen = ProcessInfo.processInfo.environment["AVBD_ROD_PEN"]
+            .flatMap(Float.init)
+        func link(_ a: Int, _ b: Int, _ k: Float, hard: Bool = false) {
+            // For hard rods `stiffness` is the PENALTY CAP, and modest is
+            // right: lambda carries the rod tension exactly; letting the
+            // penalty ramp toward 1e6 on gram nodes reproduces the stiff-
+            // spring overshoot explosion the duals exist to avoid.
             s.addSpring(SceneSpring(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
-                                    stiffness: k))
+                                    stiffness: hard ? (rodPen ?? k) : k, hard: hard))
             s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
                                   stiffnessLin: 0, stiffnessAng: 0))
         }
         for i in 0..<nu {
             for j in 0..<nv {
-                if i + 1 < nu { link(grid[i][j], grid[i + 1][j], structuralK) }
-                if j + 1 < nv { link(grid[i][j], grid[i][j + 1], structuralK) }
+                if i + 1 < nu { link(grid[i][j], grid[i + 1][j], structuralK, hard: hardRods) }
+                if j + 1 < nv { link(grid[i][j], grid[i][j + 1], structuralK, hard: hardRods) }
                 if i + 1 < nu && j + 1 < nv {
                     link(grid[i][j], grid[i + 1][j + 1], shearK)
                     link(grid[i + 1][j], grid[i][j + 1], shearK)
@@ -154,8 +167,8 @@ extension Demos {
     /// Gate 2: hammock strung between two static posts; a rigid box rides
     /// in the middle. Inextensibility gate: structural stretch < 2% under
     /// load.
-    public static func hammock(res: Int = 20, structuralK: Float = 2e5,
-                               hardRods: Bool = false) -> PhysicsScene {
+    public static func hammock(res: Int = 20, structuralK: Float = 5000,
+                               hardRods: Bool = true) -> PhysicsScene {
         var s = PhysicsScene(name: "hammock")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
@@ -165,25 +178,25 @@ extension Demos {
         let spacing: Float = 0.14
         let r: Float = min(0.05, 0.3 * spacing)
         let spanZ: Float = 1.6
+        // spawn with catenary slack: an INEXTENSIBLE sheet pinned taut is an
+        // infinite-tension geometry — real hammocks hang with sag
+        let span = Float(nu - 1) * spacing
+        let sag: Float = 0.22 * span
         var positions: [[F3]] = []
         for i in 0..<nu {
             var row: [F3] = []
+            let t = Float(i) / Float(nu - 1) * 2 - 1        // -1..1 across
+            let dip = sag * (1 - t * t)
             for j in 0..<nv {
-                row.append(F3(Float(i) * spacing - Float(nu - 1) * spacing / 2,
+                row.append(F3(Float(i) * spacing - span / 2,
                               Float(j) * spacing - Float(nv - 1) * spacing / 2,
-                              spanZ))
+                              spanZ - dip))
             }
             positions.append(row)
         }
         let grid = addClothGrid(&s, positions: positions, thickness: r,
                                 massPerNode: 0.012, friction: 0.8,
-                                structuralK: structuralK)
-        if hardRods {
-            // flip structural springs to hard AL rods (set via flag)
-            for i in 0..<s.springs.count where s.springs[i].stiffness == structuralK {
-                s.springs[i].hard = true
-            }
-        }
+                                structuralK: structuralK, hardRods: hardRods)
         // pin the two short ends to the world (taut hammock)
         for j in 0..<nv {
             for i in [0, nu - 1] {
@@ -223,6 +236,114 @@ extension Demos {
         addClothGrid(&s, positions: positions, thickness: r,
                      massPerNode: 0.008, friction: friction)
         return s
+    }
+
+    /// Inextensibility experiment: a sheet pinned at two top corners, given
+    /// a hard sideways kick so it swings and whips. The structural-edge
+    /// mechanism is selectable: stiff soft springs (k) or hard AL rods.
+    /// Pumping diagnosis: KE envelope must decay, never grow.
+    public static func flagwhip(res: Int = 16, structuralK: Float = 5000,
+                                hardRods: Bool = true) -> PhysicsScene {
+        var s = PhysicsScene(name: "flagwhip")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        addGround(&s, friction: 0.6)
+
+        let n = max(12, res)
+        let spacing: Float = 2.0 / Float(n - 1)
+        let r: Float = min(0.05, 0.3 * spacing)
+        let topZ: Float = 3.2
+        var positions: [[F3]] = []
+        for i in 0..<n {                  // i: across (y), j: down (z)
+            var row: [F3] = []
+            for j in 0..<n {
+                row.append(F3(0, Float(i) * spacing - 1.0,
+                              topZ - Float(j) * spacing))
+            }
+            positions.append(row)
+        }
+        let grid = addClothGrid(&s, positions: positions, thickness: r,
+                                massPerNode: 0.008, friction: 0.6,
+                                structuralK: structuralK, hardRods: hardRods)
+        // pin the two top corners
+        for i in [0, n - 1] {
+            let node = grid[i][0]
+            s.addJoint(SceneJoint(bodyA: -1, bodyB: node,
+                                  rA: s.bodies[node].position, rB: .zero))
+        }
+        // sideways kick: the sheet swings like a pendulum and whips
+        let kick: Float = ProcessInfo.processInfo.environment["AVBD_NO_KICK"] != nil ? 0 : 3.0
+        for i in 0..<n {
+            for j in 0..<n {
+                s.bodies[grid[i][j]].velocity = F3(kick, 0, 0) * (Float(j) / Float(n - 1))
+            }
+        }
+        return s
+    }
+
+    /// Gate 3: two narrow cloth strips crossing at 90 degrees. Strip A is
+    /// strung taut between world anchors; strip B lies across it and gets
+    /// dragged by its leading corners (drag joints returned for the
+    /// harness). Their long edges rub corner-over-corner at the crossing —
+    /// E-E territory. Returns (scene, dragJointIndices, stripANodes, stripBNodes).
+    public static func eecross(len: Int = 18, wid: Int = 4)
+        -> (PhysicsScene, [Int], [Int], [Int]) {
+        var s = PhysicsScene(name: "eecross")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        addGround(&s, friction: 0.3)
+
+        // A sits just above the ground: there is no room to wrap or swing
+        // underneath it, so "below A" can only mean "passed through".
+        let spacing: Float = 0.12
+        let r: Float = 0.04
+        let zA: Float = 0.12
+
+        // strip A: along x, pinned taut at both short ends
+        var posA: [[F3]] = []
+        for i in 0..<len {
+            var row: [F3] = []
+            for j in 0..<wid {
+                row.append(F3(Float(i) * spacing - Float(len - 1) * spacing / 2,
+                              Float(j) * spacing - Float(wid - 1) * spacing / 2,
+                              zA))
+            }
+            posA.append(row)
+        }
+        let gridA = addClothGrid(&s, positions: posA, thickness: r,
+                                 massPerNode: 0.01, friction: 0.3)
+        for i in [0, len - 1] {
+            for j in 0..<wid {
+                let node = gridA[i][j]
+                s.addJoint(SceneJoint(bodyA: -1, bodyB: node,
+                                      rA: s.bodies[node].position, rB: .zero))
+            }
+        }
+
+        // strip B: along y, resting across A, slightly above
+        var posB: [[F3]] = []
+        for i in 0..<len {
+            var row: [F3] = []
+            for j in 0..<wid {
+                row.append(F3(Float(j) * spacing - Float(wid - 1) * spacing / 2,
+                              Float(i) * spacing - Float(len - 1) * spacing / 2,
+                              zA + 2 * r + 0.02))
+            }
+            posB.append(row)
+        }
+        let gridB = addClothGrid(&s, positions: posB, thickness: r,
+                                 massPerNode: 0.01, friction: 0.3)
+        var dragJoints: [Int] = []
+        for j in 0..<wid {                  // leading edge = last row (max y)
+            let node = gridB[len - 1][j]
+            dragJoints.append(s.joints.count)
+            s.addJoint(SceneJoint(bodyA: -1, bodyB: node,
+                                  rA: s.bodies[node].position, rB: .zero,
+                                  stiffnessLin: 3000, stiffnessAng: 0))
+        }
+        let bNodes = gridB.flatMap { $0 }
+        let aNodes = gridA.flatMap { $0 }
+        return (s, dragJoints, aNodes, bNodes)
     }
 
     /// Gate 4 scene: tets + cloth + rigid bodies in one solve. A soft block
