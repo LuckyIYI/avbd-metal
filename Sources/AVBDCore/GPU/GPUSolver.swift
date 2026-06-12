@@ -72,6 +72,18 @@ public final class GPUSolver {
     var softMapKeyA, softMapKeyB, softMapVal: MTLBuffer
     var membranes, bends: MTLBuffer
 
+    // Render surface meshes (cloth triangles + tet boundary faces):
+    // packed corner ids (body | component<<24), per-vertex incidence CSR
+    // for smooth normals, and the per-body surfaced flag.
+    var surfTriBuf, surfVertsBuf, surfVtStart, surfVtCount, surfVtList: MTLBuffer
+    var surfacedFlags, softNormalsBuf, faceNormalsBuf, renderTriBuf: MTLBuffer
+    public private(set) var surfaceTriCount: Int = 0
+    public private(set) var renderTriCount: Int = 0
+    var surfVertCount: Int = 0
+    public private(set) var staticUsedColors: Int = 1
+    var usesDynamicColoring: Bool { numTris == 0 && numTets == 0 && numSprings == 0 }
+    var dynColorSrc: MTLBuffer?
+
     // Adjacency + coloring
     var degrees, adjStart, adjCursor, adjList: MTLBuffer
     var colorsA, colorsB, bodySlot, colorStart, colorList: MTLBuffer
@@ -89,7 +101,7 @@ public final class GPUSolver {
     var pso: [String: MTLComputePipelineState] = [:]
 
     // Cached per-frame color counts (read back once per step)
-    public private(set) var lastColorCounts: [Int] = []
+    public internal(set) var lastColorCounts: [Int] = []
     public private(set) var lastNumPairs: Int = 0
     public private(set) var lastNumSoft: Int = 0
     // Start pessimistic so the first frame covers every possible color.
@@ -185,6 +197,19 @@ public final class GPUSolver {
         membranes = try makeBuf(max(1, numTris) * MemoryLayout<MembraneGPU>.stride, "membranes")
         bends = try makeBuf(max(1, maxEdges) * MemoryLayout<BendGPU>.stride, "bends")
 
+        // render surface capacity: cloth tris + worst-case tet boundary;
+        // the render list adds back layers + hem rims for thin sheets
+        let maxSurfTris = numTris + 4 * numTets
+        surfTriBuf = try makeBuf(max(1, maxSurfTris) * 12, "surfTris")
+        surfVertsBuf = try makeBuf(nb * 4, "surfVerts")
+        surfVtStart = try makeBuf(nb * 4, "surfVtStart")
+        surfVtCount = try makeBuf(nb * 4, "surfVtCount")
+        surfVtList = try makeBuf(max(1, maxSurfTris) * 12, "surfVtList")
+        surfacedFlags = try makeBuf(nb * 4, "surfacedFlags")
+        softNormalsBuf = try makeBuf(nb * 16, "softNormals")
+        faceNormalsBuf = try makeBuf(max(1, maxSurfTris) * 16, "faceNormals")
+        renderTriBuf = try makeBuf(max(1, 8 * numTris + 4 * numTets) * 12, "renderTris")
+
         degrees = try makeBuf(nb * 4, "degrees")
         adjStart = try makeBuf(nb * 4, "adjStart")
         adjCursor = try makeBuf(nb * 4, "adjCursor")
@@ -193,7 +218,7 @@ public final class GPUSolver {
         colorsA = try makeBuf(nb * 4, "colorsA")
         colorsB = try makeBuf(nb * 4, "colorsB")
         bodySlot = try makeBuf(nb * 4, "bodySlot")
-        colorStart = try makeBuf((AVBD_MAX_COLORS + 1) * 4, "colorStart")
+        colorStart = try makeBuf((AVBD_MAX_COLORS + 2) * 4, "colorStart")
         colorList = try makeBuf(nb * 4, "colorList")
         changedFlag = try makeBuf(4, "changedFlag")
 
@@ -239,11 +264,13 @@ public final class GPUSolver {
         } catch {
             throw AVBDError.shaderCompile("\(error)")
         }
+        shaderLib = lib
         for name in lib.functionNames {
             guard let fn = lib.makeFunction(name: name) else { continue }
             pso[name] = try device.makeComputePipelineState(function: fn)
         }
     }
+    var shaderLib: MTLLibrary?
 
     /// Concatenates the bundled .metal sources (filename order) and compiles.
     static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
@@ -644,6 +671,217 @@ public final class GPUSolver {
         params.maxSoft = UInt32(maxSoft)
         params.softMapCapacity = UInt32(softMapCapacity)
 
+        // ---- Render surface meshes: cloth triangles as authored + the
+        // boundary faces of tet bodies (faces owned by exactly one tet),
+        // wound outward against the opposite rest vertex. Connected
+        // components give each sheet/jelly its own color.
+        var surfCorners: [UInt32] = []          // 3 per tri: body | comp<<24
+        var triVerts: [[Int]] = []              // per surface tri, its bodies
+        var isCloth: [Bool] = []                // thin sheet (two render layers)
+        for t in scene.tris {
+            triVerts.append([t.ids.0, t.ids.1, t.ids.2])
+            isCloth.append(true)
+        }
+        var faceCount: [UInt64: (count: Int, tri: (Int, Int, Int), opp: Int)] = [:]
+        for tet in scene.tets {
+            let ids = [tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3]
+            for (f, o) in [((0, 1, 2), 3), ((0, 3, 1), 2), ((1, 3, 2), 0), ((0, 2, 3), 1)] {
+                let tri = (ids[f.0], ids[f.1], ids[f.2])
+                let sorted3 = [tri.0, tri.1, tri.2].sorted()
+                let key = UInt64(sorted3[0]) << 42 | UInt64(sorted3[1]) << 21 | UInt64(sorted3[2])
+                if var e = faceCount[key] {
+                    e.count += 1
+                    faceCount[key] = e
+                } else {
+                    faceCount[key] = (1, tri, ids[o])
+                }
+            }
+        }
+        for (_, e) in faceCount where e.count == 1 {
+            var (a, b, c) = e.tri
+            // outward winding: flip if the rest normal points toward the
+            // opposite (interior) vertex
+            let pa = scene.bodies[a].position
+            let n = cross(scene.bodies[b].position - pa, scene.bodies[c].position - pa)
+            if dot(n, scene.bodies[e.opp].position - pa) > 0 { swap(&b, &c) }
+            triVerts.append([a, b, c])
+            isCloth.append(false)
+        }
+        surfaceTriCount = triVerts.count
+        if surfaceTriCount > 0 {
+            // connected components (union-find over surface vertices)
+            var parent: [Int: Int] = [:]
+            func find(_ x: Int) -> Int {
+                var r = x
+                while let p = parent[r], p != r { r = p }
+                var c = x
+                while let p = parent[c], p != r { parent[c] = r; c = p }
+                if parent[r] == nil { parent[r] = r }
+                return r
+            }
+            for tv in triVerts {
+                let r = find(tv[0])
+                parent[find(tv[1])] = r
+                parent[find(tv[2])] = r
+            }
+            var compIdx: [Int: Int] = [:]
+            var incidence: [Int: [Int]] = [:]   // body -> surface tri indices
+            var triComp: [UInt32] = []
+            for (ti, tv) in triVerts.enumerated() {
+                let root = find(tv[0])
+                if compIdx[root] == nil { compIdx[root] = compIdx.count }
+                let comp = UInt32(min(compIdx[root]!, 255))
+                triComp.append(comp)
+                for v in tv {
+                    surfCorners.append(UInt32(v) | (comp << 24))
+                    incidence[v, default: []].append(ti)
+                }
+            }
+            surfTriBuf.contents().bindMemory(to: UInt32.self, capacity: surfCorners.count)
+                .update(from: surfCorners, count: surfCorners.count)
+
+            // Render triangle list. Thin sheets get a front layer (+r along
+            // the smooth normal), a back layer (-r, reversed winding) and
+            // rim quads along boundary edges; tet boundaries are already
+            // closed and get a single outward-offset layer. Bit 23 of each
+            // packed corner is the side flag.
+            precondition(numBodies < (1 << 21), "flag bits collide with body id")
+            let side: UInt32 = 1 << 23
+            let flat: UInt32 = 1 << 21      // tet boundaries: sharp edges,
+                                            // shade with face normals
+            var renderCorners: [UInt32] = []
+            var clothEdgeUse: [UInt64: (Int, Int, UInt32)] = [:]  // first use winding
+            for (ti, tv) in triVerts.enumerated() {
+                let comp = triComp[ti] << 24
+                let flatBit = isCloth[ti] ? 0 : flat
+                let (a, b, c) = (UInt32(tv[0]) | flatBit, UInt32(tv[1]) | flatBit,
+                                 UInt32(tv[2]) | flatBit)
+                renderCorners.append(contentsOf: [a | comp, b | comp, c | comp])
+                if isCloth[ti] {
+                    renderCorners.append(contentsOf: [(a | side) | comp,
+                                                      (c | side) | comp,
+                                                      (b | side) | comp])
+                    for (u, v) in [(tv[0], tv[1]), (tv[1], tv[2]), (tv[2], tv[0])] {
+                        let key = UInt64(min(u, v)) << 32 | UInt64(max(u, v))
+                        if clothEdgeUse.removeValue(forKey: key) == nil {
+                            clothEdgeUse[key] = (u, v, comp)   // directed as authored
+                        }
+                    }
+                }
+            }
+            // hem rims: edges used by exactly one cloth triangle (bit 22
+            // marks rim corners so the AO prepass can skip them)
+            let rim: UInt32 = 1 << 22
+            for (_, (u, v, comp)) in clothEdgeUse {
+                let uF = UInt32(u) | comp | rim, vF = UInt32(v) | comp | rim
+                let uB = uF | side, vB = vF | side
+                renderCorners.append(contentsOf: [uF, vF, vB, uF, vB, uB])
+            }
+            renderTriCount = renderCorners.count / 3
+            precondition(renderCorners.count * 4 <= renderTriBuf.length,
+                         "render corner list exceeded capacity")
+            renderTriBuf.contents().bindMemory(to: UInt32.self, capacity: renderCorners.count)
+                .update(from: renderCorners, count: renderCorners.count)
+            // incidence CSR over the surfaced-vertex list + flags
+            let flags = surfacedFlags.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+            for i in 0..<numBodies { flags[i] = 0 }
+            var verts: [UInt32] = []
+            var starts: [UInt32] = []
+            var counts: [UInt32] = []
+            var list: [UInt32] = []
+            for (v, tris) in incidence.sorted(by: { $0.key < $1.key }) {
+                verts.append(UInt32(v))
+                starts.append(UInt32(list.count))
+                counts.append(UInt32(tris.count))
+                list.append(contentsOf: tris.map(UInt32.init))
+                flags[v] = 1
+            }
+            surfVertCount = verts.count
+            surfVertsBuf.contents().bindMemory(to: UInt32.self, capacity: verts.count)
+                .update(from: verts, count: verts.count)
+            surfVtStart.contents().bindMemory(to: UInt32.self, capacity: starts.count)
+                .update(from: starts, count: starts.count)
+            surfVtCount.contents().bindMemory(to: UInt32.self, capacity: counts.count)
+                .update(from: counts, count: counts.count)
+            surfVtList.contents().bindMemory(to: UInt32.self, capacity: max(1, list.count))
+                .update(from: list.isEmpty ? [0] : list, count: max(1, list.count))
+        } else {
+            memset(surfacedFlags.contents(), 0, surfacedFlags.length)
+        }
+        memset(softNormalsBuf.contents(), 0, softNormalsBuf.length)
+
+        // ---- Static topology coloring (computed ONCE; contacts do not
+        // constrain colors — same-color contact pairs degrade to Jacobi,
+        // which penalty-based contacts tolerate; stiff elements keep strict
+        // Gauss-Seidel ordering). Replaces 20 GPU Jacobi rounds per frame.
+        var adjacencySets = [Set<Int>](repeating: [], count: numBodies)
+        func link2(_ a: Int, _ b: Int) {
+            guard a >= 0, b >= 0,
+                  scene.bodies[a].density > 0 || scene.bodies[b].density > 0 else { return }
+            if scene.bodies[a].density > 0 && scene.bodies[b].density > 0 {
+                adjacencySets[a].insert(b)
+                adjacencySets[b].insert(a)
+            }
+        }
+        for j in scene.joints { link2(j.bodyA, j.bodyB) }
+        for sp2 in scene.springs { link2(sp2.bodyA, sp2.bodyB) }
+        for t in scene.tets {
+            let ids = [t.ids.0, t.ids.1, t.ids.2, t.ids.3]
+            for i in 0..<4 { for j in (i + 1)..<4 { link2(ids[i], ids[j]) } }
+        }
+        for t in scene.tris where t.mu > 0 {
+            let ids = [t.ids.0, t.ids.1, t.ids.2]
+            for i in 0..<3 { for j in (i + 1)..<3 { link2(ids[i], ids[j]) } }
+        }
+        // Bends are EXCLUDED from coloring conflicts: their 4-vertex hinge
+        // cliques over the 2-ring inflate the palette ~2x, and their forces
+        // (kappa ~ 5e-4) are orders below membrane/rod scale — same-color
+        // Jacobi updates are harmless for them, like contacts.
+        var staticColors = [Int](repeating: 0, count: numBodies)
+        var maxColor = 0
+        for v in 0..<numBodies where scene.bodies[v].density > 0 {
+            var used: UInt64 = 0
+            for nb in adjacencySets[v] where nb < v {
+                let c = staticColors[nb]
+                if c < 64 { used |= (1 << UInt64(c)) }
+            }
+            var c = 0
+            while c < 63 && (used & (1 << UInt64(c))) != 0 { c += 1 }
+            staticColors[v] = c
+            maxColor = max(maxColor, c)
+        }
+        staticUsedColors = maxColor + 1
+        // colorList/colorStart in final form, uploaded once
+        var buckets = [[UInt32]](repeating: [], count: AVBD_MAX_COLORS)
+        for v in 0..<numBodies where scene.bodies[v].density > 0 {
+            buckets[staticColors[v]].append(UInt32(v))
+        }
+        var clist: [UInt32] = []
+        var cstart: [UInt32] = []
+        for c in 0..<AVBD_MAX_COLORS {
+            cstart.append(UInt32(clist.count))
+            clist.append(contentsOf: buckets[c])
+        }
+        cstart.append(UInt32(clist.count))
+        cstart.append(UInt32(staticUsedColors))
+        colorStart.contents().bindMemory(to: UInt32.self, capacity: cstart.count)
+            .update(from: cstart, count: cstart.count)
+        if !clist.isEmpty {
+            colorList.contents().bindMemory(to: UInt32.self, capacity: clist.count)
+                .update(from: clist, count: clist.count)
+        }
+        // indirect dispatch args per color, fixed for the scene's lifetime
+        let cargs = colorArgs.contents().bindMemory(to: UInt32.self,
+                                                    capacity: AVBD_MAX_COLORS * 3)
+        for c in 0..<AVBD_MAX_COLORS {
+            cargs[c * 3 + 0] = UInt32((buckets[c].count + 63) / 64)
+            cargs[c * 3 + 1] = 1
+            cargs[c * 3 + 2] = 1
+        }
+        for i in 0..<numBodies { colA[i] = UInt32(staticColors[i]) }
+        lastColorCounts = buckets.map { $0.count }
+        lastMaxColorUsed = staticUsedColors - 1
+
         // Clear manifolds + map
         memset(manifolds.contents(), 0, manifolds.length)
         memset(prevManifolds.contents(), 0, prevManifolds.length)
@@ -665,10 +903,18 @@ public final class GPUSolver {
         params.gridHashSize = UInt32(gridHashSize)
         params.numHashed = UInt32(hashed.count)
         params.numGlobals = UInt32(globals.count)
+        params.numHashedRigid = UInt32(hashed.filter { !scene.bodies[Int($0)].isParticle }.count)
         // Anti-tunneling: cap speed so nothing crosses the thinnest static
         // geometry in one frame. Heuristic: a couple of cells per step.
         params.maxSpeed = max(30, 1.5 * params.cellSize / settings.dt * 0.5)
     }
+
+    // NOTE on indirect command buffers: the obvious dispatch-storm fix
+    // (pre-encode iterations x colors of solve commands once, replay per
+    // frame) is blocked on macOS — CPU-side compute-ICB encoding
+    // (indirectComputeCommand(at:)) is iOS-only, and GPU-side encoding
+    // cannot switch pipelines per command. Attacked instead by shrinking
+    // the static palette (bends/contacts Jacobi-accepted).
 
     // MARK: - Dispatch helpers
 
@@ -1167,7 +1413,7 @@ public final class GPUSolver {
         // persistence map), then rebuild the map for next frame. Runs at
         // start-of-step poses like the rigid narrowphase.
         if numTris > 0 {
-            stage("cloth-detect")
+            stage("el-bin")
             dispatch1D(enc, "el_count", numTris + Int(P.numEdges)) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.trisBuf, offset: 0, index: 1)
@@ -1183,6 +1429,7 @@ public final class GPUSolver {
                 e.setBuffer(self.elemCells, offset: 0, index: 2)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 3)
             }
+            stage("vt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
             dispatch1D(enc, "vt_emit", numParticles) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -1206,6 +1453,7 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 18)
             }
             }
+            stage("ee-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_EE"] == nil {
             dispatch1D(enc, "ee_emit", numEdges) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -1228,6 +1476,7 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 17)
             }
             }
+            stage("rt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_RT"] == nil {
             dispatch1D(enc, "rt_emit", numTris) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -1252,6 +1501,7 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 19)
             }
             }
+            stage("softmap")
             dispatch1D(enc, "soft_finalize", 1) { e in
                 e.setBuffer(self.counters, offset: 0, index: 0)
                 e.setBuffer(self.dispatchArgs, offset: 0, index: 1)
@@ -1335,62 +1585,104 @@ public final class GPUSolver {
             e.setBuffer(self.bends, offset: 0, index: 11)
         }
 
-        stage("coloring")
-        // Coloring (Jacobi rounds, ping-pong). Dense soft-body graphs
-        // (cloth: degree ~16) need more rounds to clear conflicts —
-        // uncleared conflicts mean connected bodies update simultaneously,
-        // which INJECTS energy into stiff constraint networks.
-        var src = colorsA, dst = colorsB
-        for _ in 0..<20 {
-            dispatch1D(enc, "color_iterate", numBodies) { e in
-                e.setBuffer(self.posLin, offset: 0, index: 0)
-                e.setBuffer(self.joints, offset: 0, index: 1)
-                e.setBuffer(self.springs, offset: 0, index: 2)
-                e.setBuffer(self.manifolds, offset: 0, index: 3)
-                e.setBuffer(self.adjStart, offset: 0, index: 4)
-                e.setBuffer(self.degrees, offset: 0, index: 5)
-                e.setBuffer(self.adjList, offset: 0, index: 6)
-                e.setBuffer(src, offset: 0, index: 7)
-                e.setBuffer(dst, offset: 0, index: 8)
-                e.setBuffer(self.changedFlag, offset: 0, index: 9)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 10)
-                e.setBuffer(self.tets, offset: 0, index: 11)
-                e.setBuffer(self.softContacts, offset: 0, index: 12)
-                e.setBuffer(self.membranes, offset: 0, index: 13)
-                e.setBuffer(self.bends, offset: 0, index: 14)
+        // Coloring is scene-adaptive:
+        // - Soft scenes (cloth/tets): STATIC topology palette from init,
+        //   Newton-style — contacts never constrain colors (same-color
+        //   contact pairs degrade to Jacobi, which gram-scale penalty
+        //   contacts tolerate; measured: all cloth gates green, 1.3-1.7 ms
+        //   of per-frame recoloring gone, palette 14-20 -> 3).
+        // - Pure rigid scenes: the original contact-aware per-frame GPU
+        //   coloring — box stacks and gear trains genuinely need strict
+        //   Gauss-Seidel contact ordering (stack/gearclock fail without).
+        if usesDynamicColoring {
+            stage("coloring")
+            var src = colorsA, dst = colorsB
+            for _ in 0..<20 {
+                dispatch1D(enc, "color_iterate", numBodies) { e in
+                    e.setBuffer(self.posLin, offset: 0, index: 0)
+                    e.setBuffer(self.joints, offset: 0, index: 1)
+                    e.setBuffer(self.springs, offset: 0, index: 2)
+                    e.setBuffer(self.manifolds, offset: 0, index: 3)
+                    e.setBuffer(self.adjStart, offset: 0, index: 4)
+                    e.setBuffer(self.degrees, offset: 0, index: 5)
+                    e.setBuffer(self.adjList, offset: 0, index: 6)
+                    e.setBuffer(src, offset: 0, index: 7)
+                    e.setBuffer(dst, offset: 0, index: 8)
+                    e.setBuffer(self.changedFlag, offset: 0, index: 9)
+                    e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 10)
+                    e.setBuffer(self.tets, offset: 0, index: 11)
+                    e.setBuffer(self.softContacts, offset: 0, index: 12)
+                    e.setBuffer(self.membranes, offset: 0, index: 13)
+                    e.setBuffer(self.bends, offset: 0, index: 14)
+                }
+                swap(&src, &dst)
             }
-            swap(&src, &dst)
+            let finalColors = src
+            dispatch1D(enc, "color_count", numBodies) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(finalColors, offset: 0, index: 1)
+                e.setBuffer(self.counters, offset: 0, index: 2)
+                e.setBuffer(self.bodySlot, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
+            }
+            dispatch1D(enc, "color_scan", AVBD_MAX_COLORS) { e in
+                e.setBuffer(self.counters, offset: 0, index: 0)
+                e.setBuffer(self.colorStart, offset: 0, index: 1)
+                e.setBuffer(self.colorArgs, offset: 0, index: 2)
+            }
+            dispatch1D(enc, "color_scatter", numBodies) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(finalColors, offset: 0, index: 1)
+                e.setBuffer(self.bodySlot, offset: 0, index: 2)
+                e.setBuffer(self.colorStart, offset: 0, index: 3)
+                e.setBuffer(self.colorList, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
+            }
+            if finalColors !== colorsA {
+                dynColorSrc = finalColors
+            }
         }
-        let finalColors = src
-
-        dispatch1D(enc, "color_count", numBodies) { e in
-            e.setBuffer(self.posLin, offset: 0, index: 0)
-            e.setBuffer(finalColors, offset: 0, index: 1)
-            e.setBuffer(self.counters, offset: 0, index: 2)
-            e.setBuffer(self.bodySlot, offset: 0, index: 3)
-            e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
-        }
-        dispatch1D(enc, "color_scan", AVBD_MAX_COLORS) { e in
-            e.setBuffer(self.counters, offset: 0, index: 0)
-            e.setBuffer(self.colorStart, offset: 0, index: 1)
-            e.setBuffer(self.colorArgs, offset: 0, index: 2)
-        }
-        dispatch1D(enc, "color_scatter", numBodies) { e in
-            e.setBuffer(self.posLin, offset: 0, index: 0)
-            e.setBuffer(finalColors, offset: 0, index: 1)
-            e.setBuffer(self.bodySlot, offset: 0, index: 2)
-            e.setBuffer(self.colorStart, offset: 0, index: 3)
-            e.setBuffer(self.colorList, offset: 0, index: 4)
-            e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
-        }
-        // ---- Solver iterations: per-color primal (indirect; empty colors
-        // dispatch zero threadgroups) + dual updates. Same command buffer —
-        // no CPU sync mid-step. The color loop bound comes from the previous
-        // frame (colors change slowly; stale bound is safe since dispatch
-        // size always comes from the GPU-side colorArgs).
         stage("solver-iterations")
         let persistPSO = ps("solve_persistent")
-        if numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
+        let multiPSO = ps("solve_persistent_multi")
+        // Multi-threadgroup persistent path: whole solve in one dispatch of
+        // a few co-resident threadgroups (device-scope spin barrier). Covers
+        // small AND mid scenes; huge scenes amortize per-color dispatches.
+        // EXPERIMENTAL, opt-in: deadlocked on first contact with reality —
+        // Metal guarantees no forward progress between threadgroups, and the
+        // arrive-and-spin barrier wedged the queue. Kept for further study.
+        let multiOK = ProcessInfo.processInfo.environment["AVBD_MULTI"] != nil
+        let noPersist = ProcessInfo.processInfo.environment["AVBD_NO_PERSIST"] != nil
+        if multiOK && numBodies <= 4096 {
+            let tgW = min(256, multiPSO.maxTotalThreadsPerThreadgroup)
+            var ntg = UInt32(min(8, max(1, (numBodies + tgW - 1) / tgW + 1)))
+            enc.setComputePipelineState(multiPSO)
+            enc.setBuffer(posLin, offset: 0, index: 0)
+            enc.setBuffer(posAng, offset: 0, index: 1)
+            enc.setBuffer(initLin, offset: 0, index: 2)
+            enc.setBuffer(initAng, offset: 0, index: 3)
+            enc.setBuffer(inertLin, offset: 0, index: 4)
+            enc.setBuffer(inertAng, offset: 0, index: 5)
+            enc.setBuffer(props, offset: 0, index: 6)
+            enc.setBuffer(joints, offset: 0, index: 7)
+            enc.setBuffer(springs, offset: 0, index: 8)
+            enc.setBuffer(manifolds, offset: 0, index: 9)
+            enc.setBuffer(adjStart, offset: 0, index: 10)
+            enc.setBuffer(degrees, offset: 0, index: 11)
+            enc.setBuffer(adjList, offset: 0, index: 12)
+            enc.setBuffer(colorList, offset: 0, index: 13)
+            enc.setBuffer(colorStart, offset: 0, index: 14)
+            enc.setBuffer(counters, offset: 0, index: 15)
+            enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
+            enc.setBuffer(shape, offset: 0, index: 17)
+            enc.setBuffer(tets, offset: 0, index: 18)
+            enc.setBuffer(softContacts, offset: 0, index: 19)
+            enc.setBuffer(membranes, offset: 0, index: 20)
+            enc.setBuffer(bends, offset: 0, index: 21)
+            enc.setBytes(&ntg, length: 4, index: 22)
+            enc.dispatchThreadgroups(MTLSize(width: Int(ntg), height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
+        } else if !noPersist && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
             // small scene: the whole solve loop in ONE dispatch — hundreds
             // of per-dispatch launch/barrier latencies become threadgroup
             // barriers (see kernel comment)
@@ -1423,10 +1715,9 @@ public final class GPUSolver {
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
         } else {
-        // tight bound: +1 headroom over what the colorer actually produced
-        // last frame (a stale bound only delays a few bodies by one frame;
-        // every extra slot costs an empty dispatch + barrier per iteration)
-        let colorBound = min(AVBD_MAX_COLORS, max(lastMaxColorUsed + 2, 4))
+        let colorBound = usesDynamicColoring
+            ? min(AVBD_MAX_COLORS, max(lastMaxColorUsed + 2, 4))
+            : staticUsedColors
         let primalPSO = ps("primal_solve")
         for it in 0..<settings.iterations {
             enc.setComputePipelineState(primalPSO)
@@ -1456,6 +1747,29 @@ public final class GPUSolver {
                 enc.setBuffer(bends, offset: 0, index: 21)
             }
             _ = it
+            if profiling { stage("solve-primal") ; enc.setComputePipelineState(primalPSO)
+                enc.setBuffer(posLin, offset: 0, index: 0)
+                enc.setBuffer(posAng, offset: 0, index: 1)
+                enc.setBuffer(initLin, offset: 0, index: 2)
+                enc.setBuffer(initAng, offset: 0, index: 3)
+                enc.setBuffer(inertLin, offset: 0, index: 4)
+                enc.setBuffer(inertAng, offset: 0, index: 5)
+                enc.setBuffer(props, offset: 0, index: 6)
+                enc.setBuffer(joints, offset: 0, index: 7)
+                enc.setBuffer(springs, offset: 0, index: 8)
+                enc.setBuffer(manifolds, offset: 0, index: 9)
+                enc.setBuffer(adjStart, offset: 0, index: 10)
+                enc.setBuffer(degrees, offset: 0, index: 11)
+                enc.setBuffer(adjList, offset: 0, index: 12)
+                enc.setBuffer(colorList, offset: 0, index: 13)
+                enc.setBuffer(colorStart, offset: 0, index: 14)
+                enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
+                enc.setBuffer(shape, offset: 0, index: 17)
+                enc.setBuffer(tets, offset: 0, index: 18)
+                enc.setBuffer(softContacts, offset: 0, index: 19)
+                enc.setBuffer(membranes, offset: 0, index: 20)
+                enc.setBuffer(bends, offset: 0, index: 21)
+            }
             for c in 0..<colorBound {
                 var cIdx = UInt32(c)
                 enc.setBytes(&cIdx, length: 4, index: 15)
@@ -1475,6 +1789,7 @@ public final class GPUSolver {
                 enc.setComputePipelineState(primalPSO)
             }
 
+            if profiling { stage("solve-dual") }
             dispatchIndirect(enc, "dual_all", argsOffset: 6) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.posAng, offset: 0, index: 1)
@@ -1531,30 +1846,33 @@ public final class GPUSolver {
                 e2.endEncoding()
             }
         }
-        // canonicalize colors on the GPU (was a CPU memcpy needing a sync)
-        if finalColors !== colorsA, let blit = cmd1.makeBlitCommandEncoder() {
-            blit.copy(from: finalColors, sourceOffset: 0,
+        if let src2 = dynColorSrc, let blit = cmd1.makeBlitCommandEncoder() {
+            blit.copy(from: src2, sourceOffset: 0,
                       to: colorsA, destinationOffset: 0, size: numBodies * 4)
             blit.endEncoding()
+            dynColorSrc = nil
         }
+        let dynColors = usesDynamicColoring
         let readStats = { [weak self] in
             guard let self else { return }
             let ctr = self.counters.contents()
                 .bindMemory(to: UInt32.self, capacity: GPUCounters.total)
             let pairs = Int(ctr[GPUCounters.pairs])
             let softN = min(Int(ctr[GPUCounters.soft]), self.maxSoft)
-            var counts: [Int] = []
-            var maxUsed = -1
-            for c in 0..<AVBD_MAX_COLORS {
-                let n = Int(ctr[GPUCounters.colorBase + c])
-                counts.append(n)
-                if n > 0 { maxUsed = c }
-            }
             self.statsLock.lock()
             self.lastNumPairs = pairs
             self.lastNumSoft = softN
-            self.lastColorCounts = counts
-            self.lastMaxColorUsed = maxUsed
+            if dynColors {
+                var counts: [Int] = []
+                var maxUsed = -1
+                for c in 0..<AVBD_MAX_COLORS {
+                    let n = Int(ctr[GPUCounters.colorBase + c])
+                    counts.append(n)
+                    if n > 0 { maxUsed = c }
+                }
+                self.lastColorCounts = counts
+                self.lastMaxColorUsed = maxUsed
+            }
             self.statsLock.unlock()
         }
         if profiling {
@@ -1738,9 +2056,48 @@ public final class GPUSolver {
         enc.setBytes(&cm, length: 4, index: 5)
         enc.setBuffer(colorsA, offset: 0, index: 6)
         enc.setBuffer(shapeType, offset: 0, index: 7)
+        enc.setBuffer(surfacedFlags, offset: 0, index: 8)
         enc.dispatchThreadgroups(MTLSize(width: (numBodies + 255) / 256, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        if surfVertCount > 0 {
+            let pf = ps("soft_face_normals")
+            enc.setComputePipelineState(pf)
+            enc.setBuffer(posLin, offset: 0, index: 0)
+            enc.setBuffer(surfTriBuf, offset: 0, index: 1)
+            enc.setBuffer(faceNormalsBuf, offset: 0, index: 2)
+            var nt = UInt32(surfaceTriCount)
+            enc.setBytes(&nt, length: 4, index: 3)
+            enc.dispatchThreadgroups(MTLSize(width: (surfaceTriCount + 255) / 256, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+            let pn = ps("soft_normals")
+            enc.setComputePipelineState(pn)
+            enc.setBuffer(posLin, offset: 0, index: 0)
+            enc.setBuffer(surfVertsBuf, offset: 0, index: 1)
+            enc.setBuffer(surfVtStart, offset: 0, index: 2)
+            enc.setBuffer(surfVtCount, offset: 0, index: 3)
+            enc.setBuffer(surfVtList, offset: 0, index: 4)
+            enc.setBuffer(surfTriBuf, offset: 0, index: 5)
+            enc.setBuffer(softNormalsBuf, offset: 0, index: 6)
+            var nv = UInt32(surfVertCount)
+            enc.setBytes(&nv, length: 4, index: 7)
+            enc.setBuffer(faceNormalsBuf, offset: 0, index: 8)
+            enc.setBuffer(shape, offset: 0, index: 9)
+            enc.dispatchThreadgroups(MTLSize(width: (surfVertCount + 255) / 256, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
         enc.endEncoding()
+    }
+
+    /// Soft-surface render data (cloth + tet boundary meshes), nil if none.
+    /// Corners pack body-id | side<<23 | component<<24; thin sheets carry
+    /// front/back layers + hem rims, offset by the thickness in normals.w.
+    /// Positions index the live posLin buffer; normals are refreshed by
+    /// encodeBuildInstances.
+    public var renderSurface: (tris: MTLBuffer, triCount: Int,
+                               positions: MTLBuffer, normals: MTLBuffer)? {
+        guard renderTriCount > 0 else { return nil }
+        return (renderTriBuf, renderTriCount, posLin, softNormalsBuf)
     }
 
     public var bodyCount: Int { numBodies }

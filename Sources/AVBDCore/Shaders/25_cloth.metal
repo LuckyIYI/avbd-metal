@@ -301,10 +301,9 @@ kernel void vt_emit(
             uint t = entry;
             uint4 tid = tris[t];
             if (tid.x == v || tid.y == v || tid.z == v) continue;
-            if (nbrContains(nbrList, ns, ne, tid.x) ||
-                nbrContains(nbrList, ns, ne, tid.y) ||
-                nbrContains(nbrList, ns, ne, tid.z)) continue;
 
+            // geometry cull FIRST: most candidates are far away, and the
+            // topological exclusion costs three binary searches
             float3 a = posLin[tid.x].xyz;
             float3 b = posLin[tid.y].xyz;
             float3 c = posLin[tid.z].xyz;
@@ -320,6 +319,9 @@ kernel void vt_emit(
             float inflate = min(length(velV - velT) * P.dt, 0.3f * P.elemCellSize);
             float detect = hSum + COLLISION_MARGIN + inflate;
             if (dist2 > detect * detect) continue;
+            if (nbrContains(nbrList, ns, ne, tid.x) ||
+                nbrContains(nbrList, ns, ne, tid.y) ||
+                nbrContains(nbrList, ns, ne, tid.z)) continue;
 
             float dist = sqrt(dist2);
             float3 triN = cross(b - a, c - a);
@@ -439,13 +441,9 @@ kernel void ee_emit(
             uint eBi = entry & ~ELEM_EDGE_BIT;
             if (eBi <= gid) continue;               // each pair once
             uint2 eB = edges[eBi];
-            // topological exclusion: shared vertex or 1.5-ring
             if (eB.x == eA.x || eB.x == eA.y || eB.y == eA.x || eB.y == eA.y) continue;
-            if (nbrContains(nbrList, nsx, nex, eB.x) ||
-                nbrContains(nbrList, nsx, nex, eB.y) ||
-                nbrContains(nbrList, nsy, ney, eB.x) ||
-                nbrContains(nbrList, nsy, ney, eB.y)) continue;
 
+            // geometry cull FIRST, exclusions (4 binary searches) after
             float3 b0 = posLin[eB.x].xyz, b1 = posLin[eB.y].xyz;
             float s, t;
             eeClosestSegSeg(a0, a1, b0, b1, s, t);
@@ -463,6 +461,10 @@ kernel void ee_emit(
             float inflate = min(length(velA - velB) * P.dt, 0.3f * P.elemCellSize);
             if (dist - hSum > COLLISION_MARGIN + inflate) continue;
             if (dist < 1e-7f) continue;             // degenerate: let V-T handle
+            if (nbrContains(nbrList, nsx, nex, eB.x) ||
+                nbrContains(nbrList, nsx, nex, eB.y) ||
+                nbrContains(nbrList, nsy, ney, eB.x) ||
+                nbrContains(nbrList, nsy, ney, eB.y)) continue;
 
             float3 nGeo = d / dist;
             uint keyA = (SC_EE << 28) | gid;
@@ -671,9 +673,10 @@ kernel void rt_emit(
     }
 
     // hashed bodies: widen the scan so big-body centers further than one cell
-    // are still reached (cellSize = 2x max hashed radius; triangles add rT)
-    int R = int(ceil((rT + 0.5f * P.cellSize) / P.cellSize));
-    R = clamp(R, 1, 4);
+    // are still reached (cellSize = 2x max hashed radius; triangles add rT).
+    // Pure-cloth scenes hash only particles: skip the whole sweep.
+    int R = P.numHashedRigid == 0 ? 0
+        : clamp(int(ceil((rT + 0.5f * P.cellSize) / P.cellSize)), 1, 4);
     int3 cc = cellCoord(m, P.cellSize);
     for (int dz = -R; dz <= R && emitted < RT_MAX_PER_TRI; dz++)
     for (int dy = -R; dy <= R && emitted < RT_MAX_PER_TRI; dy++)

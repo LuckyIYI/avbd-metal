@@ -5,7 +5,9 @@ import simd
 
 /// Observable simulation state driving the UI and the renderer.
 final class SimulationModel: ObservableObject, RenderableModel {
-    @Published var demoName = "stack" { didSet { reset() } }
+    @Published var demoName = ProcessInfo.processInfo.environment["AVBD_DEMO"] ?? "stack" {
+        didSet { reset() }
+    }
     @Published var scale = 1 { didSet { reset() } }
     @Published var running = true
     @Published var colorByGraphColor = false

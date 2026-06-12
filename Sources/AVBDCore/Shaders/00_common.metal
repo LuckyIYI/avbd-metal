@@ -253,6 +253,7 @@ struct SimParams {
     // Per-second velocity damping for 3-DOF particles (air drag + internal
     // viscosity of thin sheets — the reference cloth ships the same knob).
     float particleDamping;
+    uint numHashedRigid;    // hashed non-particle bodies (rt scan skip)
 };
 
 struct JointGPU {
@@ -339,6 +340,7 @@ struct ManifoldGPU {
 // Counters layout (single uint buffer)
 #define CTR_PAIRS 0
 #define CTR_SOFT 1                 // element (soft) contact count
+#define CTR_GBAR 2                 // device-scope barrier (multi-TG solver)
 #define CTR_COLOR_BASE 8           // MAX_COLORS entries
 #define CTR_SCATTER_BASE (8 + MAX_COLORS)  // MAX_COLORS scatter cursors
 #define CTR_TOTAL (8 + 2 * MAX_COLORS)

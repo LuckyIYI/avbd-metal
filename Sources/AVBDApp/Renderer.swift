@@ -43,6 +43,7 @@ struct VOut {
     float3 normal;
     float3 world;
     float3 albedo;
+    float flatShade;
 };
 
 #define HORIZON_LIN float3(0.78, 0.81, 0.85)
@@ -88,6 +89,7 @@ inline VOut collapse() {
     VOut o;
     o.position = float4(0, 0, -2, 1);
     o.normal = float3(0); o.world = float3(0); o.albedo = float3(0);
+    o.flatShade = 0;
     return o;
 }
 
@@ -101,6 +103,7 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
     o.normal = rot * n;
     o.world = world.xyz;
     o.albedo = srgbToLin(inst.color.rgb);
+    o.flatShade = 0;
     return o;
 }
 
@@ -178,6 +181,41 @@ vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
 }
 
 // ---------------------------------------------------------------------------
+// Soft surface meshes (cloth sheets, tet-body boundaries): vertices live in
+// the solver's posLin buffer, smooth normals come from the soft_normals
+// kernel, color from the connected-component id packed in the corner.
+// ---------------------------------------------------------------------------
+inline float3 softPalette(uint i) {
+    float h = fract(float(i) * 0.61803398875f);
+    float3 p = abs(fract(h + float3(5.0f, 3.0f, 1.0f) / 6.0f) * 6.0f - 3.0f) - 1.0f;
+    return clamp(p, 0.0f, 1.0f);
+}
+
+vertex VOut soft_vertex(uint vid [[vertex_id]],
+                        device const uint* corners [[buffer(0)]],
+                        constant Uniforms& U [[buffer(1)]],
+                        device const float4* posLin [[buffer(2)]],
+                        device const float4* normals [[buffer(3)]])
+{
+    uint packed = corners[vid];
+    uint body = packed & 0x001FFFFFu;
+    uint side = (packed >> 23) & 1u;
+    uint comp = packed >> 24;
+    float4 nt = normals[body];               // xyz smooth normal, w thickness
+    // extrude along the smooth normal: front +r, back -r — the render skin
+    // matches the contact skin, so layered cloth visually touches
+    float3 w = posLin[body].xyz + nt.xyz * (nt.w * (side == 0 ? 1.0 : -1.0) * 0.95);
+    VOut o;
+    o.position = U.viewProj * float4(w, 1);
+    o.world = w;
+    o.normal = nt.xyz;
+    o.flatShade = ((packed >> 21) & 1u) != 0 ? 1.0 : 0.0;
+    // warm fabric-ish tones, one per sheet/body
+    o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 7u + 2u), 0.72));
+    return o;
+}
+
+// ---------------------------------------------------------------------------
 // PBR main fragment (samples the SSAO texture)
 // ---------------------------------------------------------------------------
 fragment float4 pbr_fragment(VOut in [[stage_in]],
@@ -233,6 +271,94 @@ fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
     PreOut o;
     o.pos = float4(in.world, 1.0);
     o.norm = float4(normalize(in.normal), 0);
+    return o;
+}
+
+// Thin sheets are double-sided: shade with the normal facing the viewer.
+fragment float4 soft_fragment(VOut in [[stage_in]],
+                              constant Uniforms& U [[buffer(1)]],
+                              texture2d<float> aoTex [[texture(0)]])
+{
+    constexpr sampler smp(filter::linear);
+    float ao = aoTex.sample(smp, in.position.xy / U.screen.xy).r;
+
+    float3 n = normalize(in.normal);
+    if (in.flatShade > 0.5) {
+        // sharp-edged soft solids (tet boundaries): per-pixel face normal
+        n = normalize(cross(dfdx(in.world), dfdy(in.world)));
+        // derivative orientation depends on winding in screen space
+        n = dot(n, U.eye.xyz - in.world) < 0.0 ? -n : n;
+    }
+    float3 V = normalize(U.eye.xyz - in.world);
+    if (dot(n, V) < 0.0) n = -n;
+    float3 L = -U.lightDir.xyz;
+    float3 H = normalize(L + V);
+    float NdL = max(dot(n, L), 0.0);
+    float NdV = max(dot(n, V), 1e-4);
+    float NdH = max(dot(n, H), 0.0);
+    float HdV = max(dot(H, V), 0.0);
+
+    const float rough = 0.72;              // matte woven look
+    float a2 = rough * rough; a2 *= a2;
+    float dDen = NdH * NdH * (a2 - 1.0) + 1.0;
+    float D = a2 / (M_PI_F * dDen * dDen);
+    float k = (rough + 1.0); k = k * k / 8.0;
+    float G = (NdV / (NdV * (1.0 - k) + k)) * (NdL / (NdL * (1.0 - k) + k));
+    float3 F0 = float3(0.035);
+    float3 F = F0 + (1.0 - F0) * pow(1.0 - HdV, 5.0);
+    float3 spec = D * G * F / max(4.0 * NdV * NdL, 1e-4);
+
+    // a touch of wrap so the unlit side of folds doesn't go dead black
+    float wrap = max((dot(n, L) + 0.35) / 1.35, 0.0);
+    float3 direct = (in.albedo / M_PI_F * (1.0 - F) * wrap + spec * NdL) * SUN_COL;
+
+    float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
+    float3 ambient = in.albedo * irr * 1.15;
+    ambient *= ao;
+
+    float3 lit = direct + ambient;
+    float fog = horizonFog(length(in.world - U.eye.xyz));
+    lit = mix(lit, HORIZON_LIN, fog);
+    return float4(acesTonemap(lit), 1.0);
+}
+
+// Prepass variant: only the FRONT layer reaches the AO/depth buffers. The
+// back layer sits one skin behind it and, at grazing angles, reads as a
+// second surface inside the AO radius — pure view-space dark halos along
+// the cloth silhouette. Rim corners (bit 22) collapse too.
+vertex VOut soft_vertex_front(uint vid [[vertex_id]],
+                              device const uint* corners [[buffer(0)]],
+                              constant Uniforms& U [[buffer(1)]],
+                              device const float4* posLin [[buffer(2)]],
+                              device const float4* normals [[buffer(3)]])
+{
+    uint packed = corners[vid];
+    if (((packed >> 23) & 1u) != 0 || ((packed >> 22) & 1u) != 0) return collapse();
+    uint body = packed & 0x001FFFFFu;
+    float4 nt = normals[body];
+    float3 w = posLin[body].xyz + nt.xyz * (nt.w * 0.95);
+    VOut o;
+    o.position = U.viewProj * float4(w, 1);
+    o.world = w;
+    o.normal = nt.xyz;
+    o.albedo = float3(0);
+    o.flatShade = ((packed >> 21) & 1u) != 0 ? 1.0 : 0.0;
+    return o;
+}
+
+fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
+                                      constant Uniforms& U [[buffer(1)]])
+{
+    float3 n = normalize(in.normal);
+    if (in.flatShade > 0.5) {
+        n = normalize(cross(dfdx(in.world), dfdy(in.world)));
+        n = dot(n, U.eye.xyz - in.world) < 0.0 ? -n : n;
+    }
+    float3 V = normalize(U.eye.xyz - in.world);
+    if (dot(n, V) < 0.0) n = -n;           // AO sees the visible side
+    PreOut o;
+    o.pos = float4(in.world, 1.0);
+    o.norm = float4(n, 0);
     return o;
 }
 
@@ -556,8 +682,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     let queue: MTLCommandQueue
     weak var model: (AnyObject & RenderableModel)?
 
-    var boxP, sphereP, torusP, capsuleP: MTLRenderPipelineState!
-    var boxPre, spherePre, torusPre, capsulePre, floorPreP: MTLRenderPipelineState!
+    var boxP, sphereP, torusP, capsuleP, softP: MTLRenderPipelineState!
+    var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre: MTLRenderPipelineState!
     var skyP, floorP, shadowP, ssaoP, blurP, temporalP: MTLRenderPipelineState!
     var depthState, noDepthState, noWriteDepthState: MTLDepthStencilState!
 
@@ -580,6 +706,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.queue = device.makeCommandQueue()!
         self.model = model
         super.init()
+        // scripted-capture camera overrides
+        let env = ProcessInfo.processInfo.environment
+        if let v = env["AVBD_CAM_DIST"].flatMap(Float.init) { distance = v }
+        if let v = env["AVBD_CAM_AZ"].flatMap(Float.init) { azimuth = v }
+        if let v = env["AVBD_CAM_EL"].flatMap(Float.init) { elevation = v }
+        if let v = env["AVBD_CAM_TZ"].flatMap(Float.init) { target.z = v }
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
         func pipe(_ v: String, _ f: String, samples: Int = Renderer.sampleCount,
@@ -606,6 +738,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         sphereP = try pipe("sphere_vertex", "pbr_fragment")
         torusP = try pipe("torus_vertex", "pbr_fragment")
         capsuleP = try pipe("capsule_vertex", "pbr_fragment")
+        softP = try pipe("soft_vertex", "soft_fragment")
         skyP = try pipe("fs_vertex", "sky_fragment")
         floorP = try pipe("floor_vertex", "floor_fragment")
         shadowP = try pipe("shadow_vertex", "shadow_fragment", blend: true)
@@ -616,6 +749,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         torusPre = try pipe("torus_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         capsulePre = try pipe("capsule_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         floorPreP = try pipe("floor_vertex", "floor_prepass_fragment", samples: 1, colorFormats: preFmt)
+        softPre = try pipe("soft_vertex_front", "soft_prepass_fragment", samples: 1, colorFormats: preFmt)
         ssaoP = try pipe("fs_vertex", "ssao_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
         blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
@@ -768,6 +902,16 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: verts, instanceCount: count)
             }
+            if let surf = solver.renderSurface {
+                enc.setRenderPipelineState(softPre)
+                enc.setVertexBuffer(surf.tris, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
+                enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
+                enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: surf.triCount * 3)
+            }
             enc.endEncoding()
         }
 
@@ -853,6 +997,17 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: verts, instanceCount: count)
         }
+        if let surf = solver.renderSurface {
+            enc.setRenderPipelineState(softP)
+            enc.setVertexBuffer(surf.tris, offset: 0, index: 0)
+            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
+            enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexA, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: surf.triCount * 3)
+        }
         enc.endEncoding()
 
         cmd.present(drawable)
@@ -863,6 +1018,37 @@ final class Renderer: NSObject, MTKViewDelegate {
             let info = "frames=30 bodies=\(count) stats=\(model.statsText)"
             try? info.write(toFile: "/tmp/avbd_render_marker.txt", atomically: true, encoding: .utf8)
         }
+        // Scripted capture: AVBD_SHOT=<path.png> [AVBD_SHOT_FRAME=n] writes
+        // the resolved frame and exits (needs framebufferOnly = false).
+        if let shotPath = ProcessInfo.processInfo.environment["AVBD_SHOT"],
+           framesDrawn == (Int(ProcessInfo.processInfo.environment["AVBD_SHOT_FRAME"] ?? "") ?? 90) {
+            cmd.waitUntilCompleted()
+            writePNG(texture: drawable.texture, to: shotPath)
+            exit(0)
+        }
+    }
+
+    private func writePNG(texture: MTLTexture, to path: String) {
+        let w = texture.width, h = texture.height
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        bytes.withUnsafeMutableBytes { raw in
+            texture.getBytes(raw.baseAddress!, bytesPerRow: w * 4,
+                             from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        }
+        // BGRA -> RGBA
+        for i in stride(from: 0, to: bytes.count, by: 4) { bytes.swapAt(i, i + 2) }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let img = CGImage(width: w, height: h, bitsPerComponent: 8,
+                                bitsPerPixel: 32, bytesPerRow: w * 4, space: cs,
+                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                provider: provider, decode: nil,
+                                shouldInterpolate: false, intent: .defaultIntent),
+              let dest = CGImageDestinationCreateWithURL(
+                  URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil)
+        else { return }
+        CGImageDestinationAddImage(dest, img, nil)
+        CGImageDestinationFinalize(dest)
     }
 }
 

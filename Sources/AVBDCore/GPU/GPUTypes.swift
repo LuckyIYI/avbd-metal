@@ -39,7 +39,10 @@ public struct SimParamsGPU {
     public var elemHashSize: UInt32 = 0
     public var rodDecayPow: Float = 0
     public var particleDamping: Float = 0
+    public var numHashedRigid: UInt32 = 0
 }
+
+extension SimParamsGPU: Equatable {}
 
 public struct JointGPU {
     public var header: SIMD4<UInt32> = .zero  // bodyA, bodyB, broken, pad

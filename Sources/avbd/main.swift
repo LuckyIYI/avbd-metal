@@ -29,6 +29,9 @@ struct Options {
     var lr: Float = 3e-4
     var lambda: Float = 0.5
     var episodes = 10
+    var updates = 200
+    var horizon = 32
+    var epochs = 2
 }
 
 func parseOptions(_ args: [String]) -> Options {
@@ -51,6 +54,9 @@ func parseOptions(_ args: [String]) -> Options {
         case "--lr": i += 1; o.lr = Float(args[i]) ?? 3e-4
         case "--lambda": i += 1; o.lambda = Float(args[i]) ?? 0.5
         case "--episodes": i += 1; o.episodes = Int(args[i]) ?? 10
+        case "--updates": i += 1; o.updates = Int(args[i]) ?? 200
+        case "--horizon": i += 1; o.horizon = Int(args[i]) ?? 32
+        case "--epochs": i += 1; o.epochs = Int(args[i]) ?? 2
         default: break
         }
         i += 1
@@ -71,6 +77,8 @@ func makeScene(_ name: String, _ o: Options) -> PhysicsScene {
     if let dt = o.dt { scene.settings.dt = dt }
     return scene
 }
+
+setvbuf(stdout, nil, _IOLBF, 0)   // line-buffer even when redirected to a log
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else {
@@ -190,6 +198,30 @@ case "rodexp":
                      worstStretch))
     }
 
+case "profile":
+    // Per-stage GPU time breakdown (encoder-boundary timestamps).
+    guard args.count > 1 else { fail("usage: avbd profile <demo>") }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let scene = makeScene(args[1], o)
+    let solver = try GPUSolver(scene: scene)
+    print("bodies \(scene.bodies.count)  tris \(scene.tris.count)  springs \(scene.springs.count)  joints \(scene.joints.count)  colors \(solver.staticUsedColors)  persistent-capacity \(solver.persistentCapacity)")
+    for _ in 0..<30 { solver.step() }      // warm up
+    solver.sync()
+    solver.profiling = true
+    solver.resetProfile()
+    let t0 = Date()
+    for _ in 0..<o.frames { solver.step() }
+    solver.sync()
+    let wallMS = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
+    let total = solver.profileNS.values.reduce(0, +)
+    print(String(format: "wall %.3f ms/frame  (gpu-stage sum %.3f ms)",
+                 wallMS, total / Double(o.frames) / 1e6))
+    for (name, ns) in solver.profileNS.sorted(by: { $0.value > $1.value }) {
+        let ms = ns / Double(o.frames) / 1e6
+        print(String(format: "  %-22s %8.3f ms  %5.1f%%", (name as NSString).utf8String!,
+                     ms, ns / total * 100))
+    }
+
 case "clothgate":
     // Cloth gate runner: step a demo and report element-contact metrics
     // (worst V-T clearance, worst structural stretch, soft contact count).
@@ -271,6 +303,21 @@ case "collect-dagger":
                                     path: "runs/pusht/data",
                                     policyPath: "runs/pusht/model",
                                     latent: o.latent)
+
+case "train-ppo":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PPOPipeline.train(envs: o.envs, updates: o.updates, horizon: o.horizon,
+                          epochs: o.epochs, minibatch: o.batch,
+                          lr: args.contains("--lr") ? o.lr : 3e-5,
+                          latent: args.contains("--latent") ? o.latent : 192,
+                          initFrom: args.contains("--scratch")
+                              ? nil : "runs/pusht/model/bc.safetensors")
+
+case "solve-ppo":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    try PPOPipeline.solve(modelPath: "runs/pusht/model",
+                          episodes: o.episodes,
+                          latent: args.contains("--latent") ? o.latent : 192)
 
 case "train-lawm":
     let o = parseOptions(Array(args.dropFirst(1)))

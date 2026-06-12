@@ -372,11 +372,14 @@ kernel void color_scan(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         uint run = 0;
+        uint used = 0;
         for (uint c = 0; c < MAX_COLORS; c++) {
             colorStart[c] = run;
             run += counts[c];
+            if (counts[c] > 0) used = c + 1;
         }
         colorStart[MAX_COLORS] = run;
+        colorStart[MAX_COLORS + 1] = used;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < MAX_COLORS) {
@@ -1446,8 +1449,11 @@ kernel void solve_persistent(
     uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
                        P.maxSoft);
     uint dualTotal = P.numJoints + P.numSprings + numPairs + numSoft;
+    // empty palette tail costs a threadgroup barrier per color per
+    // iteration (64x20 = 1280 barriers dominated small-scene solves)
+    uint usedColors = colorStart[MAX_COLORS + 1];
     for (uint iter = 0; iter < P.iterations; iter++) {
-        for (uint c = 0; c < MAX_COLORS; c++) {
+        for (uint c = 0; c < usedColors; c++) {
             uint s0 = colorStart[c];
             uint e0 = colorStart[c + 1];
             if (s0 == e0) continue;
@@ -1491,6 +1497,109 @@ kernel void solve_persistent(
             }
         }
         threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+// Multi-threadgroup persistent solver: the whole iteration loop in ONE
+// dispatch of a few co-resident threadgroups (Apple GPUs keep a small grid
+// resident), synchronized by a monotonic device-scope arrive-and-spin
+// barrier. Fixes both small-scene pathologies at once: the single-group
+// kernel ran the solve on one GPU core, and the per-color dispatch path
+// paid ~50us launch latency x colors x iterations.
+inline void global_barrier(device atomic_uint* bar, uint ntg, uint tid,
+                           thread uint& expected)
+{
+    threadgroup_barrier(mem_flags::mem_device);
+    expected += ntg;
+    if (tid == 0) {
+        atomic_fetch_add_explicit(bar, 1u, memory_order_relaxed);
+        while (atomic_load_explicit(bar, memory_order_relaxed) < expected) {}
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+kernel void solve_persistent_multi(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device JointGPU* joints         [[buffer(7)]],
+    device SpringGPU* springs       [[buffer(8)]],
+    device ManifoldGPU* manifolds   [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    device atomic_uint* counters    [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device SoftContactGPU* soft     [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    constant uint& ntg              [[buffer(22)]],
+    uint tid                        [[thread_position_in_threadgroup]],
+    uint tgid                       [[threadgroup_position_in_grid]],
+    uint tgSize                     [[threads_per_threadgroup]])
+{
+    uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
+    uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                       P.maxSoft);
+    uint dualTotal = P.numJoints + P.numSprings + numPairs + numSoft;
+    uint usedColors = colorStart[MAX_COLORS + 1];
+    uint gtid = tgid * tgSize + tid;
+    uint gsize = ntg * tgSize;
+    uint expected = 0;
+    device atomic_uint* bar = &counters[CTR_GBAR];
+
+    for (uint iter = 0; iter < P.iterations; iter++) {
+        for (uint c = 0; c < usedColors; c++) {
+            uint s0 = colorStart[c];
+            uint e0 = colorStart[c + 1];
+            for (uint i = s0 + gtid; i < e0; i += gsize) {
+                primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
+                           props, joints, springs, manifolds,
+                           adjStart, adjCount, adjList, P, shape, tets, soft,
+                           membranes, bends, colorList[i]);
+            }
+            global_barrier(bar, ntg, tid, expected);
+        }
+        for (uint g = gtid; g < dualTotal; g += gsize) {
+            if (g < P.numJoints) {
+                if (joints[g].header.z == 0)
+                    dual_joint_one(posLin, posAng, joints, P, g);
+            } else if (g < P.numJoints + P.numSprings) {
+                device SpringGPU& sp = springs[g - P.numJoints];
+                if (sp.header.z != 0) {
+                    uint a = sp.header.x, b = sp.header.y;
+                    float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
+                    float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
+                    float C = length(pA - pB) - sp.rB.w - sp.dual.z * P.alpha;
+                    float mA = posLin[a].w, mB = posLin[b].w;
+                    float mMin = min(mA > 0.0f ? mA : FLT_MAX,
+                                     mB > 0.0f ? mB : FLT_MAX);
+                    float cap = min(P.lambdaMax, max(2.0f, 5.0e3f * mMin));
+                    sp.dual.x = clamp(0.98f * sp.dual.x + sp.dual.y * C, 0.0f, cap);
+                    if (C > 0.0f) {
+                        sp.dual.y = min(sp.dual.y + C * P.betaLin,
+                                        min(sp.rA.w, PENALTY_MAX));
+                    }
+                }
+            } else if (g < P.numJoints + P.numSprings + numPairs) {
+                uint mi = g - P.numJoints - P.numSprings;
+                if (manifolds[mi].header.z != 0)
+                    dual_manifold_one(posLin, posAng, initLin, initAng,
+                                      manifolds, P, mi);
+            } else {
+                uint sci = g - P.numJoints - P.numSprings - numPairs;
+                dual_soft_one(posLin, posAng, initLin, initAng, soft, P, sci);
+            }
+        }
+        global_barrier(bar, ntg, tid, expected);
     }
 }
 
