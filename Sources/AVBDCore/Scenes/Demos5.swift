@@ -141,6 +141,99 @@ extension Demos {
         return flat
     }
 
+    /// Voxelized soft body over an implicit shape: lattice cells whose
+    /// center satisfies `solid` get the 5-tet split with shared nodes —
+    /// same recipe as addSoftBlock, arbitrary silhouette.
+    @discardableResult
+    static func addSoftVoxelShape(_ s: inout PhysicsScene, origin: F3,
+                                  spacing: Float, nx: Int, ny: Int, nz: Int,
+                                  mu: Float, lambda: Float,
+                                  massPerNode: Float, friction: Float = 0.8,
+                                  solid: (F3) -> Bool) -> [Int] {
+        // occupancy first, then keep only the LARGEST 6-connected component:
+        // coarse voxelizations shed orphan fragments (a 1-cell tail) that
+        // would drop beside the body as their own little blobs
+        var occupied: Set<SIMD3<Int>> = []
+        for i in 0..<nx {
+            for j in 0..<ny {
+                for k in 0..<nz {
+                    let center = origin + (F3(Float(i), Float(j), Float(k))
+                                           + F3(repeating: 0.5)) * spacing
+                    if solid(center) { occupied.insert(SIMD3(i, j, k)) }
+                }
+            }
+        }
+        var unvisited = occupied
+        var keep: Set<SIMD3<Int>> = []
+        while let seed = unvisited.first {
+            var comp: Set<SIMD3<Int>> = []
+            var stack = [seed]
+            unvisited.remove(seed)
+            while let c = stack.popLast() {
+                comp.insert(c)
+                for d in [SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0),
+                          SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)] {
+                    let n = c &+ d
+                    if unvisited.remove(n) != nil { stack.append(n) }
+                }
+            }
+            if comp.count > keep.count { keep = comp }
+        }
+
+        var nodeId: [SIMD3<Int>: Int] = [:]
+        var flat: [Int] = []
+        func node(_ i: Int, _ j: Int, _ k: Int) -> Int {
+            let key = SIMD3(i, j, k)
+            if let id = nodeId[key] { return id }
+            let p = origin + F3(Float(i), Float(j), Float(k)) * spacing
+            let id = s.addParticle(radius: spacing * 0.32, mass: massPerNode,
+                                   friction: friction, position: p)
+            nodeId[key] = id
+            flat.append(id)
+            return id
+        }
+        func tet(_ a: Int, _ b: Int, _ c: Int, _ d: Int) {
+            s.addTet(SceneTet(ids: (a, b, c, d), mu: mu, lambda: lambda))
+        }
+        for i in 0..<nx {
+            for j in 0..<ny {
+                for k in 0..<nz {
+                    guard keep.contains(SIMD3(i, j, k)) else { continue }
+                    let c000 = node(i, j, k),         c100 = node(i + 1, j, k)
+                    let c010 = node(i, j + 1, k),     c110 = node(i + 1, j + 1, k)
+                    let c001 = node(i, j, k + 1),     c101 = node(i + 1, j, k + 1)
+                    let c011 = node(i, j + 1, k + 1), c111 = node(i + 1, j + 1, k + 1)
+                    if (i + j + k) % 2 == 0 {
+                        tet(c000, c100, c010, c001)
+                        tet(c110, c100, c010, c111)
+                        tet(c101, c100, c001, c111)
+                        tet(c011, c010, c001, c111)
+                        tet(c100, c010, c001, c111)
+                    } else {
+                        tet(c100, c000, c110, c101)
+                        tet(c010, c000, c110, c011)
+                        tet(c001, c000, c101, c011)
+                        tet(c111, c110, c101, c011)
+                        tet(c000, c110, c101, c011)
+                    }
+                }
+            }
+        }
+        // lattice-neighbor exclusion joints (inert): internal sphere contacts
+        // under deep squash only fight the tets
+        for (key, a) in nodeId {
+            for d in [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1),
+                      SIMD3(1, 1, 0), SIMD3(1, 0, 1), SIMD3(0, 1, 1),
+                      SIMD3(1, 1, 1)] {
+                if let b = nodeId[key &+ d] {
+                    s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
+                                          stiffnessLin: 0, stiffnessAng: 0))
+                }
+            }
+        }
+        return flat
+    }
+
     /// Paper Fig. 5: a flag (particle mass-spring cloth) attached with HARD
     /// constraints to a deformable pole of rigid segments with ball joints —
     /// soft, stiff, and rigid solved in one unified loop.
@@ -211,30 +304,47 @@ extension Demos {
         return s
     }
 
-    /// Tetrahedral soft bodies: blocks squash under a heavy rigid ball and
-    /// a plank, tumble, and recover — two-way coupling throughout.
-    public static func softbody(count: Int = 3) -> PhysicsScene {
+    /// Tetrahedral soft-body showcase: a voxelized BUNNY (body, head, ears,
+    /// tail, feet as an implicit ellipsoid union) flops onto the ground and
+    /// a rigid ball drops onto its back — ears wobble, body dents and
+    /// recovers, two-way coupling throughout.
+    public static func softbody(res: Int = 11, stiffness: Float = 2500,
+                                friction: Float = 0.8) -> PhysicsScene {
         var s = PhysicsScene(name: "softbody")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
-        s.settings.lambdaMax = 800
-        addGround(&s, friction: 0.8)
+        s.settings.lambdaMax = 1000
+        addGround(&s, friction: friction)
 
-        let nC = max(2, count)
-        for k in 0..<nC {
-            let x = Float(k % 3) * 2.4 - 2.4
-            let y = Float(k / 3) * 2.4
-            let soft = Float(k % 3)        // varying stiffness per block
-            addSoftBlock(&s, center: F3(x, y, 1.2 + Float(k % 2) * 0.3),
-                         nx: 4, ny: 4, nz: 4, spacing: 0.34,
-                         mu: 1500 + soft * 2500, lambda: 15000 + soft * 25000)
+        func ellipsoid(_ p: F3, _ c: F3, _ r: F3) -> Bool {
+            let d = (p - c) / r
+            return dot(d, d) <= 1
         }
-        // heavy rigid ball dropped onto the middle block
-        _ = s.addSphere(diameter: 1.1, density: 3, friction: 0.6,
-                        position: F3(0, 0, 4.2))
-        // rigid plank bridging two blocks
-        _ = s.addBody(size: F3(5.0, 0.9, 0.12), density: 1.0, friction: 0.7,
-                      position: F3(-1.2, 0, 3.2))
+        // bunny in a unit-ish frame, ~1.7 tall with ears, sitting pose
+        func bunny(_ p: F3) -> Bool {
+            return ellipsoid(p, F3(0.00, 0, 0.52), F3(0.62, 0.46, 0.44)) ||   // body
+                   ellipsoid(p, F3(0.52, 0, 1.00), F3(0.30, 0.26, 0.27)) ||   // head
+                   ellipsoid(p, F3(0.46, 0.14, 1.42), F3(0.11, 0.08, 0.34)) ||  // ear L
+                   ellipsoid(p, F3(0.46, -0.14, 1.42), F3(0.11, 0.08, 0.34)) || // ear R
+                   ellipsoid(p, F3(-0.60, 0, 0.42), F3(0.16, 0.16, 0.16)) ||  // tail
+                   ellipsoid(p, F3(0.30, 0.26, 0.16), F3(0.30, 0.13, 0.14)) ||  // foot L
+                   ellipsoid(p, F3(0.30, -0.26, 0.16), F3(0.30, 0.13, 0.14))    // foot R
+        }
+        let cells = max(8, min(22, res))
+        let h = 1.8 / Float(cells)
+        let nodes = addSoftVoxelShape(&s, origin: F3(-1.0, -0.7, 0.06),
+                                      spacing: h,
+                                      nx: Int(2.0 / h), ny: Int(1.4 / h),
+                                      nz: Int(1.9 / h),
+                                      mu: stiffness, lambda: 10 * stiffness,
+                                      massPerNode: 28 * h * h * h,
+                                      friction: friction, solid: bunny)
+        _ = nodes
+        // rigid ball dropped onto the bunny's back
+        _ = s.addSphere(diameter: 0.55, density: 2.2, friction: 0.6,
+                        position: F3(-0.15, 0, 2.6))
+        s.settings.cameraDistance = 6.5
+        s.settings.cameraTargetZ = 0.8
         return s
     }
 }

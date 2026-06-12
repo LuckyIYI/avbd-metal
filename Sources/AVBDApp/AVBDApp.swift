@@ -66,6 +66,26 @@ struct ContentView: View {
                         Button("Step") { model.singleStep() }
                         Button("Reset") { model.reset() }
                     }
+                    let tunables = Demos.tunables(model.demoName)
+                    if !tunables.isEmpty {
+                        DisclosureGroup("Demo parameters") {
+                            ForEach(tunables) { p in
+                                HStack {
+                                    Text(p.label).font(.caption)
+                                    Slider(value: Binding(
+                                        get: { model.demoParams[p.key] ?? p.def },
+                                        set: { model.demoParams[p.key] = $0 }
+                                    ), in: p.range, onEditingChanged: { editing in
+                                        if !editing { model.reset() }
+                                    })
+                                    Text(String(format: "%.2f",
+                                                model.demoParams[p.key] ?? p.def))
+                                        .font(.caption.monospacedDigit())
+                                        .frame(width: 44, alignment: .trailing)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 GroupBox("Solver") {

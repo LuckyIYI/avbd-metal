@@ -2,19 +2,59 @@ import simd
 
 // Built-in demo scenes (drawn from the paper's evaluation set).
 
+/// A user-tunable scene parameter (exposed as a slider in the app's
+/// expandable "Demo parameters" section and applied at scene build).
+public struct DemoParam: Identifiable {
+    public var id: String { key }
+    public let key: String
+    public let label: String
+    public let range: ClosedRange<Float>
+    public let def: Float
+    public init(_ key: String, _ label: String, _ range: ClosedRange<Float>, _ def: Float) {
+        self.key = key; self.label = label; self.range = range; self.def = def
+    }
+}
+
 public enum Demos {
     public static var all: [String] {
         ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
          "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
-         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "cloth", "softbody", "android",
-         "clothfold", "boxoncloth", "hammock", "drape", "clothcombo",
-         "flagwhip", "ribbons"]
+         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "softbody", "android",
+         "clothfold", "boxoncloth", "hammock", "drape", "multidrape",
+         "clothcombo", "flagwhip", "ribbons"]
+    }
+
+    /// Tunable parameters per demo (empty = none). Keys are looked up in
+    /// `make(_:scale:res:params:)`.
+    public static func tunables(_ name: String) -> [DemoParam] {
+        let fric = { (d: Float) in DemoParam("friction", "Friction", 0...1, d) }
+        switch name {
+        case "clothfold": return [fric(0.9)]
+        case "boxoncloth": return [fric(0.8),
+                                   DemoParam("massRatio", "Box mass ×cloth", 1...16, 8)]
+        case "hammock": return [fric(0.8)]
+        case "drape": return [fric(0.6)]
+        case "multidrape": return [fric(0.5)]
+        case "clothcombo": return [fric(0.8)]
+        case "flagwhip": return [DemoParam("kick", "Kick speed", 0...6, 3)]
+        case "ribbons": return [fric(0.35)]
+        case "softbody": return [fric(0.8),
+                                 DemoParam("stiffness", "Stiffness µ", 500...8000, 2500)]
+        default: return []
+        }
     }
 
     /// Every demo scales for stress testing: 1 = small (original size),
     /// 2 = medium, 4 = large, 8 = giant. `res` overrides cloth resolution.
-    public static func make(_ name: String, scale: Int = 1, res: Int? = nil) -> PhysicsScene? {
+    /// `params` carries the per-demo tunables (missing key or a value of
+    /// -1 = scale-derived default).
+    public static func make(_ name: String, scale: Int = 1, res: Int? = nil,
+                            params: [String: Float] = [:]) -> PhysicsScene? {
         let s = max(1, scale)
+        func p(_ key: String, _ def: Float) -> Float {
+            let v = params[key] ?? -1
+            return v < 0 ? def : v
+        }
         switch name {
         case "ground": return ground(count: s * s)
         case "stack": return stack(height: 10 * s)
@@ -37,15 +77,28 @@ public enum Demos {
         case "gearclock": return gearclock(scale: s)
         case "rubegoldberg": return rubegoldberg(scale: s)
         case "android": return android(scale: s)
-        case "cloth": return cloth(res: 12 + 4 * s)
-        case "softbody": return softbody(count: 2 + s)
-        case "clothfold": return clothfold(res: res ?? (18 + 6 * s))
-        case "boxoncloth": return boxoncloth(res: res ?? (18 + 6 * s))
-        case "hammock": return hammock(res: res ?? (16 + 4 * s), cubes: s)
-        case "drape": return drape(res: res ?? (22 + 6 * s))
-        case "clothcombo": return clothcombo(res: res ?? (16 + 4 * s))
-        case "flagwhip": return flagwhip(res: res ?? (14 + 2 * s))
-        case "ribbons": return ribbons(len: res ?? (18 + 4 * s), count: 4 + 2 * s)
+        case "softbody": return softbody(res: res ?? min(22, 9 + 2 * s),
+                                         stiffness: p("stiffness", 2500),
+                                         friction: p("friction", 0.8))
+        case "clothfold": return clothfold(res: res ?? (18 + 6 * s),
+                                           friction: p("friction", 0.9))
+        case "boxoncloth": return boxoncloth(res: res ?? (18 + 6 * s),
+                                             massRatio: p("massRatio", 8),
+                                             friction: p("friction", 0.8))
+        case "hammock": return hammock(res: res ?? (16 + 4 * s),
+                                       cubes: Int(p("cubes", Float(s))),
+                                       friction: p("friction", 0.8))
+        case "drape": return drape(res: res ?? (22 + 6 * s),
+                                   friction: p("friction", 0.6))
+        case "multidrape": return multidrape(res: res ?? (20 + 5 * s),
+                                             friction: p("friction", 0.5))
+        case "clothcombo": return clothcombo(res: res ?? (16 + 4 * s),
+                                             friction: p("friction", 0.8))
+        case "flagwhip": return flagwhip(res: res ?? (14 + 2 * s),
+                                         kick: p("kick", 3))
+        case "ribbons": return ribbons(len: res ?? (18 + 4 * s),
+                                       count: Int(p("count", Float(4 + 2 * s))),
+                                       friction: p("friction", 0.35))
         case "trebuchet": return trebuchet(castleScale: s)
         case "wreckingball": return wreckingball(floors: 2 + s)
         case "marblerun": return marblerun(marbles: 10 * s)

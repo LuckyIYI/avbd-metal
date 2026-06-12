@@ -86,13 +86,13 @@ extension Demos {
     /// ground. Without V-T contacts the layers pass through each other
     /// (nodes interleave through the holes); with them the stack keeps its
     /// layer order and thickness.
-    public static func clothfold(res: Int = 24) -> PhysicsScene {
+    public static func clothfold(res: Int = 24, friction: Float = 0.9) -> PhysicsScene {
         var s = PhysicsScene(name: "clothfold")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25
-        addGround(&s, friction: 0.9)
+        addGround(&s, friction: friction)
 
         let nu = max(18, res), nv = max(12, res / 2)
         let spacing: Float = 0.12
@@ -131,7 +131,7 @@ extension Demos {
             positions.append(row)
         }
         addClothGrid(&s, positions: positions, thickness: r,
-                     massPerNode: 0.008, friction: 0.9)
+                     massPerNode: 0.008, friction: friction)
         s.settings.cameraDistance = 7
         s.settings.cameraTargetZ = 0.8
         return s
@@ -141,13 +141,14 @@ extension Demos {
     /// on top. The box face must rest on the cloth SURFACE (corner-vs-triangle
     /// contacts), not dimple through the node gaps — and never poke through
     /// even at 8x the total cloth mass.
-    public static func boxoncloth(res: Int = 24, massRatio: Float = 8) -> PhysicsScene {
+    public static func boxoncloth(res: Int = 24, massRatio: Float = 8,
+                                  friction: Float = 0.8) -> PhysicsScene {
         var s = PhysicsScene(name: "boxoncloth")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25
-        addGround(&s, friction: 0.8)
+        addGround(&s, friction: friction)
 
         // pedestal: static box the cloth drapes over
         _ = s.addBody(size: F3(1.2, 1.2, 0.8), density: 0, friction: 0.6,
@@ -169,7 +170,7 @@ extension Demos {
             positions.append(row)
         }
         addClothGrid(&s, positions: positions, thickness: r,
-                     massPerNode: massPerNode, friction: 0.8)
+                     massPerNode: massPerNode, friction: friction)
 
         // the test article: a box weighing massRatio x the whole cloth
         let clothMass = Float(n * n) * massPerNode
@@ -186,22 +187,25 @@ extension Demos {
     /// in the middle. Inextensibility gate: structural stretch < 2% under
     /// load.
     public static func hammock(res: Int = 20, structuralK: Float = 5000,
-                               hardRods: Bool = true, cubes: Int = 1) -> PhysicsScene {
+                               hardRods: Bool = true, cubes: Int = 1,
+                               friction: Float = 0.8) -> PhysicsScene {
         var s = PhysicsScene(name: "hammock")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25
-        addGround(&s, friction: 0.8)
+        addGround(&s, friction: friction)
 
         let nu = max(16, res), nv = max(10, res * 2 / 3)
         let spacing: Float = 0.14
         let r: Float = min(0.05, 0.3 * spacing)
-        let spanZ: Float = 1.6
         // spawn with catenary slack: an INEXTENSIBLE sheet pinned taut is an
         // infinite-tension geometry — real hammocks hang with sag
         let span = Float(nu - 1) * spacing
         let sag: Float = 0.22 * span
+        // pins rise with the span: sag + cargo dip must clear the floor at
+        // any scale (a Colossal hammock pinned at 1.6 just lies on the ground)
+        let spanZ: Float = sag + 1.1
         var positions: [[F3]] = []
         for i in 0..<nu {
             var row: [F3] = []
@@ -215,7 +219,7 @@ extension Demos {
             positions.append(row)
         }
         let grid = addClothGrid(&s, positions: positions, thickness: r,
-                                massPerNode: 0.012, friction: 0.8,
+                                massPerNode: 0.012, friction: friction,
                                 structuralK: structuralK, hardRods: hardRods)
         // pin the two short ends to the world (taut hammock)
         for j in 0..<nv {
@@ -243,7 +247,7 @@ extension Demos {
                                                             rng.nextFloat(), 1))))
         }
         s.settings.cameraDistance = span * 1.9 + 2.5
-        s.settings.cameraTargetZ = 1.0
+        s.settings.cameraTargetZ = spanZ * 0.55
         return s
     }
 
@@ -285,7 +289,8 @@ extension Demos {
     /// mechanism is selectable: stiff soft springs (k) or hard AL rods.
     /// Pumping diagnosis: KE envelope must decay, never grow.
     public static func flagwhip(res: Int = 16, structuralK: Float = 5000,
-                                hardRods: Bool = true) -> PhysicsScene {
+                                hardRods: Bool = true, kick: Float = 3.0)
+        -> PhysicsScene {
         var s = PhysicsScene(name: "flagwhip")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
@@ -316,7 +321,7 @@ extension Demos {
                                   rA: s.bodies[node].position, rB: .zero))
         }
         // sideways kick: the sheet swings like a pendulum and whips
-        let kick: Float = ProcessInfo.processInfo.environment["AVBD_NO_KICK"] != nil ? 0 : 3.0
+        let kick: Float = ProcessInfo.processInfo.environment["AVBD_NO_KICK"] != nil ? 0 : kick
         for i in 0..<n {
             for j in 0..<n {
                 s.bodies[grid[i][j]].velocity = F3(kick, 0, 0) * (Float(j) / Float(n - 1))
@@ -327,25 +332,67 @@ extension Demos {
         return s
     }
 
+    /// Layered drape: three sheets of decreasing size fall in sequence
+    /// onto a sphere — the bottom one drapes the ball, the others drape
+    /// the cloth below them. Cloth-on-cloth stacking at a glance (each
+    /// sheet is its own component, so each gets its own color).
+    public static func multidrape(res: Int = 26, friction: Float = 0.5)
+        -> PhysicsScene {
+        var s = PhysicsScene(name: "multidrape")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
+        addGround(&s, friction: friction)
+        _ = s.addSphere(diameter: 1.2, density: 0, friction: friction,
+                        position: F3(0, 0, 1.0))
+
+        let n = max(18, res)
+        for k in 0..<3 {
+            let size: Float = 3.0 - Float(k) * 0.45
+            let spacing = size / Float(n - 1)
+            let r: Float = min(0.05, 0.3 * spacing)
+            let z = 1.95 + Float(k) * 0.55
+            let ang = Float(k) * 0.5      // each sheet rotated for variety
+            let ca = cos(ang), sa = sin(ang)
+            var positions: [[F3]] = []
+            for i in 0..<n {
+                var row: [F3] = []
+                for j in 0..<n {
+                    let u = Float(i) * spacing - size / 2
+                    let v = Float(j) * spacing - size / 2
+                    row.append(F3(ca * u - sa * v, sa * u + ca * v, z))
+                }
+                positions.append(row)
+            }
+            addClothGrid(&s, positions: positions, thickness: r,
+                         massPerNode: 0.008, friction: friction)
+        }
+        s.settings.cameraDistance = 8
+        s.settings.cameraTargetZ = 1.1
+        return s
+    }
+
     /// E-E showcase: long ribbons rain criss-cross onto a thin capsule
     /// cross; they fold over the bars, slide off and tangle with each
     /// other — long free edges rubbing at every angle is edge-edge
     /// territory (each ribbon is its own surface component, so each gets
     /// its own color).
-    public static func ribbons(len: Int = 22, count: Int = 6) -> PhysicsScene {
+    public static func ribbons(len: Int = 22, count: Int = 6,
+                               friction: Float = 0.35) -> PhysicsScene {
         var s = PhysicsScene(name: "ribbons")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25
-        addGround(&s, friction: 0.5)
+        addGround(&s, friction: friction)
 
         // a low cross of thin static capsules catches and folds the ribbons
         let pegZ: Float = 2.3
-        _ = s.addCapsule(length: 5.0, radius: 0.12, density: 0, friction: 0.35,
+        _ = s.addCapsule(length: 5.0, radius: 0.12, density: 0, friction: friction,
                          position: F3(0, 0, pegZ),
                          rotation: Quat(angle: .pi / 2, axis: F3(0, 1, 0)))
-        _ = s.addCapsule(length: 5.0, radius: 0.12, density: 0, friction: 0.35,
+        _ = s.addCapsule(length: 5.0, radius: 0.12, density: 0, friction: friction,
                          position: F3(0, 0, pegZ),
                          rotation: Quat(angle: .pi / 2, axis: F3(1, 0, 0)))
 
@@ -370,7 +417,7 @@ extension Demos {
                 pos.append(row)
             }
             addClothGrid(&s, positions: pos, thickness: r, massPerNode: 0.01,
-                         friction: 0.35)
+                         friction: friction)
         }
         s.settings.cameraDistance = 12
         s.settings.cameraTargetZ = 1.6
@@ -446,14 +493,14 @@ extension Demos {
 
     /// Gate 4 scene: tets + cloth + rigid bodies in one solve. A soft block
     /// sits on the ground, cloth drapes over it, rigid boxes drop on top.
-    public static func clothcombo(res: Int = 20) -> PhysicsScene {
+    public static func clothcombo(res: Int = 20, friction: Float = 0.8) -> PhysicsScene {
         var s = PhysicsScene(name: "clothcombo")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25
         s.settings.lambdaMax = 1.0e6
-        addGround(&s, friction: 0.8)
+        addGround(&s, friction: friction)
 
         addSoftBlock(&s, center: F3(0, 0, 0.7), nx: 4, ny: 4, nz: 4,
                      spacing: 0.34, mu: 4000, lambda: 40000,
@@ -473,7 +520,7 @@ extension Demos {
             positions.append(row)
         }
         addClothGrid(&s, positions: positions, thickness: r,
-                     massPerNode: 0.01, friction: 0.8, membraneMu: 300)
+                     massPerNode: 0.01, friction: friction, membraneMu: 300)
 
         _ = s.addBody(size: F3(0.45, 0.45, 0.45), density: 2, friction: 0.7,
                       position: F3(-0.1, 0.1, 2.6))

@@ -6,10 +6,21 @@ import simd
 /// Observable simulation state driving the UI and the renderer.
 final class SimulationModel: ObservableObject, RenderableModel {
     @Published var demoName = ProcessInfo.processInfo.environment["AVBD_DEMO"] ?? "stack" {
-        didSet { reset() }
+        didSet {
+            demoParams = Self.defaultParams(for: demoName)
+            reset()
+        }
     }
     @Published var scale = Int(ProcessInfo.processInfo.environment["AVBD_SIZE"] ?? "") ?? 1 {
         didSet { reset() }
+    }
+    /// Per-demo tunables (friction etc.) — edited via the expandable
+    /// "Demo parameters" section; applied on scene rebuild.
+    @Published var demoParams: [String: Float] = SimulationModel.defaultParams(
+        for: ProcessInfo.processInfo.environment["AVBD_DEMO"] ?? "stack")
+
+    static func defaultParams(for name: String) -> [String: Float] {
+        Demos.tunables(name).reduce(into: [:]) { $0[$1.key] = $1.def }
     }
     @Published var running = true
     @Published var colorByGraphColor = false
@@ -40,7 +51,8 @@ final class SimulationModel: ObservableObject, RenderableModel {
     }
 
     func reset() {
-        guard var scene = Demos.make(demoName, scale: scale) else { return }
+        guard var scene = Demos.make(demoName, scale: scale, params: demoParams)
+        else { return }
         dragJoint = scene.addDragSlot()
         // ADOPT the scene's tuned settings into the sliders (each demo is
         // tuned; overriding with stale slider state crumbles e.g. the

@@ -29,6 +29,7 @@ public final class GPUSolver {
     let gridHashSize: Int
     // Cloth elements
     let numTris: Int
+    let tetBoundaryTris: [(Int, Int, Int)]
     var numEdges: Int = 0
     var numParticles: Int = 0
     let maxSoft: Int
@@ -134,7 +135,13 @@ public final class GPUSolver {
         self.maxPairs = max(64, scene.bodies.count * maxPairsPerBody)
         self.mapCapacity = Self.nextPow2(2 * maxPairs)
         self.gridHashSize = Self.nextPow2(max(64, 2 * numBodies))
-        self.numTris = scene.tris.count
+        // Tet BOUNDARY faces are collision triangles too: soft-soft contact
+        // is element-based (soft V-V sphere pairs are banned at broadphase),
+        // so without them tet bodies would pass through each other and
+        // rigids would only touch their corner features. Collision-only —
+        // membranes and the render extractor keep using scene.tris/tets.
+        self.tetBoundaryTris = Self.tetBoundaryFaces(scene)
+        self.numTris = scene.tris.count + tetBoundaryTris.count
         // capacity bound: V-T (4/vertex) + rigid-T (4/tri) + E-E (2/edge,
         // edges <= 3 per tri)
         let particleEstimate = scene.bodies.lazy.filter { $0.isParticle }.count
@@ -318,6 +325,33 @@ public final class GPUSolver {
             options.fastMathEnabled = fastMath
         }
         return try device.makeLibrary(source: source, options: options)
+    }
+
+    /// Boundary faces of the tet meshes (faces used by exactly one tet),
+    /// wound outward against the opposite vertex. These become collision
+    /// triangles so V-T/E-E own soft-soft and rigid-face-vs-soft contact.
+    static func tetBoundaryFaces(_ scene: PhysicsScene) -> [(Int, Int, Int)] {
+        guard !scene.tets.isEmpty else { return [] }
+        var faces: [SIMD3<Int>: (tri: (Int, Int, Int), opp: Int, count: Int)] = [:]
+        for t in scene.tets {
+            let ids = [t.ids.0, t.ids.1, t.ids.2, t.ids.3]
+            for (i, j, k, o) in [(0, 1, 2, 3), (0, 1, 3, 2), (0, 2, 3, 1), (1, 2, 3, 0)] {
+                let tri = (ids[i], ids[j], ids[k])
+                let key = SIMD3([tri.0, tri.1, tri.2].sorted())
+                if var e = faces[key] { e.count += 1; faces[key] = e }
+                else { faces[key] = (tri, ids[o], 1) }
+            }
+        }
+        var out: [(Int, Int, Int)] = []
+        for (_, f) in faces where f.count == 1 {
+            var (a, b, c) = f.tri
+            let pa = scene.bodies[a].position
+            let n = cross(scene.bodies[b].position - pa, scene.bodies[c].position - pa)
+            if dot(n, scene.bodies[f.opp].position - pa) > 0 { swap(&b, &c) }
+            out.append((a, b, c))
+        }
+        // deterministic order (dictionary iteration is not)
+        return out.sorted { $0 < $1 }
     }
 
     // MARK: - Scene upload
@@ -520,15 +554,17 @@ public final class GPUSolver {
         numExclusions = UInt32(sortedExcl.count)
 
         // ---- Cloth element topology ----
-        // Triangles, unique edges, per-vertex topological neighborhoods (the
-        // V-T/E-E exclusion sets: vertices sharing a triangle), particle list.
+        // Triangles (scene cloth tris + synthesized tet boundary faces),
+        // unique edges, per-vertex topological neighborhoods (the V-T/E-E
+        // exclusion sets: vertices sharing a triangle), particle list.
+        let collTris: [(Int, Int, Int)] = scene.tris.map { $0.ids } + tetBoundaryTris
         let tp4 = trisBuf.contents().bindMemory(to: SIMD4<UInt32>.self,
                                                 capacity: max(1, numTris))
         var edgeSet: Set<UInt64> = []
         var nbrSets = [Set<Int>](repeating: [], count: numBodies)
         var maxElemR: Float = 0
-        for (i, t) in scene.tris.enumerated() {
-            let (a, b, c) = t.ids
+        for (i, ids) in collTris.enumerated() {
+            let (a, b, c) = ids
             tp4[i] = SIMD4(UInt32(a), UInt32(b), UInt32(c), 0)
             for (u, v) in [(a, b), (b, c), (a, c)] {
                 edgeSet.insert(UInt64(min(u, v)) << 32 | UInt64(max(u, v)))
@@ -556,8 +592,8 @@ public final class GPUSolver {
         // triangle adjacency (shared edges, ALL triangles) for tracker
         // propagation
         var edgeToTris: [UInt64: (Int, Int)] = [:]
-        for (ti, t) in scene.tris.enumerated() {
-            let ids = [t.ids.0, t.ids.1, t.ids.2]
+        for (ti, ids3) in collTris.enumerated() {
+            let ids = [ids3.0, ids3.1, ids3.2]
             for (u, v) in [(ids[0], ids[1]), (ids[1], ids[2]), (ids[0], ids[2])] {
                 let key = UInt64(min(u, v)) << 32 | UInt64(max(u, v))
                 if var e = edgeToTris[key] { e.1 = ti; edgeToTris[key] = e }

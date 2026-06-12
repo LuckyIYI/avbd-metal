@@ -50,14 +50,60 @@ final class SoftBodyTests: XCTestCase {
     }
 
     func testRigidRestsOnSoftBlock() throws {
-        let scene = Demos.softbody(count: 3)
-        var ball = -1
-        for (i, b) in scene.bodies.enumerated()
-            where b.shape == .sphere && b.size.x > 1.0 { ball = i }
+        var scene = PhysicsScene(name: "ballonblock")
+        scene.settings.iterations = 20
+        scene.settings.betaLin = 20000
+        scene.settings.lambdaMax = 800
+        Demos.addGround(&scene)
+        _ = Demos.addSoftBlock(&scene, center: F3(0, 0, 1.2), nx: 4, ny: 4, nz: 4,
+                               spacing: 0.34, mu: 4000, lambda: 40000)
+        let ball = scene.addSphere(diameter: 1.1, density: 3, friction: 0.6,
+                                   position: F3(0, 0, 4.2))
         let gpu = try GPUSolver(scene: scene)
         for _ in 0..<500 { gpu.step() }
         XCTAssertGreaterThan(gpu.bodyPosition(ball).z, 0.8,
                              "heavy rigid ball must rest ON the soft block (two-way coupling)")
+    }
+
+    func testBallRestsOnSoftBunny() throws {
+        let scene = Demos.softbody(res: 10)
+        var ball = -1
+        for (i, b) in scene.bodies.enumerated()
+            where b.shape == .sphere && b.size.x > 0.4 { ball = i }
+        XCTAssertGreaterThanOrEqual(ball, 0)
+        let gpu = try GPUSolver(scene: scene)
+        for _ in 0..<500 { gpu.step() }
+        XCTAssertGreaterThan(gpu.bodyPosition(ball).z, 0.55,
+                             "ball must rest on the bunny's back, not pass to the floor")
+    }
+
+    func testSoftBlocksDontInterpenetrate() throws {
+        // Soft-soft contact is element-based (soft V-V sphere pairs are
+        // banned at broadphase): without tet BOUNDARY faces as collision
+        // triangles the two blocks pass straight through each other.
+        var scene = PhysicsScene(name: "sbsb")
+        scene.settings.iterations = 20
+        Demos.addGround(&scene)
+        _ = Demos.addSoftBlock(&scene, center: F3(0, 0, 0.7), nx: 4, ny: 4, nz: 4,
+                               spacing: 0.34, mu: 4000, lambda: 40000,
+                               massPerNode: 0.05)
+        let top = Demos.addSoftBlock(&scene, center: F3(0.15, 0.1, 2.3),
+                                     nx: 3, ny: 3, nz: 3, spacing: 0.34,
+                                     mu: 4000, lambda: 40000, massPerNode: 0.05)
+        let gpu = try GPUSolver(scene: scene)
+        for _ in 0..<400 { gpu.step() }
+        var topMinZ: Float = .greatestFiniteMagnitude
+        var com = F3(0, 0, 0)
+        for i in top {
+            let p = gpu.bodyPosition(i)
+            topMinZ = min(topMinZ, p.z)
+            com += p
+        }
+        com /= Float(top.count)
+        XCTAssertGreaterThan(topMinZ, 0.95,
+                             "top soft block must rest ON the bottom block, not sink into it")
+        XCTAssertGreaterThan(com.z, 1.15,
+                             "top soft block must stay stacked, not slide through to the floor")
     }
 
     func testFlagStaysAttachedToPole() throws {
