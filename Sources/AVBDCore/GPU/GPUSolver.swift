@@ -82,6 +82,7 @@ public final class GPUSolver {
     // Voronoi temporal tracking: per-vertex / per-edge persistent closest-
     // element candidate sets, plus the topology they propagate through.
     var vtTrackBuf, eeTrackBuf, triAdjBuf: MTLBuffer
+    var clothVertFlag: MTLBuffer
     var vertEdgeStart, vertEdgeCount, vertEdgeList: MTLBuffer
     public private(set) var surfaceTriCount: Int = 0
     public private(set) var renderTriCount: Int = 0
@@ -184,6 +185,7 @@ public final class GPUSolver {
         hashedIdx = try makeBuf(nb * 4, "hashedIdx")
         globalIdx = try makeBuf(nb * 4, "globalIdx")
         hashedRigidIdx = try makeBuf(nb * 4, "hashedRigidIdx")
+        clothVertFlag = try makeBuf(nb * 4, "clothVertFlag")
         cellCount = try makeBuf(gridHashSize * 4, "cellCount")
         cellRigid = try makeBuf(gridHashSize * 4, "cellRigid")
         cellStart = try makeBuf(gridHashSize * 4, "cellStart")
@@ -850,7 +852,9 @@ public final class GPUSolver {
             var triComp: [UInt32] = []
             let groupP = clothGroupBuf.contents().bindMemory(to: UInt32.self,
                                                              capacity: numBodies)
-            for i in 0..<numBodies { groupP[i] = 0 }
+            let clothP = clothVertFlag.contents().bindMemory(to: UInt32.self,
+                                                             capacity: numBodies)
+            for i in 0..<numBodies { groupP[i] = 0; clothP[i] = 0 }
             for (ti, tv) in triVerts.enumerated() {
                 let root = find(tv[0])
                 if compIdx[root] == nil { compIdx[root] = compIdx.count }
@@ -861,6 +865,8 @@ public final class GPUSolver {
                     incidence[v, default: []].append(ti)
                     groupP[v] = comp + 1      // same-surface V-V is handled
                                               // by V-T/E-E, never spheres
+                    if isCloth[ti] { clothP[v] = 1 }  // thin sheet: render
+                                              // thickness is OPT-IN
                 }
             }
             surfTriBuf.contents().bindMemory(to: UInt32.self, capacity: surfCorners.count)
@@ -934,6 +940,7 @@ public final class GPUSolver {
         } else {
             memset(surfacedFlags.contents(), 0, surfacedFlags.length)
             memset(clothGroupBuf.contents(), 0, clothGroupBuf.length)
+            memset(clothVertFlag.contents(), 0, clothVertFlag.length)
         }
         memset(softNormalsBuf.contents(), 0, softNormalsBuf.length)
 
@@ -2269,6 +2276,9 @@ public final class GPUSolver {
             enc.setBytes(&nv, length: 4, index: 7)
             enc.setBuffer(faceNormalsBuf, offset: 0, index: 8)
             enc.setBuffer(shape, offset: 0, index: 9)
+            enc.setBuffer(clothVertFlag, offset: 0, index: 10)
+            var cs = settings.clothRenderScale
+            enc.setBytes(&cs, length: 4, index: 11)
             enc.dispatchThreadgroups(MTLSize(width: (surfVertCount + 255) / 256, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }

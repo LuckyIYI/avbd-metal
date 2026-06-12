@@ -200,10 +200,14 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
     uint packed = corners[vid];
     uint body = packed & 0x001FFFFFu;
     uint side = (packed >> 23) & 1u;
+    uint rim = (packed >> 22) & 1u;
     uint comp = packed >> 24;
     float4 nt = normals[body];               // xyz smooth normal, w thickness
-    // extrude along the smooth normal: front +r, back -r — the render skin
-    // matches the contact skin, so layered cloth visually touches
+    // zero thickness = flat sheet (the default): only the front layer
+    // exists — the back layer would z-fight and the hem rims degenerate
+    if (nt.w == 0.0 && (side == 1u || rim == 1u)) return collapse();
+    // extrude along the smooth normal: front +r, back -r — at full scale
+    // the render skin matches the contact skin, so layered cloth touches
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * (side == 0 ? 1.0 : -1.0) * 0.95);
     VOut o;
     o.position = U.viewProj * float4(w, 1);

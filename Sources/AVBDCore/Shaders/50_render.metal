@@ -112,6 +112,8 @@ kernel void soft_normals(
     constant uint& numSurfVerts     [[buffer(7)]],
     device const float4* faceNormals [[buffer(8)]],
     device const float4* shape      [[buffer(9)]],
+    device const uint* clothVert    [[buffer(10)]],  // 1 = thin-sheet vertex
+    constant float& clothScale      [[buffer(11)]],  // render thickness opt-in
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= numSurfVerts) return;
@@ -148,7 +150,11 @@ kernel void soft_normals(
     // The render skin THINS where curvature is high (low normal coherence):
     // a +-r extrusion around a hem curled tighter than r pokes the back
     // layer through the front — the black slivers at fold tips.
-    float thick = fabs(shape[v].w)
+    // Thin-sheet (cloth) thickness is OPT-IN via clothScale (0 = flat: the
+    // vertex shader collapses the back layer and hem rims when w == 0);
+    // tet boundaries always keep their outward contact-skin offset.
+    float sc = clothVert[v] != 0 ? clothScale : 1.0f;
+    float thick = fabs(shape[v].w) * sc
                 * mix(0.25f, 1.0f, saturate(coherence * coherence));
     normalsOut[v] = float4(softSafeNormalize(acc), thick);
 }

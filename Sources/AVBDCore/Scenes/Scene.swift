@@ -190,6 +190,11 @@ public struct SimSettings {
     /// rigid-rig default distance of 30.
     public var cameraDistance: Float = 0
     public var cameraTargetZ: Float = 0
+    /// Cloth render thickness as a fraction of the contact radius.
+    /// 0 (default) = flat sheets: one layer, no extrusion, no hem rims.
+    /// 1 = extrude the full contact skin (layered cloth visually touches).
+    /// Tet-boundary surfaces always keep their outward offset.
+    public var clothRenderScale: Float = 0
 
     public init() {}
 }
