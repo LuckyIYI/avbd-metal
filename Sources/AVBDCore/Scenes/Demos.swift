@@ -190,38 +190,40 @@ public enum Demos {
         return s
     }
 
-    /// Static-friction correctness: identical boxes on a 30° incline with
-    /// friction sweeping low -> high across the row. Pair friction is the
-    /// geometric mean and the slope is mu=1, so boxes with sqrt(mu) below
-    /// tan(30°) ≈ 0.577 (mu < ~0.33) must slide off; the rest must stick.
+    /// Static-friction correctness, proportioned after avbd-demo3d's
+    /// sceneStaticFriction: a LONG 30° ramp (mu = 1) with boxes starting
+    /// high up-slope, friction band straddling the stick threshold. PAIR
+    /// friction (geometric mean = sqrt(mu_box)) sweeps 0.30..0.78 around
+    /// tan(30°) ≈ 0.577 — the slick boxes run the whole ramp onto the
+    /// floor, mid ones decelerate to graded stops, the grippy ones hold.
     public static func slopefriction(count: Int = 8) -> PhysicsScene {
         var s = PhysicsScene(name: "slopefriction")
+        s.settings.iterations = 20
         addGround(&s, friction: 0.8)
         let tilt: Float = .pi / 6                       // 30 degrees
         let rot = Quat(angle: tilt, axis: F3(0, 1, 0))
-        let slopeT: Float = 0.3
-        _ = s.addBody(size: F3(9, Float(count) * 1.3 + 1, slopeT), density: 0,
-                      friction: 1.0, position: F3(0, 0, 2.6), rotation: rot)
+        let slopeT: Float = 0.4
+        let slopeLen: Float = 32
+        let centerZ = slopeLen / 2 * sin(tilt) + 0.4    // bottom edge near floor
+        _ = s.addBody(size: F3(slopeLen, Float(count) * 1.3 + 1.5, slopeT),
+                      density: 0, friction: 1.0,
+                      position: F3(0, 0, centerZ), rotation: rot)
         let n = max(2, count)
         let boxSide: Float = 0.8
         let lift = rot.act(F3(0, 0, slopeT / 2 + boxSide / 2 + 0.01))
         for k in 0..<n {
-            // Sweep the PAIR friction (geometric mean with the mu=1 slope,
-            // i.e. sqrt(mu_box)) linearly 0..0.8 — a linear mu_box sweep
-            // compresses the high range and parks most boxes above the
-            // tan(30) ~ 0.577 threshold with no visible difference. This
-            // way the sliders decelerate at visibly graded rates and the
-            // stick threshold lands ~3/4 along the row.
-            let pair = 0.8 * Float(k) / Float(n - 1)
+            let pair = 0.30 + 0.48 * Float(k) / Float(n - 1)
             let mu = pair * pair
             let y = (Float(k) - Float(n - 1) / 2) * 1.3
             _ = s.addBody(size: F3(repeating: boxSide), density: 1,
                           friction: mu,
-                          position: F3(0, 0, 2.6) + rot.act(F3(1.5, y, 0)) + lift,
+                          position: F3(0, 0, centerZ)
+                                    + rot.act(F3(-slopeLen * 0.32, y, 0))
+                                    + lift,
                           rotation: rot)
         }
-        s.settings.cameraDistance = 16
-        s.settings.cameraTargetZ = 2.4
+        s.settings.cameraDistance = 38
+        s.settings.cameraTargetZ = 5.5
         return s
     }
 
@@ -229,6 +231,10 @@ public enum Demos {
     /// top must neither squeeze the light base out nor sink through it.
     public static func ratiostack(levels: Int = 5, growth: Float = 1.45) -> PhysicsScene {
         var s = PhysicsScene(name: "ratiostack")
+        // each level is ~3x the mass of the one below; at 8 levels the
+        // bottom contact carries ~2000x the top — needs converged contacts
+        s.settings.iterations = 25
+        s.settings.betaLin = 40000
         addGround(&s, friction: 0.8)
         var side: Float = 0.5
         var z: Float = 0

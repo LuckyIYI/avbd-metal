@@ -165,7 +165,10 @@ public struct SimSettings {
     public var gravity: Float = -10.0
     public var iterations: Int = 10
     public var alpha: Float = 0.99
-    public var betaLin: Float = 5000.0
+    // 10000 matches the reference avbd-demo3d default (its in-code note
+    // calls the higher, unit-split betas "a minor upgrade from the paper");
+    // 5000 was an early-port value and converges visibly slower on stacks.
+    public var betaLin: Float = 10000.0
     public var betaAng: Float = 100.0
     public var gamma: Float = 0.999
     /// Dual variable bound (paper Sec. 4): prevents unbounded force
