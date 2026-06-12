@@ -58,6 +58,10 @@ public struct SceneJoint {
     /// with |lambda| bounded by motorTorque. 0 torque = no motor.
     public var motorTarget: Float
     public var motorTorque: Float
+    /// Continuous drive: the servo target ADVANCES at this rate (rad/s)
+    /// every step — a velocity motor built on the bounded-torque servo
+    /// (wheels, drums). 0 = positional servo only.
+    public var motorRate: Float
     /// Hinge twist limits (radians). lo < hi enables; real arms have them —
     /// without limits a decelerating arm can tumble over the top and wedge.
     public var limitLo: Float
@@ -67,7 +71,8 @@ public struct SceneJoint {
                 stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
                 fracture: Float = .infinity, fractureLinear: Bool = false,
                 hingeAxis: F3? = nil, motorTarget: Float = 0,
-                motorTorque: Float = 0, limitLo: Float = 1, limitHi: Float = -1) {
+                motorTorque: Float = 0, motorRate: Float = 0,
+                limitLo: Float = 1, limitHi: Float = -1) {
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
@@ -79,6 +84,7 @@ public struct SceneJoint {
         self.hingeAxis = hingeAxis.map(normalize)
         self.motorTarget = motorTarget
         self.motorTorque = motorTorque
+        self.motorRate = motorRate
         self.limitLo = limitLo
         self.limitHi = limitHi
     }

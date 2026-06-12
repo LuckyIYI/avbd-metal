@@ -398,7 +398,9 @@ extension Demos {
 
         let wid = 4
         let spacing: Float = 0.22
-        let r: Float = 0.06
+        // ribbons are CLOTH: keep the skin thin (render thickness == contact
+        // thickness, so a fat radius reads as rubber strips, not fabric)
+        let r: Float = 0.028
         var rng = SplitMix64(seed: 11)
         for k in 0..<count {
             let ang = Float(k) * (.pi / Float(max(1, count))) + 0.2

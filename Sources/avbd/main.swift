@@ -204,7 +204,7 @@ case "profile":
     let o = parseOptions(Array(args.dropFirst(2)))
     let scene = makeScene(args[1], o)
     let solver = try GPUSolver(scene: scene)
-    print("bodies \(scene.bodies.count)  tris \(scene.tris.count)  springs \(scene.springs.count)  joints \(scene.joints.count)  colors \(solver.staticUsedColors)  persistent-capacity \(solver.persistentCapacity)")
+    print("bodies \(scene.bodies.count)  tris \(scene.tris.count)+\(solver.tetBoundaryTris.count)b  springs \(scene.springs.count)  joints \(scene.joints.count)  colors \(solver.staticUsedColors)  persistent-capacity \(solver.persistentCapacity)")
     for _ in 0..<30 { solver.step() }      // warm up
     solver.sync()
     solver.profiling = true

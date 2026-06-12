@@ -29,7 +29,7 @@ public final class GPUSolver {
     let gridHashSize: Int
     // Cloth elements
     let numTris: Int
-    let tetBoundaryTris: [(Int, Int, Int)]
+    public let tetBoundaryTris: [(Int, Int, Int)]
     var numEdges: Int = 0
     var numParticles: Int = 0
     let maxSoft: Int
@@ -117,6 +117,8 @@ public final class GPUSolver {
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
+    /// (joint index, rad/s) — servo targets advanced each step
+    private var rateMotors: [(Int, Float)] = []
 
     public init(scene: PhysicsScene, device: MTLDevice? = nil,
                 maxPairsPerBody: Int = 16) throws {
@@ -442,10 +444,14 @@ public final class GPUSolver {
                 hashed.append(UInt32(i))
             }
         }
-        // Cell size: 2x the max hashed radius (sphere-bound broadphase)
-        var maxHashedRadius: Float = 0.5
+        // Cell size: 2x the max hashed radius (sphere-bound broadphase).
+        // shape.w is NEGATIVE for particles — take |.| or a particles-only
+        // hashed set never raises the floor and the old 0.5 floor put a
+        // whole mattress of particles into a handful of 1 m cells (atomic
+        // contention in bp_count + thousands-long cell lists in pair gen).
+        var maxHashedRadius: Float = 0.05
         for i in hashed {
-            maxHashedRadius = max(maxHashedRadius, sh[Int(i)].w)
+            maxHashedRadius = max(maxHashedRadius, abs(sh[Int(i)].w))
         }
 
         hashedIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashed.count))
@@ -481,6 +487,7 @@ public final class GPUSolver {
                 g.hingeAxis = SIMD4(axis, 1)
                 if j.motorTorque > 0 {
                     g.motor = SIMD4(j.motorTarget, j.motorTorque, 0, 400)
+                    if j.motorRate != 0 { rateMotors.append((i, j.motorRate)) }
                 }
                 if j.limitLo < j.limitHi {
                     g.limits = SIMD4(j.limitLo, j.limitHi, 0, 0)
@@ -2081,6 +2088,17 @@ public final class GPUSolver {
 
     /// Advance kinematic spinners (static bodies with prescribed rotation).
     private func advanceSpinners() {
+        // velocity motors: advance the bounded-torque servo target (wrapped;
+        // the motor constraint wraps its error the same way)
+        if !rateMotors.isEmpty {
+            let jp = joints.contents().bindMemory(to: JointGPU.self,
+                                                  capacity: max(1, numJoints))
+            for (ji, rate) in rateMotors {
+                var t = jp[ji].motor.x + rate * settings.dt
+                t -= (2 * Float.pi) * (t / (2 * .pi)).rounded()
+                jp[ji].motor.x = t
+            }
+        }
         guard !spinners.isEmpty else { return }
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         for sp in spinners {

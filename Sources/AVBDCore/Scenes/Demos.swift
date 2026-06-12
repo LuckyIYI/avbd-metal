@@ -17,11 +17,13 @@ public struct DemoParam: Identifiable {
 
 public enum Demos {
     public static var all: [String] {
-        ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
-         "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
-         "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "softbody", "android",
+        ["ground", "stack", "ratiostack", "wall", "pyramid", "pendulum", "chain",
+         "boxpile", "spring", "cardhouse", "fracture", "bridge", "tensegrity",
+         "chainmail", "swirl", "treadmill", "jenga", "dominoes", "car",
+         "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg",
+         "slopefriction", "softbody", "softwheel", "android",
          "clothfold", "boxoncloth", "hammock", "drape", "multidrape",
-         "clothcombo", "flagwhip", "ribbons"]
+         "clothcombo", "flagwhip", "ribbons", "bed"]
     }
 
     /// Tunable parameters per demo (empty = none). Keys are looked up in
@@ -40,6 +42,8 @@ public enum Demos {
         case "ribbons": return [fric(0.35)]
         case "softbody": return [fric(0.8),
                                  DemoParam("stiffness", "Stiffness µ", 500...8000, 2500)]
+        case "bed": return [fric(0.7)]
+        case "softwheel": return [DemoParam("drive", "Drive speed", 0...12, 6)]
         default: return []
         }
     }
@@ -58,6 +62,12 @@ public enum Demos {
         switch name {
         case "ground": return ground(count: s * s)
         case "stack": return stack(height: 10 * s)
+        case "ratiostack": return ratiostack(levels: min(8, 3 + s))
+        case "slopefriction": return slopefriction(count: 6 + 2 * s)
+        case "softwheel": return softwheel(res: res ?? (9 + s),
+                                           drive: p("drive", 6))
+        case "bed": return bed(res: res ?? (30 + 6 * s),
+                               friction: p("friction", 0.7))
         case "wall": return wall(width: 8 * s, height: 6 * s)
         case "pyramid": return pyramid(base: 8 * s)
         case "pendulum": return pendulum(links: 20 * s, massRatio: 100)
@@ -149,6 +159,53 @@ public enum Demos {
                                            0, bh / 2 + Float(j) * bh))
             }
         }
+        return s
+    }
+
+    /// Static-friction correctness: identical boxes on a 30° incline with
+    /// friction sweeping low -> high across the row. Pair friction is the
+    /// geometric mean and the slope is mu=1, so boxes with sqrt(mu) below
+    /// tan(30°) ≈ 0.577 (mu < ~0.33) must slide off; the rest must stick.
+    public static func slopefriction(count: Int = 8) -> PhysicsScene {
+        var s = PhysicsScene(name: "slopefriction")
+        addGround(&s, friction: 0.8)
+        let tilt: Float = .pi / 6                       // 30 degrees
+        let rot = Quat(angle: tilt, axis: F3(0, 1, 0))
+        let slopeT: Float = 0.3
+        _ = s.addBody(size: F3(9, Float(count) * 1.3 + 1, slopeT), density: 0,
+                      friction: 1.0, position: F3(0, 0, 2.6), rotation: rot)
+        let n = max(2, count)
+        let boxSide: Float = 0.8
+        let lift = rot.act(F3(0, 0, slopeT / 2 + boxSide / 2 + 0.01))
+        for k in 0..<n {
+            let mu = Float(k) / Float(n - 1)            // 0 .. 1
+            let y = (Float(k) - Float(n - 1) / 2) * 1.3
+            _ = s.addBody(size: F3(repeating: boxSide), density: 1,
+                          friction: mu,
+                          position: F3(0, 0, 2.6) + rot.act(F3(1.5, y, 0)) + lift,
+                          rotation: rot)
+        }
+        s.settings.cameraDistance = 16
+        s.settings.cameraTargetZ = 2.4
+        return s
+    }
+
+    /// Mass-ratio stack: each box LARGER than the one beneath — the heavy
+    /// top must neither squeeze the light base out nor sink through it.
+    public static func ratiostack(levels: Int = 5, growth: Float = 1.45) -> PhysicsScene {
+        var s = PhysicsScene(name: "ratiostack")
+        addGround(&s, friction: 0.8)
+        var side: Float = 0.5
+        var z: Float = 0
+        for _ in 0..<max(2, levels) {
+            z += side / 2
+            _ = s.addBody(size: F3(repeating: side * 0.98), density: 1,
+                          friction: 0.8, position: F3(0, 0, z))
+            z += side / 2
+            side *= growth
+        }
+        s.settings.cameraDistance = max(10, z * 2.2)
+        s.settings.cameraTargetZ = z * 0.45
         return s
     }
 
