@@ -966,18 +966,29 @@ public final class GPUSolver {
             link2(j.bodyA, j.bodyB)
         }
         for sp2 in scene.springs { link2(sp2.bodyA, sp2.bodyB) }
+        // Tets keep strict Gauss-Seidel ordering: Jacobi-accepting them was
+        // tried and FAILED the battery outright (volume preservation, block
+        // stacking, bunny, tire drive — Neo-Hookean at mu 2.5-9k oscillates
+        // under simultaneous neighbor updates).
         for t in scene.tets {
             let ids = [t.ids.0, t.ids.1, t.ids.2, t.ids.3]
             for i in 0..<4 { for j in (i + 1)..<4 { link2(ids[i], ids[j]) } }
         }
-        for t in scene.tris where t.mu > 0 {
-            let ids = [t.ids.0, t.ids.1, t.ids.2]
-            for i in 0..<3 { for j in (i + 1)..<3 { link2(ids[i], ids[j]) } }
+        // MEMBRANES are Jacobi-accepted (like contacts and bends): their
+        // 3-cliques were the only reason cloth needed a third color over
+        // the bipartite rod grid, and at mu ~300 with 20 iterations every
+        // cloth gate and KE envelope holds without the ordering. Palette
+        // 3 -> 2 = a third of the primal dispatch chain gone.
+        // AVBD_GS_ELEMENTS=1 restores the old strict ordering for A/B.
+        if ProcessInfo.processInfo.environment["AVBD_GS_ELEMENTS"] != nil {
+            for t in scene.tris where t.mu > 0 {
+                let ids = [t.ids.0, t.ids.1, t.ids.2]
+                for i in 0..<3 { for j in (i + 1)..<3 { link2(ids[i], ids[j]) } }
+            }
         }
-        // Bends are EXCLUDED from coloring conflicts: their 4-vertex hinge
-        // cliques over the 2-ring inflate the palette ~2x, and their forces
-        // (kappa ~ 5e-4) are orders below membrane/rod scale — same-color
-        // Jacobi updates are harmless for them, like contacts.
+        // Bends were ALWAYS excluded from coloring conflicts: their 4-vertex
+        // hinge cliques over the 2-ring inflate the palette ~2x, and their
+        // forces (kappa ~ 5e-4) are orders below membrane/rod scale.
         var staticColors = [Int](repeating: 0, count: numBodies)
         var maxColor = 0
         for v in 0..<numBodies where scene.bodies[v].density > 0 {
