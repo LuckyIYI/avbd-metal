@@ -81,7 +81,11 @@ public final class GPUSolver {
     public private(set) var renderTriCount: Int = 0
     var surfVertCount: Int = 0
     public private(set) var staticUsedColors: Int = 1
-    var usesDynamicColoring: Bool { numTris == 0 && numTets == 0 && numSprings == 0 }
+    // Contact-aware per-frame coloring for every scene WITHOUT soft
+    // elements: rigid stacking (stack/jenga/gearclock) provably needs
+    // strict GS contact ordering, and springs were always part of the
+    // dynamic coloring graph. Only cloth/tet scenes use the static palette.
+    var usesDynamicColoring: Bool { numTris == 0 && numTets == 0 }
     var dynColorSrc: MTLBuffer?
 
     // Adjacency + coloring
