@@ -83,6 +83,8 @@ public final class GPUSolver {
     // element candidate sets, plus the topology they propagate through.
     var vtTrackBuf, eeTrackBuf, triAdjBuf: MTLBuffer
     var clothVertFlag: MTLBuffer
+    var boundsBuf, ogcPrevBuf, ogcArgsBuf: MTLBuffer
+    var nbr2Start, nbr2Count, nbr2List: MTLBuffer
     var vertEdgeStart, vertEdgeCount, vertEdgeList: MTLBuffer
     public private(set) var surfaceTriCount: Int = 0
     public private(set) var renderTriCount: Int = 0
@@ -186,6 +188,13 @@ public final class GPUSolver {
         globalIdx = try makeBuf(nb * 4, "globalIdx")
         hashedRigidIdx = try makeBuf(nb * 4, "hashedRigidIdx")
         clothVertFlag = try makeBuf(nb * 4, "clothVertFlag")
+        boundsBuf = try makeBuf(nb * 4, "ogcBounds")
+        ogcPrevBuf = try makeBuf(nb * 16, "ogcPrev")
+        ogcArgsBuf = try makeBuf(3 * 4, "ogcArgs")
+        // 2-ring CSR sized after derivation below (~19/vertex upper bound)
+        nbr2Start = try makeBuf(nb * 4, "nbr2Start")
+        nbr2Count = try makeBuf(nb * 4, "nbr2Count")
+        nbr2List = try makeBuf(max(1, numTris * 24) * 4, "nbr2List")
         cellCount = try makeBuf(gridHashSize * 4, "cellCount")
         cellRigid = try makeBuf(gridHashSize * 4, "cellRigid")
         cellStart = try makeBuf(gridHashSize * 4, "cellStart")
@@ -658,6 +667,34 @@ public final class GPUSolver {
             nbrList.contents().bindMemory(to: UInt32.self, capacity: flatNbrs.count)
                 .update(from: flatNbrs, count: flatNbrs.count)
         }
+        // 2-RING neighborhoods (sorted, for the OGC conservative bounds):
+        // bounds must EXCLUDE near-geodesic same-sheet elements — the 2-ring
+        // sits at ~2 edge-lengths permanently and would cap every bound at a
+        // crawl. Safe to exclude: cloth thickness is clamped below
+        // 0.38*spacing, so 2-ring rest distances stay outside contact range.
+        let n2sP = nbr2Start.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        let n2cP = nbr2Count.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        var flat2: [UInt32] = []
+        for i in 0..<numBodies {
+            n2sP[i] = UInt32(flat2.count)
+            if nbrSets[i].isEmpty {
+                n2cP[i] = 0
+                continue
+            }
+            var two = nbrSets[i]
+            for nb1 in nbrSets[i] { two.formUnion(nbrSets[nb1]) }
+            two.remove(i)
+            let sorted2 = two.sorted()
+            n2cP[i] = UInt32(sorted2.count)
+            flat2.append(contentsOf: sorted2.map(UInt32.init))
+        }
+        if !flat2.isEmpty {
+            precondition(flat2.count <= nbr2List.length / 4,
+                         "2-ring CSR exceeded bound")
+            nbr2List.contents().bindMemory(to: UInt32.self, capacity: flat2.count)
+                .update(from: flat2, count: flat2.count)
+        }
+
         // particle list: V-T query points (any 3-DOF particle, cloth or tet)
         var particles: [UInt32] = []
         for (i, b) in scene.bodies.enumerated() where b.isParticle {
@@ -1451,6 +1488,10 @@ public final class GPUSolver {
             blit.fill(buffer: cellCount, range: 0..<(gridHashSize * 4), value: 0)
             blit.fill(buffer: cellRigid, range: 0..<(gridHashSize * 4), value: 0)
             if numTris > 0 {
+                // OGC conservative bounds: reset to "far" (0x7F7F7F7F ~ 3e38)
+                blit.fill(buffer: boundsBuf, range: 0..<(numBodies * 4), value: 0x7F)
+            }
+            if numTris > 0 {
                 blit.fill(buffer: elemCellCount, range: 0..<(elemHashSize * 4), value: 0)
             }
             blit.endEncoding()
@@ -1627,6 +1668,10 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 18)
                 e.setBuffer(self.vtTrackBuf, offset: 0, index: 19)
                 e.setBuffer(self.triAdjBuf, offset: 0, index: 20)
+                e.setBuffer(self.boundsBuf, offset: 0, index: 21)
+                e.setBuffer(self.nbr2Start, offset: 0, index: 22)
+                e.setBuffer(self.nbr2Count, offset: 0, index: 23)
+                e.setBuffer(self.nbr2List, offset: 0, index: 24)
             }
             }
             stage("ee-emit")
@@ -1654,6 +1699,10 @@ public final class GPUSolver {
                 e.setBuffer(self.vertEdgeStart, offset: 0, index: 19)
                 e.setBuffer(self.vertEdgeCount, offset: 0, index: 20)
                 e.setBuffer(self.vertEdgeList, offset: 0, index: 21)
+                e.setBuffer(self.boundsBuf, offset: 0, index: 22)
+                e.setBuffer(self.nbr2Start, offset: 0, index: 23)
+                e.setBuffer(self.nbr2Count, offset: 0, index: 24)
+                e.setBuffer(self.nbr2List, offset: 0, index: 25)
             }
             }
             stage("rt-emit")
@@ -1723,6 +1772,11 @@ public final class GPUSolver {
             e.setBuffer(self.velAng, offset: 0, index: 7)
             e.setBuffer(self.prevVelLin, offset: 0, index: 8)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 9)
+            e.setBuffer(self.ogcPrevBuf, offset: 0, index: 10)
+            e.setBuffer(self.boundsBuf, offset: 0, index: 11)
+            var doOgc: UInt32 = self.numTris > 0 ? 1 : 0
+            e.setBytes(&doOgc, length: 4, index: 12)
+            e.setBuffer(self.shape, offset: 0, index: 13)
         }
 
         stage("adjacency")
@@ -1861,6 +1915,9 @@ public final class GPUSolver {
             enc.setBuffer(membranes, offset: 0, index: 20)
             enc.setBuffer(bends, offset: 0, index: 21)
             enc.setBytes(&ntg, length: 4, index: 22)
+            enc.setBuffer(boundsBuf, offset: 0, index: 26)
+            enc.setBuffer(ogcPrevBuf, offset: 0, index: 27)
+            enc.setBuffer(counters, offset: 0, index: 28)
             enc.dispatchThreadgroups(MTLSize(width: Int(ntg), height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
         } else if !noPersist && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
@@ -1890,6 +1947,9 @@ public final class GPUSolver {
             enc.setBuffer(softContacts, offset: 0, index: 19)
             enc.setBuffer(membranes, offset: 0, index: 20)
             enc.setBuffer(bends, offset: 0, index: 21)
+            enc.setBuffer(boundsBuf, offset: 0, index: 26)
+            enc.setBuffer(ogcPrevBuf, offset: 0, index: 27)
+            enc.setBuffer(counters, offset: 0, index: 28)
             let w = persistPSO.threadExecutionWidth
             let tg = min(persistPSO.maxTotalThreadsPerThreadgroup,
                          ((max(numBodies, 64) + w - 1) / w) * w)
@@ -1931,6 +1991,9 @@ public final class GPUSolver {
                 enc.setBuffer(softContacts, offset: 0, index: 19)
                 enc.setBuffer(membranes, offset: 0, index: 20)
                 enc.setBuffer(bends, offset: 0, index: 21)
+                enc.setBuffer(self.boundsBuf, offset: 0, index: 22)
+                enc.setBuffer(self.ogcPrevBuf, offset: 0, index: 23)
+                enc.setBuffer(self.counters, offset: 0, index: 24)
             }
             _ = it
             if profiling { stage("solve-primal") ; enc.setComputePipelineState(primalPSO)
@@ -1955,6 +2018,9 @@ public final class GPUSolver {
                 enc.setBuffer(softContacts, offset: 0, index: 19)
                 enc.setBuffer(membranes, offset: 0, index: 20)
                 enc.setBuffer(bends, offset: 0, index: 21)
+                enc.setBuffer(self.boundsBuf, offset: 0, index: 22)
+                enc.setBuffer(self.ogcPrevBuf, offset: 0, index: 23)
+                enc.setBuffer(self.counters, offset: 0, index: 24)
             }
             for c in 0..<colorBound {
                 var cIdx = UInt32(c)
@@ -1994,6 +2060,37 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
                 e.setBuffer(self.springs, offset: 0, index: 8)
                 e.setBuffer(self.softContacts, offset: 0, index: 9)
+            }
+            // OGC conditional refresh (paper Alg 3): a one-thread kernel
+            // turns the exceed counter into indirect dispatch args, so the
+            // refresh runs ONLY in iterations where >1% of particles were
+            // bound-limited — settled scenes pay an empty dispatch
+            if numParticles > 0 && it + 1 < settings.iterations {
+                dispatch1D(enc, "ogc_refresh_args", 1) { e in
+                    e.setBuffer(self.counters, offset: 0, index: 0)
+                    e.setBuffer(self.ogcArgsBuf, offset: 0, index: 1)
+                    e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 2)
+                }
+                let pr = ps("ogc_bounds_refresh")
+                enc.setComputePipelineState(pr)
+                enc.setBuffer(posLin, offset: 0, index: 0)
+                enc.setBuffer(particleIdxBuf, offset: 0, index: 1)
+                enc.setBuffer(trisBuf, offset: 0, index: 2)
+                enc.setBuffer(edgesBuf, offset: 0, index: 3)
+                enc.setBuffer(vtTrackBuf, offset: 0, index: 4)
+                enc.setBuffer(eeTrackBuf, offset: 0, index: 5)
+                enc.setBuffer(vertEdgeStart, offset: 0, index: 6)
+                enc.setBuffer(vertEdgeCount, offset: 0, index: 7)
+                enc.setBuffer(vertEdgeList, offset: 0, index: 8)
+                enc.setBuffer(boundsBuf, offset: 0, index: 9)
+                enc.setBuffer(ogcPrevBuf, offset: 0, index: 10)
+                enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
+                enc.setBuffer(nbr2Start, offset: 0, index: 12)
+                enc.setBuffer(nbr2Count, offset: 0, index: 13)
+                enc.setBuffer(nbr2List, offset: 0, index: 14)
+                enc.dispatchThreadgroups(indirectBuffer: ogcArgsBuf,
+                                         indirectBufferOffset: 0,
+                                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
             }
         }
 

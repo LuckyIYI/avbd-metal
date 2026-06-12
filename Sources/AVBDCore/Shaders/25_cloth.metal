@@ -341,6 +341,10 @@ kernel void vt_emit(
     constant SimParams& P           [[buffer(18)]],
     device uint4* vtTrack           [[buffer(19)]],
     device const uint4* triAdj      [[buffer(20)]],
+    device atomic_uint* bounds      [[buffer(21)]],   // d2 bits, atomic-min
+    device const uint* nbr2Start    [[buffer(22)]],
+    device const uint* nbr2Count    [[buffer(23)]],
+    device const uint* nbr2List     [[buffer(24)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numParticles) return;
@@ -353,6 +357,17 @@ kernel void vt_emit(
 
     Best4 best;
     best4Init(best);
+
+    // OGC conservative bounds (paper Eq 21-26) fall out of candidate
+    // evaluation: every vertex-facet distance observed atomically mins
+    // into the vertex's bound AND the facet's vertices' bounds — but only
+    // for pairs OUTSIDE each other's 2-ring (near-geodesic same-sheet
+    // elements sit ~2 edge-lengths away forever and would cap every bound
+    // at a crawl; the thickness < 0.38*spacing invariant keeps them out of
+    // contact range, so excluding them is safe). Non-negative float bits
+    // order like uints, so atomic_fetch_min on bit patterns works.
+    uint n2s = nbr2Start[v], n2e = n2s + nbr2Count[v];
+    float boundsCap2 = P.elemCellSize * P.elemCellSize;
 
     // candidate evaluation: closest-point distance, with topological
     // exclusion (own / 1-ring triangles never count)
@@ -372,6 +387,20 @@ kernel void vt_emit(
                     && !nbrContains(nbrList, ns, ne, tid_.y)                   \
                     && !nbrContains(nbrList, ns, ne, tid_.z)) {                \
                     best4Insert(best, t_, d2_);                                \
+                }                                                              \
+                if (d2_ < boundsCap2                                           \
+                    && !nbrContains(nbr2List, n2s, n2e, tid_.x)                \
+                    && !nbrContains(nbr2List, n2s, n2e, tid_.y)                \
+                    && !nbrContains(nbr2List, n2s, n2e, tid_.z)) {             \
+                    uint db_ = as_type<uint>(d2_);                             \
+                    atomic_fetch_min_explicit(&bounds[v], db_,                 \
+                                              memory_order_relaxed);           \
+                    atomic_fetch_min_explicit(&bounds[tid_.x], db_,            \
+                                              memory_order_relaxed);           \
+                    atomic_fetch_min_explicit(&bounds[tid_.y], db_,            \
+                                              memory_order_relaxed);           \
+                    atomic_fetch_min_explicit(&bounds[tid_.z], db_,            \
+                                              memory_order_relaxed);           \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -569,6 +598,10 @@ kernel void ee_emit(
     device const uint* vertEdgeStart [[buffer(19)]],
     device const uint* vertEdgeCount [[buffer(20)]],
     device const uint* vertEdgeList [[buffer(21)]],
+    device atomic_uint* bounds      [[buffer(22)]],   // d2 bits, atomic-min
+    device const uint* nbr2Start    [[buffer(23)]],
+    device const uint* nbr2Count    [[buffer(24)]],
+    device const uint* nbr2List     [[buffer(25)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numEdges) return;
@@ -582,6 +615,10 @@ kernel void ee_emit(
     Best4 best;
     best4Init(best);
 
+    // edge-edge minima feed all four endpoint bounds (2-ring excluded —
+    // see vt_emit)
+    uint n2sx = nbr2Start[eA.x], n2ex = n2sx + nbr2Count[eA.x];
+    float boundsCap2 = P.elemCellSize * P.elemCellSize;
     #define EE_CONSIDER(E)                                                     \
     {                                                                          \
         uint e_ = (E);                                                         \
@@ -601,6 +638,19 @@ kernel void ee_emit(
                     && !nbrContains(nbrList, nsy, ney, eB_.x)                  \
                     && !nbrContains(nbrList, nsy, ney, eB_.y)) {               \
                     best4Insert(best, e_, d2_);                                \
+                }                                                              \
+                if (d2_ < boundsCap2                                           \
+                    && !nbrContains(nbr2List, n2sx, n2ex, eB_.x)               \
+                    && !nbrContains(nbr2List, n2sx, n2ex, eB_.y)) {            \
+                    uint db_ = as_type<uint>(d2_);                             \
+                    atomic_fetch_min_explicit(&bounds[eA.x], db_,              \
+                                              memory_order_relaxed);           \
+                    atomic_fetch_min_explicit(&bounds[eA.y], db_,              \
+                                              memory_order_relaxed);           \
+                    atomic_fetch_min_explicit(&bounds[eB_.x], db_,             \
+                                              memory_order_relaxed);           \
+                    atomic_fetch_min_explicit(&bounds[eB_.y], db_,             \
+                                              memory_order_relaxed);           \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -705,6 +755,86 @@ kernel void ee_emit(
                  softLambdaCap(P, minMass), minMass,
                  SC_EE, false, false, false, keyA, keyB);
     }
+}
+
+// ----------------------------------------------------------------------------
+// OGC mid-step bound refresh (paper Alg 3): when enough vertices have hit
+// their conservative bound, re-anchor X^prev at the LIVE positions and
+// recompute bounds from the TRACKED sets. Counter-driven and dispatched
+// INDIRECTLY, so iterations where nothing is bound-limited cost one tiny
+// args kernel and an empty dispatch — and a freely falling sheet earns a
+// fresh 0.45*d budget every few iterations instead of crawling.
+// ----------------------------------------------------------------------------
+kernel void ogc_refresh_args(
+    device atomic_uint* counters    [[buffer(0)]],
+    device uint* args               [[buffer(1)]],   // 3 uints: threadgroups
+    constant SimParams& P           [[buffer(2)]])
+{
+    uint exceeded = atomic_load_explicit(&counters[CTR_OGC], memory_order_relaxed);
+    // the paper's gamma_e = 1%: only refresh when a meaningful share of
+    // vertices are bound-limited
+    bool fire = exceeded * 100u > P.numParticles;
+    args[0] = fire ? (P.numParticles + 63u) / 64u : 0u;
+    args[1] = 1u;
+    args[2] = 1u;
+    atomic_store_explicit(&counters[CTR_OGC], 0u, memory_order_relaxed);
+}
+
+kernel void ogc_bounds_refresh(
+    device const float4* posLin     [[buffer(0)]],
+    device const uint* particleIdx  [[buffer(1)]],
+    device const uint4* tris        [[buffer(2)]],
+    device const uint2* edges       [[buffer(3)]],
+    device const uint4* vtTrack     [[buffer(4)]],
+    device const uint4* eeTrack     [[buffer(5)]],
+    device const uint* vertEdgeStart [[buffer(6)]],
+    device const uint* vertEdgeCount [[buffer(7)]],
+    device const uint* vertEdgeList [[buffer(8)]],
+    device uint* bounds             [[buffer(9)]],
+    device float4* ogcPrev          [[buffer(10)]],
+    constant SimParams& P           [[buffer(11)]],
+    device const uint* nbr2Start    [[buffer(12)]],
+    device const uint* nbr2Count    [[buffer(13)]],
+    device const uint* nbr2List     [[buffer(14)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= P.numParticles) return;
+    uint v = particleIdx[gid];
+    float3 pv = posLin[v].xyz;
+    uint n2s = nbr2Start[v], n2e = n2s + nbr2Count[v];
+    float dmin2 = 3.0e38f;
+    uint4 tracked = vtTrack[v];
+    for (int i = 0; i < 4; i++) {
+        uint t = tracked[i];
+        if (t >= P.numTris) break;
+        uint4 tid = tris[t];
+        if (nbrContains(nbr2List, n2s, n2e, tid.x)
+            || nbrContains(nbr2List, n2s, n2e, tid.y)
+            || nbrContains(nbr2List, n2s, n2e, tid.z)) continue;
+        float3 ba;
+        float3 q = closestPtTriangle(pv, posLin[tid.x].xyz, posLin[tid.y].xyz,
+                                     posLin[tid.z].xyz, ba);
+        dmin2 = min(dmin2, distance_squared(pv, q));
+    }
+    uint es = vertEdgeStart[v], ec = min(vertEdgeCount[v], 6u);
+    for (uint k = es; k < es + ec; k++) {
+        uint myE = vertEdgeList[k];
+        uint other = eeTrack[myE].x;
+        if (other >= P.numEdges) continue;
+        uint2 eo = edges[other];
+        if (nbrContains(nbr2List, n2s, n2e, eo.x)
+            || nbrContains(nbr2List, n2s, n2e, eo.y)) continue;
+        uint2 em = edges[myE];
+        float3 a0 = posLin[em.x].xyz, a1 = posLin[em.y].xyz;
+        float3 b0 = posLin[eo.x].xyz, b1 = posLin[eo.y].xyz;
+        float s, t;
+        eeClosestSegSeg(a0, a1, b0, b1, s, t);
+        float3 cA = a0 + (a1 - a0) * s;
+        float3 cB = b0 + (b1 - b0) * t;
+        dmin2 = min(dmin2, distance_squared(cA, cB));
+    }
+    bounds[v] = as_type<uint>(dmin2);
+    ogcPrev[v] = posLin[v];
 }
 
 // ----------------------------------------------------------------------------

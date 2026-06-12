@@ -23,7 +23,7 @@ public enum Demos {
          "wreckingball", "trebuchet", "rubegoldberg",
          "slopefriction", "softbody", "softwheel", "android",
          "clothfold", "boxoncloth", "hammock", "drape", "multidrape",
-         "clothcombo", "flagwhip", "ribbons", "bed"]
+         "clothcombo", "flagwhip", "ribbons", "twist", "bed"]
     }
 
     /// Tunable parameters per demo (empty = none). Keys are looked up in
@@ -47,6 +47,8 @@ public enum Demos {
         case "flagwhip": return [DemoParam("kick", "Kick speed", 0...6, 3),
                                  membrane, bending]
         case "ribbons": return [fric(0.35), membrane, bending]
+        case "twist": return [DemoParam("turnRate", "Turns / s", 0...1, 0.3),
+                              membrane, bending]
         case "softbody": return [fric(0.8),
                                  DemoParam("stiffness", "Stiffness µ", 500...8000, 2500)]
         case "bed": return [fric(0.7),
@@ -132,6 +134,10 @@ public enum Demos {
                                          kick: p("kick", 3),
                                          membraneMu: p("membrane", 300),
                                          bend: p("bending", 5) * 1e-4)
+        case "twist": return twist(res: res ?? (32 + 8 * s),
+                                   turnRate: p("turnRate", 0.3),
+                                   membraneMu: p("membrane", 300),
+                                   bend: p("bending", 5) * 1e-4)
         case "ribbons": return ribbons(len: res ?? (18 + 4 * s),
                                        count: Int(p("count", Float(4 + 2 * s))),
                                        friction: p("friction", 0.35),

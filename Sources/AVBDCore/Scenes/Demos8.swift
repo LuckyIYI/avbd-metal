@@ -83,6 +83,66 @@ extension Demos {
         return s
     }
 
+    /// OGC stress test (the paper's twisting-cloth regime): a hanging
+    /// sheet clamped to a spinning bar at the top and a free-hanging
+    /// weight bar at the bottom. The twist propagates down, the sheet
+    /// winds into a tight multi-layered rope, and the weight bar rises as
+    /// the rope shortens — layers press and slide without pass-through
+    /// (conservative bounds + log barrier).
+    public static func twist(res: Int = 40, turnRate: Float = 0.3,
+                             membraneMu: Float = 300,
+                             bend: Float = 5e-4) -> PhysicsScene {
+        var s = PhysicsScene(name: "twist")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
+        addGround(&s, friction: 0.5)
+
+        let L: Float = 2.2                        // hanging length
+        let nu = max(30, res), nv = max(16, res / 2)
+        let spacing = L / Float(nu - 1)
+        let W = Float(nv - 1) * spacing
+        let r: Float = min(0.03, 0.34 * spacing)
+        let topZ: Float = 3.0
+
+        // spinner bar (static, kinematic rotation about the vertical axis)
+        let barA = s.addBody(size: F3(W + 0.3, 0.12, 0.12), density: 0,
+                             friction: 0.4, position: F3(0, 0, topZ))
+        s.addSpinner(SceneSpinner(body: barA, axis: F3(0, 0, 1),
+                                  omega: turnRate * 2 * .pi))
+        // weight bar (dynamic): hangs from the sheet, rises as it winds
+        let barB = s.addBody(size: F3(W + 0.3, 0.12, 0.12), density: 1.2,
+                             friction: 0.4,
+                             position: F3(0, 0, topZ - L - 0.1))
+
+        var positions: [[F3]] = []
+        for i in 0..<nu {                          // i: down the sheet
+            var row: [F3] = []
+            for j in 0..<nv {
+                row.append(F3(Float(j) * spacing - W / 2, 0,
+                              topZ - 0.04 - Float(i) * spacing))
+            }
+            positions.append(row)
+        }
+        let grid = addClothGrid(&s, positions: positions, thickness: r,
+                                massPerNode: 0.5 * spacing * spacing,
+                                friction: 0.5,
+                                membraneMu: membraneMu, membraneBend: bend)
+        for j in 0..<nv {
+            for (end, bar) in [(0, barA), (nu - 1, barB)] {
+                let node = grid[end][j]
+                s.addJoint(SceneJoint(bodyA: bar, bodyB: node,
+                                      rA: s.bodies[node].position
+                                          - s.bodies[bar].position,
+                                      rB: .zero))
+            }
+        }
+        s.settings.cameraDistance = 5.5
+        s.settings.cameraTargetZ = topZ * 0.6
+        return s
+    }
+
     /// All three together: rigid bed frame, soft mattress, two softer
     /// pillows, and a cloth blanket draped over — then a ball bounces in.
     public static func bed(res: Int = 36, friction: Float = 0.7,

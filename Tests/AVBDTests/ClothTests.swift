@@ -175,6 +175,26 @@ final class ClothTests: XCTestCase {
         }
     }
 
+    /// OGC stress gate: three full turns of the hanging twist sheet must
+    /// wind into a rope without layers passing through each other and
+    /// without tearing the weave at the clamp.
+    func testTwistedSheetNoPassThrough() throws {
+        let scene = Demos.twist(res: 36, turnRate: 0.3)
+        let gpu = try GPUSolver(scene: scene)
+        for _ in 0..<600 { gpu.step() }
+        let (gap, stretch) = gpu.debugClothMetrics()
+        // skin = 2r ~ 0.043 at res 36: a crossing would read at or beyond
+        // -skin; the wound core legitimately compresses, so the red line
+        // sits just inside it (the regime is chaotic run to run)
+        XCTAssertGreaterThan(gap, -0.038,
+                             "wound layers must not pass through (gap \(gap))")
+        // neck strain under the kinematic torque is chaotic (0.1-0.5 run
+        // to run via atomic emission order); the TEAR failure mode this
+        // guards read ~5x, so 0.7 separates them decisively
+        XCTAssertLessThan(stretch, 0.7,
+                          "the clamp neck must not tear (stretch \(stretch))")
+    }
+
     /// The drape must come to rest (the energy-injection regression test:
     /// stale color bounds / unbounded duals made piles thrash at m/s).
     func testDrapeSettles() throws {

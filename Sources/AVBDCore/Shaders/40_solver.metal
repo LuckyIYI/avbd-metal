@@ -1,4 +1,4 @@
-#define OGC_BARRIER 0
+#define OGC_BARRIER 1
 #include <metal_stdlib>
 using namespace metal;
 
@@ -500,6 +500,10 @@ kernel void warmstart_bodies(
     device const float4* velAng     [[buffer(7)]],
     device const float4* prevVelLin [[buffer(8)]],
     constant SimParams& P           [[buffer(9)]],
+    device float4* ogcPrev          [[buffer(10)]],
+    device const uint* boundsBits   [[buffer(11)]],
+    constant uint& doOgc            [[buffer(12)]],
+    device const float4* shapeW     [[buffer(13)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -525,7 +529,22 @@ kernel void warmstart_bodies(
     initLin[gid] = float4(pl.xyz, 0);
     initAng[gid] = pa;
     if (mass > 0.0f) {
-        posLin[gid] = float4(pl.xyz + vl * dt + float3(0, 0, P.gravity) * (accelWeight * dt * dt), mass);
+        float3 guess = pl.xyz + vl * dt
+                     + float3(0, 0, P.gravity) * (accelWeight * dt * dt);
+        // OGC anchor = the detection pose; the warmstart placement itself
+        // is truncated within the bound (paper Eq 28) so the step STARTS
+        // penetration-free — the in-loop refresh grants further budget
+        if (doOgc != 0u && shapeW[gid].w < 0.0f) {
+            ogcPrev[gid] = float4(pl.xyz, 0);
+            float d2 = as_type<float>(boundsBits[gid]);
+            if (d2 < 1e37f) {
+                float bv = max(0.45f * sqrt(d2), -0.2f * shapeW[gid].w);
+                float3 tot = guess - pl.xyz;
+                float t2 = dot(tot, tot);
+                if (t2 > bv * bv) guess = pl.xyz + tot * (bv * rsqrt(t2));
+            }
+        }
+        posLin[gid] = float4(guess, mass);
         posAng[gid] = q_addw(pa, va * dt);
     }
 }
@@ -992,11 +1011,16 @@ inline float3 softContactForce(device const SoftContactGPU& sc, float3 C,
     float rT = sc.anchorA.x;            // restT (particle contacts only)
     uint kindB = (as_type<uint>(sc.anchorA.w) >> SCF_KIND_SHIFT) & 3u;
     if (OGC_BARRIER && rT > 0.0f && kindB != SC_RT && C.x < -0.5f * rT) {
-        float dsep = max(C.x + rT, 0.0625f * rT);
+        // genuinely divergent (floored at 0.02*rT, not force-capped):
+        // under a kinematic squeeze — the twist rope — a capped barrier
+        // lets layers grind toward raw distance 0, the conservative
+        // bounds collapse with them, and clamped vertices freeze against
+        // their driver. The earlier overdrive incident was RT contacts,
+        // which are excluded here.
+        float dsep = max(C.x + rT, 0.02f * rT);
         float kp = 0.25f * rT * rT * sc.penalty.x;
-        float Fbar = min(kp / dsep, 4.0f * sc.penalty.x * rT);
-        F.x = -Fbar + sc.lambda.x;
-        kNormal = min(kp / (dsep * dsep), 64.0f * sc.penalty.x);
+        F.x = -kp / dsep + sc.lambda.x;
+        kNormal = kp / (dsep * dsep);
     }
     F.x = min(F.x, 0.0f);
     bounds = fabs(F.x) * sc.normal.w;
@@ -1049,6 +1073,34 @@ inline void stampSoft(device const SoftContactGPU& sc, uint self,
     }
 }
 
+// OGC conservative-bound truncation (paper Eq 27): clamp a particle's
+// displacement since its bound anchor within gamma_p * (min distance to
+// any non-2-ring primitive at anchor time). ABSOLUTE, so the pairwise
+// no-cross guarantee composes; exceeders are counted and trigger the
+// in-loop anchor/bound refresh (Alg 3) instead of freezing motion.
+inline float3 ogcTruncate(float3 dxLin, float3 cur, float3 x0, uint bits,
+                          float partR, device atomic_uint* counters)
+{
+    float d2 = as_type<float>(bits);
+    if (d2 >= 1e37f) return dxLin;
+    // FLOOR of 0.2*r per anchor window: a vertex wound into a tight rope
+    // core (raw layer distance ~ 0) must never FREEZE against a driven
+    // clamp — its hard joint would lose by decimeters and the clamp row
+    // tears (twist demo: 5x rod stretch). At 0.2*r per refresh, crossing
+    // a 2r skin needs ~10 sustained windows against the divergent
+    // barrier — practically impossible, and the formal bound holds
+    // everywhere clearance exists.
+    float bv = max(0.45f * sqrt(d2), 0.2f * partR);
+    float3 tot = (cur + dxLin) - x0;
+    float t2 = dot(tot, tot);
+    if (t2 > bv * bv) {
+        tot *= bv * rsqrt(t2);
+        dxLin = (x0 + tot) - cur;
+        atomic_fetch_add_explicit(&counters[CTR_OGC], 1u, memory_order_relaxed);
+    }
+    return dxLin;
+}
+
 static inline void primal_one(
     device float4* posLin,
     device float4* posAng,
@@ -1069,6 +1121,9 @@ static inline void primal_one(
     device const SoftContactGPU* soft,
     device const MembraneGPU* membranes,
     device const BendGPU* bends,
+    device const uint* boundsBits,
+    device const float4* ogcPrev,
+    device atomic_uint* ogcCounters,
     uint body)
 {
 
@@ -1171,6 +1226,9 @@ kernel void primal_solve(
     device const SoftContactGPU* soft [[buffer(19)]],
     device const MembraneGPU* membranes [[buffer(20)]],
     device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(22)]],
+    device const float4* ogcPrev    [[buffer(23)]],
+    device atomic_uint* ogcCounters [[buffer(24)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorIndex];
@@ -1178,7 +1236,8 @@ kernel void primal_solve(
     if (s + tid >= e) return;
     primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
                joints, springs, manifolds, adjStart, adjCount, adjList,
-               P, shape, tets, soft, membranes, bends, colorList[s + tid]);
+               P, shape, tets, soft, membranes, bends, boundsBits, ogcPrev,
+               ogcCounters, colorList[s + tid]);
 }
 
 // Lane-split particle primal: 8 threads per body each stamp a slice of
@@ -1210,6 +1269,9 @@ kernel void primal_particles_split(
     device const SoftContactGPU* soft [[buffer(19)]],
     device const MembraneGPU* membranes [[buffer(20)]],
     device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(22)]],
+    device const float4* ogcPrev    [[buffer(23)]],
+    device atomic_uint* ogcCounters [[buffer(24)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorIndex];
@@ -1300,6 +1362,10 @@ kernel void primal_particles_split(
     float maxLin = 0.35f * fabs(shape[body].w);
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
+    if (!rigid) {                           // particles: OGC bound truncation
+        dxLin = ogcTruncate(dxLin, pl.xyz, ogcPrev[body].xyz,
+                            boundsBits[body], -shape[body].w, ogcCounters);
+    }
     posLin[body] = float4(pl.xyz + dxLin, mass);
     if (rigid) posAng[body] = q_addw(posAng[body], dxAng);
 }
@@ -1333,6 +1399,9 @@ kernel void primal_tail(
     device const SoftContactGPU* soft [[buffer(19)]],
     device const MembraneGPU* membranes [[buffer(20)]],
     device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(22)]],
+    device const float4* ogcPrev    [[buffer(23)]],
+    device atomic_uint* ogcCounters [[buffer(24)]],
     uint tid                        [[thread_position_in_grid]])
 {
     uint s = colorStart[colorBound];
@@ -1340,7 +1409,8 @@ kernel void primal_tail(
     if (s + tid >= e) return;
     primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
                joints, springs, manifolds, adjStart, adjCount, adjList,
-               P, shape, tets, soft, membranes, bends, colorList[s + tid]);
+               P, shape, tets, soft, membranes, bends, boundsBits, ogcPrev,
+               ogcCounters, colorList[s + tid]);
 }
 
 // Dual update for one element contact: bounded normal dual (cap scaled to
@@ -1603,6 +1673,9 @@ kernel void solve_persistent(
     device SoftContactGPU* soft     [[buffer(19)]],
     device const MembraneGPU* membranes [[buffer(20)]],
     device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(26)]],
+    device const float4* ogcPrev    [[buffer(27)]],
+    device atomic_uint* ogcCounters [[buffer(28)]],
     uint tid                        [[thread_position_in_threadgroup]],
     uint tgSize                     [[threads_per_threadgroup]])
 {
@@ -1622,7 +1695,8 @@ kernel void solve_persistent(
                 primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
                            props, joints, springs, manifolds,
                            adjStart, adjCount, adjList, P, shape, tets, soft,
-                           membranes, bends, colorList[i]);
+                           membranes, bends, boundsBits, ogcPrev, ogcCounters,
+                           colorList[i]);
             }
             threadgroup_barrier(mem_flags::mem_device);
         }
@@ -1703,6 +1777,9 @@ kernel void solve_persistent_multi(
     device const MembraneGPU* membranes [[buffer(20)]],
     device const BendGPU* bends     [[buffer(21)]],
     constant uint& ntg              [[buffer(22)]],
+    device const uint* boundsBits   [[buffer(26)]],
+    device const float4* ogcPrev    [[buffer(27)]],
+    device atomic_uint* ogcCounters [[buffer(28)]],
     uint tid                        [[thread_position_in_threadgroup]],
     uint tgid                       [[threadgroup_position_in_grid]],
     uint tgSize                     [[threads_per_threadgroup]])
@@ -1725,7 +1802,8 @@ kernel void solve_persistent_multi(
                 primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
                            props, joints, springs, manifolds,
                            adjStart, adjCount, adjList, P, shape, tets, soft,
-                           membranes, bends, colorList[i]);
+                           membranes, bends, boundsBits, ogcPrev, ogcCounters,
+                           colorList[i]);
             }
             global_barrier(bar, ntg, tid, expected);
         }
