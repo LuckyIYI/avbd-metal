@@ -1191,15 +1191,11 @@ kernel void primal_particles_split(
     uint lane = tid & 7u;
     if (s + slot >= e) return;              // uniform across the 8-lane group
     uint body = colorList[s + slot];
-
-    if (shape[body].w >= 0.0f) {            // rigid: full path on lane 0
-        if (lane == 0) {
-            primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
-                       props, joints, springs, manifolds, adjStart, adjCount,
-                       adjList, P, shape, tets, soft, membranes, bends, body);
-        }
-        return;
-    }
+    // Rigids stamp cooperatively too: a box resting on high-res cloth
+    // gathers THOUSANDS of contacts (rt corner-tri + particle np) in its
+    // adjacency — serialized on one lane it gated the whole dispatch
+    // (boxoncloth res 90: solve-primal 20.6 ms, 84% of frame).
+    bool rigid = shape[body].w >= 0.0f;     // uniform across the group
 
     PrimalAccum acc;
     acc.lhsLin = m3_zero();
@@ -1231,13 +1227,22 @@ kernel void primal_particles_split(
         }
     }
 
-    // reduce the 3-DOF system across the 8 lanes (consecutive lanes of one
-    // simdgroup): lhsLin rows + rhsLin
+    // reduce across the 8 lanes (consecutive lanes of one simdgroup):
+    // particles need only the linear 3x3, rigids the full 6x6
     for (ushort d = 4; d >= 1; d >>= 1) {
         acc.lhsLin.r0 += simd_shuffle_xor(acc.lhsLin.r0, d);
         acc.lhsLin.r1 += simd_shuffle_xor(acc.lhsLin.r1, d);
         acc.lhsLin.r2 += simd_shuffle_xor(acc.lhsLin.r2, d);
         acc.rhsLin    += simd_shuffle_xor(acc.rhsLin, d);
+        if (rigid) {
+            acc.lhsAng.r0   += simd_shuffle_xor(acc.lhsAng.r0, d);
+            acc.lhsAng.r1   += simd_shuffle_xor(acc.lhsAng.r1, d);
+            acc.lhsAng.r2   += simd_shuffle_xor(acc.lhsAng.r2, d);
+            acc.lhsCross.r0 += simd_shuffle_xor(acc.lhsCross.r0, d);
+            acc.lhsCross.r1 += simd_shuffle_xor(acc.lhsCross.r1, d);
+            acc.lhsCross.r2 += simd_shuffle_xor(acc.lhsCross.r2, d);
+            acc.rhsAng      += simd_shuffle_xor(acc.rhsAng, d);
+        }
     }
     if (lane != 0) return;
 
@@ -1247,16 +1252,29 @@ kernel void primal_particles_split(
     acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(mass / dt2)));
     acc.rhsLin += (pl.xyz - inertLin[body].xyz) * (mass / dt2);
 
-    // direct 3x3 LDL solve (particles carry no angular block)
     float3 dxLin = float3(0), dxAng = float3(0);
-    solve6x6(acc.lhsLin, m3_identity(), m3_zero(),
-             -acc.rhsLin, float3(0), dxLin, dxAng);
-    if (!finite3(dxLin)) return;
+    if (rigid) {
+        float3 moment = props[body].xyz;
+        acc.lhsAng = m3_add(acc.lhsAng, m3_diag(moment / dt2));
+        acc.rhsAng += q_sub(posAng[body], inertAng[body]) * (moment / dt2);
+        solve6x6(acc.lhsLin, acc.lhsAng, acc.lhsCross,
+                 -acc.rhsLin, -acc.rhsAng, dxLin, dxAng);
+        if (!finite3(dxLin) || !finite3(dxAng)) return;
+        float ang2 = dot(dxAng, dxAng);
+        const float maxAng = 0.5f;          // ~29 deg per iteration
+        if (ang2 > maxAng * maxAng) dxAng *= maxAng * rsqrt(ang2);
+    } else {
+        // direct 3x3 LDL solve (particles carry no angular block)
+        solve6x6(acc.lhsLin, m3_identity(), m3_zero(),
+                 -acc.rhsLin, float3(0), dxLin, dxAng);
+        if (!finite3(dxLin)) return;
+    }
 
     float maxLin = 0.35f * fabs(shape[body].w);
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
     posLin[body] = float4(pl.xyz + dxLin, mass);
+    if (rigid) posAng[body] = q_addw(posAng[body], dxAng);
 }
 
 // Tail pass: primal-update every body whose color is >= the CPU-encoded
