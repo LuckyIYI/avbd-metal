@@ -57,14 +57,10 @@ extension Demos {
             // carries the rod tension, the penalty only conditions it.
             s.addSpring(SceneSpring(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
                                     stiffness: 5000, hard: true))
-            s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
-                                  stiffnessLin: 0, stiffnessAng: 0))
         }
         func soft(_ a: Int, _ b: Int, _ k: Float) {
             s.addSpring(SceneSpring(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
                                     stiffness: k))
-            s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
-                                  stiffnessLin: 0, stiffnessAng: 0))
         }
         _ = soft     // membrane elements carry shear + bending now
         for i in 0..<nu {

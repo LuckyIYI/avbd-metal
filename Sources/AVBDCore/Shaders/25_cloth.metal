@@ -133,46 +133,77 @@ kernel void softmap_insert(
 }
 
 // ----------------------------------------------------------------------------
-// Element binning: triangles + edges hashed at their center into the element
-// grid (cell size >= 2x the max element bounding radius, computed at init
-// with stretch headroom — inextensible cloth cannot outgrow it).
+// Element binning: triangles + edges register in EVERY cell their AABB
+// overlaps, at a DETECTION-radius cell size (coarse centroid cells made
+// every query scan most of the sheet at high resolution: ~1000 candidate
+// tests per vertex; AABB multi-cell brings it to ~10-30). Cover loops are
+// clamped to 3x3x3 — the cell size is chosen at init so elements span at
+// most ~2 cells per axis with stretch headroom.
 // ----------------------------------------------------------------------------
+inline void elemBounds(device const float4* posLin,
+                       device const uint4* tris,
+                       device const uint2* edges,
+                       constant SimParams& P, uint gid,
+                       thread float3& lo, thread float3& hi)
+{
+    if (gid < P.numTris) {
+        uint4 t = tris[gid];
+        float3 a = posLin[t.x].xyz, b = posLin[t.y].xyz, c = posLin[t.z].xyz;
+        lo = min(min(a, b), c);
+        hi = max(max(a, b), c);
+    } else {
+        uint2 e = edges[gid - P.numTris];
+        float3 a = posLin[e.x].xyz, b = posLin[e.y].xyz;
+        lo = min(a, b);
+        hi = max(a, b);
+    }
+}
+
 kernel void el_count(
     device const float4* posLin     [[buffer(0)]],
     device const uint4* tris        [[buffer(1)]],
     device const uint2* edges       [[buffer(2)]],
     device atomic_uint* cellCount   [[buffer(3)]],
-    device uint2* elemSlot          [[buffer(4)]],
     constant SimParams& P           [[buffer(5)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint total = P.numTris + P.numEdges;
     if (gid >= total) return;
-    float3 c;
-    if (gid < P.numTris) {
-        uint4 t = tris[gid];
-        c = (posLin[t.x].xyz + posLin[t.y].xyz + posLin[t.z].xyz) / 3.0f;
-    } else {
-        uint2 e = edges[gid - P.numTris];
-        c = (posLin[e.x].xyz + posLin[e.y].xyz) * 0.5f;
+    float3 lo, hi;
+    elemBounds(posLin, tris, edges, P, gid, lo, hi);
+    int3 c0 = cellCoord(lo, P.elemCellSize);
+    int3 c1 = min(cellCoord(hi, P.elemCellSize), c0 + 2);
+    for (int z = c0.z; z <= c1.z; z++)
+    for (int y = c0.y; y <= c1.y; y++)
+    for (int x = c0.x; x <= c1.x; x++) {
+        uint h = cellHash(int3(x, y, z), P.elemHashSize);
+        atomic_fetch_add_explicit(&cellCount[h], 1u, memory_order_relaxed);
     }
-    uint h = cellHash(cellCoord(c, P.elemCellSize), P.elemHashSize);
-    uint slot = atomic_fetch_add_explicit(&cellCount[h], 1u, memory_order_relaxed);
-    elemSlot[gid] = uint2(h, slot);
 }
 
 kernel void el_scatter(
-    device const uint2* elemSlot    [[buffer(0)]],
-    device const uint* cellStart    [[buffer(1)]],
-    device uint* cellElems          [[buffer(2)]],
-    constant SimParams& P           [[buffer(3)]],
+    device const float4* posLin     [[buffer(0)]],
+    device const uint4* tris        [[buffer(1)]],
+    device const uint2* edges       [[buffer(2)]],
+    device atomic_uint* cellCursor  [[buffer(3)]],
+    device uint* cellElems          [[buffer(4)]],
+    constant SimParams& P           [[buffer(5)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint total = P.numTris + P.numEdges;
     if (gid >= total) return;
-    uint2 cs = elemSlot[gid];
+    float3 lo, hi;
+    elemBounds(posLin, tris, edges, P, gid, lo, hi);
     uint entry = gid < P.numTris ? gid : (ELEM_EDGE_BIT | (gid - P.numTris));
-    cellElems[cellStart[cs.x] + cs.y] = entry;
+    int3 c0 = cellCoord(lo, P.elemCellSize);
+    int3 c1 = min(cellCoord(hi, P.elemCellSize), c0 + 2);
+    for (int z = c0.z; z <= c1.z; z++)
+    for (int y = c0.y; y <= c1.y; y++)
+    for (int x = c0.x; x <= c1.x; x++) {
+        uint h = cellHash(int3(x, y, z), P.elemHashSize);
+        uint slot = atomic_fetch_add_explicit(&cellCursor[h], 1u, memory_order_relaxed);
+        cellElems[slot] = entry;
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -289,6 +320,7 @@ kernel void vt_emit(
     int3 cc = cellCoord(pv, P.elemCellSize);
     // one thread owns each vertex: the cap is thread-local
     uint emitted = 0;
+    uint seen[VT_MAX_PER_VERTEX] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
 
     for (int dz = -1; dz <= 1 && emitted < VT_MAX_PER_VERTEX; dz++)
     for (int dy = -1; dy <= 1 && emitted < VT_MAX_PER_VERTEX; dy++)
@@ -299,6 +331,9 @@ kernel void vt_emit(
             uint entry = cellElems[k];
             if (entry & ELEM_EDGE_BIT) continue;
             uint t = entry;
+            // AABB multi-cell: the same triangle appears in several scanned
+            // cells — skip already-emitted ones
+            if (seen[0] == t || seen[1] == t || seen[2] == t || seen[3] == t) continue;
             uint4 tid = tris[t];
             if (tid.x == v || tid.y == v || tid.z == v) continue;
 
@@ -317,7 +352,7 @@ kernel void vt_emit(
             float hSum = rv + rt;
             float3 velT = (velLin[tid.x].xyz + velLin[tid.y].xyz + velLin[tid.z].xyz) / 3.0f;
             float inflate = min(length(velV - velT) * P.dt, 0.3f * P.elemCellSize);
-            float detect = hSum + COLLISION_MARGIN + inflate;
+            float detect = hSum + P.elemMargin + inflate;
             if (dist2 > detect * detect) continue;
             if (nbrContains(nbrList, ns, ne, tid.x) ||
                 nbrContains(nbrList, ns, ne, tid.y) ||
@@ -367,9 +402,10 @@ kernel void vt_emit(
                      uint4(v, tid.x, tid.y, tid.z),
                      float4(1.0f, -bary.x, -bary.y, -bary.z),
                      n, friction, float3(0),
-                     g - hSum + COLLISION_MARGIN,
+                     g - hSum + P.elemMargin,
                      softLambdaCap(P, minMass), minMass,
                      SC_VT, false, false, sMem < 0.0f, keyA, keyB);
+            seen[emitted] = t;
             emitted++;
         }
     }
@@ -430,6 +466,7 @@ kernel void ee_emit(
 
     int3 cc = cellCoord(mid, P.elemCellSize);
     uint emitted = 0;
+    uint seen[EE_MAX_PER_EDGE] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
     for (int dz = -1; dz <= 1 && emitted < EE_MAX_PER_EDGE; dz++)
     for (int dy = -1; dy <= 1 && emitted < EE_MAX_PER_EDGE; dy++)
     for (int dx = -1; dx <= 1 && emitted < EE_MAX_PER_EDGE; dx++) {
@@ -440,6 +477,7 @@ kernel void ee_emit(
             if (!(entry & ELEM_EDGE_BIT)) continue;
             uint eBi = entry & ~ELEM_EDGE_BIT;
             if (eBi <= gid) continue;               // each pair once
+            if (seen[0] == eBi || seen[1] == eBi || seen[2] == eBi || seen[3] == eBi) continue;
             uint2 eB = edges[eBi];
             if (eB.x == eA.x || eB.x == eA.y || eB.y == eA.x || eB.y == eA.y) continue;
 
@@ -459,7 +497,7 @@ kernel void ee_emit(
             float hSum = rA + rB;
             float3 velB = (velLin[eB.x].xyz + velLin[eB.y].xyz) * 0.5f;
             float inflate = min(length(velA - velB) * P.dt, 0.3f * P.elemCellSize);
-            if (dist - hSum > COLLISION_MARGIN + inflate) continue;
+            if (dist - hSum > P.elemMargin + inflate) continue;
             if (dist < 1e-7f) continue;             // degenerate: let V-T handle
             if (nbrContains(nbrList, nsx, nex, eB.x) ||
                 nbrContains(nbrList, nsx, nex, eB.y) ||
@@ -498,9 +536,10 @@ kernel void ee_emit(
                      uint4(eA.x, eA.y, eB.x, eB.y),
                      float4(1.0f - s, s, -(1.0f - t), -t),
                      n, fric, float3(0),
-                     g - hSum + COLLISION_MARGIN,
+                     g - hSum + P.elemMargin,
                      softLambdaCap(P, minMass), minMass,
                      SC_EE, false, false, false, keyA, keyB);
+            seen[emitted] = eBi;
             emitted++;
         }
     }
@@ -611,7 +650,15 @@ kernel void rt_emit(
     #define RT_TEST_BODY(o)                                                    \
     {                                                                          \
         float rb = fabs(shape[o].w);                                           \
-        if (distance(posLin[o].xyz, m) <= rT + rb + COLLISION_MARGIN) {        \
+        /* surface-distance gate: center-distance is meaningless for huge   */\
+        /* statics (the ground passes always and pays 8 corner tests/tri)   */\
+        bool nearO = distance(posLin[o].xyz, m) <= rT + rb + COLLISION_MARGIN; \
+        if (nearO && (shapeType[o] & SHAPE_KIND_MASK) == 0u) {                 \
+            float3 lm = q_rotate(q_conj(posAng[o]), m - posLin[o].xyz);        \
+            float3 dq2 = max(fabs(lm) - shape[o].xyz * 0.5f, 0.0f);            \
+            nearO = length(dq2) <= rT + COLLISION_MARGIN + 0.05f;              \
+        }                                                                      \
+        if (nearO) {                                                           \
             bool excl = pairExcluded(exclusions, numExclusions,                \
                                      min(o, tid.x), max(o, tid.x))             \
                      || pairExcluded(exclusions, numExclusions,                \
@@ -630,7 +677,7 @@ kernel void rt_emit(
                     float hSum = rt_ + feats[fi].radius;                       \
                     float inflate = min(length(velLin[o].xyz - velT) * P.dt,   \
                                         0.5f * rT);                            \
-                    if (dist - hSum > COLLISION_MARGIN + inflate) continue;    \
+                    if (dist - hSum > P.elemMargin + inflate) continue;        \
                     float side = dot(d, triN) >= 0.0f ? 1.0f : -1.0f;          \
                     uint keyA = (SC_RT << 28) | o;                             \
                     uint keyB = gid * 16u + feats[fi].id;                      \
@@ -663,7 +710,7 @@ kernel void rt_emit(
                              uint4(o, tid.x, tid.y, tid.z),                    \
                              float4(1.0f, -bary.x, -bary.y, -bary.z),          \
                              n, friction, anchor,                              \
-                             g - hSum + COLLISION_MARGIN,                      \
+                             g - hSum + P.elemMargin,                          \
                              softLambdaCap(P, minMass), minMass,               \
                              SC_RT, true, roundA, sMem < 0.0f, keyA, keyB);    \
                     emitted++;                                                 \

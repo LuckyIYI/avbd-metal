@@ -65,6 +65,9 @@ kernel void adj_count(
     uint a = WORLD_BODY, b = WORLD_BODY;
     if (gid < P.numJoints) {
         if (joints[gid].header.z != 0) return;  // broken
+        // inert (exclusion-only / inactive drag slots): nothing to stamp
+        if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
+            && joints[gid].motor.w == 0.0f) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
     } else if (gid < P.numJoints + P.numSprings) {
@@ -162,6 +165,8 @@ kernel void adj_scatter(
     uint entry = 0;
     if (gid < P.numJoints) {
         if (joints[gid].header.z != 0) return;
+        if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
+            && joints[gid].motor.w == 0.0f) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
         entry = (FK_JOINT << ADJ_KIND_SHIFT) | gid;

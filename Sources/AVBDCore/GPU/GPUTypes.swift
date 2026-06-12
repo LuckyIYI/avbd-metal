@@ -40,6 +40,8 @@ public struct SimParamsGPU {
     public var rodDecayPow: Float = 0
     public var particleDamping: Float = 0
     public var numHashedRigid: UInt32 = 0
+    public var elemMargin: Float = 0.01
+    public var numSoftGroups: UInt32 = 0
 }
 
 extension SimParamsGPU: Equatable {}

@@ -254,6 +254,11 @@ struct SimParams {
     // viscosity of thin sheets — the reference cloth ships the same knob).
     float particleDamping;
     uint numHashedRigid;    // hashed non-particle bodies (rt scan skip)
+    // Element-contact detection margin: COLLISION_MARGIN is a rigid-world
+    // constant (1 cm) that exceeds the cloth skin itself at high resolution
+    // — every detection radius and grid cell would bloat with it.
+    float elemMargin;
+    uint numSoftGroups;     // distinct soft-surface components
 };
 
 struct JointGPU {

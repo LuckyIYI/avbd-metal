@@ -77,6 +77,7 @@ public final class GPUSolver {
     // for smooth normals, and the per-body surfaced flag.
     var surfTriBuf, surfVertsBuf, surfVtStart, surfVtCount, surfVtList: MTLBuffer
     var surfacedFlags, softNormalsBuf, faceNormalsBuf, renderTriBuf: MTLBuffer
+    var clothGroupBuf: MTLBuffer
     public private(set) var surfaceTriCount: Int = 0
     public private(set) var renderTriCount: Int = 0
     var surfVertCount: Int = 0
@@ -191,8 +192,10 @@ public final class GPUSolver {
         nbrList = try makeBuf(max(1, numTris * 6) * 4, "nbrList")
         elemCellCount = try makeBuf(elemHashSize * 4, "elemCellCount")
         elemCellStart = try makeBuf(elemHashSize * 4, "elemCellStart")
-        elemCells = try makeBuf((numTris + maxEdges + 1) * 4, "elemCells")
-        elemSlot = try makeBuf((numTris + maxEdges + 1) * 8, "elemSlot")
+        // AABB multi-cell: cover loops are clamped to 3x3x3 per element,
+        // so 27x capacity makes overflow impossible
+        elemCells = try makeBuf(max(1, 27 * (numTris + maxEdges)) * 4, "elemCells")
+        elemSlot = try makeBuf(elemHashSize * 4, "elemCursor")
         softContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "softContacts")
         prevSoftContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "prevSoftContacts")
         softMapKeyA = try makeBuf(softMapCapacity * 4, "softMapKeyA")
@@ -213,6 +216,7 @@ public final class GPUSolver {
         softNormalsBuf = try makeBuf(nb * 16, "softNormals")
         faceNormalsBuf = try makeBuf(max(1, maxSurfTris) * 16, "faceNormals")
         renderTriBuf = try makeBuf(max(1, 8 * numTris + 4 * numTets) * 12, "renderTris")
+        clothGroupBuf = try makeBuf(nb * 4, "clothGroup")
 
         degrees = try makeBuf(nb * 4, "degrees")
         adjStart = try makeBuf(nb * 4, "adjStart")
@@ -666,8 +670,21 @@ public final class GPUSolver {
         params.numMembranes = UInt32(mems.count)
         params.numBends = UInt32(bendEls.count)
 
-        // element grid cell size: 2x max element radius with stretch headroom
-        params.elemCellSize = max(0.2, 2 * maxElemR * 1.5)
+        // Element-contact margin scales with the cloth skin (the rigid
+        // 1 cm margin exceeds 2r at high resolution and bloats detection)
+        var maxPartR: Float = 0
+        var edgeLenSum: Float = 0
+        for key in sortedEdges {
+            let a = scene.bodies[Int(key >> 32)], b = scene.bodies[Int(key & 0xFFFFFFFF)]
+            maxPartR = max(maxPartR, max(a.size.x, b.size.x) / 2)
+            edgeLenSum += distance(a.position, b.position)
+        }
+        let meanEdge = numEdges > 0 ? edgeLenSum / Float(numEdges) : 0.2
+        params.elemMargin = min(0.01, max(0.002, 0.5 * maxPartR))
+        // Detection-radius cells (AABB multi-cell insertion): reach must
+        // cover skin + margin + velocity inflation (<= 0.3 cell, hence /0.7)
+        let reach = (2 * maxPartR + params.elemMargin) / 0.7
+        params.elemCellSize = max(0.02, max(reach, meanEdge * 1.05))
         params.elemHashSize = UInt32(elemHashSize)
         params.numTris = UInt32(numTris)
         params.numEdges = UInt32(numEdges)
@@ -729,8 +746,12 @@ public final class GPUSolver {
                 parent[find(tv[2])] = r
             }
             var compIdx: [Int: Int] = [:]
+            defer { params.numSoftGroups = UInt32(compIdx.count) }
             var incidence: [Int: [Int]] = [:]   // body -> surface tri indices
             var triComp: [UInt32] = []
+            let groupP = clothGroupBuf.contents().bindMemory(to: UInt32.self,
+                                                             capacity: numBodies)
+            for i in 0..<numBodies { groupP[i] = 0 }
             for (ti, tv) in triVerts.enumerated() {
                 let root = find(tv[0])
                 if compIdx[root] == nil { compIdx[root] = compIdx.count }
@@ -739,6 +760,8 @@ public final class GPUSolver {
                 for v in tv {
                     surfCorners.append(UInt32(v) | (comp << 24))
                     incidence[v, default: []].append(ti)
+                    groupP[v] = comp + 1      // same-surface V-V is handled
+                                              // by V-T/E-E, never spheres
                 }
             }
             surfTriBuf.contents().bindMemory(to: UInt32.self, capacity: surfCorners.count)
@@ -811,6 +834,7 @@ public final class GPUSolver {
                 .update(from: list.isEmpty ? [0] : list, count: max(1, list.count))
         } else {
             memset(surfacedFlags.contents(), 0, surfacedFlags.length)
+            memset(clothGroupBuf.contents(), 0, clothGroupBuf.length)
         }
         memset(softNormalsBuf.contents(), 0, softNormalsBuf.length)
 
@@ -938,6 +962,7 @@ public final class GPUSolver {
         params.iterations = UInt32(settings.iterations)
         params.rodDecayPow = settings.rodDecayPow
         params.particleDamping = settings.particleDamping
+
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
            let v = Float(env) {
             params.rodDecayPow = v
@@ -1332,6 +1357,7 @@ public final class GPUSolver {
         var nExcl = numExclusions
 
         // Broadphase
+        if profiling { stage("bp-count") }
         dispatch1D(enc, "bp_count", Int(P.numHashed)) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.hashedIdx, offset: 0, index: 1)
@@ -1339,7 +1365,9 @@ public final class GPUSolver {
             e.setBuffer(self.bodyCellSlot, offset: 0, index: 3)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
         }
+        if profiling { stage("bp-scan") }
         encodeScan(enc, input: cellCount, output: cellStart, count: gridHashSize)
+        if profiling { stage("bp-scatter") }
         dispatch1D(enc, "bp_scatter", Int(P.numHashed)) { e in
             e.setBuffer(self.hashedIdx, offset: 0, index: 0)
             e.setBuffer(self.bodyCellSlot, offset: 0, index: 1)
@@ -1347,6 +1375,7 @@ public final class GPUSolver {
             e.setBuffer(self.cellBodies, offset: 0, index: 3)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
         }
+        if profiling { stage("bp-pairs") }
         dispatch1D(enc, "bp_gen_pairs", Int(P.numHashed)) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.shape, offset: 0, index: 1)
@@ -1360,6 +1389,7 @@ public final class GPUSolver {
             e.setBuffer(self.counters, offset: 0, index: 9)
             e.setBuffer(self.pairs, offset: 0, index: 10)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
+            e.setBuffer(self.clothGroupBuf, offset: 0, index: 12)
         }
         dispatch1D(enc, "bp_gen_global_pairs", Int(P.numGlobals)) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -1370,6 +1400,7 @@ public final class GPUSolver {
             e.setBuffer(self.counters, offset: 0, index: 5)
             e.setBuffer(self.pairs, offset: 0, index: 6)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
+            e.setBuffer(self.clothGroupBuf, offset: 0, index: 8)
         }
         dispatch1D(enc, "bp_finalize_pairs", 1) { e in
             e.setBuffer(self.counters, offset: 0, index: 0)
@@ -1423,15 +1454,22 @@ public final class GPUSolver {
                 e.setBuffer(self.trisBuf, offset: 0, index: 1)
                 e.setBuffer(self.edgesBuf, offset: 0, index: 2)
                 e.setBuffer(self.elemCellCount, offset: 0, index: 3)
-                e.setBuffer(self.elemSlot, offset: 0, index: 4)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
             }
             encodeScan(enc, input: elemCellCount, output: elemCellStart, count: elemHashSize)
+            var ehs = UInt32(elemHashSize)
+            dispatch1D(enc, "adj_copy_cursor", elemHashSize) { e in
+                e.setBuffer(self.elemCellStart, offset: 0, index: 0)
+                e.setBuffer(self.elemSlot, offset: 0, index: 1)
+                e.setBytes(&ehs, length: 4, index: 2)
+            }
             dispatch1D(enc, "el_scatter", numTris + Int(P.numEdges)) { e in
-                e.setBuffer(self.elemSlot, offset: 0, index: 0)
-                e.setBuffer(self.elemCellStart, offset: 0, index: 1)
-                e.setBuffer(self.elemCells, offset: 0, index: 2)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 3)
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.trisBuf, offset: 0, index: 1)
+                e.setBuffer(self.edgesBuf, offset: 0, index: 2)
+                e.setBuffer(self.elemSlot, offset: 0, index: 3)
+                e.setBuffer(self.elemCells, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
             }
             stage("vt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
@@ -1782,8 +1820,9 @@ public final class GPUSolver {
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
             }
             // tail: bodies in colors >= colorBound (the async bound can be
-            // stale; skipped bodies would fly ballistic — see kernel comment)
-            do {
+            // stale; skipped bodies would fly ballistic — see kernel
+            // comment). Static palettes are exact: no tail needed.
+            if usesDynamicColoring {
                 let p = ps("primal_tail")
                 enc.setComputePipelineState(p)
                 var cb = UInt32(colorBound)

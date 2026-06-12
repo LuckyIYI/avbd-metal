@@ -41,10 +41,10 @@ extension Demos {
             // right: lambda carries the rod tension exactly; letting the
             // penalty ramp toward 1e6 on gram nodes reproduces the stiff-
             // spring overshoot explosion the duals exist to avoid.
+            // (No exclusion joints: intra-surface sphere pairs are dropped
+            // wholesale at the broadphase — elements own self-collision.)
             s.addSpring(SceneSpring(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
                                     stiffness: hard ? (rodPen ?? k) : k, hard: hard))
-            s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
-                                  stiffnessLin: 0, stiffnessAng: 0))
         }
         for i in 0..<nu {
             for j in 0..<nv {

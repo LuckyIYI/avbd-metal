@@ -14,8 +14,15 @@ inline int3 cellCoord(float3 p, float cellSize) {
 }
 
 inline uint cellHash(int3 c, uint hashSize) {
-    // Large-prime XOR hash (same family as metal-refs SpatialHashing)
+    // Large-prime XOR plus avalanche finishing. The bare XOR-of-products,
+    // masked to a small table, aliases SYSTEMATICALLY on regular lattices
+    // (cloth grids): whole families of distant cells share buckets and a
+    // 27-cell scan wades through 50x the bodies it should (measured 9.3 ms
+    // of a 20k-vertex frame). The mix breaks the structure.
     uint h = uint(c.x * 92837111) ^ uint(c.y * 689287499) ^ uint(c.z * 283923481);
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
     return h & (hashSize - 1u);
 }
 
@@ -88,6 +95,7 @@ kernel void bp_gen_pairs(
     device atomic_uint* counters    [[buffer(9)]],
     device uint2* pairs             [[buffer(10)]],
     constant SimParams& P           [[buffer(11)]],
+    device const uint* clothGroup   [[buffer(12)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numHashed) return;
@@ -95,9 +103,15 @@ kernel void bp_gen_pairs(
     float3 pa = posLin[a].xyz;
     float ra = fabs(shape[a].w);
     bool aDyn = posLin[a].w > 0.0f;
+    uint ga = clothGroup[a];
 
-    // 27 neighbor cells
+    // Soft-surface particles in a single-group scene with no hashed rigid
+    // bodies have NO legal sphere-pair partners (same-group is banned, the
+    // ground/oversized bodies are globals): the whole cell scan computes
+    // nothing — skip it by construction.
+    bool scanCells = !(ga != 0 && P.numSoftGroups <= 1 && P.numHashedRigid == 0);
     int3 cc = cellCoord(pa, P.cellSize);
+    if (scanCells) {
     for (int dz = -1; dz <= 1; dz++)
     for (int dy = -1; dy <= 1; dy++)
     for (int dx = -1; dx <= 1; dx++) {
@@ -107,6 +121,9 @@ kernel void bp_gen_pairs(
             uint b = cellBodies[k];
             if (b <= a) continue;   // each pair once
             if (!aDyn && posLin[b].w <= 0.0f) continue;
+            // same soft surface: V-T/E-E elements own self-collision;
+            // sphere pairs would only re-shoulder it at O(n^2) in piles
+            if (ga != 0 && clothGroup[b] == ga) continue;
             float rb = fabs(shape[b].w);
             float3 dp = pa - posLin[b].xyz;
             float r = ra + rb;
@@ -117,10 +134,12 @@ kernel void bp_gen_pairs(
         }
     }
 
+    }
     // Globals (statics / oversized)
     for (uint g = 0; g < P.numGlobals; g++) {
         uint b = globalIdx[g];
         if (!aDyn && posLin[b].w <= 0.0f) continue;
+        if (ga != 0 && clothGroup[b] == ga) continue;
         float rb = fabs(shape[b].w);
         float3 dp = pa - posLin[b].xyz;
         float r = ra + rb;
@@ -142,6 +161,7 @@ kernel void bp_gen_global_pairs(
     device atomic_uint* counters    [[buffer(5)]],
     device uint2* pairs             [[buffer(6)]],
     constant SimParams& P           [[buffer(7)]],
+    device const uint* clothGroup   [[buffer(8)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numGlobals) return;
@@ -154,6 +174,8 @@ kernel void bp_gen_global_pairs(
     for (uint g = gid + 1; g < P.numGlobals; g++) {
         uint b = globalIdx[g];
         if (!aDyn && posLin[b].w <= 0.0f) continue;
+        uint ga2 = clothGroup[a];
+        if (ga2 != 0 && clothGroup[b] == ga2) continue;
         float rb = fabs(shape[b].w);
         float3 dp = pa - posLin[b].xyz;
         float r = ra + rb;
