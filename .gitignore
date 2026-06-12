@@ -1,8 +1,6 @@
 refs/
 .build/
-.DS_Store
-node_modules/
-metal-refs/
-prototype2d/
 .xcbuild/
 runs/
+.DS_Store
+node_modules/
