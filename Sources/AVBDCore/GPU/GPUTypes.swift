@@ -42,6 +42,7 @@ public struct SimParamsGPU {
     public var numHashedRigid: UInt32 = 0
     public var elemMargin: Float = 0.01
     public var numSoftGroups: UInt32 = 0
+    public var frame: UInt32 = 0
 }
 
 extension SimParamsGPU: Equatable {}

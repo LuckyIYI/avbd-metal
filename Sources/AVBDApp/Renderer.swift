@@ -700,6 +700,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     var target = F3(0, 0, 3)
     var viewportSize = SIMD2<Float>(1, 1)
     private var framesDrawn = 0
+    private var lastSolverID: ObjectIdentifier?
+    private var envCameraSet = false
 
     init(device: MTLDevice, model: AnyObject & RenderableModel) throws {
         self.device = device
@@ -708,10 +710,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         super.init()
         // scripted-capture camera overrides
         let env = ProcessInfo.processInfo.environment
-        if let v = env["AVBD_CAM_DIST"].flatMap(Float.init) { distance = v }
-        if let v = env["AVBD_CAM_AZ"].flatMap(Float.init) { azimuth = v }
-        if let v = env["AVBD_CAM_EL"].flatMap(Float.init) { elevation = v }
-        if let v = env["AVBD_CAM_TZ"].flatMap(Float.init) { target.z = v }
+        if let v = env["AVBD_CAM_DIST"].flatMap(Float.init) { distance = v; envCameraSet = true }
+        if let v = env["AVBD_CAM_AZ"].flatMap(Float.init) { azimuth = v; envCameraSet = true }
+        if let v = env["AVBD_CAM_EL"].flatMap(Float.init) { elevation = v; envCameraSet = true }
+        if let v = env["AVBD_CAM_TZ"].flatMap(Float.init) { target.z = v; envCameraSet = true }
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
         func pipe(_ v: String, _ f: String, samples: Int = Renderer.sampleCount,
@@ -845,6 +847,21 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         model.tickIfRunning()
         ensureTargets(view.drawableSize)
+
+        // Per-scene default framing (small cloth rigs drown at the rigid-rig
+        // default distance). Applied on scene swap; explicit AVBD_CAM_* env
+        // overrides outrank it.
+        if lastSolverID != ObjectIdentifier(solver) {
+            lastSolverID = ObjectIdentifier(solver)
+            if !envCameraSet {
+                distance = solver.settings.cameraDistance > 0
+                    ? solver.settings.cameraDistance : 30
+                target.z = solver.settings.cameraTargetZ != 0
+                    ? solver.settings.cameraTargetZ : 3
+                target.x = 0
+                target.y = 0
+            }
+        }
 
         let count = solver.bodyCount
         let stride = MemoryLayout<simd_float4x4>.stride + 32

@@ -259,6 +259,7 @@ struct SimParams {
     // — every detection radius and grid cell would bloat with it.
     float elemMargin;
     uint numSoftGroups;     // distinct soft-surface components
+    uint frame;             // frame counter (tracker reseed staggering)
 };
 
 struct JointGPU {

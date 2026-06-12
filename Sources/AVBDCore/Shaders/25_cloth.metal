@@ -284,9 +284,34 @@ inline float softPrevSide(device const SoftContactGPU* prevSoft,
 }
 
 // ----------------------------------------------------------------------------
-// V-T: one thread per particle, scanning the element grid for triangles.
-// Exclusion is topological: own triangles and triangles touching the 1-ring.
+// V-T with VORONOI TEMPORAL TRACKING: each particle keeps its 4 closest
+// triangles across frames. Per frame it re-evaluates a small candidate
+// pool — the tracked set, the triangle-adjacency of the best, and the
+// mesh-neighbors' best — and only consults the grid on staggered reseeds
+// (1/8 of vertices per frame) or fast approaches. Folds move slowly per
+// frame; propagation through topology discovers approaching surfaces the
+// way the reference tracker does, at a fraction of a full grid scan.
 // ----------------------------------------------------------------------------
+struct Best4 {
+    uint id[4];
+    float d2[4];
+};
+
+inline void best4Init(thread Best4& b) {
+    for (int i = 0; i < 4; i++) { b.id[i] = 0xFFFFFFFFu; b.d2[i] = FLT_MAX; }
+}
+
+inline bool best4Has(thread const Best4& b, uint t) {
+    return b.id[0] == t || b.id[1] == t || b.id[2] == t || b.id[3] == t;
+}
+
+inline void best4Insert(thread Best4& b, uint t, float d2) {
+    if (d2 >= b.d2[3]) return;
+    int i = 3;
+    for (; i > 0 && b.d2[i - 1] > d2; i--) { b.id[i] = b.id[i - 1]; b.d2[i] = b.d2[i - 1]; }
+    b.id[i] = t; b.d2[i] = d2;
+}
+
 kernel void vt_emit(
     device const float4* posLin     [[buffer(0)]],
     device const float4* shape      [[buffer(1)]],
@@ -307,6 +332,8 @@ kernel void vt_emit(
     device const uint* mapKeyB      [[buffer(16)]],
     device const uint* mapVal       [[buffer(17)]],
     constant SimParams& P           [[buffer(18)]],
+    device uint4* vtTrack           [[buffer(19)]],
+    device const uint4* triAdj      [[buffer(20)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numParticles) return;
@@ -317,104 +344,152 @@ kernel void vt_emit(
     float3 velV = velLin[v].xyz;
     uint ns = nbrStart[v], ne = ns + nbrCount[v];
 
-    int3 cc = cellCoord(pv, P.elemCellSize);
-    // one thread owns each vertex: the cap is thread-local
-    uint emitted = 0;
-    uint seen[VT_MAX_PER_VERTEX] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    Best4 best;
+    best4Init(best);
 
-    for (int dz = -1; dz <= 1 && emitted < VT_MAX_PER_VERTEX; dz++)
-    for (int dy = -1; dy <= 1 && emitted < VT_MAX_PER_VERTEX; dy++)
-    for (int dx = -1; dx <= 1 && emitted < VT_MAX_PER_VERTEX; dx++) {
-        uint h = cellHash(cc + int3(dx, dy, dz), P.elemHashSize);
-        uint s = elemCellStart[h], e = s + elemCellCount[h];
-        for (uint k = s; k < e && emitted < VT_MAX_PER_VERTEX; k++) {
-            uint entry = cellElems[k];
-            if (entry & ELEM_EDGE_BIT) continue;
-            uint t = entry;
-            // AABB multi-cell: the same triangle appears in several scanned
-            // cells — skip already-emitted ones
-            if (seen[0] == t || seen[1] == t || seen[2] == t || seen[3] == t) continue;
-            uint4 tid = tris[t];
-            if (tid.x == v || tid.y == v || tid.z == v) continue;
+    // candidate evaluation: closest-point distance, with topological
+    // exclusion (own / 1-ring triangles never count)
+    #define VT_CONSIDER(T)                                                     \
+    {                                                                          \
+        uint t_ = (T);                                                         \
+        if (t_ < P.numTris && !best4Has(best, t_)) {                           \
+            uint4 tid_ = tris[t_];                                             \
+            if (tid_.x != v && tid_.y != v && tid_.z != v) {                   \
+                float3 ba_;                                                    \
+                float3 q_ = closestPtTriangle(pv, posLin[tid_.x].xyz,          \
+                                              posLin[tid_.y].xyz,              \
+                                              posLin[tid_.z].xyz, ba_);        \
+                float d2_ = distance_squared(pv, q_);                          \
+                if (d2_ < best.d2[3]                                           \
+                    && !nbrContains(nbrList, ns, ne, tid_.x)                   \
+                    && !nbrContains(nbrList, ns, ne, tid_.y)                   \
+                    && !nbrContains(nbrList, ns, ne, tid_.z)) {                \
+                    best4Insert(best, t_, d2_);                                \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }
 
-            // geometry cull FIRST: most candidates are far away, and the
-            // topological exclusion costs three binary searches
-            float3 a = posLin[tid.x].xyz;
-            float3 b = posLin[tid.y].xyz;
-            float3 c = posLin[tid.z].xyz;
-            float3 bary;
-            float3 q = closestPtTriangle(pv, a, b, c, bary);
-            float3 d = pv - q;
-            float dist2 = dot(d, d);
+    uint4 tracked = vtTrack[v];
+    for (int i = 0; i < 4; i++) VT_CONSIDER(tracked[i])
+    if (tracked.x < P.numTris) {
+        uint4 adj = triAdj[tracked.x];
+        for (int i = 0; i < 3; i++) VT_CONSIDER(adj[i])
+    }
+    // propagate from mesh neighbors' best tracked
+    for (uint k = ns; k < ne && k < ns + 8; k++) {
+        VT_CONSIDER(vtTrack[nbrList[k]].x)
+    }
 
-            float rt = max(fabs(shape[tid.x].w),
-                           max(fabs(shape[tid.y].w), fabs(shape[tid.z].w)));
-            float hSum = rv + rt;
-            float3 velT = (velLin[tid.x].xyz + velLin[tid.y].xyz + velLin[tid.z].xyz) / 3.0f;
-            float inflate = min(length(velV - velT) * P.dt, 0.3f * P.elemCellSize);
-            float detect = hSum + P.elemMargin + inflate;
-            if (dist2 > detect * detect) continue;
-            if (nbrContains(nbrList, ns, ne, tid.x) ||
-                nbrContains(nbrList, ns, ne, tid.y) ||
-                nbrContains(nbrList, ns, ne, tid.z)) continue;
-
-            float dist = sqrt(dist2);
-            float3 triN = cross(b - a, c - a);
-            float tnLen = length(triN);
-            if (tnLen < 1e-12f) continue;
-            triN /= tnLen;
-
-            float side = dot(d, triN) >= 0.0f ? 1.0f : -1.0f;
-            uint keyA = (SC_VT << 28) | v;
-            uint keyB = t;
-            // Sign memory only when the closest point is INTERIOR: crossing
-            // the plane through the face is tunneling (eject back), but
-            // sliding laterally around an edge is legitimate — pinning it
-            // to the old side snags the cloth on curved surfaces.
-            bool interior = bary.x > 0.02f && bary.y > 0.02f && bary.z > 0.02f;
-            float sMem = interior
-                ? softPrevSide(prevSoft, mapKeyA, mapKeyB, mapVal, P, keyA, keyB, side)
-                : side;
-            float3 n;
-            float g;
-            if (dist > 1e-7f && side == sMem) {
-                n = d / dist;
-                g = dist;
-            } else {
-                // crossed the plane while persistent: eject back to the
-                // remembered side
-                n = sMem * triN;
-                g = -dist;
+    // Staggered grid reseed. Distance triggers don't work here: on a flat
+    // sheet the 2-ring sits ~2 edge-lengths away, so "something is always
+    // close" and any d2 heuristic degenerates to a full scan every frame.
+    // Absolute speed doesn't either: a sheet in freefall is fast but
+    // carries its own element density with it (every scan is dense), with
+    // zero collision risk. The rescan PERIOD scales with velocity RELATIVE
+    // to the tracked best — freefall tracks its own 2-ring moving along
+    // (1/8 rate), while impacts and layer approaches create local relative
+    // motion exactly where fast rescans (1/2 rate) are needed.
+    // Propagation + persistence carry the manifold between scans.
+    float3 relV = velV;
+    if (best.id[0] < P.numTris) {
+        uint4 bt = tris[best.id[0]];
+        relV -= (velLin[bt.x].xyz + velLin[bt.y].xyz + velLin[bt.z].xyz) / 3.0f;
+    }
+    float vThresh = 0.25f * P.elemCellSize / max(P.dt, 1e-6f);
+    uint period = dot(relV, relV) > vThresh * vThresh ? 1u : 7u;
+    bool reseed = ((v + P.frame) & period) == 0u
+               || best.id[0] == 0xFFFFFFFFu;
+    if (reseed) {
+        int3 cc = cellCoord(pv, P.elemCellSize);
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            uint h = cellHash(cc + int3(dx, dy, dz), P.elemHashSize);
+            uint cs = elemCellStart[h], ce = cs + elemCellCount[h];
+            for (uint k = cs; k < ce; k++) {
+                uint entry = cellElems[k];
+                if (entry & ELEM_EDGE_BIT) continue;
+                VT_CONSIDER(entry)
             }
-
-            float fricT = (props[tid.x].w * bary.x + props[tid.y].w * bary.y
-                           + props[tid.z].w * bary.z);
-            float friction = sqrt(max(props[v].w * fricT, 0.0f));
-
-            float minMass = massV > 0.0f ? massV : FLT_MAX;
-            float mA = posLin[tid.x].w, mB = posLin[tid.y].w, mC = posLin[tid.z].w;
-            if (mA > 0.0f) minMass = min(minMass, mA);
-            if (mB > 0.0f) minMass = min(minMass, mB);
-            if (mC > 0.0f) minMass = min(minMass, mC);
-            if (minMass == FLT_MAX) continue;       // all static: inert
-
-            softEmit(soft, counters, prevSoft, mapKeyA, mapKeyB, mapVal, P,
-                     uint4(v, tid.x, tid.y, tid.z),
-                     float4(1.0f, -bary.x, -bary.y, -bary.z),
-                     n, friction, float3(0),
-                     g - hSum + P.elemMargin,
-                     softLambdaCap(P, minMass), minMass,
-                     SC_VT, false, false, sMem < 0.0f, keyA, keyB);
-            seen[emitted] = t;
-            emitted++;
         }
+    }
+    vtTrack[v] = uint4(best.id[0], best.id[1], best.id[2], best.id[3]);
+    #undef VT_CONSIDER
+
+    // emit contacts from the tracked set
+    for (int bi = 0; bi < 4; bi++) {
+        uint t = best.id[bi];
+        if (t >= P.numTris) break;
+        uint4 tid = tris[t];
+        float3 a = posLin[tid.x].xyz;
+        float3 b = posLin[tid.y].xyz;
+        float3 c = posLin[tid.z].xyz;
+        float3 bary;
+        float3 q = closestPtTriangle(pv, a, b, c, bary);
+        float3 d = pv - q;
+        float dist2 = dot(d, d);
+
+        float rt = max(fabs(shape[tid.x].w),
+                       max(fabs(shape[tid.y].w), fabs(shape[tid.z].w)));
+        float hSum = rv + rt;
+        float3 velT = (velLin[tid.x].xyz + velLin[tid.y].xyz + velLin[tid.z].xyz) / 3.0f;
+        float inflate = min(length(velV - velT) * P.dt, 0.3f * P.elemCellSize);
+        float detect = hSum + P.elemMargin + inflate;
+        if (dist2 > detect * detect) continue;
+
+        float dist = sqrt(dist2);
+        float3 triN = cross(b - a, c - a);
+        float tnLen = length(triN);
+        if (tnLen < 1e-12f) continue;
+        triN /= tnLen;
+
+        float side = dot(d, triN) >= 0.0f ? 1.0f : -1.0f;
+        uint keyA = (SC_VT << 28) | v;
+        uint keyB = t;
+        // Sign memory only when the closest point is INTERIOR: crossing
+        // the plane through the face is tunneling (eject back), but
+        // sliding laterally around an edge is legitimate.
+        bool interior = bary.x > 0.02f && bary.y > 0.02f && bary.z > 0.02f;
+        float sMem = interior
+            ? softPrevSide(prevSoft, mapKeyA, mapKeyB, mapVal, P, keyA, keyB, side)
+            : side;
+        float3 n;
+        float g;
+        if (dist > 1e-7f && side == sMem) {
+            n = d / dist;
+            g = dist;
+        } else {
+            n = sMem * triN;
+            g = -dist;
+        }
+
+        float fricT = (props[tid.x].w * bary.x + props[tid.y].w * bary.y
+                       + props[tid.z].w * bary.z);
+        float friction = sqrt(max(props[v].w * fricT, 0.0f));
+
+        float minMass = massV > 0.0f ? massV : FLT_MAX;
+        float mA = posLin[tid.x].w, mB = posLin[tid.y].w, mC = posLin[tid.z].w;
+        if (mA > 0.0f) minMass = min(minMass, mA);
+        if (mB > 0.0f) minMass = min(minMass, mB);
+        if (mC > 0.0f) minMass = min(minMass, mC);
+        if (minMass == FLT_MAX) continue;       // all static: inert
+
+        softEmit(soft, counters, prevSoft, mapKeyA, mapKeyB, mapVal, P,
+                 uint4(v, tid.x, tid.y, tid.z),
+                 float4(1.0f, -bary.x, -bary.y, -bary.z),
+                 n, friction, float3(0),
+                 g - hSum + P.elemMargin,
+                 softLambdaCap(P, minMass), minMass,
+                 SC_VT, false, false, sMem < 0.0f, keyA, keyB);
     }
 }
 
 // ----------------------------------------------------------------------------
-// E-E: one thread per edge, scanning the element grid for other edges.
-// Interior-only (endpoint regions are covered by V-T), 1.5-ring exclusion
-// (rest clearances between near-topology edges sit at the contact skin).
+// E-E with the same Voronoi temporal tracking: each edge keeps its 4
+// closest edges, propagates through endpoint-incident edges, reseeds from
+// the grid 1/8 per frame. Interior-only (endpoints are V-T territory),
+// 1.5-ring exclusion, normal-continuity crossing memory.
 // ----------------------------------------------------------------------------
 inline void eeClosestSegSeg(float3 p0, float3 p1, float3 q0, float3 q1,
                             thread float& s, thread float& t)
@@ -453,95 +528,140 @@ kernel void ee_emit(
     device const uint* mapKeyB      [[buffer(15)]],
     device const uint* mapVal       [[buffer(16)]],
     constant SimParams& P           [[buffer(17)]],
+    device uint4* eeTrack           [[buffer(18)]],
+    device const uint* vertEdgeStart [[buffer(19)]],
+    device const uint* vertEdgeCount [[buffer(20)]],
+    device const uint* vertEdgeList [[buffer(21)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numEdges) return;
     uint2 eA = edges[gid];
     float3 a0 = posLin[eA.x].xyz, a1 = posLin[eA.y].xyz;
-    float3 mid = (a0 + a1) * 0.5f;
     float rA = max(fabs(shape[eA.x].w), fabs(shape[eA.y].w));
     float3 velA = (velLin[eA.x].xyz + velLin[eA.y].xyz) * 0.5f;
     uint nsx = nbrStart[eA.x], nex = nsx + nbrCount[eA.x];
     uint nsy = nbrStart[eA.y], ney = nsy + nbrCount[eA.y];
 
-    int3 cc = cellCoord(mid, P.elemCellSize);
-    uint emitted = 0;
-    uint seen[EE_MAX_PER_EDGE] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    for (int dz = -1; dz <= 1 && emitted < EE_MAX_PER_EDGE; dz++)
-    for (int dy = -1; dy <= 1 && emitted < EE_MAX_PER_EDGE; dy++)
-    for (int dx = -1; dx <= 1 && emitted < EE_MAX_PER_EDGE; dx++) {
-        uint h = cellHash(cc + int3(dx, dy, dz), P.elemHashSize);
-        uint s0 = elemCellStart[h], e0 = s0 + elemCellCount[h];
-        for (uint k = s0; k < e0 && emitted < EE_MAX_PER_EDGE; k++) {
-            uint entry = cellElems[k];
-            if (!(entry & ELEM_EDGE_BIT)) continue;
-            uint eBi = entry & ~ELEM_EDGE_BIT;
-            if (eBi <= gid) continue;               // each pair once
-            if (seen[0] == eBi || seen[1] == eBi || seen[2] == eBi || seen[3] == eBi) continue;
-            uint2 eB = edges[eBi];
-            if (eB.x == eA.x || eB.x == eA.y || eB.y == eA.x || eB.y == eA.y) continue;
+    Best4 best;
+    best4Init(best);
 
-            // geometry cull FIRST, exclusions (4 binary searches) after
-            float3 b0 = posLin[eB.x].xyz, b1 = posLin[eB.y].xyz;
-            float s, t;
-            eeClosestSegSeg(a0, a1, b0, b1, s, t);
-            // interior only: endpoint closest points are V-T territory
-            if (s < EE_INTERIOR_EPS || s > 1.0f - EE_INTERIOR_EPS ||
-                t < EE_INTERIOR_EPS || t > 1.0f - EE_INTERIOR_EPS) continue;
+    #define EE_CONSIDER(E)                                                     \
+    {                                                                          \
+        uint e_ = (E);                                                         \
+        if (e_ < P.numEdges && e_ != gid && !best4Has(best, e_)) {             \
+            uint2 eB_ = edges[e_];                                             \
+            if (eB_.x != eA.x && eB_.x != eA.y                                 \
+                && eB_.y != eA.x && eB_.y != eA.y) {                           \
+                float s_, t_;                                                  \
+                float3 b0_ = posLin[eB_.x].xyz, b1_ = posLin[eB_.y].xyz;       \
+                eeClosestSegSeg(a0, a1, b0_, b1_, s_, t_);                     \
+                float3 cA_ = a0 + (a1 - a0) * s_;                              \
+                float3 cB_ = b0_ + (b1_ - b0_) * t_;                           \
+                float d2_ = distance_squared(cA_, cB_);                        \
+                if (d2_ < best.d2[3]                                           \
+                    && !nbrContains(nbrList, nsx, nex, eB_.x)                  \
+                    && !nbrContains(nbrList, nsx, nex, eB_.y)                  \
+                    && !nbrContains(nbrList, nsy, ney, eB_.x)                  \
+                    && !nbrContains(nbrList, nsy, ney, eB_.y)) {               \
+                    best4Insert(best, e_, d2_);                                \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }
 
-            float3 cA = a0 + (a1 - a0) * s;
-            float3 cB = b0 + (b1 - b0) * t;
-            float3 d = cA - cB;
-            float dist = length(d);
-            float rB = max(fabs(shape[eB.x].w), fabs(shape[eB.y].w));
-            float hSum = rA + rB;
-            float3 velB = (velLin[eB.x].xyz + velLin[eB.y].xyz) * 0.5f;
-            float inflate = min(length(velA - velB) * P.dt, 0.3f * P.elemCellSize);
-            if (dist - hSum > P.elemMargin + inflate) continue;
-            if (dist < 1e-7f) continue;             // degenerate: let V-T handle
-            if (nbrContains(nbrList, nsx, nex, eB.x) ||
-                nbrContains(nbrList, nsx, nex, eB.y) ||
-                nbrContains(nbrList, nsy, ney, eB.x) ||
-                nbrContains(nbrList, nsy, ney, eB.y)) continue;
-
-            float3 nGeo = d / dist;
-            uint keyA = (SC_EE << 28) | gid;
-            uint keyB = eBi;
-            // Normal continuity is the sign memory here (no face to lean
-            // on): a flip vs the stored normal means the edges crossed —
-            // eject back through. Self-consistent: while crossed, the
-            // stored (ejection) normal keeps disagreeing with geometry.
-            float g = dist;
-            float3 n = nGeo;
-            int prev = softMapFind(mapKeyA, mapKeyB, mapVal, P.softMapCapacity,
-                                   keyA, keyB);
-            if (prev >= 0 && dot(nGeo, prevSoft[prev].normal.xyz) < 0.0f) {
-                n = -nGeo;
-                g = -dist;
-            }
-
-            float fric = sqrt(max(
-                (props[eA.x].w + props[eA.y].w) * 0.5f *
-                (props[eB.x].w + props[eB.y].w) * 0.5f, 0.0f));
-            float minMass = FLT_MAX;
-            float m0 = posLin[eA.x].w, m1 = posLin[eA.y].w;
-            float m2 = posLin[eB.x].w, m3 = posLin[eB.y].w;
-            if (m0 > 0.0f) minMass = min(minMass, m0);
-            if (m1 > 0.0f) minMass = min(minMass, m1);
-            if (m2 > 0.0f) minMass = min(minMass, m2);
-            if (m3 > 0.0f) minMass = min(minMass, m3);
-            if (minMass == FLT_MAX) continue;
-
-            softEmit(soft, counters, prevSoft, mapKeyA, mapKeyB, mapVal, P,
-                     uint4(eA.x, eA.y, eB.x, eB.y),
-                     float4(1.0f - s, s, -(1.0f - t), -t),
-                     n, fric, float3(0),
-                     g - hSum + P.elemMargin,
-                     softLambdaCap(P, minMass), minMass,
-                     SC_EE, false, false, false, keyA, keyB);
-            seen[emitted] = eBi;
-            emitted++;
+    uint4 tracked = eeTrack[gid];
+    for (int i = 0; i < 4; i++) EE_CONSIDER(tracked[i])
+    // propagate through endpoint-incident edges' best tracked
+    for (int side = 0; side < 2; side++) {
+        uint vv = side == 0 ? eA.x : eA.y;
+        uint es = vertEdgeStart[vv], ec = min(vertEdgeCount[vv], 6u);
+        for (uint k = es; k < es + ec; k++) {
+            EE_CONSIDER(eeTrack[vertEdgeList[k]].x)
         }
+    }
+
+    // relative-velocity staggered reseed (see vt_emit for the reasoning)
+    float3 relV = velA;
+    if (best.id[0] < P.numEdges) {
+        uint2 bt = edges[best.id[0]];
+        relV -= (velLin[bt.x].xyz + velLin[bt.y].xyz) * 0.5f;
+    }
+    float vThresh = 0.25f * P.elemCellSize / max(P.dt, 1e-6f);
+    uint period = dot(relV, relV) > vThresh * vThresh ? 1u : 7u;
+    bool reseed = ((gid + P.frame) & period) == 0u
+               || best.id[0] == 0xFFFFFFFFu;
+    if (reseed) {
+        float3 mid = (a0 + a1) * 0.5f;
+        int3 cc = cellCoord(mid, P.elemCellSize);
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            uint h = cellHash(cc + int3(dx, dy, dz), P.elemHashSize);
+            uint s0 = elemCellStart[h], e0 = s0 + elemCellCount[h];
+            for (uint k = s0; k < e0; k++) {
+                uint entry = cellElems[k];
+                if (!(entry & ELEM_EDGE_BIT)) continue;
+                EE_CONSIDER(entry & ~ELEM_EDGE_BIT)
+            }
+        }
+    }
+    eeTrack[gid] = uint4(best.id[0], best.id[1], best.id[2], best.id[3]);
+    #undef EE_CONSIDER
+
+    // emit (each pair once: smaller index owns it)
+    for (int bi = 0; bi < 4; bi++) {
+        uint eBi = best.id[bi];
+        if (eBi >= P.numEdges) break;
+        if (eBi <= gid) continue;
+        uint2 eB = edges[eBi];
+        float3 b0 = posLin[eB.x].xyz, b1 = posLin[eB.y].xyz;
+        float s, t;
+        eeClosestSegSeg(a0, a1, b0, b1, s, t);
+        if (s < EE_INTERIOR_EPS || s > 1.0f - EE_INTERIOR_EPS ||
+            t < EE_INTERIOR_EPS || t > 1.0f - EE_INTERIOR_EPS) continue;
+
+        float3 cA = a0 + (a1 - a0) * s;
+        float3 cB = b0 + (b1 - b0) * t;
+        float3 d = cA - cB;
+        float dist = length(d);
+        float rB = max(fabs(shape[eB.x].w), fabs(shape[eB.y].w));
+        float hSum = rA + rB;
+        float3 velB = (velLin[eB.x].xyz + velLin[eB.y].xyz) * 0.5f;
+        float inflate = min(length(velA - velB) * P.dt, 0.3f * P.elemCellSize);
+        if (dist - hSum > P.elemMargin + inflate) continue;
+        if (dist < 1e-7f) continue;             // degenerate: let V-T handle
+
+        float3 nGeo = d / dist;
+        uint keyA = (SC_EE << 28) | gid;
+        uint keyB = eBi;
+        float g = dist;
+        float3 n = nGeo;
+        int prev = softMapFind(mapKeyA, mapKeyB, mapVal, P.softMapCapacity,
+                               keyA, keyB);
+        if (prev >= 0 && dot(nGeo, prevSoft[prev].normal.xyz) < 0.0f) {
+            n = -nGeo;
+            g = -dist;
+        }
+
+        float fric = sqrt(max(
+            (props[eA.x].w + props[eA.y].w) * 0.5f *
+            (props[eB.x].w + props[eB.y].w) * 0.5f, 0.0f));
+        float minMass = FLT_MAX;
+        float m0 = posLin[eA.x].w, m1 = posLin[eA.y].w;
+        float m2 = posLin[eB.x].w, m3 = posLin[eB.y].w;
+        if (m0 > 0.0f) minMass = min(minMass, m0);
+        if (m1 > 0.0f) minMass = min(minMass, m1);
+        if (m2 > 0.0f) minMass = min(minMass, m2);
+        if (m3 > 0.0f) minMass = min(minMass, m3);
+        if (minMass == FLT_MAX) continue;
+
+        softEmit(soft, counters, prevSoft, mapKeyA, mapKeyB, mapVal, P,
+                 uint4(eA.x, eA.y, eB.x, eB.y),
+                 float4(1.0f - s, s, -(1.0f - t), -t),
+                 n, fric, float3(0),
+                 g - hSum + P.elemMargin,
+                 softLambdaCap(P, minMass), minMass,
+                 SC_EE, false, false, false, keyA, keyB);
     }
 }
 
@@ -626,6 +746,7 @@ kernel void rt_emit(
     device const uint* mapKeyB      [[buffer(17)]],
     device const uint* mapVal       [[buffer(18)]],
     constant SimParams& P           [[buffer(19)]],
+    device const uint* hashedRigidIdx [[buffer(20)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numTris) return;
@@ -719,21 +840,28 @@ kernel void rt_emit(
         }                                                                      \
     }
 
-    // hashed bodies: widen the scan so big-body centers further than one cell
-    // are still reached (cellSize = 2x max hashed radius; triangles add rT).
-    // Pure-cloth scenes hash only particles: skip the whole sweep.
-    int R = P.numHashedRigid == 0 ? 0
-        : clamp(int(ceil((rT + 0.5f * P.cellSize) / P.cellSize)), 1, 4);
-    int3 cc = cellCoord(m, P.cellSize);
-    for (int dz = -R; dz <= R && emitted < RT_MAX_PER_TRI; dz++)
-    for (int dy = -R; dy <= R && emitted < RT_MAX_PER_TRI; dy++)
-    for (int dx = -R; dx <= R && emitted < RT_MAX_PER_TRI; dx++) {
-        uint h = cellHash(cc + int3(dx, dy, dz), P.gridHashSize);
-        uint s = cellStart[h], e = s + cellCount[h];
-        for (uint k = s; k < e && emitted < RT_MAX_PER_TRI; k++) {
-            uint o = cellBodies[k];
-            if (shape[o].w < 0.0f) continue;        // particles: V-T covers
+    // hashed bodies. With only a handful of rigids hashed, the grid sweep is
+    // pure overhead (27+ empty-cell probes per triangle): test them directly.
+    if (P.numHashedRigid > 0 && P.numHashedRigid <= 8) {
+        for (uint ri = 0; ri < P.numHashedRigid && emitted < RT_MAX_PER_TRI; ri++) {
+            uint o = hashedRigidIdx[ri];
             RT_TEST_BODY(o)
+        }
+    } else if (P.numHashedRigid > 0) {
+        // widen the scan so big-body centers further than one cell are still
+        // reached (cellSize = 2x max hashed radius; triangles add rT)
+        int R = clamp(int(ceil((rT + 0.5f * P.cellSize) / P.cellSize)), 1, 4);
+        int3 cc = cellCoord(m, P.cellSize);
+        for (int dz = -R; dz <= R && emitted < RT_MAX_PER_TRI; dz++)
+        for (int dy = -R; dy <= R && emitted < RT_MAX_PER_TRI; dy++)
+        for (int dx = -R; dx <= R && emitted < RT_MAX_PER_TRI; dx++) {
+            uint h = cellHash(cc + int3(dx, dy, dz), P.gridHashSize);
+            uint s = cellStart[h], e = s + cellCount[h];
+            for (uint k = s; k < e && emitted < RT_MAX_PER_TRI; k++) {
+                uint o = cellBodies[k];
+                if (shape[o].w < 0.0f) continue;    // particles: V-T covers
+                RT_TEST_BODY(o)
+            }
         }
     }
     // globals (oversized/static)

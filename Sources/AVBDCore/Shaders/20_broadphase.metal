@@ -37,12 +37,16 @@ kernel void bp_clear_cells(
 }
 
 // Count bodies per cell; remember each body's slot within its cell.
+// Cells containing at least one rigid (non-particle) body get flagged so
+// soft-surface particles can skip rigid-free cells in pair generation.
 kernel void bp_count(
     device const float4* posLin     [[buffer(0)]],
     device const uint* hashedIdx    [[buffer(1)]],   // indices of hashed bodies
     device atomic_uint* cellCount   [[buffer(2)]],
     device uint2* bodyCellSlot      [[buffer(3)]],   // (cellHash, slot) per hashed body
     constant SimParams& P           [[buffer(4)]],
+    device const float4* shape      [[buffer(5)]],
+    device uint* cellRigid          [[buffer(6)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numHashed) return;
@@ -50,6 +54,7 @@ kernel void bp_count(
     uint h = cellHash(cellCoord(posLin[b].xyz, P.cellSize), P.gridHashSize);
     uint slot = atomic_fetch_add_explicit(&cellCount[h], 1u, memory_order_relaxed);
     bodyCellSlot[gid] = uint2(h, slot);
+    if (shape[b].w >= 0.0f) cellRigid[h] = 1u;       // racing writes of 1: benign
 }
 
 // Scatter hashed bodies into the grouped cell list using scanned offsets.
@@ -96,6 +101,7 @@ kernel void bp_gen_pairs(
     device uint2* pairs             [[buffer(10)]],
     constant SimParams& P           [[buffer(11)]],
     device const uint* clothGroup   [[buffer(12)]],
+    device const uint* cellRigid    [[buffer(13)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numHashed) return;
@@ -105,25 +111,27 @@ kernel void bp_gen_pairs(
     bool aDyn = posLin[a].w > 0.0f;
     uint ga = clothGroup[a];
 
-    // Soft-surface particles in a single-group scene with no hashed rigid
-    // bodies have NO legal sphere-pair partners (same-group is banned, the
-    // ground/oversized bodies are globals): the whole cell scan computes
-    // nothing — skip it by construction.
-    bool scanCells = !(ga != 0 && P.numSoftGroups <= 1 && P.numHashedRigid == 0);
+    // Soft-surface particles never sphere-pair with OTHER soft surfaces
+    // either (cross-group contact is V-T/E-E territory just like
+    // self-collision), so their only legal hashed partners are rigid
+    // bodies: skip the scan entirely when none are hashed, and skip
+    // rigid-free cells otherwise.
+    bool scanCells = !(ga != 0 && P.numHashedRigid == 0);
     int3 cc = cellCoord(pa, P.cellSize);
     if (scanCells) {
     for (int dz = -1; dz <= 1; dz++)
     for (int dy = -1; dy <= 1; dy++)
     for (int dx = -1; dx <= 1; dx++) {
         uint h = cellHash(cc + int3(dx, dy, dz), P.gridHashSize);
+        if (ga != 0 && cellRigid[h] == 0) continue;
         uint s = cellStart[h], e = s + cellCount[h];
         for (uint k = s; k < e; k++) {
             uint b = cellBodies[k];
             if (b <= a) continue;   // each pair once
             if (!aDyn && posLin[b].w <= 0.0f) continue;
-            // same soft surface: V-T/E-E elements own self-collision;
+            // soft surface vs any soft surface: V-T/E-E elements own it;
             // sphere pairs would only re-shoulder it at O(n^2) in piles
-            if (ga != 0 && clothGroup[b] == ga) continue;
+            if (ga != 0 && clothGroup[b] != 0) continue;
             float rb = fabs(shape[b].w);
             float3 dp = pa - posLin[b].xyz;
             float r = ra + rb;

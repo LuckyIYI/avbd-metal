@@ -132,6 +132,8 @@ extension Demos {
         }
         addClothGrid(&s, positions: positions, thickness: r,
                      massPerNode: 0.008, friction: 0.9)
+        s.settings.cameraDistance = 7
+        s.settings.cameraTargetZ = 0.8
         return s
     }
 
@@ -175,6 +177,8 @@ extension Demos {
         let density = massRatio * clothMass / (boxSide * boxSide * boxSide)
         _ = s.addBody(size: F3(repeating: boxSide), density: density,
                       friction: 0.7, position: F3(0, 0, 1.45))
+        s.settings.cameraDistance = 7
+        s.settings.cameraTargetZ = 0.8
         return s
     }
 
@@ -182,7 +186,7 @@ extension Demos {
     /// in the middle. Inextensibility gate: structural stretch < 2% under
     /// load.
     public static func hammock(res: Int = 20, structuralK: Float = 5000,
-                               hardRods: Bool = true) -> PhysicsScene {
+                               hardRods: Bool = true, cubes: Int = 1) -> PhysicsScene {
         var s = PhysicsScene(name: "hammock")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
@@ -221,9 +225,25 @@ extension Demos {
                                       rA: s.bodies[node].position, rB: .zero))
             }
         }
-        // cargo: rigid box dropped into the middle
-        _ = s.addBody(size: F3(0.5, 0.5, 0.5), density: 8, friction: 0.6,
-                      position: F3(0, 0, spanZ + 0.6))
+        // cargo: rigid boxes cascade into the sag, spread along the span so
+        // bigger hammocks carry proportionally more freight (drop height
+        // cycles in tiers — no skyscraper drops at big cube counts)
+        let nC = max(1, cubes)
+        var rng = SplitMix64(seed: 7)
+        for k in 0..<nC {
+            let t = nC == 1 ? 0 : (Float(k) / Float(nC - 1) * 2 - 1) * 0.45
+            let jitter = F3((rng.nextFloat() - 0.5) * 0.2,
+                            (rng.nextFloat() - 0.5) * 0.3, 0)
+            _ = s.addBody(size: F3(0.5, 0.5, 0.5), density: 8, friction: 0.6,
+                          position: F3(t * span, 0,
+                                       spanZ + 0.6 + Float(k % 4) * 0.7)
+                                    + jitter,
+                          rotation: Quat(angle: rng.nextFloat() * 0.5,
+                                         axis: normalize(F3(rng.nextFloat(),
+                                                            rng.nextFloat(), 1))))
+        }
+        s.settings.cameraDistance = span * 1.9 + 2.5
+        s.settings.cameraTargetZ = 1.0
         return s
     }
 
@@ -255,6 +275,8 @@ extension Demos {
         addClothGrid(&s, positions: positions, thickness: r,
                      massPerNode: 0.008, friction: friction,
                      membraneMu: membrane ? 300 : 0)
+        s.settings.cameraDistance = 7
+        s.settings.cameraTargetZ = 1.0
         return s
     }
 
@@ -300,6 +322,58 @@ extension Demos {
                 s.bodies[grid[i][j]].velocity = F3(kick, 0, 0) * (Float(j) / Float(n - 1))
             }
         }
+        s.settings.cameraDistance = 7
+        s.settings.cameraTargetZ = 2.0
+        return s
+    }
+
+    /// E-E showcase: long ribbons rain criss-cross onto a thin capsule
+    /// cross; they fold over the bars, slide off and tangle with each
+    /// other — long free edges rubbing at every angle is edge-edge
+    /// territory (each ribbon is its own surface component, so each gets
+    /// its own color).
+    public static func ribbons(len: Int = 22, count: Int = 6) -> PhysicsScene {
+        var s = PhysicsScene(name: "ribbons")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        s.settings.particleDamping = 1.5
+        s.settings.clothViscosity = 0.25
+        addGround(&s, friction: 0.5)
+
+        // a low cross of thin static capsules catches and folds the ribbons
+        let pegZ: Float = 2.3
+        _ = s.addCapsule(length: 5.0, radius: 0.12, density: 0, friction: 0.35,
+                         position: F3(0, 0, pegZ),
+                         rotation: Quat(angle: .pi / 2, axis: F3(0, 1, 0)))
+        _ = s.addCapsule(length: 5.0, radius: 0.12, density: 0, friction: 0.35,
+                         position: F3(0, 0, pegZ),
+                         rotation: Quat(angle: .pi / 2, axis: F3(1, 0, 0)))
+
+        let wid = 4
+        let spacing: Float = 0.22
+        let r: Float = 0.06
+        var rng = SplitMix64(seed: 11)
+        for k in 0..<count {
+            let ang = Float(k) * (.pi / Float(max(1, count))) + 0.2
+            let dir = F3(cos(ang), sin(ang), 0)
+            let side = F3(-sin(ang), cos(ang), 0)
+            let off = side * ((rng.nextFloat() - 0.5) * 1.0)
+            let z = pegZ + 1.0 + Float(k) * 0.55
+            var pos: [[F3]] = []
+            for i in 0..<len {
+                var row: [F3] = []
+                let u = Float(i) * spacing - Float(len - 1) * spacing / 2
+                for j in 0..<wid {
+                    let v = Float(j) * spacing - Float(wid - 1) * spacing / 2
+                    row.append(dir * u + side * v + off + F3(0, 0, z))
+                }
+                pos.append(row)
+            }
+            addClothGrid(&s, positions: pos, thickness: r, massPerNode: 0.01,
+                         friction: 0.35)
+        }
+        s.settings.cameraDistance = 12
+        s.settings.cameraTargetZ = 1.6
         return s
     }
 
@@ -405,6 +479,8 @@ extension Demos {
                       position: F3(-0.1, 0.1, 2.6))
         _ = s.addSphere(diameter: 0.5, density: 1.5, friction: 0.5,
                         position: F3(0.5, -0.4, 3.1))
+        s.settings.cameraDistance = 8
+        s.settings.cameraTargetZ = 1.0
         return s
     }
 }

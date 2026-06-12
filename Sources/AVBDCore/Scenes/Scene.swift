@@ -179,6 +179,11 @@ public struct SimSettings {
     /// toward its topological 1-ring average (0..1). Damps relative flutter
     /// (bending-rate viscosity), preserves bulk motion.
     public var clothViscosity: Float = 0
+    /// Default camera framing for this scene: orbit distance and target
+    /// height (0 = renderer default). Small cloth rigs drown at the
+    /// rigid-rig default distance of 30.
+    public var cameraDistance: Float = 0
+    public var cameraTargetZ: Float = 0
 
     public init() {}
 }

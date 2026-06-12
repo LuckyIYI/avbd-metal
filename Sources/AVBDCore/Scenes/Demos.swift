@@ -7,8 +7,8 @@ public enum Demos {
         ["ground", "stack", "wall", "pyramid", "pendulum", "chain", "boxpile",
          "spring", "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "swirl", "treadmill", "jenga", "dominoes", "car", "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg", "cloth", "softbody", "android",
-         "clothfold", "boxoncloth", "hammock", "drape", "drapem", "clothcombo",
-         "flagwhip", "eecross"]
+         "clothfold", "boxoncloth", "hammock", "drape", "clothcombo",
+         "flagwhip", "ribbons"]
     }
 
     /// Every demo scales for stress testing: 1 = small (original size),
@@ -41,13 +41,11 @@ public enum Demos {
         case "softbody": return softbody(count: 2 + s)
         case "clothfold": return clothfold(res: res ?? (18 + 6 * s))
         case "boxoncloth": return boxoncloth(res: res ?? (18 + 6 * s))
-        case "hammock": return hammock(res: res ?? (16 + 4 * s))
+        case "hammock": return hammock(res: res ?? (16 + 4 * s), cubes: s)
         case "drape": return drape(res: res ?? (22 + 6 * s))
-        case "drape0": return drape(res: res ?? (22 + 6 * s), friction: 0)
-        case "drapem": return drape(res: res ?? (22 + 6 * s), membrane: true)
         case "clothcombo": return clothcombo(res: res ?? (16 + 4 * s))
         case "flagwhip": return flagwhip(res: res ?? (14 + 2 * s))
-        case "eecross": return eecross().0
+        case "ribbons": return ribbons(len: res ?? (18 + 4 * s), count: 4 + 2 * s)
         case "trebuchet": return trebuchet(castleScale: s)
         case "wreckingball": return wreckingball(floors: 2 + s)
         case "marblerun": return marblerun(marbles: 10 * s)

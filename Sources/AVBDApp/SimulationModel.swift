@@ -8,7 +8,9 @@ final class SimulationModel: ObservableObject, RenderableModel {
     @Published var demoName = ProcessInfo.processInfo.environment["AVBD_DEMO"] ?? "stack" {
         didSet { reset() }
     }
-    @Published var scale = 1 { didSet { reset() } }
+    @Published var scale = Int(ProcessInfo.processInfo.environment["AVBD_SIZE"] ?? "") ?? 1 {
+        didSet { reset() }
+    }
     @Published var running = true
     @Published var colorByGraphColor = false
 

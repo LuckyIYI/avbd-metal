@@ -1154,6 +1154,111 @@ kernel void primal_solve(
                P, shape, tets, soft, membranes, bends, colorList[s + tid]);
 }
 
+// Lane-split particle primal: 8 threads per body each stamp a slice of
+// its adjacency, reduce the 3-DOF system via simd_shuffle_xor, lane 0
+// solves. Per-body serial stamping (~20-30 scattered gathers) left mid-
+// size cloth dispatches latency-bound at ~3% occupancy; the split gives
+// 8x the threads at 1/8 the serial depth. Rigid bodies in the color fall
+// back to the full per-body path on lane 0 (rare in soft scenes).
+kernel void primal_particles_split(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device const JointGPU* joints   [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    constant uint& colorIndex       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device const SoftContactGPU* soft [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    uint tid                        [[thread_position_in_grid]])
+{
+    uint s = colorStart[colorIndex];
+    uint e = colorStart[colorIndex + 1];
+    uint slot = tid >> 3;
+    uint lane = tid & 7u;
+    if (s + slot >= e) return;              // uniform across the 8-lane group
+    uint body = colorList[s + slot];
+
+    if (shape[body].w >= 0.0f) {            // rigid: full path on lane 0
+        if (lane == 0) {
+            primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng,
+                       props, joints, springs, manifolds, adjStart, adjCount,
+                       adjList, P, shape, tets, soft, membranes, bends, body);
+        }
+        return;
+    }
+
+    PrimalAccum acc;
+    acc.lhsLin = m3_zero();
+    acc.lhsAng = m3_zero();
+    acc.lhsCross = m3_zero();
+    acc.rhsLin = float3(0);
+    acc.rhsAng = float3(0);
+
+    uint as = adjStart[body];
+    uint cnt = adjCount[body];
+    for (uint k = lane; k < cnt; k += 8) {
+        uint entry = adjList[as + k];
+        uint kind = entry >> ADJ_KIND_SHIFT;
+        uint idx = entry & ADJ_INDEX_MASK;
+        if (kind == FK_JOINT) {
+            stampJoint(joints[idx], body, posLin, posAng, initAng, P.alpha, P.dt, acc);
+        } else if (kind == FK_SPRING) {
+            stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
+        } else if (kind == FK_TET) {
+            stampTet(tets[idx], body, posLin, acc);
+        } else if (kind == FK_SOFT) {
+            stampSoft(soft[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
+        } else if (kind == FK_MEMBRANE) {
+            stampMembrane(membranes[idx], body, posLin, acc);
+        } else if (kind == FK_BEND) {
+            stampBend(bends[idx], body, posLin, acc);
+        } else {
+            stampManifold(manifolds[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
+        }
+    }
+
+    // reduce the 3-DOF system across the 8 lanes (consecutive lanes of one
+    // simdgroup): lhsLin rows + rhsLin
+    for (ushort d = 4; d >= 1; d >>= 1) {
+        acc.lhsLin.r0 += simd_shuffle_xor(acc.lhsLin.r0, d);
+        acc.lhsLin.r1 += simd_shuffle_xor(acc.lhsLin.r1, d);
+        acc.lhsLin.r2 += simd_shuffle_xor(acc.lhsLin.r2, d);
+        acc.rhsLin    += simd_shuffle_xor(acc.rhsLin, d);
+    }
+    if (lane != 0) return;
+
+    float4 pl = posLin[body];
+    float mass = pl.w;
+    float dt2 = P.dt * P.dt;
+    acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(mass / dt2)));
+    acc.rhsLin += (pl.xyz - inertLin[body].xyz) * (mass / dt2);
+
+    // direct 3x3 LDL solve (particles carry no angular block)
+    float3 dxLin = float3(0), dxAng = float3(0);
+    solve6x6(acc.lhsLin, m3_identity(), m3_zero(),
+             -acc.rhsLin, float3(0), dxLin, dxAng);
+    if (!finite3(dxLin)) return;
+
+    float maxLin = 0.35f * fabs(shape[body].w);
+    float lin2 = dot(dxLin, dxLin);
+    if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
+    posLin[body] = float4(pl.xyz + dxLin, mass);
+}
+
 // Tail pass: primal-update every body whose color is >= the CPU-encoded
 // bound. The bound comes from an ASYNC readback and can be stale when the
 // palette grows (dense cloth piles); skipping those bodies leaves them
