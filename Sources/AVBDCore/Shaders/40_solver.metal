@@ -1,3 +1,4 @@
+#define OGC_BARRIER 0
 #include <metal_stdlib>
 using namespace metal;
 
@@ -967,9 +968,36 @@ inline float3 softContactC(device const SoftContactGPU& sc,
 }
 
 inline float3 softContactForce(device const SoftContactGPU& sc, float3 C,
-                               thread float& frictionScale, thread float& bounds)
+                               thread float& frictionScale, thread float& bounds,
+                               thread float& kNormal)
 {
     float3 F = sc.penalty.xyz * C + sc.lambda.xyz;
+    kNormal = sc.penalty.x;
+    // OGC 2-stage activation (paper Eq 18-20): the quadratic stage is the
+    // penalty+dual above; below tau = restT/2 the normal force switches to
+    // the log-barrier stage k'/d (k' = tau*kc*(r-tau), C1-stitched), which
+    // stiffens as the separation closes. CLOTH-CLOTH ONLY (V-T/E-E): those
+    // are the pairs the conservative bounds keep penetration-free, so d
+    // stays positive. Rigid-vs-cloth penetrates by design (the rigid side
+    // has no displacement bound; sign memory ejects it) — a barrier there
+    // turned deep impact frames into catapults (drape: 400% stretch, cloth
+    // launched). Capped at 4x the full-compression quadratic force: with
+    // truncation as the no-cross guarantee, the barrier is a convergence
+    // aid, not an infinity.
+    // DISABLED pending a mid-step re-detection architecture: the barrier
+    // assumes a penetration-free state (paper Sec 3.7 guarantees it via
+    // per-iteration conservative-bound refreshes); applied to our deep
+    // rigid-pressed pinches it overdrives the pinch instead (boxoncloth
+    // gate fails). The data plumbing (restT in anchorA.x) stays live.
+    float rT = sc.anchorA.x;            // restT (particle contacts only)
+    uint kindB = (as_type<uint>(sc.anchorA.w) >> SCF_KIND_SHIFT) & 3u;
+    if (OGC_BARRIER && rT > 0.0f && kindB != SC_RT && C.x < -0.5f * rT) {
+        float dsep = max(C.x + rT, 0.0625f * rT);
+        float kp = 0.25f * rT * rT * sc.penalty.x;
+        float Fbar = min(kp / dsep, 4.0f * sc.penalty.x * rT);
+        F.x = -Fbar + sc.lambda.x;
+        kNormal = min(kp / (dsep * dsep), 64.0f * sc.penalty.x);
+    }
     F.x = min(F.x, 0.0f);
     bounds = fabs(F.x) * sc.normal.w;
     frictionScale = length(F.yz);
@@ -988,8 +1016,8 @@ inline void stampSoft(device const SoftContactGPU& sc, uint self,
     bool rigidA, roundA;
     float3 C = softContactC(sc, posLin, posAng, initLin, initAng, alpha,
                             n, t1, t2, rAW, rigidA, roundA);
-    float fs, bnd;
-    float3 F = softContactForce(sc, C, fs, bnd);
+    float fs, bnd, kN;
+    float3 F = softContactForce(sc, C, fs, bnd, kN);
 
     int slot = -1;
     for (uint k = 0; k < 4; k++) {
@@ -1002,7 +1030,7 @@ inline void stampSoft(device const SoftContactGPU& sc, uint self,
         // 6-DOF rigid: full linear/angular/cross blocks like stampManifold
         M3 jLin = M3{n * w, t1 * w, t2 * w};
         M3 jAng = M3{cross(rAW, jLin.r0), cross(rAW, jLin.r1), cross(rAW, jLin.r2)};
-        M3 K = m3_diag(sc.penalty.xyz);
+        M3 K = m3_diag(float3(kN, sc.penalty.y, sc.penalty.z));
         M3 jLinT = m3_transpose(jLin);
         M3 jAngT = m3_transpose(jAng);
         M3 jAngTk = m3_mulm(jAngT, K);
@@ -1014,7 +1042,7 @@ inline void stampSoft(device const SoftContactGPU& sc, uint self,
     } else {
         // 3-DOF particle: linear block only
         float w2 = w * w;
-        acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(n, n), sc.penalty.x * w2));
+        acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(n, n), kN * w2));
         acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(t1, t1), sc.penalty.y * w2));
         acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(t2, t2), sc.penalty.z * w2));
         acc.rhsLin += (n * F.x + t1 * F.y + t2 * F.z) * w;
@@ -1108,7 +1136,6 @@ static inline void primal_one(
     float ang2 = dot(dxAng, dxAng);
     const float maxAng = 0.5f;              // ~29 deg per iteration
     if (ang2 > maxAng * maxAng) dxAng *= maxAng * rsqrt(ang2);
-
     // Direct write: bodies within one color are non-adjacent except in the
     // rare same-color-conflict case, where this degrades to a Jacobi update
     // (paper Sec. 4) — aligned 16B stores keep neighbor reads consistent.
@@ -1333,8 +1360,14 @@ static inline void dual_soft_one(
     bool rigidA, roundA;
     float3 C = softContactC(sc, posLin, posAng, initLin, initAng, P.alpha,
                             n, t1, t2, rAW, rigidA, roundA);
-    float fs, bnd;
-    float3 F = softContactForce(sc, C, fs, bnd);
+    // The dual tracks the QUADRATIC stage only — the OGC log-barrier stage
+    // (softContactForce) is dual-free by design: lambda carries steady
+    // load, the barrier guards the deep regime.
+    float3 F = sc.penalty.xyz * C + sc.lambda.xyz;
+    F.x = min(F.x, 0.0f);
+    float bnd = fabs(F.x) * sc.normal.w;
+    float fs = length(F.yz);
+    if (fs > bnd && fs > 0.0f) F.yz *= bnd / fs;
 
     F.x = max(F.x, -sc.C0.w);           // bounded dual, mass-scaled cap
     sc.lambda.xyz = F;

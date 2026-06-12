@@ -224,7 +224,7 @@ inline void softEmit(device SoftContactGPU* soft,
                      constant SimParams& P,
                      uint4 ids, float4 weights,
                      float3 n, float friction, float3 anchorA,
-                     float C0n, float lamCap, float minMass,
+                     float C0n, float restT, float lamCap, float minMass,
                      uint kind, bool rigidA, bool roundA, bool sideNeg,
                      uint keyA, uint keyB)
 {
@@ -261,7 +261,14 @@ inline void softEmit(device SoftContactGPU* soft,
     device SoftContactGPU& sc = soft[slot];
     sc.ids = ids;
     sc.normal = float4(n, friction);
-    sc.anchorA = float4(anchorA, as_type<float>(flags));
+    // anchorA.xyz is the rigid slot-0 anchor ONLY when SCF_RIGID_A; for
+    // particle contacts .x carries the rest-target separation instead (the
+    // 2-stage activation's barrier engages below tau = restT/2). C0.yz must
+    // stay zero — softContactC consumes C0.xyz as the (n,t1,t2) vector and
+    // a nonzero .y injects a phantom tangential rest-offset (constant
+    // friction-direction creep force; blocks slid off each other).
+    sc.anchorA = float4(rigidA ? anchorA : float3(restT, 0, 0),
+                        as_type<float>(flags));
     sc.weights = weights;
     sc.C0 = float4(C0n, 0, 0, lamCap);
     sc.lambda = float4(lam, as_type<float>(keyA));
@@ -417,7 +424,12 @@ kernel void vt_emit(
     vtTrack[v] = uint4(best.id[0], best.id[1], best.id[2], best.id[3]);
     #undef VT_CONSIDER
 
-    // emit contacts from the tracked set
+    // ---- Emission: OGC-aligned block semantics (paper Sec 3.2). Face
+    // blocks push along ±n_t with a persistent side; boundary closest
+    // points use the live radial direction (= the edge/vertex block
+    // direction). Per-feature dedup was tried and REVERTED: facets sharing
+    // a crease edge double-emit there, and that doubled eject force is
+    // part of the equilibrium the gates were tuned against.
     for (int bi = 0; bi < 4; bi++) {
         uint t = best.id[bi];
         if (t >= P.numTris) break;
@@ -437,22 +449,44 @@ kernel void vt_emit(
         float inflate = min(length(velV - velT) * P.dt, 0.3f * P.elemCellSize);
         float detect = hSum + P.elemMargin + inflate;
         if (dist2 > detect * detect) continue;
-
         float dist = sqrt(dist2);
+
+        // F_OGC feature classification (paper Sec 3.2): interior closest
+        // points are FACE-block contacts (force along ±n_t, side picked by
+        // the persistent memory below); boundary closest points act as the
+        // edge/vertex blocks — their live closest-point direction IS the
+        // radial block direction, and the tri stencil's barycentric weights
+        // already degenerate to the exact feature weights (a zero third
+        // component on an edge, a single 1 at a vertex). Canonical
+        // per-feature persistence keys were tried and REVERTED: they keep
+        // dual/penalty state alive while a contact rotates around a corner,
+        // which ratchets weave-tearing forces that facet-keyed contacts
+        // shed on every facet flip (combined gate: rods pinned at cap).
+        uint4 cids = uint4(v, tid.x, tid.y, tid.z);
+        float4 wts = float4(1.0f, -bary.x, -bary.y, -bary.z);
+        uint keyB = t;
+        uint keyA = (SC_VT << 28) | v;
+
+        // Block semantics (OGC Sec 3.2, matching what this solver already
+        // did): deep-interior closest points are FACE-block contacts whose
+        // force acts along ±n_t with the side picked by persistent memory
+        // (the live direction flips when crossing; the block side does
+        // not). Boundary closest points use the live radial direction —
+        // exactly the edge/vertex block direction — with memory RELEASED
+        // (the sphere-flank lesson: remembered sides snag lateral slides).
+        // The TRUE side is stored every frame for ALL contacts: a contact
+        // wandering boundary -> interior must inherit its real side, not a
+        // default that ejects it through the sheet.
         float3 triN = cross(b - a, c - a);
         float tnLen = length(triN);
         if (tnLen < 1e-12f) continue;
         triN /= tnLen;
-
         float side = dot(d, triN) >= 0.0f ? 1.0f : -1.0f;
-        uint keyA = (SC_VT << 28) | v;
-        uint keyB = t;
-        // Sign memory only when the closest point is INTERIOR: crossing
-        // the plane through the face is tunneling (eject back), but
-        // sliding laterally around an edge is legitimate.
-        bool interior = bary.x > 0.02f && bary.y > 0.02f && bary.z > 0.02f;
-        float sMem = interior
-            ? softPrevSide(prevSoft, mapKeyA, mapKeyB, mapVal, P, keyA, keyB, side)
+        bool deepInterior = bary.x > 0.02f && bary.y > 0.02f
+                         && bary.z > 0.02f;
+        float sMem = deepInterior
+            ? softPrevSide(prevSoft, mapKeyA, mapKeyB, mapVal, P,
+                           keyA, keyB, side)
             : side;
         float3 n;
         float g;
@@ -463,28 +497,31 @@ kernel void vt_emit(
             n = sMem * triN;
             g = -dist;
         }
+        bool sideNeg = sMem < 0.0f;
 
         float fricT = (props[tid.x].w * bary.x + props[tid.y].w * bary.y
                        + props[tid.z].w * bary.z);
         float friction = sqrt(max(props[v].w * fricT, 0.0f));
 
         float minMass = massV > 0.0f ? massV : FLT_MAX;
-        float mA = posLin[tid.x].w, mB = posLin[tid.y].w, mC = posLin[tid.z].w;
-        if (mA > 0.0f) minMass = min(minMass, mA);
-        if (mB > 0.0f) minMass = min(minMass, mB);
-        if (mC > 0.0f) minMass = min(minMass, mC);
+        for (int k2 = 1; k2 < 4; k2++) {
+            uint bId = cids[k2];
+            if (bId == WORLD_BODY) continue;
+            float m = posLin[bId].w;
+            if (m > 0.0f) minMass = min(minMass, m);
+        }
         if (minMass == FLT_MAX) continue;       // all static: inert
 
         softEmit(soft, counters, prevSoft, mapKeyA, mapKeyB, mapVal, P,
-                 uint4(v, tid.x, tid.y, tid.z),
-                 float4(1.0f, -bary.x, -bary.y, -bary.z),
-                 n, friction, float3(0),
+                 cids, wts, n, friction, float3(0),
                  g - hSum + P.elemMargin,
+                 hSum - P.elemMargin,
                  softLambdaCap(P, minMass), minMass,
-                 SC_VT, false, false, sMem < 0.0f, keyA, keyB);
+                 SC_VT, false, false, sideNeg, keyA, keyB);
     }
 }
 
+// ----------------------------------------------------------------------------
 // ----------------------------------------------------------------------------
 // E-E with the same Voronoi temporal tracking: each edge keeps its 4
 // closest edges, propagates through endpoint-incident edges, reseeds from
@@ -631,14 +668,18 @@ kernel void ee_emit(
         if (dist - hSum > P.elemMargin + inflate) continue;
         if (dist < 1e-7f) continue;             // degenerate: let V-T handle
 
+        // Edge blocks are radial (live closest-point direction), with
+        // normal-continuity memory as crossing protection: the radial
+        // direction flips if the edges pass through each other, the
+        // remembered normal does not.
         float3 nGeo = d / dist;
         uint keyA = (SC_EE << 28) | gid;
         uint keyB = eBi;
-        float g = dist;
         float3 n = nGeo;
-        int prev = softMapFind(mapKeyA, mapKeyB, mapVal, P.softMapCapacity,
-                               keyA, keyB);
-        if (prev >= 0 && dot(nGeo, prevSoft[prev].normal.xyz) < 0.0f) {
+        float g = dist;
+        int prevEE = softMapFind(mapKeyA, mapKeyB, mapVal, P.softMapCapacity,
+                                 keyA, keyB);
+        if (prevEE >= 0 && dot(nGeo, prevSoft[prevEE].normal.xyz) < 0.0f) {
             n = -nGeo;
             g = -dist;
         }
@@ -660,6 +701,7 @@ kernel void ee_emit(
                  float4(1.0f - s, s, -(1.0f - t), -t),
                  n, fric, float3(0),
                  g - hSum + P.elemMargin,
+                 hSum - P.elemMargin,
                  softLambdaCap(P, minMass), minMass,
                  SC_EE, false, false, false, keyA, keyB);
     }
@@ -832,6 +874,7 @@ kernel void rt_emit(
                              float4(1.0f, -bary.x, -bary.y, -bary.z),          \
                              n, friction, anchor,                              \
                              g - hSum + P.elemMargin,                          \
+                             hSum - P.elemMargin,                              \
                              softLambdaCap(P, minMass), minMass,               \
                              SC_RT, true, roundA, sMem < 0.0f, keyA, keyB);    \
                     emitted++;                                                 \

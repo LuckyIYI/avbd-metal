@@ -8,7 +8,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
     @Published var demoName = ProcessInfo.processInfo.environment["AVBD_DEMO"] ?? "stack" {
         didSet {
             demoParams = Self.defaultParams(for: demoName)
-            reset()
+            reset(adoptSceneDefaults: true)   // new demo = its own tuning
         }
     }
     @Published var scale = Int(ProcessInfo.processInfo.environment["AVBD_SIZE"] ?? "") ?? 1 {
@@ -47,23 +47,33 @@ final class SimulationModel: ObservableObject, RenderableModel {
     private var frameCounter = 0
 
     init() {
-        reset()
+        reset(adoptSceneDefaults: true)
     }
 
-    func reset() {
+    /// Rebuild the scene. By default the USER'S current solver sliders and
+    /// demo parameters survive the restart — only switching to a different
+    /// demo adopts that scene's own tuned defaults (each demo is tuned;
+    /// e.g. the castle needs its own iterations/beta).
+    func reset(adoptSceneDefaults: Bool = false) {
         guard var scene = Demos.make(demoName, scale: scale, params: demoParams)
         else { return }
         dragJoint = scene.addDragSlot()
-        // ADOPT the scene's tuned settings into the sliders (each demo is
-        // tuned; overriding with stale slider state crumbles e.g. the
-        // castle, which needs its own iterations/beta)
-        adopting = true
-        iterations = Double(scene.settings.iterations)
-        alpha = Double(scene.settings.alpha)
-        betaLin = Double(scene.settings.betaLin)
-        gamma = Double(scene.settings.gamma)
-        gravity = Double(scene.settings.gravity)
-        adopting = false
+        if adoptSceneDefaults {
+            adopting = true
+            iterations = Double(scene.settings.iterations)
+            alpha = Double(scene.settings.alpha)
+            betaLin = Double(scene.settings.betaLin)
+            gamma = Double(scene.settings.gamma)
+            gravity = Double(scene.settings.gravity)
+            adopting = false
+        } else {
+            // restart with the user's current settings, as set up in the UI
+            scene.settings.iterations = Int(iterations)
+            scene.settings.alpha = Float(alpha)
+            scene.settings.betaLin = Float(betaLin)
+            scene.settings.gamma = Float(gamma)
+            scene.settings.gravity = Float(gravity)
+        }
         do {
             solver = try GPUSolver(scene: scene)
         } catch {
