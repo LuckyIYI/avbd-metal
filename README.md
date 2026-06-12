@@ -34,11 +34,9 @@ research playground built on top of it.
   hammock inextensibility, whip energy envelope, soft-block stacking).
 
 **WIP / research**
-- OGC log-barrier contact stage implemented but compiled out (`OGC_BARRIER 0`):
-  needs the paper's per-iteration re-detection cadence to be safe (see in-kernel
-  notes for the full experiment record).
-- Solve-primal dispatch floor (~3 ms = colors × iterations serial chain) —
-  next lever is palette reduction (Jacobi-accepted tets/rods).
+- Tets still require strict Gauss-Seidel coloring (Jacobi acceptance failed
+  the battery; membranes accepted it, cloth palette is 2) — tet-heavy scenes
+  keep a 4-5 color primal chain.
 - Robotics Lab: gantry-pusher Push-T environments (11k env-steps/s @ 256),
   BC visuomotor policy ~90% from pixels; latent world-model (LeWM) planning
   still below the scripted oracle.
@@ -49,7 +47,7 @@ research playground built on top of it.
 |---|---|
 | **AVBD** (Giles, Diaz, Yuksel, SIGGRAPH 2025) | Core solver: per-color 6×6 LDLᵀ block primal, bounded AL duals, penalty ramping, α-stabilization, γ warm-start |
 | **VBD** (Chen et al., SIGGRAPH 2024) | Block-descent structure the GPU loop follows; trust-region step caps |
-| **OGC** (Chen et al., SIGGRAPH 2025, `refs/ogc_paper.pdf`) | Contact model alignment: face blocks push along ±n with persistent side, boundary closest points use radial block directions; 2-stage activation implemented (dormant) |
+| **OGC** (Chen et al., SIGGRAPH 2025, `refs/ogc_paper.pdf`) | Contact model alignment (face blocks ⊥, radial boundaries) + the penetration-free machinery: 2-ring-excluded conservative bounds, Eq-28 warmstart truncation, counter-driven in-loop bound refresh (indirect dispatch, no CPU sync), divergent cloth-cloth log barrier |
 | **Stable Neo-Hookean** (Smith et al. 2018) | Tet FEM material with per-vertex SPD Hessian |
 | **Bergou et al. 2006** | Quadratic bending; hinge K derived numerically from the intrinsic unfolded shape |
 | **IPC / Codimensional IPC** (Li et al.) | Lagged friction formulation; contact-radius framing |
@@ -85,8 +83,9 @@ Demos: stacks/walls/pyramids, ratio stack, friction-sweep slope, jenga,
 dominoes, bridge, tensegrity, chainmail, treadmill, car, marble run,
 trebuchet, wrecking ball, Rube Goldberg, brick android statue, soft bunny,
 steel-and-rubber cart (`softwheel`), cloth fold/drape/multidrape/hammock/
-ribbons/box-on-cloth, and `bed` (rigid frame + soft mattress/pillows + cloth
-blanket in one solve).
+ribbons/box-on-cloth, `twist` (a hanging sheet winds into a rope against a
+spinning bar — the OGC stress test), and `bed` (rigid frame + soft
+mattress/pillows + cloth blanket in one solve).
 
 ## Performance (M1 Ultra, release, 20 iterations)
 
