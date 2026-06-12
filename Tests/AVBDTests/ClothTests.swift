@@ -9,13 +9,14 @@ final class ClothTests: XCTestCase {
     /// Gate 1a: sheet folded over itself twice (3 layers) settles on the
     /// ground; layers must hold separation for 10 simulated seconds.
     func testFoldedClothNoInterpenetration() throws {
-        let scene = Demos.clothfold(res: 20)
+        let scene = Demos.clothfold(res: 36)
         let gpu = try GPUSolver(scene: scene)
         for _ in 0..<600 { gpu.step() }
         let (gap, stretch) = gpu.debugClothMetrics()
-        // skin = rv + rt = 0.09; equilibrium sits at -margin (-0.01).
-        // Half-skin is the no-tunnel red line.
-        XCTAssertGreaterThan(gap, -0.045,
+        // towel-scale fold: spacing 2.2/35, r = 0.36*spacing ~ 0.0226,
+        // skin = 2r ~ 0.045; equilibrium sits at -margin. Half-skin is
+        // the no-tunnel red line.
+        XCTAssertGreaterThan(gap, -0.023,
                              "fold layers must not interpenetrate (gap \(gap))")
         XCTAssertLessThan(stretch, 0.05, "fold should not stress the weave")
         XCTAssertGreaterThan(gpu.lastNumSoft, 100,

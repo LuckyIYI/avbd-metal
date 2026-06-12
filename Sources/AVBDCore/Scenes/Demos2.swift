@@ -579,6 +579,11 @@ extension Demos {
     /// Jenga tower: alternating 3-block layers. Pull blocks out with the mouse.
     public static func jenga(levels: Int = 18) -> PhysicsScene {
         var s = PhysicsScene(name: "jenga")
+        // tall friction-only towers live or die on contact convergence:
+        // more iterations + a stiffer penalty ramp keep the seams from
+        // creeping (the default 10 iterations slowly shears high towers)
+        s.settings.iterations = 24
+        s.settings.betaLin = 20000
         addGround(&s, friction: 0.5)
         let bl: Float = 3.0, bw: Float = 1.0, bh: Float = 0.6
         for level in 0..<levels {

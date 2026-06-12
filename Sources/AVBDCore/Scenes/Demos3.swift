@@ -123,8 +123,9 @@ extension Demos {
         do {
             let d = F3(cos(windmillYaw), sin(windmillYaw), 0)
             let side = normalize(cross(F3(0, 0, 1), d))
-            // blade tips just graze the marble tops (gentle flick, no wedge)
-            let hubPos = windmillPos + F3(0, 0, 1.27)
+            // hub low enough that marbles strike the blades square-on and
+            // spin the wheel as they pass (it is a free hinge: tippable)
+            let hubPos = windmillPos + F3(0, 0, 1.02)
             let core = s.addBody(size: F3(0.22, 0.22, 0.22), density: 0.4,
                                  friction: 0.3, position: hubPos)
             // hinge axis = side (horizontal, perpendicular to travel)

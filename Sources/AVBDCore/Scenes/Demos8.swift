@@ -11,7 +11,8 @@ extension Demos {
     /// ring is hard-jointed to the hubs. The tires flatten at the contact
     /// patch, grip through friction, and carry the motor torque to the
     /// ground — over a couple of ridges for good measure.
-    public static func softwheel(res: Int = 10, drive: Float = 6) -> PhysicsScene {
+    public static func softwheel(res: Int = 10, drive: Float = 6,
+                                 tireMu: Float = 9000) -> PhysicsScene {
         var s = PhysicsScene(name: "softwheel")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
@@ -51,7 +52,7 @@ extension Demos {
                     &s, origin: hubC - F3(halfX, halfY, halfX), spacing: h,
                     nx: Int(2 * halfX / h) + 1, ny: Int(2 * halfY / h) + 1,
                     nz: Int(2 * halfX / h) + 1,
-                    mu: 9000, lambda: 90000,
+                    mu: tireMu, lambda: 10 * tireMu,
                     massPerNode: 150 * h * h * h, friction: 1.0) { p in
                         let q = p - hubC
                         let rr = sqrt(q.x * q.x + q.z * q.z)
@@ -84,7 +85,10 @@ extension Demos {
 
     /// All three together: rigid bed frame, soft mattress, two softer
     /// pillows, and a cloth blanket draped over — then a ball bounces in.
-    public static func bed(res: Int = 36, friction: Float = 0.7) -> PhysicsScene {
+    public static func bed(res: Int = 36, friction: Float = 0.7,
+                           mattressMu: Float = 2500, pillowMu: Float = 600,
+                           membraneMu: Float = 300,
+                           bend: Float = 5e-4) -> PhysicsScene {
         var s = PhysicsScene(name: "bed")
         s.settings.iterations = 20
         s.settings.betaLin = 20000
@@ -117,7 +121,7 @@ extension Demos {
         let mattressTop = baseTop + 0.28
         _ = addSoftBlock(&s, center: F3(0, 0, baseTop + 0.14 + 0.01),
                          nx: 22, ny: 17, nz: 4, spacing: mh,
-                         mu: 2500, lambda: 25000,
+                         mu: mattressMu, lambda: 10 * mattressMu,
                          massPerNode: 25 * mh * mh * mh * 8,
                          friction: friction)
 
@@ -126,7 +130,7 @@ extension Demos {
         for sy in [Float(-1), 1] {
             _ = addSoftBlock(&s, center: F3(-0.78, sy * 0.38, mattressTop + 0.1),
                              nx: 9, ny: 7, nz: 3, spacing: ph,
-                             mu: 600, lambda: 6000,
+                             mu: pillowMu, lambda: 10 * pillowMu,
                              massPerNode: 20 * ph * ph * ph * 8,
                              friction: friction)
         }
@@ -148,7 +152,8 @@ extension Demos {
             positions.append(row)
         }
         addClothGrid(&s, positions: positions, thickness: r,
-                     massPerNode: 0.008, friction: friction)
+                     massPerNode: 0.008, friction: friction,
+                     membraneMu: membraneMu, membraneBend: bend)
 
         // a ball bounces onto the bed
         _ = s.addSphere(diameter: 0.36, density: 1.2, friction: 0.5,

@@ -17,10 +17,10 @@ public struct DemoParam: Identifiable {
 
 public enum Demos {
     public static var all: [String] {
-        ["ground", "stack", "ratiostack", "wall", "pyramid", "pendulum", "chain",
-         "boxpile", "spring", "cardhouse", "fracture", "bridge", "tensegrity",
-         "chainmail", "swirl", "treadmill", "jenga", "dominoes", "car",
-         "gearclock", "marblerun", "wreckingball", "trebuchet", "rubegoldberg",
+        ["stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+         "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
+         "treadmill", "jenga", "dominoes", "car", "marblerun",
+         "wreckingball", "trebuchet", "rubegoldberg",
          "slopefriction", "softbody", "softwheel", "android",
          "clothfold", "boxoncloth", "hammock", "drape", "multidrape",
          "clothcombo", "flagwhip", "ribbons", "bed"]
@@ -30,20 +30,31 @@ public enum Demos {
     /// `make(_:scale:res:params:)`.
     public static func tunables(_ name: String) -> [DemoParam] {
         let fric = { (d: Float) in DemoParam("friction", "Friction", 0...1, d) }
+        // cloth material: StVK membrane stretch stiffness + quadratic
+        // bending stiffness (the actual element parameters)
+        let membrane = DemoParam("membrane", "Membrane µ", 30...1500, 300)
+        let bending = DemoParam("bending", "Bending ×1e-4", 0...40, 5)
         switch name {
-        case "clothfold": return [fric(0.9)]
+        case "clothfold": return [fric(0.9), membrane, bending]
         case "boxoncloth": return [fric(0.8),
-                                   DemoParam("massRatio", "Box mass ×cloth", 1...16, 8)]
-        case "hammock": return [fric(0.8)]
-        case "drape": return [fric(0.6)]
-        case "multidrape": return [fric(0.5)]
-        case "clothcombo": return [fric(0.8)]
-        case "flagwhip": return [DemoParam("kick", "Kick speed", 0...6, 3)]
-        case "ribbons": return [fric(0.35)]
+                                   DemoParam("massRatio", "Box mass ×cloth", 1...16, 8),
+                                   membrane, bending]
+        case "hammock": return [fric(0.8), membrane, bending]
+        case "drape": return [fric(0.6), membrane, bending]
+        case "multidrape": return [fric(0.5), membrane, bending]
+        case "clothcombo": return [fric(0.8), membrane, bending,
+                                   DemoParam("blockMu", "Block µ", 500...12000, 4000)]
+        case "flagwhip": return [DemoParam("kick", "Kick speed", 0...6, 3),
+                                 membrane, bending]
+        case "ribbons": return [fric(0.35), membrane, bending]
         case "softbody": return [fric(0.8),
                                  DemoParam("stiffness", "Stiffness µ", 500...8000, 2500)]
-        case "bed": return [fric(0.7)]
-        case "softwheel": return [DemoParam("drive", "Drive speed", 0...12, 6)]
+        case "bed": return [fric(0.7),
+                            DemoParam("mattressMu", "Mattress µ", 600...8000, 2500),
+                            DemoParam("pillowMu", "Pillow µ", 100...2500, 600),
+                            membrane, bending]
+        case "softwheel": return [DemoParam("drive", "Drive speed", 0...12, 6),
+                                  DemoParam("tireMu", "Tire µ", 2000...30000, 9000)]
         default: return []
         }
     }
@@ -60,55 +71,72 @@ public enum Demos {
             return v < 0 ? def : v
         }
         switch name {
-        case "ground": return ground(count: s * s)
         case "stack": return stack(height: 10 * s)
         case "ratiostack": return ratiostack(levels: min(8, 3 + s))
         case "slopefriction": return slopefriction(count: 6 + 2 * s)
         case "softwheel": return softwheel(res: res ?? (9 + s),
-                                           drive: p("drive", 6))
-        case "bed": return bed(res: res ?? (30 + 6 * s),
-                               friction: p("friction", 0.7))
+                                           drive: p("drive", 6),
+                                           tireMu: p("tireMu", 9000))
+        case "bed": return bed(res: res ?? min(66, 30 + 6 * s),
+                               friction: p("friction", 0.7),
+                               mattressMu: p("mattressMu", 2500),
+                               pillowMu: p("pillowMu", 600),
+                               membraneMu: p("membrane", 300),
+                               bend: p("bending", 5) * 1e-4)
         case "wall": return wall(width: 8 * s, height: 6 * s)
         case "pyramid": return pyramid(base: 8 * s)
         case "pendulum": return pendulum(links: 20 * s, massRatio: 100)
-        case "chain": return chain(links: 30 * s)
         case "boxpile": return boxpile(count: 200 * s * s)
-        case "spring": return springRatio(blocks: 2 + s)
         case "cardhouse": return cardhouse(levels: 3 + s)
         case "fracture": return fractureWall(width: 10 * s, height: 8 * s)
         case "bridge": return bridge(planks: 16 * s, drops: 4 * s)
         case "tensegrity": return tensegrity(towers: s)
         case "chainmail": return chainmail(rings: 5 + s, drops: 3 * s)
-        case "swirl": return swirl(turns: 2 + s, balls: 40 * s)
         case "treadmill": return treadmill(boxes: 12 * s)
         case "jenga": return jenga(levels: 18 * s)
         case "dominoes": return dominoes(count: 80 * s)
         case "car": return car(trackScale: s)
-        case "gearclock": return gearclock(scale: s)
         case "rubegoldberg": return rubegoldberg(scale: s)
         case "android": return android(scale: s)
         case "softbody": return softbody(res: res ?? min(22, 9 + 2 * s),
                                          stiffness: p("stiffness", 2500),
                                          friction: p("friction", 0.8))
-        case "clothfold": return clothfold(res: res ?? (18 + 6 * s),
-                                           friction: p("friction", 0.9))
+        case "clothfold": return clothfold(res: res ?? (36 + 12 * s),
+                                           friction: p("friction", 0.9),
+                                           membraneMu: p("membrane", 300),
+                                           bend: p("bending", 5) * 1e-4)
         case "boxoncloth": return boxoncloth(res: res ?? (18 + 6 * s),
                                              massRatio: p("massRatio", 8),
-                                             friction: p("friction", 0.8))
+                                             friction: p("friction", 0.8),
+                                             membraneMu: p("membrane", 300),
+                                             bend: p("bending", 5) * 1e-4)
         case "hammock": return hammock(res: res ?? (16 + 4 * s),
                                        cubes: Int(p("cubes", Float(s))),
-                                       friction: p("friction", 0.8))
+                                       friction: p("friction", 0.8),
+                                       membraneMu: p("membrane", 300),
+                                       bend: p("bending", 5) * 1e-4)
         case "drape": return drape(res: res ?? (22 + 6 * s),
-                                   friction: p("friction", 0.6))
+                                   friction: p("friction", 0.6),
+                                   membraneMu: p("membrane", 300),
+                                   bend: p("bending", 5) * 1e-4)
         case "multidrape": return multidrape(res: res ?? (20 + 5 * s),
-                                             friction: p("friction", 0.5))
-        case "clothcombo": return clothcombo(res: res ?? (16 + 4 * s),
-                                             friction: p("friction", 0.8))
+                                             friction: p("friction", 0.5),
+                                             membraneMu: p("membrane", 300),
+                                             bend: p("bending", 5) * 1e-4)
+        case "clothcombo": return clothcombo(res: res ?? min(48, 16 + 4 * s),
+                                             friction: p("friction", 0.8),
+                                             membraneMu: p("membrane", 300),
+                                             bend: p("bending", 5) * 1e-4,
+                                             blockMu: p("blockMu", 4000))
         case "flagwhip": return flagwhip(res: res ?? (14 + 2 * s),
-                                         kick: p("kick", 3))
+                                         kick: p("kick", 3),
+                                         membraneMu: p("membrane", 300),
+                                         bend: p("bending", 5) * 1e-4)
         case "ribbons": return ribbons(len: res ?? (18 + 4 * s),
                                        count: Int(p("count", Float(4 + 2 * s))),
-                                       friction: p("friction", 0.35))
+                                       friction: p("friction", 0.35),
+                                       membraneMu: p("membrane", 300),
+                                       bend: p("bending", 5) * 1e-4)
         case "trebuchet": return trebuchet(castleScale: s)
         case "wreckingball": return wreckingball(floors: 2 + s)
         case "marblerun": return marblerun(marbles: 10 * s)
@@ -178,7 +206,14 @@ public enum Demos {
         let boxSide: Float = 0.8
         let lift = rot.act(F3(0, 0, slopeT / 2 + boxSide / 2 + 0.01))
         for k in 0..<n {
-            let mu = Float(k) / Float(n - 1)            // 0 .. 1
+            // Sweep the PAIR friction (geometric mean with the mu=1 slope,
+            // i.e. sqrt(mu_box)) linearly 0..0.8 — a linear mu_box sweep
+            // compresses the high range and parks most boxes above the
+            // tan(30) ~ 0.577 threshold with no visible difference. This
+            // way the sliders decelerate at visibly graded rates and the
+            // stick threshold lands ~3/4 along the row.
+            let pair = 0.8 * Float(k) / Float(n - 1)
+            let mu = pair * pair
             let y = (Float(k) - Float(n - 1) / 2) * 1.3
             _ = s.addBody(size: F3(repeating: boxSide), density: 1,
                           friction: mu,
@@ -227,13 +262,16 @@ public enum Demos {
     public static func pendulum(links: Int, massRatio: Float) -> PhysicsScene {
         var s = PhysicsScene(name: "pendulum")
         let linkLen: Float = 0.5
+        // anchor high enough that the fully extended rope + bob clears the
+        // floor at the bottom of the swing
+        let anchorZ = Float(links) * linkLen + 2.0
         var prev = -1
         for i in 0..<links {
             let x = Float(i + 1) * linkLen
             let idx = s.addBody(size: F3(linkLen, 0.1, 0.1), density: 1, friction: 0.5,
-                                position: F3(x - linkLen / 2, 0, 10))
+                                position: F3(x - linkLen / 2, 0, anchorZ))
             s.addJoint(SceneJoint(bodyA: prev, bodyB: idx,
-                                  rA: prev < 0 ? F3(0, 0, 10) : F3(linkLen / 2, 0, 0),
+                                  rA: prev < 0 ? F3(0, 0, anchorZ) : F3(linkLen / 2, 0, 0),
                                   rB: F3(-linkLen / 2, 0, 0)))
             prev = idx
         }
@@ -242,9 +280,11 @@ public enum Demos {
         let density = massRatio * (linkLen * 0.1 * 0.1) / (bobSize * bobSize * bobSize)
         let x = Float(links) * linkLen + bobSize / 2
         let bob = s.addBody(size: F3(repeating: bobSize), density: density, friction: 0.5,
-                            position: F3(x, 0, 10))
+                            position: F3(x, 0, anchorZ))
         s.addJoint(SceneJoint(bodyA: prev, bodyB: bob,
                               rA: F3(linkLen / 2, 0, 0), rB: F3(-bobSize / 2, 0, 0)))
+        s.settings.cameraDistance = Float(links) * linkLen * 2.4 + 4
+        s.settings.cameraTargetZ = anchorZ * 0.55
         return s
     }
 

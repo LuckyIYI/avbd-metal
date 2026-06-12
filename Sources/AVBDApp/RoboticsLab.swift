@@ -69,6 +69,7 @@ final class TrainingRunner: ObservableObject {
 
 @MainActor
 final class RoboticsModel: ObservableObject, RenderableModel {
+    let cameraEpoch = 0      // lab keeps its own camera; frame once at start
     enum DriveMode: String, CaseIterable {
         case manual = "Manual (IK mouse)"
         case oracle = "Oracle"

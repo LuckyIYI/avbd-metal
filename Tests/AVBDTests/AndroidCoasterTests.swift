@@ -6,7 +6,7 @@ final class AndroidCoasterTests: XCTestCase {
     /// A ball set at the top must ride every stadium lap around the statue
     /// down to the catch pen — without harming the statue on the way.
     func testBallRidesTheWholeRoute() throws {
-        let scene = Demos.android(scale: 1)
+        let scene = Demos.androidCoaster(scale: 1)
         var ball = -1
         var statue: [Int] = []
         for (i, b) in scene.bodies.enumerated() {

@@ -8,6 +8,9 @@ protocol RenderableModel {
     var solver: GPUSolver? { get }
     var colorByGraphColor: Bool { get }
     var statsText: String { get }
+    /// Increments only when the DEMO changes — reset/size/param rebuilds
+    /// keep the user's camera.
+    var cameraEpoch: Int { get }
     func tickIfRunning()
 }
 import AVBDCore
@@ -704,7 +707,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     var target = F3(0, 0, 3)
     var viewportSize = SIMD2<Float>(1, 1)
     private var framesDrawn = 0
-    private var lastSolverID: ObjectIdentifier?
+    private var lastCameraEpoch: Int = -1
     private var envCameraSet = false
 
     init(device: MTLDevice, model: AnyObject & RenderableModel) throws {
@@ -853,10 +856,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         ensureTargets(view.drawableSize)
 
         // Per-scene default framing (small cloth rigs drown at the rigid-rig
-        // default distance). Applied on scene swap; explicit AVBD_CAM_* env
+        // default distance). Applied only when the DEMO changes — resets and
+        // size/param rebuilds keep the user's camera. AVBD_CAM_* env
         // overrides outrank it.
-        if lastSolverID != ObjectIdentifier(solver) {
-            lastSolverID = ObjectIdentifier(solver)
+        if lastCameraEpoch != model.cameraEpoch {
+            lastCameraEpoch = model.cameraEpoch
             if !envCameraSet {
                 distance = solver.settings.cameraDistance > 0
                     ? solver.settings.cameraDistance : 30

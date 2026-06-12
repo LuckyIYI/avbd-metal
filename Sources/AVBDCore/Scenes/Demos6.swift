@@ -6,14 +6,12 @@ import simd
 
 extension Demos {
 
-    public static func android(scale: Int = 1) -> PhysicsScene {
-        var s = PhysicsScene(name: "android")
-        s.settings.iterations = 20
-        s.settings.betaLin = 20000
-        s.settings.lambdaMax = 6000
-        addGround(&s, friction: 0.6)
-
-        // ---------------- the statue (destructible) ----------------
+    /// Shared statue builder: voxelized invader sprite from dynamic bricks
+    /// with weak mortar. Brick size bs scales the whole statue; fracture
+    /// thresholds scale with brick mass (~bs^3). Returns the statue top z.
+    @discardableResult
+    static func buildAndroidStatue(_ s: inout PhysicsScene, bs: Float) -> Float {
+        let k3 = (bs / 0.62) * (bs / 0.62) * (bs / 0.62)
         let sprite: [[Int]] = [
             [0,0,1,0,0,0,0,0,1,0,0],
             [0,0,0,1,0,0,0,1,0,0,0],
@@ -24,11 +22,10 @@ extension Demos {
             [1,0,1,0,0,0,0,0,1,0,1],
             [0,0,0,1,1,0,1,1,0,0,0],
         ]
-        let bs: Float = 0.62
         let depth = 2
         let rows = sprite.count
         let cols = sprite[0].count
-        let baseZ: Float = 0.9
+        let baseZ: Float = 0.9 * (bs / 0.62)
         let plinth = s.addBody(size: F3(Float(cols) * bs + 1.6,
                                         Float(depth) * bs + 1.6, baseZ),
                                density: 0, friction: 0.8,
@@ -66,13 +63,13 @@ extension Demos {
                     let a = ids[r][c][d]
                     if a < 0 { continue }
                     if r + 1 < rows, ids[r + 1][c][d] >= 0 {
-                        mortar(a, ids[r + 1][c][d], fracture: 55)      // vertical
+                        mortar(a, ids[r + 1][c][d], fracture: 55 * k3)      // vertical
                     }
                     if c + 1 < cols, ids[r][c + 1][d] >= 0 {
-                        mortar(a, ids[r][c + 1][d], fracture: 55)      // lateral
+                        mortar(a, ids[r][c + 1][d], fracture: 55 * k3)      // lateral
                     }
                     if d + 1 < depth, ids[r][c][d + 1] >= 0 {
-                        mortar(a, ids[r][c][d + 1], fracture: 55)      // depth
+                        mortar(a, ids[r][c][d + 1], fracture: 55 * k3)      // depth
                     }
                     if r == rows - 1 {
                         // anchor the feet to the plinth
@@ -82,12 +79,45 @@ extension Demos {
                                               rA: anchor - s.bodies[plinth].position,
                                               rB: anchor - ba.position,
                                               stiffnessLin: .infinity,
-                                              stiffnessAng: .infinity, fracture: 80))
+                                              stiffnessAng: .infinity, fracture: 80 * k3))
                     }
                 }
             }
         }
-        let statueTop = baseZ + Float(rows) * bs
+        return baseZ + Float(rows) * bs
+    }
+
+    /// Statue-only showcase: the brick android on its plinth, brick size
+    /// scaling with the Size picker. Fully destructible (weak mortar) —
+    /// throw things at it.
+    public static func android(scale: Int = 1) -> PhysicsScene {
+        var s = PhysicsScene(name: "android")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        s.settings.lambdaMax = 6000
+        addGround(&s, friction: 0.6)
+        let k = Float(max(1, scale)).squareRoot()
+        let top = buildAndroidStatue(&s, bs: 0.62 * k)
+        s.settings.cameraDistance = top * 2.2 + 4
+        s.settings.cameraTargetZ = top * 0.5
+        return s
+    }
+
+    /// The original marble-coaster scene (kept for the coaster tests):
+    /// the statue with a stadium-loop rail hugging its silhouette.
+    public static func androidCoaster(scale: Int = 1) -> PhysicsScene {
+        var s = PhysicsScene(name: "android")
+        s.settings.iterations = 20
+        s.settings.betaLin = 20000
+        s.settings.lambdaMax = 6000
+        addGround(&s, friction: 0.6)
+
+        // ---------------- the statue (built by the shared builder) -------
+        let bs: Float = 0.62
+        let statueTopShared = buildAndroidStatue(&s, bs: bs)
+        let depth = 2
+        let cols = 11
+        let statueTop = statueTopShared
 
         // ---------------- the coaster: tight stadium loops ----------------
         var samples: [(F3, F3, Float)] = []

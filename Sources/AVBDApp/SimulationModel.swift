@@ -8,9 +8,13 @@ final class SimulationModel: ObservableObject, RenderableModel {
     @Published var demoName = ProcessInfo.processInfo.environment["AVBD_DEMO"] ?? "stack" {
         didSet {
             demoParams = Self.defaultParams(for: demoName)
+            cameraEpoch += 1                  // reframe only on demo change
             reset(adoptSceneDefaults: true)   // new demo = its own tuning
         }
     }
+    /// Bumped only when the demo changes; the renderer reframes the camera
+    /// on epoch change (reset/size/param rebuilds keep the user's view).
+    private(set) var cameraEpoch = 0
     @Published var scale = Int(ProcessInfo.processInfo.environment["AVBD_SIZE"] ?? "") ?? 1 {
         didSet { reset() }
     }
