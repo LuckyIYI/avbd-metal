@@ -6,41 +6,6 @@ grown into a unified solver where **rigid bodies, volumetric soft bodies, and
 cloth are first-class citizens** in one solve loop — plus a robotics/world-model
 research playground built on top of it.
 
-## Status
-
-**Done**
-- **Rigid bodies**: boxes/spheres/tori/capsules, SAT narrowphase with feature-ID
-  warm-started manifolds, hard & soft joints, hinges with servo/velocity motors
-  and limits, springs, fracture, kinematic spinners. CPU reference (port of
-  [avbd-demo3d](https://github.com/savant117/avbd-demo3d)) backs GPU parity tests.
-- **Soft bodies**: 3-DOF particles (exact 3×3 block solve), stable Neo-Hookean
-  tets, voxelized implicit shapes (bunny, rubber tires); tet boundary faces are
-  collision triangles, so soft–soft and rigid-face–soft contact just work.
-- **Cloth**: StVK membrane + quadratic (Bergou) bending elements, hard
-  inextensible rods (AL duals) for structural edges, V-T / E-E / rigid-feature-T
-  contacts on a unified 4-slot stencil with persistent warm-started λ/penalty,
-  friction cones, and topological exclusions.
-- **Detection at scale**: Voronoi temporal tracking (per-vertex/edge Best-4
-  closest-element sets, topology propagation, relative-velocity-staggered grid
-  reseeds), AABB multi-cell element binning, rigid-cell-flagged broadphase.
-- **Rendering**: instanced analytic shapes, soft surfaces with angle×area
-  weighted normals (flat default for cloth, opt-in thickness), GTAO, ACES.
-- **App**: live solver parameters, per-demo material tunables (membrane µ,
-  bending, tet stiffness, friction, …), Small→Colossal scaling, mouse drag,
-  camera-stable resets.
-- **Tests**: 16 suites — accuracy, convergence, stability, friction sweep,
-  mass-ratio stacking, fracture, GPU↔CPU parity, plus adversarial cloth/soft
-  gates (fold interpenetration, forced strip crossing, 8× box-on-cloth,
-  hammock inextensibility, whip energy envelope, soft-block stacking).
-
-**WIP / research**
-- Tets still require strict Gauss-Seidel coloring (Jacobi acceptance failed
-  the battery; membranes accepted it, cloth palette is 2) — tet-heavy scenes
-  keep a 4-5 color primal chain.
-- Robotics Lab: gantry-pusher Push-T environments (11k env-steps/s @ 256),
-  BC visuomotor policy ~90% from pixels; latent world-model (LeWM) planning
-  still below the scripted oracle.
-
 ## Papers & techniques
 
 | Source | What's used |

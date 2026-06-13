@@ -196,7 +196,7 @@ extension Demos {
         }
 
         // ---- blanket (cloth) draped over the lower two thirds ----
-        let n = max(24, res)
+        let n = max(48, res)
         let sizeX: Float = 1.7, sizeY: Float = 2.0
         let spacing = max(sizeX, sizeY) / Float(n - 1)
         let nx = Int(sizeX / spacing), ny = n
@@ -215,9 +215,6 @@ extension Demos {
                      massPerNode: 0.008, friction: friction,
                      membraneMu: membraneMu, membraneBend: bend)
 
-        // a ball bounces onto the bed
-        _ = s.addSphere(diameter: 0.36, density: 1.2, friction: 0.5,
-                        position: F3(0.45, 0.1, 2.4))
         s.settings.cameraDistance = 7.5
         s.settings.cameraTargetZ = 0.8
         return s

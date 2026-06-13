@@ -153,7 +153,7 @@ extension Demos {
                                   membraneMu: Float = 300,
                                   bend: Float = 5e-4) -> PhysicsScene {
         var s = PhysicsScene(name: "boxoncloth")
-        s.settings.iterations = 10
+        s.settings.iterations = 20
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25
@@ -202,7 +202,7 @@ extension Demos {
                                membraneMu: Float = 300,
                                bend: Float = 5e-4) -> PhysicsScene {
         var s = PhysicsScene(name: "hammock")
-        s.settings.iterations = 10
+        s.settings.iterations = 20
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25

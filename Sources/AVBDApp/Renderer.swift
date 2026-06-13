@@ -17,7 +17,7 @@ import AVBDCore
 import simd
 
 // Renderer: PBR (GGX metallic-roughness) + ACES, sRGB-correct framebuffer,
-// SSAO (Alchemy-style, world-position prepass), soft blob shadows,
+// GTAO-style ambient occlusion from a world-position prepass, soft blob shadows,
 // horizon-only fog, analytic instanced geometry for box/sphere/torus/capsule.
 
 let renderShaderSource = """
@@ -223,7 +223,7 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
 }
 
 // ---------------------------------------------------------------------------
-// PBR main fragment (samples the SSAO texture)
+// PBR main fragment (samples the GTAO texture)
 // ---------------------------------------------------------------------------
 fragment float4 pbr_fragment(VOut in [[stage_in]],
                              constant Uniforms& U [[buffer(1)]],
@@ -267,7 +267,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Prepass: world position + normal into two attachments (for SSAO)
+// Prepass: world position + normal into two attachments (for GTAO)
 // ---------------------------------------------------------------------------
 struct PreOut {
     float4 pos  [[color(0)]];   // xyz world, w = 1 (geometry present)
@@ -370,7 +370,7 @@ fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// SSAO (Alchemy / point-based estimator over a spiral kernel)
+// GTAO (horizon-based estimator over screen-space slices)
 // ---------------------------------------------------------------------------
 struct FSOut { float4 position [[position]]; float2 uv; };
 
@@ -382,25 +382,25 @@ vertex FSOut fs_vertex(uint vid [[vertex_id]]) {
     return o;
 }
 
-fragment float4 ssao_fragment(FSOut in [[stage_in]],
+fragment float4 gtao_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
                               texture2d<float> posTex [[texture(0)]],
                               texture2d<float> normTex [[texture(1)]])
 {
-    // GTAO (Jimenez et al. 2016): per pixel, march 2 slices through screen
-    // space, find the two horizon angles per slice, clamp them to the
-    // normal hemisphere, and integrate the visible cosine-weighted arc
-    // analytically. Ground-truth-matching AO for uniform sky visibility.
+    // GTAO (Jimenez et al. 2016 / XeGTAO-style): march several
+    // screen-space slices, find both horizon angles per slice, clamp to the
+    // normal hemisphere, then integrate the cosine-weighted visible arc.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     float4 P4 = posTex.sample(smp, in.uv);
     if (P4.w < 0.5) return float4(1);
     float3 P = P4.xyz;
     float3 N = normalize(normTex.sample(smp, in.uv).xyz);
     float3 V = normalize(U.eye.xyz - P);
-    float dist = length(U.eye.xyz - P);
+    float3 camForward = normalize(cross(U.camRight.xyz, U.camUp.xyz));
+    float viewDepth = max(dot(P - U.eye.xyz, camForward), 0.25);
 
     const float R = 0.9;                                  // world AO radius
-    float pxRadius = U.screen.z * R / max(dist, 0.5);
+    float pxRadius = U.screen.z * R / viewDepth;
     // far away the radius collapses below sampling density — fade AO out
     // instead of letting a few-pixel march invent large-scale occlusion
     float farFade = saturate((pxRadius - 2.5) / 6.0);
@@ -408,7 +408,8 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     pxRadius = min(pxRadius, 96.0);
     // the falloff must use the radius we ACTUALLY march (post-clamp), or
     // near-camera AO reaches past its sampled range and over-darkens
-    float Reff = pxRadius * max(dist, 0.5) / U.screen.z;
+    float Reff = pxRadius * viewDepth / U.screen.z;
+    float falloffRange = max(Reff * 0.65, 1e-4);
 
     // interleaved gradient noise: much better spectral distribution than a
     // sin-hash, so residual error is high-frequency and blurs away cleanly
@@ -420,7 +421,7 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     float stepJit = fract(ign * 7.0 + U.temporal.x * 5.0);
 
     const int SLICES = 3;
-    const int STEPS = 6;
+    const int STEPS = 4;
     float occlusion = 0.0;
 
     for (int sl = 0; sl < SLICES; sl++) {
@@ -437,14 +438,29 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
         if (ol < 1e-4) { occlusion += 1.0; continue; }
         omega /= ol;
 
+        // project N into the slice plane (spanned by V and omega)
+        float3 sliceN = cross(V, omega);
+        float3 projN = N - sliceN * dot(N, sliceN);
+        float projLen = length(projN);
+        if (projLen < 1e-4) { occlusion += 1.0; continue; }
+        float3 pn = projN / projLen;
+        float cosNV = saturate(dot(pn, V));
+        float n = acos(cosNV) * (dot(pn, omega) >= 0.0 ? 1.0 : -1.0);
+
+        // XeGTAO fades discarded/out-of-radius samples toward the normal
+        // hemisphere edge instead of -1, avoiding grazing-angle detail loss.
+        float lowH0 = cos(n + M_PI_F * 0.5);
+        float lowH1 = cos(n - M_PI_F * 0.5);
+
         // horizon cosines per WORLD side of the slice (classified by the
         // actual sample offset, so screen/UV orientation can't flip them)
-        float cosH0 = -1.0, cosH1 = -1.0;
+        float cosH0 = lowH0, cosH1 = lowH1;
+        float minS = min(0.95, 1.3 / max(pxRadius, 1e-3));
         for (int side = 0; side < 2; side++) {
             float sgn = side == 0 ? 1.0 : -1.0;
             for (int st = 1; st <= STEPS; st++) {
-                float t = (float(st) - 1.0 + stepJit) / float(STEPS);
-                t = max(t, 0.02);
+                float u = saturate((float(st) - 1.0 + stepJit) / float(STEPS));
+                float t = minS + (1.0 - minS) * pow(u, 2.0);
                 float2 uv2 = in.uv + sgn * dirPx * (t * pxRadius) / U.screen.xy;
                 float4 Q4 = posTex.sample(smp, uv2);
                 if (Q4.w < 0.5) continue;
@@ -452,21 +468,14 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
                 float l = length(w);
                 if (l < 1e-4) continue;
                 float c = dot(w / l, V);
-                float fade = saturate(1.0 - (l - Reff) / Reff);
-                c = mix(-1.0, c, fade);
-                if (dot(w, omega) >= 0.0) cosH0 = max(cosH0, c);
-                else                      cosH1 = max(cosH1, c);
+                float weight = saturate((Reff - l) / falloffRange);
+                if (dot(w, omega) >= 0.0) {
+                    cosH0 = max(cosH0, mix(lowH0, c, weight));
+                } else {
+                    cosH1 = max(cosH1, mix(lowH1, c, weight));
+                }
             }
         }
-
-        // project N into the slice plane (spanned by V and omega)
-        float3 sliceN = cross(V, omega);
-        float3 projN = N - sliceN * dot(N, sliceN);
-        float projLen = length(projN);
-        if (projLen < 1e-4) { occlusion += 1.0; continue; }
-        float3 pn = projN / projLen;
-        float cosNV = clamp(dot(pn, V), -1.0, 1.0);
-        float n = acos(cosNV) * (dot(pn, omega) >= 0.0 ? 1.0 : -1.0);
 
         // signed horizon angles in the slice plane (+ = toward omega),
         // clamped to the hemisphere around the projected normal
@@ -482,6 +491,7 @@ fragment float4 ssao_fragment(FSOut in [[stage_in]],
     }
     float ao = clamp(occlusion / float(SLICES), 0.0, 1.0);
     ao = pow(ao, 1.25);    // slight contrast shaping
+    ao = max(ao, 0.03);    // visible pixels should not reach total black
     ao = mix(1.0, ao, farFade);
     return float4(ao, ao, ao, 1);
 }
@@ -691,7 +701,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     var boxP, sphereP, torusP, capsuleP, softP: MTLRenderPipelineState!
     var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre: MTLRenderPipelineState!
-    var skyP, floorP, shadowP, ssaoP, blurP, temporalP: MTLRenderPipelineState!
+    var skyP, floorP, shadowP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
     var depthState, noDepthState, noWriteDepthState: MTLDepthStencilState!
 
     var posTex, normTex, aoTexA, aoTexB, preDepthTex: MTLTexture?
@@ -759,7 +769,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         capsulePre = try pipe("capsule_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         floorPreP = try pipe("floor_vertex", "floor_prepass_fragment", samples: 1, colorFormats: preFmt)
         softPre = try pipe("soft_vertex_front", "soft_prepass_fragment", samples: 1, colorFormats: preFmt)
-        ssaoP = try pipe("fs_vertex", "ssao_fragment", samples: 1,
+        gtaoP = try pipe("fs_vertex", "gtao_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
         blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
@@ -940,13 +950,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.endEncoding()
         }
 
-        // ---- 2. SSAO ----
+        // ---- 2. GTAO ----
         let aoPass = MTLRenderPassDescriptor()
         aoPass.colorAttachments[0].texture = aoTexA
         aoPass.colorAttachments[0].loadAction = .dontCare
         aoPass.colorAttachments[0].storeAction = .store
         if let enc = cmd.makeRenderCommandEncoder(descriptor: aoPass) {
-            enc.setRenderPipelineState(ssaoP)
+            enc.setRenderPipelineState(gtaoP)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(posTex, index: 0)
             enc.setFragmentTexture(normTex, index: 1)
