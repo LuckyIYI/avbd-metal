@@ -43,31 +43,3 @@ make app && open AVBD.app                     # interactive app
 .build/release/avbd profile clothfold --scale 16 --frames 80
 .build/release/avbd clothgate drape --frames 300
 ```
-
-Demos: stacks/walls/pyramids, ratio stack, friction-sweep slope, jenga,
-dominoes, bridge, tensegrity, chainmail, treadmill, car, marble run,
-trebuchet, wrecking ball, Rube Goldberg, brick android statue, soft bunny,
-steel-and-rubber cart (`softwheel`), cloth fold/drape/multidrape/hammock/
-ribbons/box-on-cloth, `twist` (a hanging sheet winds into a rope against a
-spinning bar — the OGC stress test), and `bed` (rigid frame + soft
-mattress/pillows + cloth blanket in one solve).
-
-## Performance (M1 Ultra, release, 20 iterations)
-
-| Scene | Bodies / verts | ms/frame |
-|---|---|---|
-| clothfold Colossal | 26k cloth verts | 15.3 |
-| drape on sphere | 20k cloth verts | 9.3 |
-| bed Colossal | 5.5k (rigid+soft+cloth) | 13.8 |
-| softwheel | 1.4k (4 rubber tires) | 6.5 |
-| boxpile ×12 (10 iters) | 28.8k rigid | 9.4 |
-| boxpile ×24 (4 iters) | 115k rigid | 33.6 |
-
-## Notes
-
-- `refs/` (gitignored) holds reference material: the AVBD & OGC papers and
-  third-party sample code. It is not part of the repository history.
-- Metal fast math folds `isinf()` — hard-constraint/fracture logic uses flag
-  bits, never inf compares.
-- Solver parameters (paper Table 2): β ramp 5e3 lin / 1e2 ang, α 0.99,
-  γ 0.999, 10–20 iterations depending on scene; all live-tunable in the app.
