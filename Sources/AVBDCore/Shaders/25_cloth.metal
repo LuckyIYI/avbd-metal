@@ -368,6 +368,7 @@ kernel void vt_emit(
     // order like uints, so atomic_fetch_min on bit patterns works.
     uint n2s = nbr2Start[v], n2e = n2s + nbr2Count[v];
     float boundsCap2 = P.elemCellSize * P.elemCellSize;
+    float ownB2 = FLT_MAX;        // own-vertex bound: one atomic at the end
 
     // candidate evaluation: closest-point distance, with topological
     // exclusion (own / 1-ring triangles never count)
@@ -393,8 +394,7 @@ kernel void vt_emit(
                     && !nbrContains(nbr2List, n2s, n2e, tid_.y)                \
                     && !nbrContains(nbr2List, n2s, n2e, tid_.z)) {             \
                     uint db_ = as_type<uint>(d2_);                             \
-                    atomic_fetch_min_explicit(&bounds[v], db_,                 \
-                                              memory_order_relaxed);           \
+                    ownB2 = min(ownB2, d2_);                                   \
                     atomic_fetch_min_explicit(&bounds[tid_.x], db_,            \
                                               memory_order_relaxed);           \
                     atomic_fetch_min_explicit(&bounds[tid_.y], db_,            \
@@ -452,6 +452,9 @@ kernel void vt_emit(
     }
     vtTrack[v] = uint4(best.id[0], best.id[1], best.id[2], best.id[3]);
     #undef VT_CONSIDER
+    if (ownB2 < FLT_MAX)
+        atomic_fetch_min_explicit(&bounds[v], as_type<uint>(ownB2),
+                                  memory_order_relaxed);
 
     // ---- Emission: OGC-aligned block semantics (paper Sec 3.2). Face
     // blocks push along ±n_t with a persistent side; boundary closest
@@ -619,6 +622,7 @@ kernel void ee_emit(
     // see vt_emit)
     uint n2sx = nbr2Start[eA.x], n2ex = n2sx + nbr2Count[eA.x];
     float boundsCap2 = P.elemCellSize * P.elemCellSize;
+    float ownB2 = FLT_MAX;        // both endpoints' bound: atomics at the end
     #define EE_CONSIDER(E)                                                     \
     {                                                                          \
         uint e_ = (E);                                                         \
@@ -643,10 +647,7 @@ kernel void ee_emit(
                     && !nbrContains(nbr2List, n2sx, n2ex, eB_.x)               \
                     && !nbrContains(nbr2List, n2sx, n2ex, eB_.y)) {            \
                     uint db_ = as_type<uint>(d2_);                             \
-                    atomic_fetch_min_explicit(&bounds[eA.x], db_,              \
-                                              memory_order_relaxed);           \
-                    atomic_fetch_min_explicit(&bounds[eA.y], db_,              \
-                                              memory_order_relaxed);           \
+                    ownB2 = min(ownB2, d2_);                                   \
                     atomic_fetch_min_explicit(&bounds[eB_.x], db_,             \
                                               memory_order_relaxed);           \
                     atomic_fetch_min_explicit(&bounds[eB_.y], db_,             \
@@ -694,6 +695,11 @@ kernel void ee_emit(
     }
     eeTrack[gid] = uint4(best.id[0], best.id[1], best.id[2], best.id[3]);
     #undef EE_CONSIDER
+    if (ownB2 < FLT_MAX) {
+        uint ob_ = as_type<uint>(ownB2);
+        atomic_fetch_min_explicit(&bounds[eA.x], ob_, memory_order_relaxed);
+        atomic_fetch_min_explicit(&bounds[eA.y], ob_, memory_order_relaxed);
+    }
 
     // emit (each pair once: smaller index owns it)
     for (int bi = 0; bi < 4; bi++) {

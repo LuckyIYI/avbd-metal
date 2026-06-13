@@ -308,9 +308,18 @@ kernel void color_iterate(
     device const SoftContactGPU* soft [[buffer(12)]],
     device const MembraneGPU* membranes [[buffer(13)]],
     device const BendGPU* bends     [[buffer(14)]],
+    constant uint& passIdx          [[buffer(15)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
+    // Converged early-out: if the previous pass changed nothing, the
+    // coloring is a fixed point and this pass's dst (written two passes
+    // ago with the same fixed point) is already correct — skip the
+    // adjacency walk. Warm-started colors converge in 1-3 passes on
+    // settled scenes; the remaining passes cost launch latency only.
+    if (passIdx > 0 &&
+        atomic_load_explicit(&changedFlag[passIdx - 1],
+                             memory_order_relaxed) == 0u) return;
     if (posLin[gid].w <= 0.0f) { colorsOut[gid] = 0; return; }
 
     uint myColor = colorsIn[gid];
@@ -336,7 +345,7 @@ kernel void color_iterate(
             newColor = freeHi != 0 ? 32 + ctz(freeHi) : (MAX_COLORS - 1);
         }
         colorsOut[gid] = min(newColor, uint(MAX_COLORS - 1));
-        atomic_fetch_or_explicit(&changedFlag[0], 1u, memory_order_relaxed);
+        atomic_fetch_or_explicit(&changedFlag[passIdx], 1u, memory_order_relaxed);
     } else {
         // Compaction: take the smallest color free w.r.t. ALL dynamic
         // neighbors when it is below the current one. Keeps the palette
@@ -346,6 +355,9 @@ kernel void color_iterate(
         uint best = freeLo != 0 ? ctz(freeLo)
                   : (~allHi != 0 ? 32 + ctz(~allHi) : myColor);
         colorsOut[gid] = best < myColor ? best : myColor;
+        if (best < myColor)
+            atomic_fetch_or_explicit(&changedFlag[passIdx], 1u,
+                                     memory_order_relaxed);
     }
 }
 
@@ -389,7 +401,9 @@ kernel void color_scan(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < MAX_COLORS) {
-        dispatchArgs[tid * 3 + 0] = (counts[tid] + 63) / 64;
+        // x8: the dynamic primal runs the 8-lane cooperative split kernel;
+        // the one-thread-per-body fallback early-outs the excess groups
+        dispatchArgs[tid * 3 + 0] = (counts[tid] * 8 + 63) / 64;
         dispatchArgs[tid * 3 + 1] = 1;
         dispatchArgs[tid * 3 + 2] = 1;
     }

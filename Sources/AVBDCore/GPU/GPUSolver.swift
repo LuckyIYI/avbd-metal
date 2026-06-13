@@ -266,7 +266,7 @@ public final class GPUSolver {
         bodySlot = try makeBuf(nb * 4, "bodySlot")
         colorStart = try makeBuf((AVBD_MAX_COLORS + 2) * 4, "colorStart")
         colorList = try makeBuf(nb * 4, "colorList")
-        changedFlag = try makeBuf(4, "changedFlag")
+        changedFlag = try makeBuf(24 * 4, "changedFlag")  // per-pass slots
 
         counters = try makeBuf(GPUCounters.total * 4, "counters")
         dispatchArgs = try makeBuf(9 * 4, "dispatchArgs")
@@ -1491,6 +1491,7 @@ public final class GPUSolver {
 
         if let blit = cmd1.makeBlitCommandEncoder() {
             blit.fill(buffer: counters, range: 0..<counters.length, value: 0)
+            blit.fill(buffer: changedFlag, range: 0..<changedFlag.length, value: 0)
             blit.fill(buffer: cellCount, range: 0..<(gridHashSize * 4), value: 0)
             blit.fill(buffer: cellRigid, range: 0..<(gridHashSize * 4), value: 0)
             if numTris > 0 {
@@ -1838,7 +1839,7 @@ public final class GPUSolver {
         if usesDynamicColoring {
             stage("coloring")
             var src = colorsA, dst = colorsB
-            for _ in 0..<20 {
+            for pass in 0..<20 {
                 dispatch1D(enc, "color_iterate", numBodies) { e in
                     e.setBuffer(self.posLin, offset: 0, index: 0)
                     e.setBuffer(self.joints, offset: 0, index: 1)
@@ -1855,6 +1856,8 @@ public final class GPUSolver {
                     e.setBuffer(self.softContacts, offset: 0, index: 12)
                     e.setBuffer(self.membranes, offset: 0, index: 13)
                     e.setBuffer(self.bends, offset: 0, index: 14)
+                    var pi = UInt32(pass)
+                    e.setBytes(&pi, length: 4, index: 15)
                 }
                 swap(&src, &dst)
             }
@@ -1965,8 +1968,14 @@ public final class GPUSolver {
         let colorBound = usesDynamicColoring
             ? min(AVBD_MAX_COLORS, max(lastMaxColorUsed + 2, 4))
             : staticUsedColors
-        let primalPSO = usesDynamicColoring ? ps("primal_solve")
-                                            : ps("primal_particles_split")
+        // Rigid scenes use the 8-lane cooperative split primal too: dense
+        // piles average 12-27 manifolds/body and the one-thread-per-body
+        // kernel was latency-bound walking them serially (boxpile x12
+        // solve-primal 9.5 ms). AVBD_NO_RSPLIT restores the old kernel
+        // (the x8 indirect args early-out harmlessly).
+        let noRSplit = ProcessInfo.processInfo.environment["AVBD_NO_RSPLIT"] != nil
+        let primalPSO = (usesDynamicColoring && noRSplit) ? ps("primal_solve")
+                                                          : ps("primal_particles_split")
         // static palettes have fixed per-color counts: dispatch directly
         // (8 lanes per body for the split kernel)
         let splitSizes: [Int] = usesDynamicColoring ? []
