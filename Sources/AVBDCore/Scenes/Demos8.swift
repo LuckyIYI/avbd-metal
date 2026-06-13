@@ -14,7 +14,7 @@ extension Demos {
     public static func softwheel(res: Int = 10, drive: Float = 6,
                                  tireMu: Float = 9000) -> PhysicsScene {
         var s = PhysicsScene(name: "softwheel")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         s.settings.betaLin = 20000
         s.settings.lambdaMax = 5000
         addGround(&s, friction: 0.9)
@@ -150,7 +150,7 @@ extension Demos {
                            membraneMu: Float = 300,
                            bend: Float = 5e-4) -> PhysicsScene {
         var s = PhysicsScene(name: "bed")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         s.settings.betaLin = 20000
         s.settings.particleDamping = 1.5
         s.settings.clothViscosity = 0.25

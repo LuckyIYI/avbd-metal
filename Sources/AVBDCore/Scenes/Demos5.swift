@@ -311,7 +311,7 @@ extension Demos {
     public static func softbody(res: Int = 11, stiffness: Float = 2500,
                                 friction: Float = 0.8) -> PhysicsScene {
         var s = PhysicsScene(name: "softbody")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         s.settings.betaLin = 20000
         s.settings.lambdaMax = 1000
         addGround(&s, friction: friction)

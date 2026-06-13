@@ -116,6 +116,8 @@ public final class GPUSolver {
     // Cached per-frame color counts (read back once per step)
     public internal(set) var lastColorCounts: [Int] = []
     public private(set) var lastNumPairs: Int = 0
+    private var warnedPairSaturation = false
+    private var warnedSoftSaturation = false
     public private(set) var lastNumSoft: Int = 0
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
@@ -137,7 +139,11 @@ public final class GPUSolver {
         self.numJoints = scene.joints.count
         self.numSprings = scene.springs.count
         self.numTets = scene.tets.count
-        self.maxPairs = max(64, scene.bodies.count * maxPairsPerBody)
+        // Floor of 4096: small scenes are cheap (688B/slot) but elongated
+        // shapes (jenga blocks) legitimately exceed 16 candidates/body, and
+        // a saturated pair list silently drops a scheduling-random subset of
+        // pairs each frame — bodies lose ground support and sink/freefall.
+        self.maxPairs = max(4096, scene.bodies.count * maxPairsPerBody)
         self.mapCapacity = Self.nextPow2(2 * maxPairs)
         self.gridHashSize = Self.nextPow2(max(64, 2 * numBodies))
         // Tet BOUNDARY faces are collision triangles too: soft-soft contact
@@ -2149,6 +2155,16 @@ public final class GPUSolver {
                 .bindMemory(to: UInt32.self, capacity: GPUCounters.total)
             let pairs = Int(ctr[GPUCounters.pairs])
             let softN = min(Int(ctr[GPUCounters.soft]), self.maxSoft)
+            // Saturated capacity = contacts silently dropped (random subset,
+            // GPU arrival order) = non-deterministic sink-through. Never hide.
+            if pairs >= self.maxPairs && !self.warnedPairSaturation {
+                self.warnedPairSaturation = true
+                print("AVBD WARNING: pair list saturated (\(pairs)/\(self.maxPairs)) — contacts dropped; raise maxPairsPerBody")
+            }
+            if Int(ctr[GPUCounters.soft]) >= self.maxSoft && !self.warnedSoftSaturation {
+                self.warnedSoftSaturation = true
+                print("AVBD WARNING: soft contact list saturated (\(self.maxSoft)) — contacts dropped")
+            }
             self.statsLock.lock()
             self.lastNumPairs = pairs
             self.lastNumSoft = softN

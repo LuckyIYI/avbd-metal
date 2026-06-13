@@ -204,7 +204,7 @@ public enum Demos {
     /// floor, mid ones decelerate to graded stops, the grippy ones hold.
     public static func slopefriction(count: Int = 8) -> PhysicsScene {
         var s = PhysicsScene(name: "slopefriction")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         addGround(&s, friction: 0.8)
         let tilt: Float = .pi / 6                       // 30 degrees
         let rot = Quat(angle: tilt, axis: F3(0, 1, 0))

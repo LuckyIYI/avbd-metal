@@ -92,7 +92,7 @@ extension Demos {
     /// throw things at it.
     public static func android(scale: Int = 1) -> PhysicsScene {
         var s = PhysicsScene(name: "android")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         s.settings.betaLin = 20000
         s.settings.lambdaMax = 6000
         addGround(&s, friction: 0.6)

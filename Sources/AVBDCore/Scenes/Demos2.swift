@@ -13,7 +13,7 @@ extension Demos {
     /// hangs entirely on rope tension, like the real thing.
     public static func bridge(planks: Int = 14, drops: Int = 4) -> PhysicsScene {
         var s = PhysicsScene(name: "bridge")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         s.settings.lambdaMax = 6000
         addGround(&s, friction: 0.8)
 
@@ -204,7 +204,7 @@ extension Demos {
     /// only prevent tipping. No springs, no tricks — pure chain tension.
     public static func tensegrity(towers: Int = 1) -> PhysicsScene {
         var s = PhysicsScene(name: "tensegrity")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         s.settings.lambdaMax = 4000
         addGround(&s, friction: 0.8)
 
@@ -316,7 +316,7 @@ extension Demos {
     /// orthogonal cross-sticks welded near the post tops.
     public static func chainmail(rings: Int = 6, drops: Int = 3) -> PhysicsScene {
         var s = PhysicsScene(name: "chainmail")
-        s.settings.iterations = 25
+        s.settings.iterations = 15
         s.settings.betaLin = 20000  // fast contact stiffening for snap loads
         s.settings.lambdaMax = 1500 // wedged links must not stockpile force
         addGround(&s, friction: 0.6)
@@ -579,10 +579,9 @@ extension Demos {
     /// Jenga tower: alternating 3-block layers. Pull blocks out with the mouse.
     public static func jenga(levels: Int = 18) -> PhysicsScene {
         var s = PhysicsScene(name: "jenga")
-        // tall friction-only towers live or die on contact convergence:
-        // more iterations + a stiffer penalty ramp keep the seams from
-        // creeping (the default 10 iterations slowly shears high towers)
-        s.settings.iterations = 24
+        // tall friction-only towers need a stiffer penalty ramp so the seams
+        // don't creep; 12 iterations hold 18 levels (validated 600 frames)
+        s.settings.iterations = 12
         s.settings.betaLin = 20000
         addGround(&s, friction: 0.5)
         let bl: Float = 3.0, bw: Float = 1.0, bh: Float = 0.6
@@ -732,7 +731,7 @@ extension Demos {
 
     public static func car(trackScale: Int = 1) -> PhysicsScene {
         var s = PhysicsScene(name: "car")
-        s.settings.iterations = 20
+        s.settings.iterations = 10
         s.settings.betaLin = 20000
         s.settings.lambdaMax = 1200     // wall-seam wedges must not stockpile
                                         // force and launch the car
