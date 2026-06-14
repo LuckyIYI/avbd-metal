@@ -250,8 +250,9 @@ struct SimParams {
     // Hard-rod lambda decay vs per-frame rod rotation: lambda *= cos(dtheta)^p.
     // 0 = off. Carried duals along rotated directions pump pendulum modes.
     float rodDecayPow;
-    // Per-second velocity damping for 3-DOF particles (air drag + internal
-    // viscosity of thin sheets — the reference cloth ships the same knob).
+    // Per-second damping for non-ballistic 3-DOF particle velocity residuals.
+    // Uniform gravity is preserved so soft bodies fall at the same rate as
+    // rigid bodies; this only bleeds solver/contact/internal jitter.
     float particleDamping;
     uint numHashedRigid;    // hashed non-particle bodies (rt scan skip)
     // Element-contact detection margin: COLLISION_MARGIN is a rigid-world
@@ -292,6 +293,23 @@ struct TetGPU {
     float4 r0;          // DmInv row 0; w = rest volume
     float4 r1;          // DmInv row 1; w = mu  * volume
     float4 r2;          // DmInv row 2; w = lambda * volume
+};
+
+// Visual-only tetrahedral skinning record. ids/weights embed one render
+// vertex in a simulated tet; inv rows are that tet's rest Dm^-1 so normals
+// can be transformed by cof(F), matching the TetSkinning reference path.
+struct SkinBindingGPU {
+    uint4 ids;
+    float4 weights;
+    float4 restNormal;
+    float4 inv0;
+    float4 inv1;
+    float4 inv2;
+};
+
+struct SkinVertexGPU {
+    float4 position;
+    float4 normal;
 };
 
 // Element contact (V-T, E-E, rigid-feature-vs-element). ONE record per

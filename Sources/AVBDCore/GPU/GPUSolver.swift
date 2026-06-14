@@ -79,6 +79,11 @@ public final class GPUSolver {
     var surfTriBuf, surfVertsBuf, surfVtStart, surfVtCount, surfVtList: MTLBuffer
     var surfacedFlags, softNormalsBuf, faceNormalsBuf, renderTriBuf: MTLBuffer
     var clothGroupBuf: MTLBuffer
+    // Visual-only tetrahedral skinning buffers. These draw arbitrary mesh
+    // surfaces embedded in tets; collisions still use `trisBuf`.
+    let skinnedVertexCount: Int
+    let skinnedTriCount: Int
+    var skinBindingBuf, skinVertexBuf, skinTriBuf: MTLBuffer
     // Voronoi temporal tracking: per-vertex / per-edge persistent closest-
     // element candidate sets, plus the topology they propagate through.
     var vtTrackBuf, eeTrackBuf, triAdjBuf: MTLBuffer
@@ -153,6 +158,8 @@ public final class GPUSolver {
         // membranes and the render extractor keep using scene.tris/tets.
         self.tetBoundaryTris = Self.tetBoundaryFaces(scene)
         self.numTris = scene.tris.count + tetBoundaryTris.count
+        self.skinnedVertexCount = scene.skinnedMeshes.reduce(0) { $0 + $1.vertices.count }
+        self.skinnedTriCount = scene.skinnedMeshes.reduce(0) { $0 + $1.triangles.count }
         // capacity bound: V-T (4/vertex) + rigid-T (4/tri) + E-E (2/edge,
         // edges <= 3 per tri)
         let particleEstimate = scene.bodies.lazy.filter { $0.isParticle }.count
@@ -249,6 +256,11 @@ public final class GPUSolver {
         faceNormalsBuf = try makeBuf(max(1, maxSurfTris) * 16, "faceNormals")
         renderTriBuf = try makeBuf(max(1, 8 * numTris + 4 * numTets) * 12, "renderTris")
         clothGroupBuf = try makeBuf(nb * 4, "clothGroup")
+        skinBindingBuf = try makeBuf(max(1, skinnedVertexCount) * MemoryLayout<SkinBindingGPU>.stride,
+                                     "skinBindings")
+        skinVertexBuf = try makeBuf(max(1, skinnedVertexCount) * MemoryLayout<SkinVertexGPU>.stride,
+                                    "skinVertices")
+        skinTriBuf = try makeBuf(max(1, skinnedTriCount) * 12, "skinTris")
         vtTrackBuf = try makeBuf(nb * 16, "vtTrack")
         eeTrackBuf = try makeBuf(max(1, maxEdges) * 16, "eeTrack")
         triAdjBuf = try makeBuf(max(1, numTris) * 16, "triAdj")
@@ -293,6 +305,42 @@ public final class GPUSolver {
         case allocFailed(String)
         case shaderCompile(String)
         case kernelMissing(String)
+    }
+
+    private struct UInt64UniqueBuilder {
+        var table: [UInt64]
+        var mask: Int
+
+        init(capacity: Int) {
+            var n = 1
+            while n < max(2, capacity * 2) { n <<= 1 }
+            table = [UInt64](repeating: 0, count: n)
+            mask = n - 1
+        }
+
+        static func hash(_ x: UInt64) -> Int {
+            var h = x
+            h ^= h >> 33
+            h &*= 0xff51afd7ed558ccd
+            h ^= h >> 33
+            h &*= 0xc4ceb9fe1a85ec53
+            h ^= h >> 33
+            return Int(truncatingIfNeeded: h)
+        }
+
+        mutating func insert(_ key: UInt64) -> Bool {
+            let stored = key &+ 1
+            var slot = Self.hash(key) & mask
+            while true {
+                let cur = table[slot]
+                if cur == stored { return false }
+                if cur == 0 {
+                    table[slot] = stored
+                    return true
+                }
+                slot = (slot + 1) & mask
+            }
+        }
     }
 
     static func nextPow2(_ v: Int) -> Int {
@@ -560,17 +608,46 @@ public final class GPUSolver {
             tp[i] = g
         }
 
+        func sortedUnique(_ input: [UInt64]) -> [UInt64] {
+            guard !input.isEmpty else { return [] }
+            var keys = input
+            keys.sort()
+            var out: [UInt64] = []
+            out.reserveCapacity(keys.count)
+            var last = keys[0]
+            out.append(last)
+            for key in keys.dropFirst() where key != last {
+                out.append(key)
+                last = key
+            }
+            return out
+        }
+
+        func sortSmallUInt32(_ a: inout [UInt32]) {
+            guard a.count > 1 else { return }
+            for i in 1..<a.count {
+                let x = a[i]
+                var j = i
+                while j > 0 && a[j - 1] > x {
+                    a[j] = a[j - 1]
+                    j -= 1
+                }
+                a[j] = x
+            }
+        }
+
         // Collision exclusions: sorted (min,max) pairs of jointed/springed bodies
-        var excl: Set<UInt64> = []
+        var excl: [UInt64] = []
+        excl.reserveCapacity(scene.joints.count + scene.springs.count)
         for j in scene.joints where j.bodyA >= 0 {
             let lo = UInt64(min(j.bodyA, j.bodyB)), hi = UInt64(max(j.bodyA, j.bodyB))
-            excl.insert(lo << 32 | hi)
+            excl.append(lo << 32 | hi)
         }
         for s in scene.springs {
             let lo = UInt64(min(s.bodyA, s.bodyB)), hi = UInt64(max(s.bodyA, s.bodyB))
-            excl.insert(lo << 32 | hi)
+            excl.append(lo << 32 | hi)
         }
-        let sortedExcl = excl.sorted()
+        let sortedExcl = sortedUnique(excl)
         let ep = exclusions.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: max(1, sortedExcl.count))
         for (i, key) in sortedExcl.enumerated() {
             ep[i] = SIMD2(UInt32(key >> 32), UInt32(key & 0xFFFFFFFF))
@@ -584,34 +661,44 @@ public final class GPUSolver {
         let collTris: [(Int, Int, Int)] = scene.tris.map { $0.ids } + tetBoundaryTris
         let tp4 = trisBuf.contents().bindMemory(to: SIMD4<UInt32>.self,
                                                 capacity: max(1, numTris))
-        var edgeSet: Set<UInt64> = []
-        var nbrSets = [Set<Int>](repeating: [], count: numBodies)
+        var edgeSet = UInt64UniqueBuilder(capacity: collTris.count * 3)
+        var edgeKeys: [UInt64] = []
+        edgeKeys.reserveCapacity(collTris.count * 3)
         var maxElemR: Float = 0
         for (i, ids) in collTris.enumerated() {
             let (a, b, c) = ids
             tp4[i] = SIMD4(UInt32(a), UInt32(b), UInt32(c), 0)
             for (u, v) in [(a, b), (b, c), (a, c)] {
-                edgeSet.insert(UInt64(min(u, v)) << 32 | UInt64(max(u, v)))
+                let key = UInt64(min(u, v)) << 32 | UInt64(max(u, v))
+                if edgeSet.insert(key) { edgeKeys.append(key) }
             }
-            nbrSets[a].formUnion([b, c]); nbrSets[b].formUnion([a, c])
-            nbrSets[c].formUnion([a, b])
             let pa = scene.bodies[a].position, pb = scene.bodies[b].position
             let pc = scene.bodies[c].position
             let m = (pa + pb + pc) / 3
             let thick = max(scene.bodies[a].size.x, max(scene.bodies[b].size.x,
                                                         scene.bodies[c].size.x)) / 2
             maxElemR = max(maxElemR, max(distance(m, pa), max(distance(m, pb),
-                                                              distance(m, pc))) + thick)
+                                                                              distance(m, pc))) + thick)
         }
-        let sortedEdges = edgeSet.sorted()
-        numEdges = sortedEdges.count
+        numEdges = edgeKeys.count
         let ep2 = edgesBuf.contents().bindMemory(to: SIMD2<UInt32>.self,
                                                  capacity: max(1, numEdges))
-        for (i, key) in sortedEdges.enumerated() {
-            ep2[i] = SIMD2(UInt32(key >> 32), UInt32(key & 0xFFFFFFFF))
-            let a = scene.bodies[Int(key >> 32)], b = scene.bodies[Int(key & 0xFFFFFFFF)]
+        var nbrArrays = [[UInt32]](repeating: [], count: numBodies)
+        var vertEdges: [[UInt32]] = Array(repeating: [], count: numBodies)
+        for (i, key) in edgeKeys.enumerated() {
+            let ai = Int(key >> 32)
+            let bi = Int(key & 0xFFFFFFFF)
+            ep2[i] = SIMD2(UInt32(ai), UInt32(bi))
+            nbrArrays[ai].append(UInt32(bi))
+            nbrArrays[bi].append(UInt32(ai))
+            vertEdges[ai].append(UInt32(i))
+            vertEdges[bi].append(UInt32(i))
+            let a = scene.bodies[ai], b = scene.bodies[bi]
             maxElemR = max(maxElemR, distance(a.position, b.position) / 2
                            + max(a.size.x, b.size.x) / 2)
+        }
+        for i in 0..<numBodies {
+            sortSmallUInt32(&nbrArrays[i])
         }
         // triangle adjacency (shared edges, ALL triangles) for tracker
         // propagation
@@ -635,12 +722,6 @@ public final class GPUSolver {
             triAdjBuf.contents().bindMemory(to: SIMD4<UInt32>.self, capacity: numTris)
                 .update(from: triAdj, count: numTris)
         }
-        // vertex -> incident edges CSR (edge-tracker propagation)
-        var vertEdges: [[UInt32]] = Array(repeating: [], count: numBodies)
-        for (ei, key) in sortedEdges.enumerated() {
-            vertEdges[Int(key >> 32)].append(UInt32(ei))
-            vertEdges[Int(key & 0xFFFFFFFF)].append(UInt32(ei))
-        }
         let vesP = vertEdgeStart.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         let vecP = vertEdgeCount.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         var veFlat: [UInt32] = []
@@ -663,9 +744,8 @@ public final class GPUSolver {
         var flatNbrs: [UInt32] = []
         for i in 0..<numBodies {
             nsP[i] = UInt32(flatNbrs.count)
-            let sorted = nbrSets[i].sorted()
-            ncP[i] = UInt32(sorted.count)
-            flatNbrs.append(contentsOf: sorted.map(UInt32.init))
+            ncP[i] = UInt32(nbrArrays[i].count)
+            flatNbrs.append(contentsOf: nbrArrays[i])
         }
         precondition(flatNbrs.count <= nbrList.length / 4,
                      "neighbor CSR exceeded 6-per-triangle bound")
@@ -681,18 +761,40 @@ public final class GPUSolver {
         let n2sP = nbr2Start.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         let n2cP = nbr2Count.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         var flat2: [UInt32] = []
+        var marks = [UInt32](repeating: 0, count: numBodies)
+        var mark: UInt32 = 1
+        var two: [UInt32] = []
+        two.reserveCapacity(32)
         for i in 0..<numBodies {
             n2sP[i] = UInt32(flat2.count)
-            if nbrSets[i].isEmpty {
+            if nbrArrays[i].isEmpty {
                 n2cP[i] = 0
                 continue
             }
-            var two = nbrSets[i]
-            for nb1 in nbrSets[i] { two.formUnion(nbrSets[nb1]) }
-            two.remove(i)
-            let sorted2 = two.sorted()
-            n2cP[i] = UInt32(sorted2.count)
-            flat2.append(contentsOf: sorted2.map(UInt32.init))
+            mark &+= 1
+            if mark == 0 {
+                marks = [UInt32](repeating: 0, count: numBodies)
+                mark = 1
+            }
+            marks[i] = mark
+            two.removeAll(keepingCapacity: true)
+            for nb1 in nbrArrays[i] {
+                let n1 = Int(nb1)
+                if marks[n1] != mark {
+                    marks[n1] = mark
+                    two.append(nb1)
+                }
+                for nb2 in nbrArrays[n1] {
+                    let n2 = Int(nb2)
+                    if marks[n2] != mark {
+                        marks[n2] = mark
+                        two.append(nb2)
+                    }
+                }
+            }
+            sortSmallUInt32(&two)
+            n2cP[i] = UInt32(two.count)
+            flat2.append(contentsOf: two)
         }
         if !flat2.isEmpty {
             precondition(flat2.count <= nbr2List.length / 4,
@@ -701,9 +803,19 @@ public final class GPUSolver {
                 .update(from: flat2, count: flat2.count)
         }
 
-        // particle list: V-T query points (any 3-DOF particle, cloth or tet)
+        // Collision-surface vertices: V-T queries should come from the
+        // deformable collision surface, not from interior FEM nodes. Interior
+        // tet particles are governed by volume elements; letting them emit
+        // surface contacts creates nonphysical self-pressure and extra work.
+        var surfaceParticleFlags = [UInt8](repeating: 0, count: numBodies)
+        for (a, b, c) in collTris {
+            if scene.bodies[a].isParticle { surfaceParticleFlags[a] = 1 }
+            if scene.bodies[b].isParticle { surfaceParticleFlags[b] = 1 }
+            if scene.bodies[c].isParticle { surfaceParticleFlags[c] = 1 }
+        }
         var particles: [UInt32] = []
-        for (i, b) in scene.bodies.enumerated() where b.isParticle {
+        particles.reserveCapacity(numBodies)
+        for i in 0..<numBodies where surfaceParticleFlags[i] != 0 {
             particles.append(UInt32(i))
         }
         numParticles = numTris == 0 ? 0 : particles.count
@@ -818,7 +930,7 @@ public final class GPUSolver {
         // 1 cm margin exceeds 2r at high resolution and bloats detection)
         var maxPartR: Float = 0
         var edgeLenSum: Float = 0
-        for key in sortedEdges {
+        for key in edgeKeys {
             let a = scene.bodies[Int(key >> 32)], b = scene.bodies[Int(key & 0xFFFFFFFF)]
             maxPartR = max(maxPartR, max(a.size.x, b.size.x) / 2)
             edgeLenSum += distance(a.position, b.position)
@@ -826,9 +938,14 @@ public final class GPUSolver {
         let meanEdge = numEdges > 0 ? edgeLenSum / Float(numEdges) : 0.2
         params.elemMargin = min(0.01, max(0.002, 0.5 * maxPartR))
         // Detection-radius cells (AABB multi-cell insertion): reach must
-        // cover skin + margin + velocity inflation (<= 0.3 cell, hence /0.7)
+        // cover skin + margin + velocity inflation (<= 0.3 cell, hence /0.7).
+        // The broadphase bins fat element AABBs and clamps cover loops to
+        // 3 cells/axis, so the cell also has to cover the largest element
+        // radius plus collision padding.
         let reach = (2 * maxPartR + params.elemMargin) / 0.7
-        params.elemCellSize = max(0.02, max(reach, meanEdge * 1.05))
+        params.elemCellSize = max(0.02, max(max(reach, meanEdge * 1.05),
+                                            maxElemR + maxPartR
+                                                + params.elemMargin))
         params.elemHashSize = UInt32(elemHashSize)
         params.numTris = UInt32(numTris)
         params.numEdges = UInt32(numEdges)
@@ -840,6 +957,16 @@ public final class GPUSolver {
         // boundary faces of tet bodies (faces owned by exactly one tet),
         // wound outward against the opposite rest vertex. Connected
         // components give each sheet/jelly its own color.
+        var skinnedBodies = Set<Int>()
+        for mesh in scene.skinnedMeshes {
+            skinnedBodies.formUnion(mesh.bodyIDs)
+            for v in mesh.vertices {
+                skinnedBodies.insert(v.ids.0)
+                skinnedBodies.insert(v.ids.1)
+                skinnedBodies.insert(v.ids.2)
+                skinnedBodies.insert(v.ids.3)
+            }
+        }
         var surfCorners: [UInt32] = []          // 3 per tri: body | comp<<24
         var triVerts: [[Int]] = []              // per surface tri, its bodies
         var isCloth: [Bool] = []                // thin sheet (two render layers)
@@ -847,30 +974,41 @@ public final class GPUSolver {
             triVerts.append([t.ids.0, t.ids.1, t.ids.2])
             isCloth.append(true)
         }
-        var faceCount: [UInt64: (count: Int, tri: (Int, Int, Int), opp: Int)] = [:]
-        for tet in scene.tets {
-            let ids = [tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3]
-            for (f, o) in [((0, 1, 2), 3), ((0, 3, 1), 2), ((1, 3, 2), 0), ((0, 2, 3), 1)] {
-                let tri = (ids[f.0], ids[f.1], ids[f.2])
-                let sorted3 = [tri.0, tri.1, tri.2].sorted()
-                let key = UInt64(sorted3[0]) << 42 | UInt64(sorted3[1]) << 21 | UInt64(sorted3[2])
-                if var e = faceCount[key] {
-                    e.count += 1
-                    faceCount[key] = e
-                } else {
-                    faceCount[key] = (1, tri, ids[o])
+        let allTetsSkinned = !scene.tets.isEmpty && !skinnedBodies.isEmpty
+            && scene.tets.allSatisfy {
+                skinnedBodies.contains($0.ids.0) && skinnedBodies.contains($0.ids.1)
+                    && skinnedBodies.contains($0.ids.2) && skinnedBodies.contains($0.ids.3)
+            }
+        if !allTetsSkinned {
+            var faceCount: [UInt64: (count: Int, tri: (Int, Int, Int), opp: Int)] = [:]
+            for tet in scene.tets {
+                let ids = [tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3]
+                for (f, o) in [((0, 1, 2), 3), ((0, 3, 1), 2), ((1, 3, 2), 0), ((0, 2, 3), 1)] {
+                    let tri = (ids[f.0], ids[f.1], ids[f.2])
+                    let sorted3 = [tri.0, tri.1, tri.2].sorted()
+                    let key = UInt64(sorted3[0]) << 42 | UInt64(sorted3[1]) << 21 | UInt64(sorted3[2])
+                    if var e = faceCount[key] {
+                        e.count += 1
+                        faceCount[key] = e
+                    } else {
+                        faceCount[key] = (1, tri, ids[o])
+                    }
                 }
             }
-        }
-        for (_, e) in faceCount where e.count == 1 {
-            var (a, b, c) = e.tri
-            // outward winding: flip if the rest normal points toward the
-            // opposite (interior) vertex
-            let pa = scene.bodies[a].position
-            let n = cross(scene.bodies[b].position - pa, scene.bodies[c].position - pa)
-            if dot(n, scene.bodies[e.opp].position - pa) > 0 { swap(&b, &c) }
-            triVerts.append([a, b, c])
-            isCloth.append(false)
+            for (_, e) in faceCount where e.count == 1 {
+                var (a, b, c) = e.tri
+                // outward winding: flip if the rest normal points toward the
+                // opposite (interior) vertex
+                let pa = scene.bodies[a].position
+                let n = cross(scene.bodies[b].position - pa, scene.bodies[c].position - pa)
+                if dot(n, scene.bodies[e.opp].position - pa) > 0 { swap(&b, &c) }
+                if !skinnedBodies.isEmpty && skinnedBodies.contains(a)
+                    && skinnedBodies.contains(b) && skinnedBodies.contains(c) {
+                    continue
+                }
+                triVerts.append([a, b, c])
+                isCloth.append(false)
+            }
         }
         surfaceTriCount = triVerts.count
         if surfaceTriCount > 0 {
@@ -986,6 +1124,68 @@ public final class GPUSolver {
             memset(clothVertFlag.contents(), 0, clothVertFlag.length)
         }
         memset(softNormalsBuf.contents(), 0, softNormalsBuf.length)
+
+        if skinnedVertexCount > 0 {
+            precondition(skinnedVertexCount < (1 << 24), "skin vertex id exceeds render packing")
+            var bindings: [SkinBindingGPU] = []
+            bindings.reserveCapacity(skinnedVertexCount)
+            var skinCorners: [UInt32] = []
+            skinCorners.reserveCapacity(skinnedTriCount * 3)
+            let flags = surfacedFlags.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+            var base = 0
+            for (mi, mesh) in scene.skinnedMeshes.enumerated() {
+                let comp = UInt32(min(mi, 255)) << 24
+                for id in mesh.bodyIDs { flags[id] = 1 }
+                for tri in mesh.triangles {
+                    skinCorners.append(UInt32(base + tri.0) | comp)
+                    skinCorners.append(UInt32(base + tri.1) | comp)
+                    skinCorners.append(UInt32(base + tri.2) | comp)
+                }
+                for v in mesh.vertices {
+                    let ids = [v.ids.0, v.ids.1, v.ids.2, v.ids.3]
+                    for id in ids { flags[id] = 1 }
+                    var g = SkinBindingGPU()
+                    g.ids = SIMD4(UInt32(v.ids.0), UInt32(v.ids.1),
+                                  UInt32(v.ids.2), UInt32(v.ids.3))
+                    g.weights = v.weights
+                    let n = length_squared(v.restNormal) > 1e-12
+                        ? normalize(v.restNormal) : F3(0, 0, 1)
+                    g.restNormal = SIMD4(n, 0)
+                    if length_squared(v.restInv0) + length_squared(v.restInv1)
+                        + length_squared(v.restInv2) > 1e-16 {
+                        g.inv0 = SIMD4(v.restInv0, 0)
+                        g.inv1 = SIMD4(v.restInv1, 0)
+                        g.inv2 = SIMD4(v.restInv2, 0)
+                    } else {
+                        let x0 = scene.bodies[v.ids.0].position
+                        let d0 = scene.bodies[v.ids.1].position - x0
+                        let d1 = scene.bodies[v.ids.2].position - x0
+                        let d2 = scene.bodies[v.ids.3].position - x0
+                        let dm = simd_float3x3(columns: (d0, d1, d2))
+                        let inv = abs(dm.determinant) > 1e-12
+                            ? dm.inverse : matrix_identity_float3x3
+                        g.inv0 = SIMD4(F3(inv.columns.0.x, inv.columns.1.x,
+                                          inv.columns.2.x), 0)
+                        g.inv1 = SIMD4(F3(inv.columns.0.y, inv.columns.1.y,
+                                          inv.columns.2.y), 0)
+                        g.inv2 = SIMD4(F3(inv.columns.0.z, inv.columns.1.z,
+                                          inv.columns.2.z), 0)
+                    }
+                    bindings.append(g)
+                }
+                base += mesh.vertices.count
+            }
+            precondition(bindings.count == skinnedVertexCount)
+            precondition(skinCorners.count == skinnedTriCount * 3)
+            skinBindingBuf.contents().bindMemory(to: SkinBindingGPU.self,
+                                                 capacity: bindings.count)
+                .update(from: bindings, count: bindings.count)
+            if !skinCorners.isEmpty {
+                skinTriBuf.contents().bindMemory(to: UInt32.self,
+                                                 capacity: skinCorners.count)
+                    .update(from: skinCorners, count: skinCorners.count)
+            }
+        }
 
         // ---- Static topology coloring (computed ONCE; contacts do not
         // constrain colors — same-color contact pairs degrade to Jacobi,
@@ -1605,6 +1805,7 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
             e.setBuffer(self.shapeType, offset: 0, index: 12)
             e.setBuffer(self.spinVel, offset: 0, index: 13)
+            e.setBuffer(self.velLin, offset: 0, index: 14)
         }
 
         stage("persistence-map")
@@ -1633,7 +1834,8 @@ public final class GPUSolver {
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.trisBuf, offset: 0, index: 1)
                 e.setBuffer(self.edgesBuf, offset: 0, index: 2)
-                e.setBuffer(self.elemCellCount, offset: 0, index: 3)
+                e.setBuffer(self.shape, offset: 0, index: 3)
+                e.setBuffer(self.elemCellCount, offset: 0, index: 4)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
             }
             encodeScan(enc, input: elemCellCount, output: elemCellStart, count: elemHashSize)
@@ -1647,9 +1849,10 @@ public final class GPUSolver {
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.trisBuf, offset: 0, index: 1)
                 e.setBuffer(self.edgesBuf, offset: 0, index: 2)
-                e.setBuffer(self.elemSlot, offset: 0, index: 3)
-                e.setBuffer(self.elemCells, offset: 0, index: 4)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
+                e.setBuffer(self.shape, offset: 0, index: 3)
+                e.setBuffer(self.elemSlot, offset: 0, index: 4)
+                e.setBuffer(self.elemCells, offset: 0, index: 5)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
             }
             stage("vt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
@@ -2324,8 +2527,7 @@ public final class GPUSolver {
             let inv = q.conjugate
             let o = inv.act(origin - F3(pl[i].x, pl[i].y, pl[i].z))
             let d = inv.act(dir)
-            let stp = shapeType.contents().bindMemory(to: UInt32.self, capacity: numBodies)
-            if stp[i] != 0 {
+            if st[i] != 0 {
                 // sphere/torus: pick against bounding sphere (good enough for grab)
                 let r = sh[i].w
                 let b = dot(o, d)
@@ -2415,6 +2617,18 @@ public final class GPUSolver {
             enc.dispatchThreadgroups(MTLSize(width: (surfVertCount + 255) / 256, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
+        if skinnedVertexCount > 0 {
+            let ps = ps("skin_deform")
+            enc.setComputePipelineState(ps)
+            enc.setBuffer(posLin, offset: 0, index: 0)
+            enc.setBuffer(skinBindingBuf, offset: 0, index: 1)
+            enc.setBuffer(skinVertexBuf, offset: 0, index: 2)
+            var nv = UInt32(skinnedVertexCount)
+            enc.setBytes(&nv, length: 4, index: 3)
+            enc.dispatchThreadgroups(MTLSize(width: (skinnedVertexCount + 255) / 256,
+                                             height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
         enc.endEncoding()
     }
 
@@ -2427,6 +2641,14 @@ public final class GPUSolver {
                                positions: MTLBuffer, normals: MTLBuffer)? {
         guard renderTriCount > 0 else { return nil }
         return (renderTriBuf, renderTriCount, posLin, softNormalsBuf)
+    }
+
+    /// Skinned visual mesh render data, nil if the scene has no embedded
+    /// visual surfaces. Vertices are refreshed by encodeBuildInstances.
+    public var renderSkinnedSurface: (tris: MTLBuffer, triCount: Int,
+                                      vertices: MTLBuffer)? {
+        guard skinnedTriCount > 0 else { return nil }
+        return (skinTriBuf, skinnedTriCount, skinVertexBuf)
     }
 
     public var bodyCount: Int { numBodies }

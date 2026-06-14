@@ -77,6 +77,77 @@ final class SoftBodyTests: XCTestCase {
                              "ball must rest on the bunny's back, not pass to the floor")
     }
 
+    func testSkinnedSoftMeshUploadsAndSteps() throws {
+        let p: [F3] = [
+            F3(-0.5, -0.5, 0), F3(0.5, -0.5, 0), F3(0.5, 0.5, 0), F3(-0.5, 0.5, 0),
+            F3(-0.5, -0.5, 1), F3(0.5, -0.5, 1), F3(0.5, 0.5, 1), F3(-0.5, 0.5, 1)
+        ]
+        let tris = [
+            (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+            (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5),
+            (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)
+        ]
+        let mesh = SurfaceMesh(vertices: p, normals: [], triangles: tris)
+        var scene = PhysicsScene(name: "skin-cube")
+        Demos.addGround(&scene)
+        _ = Demos.addSkinnedSoftMesh(&scene, mesh: mesh, center: F3(0, 0, 0.08),
+                                     height: 1.0, res: 3, visualVertexLimit: 64,
+                                     minTetElements: 1,
+                                     mu: 1800)
+        XCTAssertEqual(scene.skinnedMeshes.count, 1)
+        XCTAssertEqual(scene.skinnedMeshes[0].triangles.count, tris.count)
+        XCTAssertGreaterThan(scene.tets.count, 0)
+
+        let gpu = try GPUSolver(scene: scene)
+        XCTAssertNotNil(gpu.renderSkinnedSurface)
+        for _ in 0..<5 { gpu.step() }
+        XCTAssertTrue(gpu.bodyPosition(1).z.isFinite)
+    }
+
+    func testMeshSoftBodiesDropOnPinnedClothBuilds() throws {
+        let scene = Demos.meshclothdrop(res: 10, scale: 1)
+        XCTAssertGreaterThanOrEqual(scene.skinnedMeshes.count, 2)
+        XCTAssertGreaterThan(scene.tris.count, 0)
+        for mesh in scene.skinnedMeshes {
+            let bodies = Set(mesh.bodyIDs)
+            let tets = scene.tets.filter {
+                bodies.contains($0.ids.0) && bodies.contains($0.ids.1)
+                    && bodies.contains($0.ids.2) && bodies.contains($0.ids.3)
+            }
+            XCTAssertGreaterThanOrEqual(tets.count, 600)
+        }
+        let pinned = scene.joints.filter {
+            $0.bodyA == -1 && scene.bodies[$0.bodyB].isParticle
+                && $0.stiffnessLin.isInfinite
+        }
+        XCTAssertGreaterThanOrEqual(pinned.count, 4)
+        XCTAssertTrue(scene.bodies.contains { !$0.isParticle && $0.density > 0 })
+
+        let gpu = try GPUSolver(scene: scene)
+        XCTAssertNotNil(gpu.renderSkinnedSurface)
+        for _ in 0..<8 { gpu.step() }
+        XCTAssertTrue(gpu.maxConstraintError().isFinite)
+    }
+
+    func testSkinnedBunnyDropsIntoRigidBox() throws {
+        let scene = Demos.skinnedbunny(res: 8, count: 2)
+        XCTAssertEqual(scene.skinnedMeshes.count, 2)
+        let staticBoxes = scene.bodies.filter { !$0.isParticle && $0.density == 0 && $0.shape == .box }
+        XCTAssertGreaterThanOrEqual(staticBoxes.count, 6)
+        for mesh in scene.skinnedMeshes {
+            let bodies = Set(mesh.bodyIDs)
+            let tets = scene.tets.filter {
+                bodies.contains($0.ids.0) && bodies.contains($0.ids.1)
+                    && bodies.contains($0.ids.2) && bodies.contains($0.ids.3)
+            }
+            XCTAssertGreaterThanOrEqual(tets.count, 1500)
+        }
+        let gpu = try GPUSolver(scene: scene)
+        XCTAssertNotNil(gpu.renderSkinnedSurface)
+        for _ in 0..<5 { gpu.step() }
+        XCTAssertTrue(gpu.maxConstraintError().isFinite)
+    }
+
     func testSoftBlocksDontInterpenetrate() throws {
         // Soft-soft contact is element-based (soft V-V sphere pairs are
         // banned at broadphase): without tet BOUNDARY faces as collision

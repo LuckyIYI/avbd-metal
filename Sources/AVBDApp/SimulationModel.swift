@@ -49,6 +49,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
     private var lastStepTime: Double = CACurrentMediaTime()
     private var msEMA: Double = 0
     private var frameCounter = 0
+    private var resetGeneration = 0
 
     init() {
         reset(adoptSceneDefaults: true)
@@ -59,33 +60,67 @@ final class SimulationModel: ObservableObject, RenderableModel {
     /// demo adopts that scene's own tuned defaults (each demo is tuned;
     /// e.g. the castle needs its own iterations/beta).
     func reset(adoptSceneDefaults: Bool = false) {
-        guard var scene = Demos.make(demoName, scale: scale, params: demoParams)
-        else { return }
-        dragJoint = scene.addDragSlot()
-        if adoptSceneDefaults {
-            adopting = true
-            iterations = Double(scene.settings.iterations)
-            alpha = Double(scene.settings.alpha)
-            betaLin = Double(scene.settings.betaLin)
-            gamma = Double(scene.settings.gamma)
-            gravity = Double(scene.settings.gravity)
-            adopting = false
-        } else {
-            // restart with the user's current settings, as set up in the UI
-            scene.settings.iterations = Int(iterations)
-            scene.settings.alpha = Float(alpha)
-            scene.settings.betaLin = Float(betaLin)
-            scene.settings.gamma = Float(gamma)
-            scene.settings.gravity = Float(gravity)
-        }
-        do {
-            solver = try GPUSolver(scene: scene)
-        } catch {
-            statsText = "solver init failed: \(error)"
-            solver = nil
-        }
+        resetGeneration += 1
+        let generation = resetGeneration
+        let name = demoName
+        let sceneScale = scale
+        let params = demoParams
+        let current = (iterations: iterations, alpha: alpha, betaLin: betaLin,
+                       gamma: gamma, gravity: gravity)
+        solver = nil
+        dragJoint = -1
         dragBody = nil
+        statsText = "loading..."
         lastStepTime = CACurrentMediaTime()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard var scene = Demos.make(name, scale: sceneScale, params: params) else {
+                DispatchQueue.main.async {
+                    guard generation == self.resetGeneration else { return }
+                    self.statsText = "unknown demo: \(name)"
+                }
+                return
+            }
+            let dragSlot = scene.addDragSlot()
+            if !adoptSceneDefaults {
+                // restart with the user's current settings, as set up in the UI
+                scene.settings.iterations = Int(current.iterations)
+                scene.settings.alpha = Float(current.alpha)
+                scene.settings.betaLin = Float(current.betaLin)
+                scene.settings.gamma = Float(current.gamma)
+                scene.settings.gravity = Float(current.gravity)
+            }
+            let adoptedSettings = scene.settings
+            let result: Result<GPUSolver, Error> = Result {
+                try GPUSolver(scene: scene)
+            }
+            DispatchQueue.main.async {
+                guard generation == self.resetGeneration else { return }
+                switch result {
+                case .success(let newSolver):
+                    if adoptSceneDefaults {
+                        self.adopting = true
+                        self.iterations = Double(adoptedSettings.iterations)
+                        self.alpha = Double(adoptedSettings.alpha)
+                        self.betaLin = Double(adoptedSettings.betaLin)
+                        self.gamma = Double(adoptedSettings.gamma)
+                        self.gravity = Double(adoptedSettings.gravity)
+                        self.adopting = false
+                    }
+                    self.solver = newSolver
+                    self.dragJoint = dragSlot
+                    self.dragBody = nil
+                    self.stepAccumulator = 0
+                    self.lastStepTime = CACurrentMediaTime()
+                    self.statsText = ""
+                case .failure(let error):
+                    self.statsText = "solver init failed: \(error)"
+                    self.solver = nil
+                    self.dragJoint = -1
+                    self.dragBody = nil
+                }
+            }
+        }
     }
 
     private func push() {

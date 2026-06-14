@@ -1875,13 +1875,17 @@ kernel void finalize_velocities(
     if (gid >= P.numBodies) return;
     prevVelLin[gid] = velLin[gid];
     if (posLin[gid].w > 0.0f) {
+        float3 oldV = velLin[gid].xyz;
         float3 v = (posLin[gid].xyz - initLin[gid].xyz) / P.dt;
         // Safety clamp: prevents tunneling of violently flung bodies
         float s2 = dot(v, v);
         if (s2 > P.maxSpeed * P.maxSpeed) v *= P.maxSpeed * rsqrt(s2);
-        // particle drag (thin-sheet air resistance; see SimParams)
+        // Particle damping must not alter uniform ballistic motion: soft
+        // bodies and rigids must fall at the same rate in gravity. Damp only
+        // solver/contact/internal residual velocity relative to free fall.
         if (shape[gid].w < 0.0f && P.particleDamping > 0.0f) {
-            v *= 1.0f / (1.0f + P.particleDamping * P.dt);
+            float3 ballistic = oldV + float3(0, 0, P.gravity) * P.dt;
+            v = ballistic + (v - ballistic) / (1.0f + P.particleDamping * P.dt);
         }
         velLin[gid] = float4(v, 0);
         velAng[gid] = float4(q_sub(posAng[gid], initAng[gid]) / P.dt, 0);

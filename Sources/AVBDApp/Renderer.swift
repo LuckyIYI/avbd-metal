@@ -30,6 +30,11 @@ struct RenderInstance {
     float4 params;      // torus/capsule dims; z = bounding radius, w = dynamic flag
 };
 
+struct SkinRenderVertex {
+    float4 position;
+    float4 normal;
+};
+
 struct Uniforms {
     float4x4 viewProj;
     float4 lightDir;    // xyz
@@ -219,6 +224,24 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
     o.flatShade = ((packed >> 21) & 1u) != 0 ? 1.0 : 0.0;
     // warm fabric-ish tones, one per sheet/body
     o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 7u + 2u), 0.72));
+    return o;
+}
+
+vertex VOut skin_vertex(uint vid [[vertex_id]],
+                        device const uint* corners [[buffer(0)]],
+                        constant Uniforms& U [[buffer(1)]],
+                        device const SkinRenderVertex* verts [[buffer(2)]])
+{
+    uint packed = corners[vid];
+    uint v = packed & 0x00FFFFFFu;
+    uint comp = packed >> 24;
+    SkinRenderVertex sv = verts[v];
+    VOut o;
+    o.position = U.viewProj * float4(sv.position.xyz, 1);
+    o.world = sv.position.xyz;
+    o.normal = normalize(sv.normal.xyz);
+    o.flatShade = 0.0;
+    o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 5u + 11u), 0.76));
     return o;
 }
 
@@ -699,8 +722,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     let queue: MTLCommandQueue
     weak var model: (AnyObject & RenderableModel)?
 
-    var boxP, sphereP, torusP, capsuleP, softP: MTLRenderPipelineState!
-    var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre: MTLRenderPipelineState!
+    var boxP, sphereP, torusP, capsuleP, softP, skinP: MTLRenderPipelineState!
+    var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre: MTLRenderPipelineState!
     var skyP, floorP, shadowP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
     var depthState, noDepthState, noWriteDepthState: MTLDepthStencilState!
 
@@ -758,6 +781,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         torusP = try pipe("torus_vertex", "pbr_fragment")
         capsuleP = try pipe("capsule_vertex", "pbr_fragment")
         softP = try pipe("soft_vertex", "soft_fragment")
+        skinP = try pipe("skin_vertex", "soft_fragment")
         skyP = try pipe("fs_vertex", "sky_fragment")
         floorP = try pipe("floor_vertex", "floor_fragment")
         shadowP = try pipe("shadow_vertex", "shadow_fragment", blend: true)
@@ -769,6 +793,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         capsulePre = try pipe("capsule_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         floorPreP = try pipe("floor_vertex", "floor_prepass_fragment", samples: 1, colorFormats: preFmt)
         softPre = try pipe("soft_vertex_front", "soft_prepass_fragment", samples: 1, colorFormats: preFmt)
+        skinPre = try pipe("skin_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         gtaoP = try pipe("fs_vertex", "gtao_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
         blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
@@ -947,6 +972,14 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: surf.triCount * 3)
             }
+            if let skin = solver.renderSkinnedSurface {
+                enc.setRenderPipelineState(skinPre)
+                enc.setVertexBuffer(skin.tris, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: skin.triCount * 3)
+            }
             enc.endEncoding()
         }
 
@@ -1042,6 +1075,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: surf.triCount * 3)
+        }
+        if let skin = solver.renderSkinnedSurface {
+            enc.setRenderPipelineState(skinP)
+            enc.setVertexBuffer(skin.tris, offset: 0, index: 0)
+            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexA, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: skin.triCount * 3)
         }
         enc.endEncoding()
 

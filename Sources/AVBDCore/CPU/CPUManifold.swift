@@ -85,9 +85,18 @@ public final class CPUManifold: CPUForce {
             contacts[i].C0.z -= dot(basis.2, rel)
 
             contacts[i].lambda *= solver.alpha * solver.gamma
+            let minMass = [bodyA.mass, bodyB.mass].filter { $0 > 0 }.min()
+            let kFloor = min(AVBDConstants.penaltyMax,
+                             max(AVBDConstants.penaltyMin,
+                                 (minMass ?? 0) / max(solver.dt * solver.dt, 1e-12)))
+            let penaltyMin = F3(kFloor,
+                                min(kFloor, AVBDConstants.penaltyMaxTangent),
+                                min(kFloor, AVBDConstants.penaltyMaxTangent))
+            let penaltyMax = F3(AVBDConstants.penaltyMax,
+                                AVBDConstants.penaltyMaxTangent,
+                                AVBDConstants.penaltyMaxTangent)
             contacts[i].penalty = simd_clamp(contacts[i].penalty * solver.gamma,
-                                             F3(repeating: AVBDConstants.penaltyMin),
-                                             F3(repeating: AVBDConstants.penaltyMax))
+                                             penaltyMin, penaltyMax)
         }
 
         return !contacts.isEmpty

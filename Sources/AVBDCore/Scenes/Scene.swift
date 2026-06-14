@@ -122,6 +122,49 @@ public struct SceneTet {
     }
 }
 
+/// A visual-only vertex embedded in a simulated tetrahedron. The four ids
+/// point at 3-DOF soft-body particles; `weights` are rest-pose barycentric
+/// coordinates in that tet. Rendering updates this vertex from the current
+/// tet deformation every frame, while collision remains owned by the tet
+/// boundary triangles.
+public struct SceneSkinnedVertex {
+    public var ids: (Int, Int, Int, Int)
+    public var weights: SIMD4<Float>
+    public var restNormal: F3
+    public var restInv0: F3
+    public var restInv1: F3
+    public var restInv2: F3
+
+    public init(ids: (Int, Int, Int, Int), weights: SIMD4<Float>,
+                restNormal: F3,
+                restInv0: F3 = .zero,
+                restInv1: F3 = .zero,
+                restInv2: F3 = .zero) {
+        self.ids = ids
+        self.weights = weights
+        self.restNormal = restNormal
+        self.restInv0 = restInv0
+        self.restInv1 = restInv1
+        self.restInv2 = restInv2
+    }
+}
+
+/// Visual mesh skinned to a tetrahedral soft body. Triangles index the local
+/// `vertices` array. This mesh is not used for contact generation.
+public struct SceneSkinnedMesh {
+    public var vertices: [SceneSkinnedVertex]
+    public var triangles: [(Int, Int, Int)]
+    public var bodyIDs: [Int]
+
+    public init(vertices: [SceneSkinnedVertex],
+                triangles: [(Int, Int, Int)],
+                bodyIDs: [Int] = []) {
+        self.vertices = vertices
+        self.triangles = triangles
+        self.bodyIDs = bodyIDs
+    }
+}
+
 public struct SceneSpring {
     public var bodyA: Int
     public var bodyB: Int
@@ -179,10 +222,10 @@ public struct SimSettings {
     /// Carried lambda re-applied along rotated rod directions pumps the
     /// pendulum modes of swinging sheets.
     public var rodDecayPow: Float = 0
-    /// Per-second velocity damping applied to 3-DOF particles only (air
-    /// drag + internal viscosity of thin sheets). Inextensible cloth has
-    /// no material compliance to bleed energy through; without a touch of
-    /// drag, free skirts and hems flutter forever.
+    /// Per-second damping applied to non-ballistic 3-DOF particle velocity
+    /// residuals only. Uniform gravity is preserved so soft bodies and
+    /// rigid bodies free-fall at the same rate; damping bleeds
+    /// solver/contact/internal jitter.
     public var particleDamping: Float = 0
     /// Internal sheet viscosity: per-frame blend of each particle velocity
     /// toward its topological 1-ring average (0..1). Damps relative flutter
@@ -209,6 +252,7 @@ public struct PhysicsScene {
     public var springs: [SceneSpring] = []
     public var tets: [SceneTet] = []
     public var tris: [SceneTri] = []
+    public var skinnedMeshes: [SceneSkinnedMesh] = []
     public var spinners: [SceneSpinner] = []
     public var settings = SimSettings()
 
@@ -280,6 +324,7 @@ public struct PhysicsScene {
     public mutating func addSpring(_ s: SceneSpring) { springs.append(s) }
     public mutating func addTet(_ t: SceneTet) { tets.append(t) }
     public mutating func addTri(_ t: SceneTri) { tris.append(t) }
+    public mutating func addSkinnedMesh(_ m: SceneSkinnedMesh) { skinnedMeshes.append(m) }
 
     /// Build a CPU reference solver from this scene.
     public func makeCPUSolver() -> CPUSolver {

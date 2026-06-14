@@ -6,7 +6,7 @@ using namespace metal;
 // closest points (port of avbd-demo3d collide.cpp). One thread per pair.
 // Warm-starts each contact from the previous frame's manifold (pair hash
 // map lookup + feature key match), then initializes C0 / lambda / penalty
-// exactly as the AVBD initialize step requires.
+// for the AVBD solve.
 // ============================================================================
 
 #define NP_MAX_POLY 16
@@ -47,6 +47,10 @@ struct NPAxisBest {
 
 inline bool npTestAxis(thread const NPBox& A, thread const NPBox& B, float3 delta,
                        float3 axis, int type, int ia, int ib,
+                       float3 relVel, float speculativeCap,
+                       device const float4* posLin, device const float4* shape,
+                       uint bodyA, uint bodyB,
+                       constant SimParams& P,
                        thread NPAxisBest& best) {
     float lenSq = dot(axis, axis);
     if (lenSq < SAT_EPS) return true;
@@ -59,7 +63,15 @@ inline bool npTestAxis(thread const NPBox& A, thread const NPBox& B, float3 delt
     float rB = B.half3_.x * fabs(dot(n, B.ax0)) + B.half3_.y * fabs(dot(n, B.ax1)) + B.half3_.z * fabs(dot(n, B.ax2));
 
     float separation = distance - (rA + rB);
-    if (separation > 0.0f) return false;
+    float approach = max(0.0f, -dot(relVel, n));
+    bool aStatic = posLin[bodyA].w == 0.0f;
+    bool bStatic = posLin[bodyB].w == 0.0f;
+    uint staticID = aStatic ? bodyA : bodyB;
+    float3 s = shape[staticID].xyz;
+    bool broadFloor = min(s.x, s.y) > 20.0f && s.z <= 0.15f * min(s.x, s.y);
+    bool floorLike = (aStatic != bStatic) && broadFloor && fabs(n.z) > 0.95f;
+    float allowed = floorLike ? min(approach * P.dt, speculativeCap) : 0.0f;
+    if (separation > allowed) return false;
 
     if (!best.valid || separation > best.separation) {
         best.valid = true;
@@ -70,6 +82,44 @@ inline bool npTestAxis(thread const NPBox& A, thread const NPBox& B, float3 delt
         best.normalAB = n;
     }
     return true;
+}
+
+inline float npSpeculativeCap(float radiusA, float radiusB) {
+    float r = min(fabs(radiusA), fabs(radiusB));
+    return min(0.25f, max(4.0f * COLLISION_MARGIN, 3.0f * r));
+}
+
+inline float npDetectMargin(float3 n, float3 relVel, constant SimParams& P,
+                            float radiusA, float radiusB,
+                            device const float4* posLin,
+                            device const float4* shape,
+                            uint ia, uint ib) {
+    float approach = max(0.0f, -dot(relVel, n));
+    bool aStatic = posLin[ia].w == 0.0f;
+    bool bStatic = posLin[ib].w == 0.0f;
+    uint staticID = aStatic ? ia : ib;
+    float3 s = shape[staticID].xyz;
+    bool broadFloor = min(s.x, s.y) > 20.0f && s.z <= 0.15f * min(s.x, s.y);
+    bool floorLike = (aStatic != bStatic) && broadFloor && fabs(n.z) > 0.95f;
+    float allowed = floorLike
+        ? min(approach * P.dt, npSpeculativeCap(radiusA, radiusB)) : 0.0f;
+    return COLLISION_MARGIN + allowed;
+}
+
+inline float3 npPenaltyFloor(device const float4* posLin, uint ia, uint ib,
+                             constant SimParams& P) {
+    float mA = posLin[ia].w;
+    float mB = posLin[ib].w;
+    float minMass = min(mA > 0.0f ? mA : FLT_MAX,
+                        mB > 0.0f ? mB : FLT_MAX);
+    if (minMass == FLT_MAX) return float3(PENALTY_MIN);
+    float k = min(PENALTY_MAX, max(PENALTY_MIN,
+                                   minMass / max(P.dt * P.dt, 1e-12f)));
+    return float3(k, min(k, PENALTY_MAX_T), min(k, PENALTY_MAX_T));
+}
+
+inline float3 npPenaltyCeil() {
+    return float3(PENALTY_MAX, PENALTY_MAX_T, PENALTY_MAX_T);
 }
 
 inline void npFaceAxes(thread const NPBox& box, int axisIndex,
@@ -253,6 +303,7 @@ kernel void np_collide(
     constant SimParams& P           [[buffer(11)]],
     device const uint* shapeType    [[buffer(12)]],
     device const float4* spinVel    [[buffer(13)]],
+    device const float4* velLin     [[buffer(14)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
@@ -265,6 +316,9 @@ kernel void np_collide(
     float4 pB4 = posLin[ib];
     float4 qA = posAng[ia];
     float4 qB = posAng[ib];
+    float3 vA = velLin[ia].xyz;
+    float3 vB = velLin[ib].xyz;
+    float3 relVel = vB - vA;
 
     NPBox A, B;
     A.center = pA4.xyz; A.half3_ = shape[ia].xyz * 0.5f;
@@ -311,8 +365,13 @@ kernel void np_collide(
             float3 q = npClosestOnSegment(pO, c0, c1);
             float3 d = pO - q;
             float dist = length(d);
-            if (dist <= rc + rs + COLLISION_MARGIN) {
-                nCO = dist > 1e-6f ? d / dist : float3(0, 0, 1);
+            float3 nTmp = dist > 1e-6f ? d / dist : float3(0, 0, 1);
+            float3 relCO = cIsA ? (vB - vA) : (vA - vB);
+            float detectM = npDetectMargin(nTmp, relCO, P,
+                                           shape[ic].w, shape[io].w,
+                                           posLin, shape, ic, io);
+            if (dist <= rc + rs + detectM) {
+                nCO = nTmp;
                 hits2[0].xA = q + nCO * rc;        // on capsule
                 hits2[0].xB = pO - nCO * rs;       // on sphere
                 hits2[0].feature = 0;
@@ -327,8 +386,13 @@ kernel void np_collide(
             npClosestSegSeg(c0, c1, o0, o1, qa, qb);
             float3 d = qb - qa;
             float dist = length(d);
-            if (dist <= rc + ro + COLLISION_MARGIN) {
-                nCO = dist > 1e-6f ? d / dist : float3(0, 0, 1);
+            float3 nTmp = dist > 1e-6f ? d / dist : float3(0, 0, 1);
+            float3 relCO = cIsA ? (vB - vA) : (vA - vB);
+            float detectM = npDetectMargin(nTmp, relCO, P,
+                                           shape[ic].w, shape[io].w,
+                                           posLin, shape, ic, io);
+            if (dist <= rc + ro + detectM) {
+                nCO = nTmp;
                 hits2[0].xA = qa + nCO * rc;
                 hits2[0].xB = qb - nCO * ro;
                 hits2[0].feature = 0;
@@ -362,8 +426,12 @@ kernel void np_collide(
                     n = -q_rotate(qO, nl);            // capsule -> box
                     bw = q - n * pen[axisI];
                 } else {
-                    if (dist - rc > COLLISION_MARGIN) continue;
                     n = d / dist;
+                    float3 relCO = cIsA ? (vB - vA) : (vA - vB);
+                    float detectM = npDetectMargin(n, relCO, P,
+                                                   shape[ic].w, shape[io].w,
+                                                   posLin, shape, ic, io);
+                    if (dist - rc > detectM) continue;
                 }
                 bool dup = false;
                 for (int h = 0; h < nh; h++) {
@@ -432,7 +500,8 @@ kernel void np_collide(
             C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
                                       xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
             lambda *= warm;
-            penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
+            penalty = clamp(penalty * P.gamma,
+                            npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
             outM.contacts[i].rA = float4(rA_, as_type<float>(hits2[i].feature));
             outM.contacts[i].rB = float4(rB_, 0.0f);
             outM.contacts[i].C0 = float4(C0, 0);
@@ -643,7 +712,8 @@ kernel void np_collide(
             C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
                                       xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
             lambda *= warm;
-            penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
+            penalty = clamp(penalty * P.gamma,
+                            npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
             outM.contacts[i].rA = float4(rA_, as_type<float>(hits[i].feature));
             outM.contacts[i].rB = float4(rB_, 0.0f);
             outM.contacts[i].C0 = float4(C0, 0);
@@ -663,11 +733,14 @@ kernel void np_collide(
         if (sphA && sphB) {
             float3 d = A.center - B.center;
             float dist = length(d);
-            if (dist > rA + rB + COLLISION_MARGIN) {
+            float3 nTmp = dist > 1e-9f ? d / dist : float3(0, 0, 1);
+            float detectM = npDetectMargin(nTmp, vA - vB, P, rA, rB,
+                                           posLin, shape, ia, ib);
+            if (dist > rA + rB + detectM) {
                 outM.header = uint4(ia, ib, 0, 0);
                 return;
             }
-            nrm = dist > 1e-9f ? d / dist : float3(0, 0, 1);
+            nrm = nTmp;
             contacts[0].xA = A.center - nrm * rA;
             contacts[0].xB = B.center + nrm * rB;
             contacts[0].feature = 0;
@@ -700,11 +773,19 @@ kernel void np_collide(
             } else {
                 float3 d = local - clamped;
                 float dist = length(d);
-                if (dist > r + COLLISION_MARGIN) {
+                float3 nLocalTmp = d / max(dist, 1e-9f);
+                float3 nWTmp = q_rotate(qBox, nLocalTmp);      // box -> sphere
+                float3 vSphere = sIsA ? vA : vB;
+                float3 vBox = sIsA ? vB : vA;
+                float detectM = npDetectMargin(nWTmp, vSphere - vBox, P,
+                                               r, sIsA ? shape[ib].w : shape[ia].w,
+                                               posLin, shape, sIsA ? ia : ib,
+                                               sIsA ? ib : ia);
+                if (dist > r + detectM) {
                     outM.header = uint4(ia, ib, 0, 0);
                     return;
                 }
-                nLocal = d / max(dist, 1e-9f);
+                nLocal = nLocalTmp;
                 qLocal = clamped;
             }
 
@@ -787,7 +868,8 @@ kernel void np_collide(
             C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
                                       xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
             lambda *= warm;
-            penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
+            penalty = clamp(penalty * P.gamma,
+                            npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
             outM.contacts[i].rA = float4(rA_, as_type<float>(contacts[i].feature));
             outM.contacts[i].rB = float4(rB_, stick);
             outM.contacts[i].C0 = float4(C0, 0);
@@ -802,15 +884,21 @@ kernel void np_collide(
 
     bool separated = false;
     for (int i = 0; i < 3 && !separated; i++) {
-        if (!npTestAxis(A, B, delta, npAxis(A, i), 0, i, -1, bestFace)) separated = true;
+        if (!npTestAxis(A, B, delta, npAxis(A, i), 0, i, -1,
+                        relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
+                        posLin, shape, ia, ib, P, bestFace)) separated = true;
     }
     for (int i = 0; i < 3 && !separated; i++) {
-        if (!npTestAxis(A, B, delta, npAxis(B, i), 1, -1, i, bestFace)) separated = true;
+        if (!npTestAxis(A, B, delta, npAxis(B, i), 1, -1, i,
+                        relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
+                        posLin, shape, ia, ib, P, bestFace)) separated = true;
     }
     for (int i = 0; i < 3 && !separated; i++) {
         for (int j = 0; j < 3 && !separated; j++) {
             float3 axis = cross(npAxis(A, i), npAxis(B, j));
-            if (!npTestAxis(A, B, delta, axis, 2, i, j, bestEdge)) separated = true;
+            if (!npTestAxis(A, B, delta, axis, 2, i, j,
+                            relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
+                            posLin, shape, ia, ib, P, bestEdge)) separated = true;
         }
     }
 
@@ -885,10 +973,11 @@ kernel void np_collide(
         prefix |= uint(refAxis & 0xFF) << 16;
         prefix |= uint(incAxis & 0xFF) << 8;
 
+        float faceClipSlop = PLANE_EPS + max(0.0f, best.separation);
         for (int i = 0; i < n && count < MAX_CONTACTS; i++) {
             float3 pInc = poly0[i];
             float d = dot(pInc - refCenter, refNormal);
-            if (d > PLANE_EPS) continue;
+            if (d > faceClipSlop) continue;
             float3 pRef = pInc - refNormal * d;
             float3 xA = refIsA ? pRef : pInc;
             float3 xB = refIsA ? pInc : pRef;
@@ -955,7 +1044,8 @@ kernel void np_collide(
 
         // Warm-start (Eq. 19)
         lambda *= warm;
-        penalty = clamp(penalty * P.gamma, PENALTY_MIN, PENALTY_MAX);
+        penalty = clamp(penalty * P.gamma,
+                        npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
 
         outM.contacts[i].rA = float4(rA, as_type<float>(contacts[i].feature));
         outM.contacts[i].rB = float4(rB, stick);

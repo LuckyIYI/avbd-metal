@@ -158,3 +158,39 @@ kernel void soft_normals(
                 * mix(0.25f, 1.0f, saturate(coherence * coherence));
     normalsOut[v] = float4(softSafeNormalize(acc), thick);
 }
+
+kernel void skin_deform(
+    device const float4* posLin             [[buffer(0)]],
+    device const SkinBindingGPU* bindings   [[buffer(1)]],
+    device SkinVertexGPU* out               [[buffer(2)]],
+    constant uint& numVerts                 [[buffer(3)]],
+    uint gid                                [[thread_position_in_grid]])
+{
+    if (gid >= numVerts) return;
+    SkinBindingGPU b = bindings[gid];
+    float3 q0 = posLin[b.ids.x].xyz;
+    float3 q1 = posLin[b.ids.y].xyz;
+    float3 q2 = posLin[b.ids.z].xyz;
+    float3 q3 = posLin[b.ids.w].xyz;
+
+    float4 w = b.weights;
+    float3 p = q0 * w.x + q1 * w.y + q2 * w.z + q3 * w.w;
+
+    // F = Ds * Dm^-1. With columns e0/e1/e2 for Ds and rows inv0..2 for
+    // Dm^-1, each F column is Ds times the corresponding inverse column.
+    float3 e0 = q1 - q0;
+    float3 e1 = q2 - q0;
+    float3 e2 = q3 - q0;
+    float3 f0 = e0 * b.inv0.x + e1 * b.inv1.x + e2 * b.inv2.x;
+    float3 f1 = e0 * b.inv0.y + e1 * b.inv1.y + e2 * b.inv2.y;
+    float3 f2 = e0 * b.inv0.z + e1 * b.inv1.z + e2 * b.inv2.z;
+
+    // Normal transform is inverse(transpose(F)); cof(F) is the same up to
+    // determinant scale, which drops out under normalize.
+    float3 n0 = b.restNormal.xyz;
+    float3 n = cross(f1, f2) * n0.x + cross(f2, f0) * n0.y + cross(f0, f1) * n0.z;
+    if (length(n) < 1e-10f) n = n0;
+
+    out[gid].position = float4(p, 1);
+    out[gid].normal = float4(softSafeNormalize(n), 0);
+}

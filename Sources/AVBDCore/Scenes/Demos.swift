@@ -21,7 +21,8 @@ public enum Demos {
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
          "wreckingball", "trebuchet", "rubegoldberg",
-         "slopefriction", "softbody", "softwheel", "android",
+         "slopefriction", "softbody", "skinnedbunny", "meshclothdrop",
+         "softwheel", "android",
          "clothfold", "boxoncloth", "hammock", "drape", "multidrape",
          "clothcombo", "flagwhip", "ribbons", "twist", "bed"]
     }
@@ -51,6 +52,11 @@ public enum Demos {
                               membrane, bending]
         case "softbody": return [fric(0.8),
                                  DemoParam("stiffness", "Stiffness µ", 500...8000, 2500)]
+        case "skinnedbunny": return [fric(0.8),
+                                     DemoParam("stiffness", "Stiffness µ", 500...8000, 2500)]
+        case "meshclothdrop": return [fric(0.8),
+                                      DemoParam("stiffness", "Soft µ", 500...8000, 2500),
+                                      membrane, bending]
         case "bed": return [fric(0.7),
                             DemoParam("mattressMu", "Mattress µ", 600...8000, 2500),
                             DemoParam("pillowMu", "Pillow µ", 100...2500, 600),
@@ -71,6 +77,15 @@ public enum Demos {
         func p(_ key: String, _ def: Float) -> Float {
             let v = params[key] ?? -1
             return v < 0 ? def : v
+        }
+        func skinnedCount(_ scale: Int) -> Int {
+            switch scale {
+            case 1: return 1
+            case 2: return 4
+            case 4: return 10
+            case 8: return 22
+            default: return 36
+            }
         }
         switch name {
         case "stack": return stack(height: 10 * s)
@@ -103,6 +118,16 @@ public enum Demos {
         case "softbody": return softbody(res: res ?? min(22, 9 + 2 * s),
                                          stiffness: p("stiffness", 2500),
                                          friction: p("friction", 0.8))
+        case "skinnedbunny": return skinnedbunny(res: res ?? min(7, 5 + s / 4),
+                                                 count: skinnedCount(s),
+                                                 stiffness: p("stiffness", 2500),
+                                                 friction: p("friction", 0.8))
+        case "meshclothdrop": return meshclothdrop(res: res ?? min(36, 18 + 2 * s),
+                                                   scale: s,
+                                                   stiffness: p("stiffness", 2500),
+                                                   friction: p("friction", 0.8),
+                                                   membraneMu: p("membrane", 300),
+                                                   bend: p("bending", 5) * 1e-4)
         case "clothfold": return clothfold(res: res ?? (36 + 12 * s),
                                            friction: p("friction", 0.9),
                                            membraneMu: p("membrane", 300),

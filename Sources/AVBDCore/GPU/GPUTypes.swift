@@ -70,6 +70,20 @@ public struct TetGPU {
     public var r2: SIMD4<Float> = .zero
 }
 
+public struct SkinBindingGPU {
+    public var ids: SIMD4<UInt32> = .zero
+    public var weights: SIMD4<Float> = .zero
+    public var restNormal: SIMD4<Float> = .zero
+    public var inv0: SIMD4<Float> = .zero
+    public var inv1: SIMD4<Float> = .zero
+    public var inv2: SIMD4<Float> = .zero
+}
+
+public struct SkinVertexGPU {
+    public var position: SIMD4<Float> = .zero
+    public var normal: SIMD4<Float> = .zero
+}
+
 public struct SoftContactGPU {
     public var ids: SIMD4<UInt32> = .zero
     public var normal: SIMD4<Float> = .zero

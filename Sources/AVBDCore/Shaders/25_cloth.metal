@@ -141,6 +141,7 @@ kernel void softmap_insert(
 // most ~2 cells per axis with stretch headroom.
 // ----------------------------------------------------------------------------
 inline void elemBounds(device const float4* posLin,
+                       device const float4* shape,
                        device const uint4* tris,
                        device const uint2* edges,
                        constant SimParams& P, uint gid,
@@ -149,13 +150,17 @@ inline void elemBounds(device const float4* posLin,
     if (gid < P.numTris) {
         uint4 t = tris[gid];
         float3 a = posLin[t.x].xyz, b = posLin[t.y].xyz, c = posLin[t.z].xyz;
-        lo = min(min(a, b), c);
-        hi = max(max(a, b), c);
+        float pad = max(fabs(shape[t.x].w),
+                        max(fabs(shape[t.y].w), fabs(shape[t.z].w)))
+                  + P.elemMargin;
+        lo = min(min(a, b), c) - float3(pad);
+        hi = max(max(a, b), c) + float3(pad);
     } else {
         uint2 e = edges[gid - P.numTris];
         float3 a = posLin[e.x].xyz, b = posLin[e.y].xyz;
-        lo = min(a, b);
-        hi = max(a, b);
+        float pad = max(fabs(shape[e.x].w), fabs(shape[e.y].w)) + P.elemMargin;
+        lo = min(a, b) - float3(pad);
+        hi = max(a, b) + float3(pad);
     }
 }
 
@@ -163,14 +168,15 @@ kernel void el_count(
     device const float4* posLin     [[buffer(0)]],
     device const uint4* tris        [[buffer(1)]],
     device const uint2* edges       [[buffer(2)]],
-    device atomic_uint* cellCount   [[buffer(3)]],
+    device const float4* shape      [[buffer(3)]],
+    device atomic_uint* cellCount   [[buffer(4)]],
     constant SimParams& P           [[buffer(5)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint total = P.numTris + P.numEdges;
     if (gid >= total) return;
     float3 lo, hi;
-    elemBounds(posLin, tris, edges, P, gid, lo, hi);
+    elemBounds(posLin, shape, tris, edges, P, gid, lo, hi);
     int3 c0 = cellCoord(lo, P.elemCellSize);
     int3 c1 = min(cellCoord(hi, P.elemCellSize), c0 + 2);
     for (int z = c0.z; z <= c1.z; z++)
@@ -185,15 +191,16 @@ kernel void el_scatter(
     device const float4* posLin     [[buffer(0)]],
     device const uint4* tris        [[buffer(1)]],
     device const uint2* edges       [[buffer(2)]],
-    device atomic_uint* cellCursor  [[buffer(3)]],
-    device uint* cellElems          [[buffer(4)]],
-    constant SimParams& P           [[buffer(5)]],
+    device const float4* shape      [[buffer(3)]],
+    device atomic_uint* cellCursor  [[buffer(4)]],
+    device uint* cellElems          [[buffer(5)]],
+    constant SimParams& P           [[buffer(6)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint total = P.numTris + P.numEdges;
     if (gid >= total) return;
     float3 lo, hi;
-    elemBounds(posLin, tris, edges, P, gid, lo, hi);
+    elemBounds(posLin, shape, tris, edges, P, gid, lo, hi);
     uint entry = gid < P.numTris ? gid : (ELEM_EDGE_BIT | (gid - P.numTris));
     int3 c0 = cellCoord(lo, P.elemCellSize);
     int3 c1 = min(cellCoord(hi, P.elemCellSize), c0 + 2);
