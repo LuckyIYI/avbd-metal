@@ -352,6 +352,8 @@ kernel void vt_emit(
     device const uint* nbr2Start    [[buffer(22)]],
     device const uint* nbr2Count    [[buffer(23)]],
     device const uint* nbr2List     [[buffer(24)]],
+    device const uint* clothGroup   [[buffer(25)]],
+    device const uint* clothVert    [[buffer(26)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numParticles) return;
@@ -361,6 +363,8 @@ kernel void vt_emit(
     float rv = fabs(shape[v].w);
     float3 velV = velLin[v].xyz;
     uint ns = nbrStart[v], ne = ns + nbrCount[v];
+    uint gv = clothGroup[v];
+    bool solidV = gv != 0 && clothVert[v] == 0;
 
     Best4 best;
     best4Init(best);
@@ -385,6 +389,12 @@ kernel void vt_emit(
         if (t_ < P.numTris && !best4Has(best, t_)) {                           \
             uint4 tid_ = tris[t_];                                             \
             if (tid_.x != v && tid_.y != v && tid_.z != v) {                   \
+                bool sameSolid_ = solidV && clothGroup[tid_.x] == gv            \
+                    && clothGroup[tid_.y] == gv && clothGroup[tid_.z] == gv     \
+                    && clothVert[tid_.x] == 0 && clothVert[tid_.y] == 0         \
+                    && clothVert[tid_.z] == 0;                                  \
+                if (sameSolid_) {                                               \
+                } else {                                                        \
                 float3 ba_;                                                    \
                 float3 q_ = closestPtTriangle(pv, posLin[tid_.x].xyz,          \
                                               posLin[tid_.y].xyz,              \
@@ -408,6 +418,7 @@ kernel void vt_emit(
                                               memory_order_relaxed);           \
                     atomic_fetch_min_explicit(&bounds[tid_.z], db_,            \
                                               memory_order_relaxed);           \
+                }                                                              \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -441,8 +452,10 @@ kernel void vt_emit(
     }
     float vThresh = 0.25f * P.elemCellSize / max(P.dt, 1e-6f);
     uint period = dot(relV, relV) > vThresh * vThresh ? 1u : 7u;
+    bool missingTracked = best.id[0] == 0xFFFFFFFFu;
     bool reseed = ((v + P.frame) & period) == 0u
-               || best.id[0] == 0xFFFFFFFFu;
+               || (missingTracked && !solidV)
+               || (missingTracked && solidV && ((v + P.frame) & 3u) == 0u);
     if (reseed) {
         int3 cc = cellCoord(pv, P.elemCellSize);
         for (int dz = -1; dz <= 1; dz++)
@@ -612,6 +625,8 @@ kernel void ee_emit(
     device const uint* nbr2Start    [[buffer(23)]],
     device const uint* nbr2Count    [[buffer(24)]],
     device const uint* nbr2List     [[buffer(25)]],
+    device const uint* clothGroup   [[buffer(26)]],
+    device const uint* clothVert    [[buffer(27)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numEdges) return;
@@ -621,6 +636,9 @@ kernel void ee_emit(
     float3 velA = (velLin[eA.x].xyz + velLin[eA.y].xyz) * 0.5f;
     uint nsx = nbrStart[eA.x], nex = nsx + nbrCount[eA.x];
     uint nsy = nbrStart[eA.y], ney = nsy + nbrCount[eA.y];
+    uint gA = clothGroup[eA.x];
+    bool solidA = gA != 0 && clothGroup[eA.y] == gA
+        && clothVert[eA.x] == 0 && clothVert[eA.y] == 0;
 
     Best4 best;
     best4Init(best);
@@ -637,6 +655,11 @@ kernel void ee_emit(
             uint2 eB_ = edges[e_];                                             \
             if (eB_.x != eA.x && eB_.x != eA.y                                 \
                 && eB_.y != eA.x && eB_.y != eA.y) {                           \
+                bool sameSolid_ = solidA && clothGroup[eB_.x] == gA             \
+                    && clothGroup[eB_.y] == gA                                  \
+                    && clothVert[eB_.x] == 0 && clothVert[eB_.y] == 0;          \
+                if (sameSolid_) {                                               \
+                } else {                                                        \
                 float s_, t_;                                                  \
                 float3 b0_ = posLin[eB_.x].xyz, b1_ = posLin[eB_.y].xyz;       \
                 eeClosestSegSeg(a0, a1, b0_, b1_, s_, t_);                     \
@@ -659,6 +682,7 @@ kernel void ee_emit(
                                               memory_order_relaxed);           \
                     atomic_fetch_min_explicit(&bounds[eB_.y], db_,             \
                                               memory_order_relaxed);           \
+                }                                                              \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -683,8 +707,10 @@ kernel void ee_emit(
     }
     float vThresh = 0.25f * P.elemCellSize / max(P.dt, 1e-6f);
     uint period = dot(relV, relV) > vThresh * vThresh ? 1u : 7u;
+    bool missingTracked = best.id[0] == 0xFFFFFFFFu;
     bool reseed = ((gid + P.frame) & period) == 0u
-               || best.id[0] == 0xFFFFFFFFu;
+               || (missingTracked && !solidA)
+               || (missingTracked && solidA && ((gid + P.frame) & 3u) == 0u);
     if (reseed) {
         float3 mid = (a0 + a1) * 0.5f;
         int3 cc = cellCoord(mid, P.elemCellSize);

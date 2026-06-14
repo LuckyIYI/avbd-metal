@@ -106,6 +106,23 @@ final class GPUSolverTests: XCTestCase {
         XCTAssertLessThan(spin, 0.05, "symmetric floor impact added spin: \(spin)")
     }
 
+    func testFastBoxDoesNotTunnelThroughWall() throws {
+        var scene = PhysicsScene(name: "fast-wall-box")
+        scene.settings.gravity = 0
+        _ = scene.addBody(size: F3(0.2, 20, 20), density: 0, friction: 0.7,
+                          position: F3(0, 0, 0))
+        let box = scene.addBody(size: F3(1, 1, 1), density: 1, friction: 0.5,
+                                position: F3(-0.72, 0, 0), velocity: F3(18, 0, 0))
+        let solver = try makeGPU(scene)
+
+        var maxX = -Float.greatestFiniteMagnitude
+        for _ in 0..<20 {
+            solver.step()
+            maxX = max(maxX, solver.bodyPosition(box).x)
+        }
+        XCTAssertLessThan(maxX, -0.55, "fast box center crossed wall support: \(maxX)")
+    }
+
     func testFastParticleDoesNotStartBelowFloor() throws {
         var scene = PhysicsScene(name: "fast-floor-particle")
         _ = scene.addBody(size: F3(200, 200, 2), density: 0, friction: 0.7,

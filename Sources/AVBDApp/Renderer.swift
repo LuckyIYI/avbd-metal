@@ -906,10 +906,11 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
 
-        let count = solver.bodyCount
+        let bodyCount = solver.bodyCount
+        let rigidCount = solver.renderRigidBodyCount
         let stride = MemoryLayout<simd_float4x4>.stride + 32
-        if instances == nil || instances!.length < count * stride {
-            instances = device.makeBuffer(length: max(256, count * stride),
+        if instances == nil || instances!.length < max(1, rigidCount) * stride {
+            instances = device.makeBuffer(length: max(256, max(1, rigidCount) * stride),
                                           options: .storageModePrivate)
         }
         guard let instances, let posTex, let normTex, let aoTexA, let aoTexB,
@@ -954,13 +955,15 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setRenderPipelineState(floorPreP)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-            for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
-                               (torusPre!, TORV), (capsulePre!, CAPV)] {
-                enc.setRenderPipelineState(p)
-                enc.setVertexBuffer(instances, offset: 0, index: 0)
-                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: verts, instanceCount: count)
+            if rigidCount > 0 {
+                for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
+                                   (torusPre!, TORV), (capsulePre!, CAPV)] {
+                    enc.setRenderPipelineState(p)
+                    enc.setVertexBuffer(instances, offset: 0, index: 0)
+                    enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: verts, instanceCount: rigidCount)
+                }
             }
             if let surf = solver.renderSurface {
                 enc.setRenderPipelineState(softPre)
@@ -1049,21 +1052,25 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
         enc.setDepthStencilState(noWriteDepthState)
-        enc.setRenderPipelineState(shadowP)
-        enc.setVertexBuffer(instances, offset: 0, index: 0)
-        enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
-                           instanceCount: count)
-
-        enc.setDepthStencilState(depthState)
-        for (p, verts) in [(boxP!, 36), (sphereP!, SPHV), (torusP!, TORV), (capsuleP!, CAPV)] {
-            enc.setRenderPipelineState(p)
+        if rigidCount > 0 {
+            enc.setRenderPipelineState(shadowP)
             enc.setVertexBuffer(instances, offset: 0, index: 0)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.setFragmentTexture(aoTexA, index: 0)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: verts, instanceCount: count)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
+                               instanceCount: rigidCount)
+        }
+
+        enc.setDepthStencilState(depthState)
+        if rigidCount > 0 {
+            for (p, verts) in [(boxP!, 36), (sphereP!, SPHV), (torusP!, TORV), (capsuleP!, CAPV)] {
+                enc.setRenderPipelineState(p)
+                enc.setVertexBuffer(instances, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentTexture(aoTexA, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: verts, instanceCount: rigidCount)
+            }
         }
         if let surf = solver.renderSurface {
             enc.setRenderPipelineState(softP)
@@ -1093,7 +1100,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         framesDrawn += 1
         if framesDrawn == 30, ProcessInfo.processInfo.environment["AVBD_MARKER"] != nil {
-            let info = "frames=30 bodies=\(count) stats=\(model.statsText)"
+            let info = "frames=30 bodies=\(bodyCount) rigidInstances=\(rigidCount) stats=\(model.statsText)"
             try? info.write(toFile: "/tmp/avbd_render_marker.txt", atomically: true, encoding: .utf8)
         }
         // Scripted capture: AVBD_SHOT=<path.png> [AVBD_SHOT_FRAME=n] writes

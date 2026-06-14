@@ -78,6 +78,8 @@ public final class GPUSolver {
     // for smooth normals, and the per-body surfaced flag.
     var surfTriBuf, surfVertsBuf, surfVtStart, surfVtCount, surfVtList: MTLBuffer
     var surfacedFlags, softNormalsBuf, faceNormalsBuf, renderTriBuf: MTLBuffer
+    var renderBodyIdxBuf: MTLBuffer
+    public private(set) var renderRigidBodyCount: Int = 0
     var clothGroupBuf: MTLBuffer
     // Visual-only tetrahedral skinning buffers. These draw arbitrary mesh
     // surfaces embedded in tets; collisions still use `trisBuf`.
@@ -255,6 +257,7 @@ public final class GPUSolver {
         softNormalsBuf = try makeBuf(nb * 16, "softNormals")
         faceNormalsBuf = try makeBuf(max(1, maxSurfTris) * 16, "faceNormals")
         renderTriBuf = try makeBuf(max(1, 8 * numTris + 4 * numTets) * 12, "renderTris")
+        renderBodyIdxBuf = try makeBuf(max(1, nb) * 4, "renderBodyIdx")
         clothGroupBuf = try makeBuf(nb * 4, "clothGroup")
         skinBindingBuf = try makeBuf(max(1, skinnedVertexCount) * MemoryLayout<SkinBindingGPU>.stride,
                                      "skinBindings")
@@ -489,7 +492,8 @@ public final class GPUSolver {
 
         // Partition into hashed vs global bodies. Globals: statics or bodies
         // far larger than the median dynamic radius (keeps grid cells tight).
-        let medianRadius = radii.sorted()[max(0, radii.count / 2 - (radii.isEmpty ? 0 : 0))]
+        let sortedRadii = radii.sorted()
+        let medianRadius = sortedRadii.isEmpty ? 0.5 : sortedRadii[sortedRadii.count / 2]
         let threshold = medianRadius * 4
         var hashed: [UInt32] = []
         var globals: [UInt32] = []
@@ -661,36 +665,49 @@ public final class GPUSolver {
         let collTris: [(Int, Int, Int)] = scene.tris.map { $0.ids } + tetBoundaryTris
         let tp4 = trisBuf.contents().bindMemory(to: SIMD4<UInt32>.self,
                                                 capacity: max(1, numTris))
-        var edgeSet = UInt64UniqueBuilder(capacity: collTris.count * 3)
-        var edgeKeys: [UInt64] = []
-        edgeKeys.reserveCapacity(collTris.count * 3)
+        var topoEdgeSet = UInt64UniqueBuilder(capacity: collTris.count * 3)
+        var topoEdgeKeys: [UInt64] = []
+        topoEdgeKeys.reserveCapacity(collTris.count * 3)
+        var contactEdgeSet = UInt64UniqueBuilder(capacity: scene.tris.count * 3)
+        var contactEdgeKeys: [UInt64] = []
+        contactEdgeKeys.reserveCapacity(scene.tris.count * 3)
         var maxElemR: Float = 0
+        var maxCollisionParticleRadius: Float = 0
         for (i, ids) in collTris.enumerated() {
             let (a, b, c) = ids
             tp4[i] = SIMD4(UInt32(a), UInt32(b), UInt32(c), 0)
+            let emitsEE = i < scene.tris.count
             for (u, v) in [(a, b), (b, c), (a, c)] {
                 let key = UInt64(min(u, v)) << 32 | UInt64(max(u, v))
-                if edgeSet.insert(key) { edgeKeys.append(key) }
+                if topoEdgeSet.insert(key) { topoEdgeKeys.append(key) }
+                if emitsEE && contactEdgeSet.insert(key) {
+                    contactEdgeKeys.append(key)
+                }
             }
             let pa = scene.bodies[a].position, pb = scene.bodies[b].position
             let pc = scene.bodies[c].position
             let m = (pa + pb + pc) / 3
             let thick = max(scene.bodies[a].size.x, max(scene.bodies[b].size.x,
                                                         scene.bodies[c].size.x)) / 2
+            maxCollisionParticleRadius = max(maxCollisionParticleRadius, thick)
             maxElemR = max(maxElemR, max(distance(m, pa), max(distance(m, pb),
                                                                               distance(m, pc))) + thick)
         }
-        numEdges = edgeKeys.count
+        numEdges = contactEdgeKeys.count
         let ep2 = edgesBuf.contents().bindMemory(to: SIMD2<UInt32>.self,
                                                  capacity: max(1, numEdges))
         var nbrArrays = [[UInt32]](repeating: [], count: numBodies)
         var vertEdges: [[UInt32]] = Array(repeating: [], count: numBodies)
-        for (i, key) in edgeKeys.enumerated() {
+        for key in topoEdgeKeys {
+            let ai = Int(key >> 32)
+            let bi = Int(key & 0xFFFFFFFF)
+            nbrArrays[ai].append(UInt32(bi))
+            nbrArrays[bi].append(UInt32(ai))
+        }
+        for (i, key) in contactEdgeKeys.enumerated() {
             let ai = Int(key >> 32)
             let bi = Int(key & 0xFFFFFFFF)
             ep2[i] = SIMD2(UInt32(ai), UInt32(bi))
-            nbrArrays[ai].append(UInt32(bi))
-            nbrArrays[bi].append(UInt32(ai))
             vertEdges[ai].append(UInt32(i))
             vertEdges[bi].append(UInt32(i))
             let a = scene.bodies[ai], b = scene.bodies[bi]
@@ -813,6 +830,42 @@ public final class GPUSolver {
             if scene.bodies[b].isParticle { surfaceParticleFlags[b] = 1 }
             if scene.bodies[c].isParticle { surfaceParticleFlags[c] = 1 }
         }
+        // Soft collision groups are part of the contact model, not rendering.
+        // Skinned tet meshes intentionally hide their generated collision
+        // shell from the renderer; deriving these groups from render surfaces
+        // made skinned soft bodies fall back to expensive particle-pair
+        // broadphase in addition to V-T/E-E element contacts.
+        let groupP = clothGroupBuf.contents().bindMemory(to: UInt32.self,
+                                                         capacity: numBodies)
+        for i in 0..<numBodies { groupP[i] = 0 }
+        if !collTris.isEmpty {
+            var parent: [Int: Int] = [:]
+            func findCollisionRoot(_ x: Int) -> Int {
+                var r = x
+                while let p = parent[r], p != r { r = p }
+                var c = x
+                while let p = parent[c], p != r { parent[c] = r; c = p }
+                if parent[r] == nil { parent[r] = r }
+                return r
+            }
+            for (a, b, c) in collTris {
+                let r = findCollisionRoot(a)
+                parent[findCollisionRoot(b)] = r
+                parent[findCollisionRoot(c)] = r
+            }
+            var groupIndex: [Int: UInt32] = [:]
+            for (a, b, c) in collTris {
+                let root = findCollisionRoot(a)
+                if groupIndex[root] == nil {
+                    groupIndex[root] = UInt32(groupIndex.count + 1)
+                }
+                let g = groupIndex[root]!
+                if scene.bodies[a].isParticle { groupP[a] = g }
+                if scene.bodies[b].isParticle { groupP[b] = g }
+                if scene.bodies[c].isParticle { groupP[c] = g }
+            }
+            params.numSoftGroups = UInt32(groupIndex.count)
+        }
         var particles: [UInt32] = []
         particles.reserveCapacity(numBodies)
         for i in 0..<numBodies where surfaceParticleFlags[i] != 0 {
@@ -928,14 +981,14 @@ public final class GPUSolver {
 
         // Element-contact margin scales with the cloth skin (the rigid
         // 1 cm margin exceeds 2r at high resolution and bloats detection)
-        var maxPartR: Float = 0
+        var maxPartR = maxCollisionParticleRadius
         var edgeLenSum: Float = 0
-        for key in edgeKeys {
+        for key in topoEdgeKeys {
             let a = scene.bodies[Int(key >> 32)], b = scene.bodies[Int(key & 0xFFFFFFFF)]
             maxPartR = max(maxPartR, max(a.size.x, b.size.x) / 2)
             edgeLenSum += distance(a.position, b.position)
         }
-        let meanEdge = numEdges > 0 ? edgeLenSum / Float(numEdges) : 0.2
+        let meanEdge = topoEdgeKeys.isEmpty ? 0.2 : edgeLenSum / Float(topoEdgeKeys.count)
         params.elemMargin = min(0.01, max(0.002, 0.5 * maxPartR))
         // Detection-radius cells (AABB multi-cell insertion): reach must
         // cover skin + margin + velocity inflation (<= 0.3 cell, hence /0.7).
@@ -1028,14 +1081,11 @@ public final class GPUSolver {
                 parent[find(tv[2])] = r
             }
             var compIdx: [Int: Int] = [:]
-            defer { params.numSoftGroups = UInt32(compIdx.count) }
             var incidence: [Int: [Int]] = [:]   // body -> surface tri indices
             var triComp: [UInt32] = []
-            let groupP = clothGroupBuf.contents().bindMemory(to: UInt32.self,
-                                                             capacity: numBodies)
             let clothP = clothVertFlag.contents().bindMemory(to: UInt32.self,
                                                              capacity: numBodies)
-            for i in 0..<numBodies { groupP[i] = 0; clothP[i] = 0 }
+            for i in 0..<numBodies { clothP[i] = 0 }
             for (ti, tv) in triVerts.enumerated() {
                 let root = find(tv[0])
                 if compIdx[root] == nil { compIdx[root] = compIdx.count }
@@ -1044,8 +1094,6 @@ public final class GPUSolver {
                 for v in tv {
                     surfCorners.append(UInt32(v) | (comp << 24))
                     incidence[v, default: []].append(ti)
-                    groupP[v] = comp + 1      // same-surface V-V is handled
-                                              // by V-T/E-E, never spheres
                     if isCloth[ti] { clothP[v] = 1 }  // thin sheet: render
                                               // thickness is OPT-IN
                 }
@@ -1120,7 +1168,6 @@ public final class GPUSolver {
                 .update(from: list.isEmpty ? [0] : list, count: max(1, list.count))
         } else {
             memset(surfacedFlags.contents(), 0, surfacedFlags.length)
-            memset(clothGroupBuf.contents(), 0, clothGroupBuf.length)
             memset(clothVertFlag.contents(), 0, clothVertFlag.length)
         }
         memset(softNormalsBuf.contents(), 0, softNormalsBuf.length)
@@ -1186,6 +1233,18 @@ public final class GPUSolver {
                     .update(from: skinCorners, count: skinCorners.count)
             }
         }
+        let flags = surfacedFlags.contents().bindMemory(to: UInt32.self,
+                                                        capacity: numBodies)
+        var renderBodyIDs: [UInt32] = []
+        renderBodyIDs.reserveCapacity(numBodies)
+        for i in 0..<numBodies where flags[i] == 0 {
+            renderBodyIDs.append(UInt32(i))
+        }
+        renderRigidBodyCount = renderBodyIDs.count
+        renderBodyIdxBuf.contents().bindMemory(to: UInt32.self,
+                                               capacity: max(1, renderBodyIDs.count))
+            .update(from: renderBodyIDs.isEmpty ? [0] : renderBodyIDs,
+                    count: max(1, renderBodyIDs.count))
 
         // ---- Static topology coloring (computed ONCE; contacts do not
         // constrain colors — same-color contact pairs degrade to Jacobi,
@@ -1882,6 +1941,8 @@ public final class GPUSolver {
                 e.setBuffer(self.nbr2Start, offset: 0, index: 22)
                 e.setBuffer(self.nbr2Count, offset: 0, index: 23)
                 e.setBuffer(self.nbr2List, offset: 0, index: 24)
+                e.setBuffer(self.clothGroupBuf, offset: 0, index: 25)
+                e.setBuffer(self.clothVertFlag, offset: 0, index: 26)
             }
             }
             stage("ee-emit")
@@ -1913,6 +1974,8 @@ public final class GPUSolver {
                 e.setBuffer(self.nbr2Start, offset: 0, index: 23)
                 e.setBuffer(self.nbr2Count, offset: 0, index: 24)
                 e.setBuffer(self.nbr2List, offset: 0, index: 25)
+                e.setBuffer(self.clothGroupBuf, offset: 0, index: 26)
+                e.setBuffer(self.clothVertFlag, offset: 0, index: 27)
             }
             }
             stage("rt-emit")
@@ -2572,21 +2635,26 @@ public final class GPUSolver {
                                      colorMode: UInt32 = 0) {
         // no sync: instances are built on the GPU; queue order serializes
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
-        var nb = UInt32(numBodies)
         var cm = colorMode
-        let p = ps("build_instances")
-        enc.setComputePipelineState(p)
-        enc.setBuffer(posLin, offset: 0, index: 0)
-        enc.setBuffer(posAng, offset: 0, index: 1)
-        enc.setBuffer(shape, offset: 0, index: 2)
-        enc.setBuffer(instances, offset: 0, index: 3)
-        enc.setBytes(&nb, length: 4, index: 4)
-        enc.setBytes(&cm, length: 4, index: 5)
-        enc.setBuffer(colorsA, offset: 0, index: 6)
-        enc.setBuffer(shapeType, offset: 0, index: 7)
-        enc.setBuffer(surfacedFlags, offset: 0, index: 8)
-        enc.dispatchThreadgroups(MTLSize(width: (numBodies + 255) / 256, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        if renderRigidBodyCount > 0 {
+            var nb = UInt32(renderRigidBodyCount)
+            let p = ps("build_instances")
+            enc.setComputePipelineState(p)
+            enc.setBuffer(posLin, offset: 0, index: 0)
+            enc.setBuffer(posAng, offset: 0, index: 1)
+            enc.setBuffer(shape, offset: 0, index: 2)
+            enc.setBuffer(instances, offset: 0, index: 3)
+            enc.setBytes(&nb, length: 4, index: 4)
+            enc.setBytes(&cm, length: 4, index: 5)
+            enc.setBuffer(colorsA, offset: 0, index: 6)
+            enc.setBuffer(shapeType, offset: 0, index: 7)
+            enc.setBuffer(renderBodyIdxBuf, offset: 0, index: 8)
+            enc.dispatchThreadgroups(MTLSize(width: (renderRigidBodyCount + 255) / 256,
+                                             height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256,
+                                                                    height: 1,
+                                                                    depth: 1))
+        }
         if surfVertCount > 0 {
             let pf = ps("soft_face_normals")
             enc.setComputePipelineState(pf)

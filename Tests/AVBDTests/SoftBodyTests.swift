@@ -5,6 +5,24 @@ import simd
 /// Soft body physics per the paper: 3-DOF particles, hard rod elements,
 /// Neo-Hookean tets, and two-way rigid coupling.
 final class SoftBodyTests: XCTestCase {
+    private func particleBounds(_ scene: PhysicsScene,
+                                bodyIDs: [Int]) -> (F3, F3) {
+        var mn = F3(repeating: Float.greatestFiniteMagnitude)
+        var mx = F3(repeating: -Float.greatestFiniteMagnitude)
+        for id in bodyIDs {
+            let p = scene.bodies[id].position
+            mn = min(mn, p)
+            mx = max(mx, p)
+        }
+        return (mn, mx)
+    }
+
+    private func separated(_ a: (F3, F3), _ b: (F3, F3),
+                           clearance: Float = 0.01) -> Bool {
+        a.1.x + clearance < b.0.x || b.1.x + clearance < a.0.x
+            || a.1.y + clearance < b.0.y || b.1.y + clearance < a.0.y
+            || a.1.z + clearance < b.0.z || b.1.z + clearance < a.0.z
+    }
 
     func testParticleRodChainInextensible() throws {
         var scene = PhysicsScene(name: "pc")
@@ -125,6 +143,8 @@ final class SoftBodyTests: XCTestCase {
 
         let gpu = try GPUSolver(scene: scene)
         XCTAssertNotNil(gpu.renderSkinnedSurface)
+        XCTAssertGreaterThan(gpu.numEdges, 0,
+                             "pinned cloth must keep EE contact edges")
         for _ in 0..<8 { gpu.step() }
         XCTAssertTrue(gpu.maxConstraintError().isFinite)
     }
@@ -144,8 +164,25 @@ final class SoftBodyTests: XCTestCase {
         }
         let gpu = try GPUSolver(scene: scene)
         XCTAssertNotNil(gpu.renderSkinnedSurface)
+        XCTAssertEqual(gpu.numEdges, 0,
+                       "closed tet solids should use VT/RT contact, not cloth EE edges")
+        let nonParticles = scene.bodies.filter { !$0.isParticle }.count
+        XCTAssertEqual(gpu.renderRigidBodyCount, nonParticles,
+                       "skinned soft particles should not be rendered as hidden rigid instances")
+        XCTAssertLessThan(gpu.renderRigidBodyCount, scene.bodies.count / 20)
         for _ in 0..<5 { gpu.step() }
         XCTAssertTrue(gpu.maxConstraintError().isFinite)
+    }
+
+    func testSkinnedBunniesStartSeparatedInBox() throws {
+        let scene = Demos.skinnedbunny(res: 8, count: 36)
+        let bounds = scene.skinnedMeshes.map { particleBounds(scene, bodyIDs: $0.bodyIDs) }
+        for i in 0..<bounds.count {
+            for j in (i + 1)..<bounds.count {
+                XCTAssertTrue(separated(bounds[i], bounds[j]),
+                              "skinned bunnies \(i) and \(j) must not overlap at init")
+            }
+        }
     }
 
     func testSoftBlocksDontInterpenetrate() throws {

@@ -48,8 +48,6 @@ struct NPAxisBest {
 inline bool npTestAxis(thread const NPBox& A, thread const NPBox& B, float3 delta,
                        float3 axis, int type, int ia, int ib,
                        float3 relVel, float speculativeCap,
-                       device const float4* posLin, device const float4* shape,
-                       uint bodyA, uint bodyB,
                        constant SimParams& P,
                        thread NPAxisBest& best) {
     float lenSq = dot(axis, axis);
@@ -64,13 +62,7 @@ inline bool npTestAxis(thread const NPBox& A, thread const NPBox& B, float3 delt
 
     float separation = distance - (rA + rB);
     float approach = max(0.0f, -dot(relVel, n));
-    bool aStatic = posLin[bodyA].w == 0.0f;
-    bool bStatic = posLin[bodyB].w == 0.0f;
-    uint staticID = aStatic ? bodyA : bodyB;
-    float3 s = shape[staticID].xyz;
-    bool broadFloor = min(s.x, s.y) > 20.0f && s.z <= 0.15f * min(s.x, s.y);
-    bool floorLike = (aStatic != bStatic) && broadFloor && fabs(n.z) > 0.95f;
-    float allowed = floorLike ? min(approach * P.dt, speculativeCap) : 0.0f;
+    float allowed = min(approach * P.dt, speculativeCap);
     if (separation > allowed) return false;
 
     if (!best.valid || separation > best.separation) {
@@ -90,19 +82,9 @@ inline float npSpeculativeCap(float radiusA, float radiusB) {
 }
 
 inline float npDetectMargin(float3 n, float3 relVel, constant SimParams& P,
-                            float radiusA, float radiusB,
-                            device const float4* posLin,
-                            device const float4* shape,
-                            uint ia, uint ib) {
+                            float radiusA, float radiusB) {
     float approach = max(0.0f, -dot(relVel, n));
-    bool aStatic = posLin[ia].w == 0.0f;
-    bool bStatic = posLin[ib].w == 0.0f;
-    uint staticID = aStatic ? ia : ib;
-    float3 s = shape[staticID].xyz;
-    bool broadFloor = min(s.x, s.y) > 20.0f && s.z <= 0.15f * min(s.x, s.y);
-    bool floorLike = (aStatic != bStatic) && broadFloor && fabs(n.z) > 0.95f;
-    float allowed = floorLike
-        ? min(approach * P.dt, npSpeculativeCap(radiusA, radiusB)) : 0.0f;
+    float allowed = min(approach * P.dt, npSpeculativeCap(radiusA, radiusB));
     return COLLISION_MARGIN + allowed;
 }
 
@@ -368,8 +350,7 @@ kernel void np_collide(
             float3 nTmp = dist > 1e-6f ? d / dist : float3(0, 0, 1);
             float3 relCO = cIsA ? (vB - vA) : (vA - vB);
             float detectM = npDetectMargin(nTmp, relCO, P,
-                                           shape[ic].w, shape[io].w,
-                                           posLin, shape, ic, io);
+                                           shape[ic].w, shape[io].w);
             if (dist <= rc + rs + detectM) {
                 nCO = nTmp;
                 hits2[0].xA = q + nCO * rc;        // on capsule
@@ -389,8 +370,7 @@ kernel void np_collide(
             float3 nTmp = dist > 1e-6f ? d / dist : float3(0, 0, 1);
             float3 relCO = cIsA ? (vB - vA) : (vA - vB);
             float detectM = npDetectMargin(nTmp, relCO, P,
-                                           shape[ic].w, shape[io].w,
-                                           posLin, shape, ic, io);
+                                           shape[ic].w, shape[io].w);
             if (dist <= rc + ro + detectM) {
                 nCO = nTmp;
                 hits2[0].xA = qa + nCO * rc;
@@ -429,8 +409,7 @@ kernel void np_collide(
                     n = d / dist;
                     float3 relCO = cIsA ? (vB - vA) : (vA - vB);
                     float detectM = npDetectMargin(n, relCO, P,
-                                                   shape[ic].w, shape[io].w,
-                                                   posLin, shape, ic, io);
+                                                   shape[ic].w, shape[io].w);
                     if (dist - rc > detectM) continue;
                 }
                 bool dup = false;
@@ -734,8 +713,7 @@ kernel void np_collide(
             float3 d = A.center - B.center;
             float dist = length(d);
             float3 nTmp = dist > 1e-9f ? d / dist : float3(0, 0, 1);
-            float detectM = npDetectMargin(nTmp, vA - vB, P, rA, rB,
-                                           posLin, shape, ia, ib);
+            float detectM = npDetectMargin(nTmp, vA - vB, P, rA, rB);
             if (dist > rA + rB + detectM) {
                 outM.header = uint4(ia, ib, 0, 0);
                 return;
@@ -778,9 +756,7 @@ kernel void np_collide(
                 float3 vSphere = sIsA ? vA : vB;
                 float3 vBox = sIsA ? vB : vA;
                 float detectM = npDetectMargin(nWTmp, vSphere - vBox, P,
-                                               r, sIsA ? shape[ib].w : shape[ia].w,
-                                               posLin, shape, sIsA ? ia : ib,
-                                               sIsA ? ib : ia);
+                                               r, sIsA ? shape[ib].w : shape[ia].w);
                 if (dist > r + detectM) {
                     outM.header = uint4(ia, ib, 0, 0);
                     return;
@@ -886,19 +862,19 @@ kernel void np_collide(
     for (int i = 0; i < 3 && !separated; i++) {
         if (!npTestAxis(A, B, delta, npAxis(A, i), 0, i, -1,
                         relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
-                        posLin, shape, ia, ib, P, bestFace)) separated = true;
+                        P, bestFace)) separated = true;
     }
     for (int i = 0; i < 3 && !separated; i++) {
         if (!npTestAxis(A, B, delta, npAxis(B, i), 1, -1, i,
                         relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
-                        posLin, shape, ia, ib, P, bestFace)) separated = true;
+                        P, bestFace)) separated = true;
     }
     for (int i = 0; i < 3 && !separated; i++) {
         for (int j = 0; j < 3 && !separated; j++) {
             float3 axis = cross(npAxis(A, i), npAxis(B, j));
             if (!npTestAxis(A, B, delta, axis, 2, i, j,
                             relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
-                            posLin, shape, ia, ib, P, bestEdge)) separated = true;
+                            P, bestEdge)) separated = true;
         }
     }
 

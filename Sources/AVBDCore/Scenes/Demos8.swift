@@ -215,6 +215,9 @@ extension Demos {
                      massPerNode: 0.008, friction: friction,
                      membraneMu: membraneMu, membraneBend: bend)
 
+        _ = s.addSphere(diameter: 0.42, density: 1.8, friction: friction,
+                        position: F3(0.35, 0, mattressTop + 1.0))
+
         s.settings.cameraDistance = 7.5
         s.settings.cameraTargetZ = 0.8
         return s

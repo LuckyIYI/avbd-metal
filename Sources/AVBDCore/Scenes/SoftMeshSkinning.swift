@@ -368,15 +368,72 @@ public struct SurfaceMesh {
     }
 }
 
-extension Demos {
-    private struct SkinnedSoftMeshTemplate {
-        var nodePositions: [F3]
-        var tetIDs: [(Int, Int, Int, Int)]
-        var jointPairs: [(Int, Int)]
-        var skinVertices: [SceneSkinnedVertex]
-        var triangles: [(Int, Int, Int)]
-        var spacing: Float
+private struct SkinnedSoftMeshTemplate {
+    var nodePositions: [F3]
+    var tetIDs: [(Int, Int, Int, Int)]
+    var jointPairs: [(Int, Int)]
+    var skinVertices: [SceneSkinnedVertex]
+    var triangles: [(Int, Int, Int)]
+    var spacing: Float
+}
+
+private struct SkinnedSoftMeshTemplateKey: Hashable {
+    var mesh: String
+    var height: UInt32
+    var res: Int
+    var visualVertexLimit: Int
+    var voxelVertexLimit: Int
+    var minTetElements: Int
+}
+
+private final class SkinnedSoftMeshCache {
+    static let shared = SkinnedSoftMeshCache()
+
+    private let lock = NSLock()
+    private var meshes: [String: SurfaceMesh] = [:]
+    private var templates: [SkinnedSoftMeshTemplateKey: SkinnedSoftMeshTemplate] = [:]
+
+    func mesh(for key: String, build: () -> SurfaceMesh) -> SurfaceMesh {
+        lock.lock()
+        if let cached = meshes[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let built = build()
+        lock.lock()
+        if let cached = meshes[key] {
+            lock.unlock()
+            return cached
+        }
+        meshes[key] = built
+        lock.unlock()
+        return built
     }
+
+    func template(for key: SkinnedSoftMeshTemplateKey,
+                  build: () -> SkinnedSoftMeshTemplate) -> SkinnedSoftMeshTemplate {
+        lock.lock()
+        if let cached = templates[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let built = build()
+        lock.lock()
+        if let cached = templates[key] {
+            lock.unlock()
+            return cached
+        }
+        templates[key] = built
+        lock.unlock()
+        return built
+    }
+}
+
+extension Demos {
 
     @discardableResult
     public static func addSkinnedSoftMesh(_ s: inout PhysicsScene,
@@ -395,11 +452,7 @@ extension Demos {
                                                    res: res,
                                                    visualVertexLimit: visualVertexLimit,
                                                    voxelVertexLimit: voxelVertexLimit,
-                                                   minTetElements: minTetElements,
-                                                   mu: mu,
-                                                   lambda: lambda ?? 10 * mu,
-                                                   massScale: massScale,
-                                                   friction: friction)
+                                                   minTetElements: minTetElements)
         return instantiateSkinnedSoftMesh(&s, template: template, center: center,
                                           mu: mu, lambda: lambda ?? 10 * mu,
                                           massScale: massScale,
@@ -411,11 +464,7 @@ extension Demos {
                                                     res: Int,
                                                     visualVertexLimit: Int,
                                                     voxelVertexLimit: Int,
-                                                    minTetElements: Int,
-                                                    mu: Float,
-                                                    lambda: Float,
-                                                    massScale: Float,
-                                                    friction: Float)
+                                                    minTetElements: Int)
         -> SkinnedSoftMeshTemplate {
         let fitted = input.fitted(height: height, center: .zero)
         let visual = fitted.simplified(maxVertices: visualVertexLimit)
@@ -449,10 +498,10 @@ extension Demos {
         let (_, origin, spacing) = voxel
         var tmp = PhysicsScene(name: "skin-template")
         let nodes = addSoftVoxelCells(&tmp, cells: cells, origin: origin,
-                                      spacing: spacing, mu: mu,
-                                      lambda: lambda,
-                                      massPerNode: massScale * spacing * spacing * spacing,
-                                      friction: friction)
+                                      spacing: spacing, mu: 1,
+                                      lambda: 1,
+                                      massPerNode: 1,
+                                      friction: 0)
         let skin = bindVisualMesh(visual, scene: tmp,
                                   tetRange: 0..<tmp.tets.count,
                                   bodyIDs: nodes)
@@ -467,6 +516,30 @@ extension Demos {
                                        skinVertices: skin.vertices,
                                        triangles: skin.triangles,
                                        spacing: spacing)
+    }
+
+    private static func cachedSkinnedSoftMeshTemplate(mesh input: SurfaceMesh,
+                                                      meshKey: String,
+                                                      height: Float,
+                                                      res: Int,
+                                                      visualVertexLimit: Int,
+                                                      voxelVertexLimit: Int,
+                                                      minTetElements: Int)
+        -> SkinnedSoftMeshTemplate {
+        let key = SkinnedSoftMeshTemplateKey(mesh: meshKey,
+                                             height: height.bitPattern,
+                                             res: res,
+                                             visualVertexLimit: visualVertexLimit,
+                                             voxelVertexLimit: voxelVertexLimit,
+                                             minTetElements: minTetElements)
+        return SkinnedSoftMeshCache.shared.template(for: key) {
+            makeSkinnedSoftMeshTemplate(mesh: input,
+                                        height: height,
+                                        res: res,
+                                        visualVertexLimit: visualVertexLimit,
+                                        voxelVertexLimit: voxelVertexLimit,
+                                        minTetElements: minTetElements)
+        }
     }
 
     @discardableResult
@@ -521,44 +594,62 @@ extension Demos {
         s.settings.lambdaMax = 1000
         addGround(&s, friction: friction)
 
-        let source = loadDefaultSkinMesh(meshPath: meshPath)
+        let (source, sourceKey) = loadDefaultSkinMeshWithKey(meshPath: meshPath)
         let n = max(1, count)
-        let baseSlots = max(1, min(n, Int(ceil(Double(n) * 0.35))))
+        let bodyHeight: Float = n > 8 ? 1.12 : 1.35
+        let visualLimit = n > 12 ? 1600 : 2800
+        let voxelLimit = n > 12 ? 6500 : 9000
+        let template = cachedSkinnedSoftMeshTemplate(mesh: source,
+                                                     meshKey: sourceKey,
+                                                     height: bodyHeight,
+                                                     res: res,
+                                                     visualVertexLimit: visualLimit,
+                                                     voxelVertexLimit: voxelLimit,
+                                                     minTetElements: 1500)
+        var templateMin = F3(repeating: Float.greatestFiniteMagnitude)
+        var templateMax = F3(repeating: -Float.greatestFiniteMagnitude)
+        for p in template.nodePositions {
+            templateMin = min(templateMin, p)
+            templateMax = max(templateMax, p)
+        }
+        let extent = max(templateMax - templateMin, F3(repeating: 1e-4))
+        let planarExtent = max(extent.x, extent.y)
+        let spacing = max(planarExtent * 1.38, bodyHeight * (n > 8 ? 1.22 : 1.26))
+        let layerStride = max(extent.z * 1.36, bodyHeight * 1.48)
+        let baseSlots = max(1, min(n, Int(ceil(Double(n) * (n > 8 ? 0.18 : 0.50)))))
         let cols = Int(ceil(sqrt(Double(baseSlots))))
         let rows = (baseSlots + cols - 1) / cols
         let layers = (n + baseSlots - 1) / baseSlots
-        let spacing: Float = n > 8 ? 0.98 : 1.12
-        let bodyHeight: Float = n > 8 ? 1.12 : 1.35
-        let halfX = Float(cols) * spacing * 0.5 + bodyHeight * 0.42
-        let halfY = Float(rows) * spacing * 0.5 + bodyHeight * 0.42
-        let wallH: Float = max(3.2, bodyHeight * (Float(layers) + 1.45))
+        let layerShiftX = layers > 1 ? spacing * 0.18 : 0
+        let layerShiftY = layers > 1 ? spacing * 0.12 : 0
+        let halfX = Float(max(0, cols - 1)) * spacing * 0.5
+            + layerShiftX + max(abs(templateMin.x), abs(templateMax.x)) + 0.10
+        let halfY = Float(max(0, rows - 1)) * spacing * 0.5
+            + layerShiftY + max(abs(templateMin.y), abs(templateMax.y)) + 0.10
+        let baseZ = max(0.18, -templateMin.z + 0.06)
+        let topZ = baseZ + Float(max(0, layers - 1)) * layerStride + templateMax.z
+        let stackWallH = topZ + max(0.8, extent.z * 0.55)
+        let wallH: Float = max(1.1, stackWallH / 4.0)
         addOpenBox(&s, halfX: halfX, halfY: halfY, wallHeight: wallH,
                    thickness: 0.16, friction: friction)
         var rng = SplitMix64(seed: 0x5eed_b00c)
-        let visualLimit = n > 12 ? 1600 : 2800
-        let voxelLimit = n > 12 ? 6500 : 9000
-        let template = makeSkinnedSoftMeshTemplate(mesh: source,
-                                                   height: bodyHeight,
-                                                   res: res,
-                                                   visualVertexLimit: visualLimit,
-                                                   voxelVertexLimit: voxelLimit,
-                                                   minTetElements: 1500,
-                                                   mu: stiffness,
-                                                   lambda: 10 * stiffness,
-                                                   massScale: 28,
-                                                   friction: friction)
+        let jitterXY = min(0.045, spacing * 0.025)
+        let jitterZ = min(0.035, layerStride * 0.018)
         for i in 0..<n {
             let slot = i % baseSlots
             let layer = i / baseSlots
             let x = Float(slot % cols) - Float(cols - 1) * 0.5
             let y = Float(slot / cols) - Float(rows - 1) * 0.5
-            let jitter = F3((rng.nextFloat() - 0.5) * 0.12,
-                            (rng.nextFloat() - 0.5) * 0.12,
-                            (rng.nextFloat() - 0.5) * 0.10)
+            let sx = layers > 1 ? (layer % 2 == 0 ? -layerShiftX : layerShiftX) : 0
+            let sy = layers > 1 ? Float((layer % 3) - 1) * layerShiftY : 0
+            let jitter = F3((rng.nextFloat() - 0.5) * 2 * jitterXY,
+                            (rng.nextFloat() - 0.5) * 2 * jitterXY,
+                            (rng.nextFloat() - 0.5) * 2 * jitterZ)
             _ = instantiateSkinnedSoftMesh(&s, template: template,
-                                           center: F3(x * spacing, y * spacing,
-                                                      0.14 + Float(layer)
-                                                          * bodyHeight * 0.92)
+                                           center: F3(x * spacing + sx,
+                                                      y * spacing + sy,
+                                                      baseZ + Float(layer)
+                                                          * layerStride)
                                                + jitter,
                                            mu: stiffness,
                                            lambda: 10 * stiffness,
@@ -589,7 +680,7 @@ extension Demos {
         s.settings.clothViscosity = 0.25
         addGround(&s, friction: friction)
 
-        let source = loadDefaultSkinMesh(meshPath: meshPath)
+        let (source, sourceKey) = loadDefaultSkinMeshWithKey(meshPath: meshPath)
         let k = max(1, scale)
         let n = max(14, res)
         let clothSize: Float = 3.6 + 0.32 * Float(k).squareRoot()
@@ -631,16 +722,13 @@ extension Demos {
         let softRes = max(8, min(14, res / 2))
         let softLimit = softCount > 6 ? 1400 : 2200
         let voxelLimit = softCount > 6 ? 6500 : 9000
-        let template = makeSkinnedSoftMeshTemplate(mesh: source,
-                                                   height: 0.62,
-                                                   res: softRes,
-                                                   visualVertexLimit: softLimit,
-                                                   voxelVertexLimit: voxelLimit,
-                                                   minTetElements: 600,
-                                                   mu: stiffness,
-                                                   lambda: 10 * stiffness,
-                                                   massScale: 22,
-                                                   friction: friction)
+        let template = cachedSkinnedSoftMeshTemplate(mesh: source,
+                                                     meshKey: sourceKey,
+                                                     height: 0.62,
+                                                     res: softRes,
+                                                     visualVertexLimit: softLimit,
+                                                     voxelVertexLimit: voxelLimit,
+                                                     minTetElements: 600)
         let dropZ = pinZ + 2.2
         var rng = SplitMix64(seed: 0x5eed_4017)
         let cols = max(1, Int(ceil(sqrt(Double(softCount)))))
@@ -1014,14 +1102,34 @@ extension Demos {
     }
 
     private static func loadDefaultSkinMesh(meshPath: String?) -> SurfaceMesh {
+        loadDefaultSkinMeshWithKey(meshPath: meshPath).0
+    }
+
+    private static func loadDefaultSkinMeshWithKey(meshPath: String?) -> (SurfaceMesh, String) {
         let envPath = ProcessInfo.processInfo.environment["AVBD_SKIN_MESH"]
         let desktop = "/Users/lakiiinbor/Desktop/bunny.obj"
         let path = meshPath ?? envPath ?? (FileManager.default.fileExists(atPath: desktop)
                                            ? desktop : nil)
-        if let path, let mesh = try? SurfaceMesh.load(path: path) {
-            return mesh
+        if let path {
+            let key = skinMeshFileKey(path)
+            let mesh = SkinnedSoftMeshCache.shared.mesh(for: key) {
+                (try? SurfaceMesh.load(path: path)) ?? proceduralBunnySurface(res: 22)
+            }
+            return (mesh, key)
         }
-        return proceduralBunnySurface(res: 22)
+        let key = "procedural-bunny:22"
+        let mesh = SkinnedSoftMeshCache.shared.mesh(for: key) {
+            proceduralBunnySurface(res: 22)
+        }
+        return (mesh, key)
+    }
+
+    private static func skinMeshFileKey(_ path: String) -> String {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: url.path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return String(format: "file:%@:%llu:%.6f", url.path, size, modified)
     }
 }
 

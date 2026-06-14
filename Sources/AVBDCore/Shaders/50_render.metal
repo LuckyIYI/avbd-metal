@@ -36,19 +36,20 @@ kernel void build_instances(
     device const float4* posAng     [[buffer(1)]],
     device const float4* shape      [[buffer(2)]],
     device RenderInstance* out      [[buffer(3)]],
-    constant uint& numBodies        [[buffer(4)]],
+    constant uint& numInstances     [[buffer(4)]],
     constant uint& colorMode        [[buffer(5)]],   // 0 index, 1 graph color
     device const uint* colors       [[buffer(6)]],
     device const uint* shapeType    [[buffer(7)]],
-    device const uint* surfaced     [[buffer(8)]],   // 1 = body rendered by a surface mesh
+    device const uint* bodyIDs      [[buffer(8)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    if (gid >= numBodies) return;
-    float4 pl = posLin[gid];
-    float3x3 R = q_to_mat(posAng[gid]);
-    uint st = shapeType[gid] & SHAPE_KIND_MASK;
+    if (gid >= numInstances) return;
+    uint body = bodyIDs[gid];
+    float4 pl = posLin[body];
+    float3x3 R = q_to_mat(posAng[body]);
+    uint st = shapeType[body] & SHAPE_KIND_MASK;
     // torus/capsule: unit-scale model (geometry sized in the vertex shader)
-    float3 sz = st >= 2 ? float3(1) : shape[gid].xyz;
+    float3 sz = st >= 2 ? float3(1) : shape[body].xyz;
 
     float4x4 m;
     m[0] = float4(R[0] * sz.x, 0);
@@ -58,23 +59,19 @@ kernel void build_instances(
     out[gid].model = m;
 
     // hide the giant ground slab (the checkerboard floor replaces it)
-    if (st == 0 && pl.w <= 0.0f && shape[gid].x > 150.0f) {
+    if (st == 0 && pl.w <= 0.0f && shape[body].x > 150.0f) {
         out[gid].model = float4x4(0.0f);
         out[gid].color = float4(0);
         out[gid].params = float4(0);
         return;
     }
     float3 c = pl.w > 0.0f
-        ? palette(colorMode == 1 ? colors[gid] : gid)
+        ? palette(colorMode == 1 ? colors[body] : body)
         : float3(0.58f, 0.60f, 0.66f);
-    // Surface-meshed particles (cloth/tet vertices): shape type 9 collapses
-    // in every geometry vertex shader, but params survive so the body still
-    // casts its blob shadow — dense overlapping blobs read as the soft
-    // shadow of the sheet/jelly itself.
-    out[gid].color = float4(c, surfaced[gid] != 0 ? 9.0f : float(st));
+    out[gid].color = float4(c, float(st));
     // params.z = bounding radius (blob shadow size), w = shadow strength
     // (statics cast none — they're scenery)
-    out[gid].params = float4(shape[gid].x, shape[gid].y, shape[gid].w,
+    out[gid].params = float4(shape[body].x, shape[body].y, shape[body].w,
                              pl.w > 0.0f ? 1.0f : 0.0f);
 }
 
