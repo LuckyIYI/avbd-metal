@@ -22,6 +22,10 @@ claims where possible.
   available. The design is allowed to use no fewer than five stance legs in
   its conservative dynamic load case. A four-leg fast gait is not accepted by
   the present torque model.
+- The landscape phone should be the body datum rather than an accessory mounted
+  on a pre-existing plate. The revised body uses a surrounding torsion ring, a
+  transverse load-bearing phone/battery spine, direct perimeter hip pods, and
+  two identical removable end guides.
 - OpenSCAD is an appropriate source-controlled CAD tool because its CLI can
   select and export individual parts and render assemblies without manual GUI
   steps. The installed build is the native universal 2026.06.12 snapshot;
@@ -47,8 +51,8 @@ claims where possible.
 
 - No fabricated prototype has walked yet. The PASS report is a conservative
   analytical screen, not empirical proof.
-- Generated closed-mesh volume gives a 273.1 g full-solid PETG/TPU estimate;
-  the load budget rounds that up to 275 g. A slicer and physical scale still
+- Generated closed-mesh volume gives a 278.6 g full-solid PETG/TPU estimate;
+  the load budget rounds that up to 280 g. A slicer and physical scale still
   need to replace the density-only estimate.
 - Servo thermal behaviour, wiring voltage drop, joint backlash, foot friction,
   fatigue, shock loading, and phone retention require bench tests.

@@ -2,7 +2,8 @@ category,item,quantity,unit_mass_g,notes
 compute,iPhone 15 Pro,1,187,Bare phone; 146.6 x 70.6 x 8.25 mm
 actuator,ROBOTIS XC330-M288-T,16,23,5 V TTL metal-gear smart servo
 frame,ROBOTIS FPX330-H101/S102 frame sets,16,,Use official X330 brackets and idlers
-print,PETG chassis and landscape phone dock,1,,0.20 mm layers; 5 perimeters; 35-45% gyroid
+print,PETG torsion-ring chassis with phone spine,1,,0.20 mm layers; 5 perimeters; 35-45% gyroid
+print,PETG removable phone end guide,2,,Identical reversible parts; TPU tape at glass contact
 print,PETG coxa link,8,,Print flat; 5 perimeters
 print,CF-PETG or PA-CF tibia link,8,,Print flat; anneal only per filament instructions
 print,TPU foot pad,8,,Shore 95A recommended
@@ -12,6 +13,6 @@ control,ESP32-S3 wireless-to-DYNAMIXEL TTL bridge,1,25,iPhone does planning; MCU
 safety,25-30 A main fuse and master switch,1,,Required
 wiring,Four fused servo power branches,4,,Do not route full current through one JST daisy chain
 fastener,M2 Robotis frame hardware,1 lot,,Use supplied fasteners where possible
-fastener,M3 heat-set inserts and screws,1 lot,,Tray/chassis/battery cradle
+fastener,M3 heat-set inserts and screws,1 lot,,Phone guides/chassis/battery cradle
 padding,0.8-1.0 mm TPU or silicone phone pads,1 set,,Never clamp glass directly against PETG
 retention,10-12 mm silicone phone safety strap,1,,Mandatory for walking; keep below camera field

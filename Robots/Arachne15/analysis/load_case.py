@@ -19,7 +19,7 @@ G = 9.80665
 MASS_G = {
     "iphone_15_pro": 187.0,
     "xc330_servos_16x": 16 * 23.0,
-    "printed_chassis_dock_links_feet_full_solid_upper_bound": 275.0,
+    "printed_chassis_dock_links_feet_full_solid_upper_bound": 280.0,
     "robotis_frames_horns_fasteners": 85.0,
     "2s_2200mah_battery": 135.0,
     "5v_20a_bec_and_distribution": 45.0,
@@ -30,7 +30,7 @@ MASS_G = {
 # Conservative component-centre heights for the landscape camera-forward phone
 # layout. These are used only for a first-order level-floor tip-over check.
 MASS_Z_MM = {
-    "iphone_15_pro": 118.3,
+    "iphone_15_pro": 113.3,
     "xc330_servos_16x": 90.0,
     "printed_chassis_dock_links_feet_full_solid_upper_bound": 90.0,
     "robotis_frames_horns_fasteners": 90.0,
@@ -48,9 +48,12 @@ DYNAMIC_FACTOR = 1.50
 MIN_STANCE_LEGS = 5
 TARGET_MIN_SAFETY_FACTOR = 1.15
 
-HIP_XS_M = [-0.069, -0.025, 0.025, 0.069]
-HIP_Y_M = 0.063
+HIP_XS_M = [-0.060, -0.024, 0.024, 0.060]
+HIP_Y_M = 0.092
 COXA_M = 0.050
+SERVO_WIDTH_MM = 20.0
+PHONE_GUIDE_WIDTH_MM = 22.0
+MIN_COMPONENT_CLEARANCE_MM = 3.0
 
 
 def outward_angle_deg(x: float, side: int) -> float:
@@ -118,6 +121,15 @@ def main() -> None:
         }
 
     feet = foot_positions()
+    footprint_mm = [
+        (max(p[axis] for p in feet) - min(p[axis] for p in feet)) * 1000
+        for axis in (0, 1)
+    ]
+    guide_to_inner_hip_clearance_mm = (
+        abs(HIP_XS_M[1]) * 1000
+        - SERVO_WIDTH_MM / 2
+        - PHONE_GUIDE_WIDTH_MM / 2
+    )
     single_swing_margins = []
     for swing in range(len(feet)):
         hull = convex_hull([p for i, p in enumerate(feet) if i != swing])
@@ -131,8 +143,11 @@ def main() -> None:
 
     worst_case = stance_cases[str(MIN_STANCE_LEGS)]
     report = {
-        "status": "PASS" if worst_case["passes"] and min(single_swing_margins) > 0
-        else "FAIL",
+        "status": "PASS" if (
+            worst_case["passes"]
+            and min(single_swing_margins) > 0
+            and guide_to_inner_hip_clearance_mm >= MIN_COMPONENT_CLEARANCE_MM
+        ) else "FAIL",
         "scope": "analytical pre-check; flat floor, slow wave gait, no prototype evidence",
         "mass_budget_g": MASS_G,
         "total_design_mass_g": total_mass_kg * 1000,
@@ -147,7 +162,9 @@ def main() -> None:
             "tibia_pitch_deg_below_horizontal": TIBIA_PITCH_DEG,
             "horizontal_knee_moment_arm_mm": horizontal_arm * 1000,
             "nominal_foot_positions_m": feet,
-            "minimum_dock_to_inner_hip_clearance_mm": 3.0,
+            "nominal_stance_footprint_mm": footprint_mm,
+            "minimum_guide_to_inner_hip_clearance_mm": guide_to_inner_hip_clearance_mm,
+            "required_component_clearance_mm": MIN_COMPONENT_CLEARANCE_MM,
         },
         "load_cases": stance_cases,
         "required_gait": {

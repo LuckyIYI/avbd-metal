@@ -4,51 +4,51 @@
   "parts": [
     {
       "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/battery_cradle.stl",
-      "triangles": 1886,
+      "triangles": 1898,
       "bounds_min_mm": [
-        -55.5,
-        -30.0,
+        -20.0,
+        -65.5,
         0.0
       ],
       "bounds_max_mm": [
-        55.5,
-        30.0,
+        20.0,
+        65.5,
         4.0
       ],
       "size_mm": [
-        111.0,
-        60.0,
+        40.0,
+        131.0,
         4.0
       ],
-      "solid_volume_cm3": 8.719861231612274,
+      "solid_volume_cm3": 11.55986120869167,
       "quantity": 1,
       "material": "PETG",
       "density_g_cm3": 1.27,
-      "assembly_full_solid_mass_g": 11.074223764147588
+      "assembly_full_solid_mass_g": 14.681023735038421
     },
     {
       "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/chassis.stl",
-      "triangles": 6094,
+      "triangles": 6286,
       "bounds_min_mm": [
-        -89.0,
-        -58.0,
+        -77.0,
+        -106.0,
         0.0
       ],
       "bounds_max_mm": [
-        89.0,
-        58.0,
+        77.0,
+        106.0,
         7.0
       ],
       "size_mm": [
-        178.0,
-        116.0,
+        154.0,
+        212.0,
         7.0
       ],
-      "solid_volume_cm3": 68.80909281288062,
+      "solid_volume_cm3": 95.93954120436901,
       "quantity": 1,
       "material": "PETG",
       "density_g_cm3": 1.27,
-      "assembly_full_solid_mass_g": 87.3875478723584
+      "assembly_full_solid_mass_g": 121.84321732954864
     },
     {
       "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/coxa_link.stl",
@@ -99,28 +99,28 @@
       "assembly_full_solid_mass_g": 9.39239165643648
     },
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/phone_tray.stl",
-      "triangles": 1490,
+      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/phone_guide.stl",
+      "triangles": 1096,
       "bounds_min_mm": [
-        -12.0,
-        -80.0,
+        -11.0,
+        -9.0,
         0.0
       ],
       "bounds_max_mm": [
-        12.0,
-        80.0,
-        64.0
+        11.0,
+        9.0,
+        52.0
       ],
       "size_mm": [
-        24.0,
-        160.0,
-        64.0
+        22.0,
+        18.0,
+        52.0
       ],
-      "solid_volume_cm3": 39.649731685391245,
-      "quantity": 1,
+      "solid_volume_cm3": 7.753719708262139,
+      "quantity": 2,
       "material": "PETG",
       "density_g_cm3": 1.27,
-      "assembly_full_solid_mass_g": 50.35515924044688
+      "assembly_full_solid_mass_g": 19.694448058985834
     },
     {
       "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/retainer_clip.stl",
@@ -141,10 +141,10 @@
         12.0
       ],
       "solid_volume_cm3": 0.7387195916494871,
-      "quantity": 4,
+      "quantity": 2,
       "material": "PETG",
       "density_g_cm3": 1.27,
-      "assembly_full_solid_mass_g": 3.7526955255793943
+      "assembly_full_solid_mass_g": 1.8763477627896972
     },
     {
       "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/tibia_link.stl",
@@ -173,9 +173,9 @@
   ],
   "assembly": {
     "unique_printed_parts": 7,
-    "total_printed_pieces": 31,
-    "full_solid_mass_g": 273.09009674152355,
-    "load_budget_rounded_up_g": 275.0,
+    "total_printed_pieces": 30,
+    "full_solid_mass_g": 278.61550722535384,
+    "load_budget_rounded_up_g": 280.0,
     "passes_load_budget": true
   }
 }

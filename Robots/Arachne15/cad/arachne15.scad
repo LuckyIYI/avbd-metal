@@ -24,29 +24,32 @@ servo_stall_torque_nm_5v = 0.93;
 frame_mount_spacing = 16.0;     // FPX330-S102 two-hole mounting pair
 horn_hub_clearance = 8.2;       // clears official 8 mm hub opening
 
-// Chassis and top-inserted landscape dock. Robot forward is +X. The phone's
-// rear cameras face +X and its screen faces -X.
-chassis_x = 178;
-chassis_y = 112;
+// Phone-first body architecture. Robot forward is +X. The landscape phone is
+// the transverse structural datum; its rear cameras face +X and screen -X.
+chassis_x = 154;
+chassis_y = 176;
 chassis_z = 5;
-chassis_corner_r = 18;
-chassis_window_x = 136;
-chassis_window_y = 58;
+chassis_corner_r = 26;
+chassis_window_x = 126;         // 14 mm torsion-ring rail in X
+chassis_window_y = 148;         // 14 mm torsion-ring rail in Y
+phone_spine_x = 28;
+phone_spine_y = 160;
 
-dock_x = 24;
-dock_y = 160;
-dock_base_z = 8;
-dock_wall = 3;
-dock_guide_h = 64;
+guide_x = 22;
+guide_depth = 8;
+guide_foot_y = 18;
+guide_end_wall = 3;
+guide_h = 52;                   // captures 74% of phone height; top stays removable
 dock_phone_bottom_z = 2;
 phone_cavity_thickness = phone_body_z + 2 * phone_clearance;
 phone_cavity_width = phone_x + 2 * phone_clearance;
+guide_center_y = phone_cavity_width / 2 + guide_depth / 2;
 
 // Nominal flat-ground stance.
 body_floor_z = 76;
 hip_axis_z = 98;
-hip_xs = [-69, -25, 25, 69];    // 3 mm clearance from landscape dock at inner hips
-hip_y = 63;
+hip_xs = [-60, -24, 24, 60];
+hip_y = 92;
 coxa_length = 50;
 tibia_length = 105;
 tibia_pitch_deg = 65;
@@ -61,8 +64,10 @@ assert(phone_cavity_thickness >= phone_body_z + 1.0,
        "phone thickness cavity needs at least 0.5 mm clearance per side");
 assert(phone_cavity_width >= phone_x + 1.0,
        "phone cavity needs at least 0.5 mm clearance per side");
-assert(chassis_x >= dock_x + 40 && chassis_y >= 100,
-       "dock mounting bridge leaves insufficient chassis structure");
+assert(chassis_y >= phone_cavity_width + 24,
+       "chassis must surround the landscape phone and guide mounts");
+assert(abs(hip_xs[1]) - servo_w / 2 - guide_x / 2 >= 3,
+       "inner hip needs at least 3 mm phone-guide clearance");
 
 module rounded_prism(size = [10, 10, 2], r = 2) {
     x = size[0]; y = size[1]; z = size[2];
@@ -82,54 +87,56 @@ module hole_pattern_pcd12(h = 10, diameter = 2.2) {
 module chassis() {
     difference() {
         union() {
-            rounded_prism([chassis_x, chassis_y, chassis_z], chassis_corner_r);
-            // Eight local load spreaders for the hip brackets.
+            // Closed perimeter ring carries leg loads around the electronics bay.
+            difference() {
+                rounded_prism([chassis_x, chassis_y, chassis_z], chassis_corner_r);
+                translate([0, 0, -0.5])
+                    rounded_prism([chassis_window_x, chassis_window_y,
+                                   chassis_z + 2], 18);
+            }
+            // Transverse load spine directly seats the phone and battery.
+            rounded_prism([phone_spine_x, phone_spine_y, chassis_z + 2], 6);
+            // Hip pods put every bracket load directly into the perimeter ring.
             for (x = hip_xs)
                 for (side = [-1, 1])
-                    translate([x, side * 49, 0])
-                        rounded_prism([28, 18, chassis_z + 2], 5);
+                    translate([x, side * hip_y, 0])
+                        rounded_prism([28, 28, chassis_z + 2], 6);
         }
-        // Open centre: camera clearance, cooling, and lower electronics access.
-        translate([0, 0, -0.5])
-            rounded_prism([chassis_window_x, chassis_window_y,
-                           chassis_z + 3], 12);
+        // The phone bottoms on a 2 mm PETG web inside the structural spine.
+        translate([0, 0, dock_phone_bottom_z + 5])
+            cube([phone_cavity_thickness, phone_cavity_width, 10], center = true);
         // Two M2.2 bracket clearances per hip. Final hardware uses FPX330 frames.
         for (x = hip_xs)
             for (side = [-1, 1])
                 for (dx = [-frame_mount_spacing / 2, frame_mount_spacing / 2])
-                    translate([x + dx, side * 49, -0.5])
+                    translate([x + dx, side * hip_y, -0.5])
                         cylinder(d = 2.2, h = chassis_z + 3);
-        // Portrait-dock M3 attachment holes land on the centre side rails.
-        for (x = [-9, 9])
-            for (y = [-38, 38])
-                translate([x, y, -0.5]) cylinder(d = 3.2, h = chassis_z + 2);
+        // Two M3 guide fasteners at each phone end, outside the glass slot.
+        for (x = [-8, 8])
+            for (side = [-1, 1])
+                translate([x, side * guide_center_y, -0.5])
+                    cylinder(d = 3.2, h = chassis_z + 3);
     }
 }
 
-module phone_tray() {
+module phone_guide() {
+    // One reversible U-channel guide; print two and rotate the second 180 deg.
     difference() {
         union() {
-            // Bottom bridge transfers the phone load directly into the chassis.
-            rounded_prism([dock_x, dock_y, dock_base_z], 4);
-            // Edge guides leave both broad faces open for camera, cooling, and UI.
-            for (side = [-1, 1])
-                translate([0, side * (phone_cavity_width / 2 + dock_wall / 2), 0])
-                    rounded_prism([dock_x, dock_wall, dock_guide_h], 1.2);
-            // Screen-side lower buttress; the camera-facing side remains open.
-            translate([-(phone_cavity_thickness / 2 + dock_wall / 2), 0, 0])
-                rounded_prism([dock_wall, phone_cavity_width + 2 * dock_wall, 30], 1.2);
+            rounded_prism([guide_x, guide_foot_y, chassis_z], 3);
+            rounded_prism([guide_x, guide_depth, guide_h], 1.5);
         }
-        // Bare-phone slot, open upward. TPU tape is applied after printing.
-        translate([0, 0, dock_phone_bottom_z + 5])
-            cube([phone_cavity_thickness, phone_cavity_width, 10], center = true);
-        // Four M3 chassis screws outside the phone-thickness slot.
-        for (x = [-9, 9])
-            for (y = [-38, 38])
-                translate([x, y, -0.5]) cylinder(d = 3.2, h = dock_base_z + 2);
-        // Two low strap paths retain the phone without entering the camera field.
-        for (z = [38, 74])
-            translate([0, 0, z])
-                cube([dock_x + 2, 5, 3], center = true);
+        // Slot opens toward local -Y; a 3 mm outer end wall arrests the phone.
+        translate([0, -(guide_depth - guide_end_wall) / 2,
+                   dock_phone_bottom_z + guide_h / 2])
+            cube([phone_cavity_thickness, guide_depth - guide_end_wall + 1,
+                  guide_h + 1], center = true);
+        for (x = [-8, 8])
+            translate([x, 0, -0.5]) cylinder(d = 3.2, h = chassis_z + 2);
+        // Paired shallow edge notches locate the strap without severing the guide.
+        for (x = [-guide_x / 2, guide_x / 2])
+            translate([x, 0, 34])
+                cube([3, guide_depth + 2, 3], center = true);
     }
 }
 
@@ -188,8 +195,9 @@ module tibia_link() {
 }
 
 module battery_cradle() {
-    bx = battery_size[0] + 6;
-    by = battery_size[1] + 5;
+    // Battery long axis follows the phone/spine along Y for a compact low CoM.
+    bx = battery_size[1] + 5;
+    by = battery_size[0] + 6;
     difference() {
         union() {
             for (side = [-1, 1])
@@ -271,7 +279,7 @@ module orient_phone(phone_bottom) {
 }
 
 module phone_visual() {
-    phone_bottom = body_floor_z + chassis_z + dock_phone_bottom_z;
+    phone_bottom = body_floor_z + dock_phone_bottom_z;
     color([0.28, 0.31, 0.34, 0.93])
         orient_phone(phone_bottom)
             rounded_prism([phone_x, phone_y, phone_body_z], phone_corner_r);
@@ -284,7 +292,7 @@ module phone_visual() {
 }
 
 module camera_forward_visual() {
-    camera_z = body_floor_z + chassis_z + dock_phone_bottom_z + phone_y - 18;
+    camera_z = body_floor_z + dock_phone_bottom_z + phone_y - 18;
     camera_y = phone_x / 2 - 21;
     color([0.15, 0.55, 1.0, 0.65]) {
         beam_between([phone_body_z / 2 + camera_extra_z, camera_y, camera_z],
@@ -303,13 +311,15 @@ module electronics_visual() {
             rounded_prism(bec_size, 3);
     color([0.35, 0.25, 0.12, 0.9])
         translate([0, 0, body_floor_z - 29])
-            rounded_prism(battery_size, 4);
+            rounded_prism([battery_size[1], battery_size[0], battery_size[2]], 4);
 }
 
 module assembly() {
     color([0.13, 0.14, 0.16]) translate([0, 0, body_floor_z]) chassis();
-    color([0.92, 0.52, 0.10])
-        translate([0, 0, body_floor_z + chassis_z]) phone_tray();
+    for (side = [-1, 1])
+        color([0.92, 0.52, 0.10])
+            translate([0, side * guide_center_y, body_floor_z])
+                rotate([0, 0, side > 0 ? 0 : 180]) phone_guide();
     phone_visual();
     camera_forward_visual();
     electronics_visual();
@@ -323,24 +333,24 @@ module assembly() {
     // Two removable edge wedges; the walking build also uses a silicone strap.
     for (side = [-1, 1])
         color([0.95, 0.62, 0.16])
-            translate([-8, side * (phone_cavity_width / 2 + dock_wall),
-                       body_floor_z + chassis_z + dock_guide_h - 8])
+            translate([-8, side * (guide_center_y + guide_depth / 2),
+                       body_floor_z + guide_h - 8])
                 rotate([90, 0, side > 0 ? 0 : 180]) retainer_clip();
 
     // Ground datum.
     color([0.7, 0.72, 0.75, 0.25])
-        translate([0, 0, -1]) cube([430, 350, 1], center = true);
+        translate([0, 0, -1]) cube([340, 410, 1], center = true);
 }
 
 echo(str("Arachne-15 landscape dock cavity: ", phone_cavity_thickness,
          " thick x ", phone_cavity_width, " wide mm; bare phone: ", phone_x,
          " x ", phone_y, " x ", phone_body_z, " mm; rear camera faces +X"));
-echo(str("Nominal footprint approx 430 x 350 mm; chassis ground clearance ",
+echo(str("Nominal stance footprint approx 265 x 362 mm; chassis ground clearance ",
          body_floor_z, " mm"));
 
 if (PART == "assembly") assembly();
 else if (PART == "chassis") chassis();
-else if (PART == "phone_tray") phone_tray();
+else if (PART == "phone_guide") phone_guide();
 else if (PART == "retainer_clip") retainer_clip();
 else if (PART == "coxa_link") coxa_link();
 else if (PART == "tibia_link") tibia_link();

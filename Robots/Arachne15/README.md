@@ -7,48 +7,55 @@ not yet been proven.
 
 ![Arachne-15 assembly](build/arachne15-assembly.png)
 
+![Camera-facing front elevation](build/arachne15-front.png)
+
+![Structural top view](build/arachne15-top.png)
+
 ## Geometry
 
 | Item | Nominal dimension |
 |---|---:|
 | Bare iPhone 15 Pro | 146.60 × 70.60 × 8.25 mm; 187 g |
 | Landscape dock cavity | 9.45 mm thick × 147.80 mm wide |
-| Chassis | 178 × 112 × 5 mm |
+| Chassis ring | 154 × 176 × 5 mm; 154 × 212 mm with hip pods |
 | Body ground clearance | 76 mm |
 | Coxa axis spacing | 50 mm |
 | Tibia axis spacing | 105 mm |
 | Nominal tibia pitch | 65° below horizontal |
-| Approximate stance footprint | 430 × 350 mm |
+| Approximate stance footprint | 265 × 362 mm |
 | Actuators | 16 × XC330-M288-T, 20 × 34 × 26 mm body |
 
-Robot forward is `+X`. The phone drops from above into a centred landscape dock:
+Robot forward is `+X`. The phone drops from above into the chassis's transverse
+structural spine:
 rear cameras face forward, the screen faces backward, and both broad faces stay
-open for vision, cooling, and access. Narrow end guides avoid the camera plateau;
-two TPU-backed wedges and a silicone safety strap retain the phone. The default
-0.60 mm-per-side fit is for a bare phone; measure and update the parameters
-before using any case.
+open for vision, cooling, and access. Two identical removable U-channel end
+guides avoid the camera plateau; TPU-backed wedges and a silicone safety strap
+retain the phone. The default 0.60 mm-per-side fit is for a bare phone; measure
+and update the parameters before using any case.
 
-The two inner hip axes are shifted outward to ±25 mm, leaving 3 mm between the
-audited actuator envelope and the overhanging landscape dock.
+The body is derived from this phone position: a 14 mm torsion ring routes all
+eight hip loads around the central bay, the transverse phone spine closes the
+ring, hip axes sit at `X = ±60/±24 mm, Y = ±92 mm`, and the battery aligns
+directly below the phone. The closest guide-to-actuator clearance is 3 mm.
 
 ## Can it carry the phone and walk?
 
-The current conservative analytical budget is 1.215 kg including the phone, 16
+The current conservative analytical budget is 1.220 kg including the phone, 16
 servos, battery, power electronics, brackets, fasteners, wiring, and margin.
-The generated meshes total about 273 g if printed completely solid; the load
-budget rounds this up to 275 g. At ROBOTIS's recommended general-use limit of
+The generated meshes total 278.6 g if printed completely solid; the load budget
+rounds this up to 280 g. At ROBOTIS's recommended general-use limit of
 20% stall torque:
 
 - available design torque per knee: 0.186 N·m;
 - five-leg stance with 1.5× dynamic factor: about 0.158 N·m per knee;
 - safety factor: about 1.17;
-- seven-leg wave stance: about 1.64 safety factor;
+- seven-leg wave stance: about 1.63 safety factor;
 - four-leg dynamic stance: fails the design rule.
 
 With the phone vertical in landscape, the estimated whole-robot centre of mass
-is 88.1 mm above the floor. The worst seven-foot support polygon retains 99.1
+is 87.3 mm above the floor. The worst seven-foot support polygon retains 95.0
 mm of horizontal margin, corresponding to a first-order lateral tip threshold
-of 1.12 g. This remains analytical, not a substitute for a tethered prototype.
+of 1.09 g. This remains analytical, not a substitute for a tethered prototype.
 
 Therefore the mechanism is *capable on paper* of slow, level-floor wave-gait
 walking while carrying the iPhone. It is not yet a walking prototype. Do not
@@ -117,5 +124,6 @@ openscad --export-format binstl -D 'PART="chassis"' \
 - Perform the verification ladder in order: unpowered fit, one-joint current,
   suspended gait, tethered stand, low-body crawl, then untethered walking.
 
-See [RESEARCH.md](RESEARCH.md) for sources and unresolved risks, and [BOM.csv](BOM.csv)
-for the initial hardware list.
+See [DESIGN.md](DESIGN.md) for the first-principles derivation,
+[RESEARCH.md](RESEARCH.md) for sources and unresolved risks, and
+[BOM.csv](BOM.csv) for the initial hardware list.
