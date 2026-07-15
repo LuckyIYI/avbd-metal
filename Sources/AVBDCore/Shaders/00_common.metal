@@ -20,6 +20,10 @@ using namespace metal;
 // shapeType encoding: low nibble = shape kind, bit 4 = particle (3-DOF)
 #define SHAPE_KIND_MASK 0xFu
 #define SHAPE_PARTICLE  0x10u
+// Collider-only flag: a centered standalone round primitive can keep its
+// contact anchor as a world-space offset to roll freely. Offset compound
+// colliders must use body-local anchors so they rotate with their owner.
+#define COLLIDER_WORLD_ROUND_ANCHOR 0x20u
 #define MAX_CONTACTS 8
 
 // Force kinds packed into adjacency entries (top 4 bits)
@@ -91,6 +95,17 @@ inline float4 q_inv(float4 q) { return q_conj(q) / dot(q, q); }
 inline float3 q_rotate(float4 q, float3 v) {
     float3 t = 2.0f * cross(q.xyz, v);
     return v + q.w * t + cross(q.xyz, t);
+}
+// Rotate a principal-axis inertia tensor into world tangent coordinates:
+// R diag(I) R^T = sum_i I_i * column_i(R) column_i(R)^T.
+inline M3 world_inertia(float4 q, float3 principal) {
+    float3 c0 = q_rotate(q, float3(1, 0, 0));
+    float3 c1 = q_rotate(q, float3(0, 1, 0));
+    float3 c2 = q_rotate(q, float3(0, 0, 1));
+    return m3_add(m3_add(
+        m3_scale(m3_outer(c0, c0), principal.x),
+        m3_scale(m3_outer(c1, c1), principal.y)),
+        m3_scale(m3_outer(c2, c2), principal.z));
 }
 // q_a - q_b in tangent space (Eq. 20). The relative quaternion is
 // canonicalized to the w >= 0 hemisphere: without this, a freely spinning
@@ -261,7 +276,16 @@ struct SimParams {
     float elemMargin;
     uint numSoftGroups;     // distinct soft-surface components
     uint frame;             // frame counter (tracker reseed staggering)
+    uint frictionCombineMode; // 0 geometric, 1 multiply, 2 min, 3 max, 4 average
 };
+
+inline float combine_friction(float a, float b, uint mode) {
+    if (mode == 1u) return a * b;
+    if (mode == 2u) return min(a, b);
+    if (mode == 3u) return max(a, b);
+    if (mode == 4u) return 0.5f * (a + b);
+    return sqrt(max(a * b, 0.0f));
+}
 
 struct JointGPU {
     uint4 header;       // bodyA (WORLD_BODY=world), bodyB, broken flag, flags
@@ -277,7 +301,8 @@ struct JointGPU {
     float4 hingeAxis;   // xyz: axis in B local; w != 0 -> 1-DOF hinge
     float4 motor;       // x = target angle, y = max |lambda| (torque limit),
                         // z = lambda, w = penalty (0 = no motor)
-    float4 limits;      // x = lo, y = hi (twist range; lo < hi enables)
+    float4 limits;      // x/y = twist range, z = PD damping, w = fixed-PD flag
+    float4 dynamics;    // x = armature, y = inertial-predicted twist
 };
 
 struct SpringGPU {
@@ -356,6 +381,7 @@ struct ContactGPU {
 
 struct ManifoldGPU {
     uint4 header;       // bodyA, bodyB, numContacts, active
+    uint4 colliderPair; // colliderA, colliderB (warm-start identity), pad
     float4 basisN;      // w = friction
     float4 basisT1;     // t2 = cross(n, t1)
     ContactGPU contacts[MAX_CONTACTS];

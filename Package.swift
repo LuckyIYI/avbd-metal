@@ -16,7 +16,7 @@ let package = Package(
     targets: [
         .target(
             name: "AVBDCore",
-            resources: [.copy("Shaders")]
+            resources: [.copy("Shaders"), .copy("Assets")]
         ),
         .target(
             name: "AVBDLearn",
@@ -39,7 +39,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AVBDTests",
-            dependencies: ["AVBDCore"]
+            dependencies: ["AVBDCore", "AVBDLearn"]
         ),
     ]
 )

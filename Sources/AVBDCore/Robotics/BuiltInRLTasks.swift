@@ -1,0 +1,646 @@
+/// Canonical task registry used by the CLI and by MLX experiments. A new
+/// scene/task becomes trainable by registering one factory; algorithms do not
+/// require task-specific branches.
+public enum BuiltInRLTasks {
+    private static let pushTOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "actionScale",
+    ]
+    private static let humanoidWalkOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "minimumCommandSpeed",
+        "maximumCommandSpeed", "commandCurriculumControlSteps",
+        "trainingInitialEpisodeAgeFraction", "standingCommandProbability",
+        "standingCommandCurriculumControlSteps", "commandGatedActor",
+        "threeModeActor", "expertGateCommandSpeed", "expertGateBlendWidth",
+        "standExpertBlendStartSpeed", "standExpertBlendWidth",
+        "standExpertRequiresDoubleSupport",
+        "standExpertUsesPlanarSpeed",
+        "freezeBasePolicyExpert", "freezeLowSpeedPolicyExpert",
+        "trainBasePolicyExpert", "velocityTrackingStandardDeviation",
+        "velocityTrackingErrorPenaltyWeight", "standStillVelocityPenaltyWeight",
+        "standStillJointDeviationPenaltyWeight",
+        "standStillDoubleSupportRewardWeight", "standStillFallPenalty",
+        "lateralPenaltyWarmupControlSteps", "lateralPenaltyRampControlSteps",
+        "laneTrackingStandardDeviation", "alternatingTouchdownRewardWeight",
+        "flightPenaltyWeight", "initialRollPitchRange", "initialYawRange",
+        "actionTargetResponse",
+    ]
+    private static let humanoidVelocityOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation",
+        "minimumForwardVelocity", "maximumForwardVelocity",
+        "minimumLateralVelocity", "maximumLateralVelocity",
+        "minimumYawRate", "maximumYawRate", "commandResamplingSteps",
+        "standingCommandProbability", "initialRollPitchRange",
+        "initialYawRange",
+    ]
+    private static let humanoidIsaacVelocityOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "commandResamplingSteps",
+        "standingCommandProbability", "initialYawRange",
+        "observationNoise", "solverIterations",
+    ]
+    private static let humanoidIsaacGoalOptionKeys =
+        humanoidIsaacVelocityOptionKeys.union([
+            "pointGoal",
+            "minimumGoalDistance", "maximumGoalDistance", "goalRadius",
+            "goalSlowdownDistance", "goalCommandSpeed",
+            "goalBoundaryCommandSpeed", "goalDwellSteps",
+            "maximumGoalArrivalSpeed", "goalProgressRewardWeight",
+            "goalStableRewardWeight", "goalSuccessBonus",
+            "projectileProbability", "projectileCurriculumControlSteps",
+            "projectileSize", "projectileMass",
+            "minimumProjectileSpeed", "maximumProjectileSpeed",
+            "projectileLeftProbability",
+            "minimumProjectileLaunchStep", "maximumProjectileLaunchStep",
+            "recoveryGatedActor", "freezeBasePolicyExpert",
+            "recoveryContextObservations", "recoveryContextDuration",
+            "recoveryExpertSide", "recoveryExpertGatePeak",
+            "recoveryExpertGateDecay",
+            "initializeRecoveryExpertFromBaseOnTransfer",
+            "initializeRecoveryExpertFromMirroredBaseOnTransfer",
+            "postImpactUprightRewardWeight",
+            "postImpactAngularVelocityPenaltyWeight",
+            "postImpactFallPenalty",
+        ])
+    private static let humanoidGoalOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "minimumCommandSpeed",
+        "maximumCommandSpeed", "commandCurriculumControlSteps",
+        "trainingInitialEpisodeAgeFraction", "standingCommandProbability",
+        "commandGatedActor",
+        "threeModeActor", "expertGateCommandSpeed", "expertGateBlendWidth",
+        "standExpertBlendStartSpeed", "standExpertBlendWidth",
+        "standExpertRequiresDoubleSupport",
+        "standExpertUsesPlanarSpeed",
+        "freezeBasePolicyExpert", "freezeLowSpeedPolicyExpert",
+        "trainBasePolicyExpert", "velocityTrackingStandardDeviation",
+        "velocityTrackingErrorPenaltyWeight", "standStillVelocityPenaltyWeight",
+        "standStillJointDeviationPenaltyWeight",
+        "standStillDoubleSupportRewardWeight", "standStillFallPenalty",
+        "lateralPenaltyWarmupControlSteps", "lateralPenaltyRampControlSteps",
+        "laneTrackingStandardDeviation", "alternatingTouchdownRewardWeight",
+        "flightPenaltyWeight", "initialRollPitchRange", "initialYawRange",
+        "maximumGoalDirectionAngle", "initialGoalDirectionAngle",
+        "goalDirectionCurriculumControlSteps", "goalRadius",
+        "goalSlowdownDistance", "goalObservationUsesLateralVelocity",
+        "goalObservationIncludesLateralVelocity",
+        "minimumGoalDistanceMeters",
+        "maximumGoalDistanceMeters", "initialGoalDistanceScale",
+        "goalDistanceCurriculumControlSteps", "goalDwellSteps",
+        "maximumGoalArrivalSpeed", "goalBoundaryCommandSpeed",
+        "goalStableDwellRewardWeight", "projectileProbability",
+        "projectileCurriculumControlSteps", "minimumProjectileSpeed",
+        "maximumProjectileSpeed", "minimumProjectileLaunchStep",
+        "maximumProjectileLaunchStep", "actionTargetResponse",
+    ]
+    private static let armPushTOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "jointDeltaActionScale",
+        "endEffectorDeltaActionScale",
+        "linkMass", "tipMass", "motorTorque", "motorStiffness",
+        "motorDamping", "motorArmature", "blockMass",
+        "blockStaticFriction", "blockDynamicFriction",
+        "blockSpawnGoalBlend",
+        "blockSpawnRadius", "blockSpawnYawRange", "blockSpawnLateralBias",
+        "goalProgressWeight",
+        "reachProgressWeight", "yawProgressWeight", "coverageProgressWeight",
+        "coverageRewardWeight", "poseProgressRewardWeight", "poseRewardWeight",
+        "poseRewardDistanceScale",
+        "reachingRewardWeight", "actionMagnitudePenaltyWeight",
+        "actionRatePenaltyWeight", "precisionGatedActor",
+        "precisionExpertGateCoverage", "precisionExpertReleaseCoverage",
+        "freezeBasePolicyExpert",
+        "pushContactProgressWeight",
+        "reachDistancePenaltyWeight", "goalDistancePenaltyWeight",
+        "yawErrorPenaltyWeight", "pushContactDistancePenaltyWeight",
+        "successBonus", "successRewardOverride", "successCoverage",
+        "continueAfterSuccess",
+        "successYawTolerance",
+        "reachCurriculumSuccessDistance",
+        "pushContactCurriculumSuccessDistance", "pushContactOffset",
+        "pushContactCurriculumMaximumGoalRegression",
+        "pushContactCurriculumMinimumGoalProgress",
+        "pushContactCurriculumMaximumGoalDistance",
+    ]
+
+    public static let registry: RLTaskRegistry = {
+        let registry = RLTaskRegistry()
+        try! registry.register("pusht-state-v0") { cfg in
+            try cfg.validateOptions(
+                supported: pushTOptionKeys, taskID: "pusht-state-v0")
+            return try PushTTask(configuration: PushTTaskConfig(
+                numEnvironments: cfg.numEnvironments,
+                seed: cfg.seed,
+                maxEpisodeSteps: Int(cfg.options["maxEpisodeSteps"] ?? 300),
+                controlDecimation: Int(cfg.options["controlDecimation"] ?? 4),
+                actionScale: cfg.options["actionScale"] ?? 0.18,
+                autoReset: cfg.autoReset))
+        }
+        try! registry.register("humanoid-walk-v0") { cfg in
+            try cfg.validateOptions(
+                supported: humanoidWalkOptionKeys, taskID: "humanoid-walk-v0")
+            return try HumanoidWalkTask(configuration: HumanoidWalkTaskConfig(
+                numEnvironments: cfg.numEnvironments,
+                seed: cfg.seed,
+                maxEpisodeSteps: Int(cfg.options["maxEpisodeSteps"] ?? 1_000),
+                controlDecimation: Int(cfg.options["controlDecimation"] ?? 4),
+                minimumCommandSpeed: cfg.options["minimumCommandSpeed"] ?? 0.45,
+                maximumCommandSpeed: cfg.options["maximumCommandSpeed"] ?? 0.65,
+                commandCurriculumControlSteps:
+                    Int(cfg.options["commandCurriculumControlSteps"] ?? 0),
+                trainingInitialEpisodeAgeFraction:
+                    cfg.options["trainingInitialEpisodeAgeFraction"] ?? 0,
+                standingCommandProbability:
+                    cfg.options["standingCommandProbability"] ?? 0,
+                standingCommandCurriculumControlSteps: Int(
+                    cfg.options["standingCommandCurriculumControlSteps"] ?? 0),
+                commandGatedActor: (cfg.options["commandGatedActor"] ?? 0) > 0,
+                threeModeActor: (cfg.options["threeModeActor"] ?? 0) > 0,
+                expertGateCommandSpeed:
+                    cfg.options["expertGateCommandSpeed"] ?? 0.20,
+                expertGateBlendWidth:
+                    cfg.options["expertGateBlendWidth"] ?? 0,
+                standExpertBlendStartSpeed:
+                    cfg.options["standExpertBlendStartSpeed"] ?? 0,
+                standExpertBlendWidth:
+                    cfg.options["standExpertBlendWidth"] ?? 0,
+                standExpertRequiresDoubleSupport:
+                    (cfg.options["standExpertRequiresDoubleSupport"] ?? 0) > 0,
+                standExpertUsesPlanarSpeed:
+                    (cfg.options["standExpertUsesPlanarSpeed"] ?? 0) > 0,
+                freezeBasePolicyExpert:
+                    (cfg.options["freezeBasePolicyExpert"] ?? 0) > 0,
+                freezeLowSpeedPolicyExpert:
+                    (cfg.options["freezeLowSpeedPolicyExpert"] ?? 0) > 0,
+                trainBasePolicyExpert:
+                    (cfg.options["trainBasePolicyExpert"] ?? 0) > 0,
+                velocityTrackingStandardDeviation:
+                    cfg.options["velocityTrackingStandardDeviation"]
+                        ?? HumanoidLocomotionObjective
+                            .velocityTrackingStandardDeviation,
+                velocityTrackingErrorPenaltyWeight:
+                    cfg.options["velocityTrackingErrorPenaltyWeight"] ?? 0,
+                standStillVelocityPenaltyWeight:
+                    cfg.options["standStillVelocityPenaltyWeight"] ?? 2,
+                standStillJointDeviationPenaltyWeight:
+                    cfg.options["standStillJointDeviationPenaltyWeight"] ?? 1,
+                standStillDoubleSupportRewardWeight:
+                    cfg.options["standStillDoubleSupportRewardWeight"] ?? 1,
+                standStillFallPenalty:
+                    cfg.options["standStillFallPenalty"] ?? 0,
+                lateralPenaltyWarmupControlSteps:
+                    Int(cfg.options["lateralPenaltyWarmupControlSteps"] ?? 0),
+                lateralPenaltyRampControlSteps:
+                    Int(cfg.options["lateralPenaltyRampControlSteps"] ?? 0),
+                laneTrackingStandardDeviation:
+                    cfg.options["laneTrackingStandardDeviation"] ?? 0.30,
+                alternatingTouchdownRewardWeight:
+                    cfg.options["alternatingTouchdownRewardWeight"] ?? 2,
+                flightPenaltyWeight:
+                    cfg.options["flightPenaltyWeight"] ?? 1,
+                initialRollPitchRange:
+                    cfg.options["initialRollPitchRange"] ?? 0.015,
+                initialYawRange: cfg.options["initialYawRange"] ?? 0.05,
+                actionTargetResponse: cfg.options["actionTargetResponse"] ?? 1,
+                autoReset: cfg.autoReset),
+                taskRevision: ((cfg.options["minimumCommandSpeed"] ?? 0.45) < 0.20
+                    || (cfg.options["standingCommandProbability"] ?? 0) > 0
+                    || (cfg.options["commandGatedActor"] ?? 0) > 0
+                    ? ((cfg.options["standStillFallPenalty"] ?? 0) > 0
+                        ? 45
+                        : (cfg.options["commandGatedActor"] ?? 0) > 0
+                        ? ((cfg.options["expertGateCommandSpeed"] ?? 0.20) > 0.20
+                            ? 44 : 43)
+                        : ((cfg.options["standingCommandProbability"] ?? 0) > 0
+                            ? 42 : 41))
+                    : 35)
+                    + ((cfg.options["trainingInitialEpisodeAgeFraction"] ?? 0) > 0
+                        ? 100 : 0)
+                    + ((cfg.options["trainBasePolicyExpert"] ?? 0) > 0
+                        ? 200 : 0)
+                    + ((cfg.options["threeModeActor"] ?? 0) > 0
+                        ? 400 : 0)
+                    + ((cfg.options["velocityTrackingStandardDeviation"]
+                        ?? HumanoidLocomotionObjective
+                            .velocityTrackingStandardDeviation)
+                        != HumanoidLocomotionObjective
+                            .velocityTrackingStandardDeviation ? 800 : 0)
+                    + ((cfg.options["velocityTrackingErrorPenaltyWeight"] ?? 0) > 0
+                        ? 1_600 : 0)
+                    + ((cfg.options["freezeLowSpeedPolicyExpert"] ?? 0) > 0
+                        ? 3_200 : 0))
+        }
+        try! registry.register("humanoid-velocity-v0") { cfg in
+            try cfg.validateOptions(
+                supported: humanoidVelocityOptionKeys,
+                taskID: "humanoid-velocity-v0")
+            return try HumanoidVelocityTask(
+                configuration: HumanoidVelocityTaskConfig(
+                    numEnvironments: cfg.numEnvironments,
+                    seed: cfg.seed,
+                    maxEpisodeSteps: Int(
+                        cfg.options["maxEpisodeSteps"] ?? 1_000),
+                    controlDecimation: Int(
+                        cfg.options["controlDecimation"] ?? 5),
+                    minimumForwardVelocity:
+                        cfg.options["minimumForwardVelocity"] ?? -0.6,
+                    maximumForwardVelocity:
+                        cfg.options["maximumForwardVelocity"] ?? 1.5,
+                    minimumLateralVelocity:
+                        cfg.options["minimumLateralVelocity"] ?? -0.8,
+                    maximumLateralVelocity:
+                        cfg.options["maximumLateralVelocity"] ?? 0.8,
+                    minimumYawRate:
+                        cfg.options["minimumYawRate"] ?? -0.7,
+                    maximumYawRate:
+                        cfg.options["maximumYawRate"] ?? 0.7,
+                    commandResamplingSteps: Int(
+                        cfg.options["commandResamplingSteps"] ?? 500),
+                    standingCommandProbability:
+                        cfg.options["standingCommandProbability"] ?? 0.10,
+                    initialRollPitchRange:
+                        cfg.options["initialRollPitchRange"] ?? 0.015,
+                    initialYawRange:
+                        cfg.options["initialYawRange"] ?? .pi,
+                    autoReset: cfg.autoReset))
+        }
+        try! registry.register("humanoid-isaac-flat-v0") { cfg in
+            try cfg.validateOptions(
+                supported: humanoidIsaacVelocityOptionKeys,
+                taskID: "humanoid-isaac-flat-v0")
+            return try HumanoidIsaacVelocityTask(
+                configuration: HumanoidIsaacVelocityTaskConfig(
+                    numEnvironments: cfg.numEnvironments,
+                    seed: cfg.seed,
+                    maxEpisodeSteps: Int(
+                        cfg.options["maxEpisodeSteps"] ?? 1_000),
+                    commandResamplingSteps: Int(
+                        cfg.options["commandResamplingSteps"] ?? 500),
+                    standingCommandProbability:
+                        cfg.options["standingCommandProbability"] ?? 0.02,
+                    initialYawRange:
+                        cfg.options["initialYawRange"] ?? .pi,
+                    observationNoise:
+                        (cfg.options["observationNoise"] ?? 1) > 0,
+                    solverIterations:
+                        Int(cfg.options["solverIterations"] ?? 20),
+                    autoReset: cfg.autoReset))
+        }
+        try! registry.register("humanoid-isaac-goal-v0") { cfg in
+            try cfg.validateOptions(
+                supported: humanoidIsaacGoalOptionKeys,
+                taskID: "humanoid-isaac-goal-v0")
+            guard (cfg.options["pointGoal"] ?? 1) == 1 else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "humanoid-isaac-goal-v0 requires pointGoal=1")
+            }
+            return try HumanoidIsaacVelocityTask(
+                configuration: HumanoidIsaacVelocityTaskConfig(
+                    numEnvironments: cfg.numEnvironments,
+                    seed: cfg.seed,
+                    maxEpisodeSteps: Int(
+                        cfg.options["maxEpisodeSteps"] ?? 1_000),
+                    commandResamplingSteps: Int(
+                        cfg.options["commandResamplingSteps"] ?? 500),
+                    standingCommandProbability: 0,
+                    initialYawRange:
+                        cfg.options["initialYawRange"] ?? .pi,
+                    observationNoise:
+                        (cfg.options["observationNoise"] ?? 1) > 0,
+                    solverIterations:
+                        Int(cfg.options["solverIterations"] ?? 20),
+                    autoReset: cfg.autoReset,
+                    pointGoal: true,
+                    minimumGoalDistance:
+                        cfg.options["minimumGoalDistance"] ?? 4,
+                    maximumGoalDistance:
+                        cfg.options["maximumGoalDistance"] ?? 8,
+                    goalRadius: cfg.options["goalRadius"] ?? 0.75,
+                    goalSlowdownDistance:
+                        cfg.options["goalSlowdownDistance"] ?? 2.5,
+                    goalCommandSpeed:
+                        cfg.options["goalCommandSpeed"] ?? 0.55,
+                    goalBoundaryCommandSpeed:
+                        cfg.options["goalBoundaryCommandSpeed"] ?? 0.15,
+                    goalDwellSteps: Int(
+                        cfg.options["goalDwellSteps"] ?? 25),
+                    maximumGoalArrivalSpeed:
+                        cfg.options["maximumGoalArrivalSpeed"] ?? 0.25,
+                    goalProgressRewardWeight:
+                        cfg.options["goalProgressRewardWeight"] ?? 1,
+                    goalStableRewardWeight:
+                        cfg.options["goalStableRewardWeight"] ?? 2,
+                    goalSuccessBonus:
+                        cfg.options["goalSuccessBonus"] ?? 5,
+                    projectileProbability:
+                        cfg.options["projectileProbability"] ?? 0,
+                    projectileCurriculumControlSteps: Int(
+                        cfg.options["projectileCurriculumControlSteps"] ?? 0),
+                    projectileSize:
+                        cfg.options["projectileSize"] ?? 0.25,
+                    projectileMass:
+                        cfg.options["projectileMass"] ?? 8,
+                    minimumProjectileSpeed:
+                        cfg.options["minimumProjectileSpeed"] ?? 4,
+                    maximumProjectileSpeed:
+                        cfg.options["maximumProjectileSpeed"] ?? 6,
+                    projectileLeftProbability:
+                        cfg.options["projectileLeftProbability"] ?? 0.5,
+                    minimumProjectileLaunchStep: Int(
+                        cfg.options["minimumProjectileLaunchStep"] ?? 100),
+                    maximumProjectileLaunchStep: Int(
+                        cfg.options["maximumProjectileLaunchStep"] ?? 300),
+                    recoveryGatedActor:
+                        (cfg.options["recoveryGatedActor"] ?? 0) > 0,
+                    freezeBasePolicyExpert:
+                        (cfg.options["freezeBasePolicyExpert"] ?? 1) > 0,
+                    recoveryContextObservations:
+                        (cfg.options["recoveryContextObservations"] ?? 0) > 0,
+                    recoveryContextDuration:
+                        cfg.options["recoveryContextDuration"] ?? 2,
+                    recoveryExpertSide:
+                        cfg.options["recoveryExpertSide"] ?? 0,
+                    recoveryExpertGatePeak:
+                        cfg.options["recoveryExpertGatePeak"] ?? 1,
+                    recoveryExpertGateDecay:
+                        (cfg.options["recoveryExpertGateDecay"] ?? 0) > 0,
+                    initializeRecoveryExpertFromBaseOnTransfer:
+                        (cfg.options[
+                            "initializeRecoveryExpertFromBaseOnTransfer"] ?? 1) > 0,
+                    initializeRecoveryExpertFromMirroredBaseOnTransfer:
+                        (cfg.options[
+                            "initializeRecoveryExpertFromMirroredBaseOnTransfer"]
+                            ?? 0) > 0,
+                    postImpactUprightRewardWeight:
+                        cfg.options["postImpactUprightRewardWeight"] ?? 0,
+                    postImpactAngularVelocityPenaltyWeight:
+                        cfg.options[
+                            "postImpactAngularVelocityPenaltyWeight"] ?? 0,
+                    postImpactFallPenalty:
+                        cfg.options["postImpactFallPenalty"] ?? 0),
+                taskID: "humanoid-isaac-goal-v0")
+        }
+        try! registry.register("humanoid-goal-v0") { cfg in
+            try cfg.validateOptions(
+                supported: humanoidGoalOptionKeys, taskID: "humanoid-goal-v0")
+            guard (cfg.options["standingCommandProbability"] ?? 0) == 0 else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "humanoid-goal-v0 requires standingCommandProbability=0; "
+                    + "goal arrival supplies the zero-speed command")
+            }
+            return try HumanoidWalkTask(
+                configuration: HumanoidWalkTaskConfig(
+                    numEnvironments: cfg.numEnvironments,
+                    seed: cfg.seed,
+                    maxEpisodeSteps: Int(
+                        cfg.options["maxEpisodeSteps"] ?? 1_000),
+                    controlDecimation: Int(
+                        cfg.options["controlDecimation"] ?? 4),
+                    minimumCommandSpeed:
+                        cfg.options["minimumCommandSpeed"] ?? 0.45,
+                    maximumCommandSpeed:
+                        cfg.options["maximumCommandSpeed"] ?? 0.65,
+                    commandCurriculumControlSteps: Int(
+                        cfg.options["commandCurriculumControlSteps"] ?? 0),
+                    trainingInitialEpisodeAgeFraction:
+                        cfg.options["trainingInitialEpisodeAgeFraction"] ?? 0,
+                    standingCommandProbability: 0,
+                    commandGatedActor:
+                        (cfg.options["commandGatedActor"] ?? 0) > 0,
+                    threeModeActor:
+                        (cfg.options["threeModeActor"] ?? 0) > 0,
+                    expertGateCommandSpeed:
+                        cfg.options["expertGateCommandSpeed"] ?? 0.20,
+                    expertGateBlendWidth:
+                        cfg.options["expertGateBlendWidth"] ?? 0,
+                    standExpertBlendStartSpeed:
+                        cfg.options["standExpertBlendStartSpeed"] ?? 0,
+                    standExpertBlendWidth:
+                        cfg.options["standExpertBlendWidth"] ?? 0,
+                    standExpertRequiresDoubleSupport:
+                        (cfg.options["standExpertRequiresDoubleSupport"] ?? 0) > 0,
+                    standExpertUsesPlanarSpeed:
+                        (cfg.options["standExpertUsesPlanarSpeed"] ?? 0) > 0,
+                    freezeBasePolicyExpert:
+                        (cfg.options["freezeBasePolicyExpert"] ?? 0) > 0,
+                    freezeLowSpeedPolicyExpert:
+                        (cfg.options["freezeLowSpeedPolicyExpert"] ?? 0) > 0,
+                    trainBasePolicyExpert:
+                        (cfg.options["trainBasePolicyExpert"] ?? 0) > 0,
+                    velocityTrackingStandardDeviation:
+                        cfg.options["velocityTrackingStandardDeviation"]
+                            ?? HumanoidLocomotionObjective
+                                .velocityTrackingStandardDeviation,
+                    velocityTrackingErrorPenaltyWeight:
+                        cfg.options["velocityTrackingErrorPenaltyWeight"] ?? 0,
+                    standStillVelocityPenaltyWeight:
+                        cfg.options["standStillVelocityPenaltyWeight"] ?? 2,
+                    standStillJointDeviationPenaltyWeight:
+                        cfg.options["standStillJointDeviationPenaltyWeight"] ?? 1,
+                    standStillDoubleSupportRewardWeight:
+                        cfg.options["standStillDoubleSupportRewardWeight"] ?? 1,
+                    standStillFallPenalty:
+                        cfg.options["standStillFallPenalty"] ?? 0,
+                    lateralPenaltyWarmupControlSteps: Int(
+                        cfg.options["lateralPenaltyWarmupControlSteps"] ?? 0),
+                    lateralPenaltyRampControlSteps: Int(
+                        cfg.options["lateralPenaltyRampControlSteps"] ?? 0),
+                    laneTrackingStandardDeviation:
+                        cfg.options["laneTrackingStandardDeviation"] ?? 0.30,
+                    alternatingTouchdownRewardWeight:
+                        cfg.options["alternatingTouchdownRewardWeight"] ?? 2,
+                    flightPenaltyWeight:
+                        cfg.options["flightPenaltyWeight"] ?? 1,
+                    initialRollPitchRange:
+                        cfg.options["initialRollPitchRange"] ?? 0.015,
+                    initialYawRange:
+                        cfg.options["initialYawRange"] ?? 0.05,
+                    maximumGoalDirectionAngle:
+                        cfg.options["maximumGoalDirectionAngle"] ?? .pi,
+                    initialGoalDirectionAngle:
+                        cfg.options["initialGoalDirectionAngle"] ?? 0,
+                    goalDirectionCurriculumControlSteps: Int(
+                        cfg.options["goalDirectionCurriculumControlSteps"]
+                            ?? 2_400),
+                    goalRadius: cfg.options["goalRadius"] ?? 1.5,
+                    goalSlowdownDistance:
+                        cfg.options["goalSlowdownDistance"] ?? 3,
+                    goalObservationUsesLateralVelocity:
+                        (cfg.options["goalObservationUsesLateralVelocity"] ?? 0)
+                            > 0,
+                    goalObservationIncludesLateralVelocity:
+                        (cfg.options["goalObservationIncludesLateralVelocity"]
+                            ?? 0) > 0,
+                    minimumGoalDistanceMeters:
+                        cfg.options["minimumGoalDistanceMeters"] ?? 0,
+                    maximumGoalDistanceMeters:
+                        cfg.options["maximumGoalDistanceMeters"] ?? 0,
+                    initialGoalDistanceScale:
+                        cfg.options["initialGoalDistanceScale"] ?? 1,
+                    goalDistanceCurriculumControlSteps: Int(
+                        cfg.options["goalDistanceCurriculumControlSteps"] ?? 0),
+                    goalDwellSteps: Int(
+                        cfg.options["goalDwellSteps"] ?? 25),
+                    maximumGoalArrivalSpeed:
+                        cfg.options["maximumGoalArrivalSpeed"] ?? 0.25,
+                    goalBoundaryCommandSpeed:
+                        cfg.options["goalBoundaryCommandSpeed"] ?? 0,
+                    goalStableDwellRewardWeight:
+                        cfg.options["goalStableDwellRewardWeight"] ?? 0,
+                    projectileProbability:
+                        cfg.options["projectileProbability"] ?? 0.5,
+                    projectileCurriculumControlSteps: Int(
+                        cfg.options["projectileCurriculumControlSteps"]
+                            ?? 2_400),
+                    minimumProjectileSpeed:
+                        cfg.options["minimumProjectileSpeed"] ?? 4,
+                    maximumProjectileSpeed:
+                        cfg.options["maximumProjectileSpeed"] ?? 6,
+                    minimumProjectileLaunchStep: Int(
+                        cfg.options["minimumProjectileLaunchStep"] ?? 200),
+                    maximumProjectileLaunchStep: Int(
+                        cfg.options["maximumProjectileLaunchStep"] ?? 700),
+                    actionTargetResponse:
+                        cfg.options["actionTargetResponse"] ?? 1,
+                    autoReset: cfg.autoReset),
+                taskID: "humanoid-goal-v0",
+                taskRevision: ((cfg.options["goalStableDwellRewardWeight"] ?? 0) > 0
+                    ? (30
+                        + ((cfg.options["standStillFallPenalty"] ?? 0) > 0 ? 1 : 0)
+                        + ((cfg.options["freezeBasePolicyExpert"] ?? 0) > 0 ? 2 : 0)
+                        + ((cfg.options["expertGateBlendWidth"] ?? 0) > 0 ? 4 : 0))
+                    : (cfg.options["goalBoundaryCommandSpeed"] ?? 0) > 0
+                    ? (20
+                        + ((cfg.options["standStillFallPenalty"] ?? 0) > 0 ? 1 : 0)
+                        + ((cfg.options["freezeBasePolicyExpert"] ?? 0) > 0 ? 2 : 0)
+                        + ((cfg.options["expertGateBlendWidth"] ?? 0) > 0 ? 4 : 0))
+                    : (cfg.options["expertGateBlendWidth"] ?? 0) > 0
+                    ? (15
+                        + ((cfg.options["standStillFallPenalty"] ?? 0) > 0 ? 1 : 0)
+                        + ((cfg.options["freezeBasePolicyExpert"] ?? 0) > 0 ? 2 : 0))
+                    : ((cfg.options["freezeBasePolicyExpert"] ?? 0) > 0
+                        ? ((cfg.options["standStillFallPenalty"] ?? 0) > 0 ? 14 : 13)
+                        : ((cfg.options["standStillFallPenalty"] ?? 0) > 0
+                            ? 12
+                            : ((cfg.options["commandGatedActor"] ?? 0) > 0 ? 11 : 10))))
+                    + ((cfg.options["trainingInitialEpisodeAgeFraction"] ?? 0) > 0
+                        ? 100 : 0)
+                    + ((cfg.options["trainBasePolicyExpert"] ?? 0) > 0
+                        ? 200 : 0)
+                    + ((cfg.options["threeModeActor"] ?? 0) > 0
+                        ? 400 : 0)
+                    + ((cfg.options["velocityTrackingStandardDeviation"]
+                        ?? HumanoidLocomotionObjective
+                            .velocityTrackingStandardDeviation)
+                        != HumanoidLocomotionObjective
+                            .velocityTrackingStandardDeviation ? 800 : 0)
+                    + ((cfg.options["velocityTrackingErrorPenaltyWeight"] ?? 0) > 0
+                        ? 1_600 : 0)
+                    + ((cfg.options["freezeLowSpeedPolicyExpert"] ?? 0) > 0
+                        ? 3_200 : 0)
+                    + ((cfg.options["minimumGoalDistanceMeters"] ?? 0) > 0
+                        ? 6_400 : 0)
+                    + ((cfg.options["standExpertBlendStartSpeed"] ?? 0) > 0
+                        ? 12_800 : 0)
+                    + ((cfg.options["standExpertRequiresDoubleSupport"] ?? 0) > 0
+                        ? 25_600 : 0)
+                    + ((cfg.options["standExpertUsesPlanarSpeed"] ?? 0) > 0
+                        ? 51_200 : 0)
+                    + ((cfg.options["goalObservationUsesLateralVelocity"] ?? 0)
+                        > 0 ? 102_400 : 0)
+                    + ((cfg.options[
+                        "goalObservationIncludesLateralVelocity"] ?? 0)
+                        > 0 ? 204_800 : 0))
+        }
+        try! registry.register("arm-pusht-v0") { cfg in
+            try cfg.validateOptions(
+                supported: armPushTOptionKeys, taskID: "arm-pusht-v0")
+            return try ArmPushTTask(configuration: ArmPushTTaskConfig(
+                numEnvironments: cfg.numEnvironments,
+                seed: cfg.seed,
+                maxEpisodeSteps: Int(cfg.options["maxEpisodeSteps"] ?? 100),
+                // The maintained PushT-v1 benchmark runs policy control at
+                // 20 Hz. AVBD simulates at 120 Hz, so six substeps preserve
+                // both its 100-action horizon and five seconds of task time.
+                controlDecimation: Int(cfg.options["controlDecimation"] ?? 6),
+                autoReset: cfg.autoReset,
+                jointDeltaActionScale:
+                    cfg.options["jointDeltaActionScale"] ?? 0.1,
+                endEffectorDeltaActionScale:
+                    cfg.options["endEffectorDeltaActionScale"] ?? 0,
+                linkMass: cfg.options["linkMass"] ?? 2.7,
+                tipMass: cfg.options["tipMass"] ?? 0.75,
+                motorTorque: cfg.options["motorTorque"] ?? 100,
+                motorStiffness: cfg.options["motorStiffness"] ?? 1_000,
+                motorDamping: cfg.options["motorDamping"] ?? 100,
+                motorArmature: cfg.options["motorArmature"] ?? 0.1,
+                blockMass: cfg.options["blockMass"] ?? 0.8,
+                blockStaticFriction:
+                    cfg.options["blockStaticFriction"] ?? 3,
+                blockDynamicFriction:
+                    cfg.options["blockDynamicFriction"] ?? 3,
+                blockSpawnGoalBlend:
+                    cfg.options["blockSpawnGoalBlend"] ?? 0,
+                blockSpawnRadius: cfg.options["blockSpawnRadius"] ?? 0.07,
+                blockSpawnYawRange:
+                    cfg.options["blockSpawnYawRange"] ?? 0.35,
+                blockSpawnLateralBias:
+                    cfg.options["blockSpawnLateralBias"] ?? 0,
+                goalProgressWeight: cfg.options["goalProgressWeight"] ?? 0,
+                reachProgressWeight: cfg.options["reachProgressWeight"] ?? 0,
+                yawProgressWeight: cfg.options["yawProgressWeight"] ?? 0,
+                coverageProgressWeight:
+                    cfg.options["coverageProgressWeight"] ?? 0,
+                coverageRewardWeight:
+                    cfg.options["coverageRewardWeight"] ?? 0,
+                poseProgressRewardWeight:
+                    cfg.options["poseProgressRewardWeight"] ?? 0,
+                poseRewardWeight: cfg.options["poseRewardWeight"] ?? 1,
+                poseRewardDistanceScale:
+                    cfg.options["poseRewardDistanceScale"] ?? 5,
+                reachingRewardWeight:
+                    cfg.options["reachingRewardWeight"] ?? 0.05,
+                actionMagnitudePenaltyWeight:
+                    cfg.options["actionMagnitudePenaltyWeight"] ?? 0,
+                actionRatePenaltyWeight:
+                    cfg.options["actionRatePenaltyWeight"] ?? 0,
+                precisionGatedActor:
+                    (cfg.options["precisionGatedActor"] ?? 0) > 0,
+                precisionExpertGateCoverage:
+                    cfg.options["precisionExpertGateCoverage"] ?? 0.75,
+                precisionExpertReleaseCoverage:
+                    cfg.options["precisionExpertReleaseCoverage"] ?? 0.75,
+                freezeBasePolicyExpert:
+                    (cfg.options["freezeBasePolicyExpert"] ?? 0) > 0,
+                pushContactProgressWeight:
+                    cfg.options["pushContactProgressWeight"] ?? 0,
+                reachDistancePenaltyWeight:
+                    cfg.options["reachDistancePenaltyWeight"] ?? 0,
+                goalDistancePenaltyWeight:
+                    cfg.options["goalDistancePenaltyWeight"] ?? 0,
+                yawErrorPenaltyWeight:
+                    cfg.options["yawErrorPenaltyWeight"] ?? 0,
+                pushContactDistancePenaltyWeight:
+                    cfg.options["pushContactDistancePenaltyWeight"] ?? 0,
+                successBonus: cfg.options["successBonus"] ?? 0,
+                successRewardOverride:
+                    cfg.options["successRewardOverride"] ?? 3,
+                continueAfterSuccess:
+                    (cfg.options["continueAfterSuccess"] ?? 0) > 0,
+                successCoverage: cfg.options["successCoverage"]
+                    ?? ArmPushTEnv.successCoverage,
+                successYawTolerance: cfg.options["successYawTolerance"] ?? .pi,
+                reachCurriculumSuccessDistance:
+                    cfg.options["reachCurriculumSuccessDistance"] ?? 0,
+                pushContactCurriculumSuccessDistance:
+                    cfg.options["pushContactCurriculumSuccessDistance"] ?? 0,
+                pushContactOffset: cfg.options["pushContactOffset"] ?? 0.11,
+                pushContactCurriculumMaximumGoalRegression:
+                    cfg.options[
+                        "pushContactCurriculumMaximumGoalRegression"] ?? 0,
+                pushContactCurriculumMinimumGoalProgress:
+                    cfg.options[
+                        "pushContactCurriculumMinimumGoalProgress"] ?? 0,
+                pushContactCurriculumMaximumGoalDistance:
+                    cfg.options[
+                        "pushContactCurriculumMaximumGoalDistance"] ?? 0))
+        }
+        return registry
+    }()
+}

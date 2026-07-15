@@ -21,6 +21,8 @@ public final class GPUSolver {
 
     // Capacities
     let numBodies: Int
+    let numColliders: Int
+    let numConvexHullVertices: Int
     let numJoints: Int
     let numSprings: Int
     let numTets: Int
@@ -44,9 +46,26 @@ public final class GPUSolver {
     var props, shape: MTLBuffer
     var shapeType: MTLBuffer       // 0 box, 1 sphere, 2 torus
     var spinVel: MTLBuffer         // angular velocity of kinematic spinners
+    // Collision geometry is independent of body inertia. Every legacy body
+    // contributes one identity-local collider; imported links may contribute
+    // zero or many offset primitives.
+    var colliderOwner, colliderShape, colliderShapeType, colliderGroup: MTLBuffer
+    var colliderLocalPosition, colliderLocalRotation: MTLBuffer
+    var colliderFriction: MTLBuffer
+    var colliderHullRange, convexHullVertices: MTLBuffer
 
     // Constraints
     var joints: MTLBuffer
+    /// Adaptive joint penalties are solver state, not scene state. Keep the
+    /// authored first-frame values so an in-place environment reset can be
+    /// bitwise equivalent to a fresh episode instead of inheriting the
+    /// previous fall's augmented-Lagrangian conditioning.
+    private var initialJointPenaltyLin: [SIMD4<Float>] = []
+    private var initialJointPenaltyAng: [SIMD4<Float>] = []
+    /// Legacy bounded-torque motors use an adaptive angular penalty in
+    /// `motor.w`. It is just as episode-local as the joint AL penalties;
+    /// carrying it across a reset changes the actuator gain seen by PPO.
+    private var initialJointMotorPenalty: [Float] = []
     var springs: MTLBuffer
     var manifolds: MTLBuffer       // current frame
     var prevManifolds: MTLBuffer   // previous frame (swapped)
@@ -56,6 +75,10 @@ public final class GPUSolver {
     var hashedIdx, globalIdx, hashedRigidIdx: MTLBuffer
     var cellCount, cellStart, cellBodies, cellRigid: MTLBuffer
     var bodyCellSlot: MTLBuffer
+    /// Per-producer candidate counts and exclusive offsets. Pair emission is
+    /// count/scan/scatter instead of atomic append so manifold identity and
+    /// contact accumulation order are reproducible across Metal schedules.
+    var pairCount, pairStart: MTLBuffer
     var pairs: MTLBuffer
     var exclusions: MTLBuffer
     var numExclusions: UInt32 = 0
@@ -143,16 +166,26 @@ public final class GPUSolver {
 
         self.settings = scene.settings
         self.numBodies = scene.bodies.count
+        self.numColliders = scene.colliders.count
+        self.numConvexHullVertices = scene.colliders.reduce(0) {
+            $0 + $1.convexHullVertices.count
+        }
         self.numJoints = scene.joints.count
         self.numSprings = scene.springs.count
         self.numTets = scene.tets.count
+        let enabledColliderCount = scene.colliders.lazy.filter(\.collisionEnabled).count
         // Floor of 4096: small scenes are cheap (688B/slot) but elongated
         // shapes (jenga blocks) legitimately exceed 16 candidates/body, and
         // a saturated pair list silently drops a scheduling-random subset of
         // pairs each frame — bodies lose ground support and sink/freefall.
-        self.maxPairs = max(4096, scene.bodies.count * maxPairsPerBody)
+        // Visual-only/imported proxy colliders do not enter broad phase and
+        // therefore must not size the 688-byte manifold pools. This matters
+        // for batched robots: H1 keeps its analytic MJCF proxies for replay,
+        // while only three exact USD hulls per environment are active.
+        self.maxPairs = max(4096, enabledColliderCount * maxPairsPerBody)
         self.mapCapacity = Self.nextPow2(2 * maxPairs)
-        self.gridHashSize = Self.nextPow2(max(64, 2 * numBodies))
+        self.gridHashSize = Self.nextPow2(
+            max(64, 2 * max(1, enabledColliderCount)))
         // Tet BOUNDARY faces are collision triangles too: soft-soft contact
         // is element-based (soft V-V sphere pairs are banned at broadphase),
         // so without them tet bodies would pass through each other and
@@ -192,6 +225,21 @@ public final class GPUSolver {
         shape = try makeBuf(nb * 16, "shape")
         shapeType = try makeBuf(nb * 4, "shapeType")
         spinVel = try makeBuf(nb * 16, "spinVel")
+        colliderOwner = try makeBuf(numColliders * 4, "colliderOwner")
+        colliderShape = try makeBuf(numColliders * 16, "colliderShape")
+        colliderShapeType = try makeBuf(numColliders * 4, "colliderShapeType")
+        colliderGroup = try makeBuf(numColliders * 4, "colliderGroup")
+        colliderLocalPosition = try makeBuf(numColliders * 16, "colliderLocalPosition")
+        colliderLocalRotation = try makeBuf(numColliders * 16, "colliderLocalRotation")
+        colliderFriction = try makeBuf(
+            numColliders * MemoryLayout<SIMD2<Float>>.stride,
+            "colliderFriction")
+        colliderHullRange = try makeBuf(
+            numColliders * MemoryLayout<SIMD2<UInt32>>.stride,
+            "colliderHullRange")
+        convexHullVertices = try makeBuf(
+            max(1, numConvexHullVertices) * MemoryLayout<SIMD4<Float>>.stride,
+            "convexHullVertices")
 
         joints = try makeBuf(max(1, numJoints) * MemoryLayout<JointGPU>.stride, "joints")
         springs = try makeBuf(max(1, numSprings) * MemoryLayout<SpringGPU>.stride, "springs")
@@ -199,9 +247,9 @@ public final class GPUSolver {
         manifolds = try makeBuf(maxPairs * MemoryLayout<ManifoldGPU>.stride, "manifolds")
         prevManifolds = try makeBuf(maxPairs * MemoryLayout<ManifoldGPU>.stride, "prevManifolds")
 
-        hashedIdx = try makeBuf(nb * 4, "hashedIdx")
-        globalIdx = try makeBuf(nb * 4, "globalIdx")
-        hashedRigidIdx = try makeBuf(nb * 4, "hashedRigidIdx")
+        hashedIdx = try makeBuf(numColliders * 4, "hashedIdx")
+        globalIdx = try makeBuf(numColliders * 4, "globalIdx")
+        hashedRigidIdx = try makeBuf(numColliders * 4, "hashedRigidIdx")
         clothVertFlag = try makeBuf(nb * 4, "clothVertFlag")
         boundsBuf = try makeBuf(nb * 4, "ogcBounds")
         ogcPrevBuf = try makeBuf(nb * 16, "ogcPrev")
@@ -213,10 +261,14 @@ public final class GPUSolver {
         cellCount = try makeBuf(gridHashSize * 4, "cellCount")
         cellRigid = try makeBuf(gridHashSize * 4, "cellRigid")
         cellStart = try makeBuf(gridHashSize * 4, "cellStart")
-        cellBodies = try makeBuf(nb * 4, "cellBodies")
-        bodyCellSlot = try makeBuf(nb * 8, "bodyCellSlot")
+        cellBodies = try makeBuf(numColliders * 4, "cellBodies")
+        bodyCellSlot = try makeBuf(numColliders * 8, "bodyCellSlot")
+        pairCount = try makeBuf(numColliders * 4, "pairCount")
+        pairStart = try makeBuf(numColliders * 4, "pairStart")
         pairs = try makeBuf(maxPairs * 8, "pairs")
-        exclusions = try makeBuf(max(1, scene.joints.count + scene.springs.count) * 8, "exclusions")
+        exclusions = try makeBuf(max(1, scene.joints.count + scene.springs.count
+                                     + scene.collisionExclusions.count) * 8,
+                                 "exclusions")
 
         mapKeyA = try makeBuf(mapCapacity * 4, "mapKeyA")
         mapKeyB = try makeBuf(mapCapacity * 4, "mapKeyB")
@@ -257,7 +309,7 @@ public final class GPUSolver {
         softNormalsBuf = try makeBuf(nb * 16, "softNormals")
         faceNormalsBuf = try makeBuf(max(1, maxSurfTris) * 16, "faceNormals")
         renderTriBuf = try makeBuf(max(1, 8 * numTris + 4 * numTets) * 12, "renderTris")
-        renderBodyIdxBuf = try makeBuf(max(1, nb) * 4, "renderBodyIdx")
+        renderBodyIdxBuf = try makeBuf(max(1, numColliders) * 4, "renderColliderIdx")
         clothGroupBuf = try makeBuf(nb * 4, "clothGroup")
         skinBindingBuf = try makeBuf(max(1, skinnedVertexCount) * MemoryLayout<SkinBindingGPU>.stride,
                                      "skinBindings")
@@ -438,10 +490,9 @@ public final class GPUSolver {
         let colA = colorsA.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         let colB = colorsB.contents().bindMemory(to: UInt32.self, capacity: numBodies)
 
-        var radii: [Float] = []
         for (i, b) in scene.bodies.enumerated() {
-            let mass: Float
-            let moment: F3
+            var mass: Float
+            var moment: F3
             let radius: Float
             switch b.shape {
             case .box:
@@ -472,6 +523,11 @@ public final class GPUSolver {
                 moment = F3(iPerp, iPerp, iAxis)
                 radius = L / 2 + r
             }
+            if let explicitMass = b.mass,
+               let explicitInertia = b.diagonalInertia {
+                mass = explicitMass
+                moment = explicitInertia
+            }
             pl[i] = SIMD4(b.position, mass)
             pa[i] = SIMD4(b.rotation.imag, b.rotation.real)
             vl[i] = SIMD4(b.velocity, 0)
@@ -487,10 +543,85 @@ public final class GPUSolver {
             }
             colA[i] = UInt32(i % AVBD_MAX_COLORS)  // initial guess; refined per frame
             colB[i] = colA[i]
-            if mass > 0 { radii.append(radius) }
         }
 
-        // Partition into hashed vs global bodies. Globals: statics or bodies
+        let co = colliderOwner.contents().bindMemory(to: UInt32.self,
+                                                     capacity: numColliders)
+        let cs = colliderShape.contents().bindMemory(to: SIMD4<Float>.self,
+                                                     capacity: numColliders)
+        let ct = colliderShapeType.contents().bindMemory(to: UInt32.self,
+                                                         capacity: numColliders)
+        let cg = colliderGroup.contents().bindMemory(to: UInt32.self,
+                                                     capacity: numColliders)
+        let cp = colliderLocalPosition.contents().bindMemory(to: SIMD4<Float>.self,
+                                                             capacity: numColliders)
+        let cq = colliderLocalRotation.contents().bindMemory(to: SIMD4<Float>.self,
+                                                             capacity: numColliders)
+        let cf = colliderFriction.contents().bindMemory(
+            to: SIMD2<Float>.self, capacity: numColliders)
+        let chr = colliderHullRange.contents().bindMemory(
+            to: SIMD2<UInt32>.self, capacity: numColliders)
+        let chv = convexHullVertices.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: max(1, numConvexHullVertices))
+        func radius(of c: SceneCollider) -> Float {
+            if !c.convexHullVertices.isEmpty {
+                return c.convexHullVertices.reduce(0) { max($0, length($1)) }
+            }
+            switch c.shape {
+            case .sphere: return c.size.x / 2
+            case .torus: return c.size.x + c.size.y
+            case .capsule: return c.size.x / 2 + c.size.y
+            case .box: return length(c.size * 0.5)
+            }
+        }
+        var radii: [Float] = []
+        radii.reserveCapacity(numColliders)
+        var hullVertexOffset = 0
+        for (i, c) in scene.colliders.enumerated() {
+            precondition(scene.bodies.indices.contains(c.body),
+                         "collider owner out of range")
+            let r = radius(of: c)
+            let particle = scene.bodies[c.body].isParticle
+            co[i] = UInt32(c.body)
+            cg[i] = c.collisionGroup
+            cs[i] = SIMD4(c.size, particle ? -r : r)
+            cp[i] = SIMD4(c.localPosition, c.friction)
+            cq[i] = SIMD4(c.localRotation.imag, c.localRotation.real)
+            cf[i] = SIMD2(c.friction, c.dynamicFriction)
+            if c.convexHullVertices.isEmpty {
+                chr[i] = .zero
+            } else {
+                precondition(c.convexHullVertices.count <= 64,
+                             "Metal convex contact supports at most 64 vertices")
+                chr[i] = SIMD2(UInt32(hullVertexOffset),
+                               UInt32(c.convexHullVertices.count))
+                for vertex in c.convexHullVertices {
+                    chv[hullVertexOffset] = SIMD4(vertex, 0)
+                    hullVertexOffset += 1
+                }
+            }
+            var flags: UInt32
+            if !c.convexHullVertices.isEmpty {
+                flags = 4
+            } else {
+                switch c.shape {
+                case .box: flags = 0
+                case .sphere: flags = 1
+                case .torus: flags = 2
+                case .capsule: flags = 3
+                }
+            }
+            if particle { flags |= 0x10 }
+            if c.usesWorldSpaceRoundAnchor { flags |= 0x20 }
+            ct[i] = flags
+            if c.collisionEnabled && scene.bodies[c.body].isDynamic {
+                radii.append(r)
+            }
+        }
+        precondition(hullVertexOffset == numConvexHullVertices)
+
+        // Partition collision primitives into hashed vs global sets. Globals:
+        // primitives far larger than the median dynamic radius.
         // far larger than the median dynamic radius (keeps grid cells tight).
         let sortedRadii = radii.sorted()
         let medianRadius = sortedRadii.isEmpty ? 0.5 : sortedRadii[sortedRadii.count / 2]
@@ -499,15 +630,15 @@ public final class GPUSolver {
         var globals: [UInt32] = []
         // Only oversized bodies go to the brute-forced global list; normal
         // sized statics live in the spatial hash like everything else.
-        for (i, b) in scene.bodies.enumerated() {
-            let radius: Float
-            switch b.shape {
-            case .sphere: radius = b.size.x / 2
-            case .torus: radius = b.size.x + b.size.y
-            case .capsule: radius = b.size.x / 2 + b.size.y
-            case .box: radius = length(b.size * 0.5)
-            }
-            if radius > threshold {
+        let hasIsolatedGroups = scene.colliders.contains {
+            $0.collisionEnabled && $0.collisionGroup != 0
+        }
+        for (i, c) in scene.colliders.enumerated() {
+            guard c.collisionEnabled else { continue }
+            // Shared-domain geometry must be visible to every isolated hash
+            // domain, so keep it in the normally tiny global list.
+            if radius(of: c) > threshold
+                || (hasIsolatedGroups && c.collisionGroup == 0) {
                 globals.append(UInt32(i))
             } else {
                 hashed.append(UInt32(i))
@@ -520,7 +651,7 @@ public final class GPUSolver {
         // contention in bp_count + thousands-long cell lists in pair gen).
         var maxHashedRadius: Float = 0.05
         for i in hashed {
-            maxHashedRadius = max(maxHashedRadius, abs(sh[Int(i)].w))
+            maxHashedRadius = max(maxHashedRadius, abs(cs[Int(i)].w))
         }
 
         hashedIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashed.count))
@@ -554,16 +685,41 @@ public final class GPUSolver {
             g.restRel = SIMD4(rel.imag, rel.real)
             if let axis = j.hingeAxis {
                 g.hingeAxis = SIMD4(axis, 1)
+                g.dynamics.x = j.armature
                 if j.motorTorque > 0 {
-                    g.motor = SIMD4(j.motorTarget, j.motorTorque, 0, 400)
+                    let fixedPD = j.motorStiffness > 0
+                    g.motor = SIMD4(j.motorTarget, j.motorTorque, 0,
+                                    fixedPD ? j.motorStiffness : 400)
+                    g.limits = SIMD4(j.limitLo, j.limitHi,
+                                    max(j.motorDamping, 0), fixedPD ? 1 : 0)
                     if j.motorRate != 0 { rateMotors.append((i, j.motorRate)) }
                 }
-                if j.limitLo < j.limitHi {
+                if j.limitLo < j.limitHi && j.motorTorque == 0 {
                     g.limits = SIMD4(j.limitLo, j.limitHi, 0, 0)
                 }
             }
-            // soft (finite) joints ARE their stiffness from frame one; only
-            // hard (AL) constraints ramp from PENALTY_MIN per the paper
+            // A hard articulation constraint must be load-bearing on its
+            // first frame. Starting every hard joint at PENALTY_MIN lets an
+            // articulated robot compress under gravity until the adaptive
+            // penalty has ramped, so its first reset has different dynamics
+            // from every later reset. Use the same effective-mass / dt^2
+            // floor as newly created contacts; AVBD can still adapt upward.
+            let massA = j.bodyA >= 0 ? pl[j.bodyA].w : 0
+            let massB = pl[j.bodyB].w
+            let dynamicMasses = [massA, massB].filter { $0 > 0 }
+            let effectiveMass = dynamicMasses.min() ?? 0
+            let hardPenaltyFloor = min(
+                1.0e9,
+                max(1, effectiveMass
+                    / max(settings.dt * settings.dt, 1.0e-12)))
+            if j.stiffnessLin.isInfinite {
+                g.penaltyLin = SIMD4(repeating: hardPenaltyFloor)
+            }
+            if j.stiffnessAng.isInfinite {
+                g.penaltyAng = SIMD4(repeating: hardPenaltyFloor)
+            }
+            // Soft (finite) joints are their physical stiffness from frame
+            // one; they do not use the adaptive hard-constraint floor.
             if j.stiffnessLin > 0 && j.stiffnessLin.isFinite {
                 g.penaltyLin = SIMD4(repeating: min(j.stiffnessLin, 1e9))
             }
@@ -572,6 +728,9 @@ public final class GPUSolver {
             }
             jp[i] = g
         }
+        initialJointPenaltyLin = (0..<numJoints).map { jp[$0].penaltyLin }
+        initialJointPenaltyAng = (0..<numJoints).map { jp[$0].penaltyAng }
+        initialJointMotorPenalty = (0..<numJoints).map { jp[$0].motor.w }
 
         // Springs (rest length resolved here if negative)
         let sp = springs.contents().bindMemory(to: SpringGPU.self, capacity: max(1, numSprings))
@@ -640,15 +799,21 @@ public final class GPUSolver {
             }
         }
 
-        // Collision exclusions: sorted (min,max) pairs of jointed/springed bodies
+        // Collision exclusions: sorted (min,max) pairs of jointed/springed
+        // bodies plus explicit source-asset exclusions.
         var excl: [UInt64] = []
-        excl.reserveCapacity(scene.joints.count + scene.springs.count)
+        excl.reserveCapacity(scene.joints.count + scene.springs.count
+                             + scene.collisionExclusions.count)
         for j in scene.joints where j.bodyA >= 0 {
             let lo = UInt64(min(j.bodyA, j.bodyB)), hi = UInt64(max(j.bodyA, j.bodyB))
             excl.append(lo << 32 | hi)
         }
         for s in scene.springs {
             let lo = UInt64(min(s.bodyA, s.bodyB)), hi = UInt64(max(s.bodyA, s.bodyB))
+            excl.append(lo << 32 | hi)
+        }
+        for e in scene.collisionExclusions {
+            let lo = UInt64(min(e.bodyA, e.bodyB)), hi = UInt64(max(e.bodyA, e.bodyB))
             excl.append(lo << 32 | hi)
         }
         let sortedExcl = sortedUnique(excl)
@@ -1235,16 +1400,17 @@ public final class GPUSolver {
         }
         let flags = surfacedFlags.contents().bindMemory(to: UInt32.self,
                                                         capacity: numBodies)
-        var renderBodyIDs: [UInt32] = []
-        renderBodyIDs.reserveCapacity(numBodies)
-        for i in 0..<numBodies where flags[i] == 0 {
-            renderBodyIDs.append(UInt32(i))
+        var renderColliderIDs: [UInt32] = []
+        renderColliderIDs.reserveCapacity(numColliders)
+        for (i, c) in scene.colliders.enumerated()
+            where c.isRendered && flags[c.body] == 0 {
+            renderColliderIDs.append(UInt32(i))
         }
-        renderRigidBodyCount = renderBodyIDs.count
+        renderRigidBodyCount = renderColliderIDs.count
         renderBodyIdxBuf.contents().bindMemory(to: UInt32.self,
-                                               capacity: max(1, renderBodyIDs.count))
-            .update(from: renderBodyIDs.isEmpty ? [0] : renderBodyIDs,
-                    count: max(1, renderBodyIDs.count))
+                                               capacity: max(1, renderColliderIDs.count))
+            .update(from: renderColliderIDs.isEmpty ? [0] : renderColliderIDs,
+                    count: max(1, renderColliderIDs.count))
 
         // ---- Static topology coloring (computed ONCE; contacts do not
         // constrain colors — same-color contact pairs degrade to Jacobi,
@@ -1253,8 +1419,8 @@ public final class GPUSolver {
         var adjacencySets = [Set<Int>](repeating: [], count: numBodies)
         func link2(_ a: Int, _ b: Int) {
             guard a >= 0, b >= 0,
-                  scene.bodies[a].density > 0 || scene.bodies[b].density > 0 else { return }
-            if scene.bodies[a].density > 0 && scene.bodies[b].density > 0 {
+                  scene.bodies[a].isDynamic || scene.bodies[b].isDynamic else { return }
+            if scene.bodies[a].isDynamic && scene.bodies[b].isDynamic {
                 adjacencySets[a].insert(b)
                 adjacencySets[b].insert(a)
             }
@@ -1293,7 +1459,7 @@ public final class GPUSolver {
         // forces (kappa ~ 5e-4) are orders below membrane/rod scale.
         var staticColors = [Int](repeating: 0, count: numBodies)
         var maxColor = 0
-        for v in 0..<numBodies where scene.bodies[v].density > 0 {
+        for v in 0..<numBodies where scene.bodies[v].isDynamic {
             var used: UInt64 = 0
             for nb in adjacencySets[v] where nb < v {
                 let c = staticColors[nb]
@@ -1307,7 +1473,7 @@ public final class GPUSolver {
         staticUsedColors = maxColor + 1
         // colorList/colorStart in final form, uploaded once
         var buckets = [[UInt32]](repeating: [], count: AVBD_MAX_COLORS)
-        for v in 0..<numBodies where scene.bodies[v].density > 0 {
+        for v in 0..<numBodies where scene.bodies[v].isDynamic {
             buckets[staticColors[v]].append(UInt32(v))
         }
         var clist: [UInt32] = []
@@ -1357,7 +1523,9 @@ public final class GPUSolver {
         params.gridHashSize = UInt32(gridHashSize)
         params.numHashed = UInt32(hashed.count)
         params.numGlobals = UInt32(globals.count)
-        let hashedRigid = hashed.filter { !scene.bodies[Int($0)].isParticle }
+        let hashedRigid = hashed.filter {
+            !scene.bodies[scene.colliders[Int($0)].body].isParticle
+        }
         params.numHashedRigid = UInt32(hashedRigid.count)
         hashedRigidIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashedRigid.count))
             .update(from: hashedRigid.isEmpty ? [0] : hashedRigid, count: max(1, hashedRigid.count))
@@ -1392,6 +1560,7 @@ public final class GPUSolver {
         params.rodDecayPow = settings.rodDecayPow
         params.particleDamping = settings.particleDamping
         params.frame = UInt32(truncatingIfNeeded: frameIndex)
+        params.frictionCombineMode = settings.frictionCombineMode.rawValue
 
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
            let v = Float(env) {
@@ -1494,32 +1663,186 @@ public final class GPUSolver {
 
     public var metalDevice: MTLDevice { device }
 
-    /// Robotics: teleport a body (resets its velocity).
-    public func setBodyPose(_ i: Int, position: F3, rotation: Quat) {
+    public struct BodyPoseUpdate {
+        public var body: Int
+        public var position: F3
+        public var rotation: Quat
+
+        public init(body: Int, position: F3, rotation: Quat) {
+            self.body = body
+            self.position = position
+            self.rotation = rotation
+        }
+    }
+
+    /// Batched pose-and-velocity write used for deterministic resets and
+    /// physical disturbance injection. Unlike an impulse shortcut, a launched
+    /// object enters the ordinary broadphase/contact solver on the next step.
+    public struct BodyStateUpdate {
+        public var body: Int
+        public var position: F3
+        public var rotation: Quat
+        public var linearVelocity: F3
+        public var angularVelocity: F3
+
+        public init(body: Int, position: F3, rotation: Quat,
+                    linearVelocity: F3 = .zero,
+                    angularVelocity: F3 = .zero) {
+            self.body = body
+            self.position = position
+            self.rotation = rotation
+            self.linearVelocity = linearVelocity
+            self.angularVelocity = angularVelocity
+        }
+    }
+
+    public struct JointAnchorUpdate {
+        public var joint: Int
+        public var point: F3
+
+        public init(joint: Int, point: F3) {
+            self.joint = joint
+            self.point = point
+        }
+    }
+
+    public struct MotorTargetUpdate {
+        public var joint: Int
+        public var angle: Float
+
+        public init(joint: Int, angle: Float) {
+            self.joint = joint
+            self.angle = angle
+        }
+    }
+
+    public struct RigidBodyState {
+        public var position: F3
+        public var rotation: Quat
+        public var linearVelocity: F3
+        public var angularVelocity: F3
+
+        public init(position: F3, rotation: Quat, linearVelocity: F3,
+                    angularVelocity: F3) {
+            self.position = position
+            self.rotation = rotation
+            self.linearVelocity = linearVelocity
+            self.angularVelocity = angularVelocity
+        }
+    }
+
+    /// Robotics: teleport several bodies after a single GPU fence. Batched
+    /// resets must use this API; synchronizing once per body destroys the
+    /// throughput advantage of vectorized environments.
+    public func setBodyPoses(_ updates: [BodyPoseUpdate]) {
+        setBodyStates(updates.map {
+            BodyStateUpdate(body: $0.body, position: $0.position,
+                            rotation: $0.rotation)
+        })
+    }
+
+    /// Robotics: update several rigid states after one GPU fence. Constraint
+    /// warm starts incident to those bodies are cleared exactly as for pose
+    /// resets, so a relaunched projectile cannot inherit stale impulses.
+    public func setBodyStates(_ updates: [BodyStateUpdate]) {
+        guard !updates.isEmpty else { return }
         sync()
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let vl = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let va = velAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
-        pl[i] = SIMD4(position, pl[i].w)
-        pa[i] = SIMD4(rotation.imag, rotation.real)
-        vl[i] = .zero
-        va[i] = .zero
+        let pvl = prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        for u in updates {
+            precondition(u.body >= 0 && u.body < numBodies, "body index out of range")
+            pl[u.body] = SIMD4(u.position, pl[u.body].w)
+            pa[u.body] = SIMD4(u.rotation.imag, u.rotation.real)
+            vl[u.body] = SIMD4(u.linearVelocity, 0)
+            va[u.body] = SIMD4(u.angularVelocity, 0)
+            // Adaptive body initialization estimates acceleration from this
+            // history slot. Carrying a pre-teleport velocity here makes the
+            // first post-reset prediction depend on the previous episode.
+            pvl[u.body] = SIMD4(u.linearVelocity, 0)
+        }
+        // A teleported episode must not inherit augmented-Lagrangian or motor
+        // impulses from its previous trajectory. Clear warm starts for every
+        // constraint incident to a reset body while leaving other replicas'
+        // solver state untouched.
+        let resetBodies = Set(updates.map { UInt32($0.body) })
+        if numJoints > 0 {
+            let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: numJoints)
+            for i in 0..<numJoints {
+                let a = jp[i].header.x, b = jp[i].header.y
+                if resetBodies.contains(b)
+                    || (a != UInt32.max && resetBodies.contains(a)) {
+                    jp[i].lambdaLin = .zero
+                    jp[i].lambdaAng = .zero
+                    jp[i].motor.z = 0
+                    jp[i].motor.w = initialJointMotorPenalty[i]
+                    jp[i].dynamics.y = 0
+                    jp[i].penaltyLin = initialJointPenaltyLin[i]
+                    jp[i].penaltyAng = initialJointPenaltyAng[i]
+                }
+            }
+        }
+        if numSprings > 0 {
+            let sp = springs.contents().bindMemory(to: SpringGPU.self, capacity: numSprings)
+            for i in 0..<numSprings where resetBodies.contains(sp[i].header.x)
+                    || resetBodies.contains(sp[i].header.y) {
+                sp[i].dual = .zero
+            }
+        }
+        // Contact multipliers, penalties, and static-friction anchors are
+        // also temporal solver state. The persistence hash may continue to
+        // point at these slots until the next narrow phase; a zero contact
+        // count makes that lookup deliberately cold without rebuilding the
+        // global map or disturbing other vectorized environments.
+        for buffer in [manifolds, prevManifolds] {
+            let mp = buffer.contents().bindMemory(
+                to: ManifoldGPU.self, capacity: maxPairs)
+            for i in 0..<maxPairs {
+                if resetBodies.contains(mp[i].header.x)
+                    || resetBodies.contains(mp[i].header.y) {
+                    mp[i] = ManifoldGPU()
+                }
+            }
+        }
+    }
+
+    /// Robotics: teleport a body (resets its velocity).
+    public func setBodyPose(_ i: Int, position: F3, rotation: Quat) {
+        setBodyPoses([BodyPoseUpdate(body: i, position: position, rotation: rotation)])
     }
 
     /// Robotics: move a world-anchored joint's target point (Cartesian
     /// position actuator — the joint's bounded force does the rest).
-    public func setJointWorldAnchor(_ jointIndex: Int, point: F3) {
+    public func setJointWorldAnchors(_ updates: [JointAnchorUpdate]) {
+        guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
-        jp[jointIndex].rA = SIMD4(point, jp[jointIndex].rA.w)
+        for u in updates {
+            precondition(u.joint >= 0 && u.joint < numJoints, "joint index out of range")
+            jp[u.joint].rA = SIMD4(u.point, jp[u.joint].rA.w)
+        }
+    }
+
+    public func setJointWorldAnchor(_ jointIndex: Int, point: F3) {
+        setJointWorldAnchors([JointAnchorUpdate(joint: jointIndex, point: point)])
     }
 
     /// Robotics: set a motor joint's target angle at runtime.
-    public func setMotorTarget(_ jointIndex: Int, angle: Float) {
+    public func setMotorTargets(_ updates: [MotorTargetUpdate]) {
+        guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
-        jp[jointIndex].motor.x = angle
+        for u in updates {
+            precondition(u.joint >= 0 && u.joint < numJoints, "joint index out of range")
+            jp[u.joint].motor.x = u.angle
+        }
+    }
+
+    public func setMotorTarget(_ jointIndex: Int, angle: Float) {
+        setMotorTargets([MotorTargetUpdate(joint: jointIndex, angle: angle)])
     }
 
     /// Robotics: set a motor joint's torque limit at runtime.
@@ -1531,21 +1854,51 @@ public final class GPUSolver {
 
     /// Robotics: read a motor joint's current twist angle.
     public func motorAngle(_ jointIndex: Int) -> Float {
+        motorAngles([jointIndex])[0]
+    }
+
+    /// Read several hinge angles behind one GPU fence.
+    public func motorAngles(_ jointIndices: [Int]) -> [Float] {
+        motorStates(jointIndices).map(\.angle)
+    }
+
+    /// Read reduced hinge position and velocity behind one GPU fence. The
+    /// velocity is the relative angular velocity of the child and parent,
+    /// projected onto the current world-space hinge axis. This avoids noisy
+    /// finite differences of the projected twist angle in RL observations
+    /// and acceleration rewards.
+    public func motorStates(_ jointIndices: [Int])
+        -> [(angle: Float, velocity: Float)] {
+        guard !jointIndices.isEmpty else { return [] }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
-        let j = jp[jointIndex]
-        let a = j.header.x
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
-        let qB = Quat(real: pa[Int(j.header.y)].w,
-                      imag: F3(pa[Int(j.header.y)].x, pa[Int(j.header.y)].y, pa[Int(j.header.y)].z))
-        let qA: Quat = a == 0xFFFFFFFF
-            ? Quat(real: 1, imag: .zero)
-            : Quat(real: pa[Int(a)].w, imag: F3(pa[Int(a)].x, pa[Int(a)].y, pa[Int(a)].z))
-        let rest = Quat(real: j.restRel.w, imag: F3(j.restRel.x, j.restRel.y, j.restRel.z))
-        var r = (qA * rest).inverse * qB
-        if r.real < 0 { r = Quat(real: -r.real, imag: -r.imag) }
-        let axis = F3(j.hingeAxis.x, j.hingeAxis.y, j.hingeAxis.z)
-        return 2 * atan2(dot(r.imag, axis), r.real)
+        let va = velAng.contents().bindMemory(to: SIMD4<Float>.self,
+                                              capacity: numBodies)
+        return jointIndices.map { jointIndex in
+            precondition(jointIndex >= 0 && jointIndex < numJoints, "joint index out of range")
+            let j = jp[jointIndex]
+            let a = j.header.x
+            let b = Int(j.header.y)
+            let qB = Quat(real: pa[b].w,
+                          imag: F3(pa[b].x, pa[b].y, pa[b].z))
+            let qA: Quat = a == 0xFFFFFFFF
+                ? Quat(real: 1, imag: .zero)
+                : Quat(real: pa[Int(a)].w,
+                       imag: F3(pa[Int(a)].x, pa[Int(a)].y, pa[Int(a)].z))
+            let rest = Quat(real: j.restRel.w,
+                            imag: F3(j.restRel.x, j.restRel.y, j.restRel.z))
+            var r = (qA * rest).inverse * qB
+            if r.real < 0 { r = Quat(real: -r.real, imag: -r.imag) }
+            let axis = F3(j.hingeAxis.x, j.hingeAxis.y, j.hingeAxis.z)
+            let angle = 2 * atan2(dot(r.imag, axis), r.real)
+            let childVelocity = F3(va[b].x, va[b].y, va[b].z)
+            let parentVelocity: F3 = a == 0xFFFFFFFF
+                ? .zero : F3(va[Int(a)].x, va[Int(a)].y, va[Int(a)].z)
+            let velocity = dot(childVelocity - parentVelocity,
+                               qB.act(axis))
+            return (angle, velocity)
+        }
     }
 
     /// Debug: worst joints by linear lambda, with endpoints.
@@ -1800,8 +2153,12 @@ public final class GPUSolver {
             e.setBuffer(self.cellCount, offset: 0, index: 2)
             e.setBuffer(self.bodyCellSlot, offset: 0, index: 3)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
-            e.setBuffer(self.shape, offset: 0, index: 5)
+            e.setBuffer(self.colliderShape, offset: 0, index: 5)
             e.setBuffer(self.cellRigid, offset: 0, index: 6)
+            e.setBuffer(self.colliderOwner, offset: 0, index: 7)
+            e.setBuffer(self.colliderLocalPosition, offset: 0, index: 8)
+            e.setBuffer(self.posAng, offset: 0, index: 9)
+            e.setBuffer(self.colliderGroup, offset: 0, index: 10)
         }
         if profiling { stage("bp-scan") }
         encodeScan(enc, input: cellCount, output: cellStart, count: gridHashSize)
@@ -1813,38 +2170,65 @@ public final class GPUSolver {
             e.setBuffer(self.cellBodies, offset: 0, index: 3)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
         }
+        var hashSize32 = UInt32(gridHashSize)
+        dispatch1D(enc, "bp_sort_cells", gridHashSize) { e in
+            e.setBuffer(self.cellStart, offset: 0, index: 0)
+            e.setBuffer(self.cellCount, offset: 0, index: 1)
+            e.setBuffer(self.cellBodies, offset: 0, index: 2)
+            e.setBytes(&hashSize32, length: 4, index: 3)
+        }
         if profiling { stage("bp-pairs") }
-        dispatch1D(enc, "bp_gen_pairs", Int(P.numHashed)) { e in
-            e.setBuffer(self.posLin, offset: 0, index: 0)
-            e.setBuffer(self.shape, offset: 0, index: 1)
-            e.setBuffer(self.hashedIdx, offset: 0, index: 2)
-            e.setBuffer(self.cellStart, offset: 0, index: 3)
-            e.setBuffer(self.cellCount, offset: 0, index: 4)
-            e.setBuffer(self.cellBodies, offset: 0, index: 5)
-            e.setBuffer(self.globalIdx, offset: 0, index: 6)
-            e.setBuffer(self.exclusions, offset: 0, index: 7)
-            e.setBytes(&nExcl, length: 4, index: 8)
-            e.setBuffer(self.counters, offset: 0, index: 9)
-            e.setBuffer(self.pairs, offset: 0, index: 10)
-            e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
-            e.setBuffer(self.clothGroupBuf, offset: 0, index: 12)
-            e.setBuffer(self.cellRigid, offset: 0, index: 13)
+        let pairProducerCount = Int(P.numHashed + P.numGlobals)
+        if pairProducerCount > 0 {
+            dispatch1D(enc, "bp_count_pairs_deterministic", pairProducerCount) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.colliderShape, offset: 0, index: 1)
+                e.setBuffer(self.hashedIdx, offset: 0, index: 2)
+                e.setBuffer(self.cellStart, offset: 0, index: 3)
+                e.setBuffer(self.cellCount, offset: 0, index: 4)
+                e.setBuffer(self.cellBodies, offset: 0, index: 5)
+                e.setBuffer(self.globalIdx, offset: 0, index: 6)
+                e.setBuffer(self.exclusions, offset: 0, index: 7)
+                e.setBytes(&nExcl, length: 4, index: 8)
+                e.setBuffer(self.pairCount, offset: 0, index: 9)
+                e.setBuffer(self.pairs, offset: 0, index: 10)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
+                e.setBuffer(self.clothGroupBuf, offset: 0, index: 12)
+                e.setBuffer(self.cellRigid, offset: 0, index: 13)
+                e.setBuffer(self.colliderOwner, offset: 0, index: 14)
+                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 15)
+                e.setBuffer(self.posAng, offset: 0, index: 16)
+                e.setBuffer(self.colliderGroup, offset: 0, index: 17)
+            }
+            encodeScan(enc, input: pairCount, output: pairStart,
+                       count: pairProducerCount)
+            dispatch1D(enc, "bp_emit_pairs_deterministic", pairProducerCount) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.colliderShape, offset: 0, index: 1)
+                e.setBuffer(self.hashedIdx, offset: 0, index: 2)
+                e.setBuffer(self.cellStart, offset: 0, index: 3)
+                e.setBuffer(self.cellCount, offset: 0, index: 4)
+                e.setBuffer(self.cellBodies, offset: 0, index: 5)
+                e.setBuffer(self.globalIdx, offset: 0, index: 6)
+                e.setBuffer(self.exclusions, offset: 0, index: 7)
+                e.setBytes(&nExcl, length: 4, index: 8)
+                e.setBuffer(self.pairStart, offset: 0, index: 9)
+                e.setBuffer(self.pairs, offset: 0, index: 10)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
+                e.setBuffer(self.clothGroupBuf, offset: 0, index: 12)
+                e.setBuffer(self.cellRigid, offset: 0, index: 13)
+                e.setBuffer(self.colliderOwner, offset: 0, index: 14)
+                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 15)
+                e.setBuffer(self.posAng, offset: 0, index: 16)
+                e.setBuffer(self.colliderGroup, offset: 0, index: 17)
+            }
         }
-        dispatch1D(enc, "bp_gen_global_pairs", Int(P.numGlobals)) { e in
-            e.setBuffer(self.posLin, offset: 0, index: 0)
-            e.setBuffer(self.shape, offset: 0, index: 1)
-            e.setBuffer(self.globalIdx, offset: 0, index: 2)
-            e.setBuffer(self.exclusions, offset: 0, index: 3)
-            e.setBytes(&nExcl, length: 4, index: 4)
-            e.setBuffer(self.counters, offset: 0, index: 5)
-            e.setBuffer(self.pairs, offset: 0, index: 6)
-            e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
-            e.setBuffer(self.clothGroupBuf, offset: 0, index: 8)
-        }
-        dispatch1D(enc, "bp_finalize_pairs", 1) { e in
-            e.setBuffer(self.counters, offset: 0, index: 0)
-            e.setBuffer(self.dispatchArgs, offset: 0, index: 1)
-            e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 2)
+        dispatch1D(enc, "bp_finalize_deterministic_pairs", 1) { e in
+            e.setBuffer(self.pairCount, offset: 0, index: 0)
+            e.setBuffer(self.pairStart, offset: 0, index: 1)
+            e.setBuffer(self.counters, offset: 0, index: 2)
+            e.setBuffer(self.dispatchArgs, offset: 0, index: 3)
+            e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
         }
 
         stage("narrowphase")
@@ -1852,7 +2236,7 @@ public final class GPUSolver {
         dispatchIndirect(enc, "np_collide", argsOffset: 0) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.posAng, offset: 0, index: 1)
-            e.setBuffer(self.shape, offset: 0, index: 2)
+            e.setBuffer(self.colliderShape, offset: 0, index: 2)
             e.setBuffer(self.props, offset: 0, index: 3)
             e.setBuffer(self.pairs, offset: 0, index: 4)
             e.setBuffer(self.counters, offset: 0, index: 5)
@@ -1862,9 +2246,16 @@ public final class GPUSolver {
             e.setBuffer(self.mapKeyB, offset: 0, index: 9)
             e.setBuffer(self.mapVal, offset: 0, index: 10)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
-            e.setBuffer(self.shapeType, offset: 0, index: 12)
+            e.setBuffer(self.colliderShapeType, offset: 0, index: 12)
             e.setBuffer(self.spinVel, offset: 0, index: 13)
             e.setBuffer(self.velLin, offset: 0, index: 14)
+            e.setBuffer(self.velAng, offset: 0, index: 15)
+            e.setBuffer(self.colliderOwner, offset: 0, index: 16)
+            e.setBuffer(self.colliderLocalPosition, offset: 0, index: 17)
+            e.setBuffer(self.colliderLocalRotation, offset: 0, index: 18)
+            e.setBuffer(self.colliderHullRange, offset: 0, index: 19)
+            e.setBuffer(self.convexHullVertices, offset: 0, index: 20)
+            e.setBuffer(self.colliderFriction, offset: 0, index: 21)
         }
 
         stage("persistence-map")
@@ -2033,6 +2424,7 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 3)
             e.setBuffer(self.springs, offset: 0, index: 4)
             e.setBuffer(self.velLin, offset: 0, index: 5)
+            e.setBuffer(self.velAng, offset: 0, index: 6)
         }
         dispatch1D(enc, "warmstart_bodies", numBodies) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -2091,6 +2483,12 @@ public final class GPUSolver {
             e.setBuffer(self.softContacts, offset: 0, index: 9)
             e.setBuffer(self.membranes, offset: 0, index: 10)
             e.setBuffer(self.bends, offset: 0, index: 11)
+        }
+        dispatch1D(enc, "adj_sort", numBodies) { e in
+            e.setBuffer(self.adjStart, offset: 0, index: 0)
+            e.setBuffer(self.degrees, offset: 0, index: 1)
+            e.setBuffer(self.adjList, offset: 0, index: 2)
+            e.setBytes(&nb32, length: 4, index: 3)
         }
 
         // Coloring is scene-adaptive:
@@ -2536,6 +2934,13 @@ public final class GPUSolver {
         return p[i].w
     }
 
+    public func bodyDiagonalInertia(_ i: Int) -> F3 {
+        sync()
+        let p = props.contents().bindMemory(to: SIMD4<Float>.self,
+                                            capacity: numBodies)
+        return F3(p[i].x, p[i].y, p[i].z)
+    }
+
     public func bodyVelocity(_ i: Int) -> F3 {
         sync()
         let p = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -2546,6 +2951,26 @@ public final class GPUSolver {
         sync()
         let p = velAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         return F3(p[i].x, p[i].y, p[i].z)
+    }
+
+    /// Read an arbitrary set of body states after one GPU fence. The order
+    /// of the result matches `bodyIndices`, which makes this directly usable
+    /// for row-major environment observations.
+    public func bodyStates(_ bodyIndices: [Int]) -> [RigidBodyState] {
+        guard !bodyIndices.isEmpty else { return [] }
+        sync()
+        let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let vl = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        let va = velAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        return bodyIndices.map { i in
+            precondition(i >= 0 && i < numBodies, "body index out of range")
+            return RigidBodyState(
+                position: F3(pl[i].x, pl[i].y, pl[i].z),
+                rotation: Quat(real: pa[i].w, imag: F3(pa[i].x, pa[i].y, pa[i].z)),
+                linearVelocity: F3(vl[i].x, vl[i].y, vl[i].z),
+                angularVelocity: F3(va[i].x, va[i].y, va[i].z))
+        }
     }
 
     // MARK: - Interaction & rendering support
@@ -2576,55 +3001,78 @@ public final class GPUSolver {
         jp[jointIndex] = j
     }
 
-    /// Ray-cast against body OBBs (CPU, shared buffers). Returns (body, local hit).
+    /// Ray-cast against collision primitives (CPU, shared buffers). Returns
+    /// the owning body and a body-local anchor suitable for dragging.
     public func pick(origin: F3, dir: F3) -> (body: Int, local: F3)? {
         sync()
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
-        let sh = shape.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
-        let st = shapeType.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        let sh = colliderShape.contents().bindMemory(to: SIMD4<Float>.self,
+                                                     capacity: numColliders)
+        let st = colliderShapeType.contents().bindMemory(to: UInt32.self,
+                                                         capacity: numColliders)
+        let owners = colliderOwner.contents().bindMemory(to: UInt32.self,
+                                                         capacity: numColliders)
+        let lp = colliderLocalPosition.contents().bindMemory(to: SIMD4<Float>.self,
+                                                             capacity: numColliders)
+        let lq = colliderLocalRotation.contents().bindMemory(to: SIMD4<Float>.self,
+                                                             capacity: numColliders)
         var bestT = Float.infinity
         var best: (Int, F3)? = nil
-        for i in 0..<numBodies where pl[i].w > 0 {
-            let q = Quat(real: pa[i].w, imag: F3(pa[i].x, pa[i].y, pa[i].z))
+        for i in 0..<numColliders {
+            let body = Int(owners[i])
+            guard pl[body].w > 0 else { continue }
+            let bodyQ = Quat(real: pa[body].w,
+                             imag: F3(pa[body].x, pa[body].y, pa[body].z))
+            let localQ = Quat(real: lq[i].w, imag: F3(lq[i].x, lq[i].y, lq[i].z))
+            let q = bodyQ * localQ
+            let center = F3(pl[body].x, pl[body].y, pl[body].z)
+                + bodyQ.act(F3(lp[i].x, lp[i].y, lp[i].z))
             let inv = q.conjugate
-            let o = inv.act(origin - F3(pl[i].x, pl[i].y, pl[i].z))
+            let o = inv.act(origin - center)
             let d = inv.act(dir)
-            if st[i] != 0 {
+            var hitT: Float?
+            if (st[i] & 0xF) != 0 {
                 // sphere/torus: pick against bounding sphere (good enough for grab)
-                let r = sh[i].w
+                let r = abs(sh[i].w)
                 let b = dot(o, d)
                 let cc = dot(o, o) - r * r
                 let disc = b * b - cc
                 if disc < 0 { continue }
                 let t = -b - disc.squareRoot()
-                if t >= 0 && t < bestT {
-                    bestT = t
-                    best = (i, o + d * t)
+                if t >= 0 { hitT = t }
+            } else {
+                let half = F3(sh[i].x, sh[i].y, sh[i].z) * 0.5
+                var tEnter: Float = 0
+                var tExit = Float.infinity
+                var hit = true
+                for k in 0..<3 {
+                    if abs(d[k]) < 1e-6 {
+                        if o[k] < -half[k] || o[k] > half[k] {
+                            hit = false
+                            break
+                        }
+                        continue
+                    }
+                    var t0 = (-half[k] - o[k]) / d[k]
+                    var t1 = (half[k] - o[k]) / d[k]
+                    if t0 > t1 { swap(&t0, &t1) }
+                    tEnter = max(tEnter, t0)
+                    tExit = min(tExit, t1)
+                    if tEnter > tExit { hit = false; break }
                 }
-                continue
-            }
-            let half = F3(sh[i].x, sh[i].y, sh[i].z) * 0.5
-            var tEnter: Float = 0
-            var tExit = Float.infinity
-            var hit = true
-            for k in 0..<3 {
-                if abs(d[k]) < 1e-6 {
-                    if o[k] < -half[k] || o[k] > half[k] { hit = false; break }
-                    continue
+                if hit {
+                    let t = tEnter >= 0 ? tEnter : tExit
+                    if t >= 0 { hitT = t }
                 }
-                var t0 = (-half[k] - o[k]) / d[k]
-                var t1 = (half[k] - o[k]) / d[k]
-                if t0 > t1 { swap(&t0, &t1) }
-                tEnter = max(tEnter, t0)
-                tExit = min(tExit, t1)
-                if tEnter > tExit { hit = false; break }
             }
-            if !hit { continue }
-            let t = tEnter >= 0 ? tEnter : tExit
+            guard let t = hitT else { continue }
             if t >= 0 && t < bestT {
                 bestT = t
-                best = (i, o + d * t)
+                let worldHit = origin + dir * t
+                let bodyLocal = bodyQ.conjugate.act(
+                    worldHit - F3(pl[body].x, pl[body].y, pl[body].z))
+                best = (body, bodyLocal)
             }
         }
         return best
@@ -2642,13 +3090,16 @@ public final class GPUSolver {
             enc.setComputePipelineState(p)
             enc.setBuffer(posLin, offset: 0, index: 0)
             enc.setBuffer(posAng, offset: 0, index: 1)
-            enc.setBuffer(shape, offset: 0, index: 2)
+            enc.setBuffer(colliderShape, offset: 0, index: 2)
             enc.setBuffer(instances, offset: 0, index: 3)
             enc.setBytes(&nb, length: 4, index: 4)
             enc.setBytes(&cm, length: 4, index: 5)
             enc.setBuffer(colorsA, offset: 0, index: 6)
-            enc.setBuffer(shapeType, offset: 0, index: 7)
+            enc.setBuffer(colliderShapeType, offset: 0, index: 7)
             enc.setBuffer(renderBodyIdxBuf, offset: 0, index: 8)
+            enc.setBuffer(colliderOwner, offset: 0, index: 9)
+            enc.setBuffer(colliderLocalPosition, offset: 0, index: 10)
+            enc.setBuffer(colliderLocalRotation, offset: 0, index: 11)
             enc.dispatchThreadgroups(MTLSize(width: (renderRigidBodyCount + 255) / 256,
                                              height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256,
@@ -2720,6 +3171,21 @@ public final class GPUSolver {
     }
 
     public var bodyCount: Int { numBodies }
+
+    /// Active rigid contact owner pairs from the last completed step. This is
+    /// a diagnostic/readback API for asset validation and tests; training
+    /// loops should use task observations and avoid the synchronization.
+    public func activeRigidContactPairs() -> [(Int, Int)] {
+        sync()
+        let m = prevManifolds.contents().bindMemory(
+            to: ManifoldGPU.self, capacity: maxPairs)
+        var result: [(Int, Int)] = []
+        result.reserveCapacity(lastNumPairs)
+        for i in 0..<lastNumPairs where m[i].header.z > 0 {
+            result.append((Int(m[i].header.x), Int(m[i].header.y)))
+        }
+        return result
+    }
 
     /// Max threadgroup width of the persistent solver kernel (scenes at or
     /// under this run the whole solve in one dispatch).

@@ -18,7 +18,8 @@ public final class CPUManifold: CPUForce {
     public var numContacts: Int { contacts.count }
     // Basis rows: normal (B->A flipped to point A-ward), tangent1, tangent2
     public var basis: (F3, F3, F3) = (.zero, .zero, .zero)
-    public var friction: Float = 0
+    public var staticFriction: Float = 0
+    public var dynamicFriction: Float = 0
 
     init(solver: CPUSolver, bodyA: CPURigid, bodyB: CPURigid) {
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)
@@ -42,7 +43,10 @@ public final class CPUManifold: CPUForce {
 
     override func initialize() -> Bool {
         guard let bodyA, let bodyB else { return false }
-        friction = (bodyA.friction * bodyB.friction).squareRoot()
+        staticFriction = solver.frictionCombineMode.combine(
+            bodyA.friction, bodyB.friction)
+        dynamicFriction = solver.frictionCombineMode.combine(
+            bodyA.dynamicFriction, bodyB.dynamicFriction)
 
         var newContacts: [ContactPoint] = []
         let count = Self.collide(bodyA, bodyB, &newContacts, &basis)
@@ -117,13 +121,14 @@ public final class CPUManifold: CPUForce {
 
         var F = c.penalty * C + c.lambda
         F[0] = min(F[0], 0)
-        let bounds = abs(F[0]) * friction
+        let staticBounds = abs(F[0]) * staticFriction
+        let dynamicBounds = abs(F[0]) * dynamicFriction
         let frictionScale = length(SIMD2<Float>(F[1], F[2]))
-        if frictionScale > bounds && frictionScale > 0 {
-            F[1] *= bounds / frictionScale
-            F[2] *= bounds / frictionScale
+        if frictionScale > staticBounds && frictionScale > 0 {
+            F[1] *= dynamicBounds / frictionScale
+            F[2] *= dynamicBounds / frictionScale
         }
-        return (F, C, frictionScale, bounds)
+        return (F, C, frictionScale, staticBounds)
     }
 
     override func updatePrimal(_ body: CPURigid, _ alpha: Float,

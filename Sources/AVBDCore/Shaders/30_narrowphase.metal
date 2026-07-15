@@ -183,6 +183,66 @@ struct NPContact {
     uint feature;
 };
 
+struct NPConvexBoxCandidate {
+    float3 xHull;
+    float3 xBox;
+    float3 boxToHull;
+    float separation;
+    uint feature;
+};
+
+// Exact cooked convex vertex against an oriented terrain/projectile box.
+// For a point inside the box, project to its nearest exit face; outside,
+// clamp to the box and retain speculative contacts inside the velocity-aware
+// detection margin. H1 disables robot self-collision, so its ankle/torso
+// hulls only require this path against the flat box terrain (and optional box
+// projectiles). General convex-convex GJK/EPA remains a separate extension.
+inline bool npConvexVertexBoxCandidate(
+    float3 vertexWorld, uint feature,
+    thread const NPBox& box, float4 qBox,
+    float3 hullVelocityMinusBoxVelocity,
+    float hullRadius, float boxRadius,
+    constant SimParams& P,
+    thread NPConvexBoxCandidate& result)
+{
+    float4 qInv = q_conj(qBox);
+    float3 local = q_rotate(qInv, vertexWorld - box.center);
+    float3 clamped = clamp(local, -box.half3_, box.half3_);
+    float3 normalLocal;
+    float3 boxLocal;
+    float separation;
+    bool inside = all(local >= -box.half3_) && all(local <= box.half3_);
+    if (inside) {
+        float3 clearance = box.half3_ - fabs(local);
+        int axis = 0;
+        if (clearance.y < clearance[axis]) axis = 1;
+        if (clearance.z < clearance[axis]) axis = 2;
+        normalLocal = float3(0);
+        normalLocal[axis] = local[axis] >= 0.0f ? 1.0f : -1.0f;
+        boxLocal = local;
+        boxLocal[axis] = normalLocal[axis] * box.half3_[axis];
+        separation = -clearance[axis];
+    } else {
+        float3 delta = local - clamped;
+        float distance = length(delta);
+        if (distance < 1e-8f) return false;
+        normalLocal = delta / distance;
+        float3 normalWorld = q_rotate(qBox, normalLocal);
+        float detect = npDetectMargin(normalWorld,
+                                      hullVelocityMinusBoxVelocity, P,
+                                      hullRadius, boxRadius);
+        if (distance > detect) return false;
+        boxLocal = clamped;
+        separation = distance;
+    }
+    result.xHull = vertexWorld;
+    result.xBox = q_rotate(qBox, boxLocal) + box.center;
+    result.boxToHull = q_rotate(qBox, normalLocal);
+    result.separation = separation;
+    result.feature = (4u << 24) | (feature & 0x00FFFFFFu);
+    return true;
+}
+
 inline bool npAddContact(thread NPContact* contacts, thread int& count,
                          thread float3* midpoints,
                          float3 xA, float3 xB, uint feature) {
@@ -286,6 +346,13 @@ kernel void np_collide(
     device const uint* shapeType    [[buffer(12)]],
     device const float4* spinVel    [[buffer(13)]],
     device const float4* velLin     [[buffer(14)]],
+    device const float4* velAng     [[buffer(15)]],
+    device const uint* colliderOwner [[buffer(16)]],
+    device const float4* colliderLocalPosition [[buffer(17)]],
+    device const float4* colliderLocalRotation [[buffer(18)]],
+    device const uint2* colliderHullRange [[buffer(19)]],
+    device const float4* convexHullVertices [[buffer(20)]],
+    device const float2* colliderFriction [[buffer(21)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
@@ -293,13 +360,22 @@ kernel void np_collide(
 
     uint2 pair = pairs[gid];
     uint ia = pair.x, ib = pair.y;
+    uint ba = colliderOwner[ia], bb = colliderOwner[ib];
 
-    float4 pA4 = posLin[ia];
-    float4 pB4 = posLin[ib];
-    float4 qA = posAng[ia];
-    float4 qB = posAng[ib];
-    float3 vA = velLin[ia].xyz;
-    float3 vB = velLin[ib].xyz;
+    float4 bodyPA4 = posLin[ba];
+    float4 bodyPB4 = posLin[bb];
+    float4 qBodyA = posAng[ba];
+    float4 qBodyB = posAng[bb];
+    float3 centerA = bodyPA4.xyz
+        + q_rotate(qBodyA, colliderLocalPosition[ia].xyz);
+    float3 centerB = bodyPB4.xyz
+        + q_rotate(qBodyB, colliderLocalPosition[ib].xyz);
+    float4 pA4 = float4(centerA, bodyPA4.w);
+    float4 pB4 = float4(centerB, bodyPB4.w);
+    float4 qA = q_mul(qBodyA, colliderLocalRotation[ia]);
+    float4 qB = q_mul(qBodyB, colliderLocalRotation[ib]);
+    float3 vA = velLin[ba].xyz + cross(velAng[ba].xyz, centerA - bodyPA4.xyz);
+    float3 vB = velLin[bb].xyz + cross(velAng[bb].xyz, centerB - bodyPB4.xyz);
     float3 relVel = vB - vA;
 
     NPBox A, B;
@@ -311,6 +387,7 @@ kernel void np_collide(
     float3 delta = B.center - A.center;
 
     device ManifoldGPU& outM = manifolds[gid];
+    outM.colliderPair = uint4(ia, ib, 0, 0);
 
     // --- shape type dispatch (0 box, 1 sphere, 2 torus, 3 capsule) ---
     uint stA = shapeType[ia] & SHAPE_KIND_MASK;
@@ -321,6 +398,153 @@ kernel void np_collide(
     bool torB = stB == 2;
     bool capA = stA == 3;
     bool capB = stB == 3;
+    bool hullA = stA == 4;
+    bool hullB = stB == 4;
+
+    if (hullA || hullB) {
+        // The exact H1 contract only needs convex-vs-box. Refuse unsupported
+        // pairs explicitly instead of silently treating hull AABBs as boxes.
+        if ((hullA && hullB) || (hullA ? stB : stA) != 0) {
+            outM.header = uint4(ba, bb, 0, 0);
+            return;
+        }
+        bool hIsA = hullA;
+        uint ih = hIsA ? ia : ib;
+        float4 qH = hIsA ? qA : qB;
+        float3 pH = hIsA ? pA4.xyz : pB4.xyz;
+        thread const NPBox& box = hIsA ? B : A;
+        float4 qBox = hIsA ? qB : qA;
+        float3 relHullBox = hIsA ? (vA - vB) : (vB - vA);
+        float hullRadius = fabs(shape[ih].w);
+        float boxRadius = fabs(shape[hIsA ? ib : ia].w);
+        uint2 range = colliderHullRange[ih];
+
+        NPConvexBoxCandidate best;
+        bool haveBest = false;
+        for (uint vid = 0; vid < range.y; vid++) {
+            float3 localVertex = convexHullVertices[range.x + vid].xyz;
+            float3 worldVertex = pH + q_rotate(qH, localVertex);
+            NPConvexBoxCandidate candidate;
+            if (!npConvexVertexBoxCandidate(
+                    worldVertex, vid, box, qBox, relHullBox,
+                    hullRadius, boxRadius, P, candidate)) continue;
+            if (!haveBest
+                || candidate.separation < best.separation - 1e-8f
+                || (fabs(candidate.separation - best.separation) <= 1e-8f
+                    && candidate.feature < best.feature)) {
+                best = candidate;
+                haveBest = true;
+            }
+        }
+        if (!haveBest) {
+            outM.header = uint4(ba, bb, 0, 0);
+            return;
+        }
+
+        NPConvexBoxCandidate chosen[MAX_CONTACTS];
+        int count = 1;
+        chosen[0] = best;
+        float separationBand = max(0.002f, 0.75f * COLLISION_MARGIN);
+        while (count < MAX_CONTACTS) {
+            NPConvexBoxCandidate next;
+            bool haveNext = false;
+            float bestSpread = -1.0f;
+            for (uint vid = 0; vid < range.y; vid++) {
+                float3 localVertex = convexHullVertices[range.x + vid].xyz;
+                float3 worldVertex = pH + q_rotate(qH, localVertex);
+                NPConvexBoxCandidate candidate;
+                if (!npConvexVertexBoxCandidate(
+                        worldVertex, vid, box, qBox, relHullBox,
+                        hullRadius, boxRadius, P, candidate)) continue;
+                if (candidate.separation > best.separation + separationBand
+                    || dot(candidate.boxToHull, best.boxToHull) < 0.98f) continue;
+                bool duplicate = false;
+                float minSpread = FLT_MAX;
+                for (int j = 0; j < count; j++) {
+                    if (candidate.feature == chosen[j].feature) {
+                        duplicate = true;
+                        break;
+                    }
+                    float3 d = candidate.xHull - chosen[j].xHull;
+                    d -= best.boxToHull * dot(best.boxToHull, d);
+                    minSpread = min(minSpread, dot(d, d));
+                }
+                if (duplicate) continue;
+                if (!haveNext || minSpread > bestSpread + 1e-10f
+                    || (fabs(minSpread - bestSpread) <= 1e-10f
+                        && candidate.feature < next.feature)) {
+                    next = candidate;
+                    bestSpread = minSpread;
+                    haveNext = true;
+                }
+            }
+            if (!haveNext || bestSpread < MERGE_DIST_SQ) break;
+            chosen[count++] = next;
+        }
+
+        float3 normal = hIsA ? best.boxToHull : -best.boxToHull;
+        float3 t1, t2;
+        orthonormal(normal, t1, t2);
+        float staticFriction = combine_friction(
+            colliderFriction[ia].x, colliderFriction[ib].x,
+            P.frictionCombineMode);
+        float dynamicFriction = combine_friction(
+            colliderFriction[ia].y, colliderFriction[ib].y,
+            P.frictionCombineMode);
+        int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal,
+                                  P.mapCapacity, ia, ib);
+        outM.header = uint4(ba, bb, uint(count), 1);
+        outM.basisN = float4(normal, dynamicFriction);
+        outM.basisT1 = float4(t1, staticFriction);
+        float4 qAc = q_conj(qBodyA);
+        float4 qBc = q_conj(qBodyB);
+        float warm = P.alpha * P.gamma;
+        for (int i = 0; i < count; i++) {
+            float3 xA = hIsA ? chosen[i].xHull : chosen[i].xBox;
+            float3 xB = hIsA ? chosen[i].xBox : chosen[i].xHull;
+            float3 rA = q_rotate(qAc, xA - bodyPA4.xyz);
+            float3 rB = q_rotate(qBc, xB - bodyPB4.xyz);
+            float3 lambda = float3(0);
+            float3 penalty = float3(0);
+            float stick = 0.0f;
+            if (prevIdx >= 0) {
+                device const ManifoldGPU& previous = prevManifolds[prevIdx];
+                for (uint j = 0; j < previous.header.z; j++) {
+                    if (as_type<uint>(previous.contacts[j].rA.w)
+                        == chosen[i].feature) {
+                        lambda = previous.contacts[j].lambda.xyz;
+                        penalty = previous.contacts[j].penalty.xyz;
+                        stick = previous.contacts[j].rB.w;
+                        if (stick != 0.0f) {
+                            rA = previous.contacts[j].rA.xyz;
+                            rB = previous.contacts[j].rB.xyz;
+                        }
+                        break;
+                    }
+                }
+            }
+            float3 xAw = xform(bodyPA4.xyz, qBodyA, rA);
+            float3 xBw = xform(bodyPB4.xyz, qBodyB, rB);
+            float3 d = xAw - xBw;
+            float3 C0 = float3(dot(normal, d) + COLLISION_MARGIN,
+                               dot(t1, d), dot(t2, d));
+            C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
+                                      xAw - bodyPA4.xyz,
+                                      xBw - bodyPB4.xyz,
+                                      t1, t2, P.dt, P.alpha);
+            lambda *= warm;
+            penalty = clamp(penalty * P.gamma,
+                            npPenaltyFloor(posLin, ba, bb, P),
+                            npPenaltyCeil());
+            outM.contacts[i].rA = float4(
+                rA, as_type<float>(chosen[i].feature));
+            outM.contacts[i].rB = float4(rB, stick);
+            outM.contacts[i].C0 = float4(C0, 0);
+            outM.contacts[i].lambda = float4(lambda, 0);
+            outM.contacts[i].penalty = float4(penalty, 0);
+        }
+        return;
+    }
 
     // capsule pairs not involving a torus: single-contact closest-point
     if ((capA || capB) && !torA && !torB) {
@@ -427,31 +651,39 @@ kernel void np_collide(
         }
 
         if (nh == 0) {
-            outM.header = uint4(ia, ib, 0, 0);
+            outM.header = uint4(ba, bb, 0, 0);
             return;
         }
 
         float3 nrmC = cIsA ? -nCO : nCO;          // B -> A
         float3 t1, t2;
         orthonormal(nrmC, t1, t2);
-        float friction = sqrt(props[ia].w * props[ib].w);
+        float staticFriction = combine_friction(
+            colliderFriction[ia].x, colliderFriction[ib].x,
+            P.frictionCombineMode);
+        float dynamicFriction = combine_friction(
+            colliderFriction[ia].y, colliderFriction[ib].y,
+            P.frictionCombineMode);
         int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
-        bool roundA = stA != 0;
-        bool roundB = stB != 0;
+        bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
-        outM.header = uint4(ia, ib, uint(nh), flags);
-        outM.basisN = float4(nrmC, friction);
-        outM.basisT1 = float4(t1, 0);
-        float4 qAc = q_conj(qA);
-        float4 qBc = q_conj(qB);
+        outM.header = uint4(ba, bb, uint(nh), flags);
+        outM.basisN = float4(nrmC, dynamicFriction);
+        outM.basisT1 = float4(t1, staticFriction);
+        float4 qAc = q_conj(qBodyA);
+        float4 qBc = q_conj(qBodyB);
         float warm = P.alpha * P.gamma;
         for (int i = 0; i < nh; i++) {
             float3 xAw = cIsA ? hits2[i].xA : hits2[i].xB;
             float3 xBw = cIsA ? hits2[i].xB : hits2[i].xA;
-            float3 rA_ = roundA ? (xAw - pA4.xyz) : q_rotate(qAc, xAw - pA4.xyz);
-            float3 rB_ = roundB ? (xBw - pB4.xyz) : q_rotate(qBc, xBw - pB4.xyz);
+            float3 rA_ = roundA ? (xAw - bodyPA4.xyz)
+                                : q_rotate(qAc, xAw - bodyPA4.xyz);
+            float3 rB_ = roundB ? (xBw - bodyPB4.xyz)
+                                : q_rotate(qBc, xBw - bodyPB4.xyz);
             float3 lambda = float3(0);
             float3 penalty = float3(0);
+            float stick = 0.0f;
             if (prevIdx >= 0) {
                 device const ManifoldGPU& pm = prevManifolds[prevIdx];
                 uint pn = pm.header.z;
@@ -472,17 +704,36 @@ kernel void np_collide(
                     float3 lt = t1o * lambda.y + t2o * lambda.z;
                     lambda.y = dot(t1, lt);
                     lambda.z = dot(t2, lt);
+                    // A centered standalone round primitive deliberately
+                    // uses a world-offset anchor so it can roll. Compound
+                    // robot colliders use body-local material anchors: while
+                    // the contact is inside the Coulomb cone, retain those
+                    // anchors exactly as the box manifold does. Rebuilding
+                    // them from the closest points every frame erases the
+                    // accumulated tangential displacement and permits creep.
+                    if (!roundA && !roundB) {
+                        stick = pm.contacts[bestJ].rB.w;
+                        if (stick != 0.0f) {
+                            rA_ = pm.contacts[bestJ].rA.xyz;
+                            rB_ = pm.contacts[bestJ].rB.xyz;
+                        }
+                    }
                 }
             }
+            xAw = roundA ? bodyPA4.xyz + rA_
+                         : xform(bodyPA4.xyz, qBodyA, rA_);
+            xBw = roundB ? bodyPB4.xyz + rB_
+                         : xform(bodyPB4.xyz, qBodyB, rB_);
             float3 d = xAw - xBw;
             float3 C0 = float3(dot(nrmC, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
-            C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
-                                      xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
+            C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
+                                      xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
+                                      t1, t2, P.dt, P.alpha);
             lambda *= warm;
             penalty = clamp(penalty * P.gamma,
-                            npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
+                            npPenaltyFloor(posLin, ba, bb, P), npPenaltyCeil());
             outM.contacts[i].rA = float4(rA_, as_type<float>(hits2[i].feature));
-            outM.contacts[i].rB = float4(rB_, 0.0f);
+            outM.contacts[i].rB = float4(rB_, stick);
             outM.contacts[i].C0 = float4(C0, 0);
             outM.contacts[i].lambda = float4(lambda, 0);
             outM.contacts[i].penalty = float4(penalty, 0);
@@ -627,7 +878,7 @@ kernel void np_collide(
         }
 
         if (nHits == 0) {
-            outM.header = uint4(ia, ib, 0, 0);
+            outM.header = uint4(ba, bb, 0, 0);
             return;
         }
 
@@ -643,24 +894,31 @@ kernel void np_collide(
 
         float3 t1, t2;
         orthonormal(nrmT, t1, t2);
-        float friction = sqrt(props[ia].w * props[ib].w);
+        float staticFriction = combine_friction(
+            colliderFriction[ia].x, colliderFriction[ib].x,
+            P.frictionCombineMode);
+        float dynamicFriction = combine_friction(
+            colliderFriction[ia].y, colliderFriction[ib].y,
+            P.frictionCombineMode);
         int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
 
-        bool roundA = stA != 0;
-        bool roundB = stB != 0;
+        bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
-        outM.header = uint4(ia, ib, uint(nHits), flags);
-        outM.basisN = float4(nrmT, friction);
-        outM.basisT1 = float4(t1, 0);
+        outM.header = uint4(ba, bb, uint(nHits), flags);
+        outM.basisN = float4(nrmT, dynamicFriction);
+        outM.basisT1 = float4(t1, staticFriction);
 
-        float4 qAc = q_conj(qA);
-        float4 qBc = q_conj(qB);
+        float4 qAc = q_conj(qBodyA);
+        float4 qBc = q_conj(qBodyB);
         float warm = P.alpha * P.gamma;
         for (int i = 0; i < nHits; i++) {
             float3 xAw = tIsA ? hits[i].xT : hits[i].xO;
             float3 xBw = tIsA ? hits[i].xO : hits[i].xT;
-            float3 rA_ = roundA ? (xAw - pA4.xyz) : q_rotate(qAc, xAw - pA4.xyz);
-            float3 rB_ = roundB ? (xBw - pB4.xyz) : q_rotate(qBc, xBw - pB4.xyz);
+            float3 rA_ = roundA ? (xAw - bodyPA4.xyz)
+                                : q_rotate(qAc, xAw - bodyPA4.xyz);
+            float3 rB_ = roundB ? (xBw - bodyPB4.xyz)
+                                : q_rotate(qBc, xBw - bodyPB4.xyz);
             float3 lambda = float3(0);
             float3 penalty = float3(0);
             if (prevIdx >= 0) {
@@ -688,11 +946,12 @@ kernel void np_collide(
             }
             float3 d = xAw - xBw;
             float3 C0 = float3(dot(nrmT, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
-            C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
-                                      xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
+            C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
+                                      xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
+                                      t1, t2, P.dt, P.alpha);
             lambda *= warm;
             penalty = clamp(penalty * P.gamma,
-                            npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
+                            npPenaltyFloor(posLin, ba, bb, P), npPenaltyCeil());
             outM.contacts[i].rA = float4(rA_, as_type<float>(hits[i].feature));
             outM.contacts[i].rB = float4(rB_, 0.0f);
             outM.contacts[i].C0 = float4(C0, 0);
@@ -715,7 +974,7 @@ kernel void np_collide(
             float3 nTmp = dist > 1e-9f ? d / dist : float3(0, 0, 1);
             float detectM = npDetectMargin(nTmp, vA - vB, P, rA, rB);
             if (dist > rA + rB + detectM) {
-                outM.header = uint4(ia, ib, 0, 0);
+                outM.header = uint4(ba, bb, 0, 0);
                 return;
             }
             nrm = nTmp;
@@ -758,7 +1017,7 @@ kernel void np_collide(
                 float detectM = npDetectMargin(nWTmp, vSphere - vBox, P,
                                                r, sIsA ? shape[ib].w : shape[ia].w);
                 if (dist > r + detectM) {
-                    outM.header = uint4(ia, ib, 0, 0);
+                    outM.header = uint4(ba, bb, 0, 0);
                     return;
                 }
                 nLocal = nLocalTmp;
@@ -783,22 +1042,29 @@ kernel void np_collide(
         // 4 B-sphere.
         float3 t1, t2;
         orthonormal(nrm, t1, t2);
-        float friction = sqrt(props[ia].w * props[ib].w);
+        float staticFriction = combine_friction(
+            colliderFriction[ia].x, colliderFriction[ib].x,
+            P.frictionCombineMode);
+        float dynamicFriction = combine_friction(
+            colliderFriction[ia].y, colliderFriction[ib].y,
+            P.frictionCombineMode);
         int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
 
-        uint flags = 1u | (sphA ? 2u : 0u) | (sphB ? 4u : 0u);
-        outM.header = uint4(ia, ib, uint(count), flags);
-        outM.basisN = float4(nrm, friction);
-        outM.basisT1 = float4(t1, 0);
+        bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        outM.header = uint4(ba, bb, uint(count), flags);
+        outM.basisN = float4(nrm, dynamicFriction);
+        outM.basisT1 = float4(t1, staticFriction);
 
-        float4 qAc = q_conj(qA);
-        float4 qBc = q_conj(qB);
+        float4 qAc = q_conj(qBodyA);
+        float4 qBc = q_conj(qBodyB);
         float warm = P.alpha * P.gamma;
         for (int i = 0; i < count; i++) {
-            float3 rA_ = sphA ? (contacts[i].xA - pA4.xyz)
-                              : q_rotate(qAc, contacts[i].xA - pA4.xyz);
-            float3 rB_ = sphB ? (contacts[i].xB - pB4.xyz)
-                              : q_rotate(qBc, contacts[i].xB - pB4.xyz);
+            float3 rA_ = roundA ? (contacts[i].xA - bodyPA4.xyz)
+                                : q_rotate(qAc, contacts[i].xA - bodyPA4.xyz);
+            float3 rB_ = roundB ? (contacts[i].xB - bodyPB4.xyz)
+                                : q_rotate(qBc, contacts[i].xB - bodyPB4.xyz);
             float3 lambda = float3(0);
             float3 penalty = float3(0);
             float stick = 0.0f;
@@ -828,7 +1094,7 @@ kernel void np_collide(
                     lambda.z = dot(t2, lt);
                     bool partA = shape[ia].w < 0.0f;
                     bool partB = shape[ib].w < 0.0f;
-                    if ((partA || !sphA) && (partB || !sphB)) {
+                    if ((partA || !roundA) && (partB || !roundB)) {
                         stick = pm.contacts[bestJ].rB.w;
                         if (stick != 0.0f) {
                             rA_ = pm.contacts[bestJ].rA.xyz;
@@ -837,15 +1103,18 @@ kernel void np_collide(
                     }
                 }
             }
-            float3 xAw = sphA ? pA4.xyz + rA_ : xform(pA4.xyz, qA, rA_);
-            float3 xBw = sphB ? pB4.xyz + rB_ : xform(pB4.xyz, qB, rB_);
+            float3 xAw = roundA ? bodyPA4.xyz + rA_
+                                : xform(bodyPA4.xyz, qBodyA, rA_);
+            float3 xBw = roundB ? bodyPB4.xyz + rB_
+                                : xform(bodyPB4.xyz, qBodyB, rB_);
             float3 d = xAw - xBw;
             float3 C0 = float3(dot(nrm, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
-            C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
-                                      xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
+            C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
+                                      xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
+                                      t1, t2, P.dt, P.alpha);
             lambda *= warm;
             penalty = clamp(penalty * P.gamma,
-                            npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
+                            npPenaltyFloor(posLin, ba, bb, P), npPenaltyCeil());
             outM.contacts[i].rA = float4(rA_, as_type<float>(contacts[i].feature));
             outM.contacts[i].rB = float4(rB_, stick);
             outM.contacts[i].C0 = float4(C0, 0);
@@ -879,7 +1148,7 @@ kernel void np_collide(
     }
 
     if (separated || !bestFace.valid) {
-        outM.header = uint4(ia, ib, 0, 0);
+        outM.header = uint4(ba, bb, 0, 0);
         return;
     }
 
@@ -972,22 +1241,27 @@ kernel void np_collide(
     float3 t1, t2;
     orthonormal(nrm, t1, t2);
 
-    float friction = sqrt(props[ia].w * props[ib].w);
+    float staticFriction = combine_friction(
+        colliderFriction[ia].x, colliderFriction[ib].x,
+        P.frictionCombineMode);
+    float dynamicFriction = combine_friction(
+        colliderFriction[ia].y, colliderFriction[ib].y,
+        P.frictionCombineMode);
 
     // Previous manifold for warm-start
     int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
 
-    outM.header = uint4(ia, ib, uint(count), 1);
-    outM.basisN = float4(nrm, friction);
-    outM.basisT1 = float4(t1, 0);
+    outM.header = uint4(ba, bb, uint(count), 1);
+    outM.basisN = float4(nrm, dynamicFriction);
+    outM.basisT1 = float4(t1, staticFriction);
 
-    float4 qAc = q_conj(qA);
-    float4 qBc = q_conj(qB);
+    float4 qAc = q_conj(qBodyA);
+    float4 qBc = q_conj(qBodyB);
     float warm = P.alpha * P.gamma;
 
     for (int i = 0; i < count; i++) {
-        float3 rA = q_rotate(qAc, contacts[i].xA - pA4.xyz);
-        float3 rB = q_rotate(qBc, contacts[i].xB - pB4.xyz);
+        float3 rA = q_rotate(qAc, contacts[i].xA - bodyPA4.xyz);
+        float3 rB = q_rotate(qBc, contacts[i].xB - bodyPB4.xyz);
         float3 lambda = float3(0);
         float3 penalty = float3(0);
         float stick = 0.0f;
@@ -1011,17 +1285,18 @@ kernel void np_collide(
         }
 
         // C0 at start-of-step pose
-        float3 xAw = xform(pA4.xyz, qA, rA);
-        float3 xBw = xform(pB4.xyz, qB, rB);
+        float3 xAw = xform(bodyPA4.xyz, qBodyA, rA);
+        float3 xBw = xform(bodyPB4.xyz, qBodyB, rB);
         float3 d = xAw - xBw;
         float3 C0 = float3(dot(nrm, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
-        C0.yz -= spinSurfaceShift(spinVel[ia], spinVel[ib],
-                                  xAw - pA4.xyz, xBw - pB4.xyz, t1, t2, P.dt, P.alpha);
+        C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
+                                  xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
+                                  t1, t2, P.dt, P.alpha);
 
         // Warm-start (Eq. 19)
         lambda *= warm;
         penalty = clamp(penalty * P.gamma,
-                        npPenaltyFloor(posLin, ia, ib, P), npPenaltyCeil());
+                        npPenaltyFloor(posLin, ba, bb, P), npPenaltyCeil());
 
         outM.contacts[i].rA = float4(rA, as_type<float>(contacts[i].feature));
         outM.contacts[i].rB = float4(rB, stick);

@@ -28,6 +28,16 @@ public struct PushTEnvGPU {
     public var goal: SIMD4<Float> = .zero
 }
 
+/// Compact state observation used by state-based policies. Pixel policies
+/// can continue to use `observations()`; both views come from the same
+/// batched simulation state.
+public struct PushTState {
+    public var tipPosition: SIMD2<Float>
+    public var tipVelocity: SIMD2<Float>
+    public var blockPosition: SIMD2<Float>
+    public var blockYaw: Float
+}
+
 // Robotics mode: massively parallel 3D Push-T environments.
 //
 // The robot is a GANTRY PUSHER (industry-standard for tabletop pushing
@@ -176,16 +186,22 @@ public final class PushTEnv: RoboticsEnv {
     /// rate-limited to a realistic tool-head speed.
     public func step(actions: [SIMD2<Float>], substeps: Int = 4,
                      maxStep: Float = 0.16) {
+        precondition(actions.count == numEnvs, "expected one action per environment")
         if commanded.isEmpty {
             commanded = (0..<numEnvs).map { tipPos($0) }
         }
         let limit = min(maxStep, tipSpeedLimit)
+        var anchors = [GPUSolver.JointAnchorUpdate]()
+        anchors.reserveCapacity(numEnvs)
         for e in 0..<numEnvs {
             let d = actions[e] - commanded[e]
             let l = length(d)
             commanded[e] += l > limit ? d * (limit / l) : d
-            setTipTarget(e, commanded[e])
+            let p = commanded[e]
+            let world = refs[e].center + F3(p.x, p.y, Self.tipHeight)
+            anchors.append(.init(joint: refs[e].dragJoint, point: world))
         }
+        solver.setJointWorldAnchors(anchors)
         for _ in 0..<substeps { solver.step() }
     }
 
@@ -204,29 +220,75 @@ public final class PushTEnv: RoboticsEnv {
         return (SIMD2(mid.x, mid.y), atan2(fwd.y, fwd.x))
     }
 
+    /// Read every environment's policy state after one GPU fence.
+    public func states() -> [PushTState] {
+        var ids = [Int]()
+        ids.reserveCapacity(numEnvs * 3)
+        for r in refs {
+            ids.append(r.tip)
+            ids.append(r.blockBar)
+            ids.append(r.blockStem)
+        }
+        let bodies = solver.bodyStates(ids)
+        return (0..<numEnvs).map { e in
+            let r = refs[e]
+            let tip = bodies[e * 3]
+            let bar = bodies[e * 3 + 1]
+            let stem = bodies[e * 3 + 2]
+            let mid = (bar.position + stem.position) * 0.5 - r.center
+            let fwd = bar.rotation.act(F3(1, 0, 0))
+            return PushTState(
+                tipPosition: SIMD2(tip.position.x - r.center.x,
+                                   tip.position.y - r.center.y),
+                tipVelocity: SIMD2(tip.linearVelocity.x, tip.linearVelocity.y),
+                blockPosition: SIMD2(mid.x, mid.y),
+                blockYaw: atan2(fwd.y, fwd.x))
+        }
+    }
+
     /// In-place per-env reset: teleport pusher + re-randomize block.
     public func reset(_ e: Int, seed: UInt64) {
-        var rng = SplitMix64(seed: seed)
-        let r = refs[e]
-        let (tp, tq) = spawnPoses[r.tip]
-        solver.setBodyPose(r.tip, position: tp, rotation: tq)
-        solver.setJointWorldAnchor(r.dragJoint, point: tp)
-        let ang = rng.nextFloat() * 2 * .pi
-        let rad = 0.55 + rng.nextFloat() * 1.0
-        let byaw = (rng.nextFloat() - 0.5) * 2 * .pi
-        let q = Quat(angle: byaw, axis: F3(0, 0, 1))
-        let bc = r.center + F3(cos(ang) * rad, sin(ang) * rad, 0)
-        solver.setBodyPose(r.blockBar,
-                           position: bc + q.act(F3(0, 0.125, 0)) + F3(0, 0, 0.09),
-                           rotation: q)
-        solver.setBodyPose(r.blockStem,
-                           position: bc + q.act(F3(0, -0.325, 0)) + F3(0, 0, 0.09),
-                           rotation: q)
-        if !commanded.isEmpty { commanded[e] = SIMD2(tp.x - r.center.x, tp.y - r.center.y) }
+        reset([e], seeds: [seed])
+    }
+
+    /// In-place reset for an arbitrary subset, with exactly one solver
+    /// synchronization for all teleports and one for all actuator anchors.
+    public func reset(_ envs: [Int], seeds: [UInt64]) {
+        precondition(envs.count == seeds.count, "one reset seed is required per environment")
+        var poses = [GPUSolver.BodyPoseUpdate]()
+        var anchors = [GPUSolver.JointAnchorUpdate]()
+        poses.reserveCapacity(envs.count * 3)
+        anchors.reserveCapacity(envs.count)
+        for (i, e) in envs.enumerated() {
+            precondition(e >= 0 && e < numEnvs, "environment index out of range")
+            var rng = SplitMix64(seed: seeds[i])
+            let r = refs[e]
+            let (tp, tq) = spawnPoses[r.tip]
+            poses.append(.init(body: r.tip, position: tp, rotation: tq))
+            anchors.append(.init(joint: r.dragJoint, point: tp))
+            let ang = rng.nextFloat() * 2 * .pi
+            let rad = 0.55 + rng.nextFloat()
+            let byaw = (rng.nextFloat() - 0.5) * 2 * .pi
+            let q = Quat(angle: byaw, axis: F3(0, 0, 1))
+            let bc = r.center + F3(cos(ang) * rad, sin(ang) * rad, 0)
+            poses.append(.init(body: r.blockBar,
+                               position: bc + q.act(F3(0, 0.125, 0)) + F3(0, 0, 0.09),
+                               rotation: q))
+            poses.append(.init(body: r.blockStem,
+                               position: bc + q.act(F3(0, -0.325, 0)) + F3(0, 0, 0.09),
+                               rotation: q))
+            if !commanded.isEmpty {
+                commanded[e] = SIMD2(tp.x - r.center.x, tp.y - r.center.y)
+            }
+        }
+        solver.setBodyPoses(poses)
+        solver.setJointWorldAnchors(anchors)
     }
 
     public func resetAll(seed: UInt64) {
-        for e in 0..<numEnvs { reset(e, seed: seed &+ UInt64(e) &* 7919) }
+        let ids = Array(0..<numEnvs)
+        let seeds = ids.map { seed &+ UInt64($0) &* 7919 }
+        reset(ids, seeds: seeds)
     }
 
     /// Geometric two-phase push planner (3D-aware, model-based, non-neural).

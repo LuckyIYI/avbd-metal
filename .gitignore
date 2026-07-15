@@ -3,5 +3,12 @@ refs/
 .xcbuild/
 runs/
 .DS_Store
+*.profraw
 node_modules/
 AVBD.app/
+
+# Generated training/evaluation output and replay media stay local. The source
+# tree contains the scripts and textual methodology needed to reproduce them.
+artifacts/
+checkpoints/
+docs/

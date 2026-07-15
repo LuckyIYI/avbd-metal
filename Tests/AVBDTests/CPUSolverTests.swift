@@ -3,6 +3,16 @@ import simd
 @testable import AVBDCore
 
 final class CPUSolverTests: XCTestCase {
+    func testFrictionCombineModesMatchAuthoredMaterialRules() {
+        XCTAssertEqual(FrictionCombineMode.geometricMean.combine(0.8, 0.5),
+                       sqrt(0.4), accuracy: 1e-6)
+        XCTAssertEqual(FrictionCombineMode.multiply.combine(0.8, 0.5),
+                       0.4, accuracy: 1e-6)
+        XCTAssertEqual(FrictionCombineMode.minimum.combine(0.8, 0.5), 0.5)
+        XCTAssertEqual(FrictionCombineMode.maximum.combine(0.8, 0.5), 0.8)
+        XCTAssertEqual(FrictionCombineMode.average.combine(0.8, 0.5), 0.65)
+    }
+
     /// A single box resting on a static ground should settle and not sink.
     func testBoxRestsOnGround() {
         let solver = CPUSolver()

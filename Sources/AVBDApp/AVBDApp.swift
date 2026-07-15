@@ -19,7 +19,7 @@ struct AVBDApp: App {
     var body: some SwiftUI.Scene {
         WindowGroup("AVBD Metal") {
             ContentView(model: model)
-                .frame(minWidth: 1000, minHeight: 640)
+                .frame(minWidth: 1120, minHeight: 680)
         }
     }
 }
@@ -27,9 +27,10 @@ struct AVBDApp: App {
 struct ContentView: View {
     @ObservedObject var model: SimulationModel
     @StateObject var robotics = RoboticsModel()
+    @State private var selectedTab = ProcessInfo.processInfo.environment["AVBD_POLICY_REPLAY"] == nil ? 0 : 2
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             HSplitView {
                 MetalView(model: model)
                     .frame(minWidth: 600)
@@ -38,8 +39,13 @@ struct ContentView: View {
                     .padding(12)
             }
             .tabItem { Text("Playground") }
+            .tag(0)
             RoboticsLabView(model: robotics)
                 .tabItem { Text("Robotics Lab") }
+                .tag(1)
+            PolicyReplayLabView()
+                .tabItem { Text("Policy Replay") }
+                .tag(2)
         }
     }
 
@@ -147,7 +153,8 @@ struct MetalView: NSViewRepresentable {
     func makeNSView(context: Context) -> InteractiveMTKView {
         let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()!
         let view = InteractiveMTKView(frame: .zero, device: device)
-        if ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil {
+        if ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil
+            || ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] != nil {
             view.framebufferOnly = false
         }
         view.colorPixelFormat = Renderer.colorFormat

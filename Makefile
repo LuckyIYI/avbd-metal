@@ -51,6 +51,7 @@ app-ml:
 	mkdir -p AVBD.app/Contents/MacOS AVBD.app/Contents/Resources
 	cp .xcbuild/Build/Products/Release/AVBDApp AVBD.app/Contents/MacOS/AVBDApp
 	cp -R .xcbuild/Build/Products/Release/avbd-metal_AVBDCore.bundle AVBD.app/Contents/Resources/
+	cp -R checkpoints AVBD.app/Contents/Resources/
 	-cp .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib AVBD.app/Contents/Resources/ 2>/dev/null
 	-cp -R .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle AVBD.app/Contents/Resources/ 2>/dev/null
 	cp AVBD.app/Contents/Info.plist.tmp AVBD.app/Contents/Info.plist 2>/dev/null || printf '%s\n' \

@@ -3,6 +3,112 @@ import simd
 @testable import AVBDCore
 
 final class RoboticsTests: XCTestCase {
+    func testHumanoidResetRestoresIdenticalSolverTrajectory() throws {
+        let env = try HumanoidWalkEnv(
+            numEnvironments: 1, seed: 41, controlProfile: .isaacLab)
+        let zero = ContiguousArray<Float>(
+            repeating: 0, count: HumanoidWalkEnv.jointRanges.count)
+
+        func rollout() -> HumanoidState {
+            for _ in 0..<100 {
+                env.step(normalizedActions: zero, decimation: 4,
+                         clampActions: false, clampTargetsToLimits: false)
+            }
+            return env.states()[0]
+        }
+
+        env.reset([0], seeds: [9001], initialRollPitchRange: 0,
+                  initialYawRange: 0)
+        let first = rollout()
+        env.reset([0], seeds: [9001], initialRollPitchRange: 0,
+                  initialYawRange: 0)
+        let second = rollout()
+
+        XCTAssertLessThan(length(first.root.position - second.root.position),
+                          2e-4)
+        XCTAssertLessThan(length(first.root.linearVelocity
+                                  - second.root.linearVelocity), 2e-3)
+        XCTAssertLessThan(length(first.root.angularVelocity
+                                  - second.root.angularVelocity), 2e-3)
+        XCTAssertLessThan(zip(first.jointAngles, second.jointAngles).map {
+            abs($0 - $1)
+        }.max() ?? 0, 2e-4)
+    }
+
+    func testUnactuatedHingeDoesNotConstrainItsFreeAxis() throws {
+        var scene = PhysicsScene(name: "free-hinge-axis")
+        scene.settings.dt = 1 / 240
+        scene.settings.gravity = 0
+        scene.settings.iterations = 16
+        let link = scene.addBody(
+            size: F3(0.4, 0.2, 0.2), density: 1, friction: 0,
+            position: .zero)
+        scene.addJoint(SceneJoint(
+            bodyA: -1, bodyB: link, rA: .zero, rB: .zero,
+            stiffnessLin: .infinity, stiffnessAng: .infinity,
+            hingeAxis: F3(0, 0, 1)))
+        let gpu = try GPUSolver(scene: scene)
+        gpu.setBodyStates([.init(
+            body: link, position: .zero,
+            rotation: Quat(real: 1, imag: .zero),
+            angularVelocity: F3(0, 0, 4))])
+        for _ in 0..<120 { gpu.step() }
+        let state = gpu.bodyStates([link])[0]
+        XCTAssertEqual(state.angularVelocity.z, 4, accuracy: 0.08,
+                       "hard hinge alignment must not damp free-axis spin")
+        XCTAssertLessThan(abs(state.angularVelocity.x), 0.02)
+        XCTAssertLessThan(abs(state.angularVelocity.y), 0.02)
+    }
+
+    func testFixedPDServoStepResponse() throws {
+        var scene = PhysicsScene(name: "fixed-pd-step")
+        scene.settings.iterations = 16
+        let link = scene.addBody(size: F3(1.0, 0.14, 0.14), density: 1.2,
+                                 friction: 0.4, position: F3(0.5, 0, 2))
+        scene.addJoint(SceneJoint(
+            bodyA: -1, bodyB: link, rA: F3(0, 0, 2), rB: F3(-0.5, 0, 0),
+            stiffnessLin: .infinity, stiffnessAng: .infinity,
+            hingeAxis: F3(0, 1, 0), motorTarget: 0, motorTorque: 260,
+            motorStiffness: 200, motorDamping: 5))
+        let gpu = try GPUSolver(scene: scene)
+        for _ in 0..<60 { gpu.step() }
+        gpu.setMotorTarget(0, angle: 0.8)
+        var maxAngle: Float = -9
+        for _ in 0..<240 {
+            gpu.step()
+            maxAngle = max(maxAngle, gpu.motorAngle(0))
+        }
+        XCTAssertEqual(gpu.motorAngle(0), 0.8, accuracy: 0.04)
+        XCTAssertLessThan(maxAngle - 0.8, 0.08)
+    }
+
+    func testFixedPDTorqueLimitMatchesOneStepImpulse() throws {
+        var scene = PhysicsScene(name: "fixed-pd-effort-limit")
+        scene.settings.dt = 0.005
+        scene.settings.gravity = 0
+        scene.settings.iterations = 12
+        let link = scene.addBody(
+            size: F3(repeating: 0.2), density: 0, friction: 0,
+            position: .zero, mass: 1,
+            diagonalInertia: F3(repeating: 1), collisionEnabled: false)
+        scene.addJoint(SceneJoint(
+            bodyA: -1, bodyB: link, rA: .zero, rB: .zero,
+            stiffnessLin: .infinity, stiffnessAng: .infinity,
+            hingeAxis: F3(0, 0, 1), motorTarget: 1, motorTorque: 10,
+            motorStiffness: 200, motorDamping: 5))
+        let gpu = try GPUSolver(scene: scene)
+
+        gpu.step()
+
+        // The PD request is 200 Nm, so the 10 Nm effort cap is active. A
+        // constrained implicit drive at its active bound is a constant
+        // torque for this step: delta omega = tau * dt / I = 0.05 rad/s.
+        // Retaining the unsaturated spring Hessian would silently weaken the
+        // capped actuator, especially for H1's low-inertia ankle links.
+        let state = gpu.bodyStates([link])[0]
+        XCTAssertEqual(state.angularVelocity.z, 0.05, accuracy: 2e-4)
+    }
+
     func testServoStepResponseNoOvershoot() throws {
         var scene = PhysicsScene(name: "step")
         scene.settings.iterations = 16

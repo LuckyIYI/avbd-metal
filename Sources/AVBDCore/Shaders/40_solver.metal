@@ -217,6 +217,31 @@ kernel void adj_scatter(
     }
 }
 
+// Atomic scatter gives each body the correct force set but a scheduling-
+// dependent summation order. Once pair/manifold indices are deterministic,
+// sorting each (typically short) CSR segment makes every primal accumulation
+// bitwise repeatable for a fixed input state.
+kernel void adj_sort(
+    device const uint* adjStart     [[buffer(0)]],
+    device const uint* adjCount     [[buffer(1)]],
+    device uint* adjList            [[buffer(2)]],
+    constant uint& numBodies        [[buffer(3)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= numBodies) return;
+    uint s = adjStart[gid];
+    uint n = adjCount[gid];
+    for (uint i = 1; i < n; i++) {
+        uint value = adjList[s + i];
+        uint j = i;
+        while (j > 0 && adjList[s + j - 1] > value) {
+            adjList[s + j] = adjList[s + j - 1];
+            j--;
+        }
+        adjList[s + j] = value;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Graph coloring: incremental parallel greedy (paper Sec. 4).
 // Colors persist across frames; only dynamic-dynamic edges constrain colors.
@@ -434,6 +459,7 @@ kernel void warmstart_joints(
     constant SimParams& P           [[buffer(3)]],
     device SpringGPU* springs       [[buffer(4)]],
     device const float4* velLin     [[buffer(5)]],
+    device const float4* velAng     [[buffer(6)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numJoints) {
@@ -485,13 +511,27 @@ kernel void warmstart_joints(
         float3 aB = q_rotate(posAng[b], j.hingeAxis.xyz);
         float3 aA = q_rotate(q_mul(qA, j.restRel), j.hingeAxis.xyz);
         c0a = cross(aA, aB) * torqueArm;
+        if (j.dynamics.x > 0.0f) {
+            float4 r = q_mul(q_inv(q_mul(qA, j.restRel)), posAng[b]);
+            if (r.w < 0.0f) r = -r;
+            float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
+            float3 omegaA = a == WORLD_BODY ? float3(0) : velAng[a].xyz;
+            float twistRate = dot(velAng[b].xyz - omegaA, aB);
+            j.dynamics.y = twist + P.dt * twistRate;
+        }
     } else {
         c0a = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
     }
     j.C0Ang = float4(c0a, j.C0Ang.w);
     if (j.motor.w > 0.0f) {
-        j.motor.z *= P.alpha * P.gamma;                       // lambda
-        j.motor.w = clamp(j.motor.w * P.gamma, 50.0f, 2.0e5f); // penalty
+        if (j.limits.w > 0.0f) {
+            // Fixed PD has no augmented-Lagrangian warm start or adaptive
+            // gain. Its stiffness and damping remain physical scene data.
+            j.motor.z = 0.0f;
+        } else {
+            j.motor.z *= P.alpha * P.gamma;                     // lambda
+            j.motor.w = clamp(j.motor.w * P.gamma, 50.0f, 2.0e5f); // penalty
+        }
     }
 
     float warm = P.alpha * P.gamma;
@@ -638,8 +678,25 @@ inline void stampJoint(device const JointGPU& j, uint self,
             C = cross(aA, aB) * torqueArm;
             if (j.header.w & 2) C -= j.C0Ang.xyz * alpha;
             float3 F = penAng * C + j.lambdaAng.xyz;
-            acc.lhsAng = m3_add(acc.lhsAng, m3_diag(penAng * (s * s)));
-            acc.rhsAng += F * (-s);
+            // Exact Gauss-Newton hinge Jacobian. For C = aA x aB,
+            //   dC/dthetaA = aA aB^T - dot(aA,aB) I
+            //   dC/dthetaB = dot(aA,aB) I - aB aA^T.
+            // At alignment these become -P and +P, where
+            // P = I - aa^T has rank two. The previous isotropic `k I`
+            // Hessian incorrectly added hard-constraint curvature around
+            // the free twist axis, numerically opposing every motor torque.
+            float alignment = dot(aA, aB);
+            M3 J = isA
+                ? m3_add(m3_outer(aA, aB),
+                         m3_scale(m3_identity(), -alignment))
+                : m3_add(m3_scale(m3_identity(), alignment),
+                         m3_scale(m3_outer(aB, aA), -1.0f));
+            J = m3_scale(J, torqueArm);
+            M3 JT = m3_transpose(J);
+            M3 K = m3_diag(penAng);
+            acc.lhsAng = m3_add(
+                acc.lhsAng, m3_mulm(m3_mulm(JT, K), J));
+            acc.rhsAng += m3_mul(JT, F);
 
             // MOTOR (servo): drive the twist angle about the hinge axis
             // toward the target, with bounded lambda = torque limit (the
@@ -651,6 +708,23 @@ inline void stampJoint(device const JointGPU& j, uint self,
                 float4 r = q_mul(q_inv(q_mul(qA, j.restRel)), posAng[b]);
                 if (r.w < 0.0f) r = -r;
                 float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
+
+                // Reflected rotor inertia is a joint-space inertial energy:
+                //   0.5 * armature / dt^2 * (q - q_hat)^2.
+                // q_hat was predicted from the start-of-step relative
+                // angular velocity. Stamping its signed gradient on both
+                // bodies preserves the coupled inertia under the solver's
+                // block-coordinate primal iterations.
+                if (j.dynamics.x > 0.0f) {
+                    float Ca = twist - j.dynamics.y;
+                    Ca = Ca - 6.2831853f
+                        * floor((Ca + 3.14159265f) / 6.2831853f);
+                    float ka = j.dynamics.x / max(dt * dt, 1e-12f);
+                    float sm = (self == a) ? -1.0f : 1.0f;
+                    acc.lhsAng = m3_add(
+                        acc.lhsAng, m3_scale(m3_outer(aB, aB), ka));
+                    acc.rhsAng += aB * (ka * Ca * sm);
+                }
 
                 // joint limits: stiff one-sided penalty (rarely active)
                 if (j.limits.x < j.limits.y) {
@@ -679,10 +753,14 @@ inline void stampJoint(device const JointGPU& j, uint self,
                 float dTwist = twist - twist0;
                 dTwist = dTwist - 6.2831853f * floor((dTwist + 3.14159265f) / 6.2831853f);
 
-                // damping coefficient: ~2 sqrt(k I) would be critical; a
-                // fixed fraction of stiffness over the step works well here
-                float cD = 0.30f * j.motor.w * dt * 60.0f;   // scale-stable
-                float Fm = clamp(j.motor.w * Cm + j.motor.z + cD * dTwist,
+                // For fixed PD, kd is stored in physical torque/(rad/s)
+                // units, so the position-level derivative is kd / dt. The
+                // legacy actuator retains its historical heuristic damping.
+                float cD = j.limits.w > 0.0f
+                    ? j.limits.z / max(dt, 1e-6f)
+                    : 0.30f * j.motor.w * dt * 60.0f;
+                float dual = j.limits.w > 0.0f ? 0.0f : j.motor.z;
+                float Fm = clamp(j.motor.w * Cm + dual + cD * dTwist,
                                  -j.motor.y, j.motor.y);
                 float sm = (self == a) ? -1.0f : 1.0f;
                 float3 axW = aB;
@@ -896,7 +974,8 @@ inline float3 contactForceC(device const ManifoldGPU& m, uint ci,
     float3 nrm = m.basisN.xyz;
     float3 t1 = m.basisT1.xyz;
     float3 t2 = cross(nrm, t1);
-    float friction = m.basisN.w;
+    float dynamicFriction = m.basisN.w;
+    float staticFriction = m.basisT1.w;
 
     device const ContactGPU& c = m.contacts[ci];
     float3 C = c.C0.xyz * (1.0f - alpha);
@@ -907,10 +986,11 @@ inline float3 contactForceC(device const ManifoldGPU& m, uint ci,
 
     float3 F = c.penalty.xyz * C + c.lambda.xyz;
     F.x = min(F.x, 0.0f);
-    bounds = fabs(F.x) * friction;
+    bounds = fabs(F.x) * staticFriction;
     frictionScale = length(F.yz);
     if (frictionScale > bounds && frictionScale > 0.0f) {
-        F.yz *= bounds / frictionScale;
+        float dynamicBounds = fabs(F.x) * dynamicFriction;
+        F.yz *= dynamicBounds / frictionScale;
     }
     Cout = C;
     return F;
@@ -1148,10 +1228,11 @@ static inline void primal_one(
 
     PrimalAccum acc;
     acc.lhsLin = m3_diag(float3(mass / dt2));
-    acc.lhsAng = m3_diag(moment / dt2);
+    M3 inertia = m3_scale(world_inertia(posAng[body], moment), 1.0f / dt2);
+    acc.lhsAng = inertia;
     acc.lhsCross = m3_zero();
     acc.rhsLin = (pl.xyz - inertLin[body].xyz) * (mass / dt2);
-    acc.rhsAng = q_sub(posAng[body], inertAng[body]) * (moment / dt2);
+    acc.rhsAng = m3_mul(inertia, q_sub(posAng[body], inertAng[body]));
 
     uint as = adjStart[body], ae = as + adjCount[body];
     for (uint k = as; k < ae; k++) {
@@ -1358,8 +1439,11 @@ kernel void primal_particles_split(
     float3 dxLin = float3(0), dxAng = float3(0);
     if (rigid) {
         float3 moment = props[body].xyz;
-        acc.lhsAng = m3_add(acc.lhsAng, m3_diag(moment / dt2));
-        acc.rhsAng += q_sub(posAng[body], inertAng[body]) * (moment / dt2);
+        M3 inertia = m3_scale(
+            world_inertia(posAng[body], moment), 1.0f / dt2);
+        acc.lhsAng = m3_add(acc.lhsAng, inertia);
+        acc.rhsAng += m3_mul(
+            inertia, q_sub(posAng[body], inertAng[body]));
         solve6x6(acc.lhsLin, acc.lhsAng, acc.lhsCross,
                  -acc.rhsLin, -acc.rhsAng, dxLin, dxAng);
         if (!finite3(dxLin) || !finite3(dxAng)) return;
@@ -1514,9 +1598,13 @@ static inline void dual_joint_one(
                 float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
                 float Cm = twist - j.motor.x;
                 Cm = Cm - 6.2831853f * floor((Cm + 3.14159265f) / 6.2831853f);
-                j.motor.z = clamp(j.motor.w * Cm + j.motor.z,
-                                  -j.motor.y, j.motor.y);
-                j.motor.w = min(j.motor.w + fabs(Cm) * P.betaAng, 2.0e5f);
+                if (j.limits.w > 0.0f) {
+                    j.motor.z = 0.0f;
+                } else {
+                    j.motor.z = clamp(j.motor.w * Cm + j.motor.z,
+                                      -j.motor.y, j.motor.y);
+                    j.motor.w = min(j.motor.w + fabs(Cm) * P.betaAng, 2.0e5f);
+                }
             }
         } else {
             C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;

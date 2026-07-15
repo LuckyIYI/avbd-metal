@@ -69,6 +69,7 @@ final class TrainingRunner: ObservableObject {
 
 @MainActor
 final class RoboticsModel: ObservableObject, RenderableModel {
+    nonisolated let captureID = "robotics"
     let cameraEpoch = 0      // lab keeps its own camera; frame once at start
     enum DriveMode: String, CaseIterable {
         case manual = "Manual (IK mouse)"
@@ -317,6 +318,11 @@ struct RoboticsMetalView: NSViewRepresentable {
     func makeNSView(context: Context) -> LabMTKView {
         let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()!
         let view = LabMTKView(frame: .zero, device: device)
+        if ProcessInfo.processInfo.environment["AVBD_CAPTURE_VIEW"] == "robotics",
+           ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil
+            || ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] != nil {
+            view.framebufferOnly = false
+        }
         view.colorPixelFormat = Renderer.colorFormat
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = Renderer.sampleCount

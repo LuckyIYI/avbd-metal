@@ -62,6 +62,17 @@ public typealias Quat = simd_quatf
     q.act(v)
 }
 
+/// Principal-axis inertia rotated into the world-space angular tangent basis.
+@inlinable func worldInertiaRows(_ q: Quat, _ principal: F3) -> Mat3Rows {
+    let c0 = q.act(F3(1, 0, 0))
+    let c1 = q.act(F3(0, 1, 0))
+    let c2 = q.act(F3(0, 0, 1))
+    let matrix = outer(c0, c0) * principal.x
+        + outer(c1, c1) * principal.y
+        + outer(c2, c2) * principal.z
+    return Mat3Rows(rowMajor: matrix)
+}
+
 @inlinable public func transform(_ p: F3, _ q: Quat, _ v: F3) -> F3 {
     q.act(v) + p
 }

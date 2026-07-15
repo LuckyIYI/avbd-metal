@@ -40,26 +40,33 @@ kernel void build_instances(
     constant uint& colorMode        [[buffer(5)]],   // 0 index, 1 graph color
     device const uint* colors       [[buffer(6)]],
     device const uint* shapeType    [[buffer(7)]],
-    device const uint* bodyIDs      [[buffer(8)]],
+    device const uint* colliderIDs  [[buffer(8)]],
+    device const uint* colliderOwner [[buffer(9)]],
+    device const float4* colliderLocalPosition [[buffer(10)]],
+    device const float4* colliderLocalRotation [[buffer(11)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= numInstances) return;
-    uint body = bodyIDs[gid];
+    uint collider = colliderIDs[gid];
+    uint body = colliderOwner[collider];
     float4 pl = posLin[body];
-    float3x3 R = q_to_mat(posAng[body]);
-    uint st = shapeType[body] & SHAPE_KIND_MASK;
+    float4 worldQ = q_mul(posAng[body], colliderLocalRotation[collider]);
+    float3 center = pl.xyz
+        + q_rotate(posAng[body], colliderLocalPosition[collider].xyz);
+    float3x3 R = q_to_mat(worldQ);
+    uint st = shapeType[collider] & SHAPE_KIND_MASK;
     // torus/capsule: unit-scale model (geometry sized in the vertex shader)
-    float3 sz = st >= 2 ? float3(1) : shape[body].xyz;
+    float3 sz = st >= 2 ? float3(1) : shape[collider].xyz;
 
     float4x4 m;
     m[0] = float4(R[0] * sz.x, 0);
     m[1] = float4(R[1] * sz.y, 0);
     m[2] = float4(R[2] * sz.z, 0);
-    m[3] = float4(pl.xyz, 1);
+    m[3] = float4(center, 1);
     out[gid].model = m;
 
     // hide the giant ground slab (the checkerboard floor replaces it)
-    if (st == 0 && pl.w <= 0.0f && shape[body].x > 150.0f) {
+    if (st == 0 && pl.w <= 0.0f && shape[collider].x > 150.0f) {
         out[gid].model = float4x4(0.0f);
         out[gid].color = float4(0);
         out[gid].params = float4(0);
@@ -71,7 +78,8 @@ kernel void build_instances(
     out[gid].color = float4(c, float(st));
     // params.z = bounding radius (blob shadow size), w = shadow strength
     // (statics cast none — they're scenery)
-    out[gid].params = float4(shape[body].x, shape[body].y, shape[body].w,
+    out[gid].params = float4(shape[collider].x, shape[collider].y,
+                             shape[collider].w,
                              pl.w > 0.0f ? 1.0f : 0.0f);
 }
 

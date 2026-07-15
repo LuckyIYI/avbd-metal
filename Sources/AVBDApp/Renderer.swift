@@ -5,6 +5,10 @@ import MetalKit
 /// serve both the physics playground and the Robotics Lab.
 @MainActor
 protocol RenderableModel {
+    /// Stable routing key for screenshots/video. SwiftUI may instantiate and
+    /// render hidden tabs, so capture must never be selected merely because a
+    /// renderer exists.
+    nonisolated var captureID: String { get }
     var solver: GPUSolver? { get }
     var colorByGraphColor: Bool { get }
     var statsText: String { get }
@@ -743,6 +747,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var lastCameraEpoch: Int = -1
     private var envCameraSet = false
 
+    private var scriptedCaptureAllowed: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        let selected = environment["AVBD_CAPTURE_VIEW"]
+            ?? (environment["AVBD_POLICY_REPLAY"] == nil ? "playground" : "policy")
+        return model?.captureID == selected
+    }
+
     init(device: MTLDevice, model: AnyObject & RenderableModel) throws {
         self.device = device
         self.queue = device.makeCommandQueue()!
@@ -901,8 +912,16 @@ final class Renderer: NSObject, MTKViewDelegate {
                     ? solver.settings.cameraDistance : 30
                 target.z = solver.settings.cameraTargetZ != 0
                     ? solver.settings.cameraTargetZ : 3
-                target.x = 0
-                target.y = 0
+                target.x = solver.settings.cameraTargetX.isFinite
+                    ? solver.settings.cameraTargetX : 0
+                target.y = solver.settings.cameraTargetY.isFinite
+                    ? solver.settings.cameraTargetY : 0
+                if solver.settings.cameraAzimuth.isFinite {
+                    azimuth = solver.settings.cameraAzimuth
+                }
+                if solver.settings.cameraElevation.isFinite {
+                    elevation = solver.settings.cameraElevation
+                }
             }
         }
 
@@ -1098,6 +1117,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         cmd.present(drawable)
         cmd.commit()
 
+        // Policy Replay advances the simulator at the start of the next draw.
+        // This renderer owns a different MTLCommandQueue from GPUSolver, so
+        // resource hazards are not serialized by queue order. Waiting here
+        // prevents the next physics write from racing this frame's instance
+        // build/read of the same solver state buffers. Headless evaluation
+        // has no renderer and therefore never encountered this race.
+        if model.captureID == "policy" { cmd.waitUntilCompleted() }
+
         framesDrawn += 1
         if framesDrawn == 30, ProcessInfo.processInfo.environment["AVBD_MARKER"] != nil {
             let info = "frames=30 bodies=\(bodyCount) rigidInstances=\(rigidCount) stats=\(model.statsText)"
@@ -1105,11 +1132,23 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         // Scripted capture: AVBD_SHOT=<path.png> [AVBD_SHOT_FRAME=n] writes
         // the resolved frame and exits (needs framebufferOnly = false).
-        if let shotPath = ProcessInfo.processInfo.environment["AVBD_SHOT"],
+        if scriptedCaptureAllowed,
+           let shotPath = ProcessInfo.processInfo.environment["AVBD_SHOT"],
            framesDrawn == (Int(ProcessInfo.processInfo.environment["AVBD_SHOT_FRAME"] ?? "") ?? 90) {
             cmd.waitUntilCompleted()
             writePNG(texture: drawable.texture, to: shotPath)
             exit(0)
+        }
+        if scriptedCaptureAllowed,
+           let directory = ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] {
+            let every = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_EVERY"] ?? "") ?? 3, 1)
+            let maximum = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_FRAMES"] ?? "") ?? 600, 1)
+            if framesDrawn.isMultiple(of: every) {
+                cmd.waitUntilCompleted()
+                let path = String(format: "%@/%05d.png", directory, framesDrawn / every)
+                writePNG(texture: drawable.texture, to: path)
+            }
+            if framesDrawn >= maximum { exit(0) }
         }
     }
 

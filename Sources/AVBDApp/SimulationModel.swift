@@ -5,6 +5,7 @@ import simd
 
 /// Observable simulation state driving the UI and the renderer.
 final class SimulationModel: ObservableObject, RenderableModel {
+    nonisolated let captureID = "playground"
     @Published var demoName = ProcessInfo.processInfo.environment["AVBD_DEMO"] ?? "stack" {
         didSet {
             demoParams = Self.defaultParams(for: demoName)

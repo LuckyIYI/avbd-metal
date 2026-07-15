@@ -3,6 +3,18 @@ import simd
 @testable import AVBDCore
 
 final class GPUSolverTests: XCTestCase {
+    func testWorldSpaceInertiaRotatesPrincipalAxes() {
+        let principal = F3(1, 2, 3)
+        let rotation = Quat(angle: .pi / 2, axis: F3(0, 0, 1))
+        let inertia = worldInertiaRows(rotation, principal)
+        XCTAssertEqual(inertia.r0.x, 2, accuracy: 1e-5)
+        XCTAssertEqual(inertia.r1.y, 1, accuracy: 1e-5)
+        XCTAssertEqual(inertia.r2.z, 3, accuracy: 1e-5)
+        XCTAssertEqual(inertia.r0.y, 0, accuracy: 1e-5)
+        XCTAssertEqual(inertia.r0.z, 0, accuracy: 1e-5)
+        XCTAssertEqual(inertia.r1.z, 0, accuracy: 1e-5)
+    }
+
     func makeGPU(_ scene: PhysicsScene) throws -> GPUSolver {
         do {
             return try GPUSolver(scene: scene)
@@ -16,6 +28,39 @@ final class GPUSolverTests: XCTestCase {
         let solver = try makeGPU(Demos.ground())
         XCTAssertNotNil(solver.device)
         XCTAssertFalse(solver.pso.isEmpty)
+    }
+
+    func testCollisionGroupsIsolateOverlappingSimulationReplicas() throws {
+        var scene = PhysicsScene(name: "overlapping-collision-groups")
+        scene.settings.dt = 1 / 120
+        scene.settings.iterations = 16
+        _ = scene.addBody(
+            size: F3(20, 20, 0.2), density: 0, friction: 0.9,
+            position: F3(0, 0, -0.1))
+        let first = scene.addBody(
+            size: F3(repeating: 1), density: 1, friction: 0.8,
+            position: F3(0, 0, 1.5), collisionGroup: 1)
+        let second = scene.addBody(
+            size: F3(repeating: 1), density: 1, friction: 0.8,
+            position: F3(0, 0, 1.5), collisionGroup: 2)
+
+        let solver = try makeGPU(scene)
+        for _ in 0..<240 { solver.step() }
+        let a = solver.bodyStates([first])[0]
+        let b = solver.bodyStates([second])[0]
+
+        // Both replicas contact shared group-zero ground, but their perfectly
+        // overlapping bodies never see one another and therefore evolve
+        // identically rather than being pushed apart.
+        XCTAssertEqual(a.position.x.bitPattern, b.position.x.bitPattern)
+        XCTAssertEqual(a.position.y.bitPattern, b.position.y.bitPattern)
+        XCTAssertEqual(a.position.z.bitPattern, b.position.z.bitPattern)
+        XCTAssertEqual(a.rotation.imag.x.bitPattern, b.rotation.imag.x.bitPattern)
+        XCTAssertEqual(a.rotation.imag.y.bitPattern, b.rotation.imag.y.bitPattern)
+        XCTAssertEqual(a.rotation.imag.z.bitPattern, b.rotation.imag.z.bitPattern)
+        XCTAssertEqual(a.rotation.real.bitPattern, b.rotation.real.bitPattern)
+        XCTAssertEqual(a.position.z, 0.5, accuracy: 0.06)
+        XCTAssertEqual(solver.lastNumPairs, 2)
     }
 
     func testFreeFallMatchesAnalytic() throws {
@@ -32,6 +77,143 @@ final class GPUSolverTests: XCTestCase {
             z += v * solver.settings.dt
         }
         XCTAssertEqual(solver.bodyPosition(0).z, z, accuracy: 0.01)
+    }
+
+    func testExplicitImportedInertiaOverridesCollisionPrimitiveDensity() throws {
+        var scene = PhysicsScene(name: "explicit-inertia")
+        let expectedInertia = F3(0.0490211, 0.0445821, 0.00824619)
+        let body = scene.addBody(
+            size: F3(0.3, 0.2, 0.1), density: 0, friction: 0.5,
+            position: F3(0, 0, 10), mass: 5.39,
+            diagonalInertia: expectedInertia)
+
+        let gpu = try makeGPU(scene)
+        XCTAssertEqual(gpu.bodyMass(body), 5.39, accuracy: 1e-6)
+        let gpuInertia = gpu.bodyDiagonalInertia(body)
+        XCTAssertEqual(gpuInertia.x, expectedInertia.x, accuracy: 1e-7)
+        XCTAssertEqual(gpuInertia.y, expectedInertia.y, accuracy: 1e-7)
+        XCTAssertEqual(gpuInertia.z, expectedInertia.z, accuracy: 1e-7)
+
+        let cpu = scene.makeCPUSolver()
+        XCTAssertEqual(cpu.bodies[body].mass, 5.39, accuracy: 1e-6)
+        XCTAssertEqual(cpu.bodies[body].moment.x, expectedInertia.x, accuracy: 1e-7)
+        XCTAssertEqual(cpu.bodies[body].moment.y, expectedInertia.y, accuracy: 1e-7)
+        XCTAssertEqual(cpu.bodies[body].moment.z, expectedInertia.z, accuracy: 1e-7)
+    }
+
+    func testOffsetCompoundCollidersSupportOneRigidBody() throws {
+        var scene = PhysicsScene(name: "compound-collider-support")
+        scene.settings.dt = 1 / 120
+        scene.settings.iterations = 20
+        _ = scene.addBody(size: F3(20, 20, 0.1), density: 0,
+                          friction: 1, position: F3(0, 0, -0.05))
+        let body = scene.addBody(
+            size: F3(0.4, 0.4, 0.4), density: 0, friction: 0.9,
+            position: F3(0, 0, 1.5), mass: 2,
+            diagonalInertia: F3(0.25, 0.25, 0.25),
+            collisionEnabled: false)
+        _ = scene.addCollider(body: body, size: F3(0.30, 0.30, 0.20),
+                              localPosition: F3(-0.35, 0, -0.80))
+        _ = scene.addCollider(body: body, size: F3(0.30, 0.30, 0.20),
+                              localPosition: F3(0.35, 0, -0.80))
+
+        let solver = try makeGPU(scene)
+        for _ in 0..<360 { solver.step() }
+        let state = solver.bodyStates([body])[0]
+
+        // Ground top is z=0 and each foot is 0.1 m thick, so an offset-aware
+        // body rests with its COM near 0.9 m. Treating the colliders as
+        // centered would instead put the COM near 0.1 m.
+        XCTAssertEqual(state.position.z, 0.90, accuracy: 0.08)
+        XCTAssertLessThan(abs(state.rotation.imag.x), 0.08)
+        XCTAssertLessThan(abs(state.rotation.imag.y), 0.08)
+        XCTAssertGreaterThanOrEqual(solver.lastNumPairs, 2)
+    }
+
+    func testConvexHullColliderRestsOnBoxTerrain() throws {
+        var scene = PhysicsScene(name: "convex-hull-box-contact")
+        scene.settings.dt = 1 / 120
+        scene.settings.gravity = -9.81
+        scene.settings.iterations = 20
+        let ground = scene.addBody(
+            size: F3(20, 20, 0.2), density: 0, friction: 1,
+            position: F3(0, 0, -0.1))
+        let body = scene.addBody(
+            size: F3(repeating: 1), density: 0, friction: 1,
+            position: F3(0, 0, 2), mass: 1,
+            diagonalInertia: F3(repeating: 1 / 6),
+            collisionEnabled: false)
+        let hull = [
+            F3(-0.5, -0.5, -0.5), F3(0.5, -0.5, -0.5),
+            F3(-0.5, 0.5, -0.5), F3(0.5, 0.5, -0.5),
+            F3(-0.5, -0.5, 0.5), F3(0.5, -0.5, 0.5),
+            F3(-0.5, 0.5, 0.5), F3(0.5, 0.5, 0.5),
+        ]
+        let collider = scene.addConvexCollider(
+            body: body, vertices: hull, friction: 1)
+        XCTAssertEqual(scene.colliders[collider].convexHullVertices.count, 8)
+        XCTAssertEqual(scene.colliders[collider].size, F3(repeating: 1))
+
+        let solver = try makeGPU(scene)
+        for _ in 0..<360 { solver.step() }
+        let state = solver.bodyStates([body])[0]
+        XCTAssertEqual(state.position.z, 0.5, accuracy: 0.06)
+        XCTAssertLessThan(abs(state.rotation.imag.x), 0.05)
+        XCTAssertLessThan(abs(state.rotation.imag.y), 0.05)
+        XCTAssertTrue(solver.activeRigidContactPairs().contains {
+            ($0.0 == ground && $0.1 == body)
+                || ($0.0 == body && $0.1 == ground)
+        })
+    }
+
+    /// Imported robot feet are compound capsule colliders. Their material
+    /// contact anchors must persist while sticking; rebuilding those anchors
+    /// every frame turns static friction into bounded per-frame creep and lets
+    /// a locomotion policy translate in permanent double support.
+    func testCompoundCapsuleFootHoldsUnderSubCoulombActuatorLoad() throws {
+        var scene = PhysicsScene(name: "compound-capsule-static-friction")
+        scene.settings.dt = 1 / 120
+        scene.settings.iterations = 20
+        _ = scene.addBody(size: F3(20, 8, 0.20), density: 0,
+                          friction: 1.1, position: F3(0, 0, -0.10))
+
+        let foot = scene.addBody(
+            size: F3(0.35, 0.20, 0.20), density: 0, friction: 1.1,
+            position: F3(0, 0, 0.36),
+            mass: 5, diagonalInertia: F3(0.08, 0.12, 0.08),
+            collisionEnabled: false)
+        let capsuleAlongX = Quat(angle: .pi / 2, axis: F3(0, 1, 0))
+        for y in [-0.07 as Float, 0.07] {
+            _ = scene.addCollider(
+                body: foot, size: F3(0.24, 0.035, 0), friction: 1.1,
+                localPosition: F3(0, y, -0.31),
+                localRotation: capsuleAlongX, shape: .capsule)
+        }
+        _ = scene.addCollider(
+            body: foot, size: F3(0.14, 0.035, 0), friction: 1.1,
+            localPosition: F3(0.14, 0, -0.31),
+            localRotation: Quat(angle: .pi / 2, axis: F3(1, 0, 0)),
+            shape: .capsule)
+        // 500 N/m * 0.04 m = 20 N. The available Coulomb force is about
+        // 1.1 * 5 kg * 10 m/s² = 55 N, so a correct static contact must hold.
+        scene.addJoint(SceneJoint(
+            bodyA: -1, bodyB: foot, rA: F3(0, 0, 0.36), rB: .zero,
+            stiffnessLin: 500, stiffnessAng: 0))
+
+        let solver = try makeGPU(scene)
+        for _ in 0..<600 { solver.step() }
+        let settled = solver.bodyPosition(foot)
+        for _ in 0..<1_200 {
+            let p = solver.bodyPosition(foot)
+            solver.setJointWorldAnchors([.init(
+                joint: 0, point: F3(p.x + 0.04, p.y, p.z))])
+            solver.step()
+        }
+        let state = solver.bodyStates([foot])[0]
+
+        XCTAssertLessThan(abs(state.position.x - settled.x), 0.001,
+                          "compound capsule foot crept under a sub-Coulomb actuator load")
+        XCTAssertLessThan(length(state.linearVelocity), 0.03)
     }
 
     func testSoftParticlesFreeFallLikeRigidBodiesWithDamping() throws {
@@ -156,6 +338,58 @@ final class GPUSolverTests: XCTestCase {
             let p = solver.bodyPosition(1 + i)
             XCTAssertEqual(p.z, 0.5 + Float(i), accuracy: 0.08, "box \(i) z")
             XCTAssertLessThan(length(F3(p.x, p.y, 0)), 0.15, "box \(i) lateral drift")
+        }
+    }
+
+    func testContactRichTrajectoryIsBitwiseDeterministic() throws {
+        var scene = PhysicsScene(name: "deterministic-contact-grid")
+        scene.settings.dt = 1 / 120
+        scene.settings.iterations = 12
+        _ = scene.addBody(size: F3(80, 20, 0.2), density: 0,
+                          friction: 0.9, position: F3(0, 0, -0.1))
+        var dynamicBodies = [Int]()
+        for lane in 0..<16 {
+            let x = Float(lane) * 2 - 15
+            for level in 0..<4 {
+                dynamicBodies.append(scene.addBody(
+                    size: F3(0.8, 0.8, 0.8), density: 1,
+                    friction: 0.8,
+                    position: F3(x, 0, 0.4 + Float(level) * 0.81)))
+            }
+        }
+
+        let first = try makeGPU(scene)
+        let second = try makeGPU(scene)
+        for _ in 0..<240 {
+            first.step()
+            second.step()
+        }
+        first.sync()
+        second.sync()
+        let firstStates = first.bodyStates(dynamicBodies)
+        let secondStates = second.bodyStates(dynamicBodies)
+        XCTAssertEqual(first.lastNumPairs, second.lastNumPairs)
+        XCTAssertEqual(firstStates.count, secondStates.count)
+        for i in firstStates.indices {
+            let a = firstStates[i]
+            let b = secondStates[i]
+            XCTAssertEqual(a.position.x.bitPattern, b.position.x.bitPattern)
+            XCTAssertEqual(a.position.y.bitPattern, b.position.y.bitPattern)
+            XCTAssertEqual(a.position.z.bitPattern, b.position.z.bitPattern)
+            XCTAssertEqual(a.rotation.imag.x.bitPattern,
+                           b.rotation.imag.x.bitPattern)
+            XCTAssertEqual(a.rotation.imag.y.bitPattern,
+                           b.rotation.imag.y.bitPattern)
+            XCTAssertEqual(a.rotation.imag.z.bitPattern,
+                           b.rotation.imag.z.bitPattern)
+            XCTAssertEqual(a.rotation.real.bitPattern,
+                           b.rotation.real.bitPattern)
+            XCTAssertEqual(a.linearVelocity.x.bitPattern,
+                           b.linearVelocity.x.bitPattern)
+            XCTAssertEqual(a.linearVelocity.y.bitPattern,
+                           b.linearVelocity.y.bitPattern)
+            XCTAssertEqual(a.linearVelocity.z.bitPattern,
+                           b.linearVelocity.z.bitPattern)
         }
     }
 

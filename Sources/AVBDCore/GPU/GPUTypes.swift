@@ -43,6 +43,7 @@ public struct SimParamsGPU {
     public var elemMargin: Float = 0.01
     public var numSoftGroups: UInt32 = 0
     public var frame: UInt32 = 0
+    public var frictionCombineMode: UInt32 = 0
 }
 
 extension SimParamsGPU: Equatable {}
@@ -59,8 +60,9 @@ public struct JointGPU {
     public var penaltyAng: SIMD4<Float> = .zero
     public var restRel: SIMD4<Float> = SIMD4(0, 0, 0, 1)
     public var hingeAxis: SIMD4<Float> = .zero
-    public var motor: SIMD4<Float> = .zero
-    public var limits: SIMD4<Float> = .zero
+    public var motor: SIMD4<Float> = .zero       // target, effort cap, dual, kp
+    public var limits: SIMD4<Float> = .zero      // lo, hi, kd, fixed-PD flag
+    public var dynamics: SIMD4<Float> = .zero    // armature, predicted twist, pad, pad
 }
 
 public struct TetGPU {
@@ -123,6 +125,7 @@ public struct ContactGPU {
 
 public struct ManifoldGPU {
     public var header: SIMD4<UInt32> = .zero  // bodyA, bodyB, numContacts, active
+    public var colliderPair: SIMD4<UInt32> = .zero // collision-geom identity
     public var basisN: SIMD4<Float> = .zero   // w = friction
     public var basisT1: SIMD4<Float> = .zero
     public var contacts: (ContactGPU, ContactGPU, ContactGPU, ContactGPU,

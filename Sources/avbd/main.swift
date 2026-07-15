@@ -23,40 +23,162 @@ struct Options {
     var watch: Int? = nil
     var res: Int? = nil
     var statsEvery = 60
-    var envs = 64
-    var batch = 256
+    var envs = 256
+    var batch = 1024
     var latent = 128
     var lr: Float = 3e-4
+    var gamma: Float = 0.99
+    var gaeLambda: Float = 0.95
+    var rewardScale: Float = 1
     var lambda: Float = 0.5
     var episodes = 10
-    var updates = 200
-    var horizon = 32
-    var epochs = 2
+    var updates = 3000
+    var horizon = 24
+    var epochs = 5
+    var hidden = 512
+    var hiddenLayers: [Int]? = nil
+    var actionDistribution: PPOActionDistribution? = nil
+    var seed: UInt64 = 1
+    var algorithm = "ppo"
+    var actionStd: Float = 1.0
+    var minimumActionStd: Float? = nil
+    var maximumActionStd: Float? = nil
+    var initializeFrom: String? = nil
+    var policyExpertFrom: String? = nil
+    var standExpertFrom: String? = nil
+    var initializationNormalizerPriorCount: Double? = nil
+    var symmetryAugmentation = true
+    var symmetryMirrorLossCoefficient: Float? = 0.01
+    var updateObservationNormalizer = true
+    var normalizeObservations = true
+    var entropy: Float = 0.01
+    var targetKL: Float = 0.01
+    var policyClip: Float = 0.2
+    var valueClip: Float = 0.2
+    var valueCoefficient: Float = 1
+    var maxGradientNorm: Float = 1
+    var successImitationCoefficient: Float = 0
+    var referencePolicyCoefficient: Float = 0
+    var checkpointInterval = 50
+    var resume = false
+    var runName = "ppo"
+    var checkpoint: String? = nil
+    var output: String? = nil
+    /// Task-owned numeric configuration. Keeping these values out of the PPO
+    /// parser lets new scenes expose curricula and control settings without
+    /// adding task-specific branches to this executable.
+    var taskOptions: [String: Float] = [:]
 }
 
 func parseOptions(_ args: [String]) -> Options {
     var o = Options()
     var i = 0
+    func value(after flag: String) -> String {
+        guard i + 1 < args.count else { fail("missing value after \(flag)") }
+        i += 1
+        return args[i]
+    }
     while i < args.count {
         switch args[i] {
-        case "--frames": i += 1; o.frames = Int(args[i]) ?? o.frames
-        case "--iterations": i += 1; o.iterations = Int(args[i])
-        case "--scale": i += 1; o.scale = Int(args[i]) ?? 1
-        case "--dt": i += 1; o.dt = Float(args[i])
+        case "--frames": o.frames = Int(value(after: args[i])) ?? o.frames
+        case "--iterations": o.iterations = Int(value(after: args[i]))
+        case "--scale": o.scale = Int(value(after: args[i])) ?? o.scale
+        case "--dt": o.dt = Float(value(after: args[i]))
         case "--cpu": o.useCPU = true
         case "--json": o.json = true
-        case "--watch": i += 1; o.watch = Int(args[i])
-        case "--res": i += 1; o.res = Int(args[i])
-        case "--stats-every": i += 1; o.statsEvery = Int(args[i]) ?? 60
-        case "--envs": i += 1; o.envs = Int(args[i]) ?? 64
-        case "--batch": i += 1; o.batch = Int(args[i]) ?? 256
-        case "--latent": i += 1; o.latent = Int(args[i]) ?? 128
-        case "--lr": i += 1; o.lr = Float(args[i]) ?? 3e-4
-        case "--lambda": i += 1; o.lambda = Float(args[i]) ?? 0.5
-        case "--episodes": i += 1; o.episodes = Int(args[i]) ?? 10
-        case "--updates": i += 1; o.updates = Int(args[i]) ?? 200
-        case "--horizon": i += 1; o.horizon = Int(args[i]) ?? 32
-        case "--epochs": i += 1; o.epochs = Int(args[i]) ?? 2
+        case "--watch": o.watch = Int(value(after: args[i]))
+        case "--res": o.res = Int(value(after: args[i]))
+        case "--stats-every":
+            o.statsEvery = Int(value(after: args[i])) ?? o.statsEvery
+        case "--envs": o.envs = Int(value(after: args[i])) ?? o.envs
+        case "--batch": o.batch = Int(value(after: args[i])) ?? o.batch
+        case "--latent": o.latent = Int(value(after: args[i])) ?? o.latent
+        case "--lr": o.lr = Float(value(after: args[i])) ?? o.lr
+        case "--gamma": o.gamma = Float(value(after: args[i])) ?? o.gamma
+        case "--gae-lambda":
+            o.gaeLambda = Float(value(after: args[i])) ?? o.gaeLambda
+        case "--reward-scale":
+            o.rewardScale = Float(value(after: args[i])) ?? o.rewardScale
+        case "--lambda": o.lambda = Float(value(after: args[i])) ?? o.lambda
+        case "--episodes": o.episodes = Int(value(after: args[i])) ?? o.episodes
+        case "--updates": o.updates = Int(value(after: args[i])) ?? o.updates
+        case "--horizon": o.horizon = Int(value(after: args[i])) ?? o.horizon
+        case "--epochs": o.epochs = Int(value(after: args[i])) ?? o.epochs
+        case "--hidden": o.hidden = Int(value(after: args[i])) ?? o.hidden
+        case "--hidden-layers":
+            let widths = value(after: args[i]).split(separator: ",").compactMap {
+                Int($0)
+            }
+            guard widths.count == 3 else {
+                fail("--hidden-layers expects three comma-separated integers")
+            }
+            o.hiddenLayers = widths
+        case "--action-distribution":
+            let name = value(after: args[i])
+            guard let distribution = PPOActionDistribution(rawValue: name) else {
+                fail("--action-distribution must be gaussian or squashed-gaussian")
+            }
+            o.actionDistribution = distribution
+        case "--seed": o.seed = UInt64(value(after: args[i])) ?? o.seed
+        case "--algorithm": o.algorithm = value(after: args[i])
+        case "--action-std":
+            o.actionStd = Float(value(after: args[i])) ?? o.actionStd
+        case "--minimum-action-std":
+            o.minimumActionStd = Float(value(after: args[i]))
+        case "--maximum-action-std":
+            o.maximumActionStd = Float(value(after: args[i]))
+        case "--initialize-from":
+            o.initializeFrom = value(after: args[i])
+        case "--policy-expert-from":
+            o.policyExpertFrom = value(after: args[i])
+        case "--stand-expert-from":
+            o.standExpertFrom = value(after: args[i])
+        case "--initialization-normalizer-prior-count":
+            o.initializationNormalizerPriorCount =
+                Double(value(after: args[i]))
+        case "--no-symmetry-augmentation": o.symmetryAugmentation = false
+        case "--symmetry-mirror-loss":
+            o.symmetryMirrorLossCoefficient = Float(value(after: args[i]))
+        case "--legacy-symmetry-data-augmentation":
+            o.symmetryMirrorLossCoefficient = 0
+        case "--freeze-observation-normalizer":
+            o.updateObservationNormalizer = false
+        case "--no-observation-normalization":
+            o.normalizeObservations = false
+        case "--entropy": o.entropy = Float(value(after: args[i])) ?? o.entropy
+        case "--target-kl": o.targetKL = Float(value(after: args[i])) ?? o.targetKL
+        case "--policy-clip":
+            o.policyClip = Float(value(after: args[i])) ?? o.policyClip
+        case "--value-clip":
+            o.valueClip = Float(value(after: args[i])) ?? o.valueClip
+        case "--value-coef":
+            o.valueCoefficient = Float(value(after: args[i]))
+                ?? o.valueCoefficient
+        case "--max-grad-norm":
+            o.maxGradientNorm = Float(value(after: args[i]))
+                ?? o.maxGradientNorm
+        case "--success-imitation-coef":
+            o.successImitationCoefficient = Float(value(after: args[i]))
+                ?? o.successImitationCoefficient
+        case "--reference-policy-coef":
+            o.referencePolicyCoefficient = Float(value(after: args[i]))
+                ?? o.referencePolicyCoefficient
+        case "--checkpoint-interval":
+            o.checkpointInterval = Int(value(after: args[i]))
+                ?? o.checkpointInterval
+        case "--resume": o.resume = true
+        case "--run": o.runName = value(after: args[i])
+        case "--checkpoint": o.checkpoint = value(after: args[i])
+        case "--output": o.output = value(after: args[i])
+        case "--task-option":
+            let assignment = value(after: args[i])
+            let pieces = assignment.split(separator: "=", maxSplits: 1,
+                                          omittingEmptySubsequences: false)
+            guard pieces.count == 2, !pieces[0].isEmpty,
+                  let numericValue = Float(pieces[1]) else {
+                fail("--task-option expects key=value with a numeric value")
+            }
+            o.taskOptions[String(pieces[0])] = numericValue
         default: break
         }
         i += 1
@@ -90,6 +212,16 @@ guard let command = args.first else {
       bench <demo>   Benchmark ms/frame
       parity <demo>  Compare GPU vs CPU trajectories
       list           List demo scenes
+      list-rl        List vectorized robot-learning tasks and algorithms
+      rl-smoke <task>  Step a vectorized task and validate finite tensors
+      train-rl <task>  Train any registered task with MLX PPO
+      eval-rl <task>   Evaluate a saved MLX policy deterministically
+      trace-rl <task>  Trace one deterministic policy trajectory step by step
+      eval-arm-expert  Evaluate the batched Push-T demonstration expert
+      select-rl <reports...>  Select one checkpoint on validation-only reports
+      verify-selection-rl <selection.json> <reports...>  Reject seed leakage or drift
+      aggregate-rl <reports...>  Aggregate distinct-seed evaluation JSON files
+      aggregate-checkpoint-rl <reports...>  Aggregate one checkpoint over reset seeds
 
     Options: --frames N --iterations N --scale N --dt T --cpu --json --watch BODY --stats-every N
     """)
@@ -99,6 +231,450 @@ guard let command = args.first else {
 switch command {
 case "list":
     for d in Demos.all { print(d) }
+
+case "list-rl":
+    print("tasks:")
+    for id in BuiltInRLTasks.registry.taskIDs { print("  \(id)") }
+    print("algorithms:")
+    for id in VectorRLAlgorithmRegistry.builtIn.algorithmIDs { print("  \(id)") }
+
+case "rl-smoke":
+    guard args.count > 1 else { fail("usage: avbd rl-smoke <task> [--envs N --frames N]") }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let task = try BuiltInRLTasks.registry.make(
+        args[1], configuration: RLTaskConfiguration(
+            numEnvironments: o.envs, seed: o.seed, options: o.taskOptions))
+    var observation = try task.reset(seed: o.seed)
+    var actions = RLActionBatch(spec: task.spec)
+    var smokeRNG = SplitMix64(seed: o.seed &+ 0xD1B54A32D192ED03)
+    func normalSample() -> Float {
+        let u1 = max(smokeRNG.nextFloat(), 1e-7)
+        let u2 = smokeRNG.nextFloat()
+        return sqrt(-2 * log(u1)) * cos(2 * .pi * u2)
+    }
+    var result = RLStepBatch(spec: task.spec)
+    let t0 = Date()
+    var rewardSum: Float = 0
+    var diagnosticMetricSums = [String: Float]()
+    var completedMetricSums = [String: Float]()
+    var completedEpisodes = 0, successfulEpisodes = 0
+    var completedLength: Float = 0
+    var completedDistance: Float = 0
+    for frame in 0..<o.frames {
+        if args.contains("--action-std") {
+            let lowerBounds = task.spec.action.lowerBound
+            let upperBounds = task.spec.action.upperBound
+            for i in actions.values.indices {
+                let component = i % actions.actionDimension
+                let sample = normalSample() * o.actionStd
+                if let lowerBounds, let upperBounds {
+                    actions.values[i] = simd_clamp(
+                        sample, lowerBounds[component], upperBounds[component])
+                } else {
+                    actions.values[i] = sample
+                }
+            }
+        }
+        try task.step(actions: actions, into: &result)
+        if args.contains("--trace") {
+            for e in 0..<task.spec.numEnvironments {
+                let height = result.metrics["state/torso_height_m"]?[e]
+                    ?? .nan
+                let up = result.metrics["state/projected_gravity_z"]?[e]
+                    ?? .nan
+                let margin = result.metrics[
+                    "state/minimum_joint_limit_margin_rad"]?[e] ?? .nan
+                let clearance = result.metrics[
+                    "state/minimum_foot_clearance_m"]?[e] ?? .nan
+                let contacts = result.metrics["state/feet_in_contact"]?[e]
+                    ?? .nan
+                let speed = result.metrics["state/root_planar_speed_mps"]?[e]
+                    ?? .nan
+                let torqueRatio = result.metrics[
+                    "state/maximum_actuator_torque_ratio"]?[e] ?? .nan
+                let saturated = result.metrics[
+                    "state/saturated_actuator_count"]?[e] ?? .nan
+                print(String(format:
+                    "frame %d env %d height %.6f up %.6f margin %.6f "
+                    + "clearance %.6f contacts %.0f speed %.6f "
+                    + "maxTorqueRatio %.3f saturated %.0f "
+                    + "terminated %@ truncated %@",
+                    frame + 1, e, height, up, margin, clearance, contacts,
+                    speed, torqueRatio, saturated,
+                    result.terminated[e] ? "true" : "false",
+                    result.truncated[e] ? "true" : "false"))
+            }
+        }
+        observation = result.observations
+        rewardSum += result.rewards.reduce(0, +)
+        for (name, values) in result.metrics
+            where name.hasPrefix("reward/") || name.hasPrefix("penalty/")
+                || name.hasPrefix("gait/") || name.hasPrefix("state/") {
+            diagnosticMetricSums[name, default: 0] += values.reduce(0, +)
+        }
+        if let lengths = result.metrics["episode/length"] {
+            for e in 0..<task.spec.numEnvironments where lengths[e] > 0 {
+                completedEpisodes += 1
+                completedLength += lengths[e]
+                completedDistance += result.metrics["episode/forward_distance_m"]?[e] ?? 0
+                for (name, values) in result.metrics
+                    where name.hasPrefix("episode/") && e < values.count {
+                    completedMetricSums[name, default: 0] += values[e]
+                }
+                if result.successes[e] { successfulEpisodes += 1 }
+            }
+        }
+        guard observation.policy.allSatisfy(\.isFinite),
+              result.rewards.allSatisfy(\.isFinite) else {
+            fail("non-finite task tensor")
+        }
+    }
+    let elapsed = max(-t0.timeIntervalSinceNow, 1e-9)
+    let transitions = Double(o.frames * task.spec.numEnvironments)
+    print(String(format:
+        "%@  envs %d  obs %d  act %d  %.0f transitions/s  mean reward %+.4f  "
+        + "episodes %d  success %.1f%%  mean length %.1f  mean dx %+.3f m",
+        task.spec.id, task.spec.numEnvironments, task.spec.observation.elementCount,
+        task.spec.action.elementCount, transitions / elapsed,
+        rewardSum / Float(max(o.frames * task.spec.numEnvironments, 1)),
+        completedEpisodes,
+        completedEpisodes > 0
+            ? Float(successfulEpisodes) / Float(completedEpisodes) * 100 : 0,
+        completedEpisodes > 0 ? completedLength / Float(completedEpisodes) : 0,
+        completedEpisodes > 0 ? completedDistance / Float(completedEpisodes) : 0))
+    for (name, total) in diagnosticMetricSums.sorted(by: { $0.key < $1.key }) {
+        print(String(format: "  %@ mean %+.6f", name,
+                     total / Float(max(o.frames * task.spec.numEnvironments, 1))))
+    }
+    for (name, total) in completedMetricSums.sorted(by: { $0.key < $1.key }) {
+        print(String(format: "  %@ completed-episode mean %+.6f", name,
+                     total / Float(max(completedEpisodes, 1))))
+    }
+
+case "train-rl":
+    guard args.count > 1 else {
+        fail("usage: avbd train-rl <task> [--algorithm ppo --envs N --updates N]")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let taskID = args[1]
+    let task = try BuiltInRLTasks.registry.make(
+        taskID, configuration: RLTaskConfiguration(
+            numEnvironments: o.envs, seed: o.seed, options: o.taskOptions))
+    guard o.algorithm == "ppo" else {
+        fail("algorithm '\(o.algorithm)' is not configured; available: "
+             + VectorRLAlgorithmRegistry.builtIn.algorithmIDs.joined(separator: ", "))
+    }
+    let config = VectorPPOConfig(
+        updates: o.updates, rolloutSteps: o.horizon,
+        updateEpochs: o.epochs, minibatchSize: o.batch,
+        learningRate: o.lr, gamma: o.gamma, gaeLambda: o.gaeLambda,
+        rewardScale: o.rewardScale,
+        hiddenSize: o.hidden, seed: o.seed)
+    var tunedConfig = config
+    tunedConfig.policyClip = o.policyClip
+    tunedConfig.valueClip = o.valueClip
+    tunedConfig.valueCoefficient = o.valueCoefficient
+    tunedConfig.maxGradientNorm = o.maxGradientNorm
+    tunedConfig.successImitationCoefficient =
+        o.successImitationCoefficient
+    tunedConfig.referencePolicyCoefficient =
+        o.referencePolicyCoefficient
+    tunedConfig.initialActionStd = o.actionStd
+    tunedConfig.hiddenDimensions = o.hiddenLayers
+    tunedConfig.actionDistribution = o.actionDistribution
+    tunedConfig.minimumActionStd = o.minimumActionStd
+    tunedConfig.maximumActionStd = o.maximumActionStd
+    tunedConfig.initializationCheckpoint = o.initializeFrom
+    tunedConfig.policyExpertInitializationCheckpoint = o.policyExpertFrom
+    tunedConfig.standExpertInitializationCheckpoint = o.standExpertFrom
+    tunedConfig.initializationNormalizerPriorCount =
+        o.initializationNormalizerPriorCount
+    tunedConfig.useTaskSymmetryAugmentation = o.symmetryAugmentation
+    tunedConfig.symmetryMirrorLossCoefficient =
+        o.symmetryMirrorLossCoefficient
+    tunedConfig.updateObservationNormalizer = o.updateObservationNormalizer
+    tunedConfig.normalizeObservations = o.normalizeObservations
+    tunedConfig.entropyCoefficient = o.entropy
+    tunedConfig.targetKL = o.targetKL
+    tunedConfig.checkpointInterval = o.checkpointInterval
+    let trainer = VectorPPOTrainer(configuration: tunedConfig)
+    try trainer.train(task: task, outputDirectory: "runs/\(taskID)/\(o.runName)",
+                      resume: o.resume)
+
+case "eval-rl":
+    guard args.count > 1 else {
+        fail("usage: avbd eval-rl <task> [--envs N --episodes N --seed N]")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let taskID = args[1]
+    let task = try BuiltInRLTasks.registry.make(
+        taskID, configuration: RLTaskConfiguration(
+            numEnvironments: o.envs, seed: o.seed, autoReset: false,
+            options: o.taskOptions))
+    let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
+    let metrics = try VectorPPOTrainer.evaluate(
+        task: task, checkpointDirectory: checkpointDirectory,
+        episodes: o.episodes, seed: o.seed)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let encodedMetrics = try encoder.encode(metrics)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try encodedMetrics.write(to: url, options: .atomic)
+    }
+    if o.json {
+        print(String(decoding: encodedMetrics, as: UTF8.self))
+    } else {
+        print(String(format:
+            "eval %@  episodes %d  success %d (%.1f%%)  return %+.3f  length %.1f",
+            taskID, metrics.episodes, metrics.successes, metrics.successRate * 100,
+            metrics.meanReturn, metrics.meanEpisodeLength))
+        for (name, value) in metrics.taskMetrics.sorted(by: { $0.key < $1.key }) {
+            print(String(format: "  %@ %.5f", name, value))
+        }
+        if let acceptance = metrics.acceptance {
+            print("acceptance \(acceptance.passed ? "PASS" : "FAIL")")
+            for failure in acceptance.failures { print("  \(failure)") }
+        }
+    }
+    if metrics.acceptance?.passed == false { exit(2) }
+
+case "trace-rl":
+    guard args.count > 1 else {
+        fail("usage: avbd trace-rl <task> [--checkpoint DIR --frames N]")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let taskID = args[1]
+    let task = try BuiltInRLTasks.registry.make(
+        taskID, configuration: RLTaskConfiguration(
+            numEnvironments: 1, seed: o.seed, autoReset: false,
+            options: o.taskOptions))
+    let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
+    let runner = try VectorPolicyRunner(
+        checkpointDirectory: checkpointDirectory)
+    let metadata = runner.metadata
+    guard metadata.task == task.spec.id,
+          (metadata.taskRevision ?? 1) == task.spec.revision,
+          metadata.taskConfiguration == task.spec.configurationValues,
+          metadata.observationDimension == task.spec.observation.elementCount,
+          metadata.actionDimension == task.spec.action.elementCount else {
+        fail("checkpoint/task mismatch for deterministic trace")
+    }
+    var observation = try task.reset(seed: o.seed)
+    var result = RLStepBatch(spec: task.spec)
+    print("step action0 action1 q0 q1 tip_x tip_y block_x block_y "
+        + "goal_m coverage reward done")
+    for step in 0..<min(o.frames, task.spec.maxEpisodeSteps) {
+        let expertGates = (task as? any PolicyExpertGateProviding)?
+            .policyExpertGates(observation.policy)
+        let standExpertGates = (task as? any PolicyStandExpertGateProviding)?
+            .policyStandExpertGates(observation.policy)
+        let actions = try runner.actions(
+            for: observation, expertGates: expertGates,
+            standExpertGates: standExpertGates)
+        try task.step(actions: actions, into: &result)
+        if let arm = task as? ArmPushTTask {
+            let state = arm.environment.states()[0]
+            let goalDistance = simd_length(
+                arm.environment.refs[0].goalPosition - state.blockPosition)
+            let coverage = arm.environment.coverage(0, state: state)
+            print(String(format:
+                "%3d %+.5f %+.5f %+.5f %+.5f %+.5f %+.5f "
+                + "%+.5f %+.5f %.5f %.5f %+.5f %@",
+                step + 1, actions.values[0], actions.values[1],
+                state.jointAngles[0], state.jointAngles[1],
+                state.tipPosition.x, state.tipPosition.y,
+                state.blockPosition.x, state.blockPosition.y,
+                goalDistance, coverage, result.rewards[0],
+                result.terminated[0] || result.truncated[0]
+                    ? "true" : "false"))
+        } else {
+            print(String(format: "%3d action_mean_abs %.5f reward %+.5f done %@",
+                         step + 1,
+                         actions.values.map(abs).reduce(0, +)
+                            / Float(max(actions.values.count, 1)),
+                         result.rewards[0],
+                         result.terminated[0] || result.truncated[0]
+                            ? "true" : "false"))
+        }
+        observation = result.observations
+        if result.terminated[0] || result.truncated[0] { break }
+    }
+
+case "eval-arm-expert":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    let env = try ArmPushTEnv(numEnvironments: o.envs, seed: o.seed)
+    let ids = Array(0..<o.envs)
+    env.reset(ids, seeds: ids.map {
+        o.seed &+ UInt64($0) &* 0x9E3779B97F4A7C15
+    })
+    let expert = ArmPushTGeometricExpert(numEnvironments: o.envs)
+    var maximumCoverage = [Float](repeating: 0, count: o.envs)
+    var firstSuccessStep = [Int?](repeating: nil, count: o.envs)
+    var appliedActions = ContiguousArray(repeating: Float(0), count: o.envs * 2)
+    for step in 0..<o.frames {
+        let states = env.states()
+        let requestedActions = expert.actions(environment: env, states: states)
+        for i in appliedActions.indices {
+            appliedActions[i] += 0.60 * (requestedActions[i] - appliedActions[i])
+        }
+        if let watch = o.watch, (0..<o.envs).contains(watch), step % 20 == 0 {
+            let s = states[watch]
+            print(String(format:
+                "step %3d tip (%+.3f,%+.3f) block (%+.3f,%+.3f) yaw %+.3f action (%+.3f,%+.3f) coverage %.3f",
+                step, s.tipPosition.x, s.tipPosition.y,
+                s.blockPosition.x, s.blockPosition.y, s.blockYaw,
+                appliedActions[watch * 2], appliedActions[watch * 2 + 1],
+                env.coverage(watch, state: s)))
+        }
+        // Match ArmPushTTask's maintained 20 Hz controller over the 120 Hz
+        // physics step so this diagnostic has the same five-second horizon.
+        env.step(normalizedActions: appliedActions, decimation: 6)
+        let next = env.states()
+        for e in 0..<o.envs {
+            let coverage = env.coverage(e, state: next[e])
+            maximumCoverage[e] = max(maximumCoverage[e], coverage)
+            if coverage > ArmPushTEnv.successCoverage,
+               firstSuccessStep[e] == nil {
+                firstSuccessStep[e] = step + 1
+            }
+        }
+    }
+    let successes = firstSuccessStep.compactMap { $0 }
+    let sortedCoverage = maximumCoverage.sorted()
+    let medianCoverage = sortedCoverage[sortedCoverage.count / 2]
+    let meanCoverage = maximumCoverage.reduce(0, +) / Float(o.envs)
+    let meanSuccessStep = successes.isEmpty ? 0
+        : Float(successes.reduce(0, +)) / Float(successes.count)
+    print(String(format:
+        "arm expert  envs %d  success %d (%.1f%%)  coverage mean %.3f median %.3f  success_step %.1f",
+        o.envs, successes.count, 100 * Float(successes.count) / Float(o.envs),
+        meanCoverage, medianCoverage, meanSuccessStep))
+
+case "select-rl":
+    let raw = Array(args.dropFirst())
+    let o = parseOptions(raw)
+    var reportPaths = [String]()
+    var index = 0
+    while index < raw.count {
+        if raw[index] == "--output" {
+            index += 2
+        } else {
+            reportPaths.append(raw[index])
+            index += 1
+        }
+    }
+    guard !reportPaths.isEmpty else {
+        fail("usage: avbd select-rl <validation-report.json...> "
+            + "[--output selection.json]")
+    }
+    let reports = try reportPaths.map {
+        try JSONDecoder().decode(
+            PPOEvaluationMetrics.self,
+            from: Data(contentsOf: URL(fileURLWithPath: $0)))
+    }
+    let selection = try PPOCheckpointSelection.make(reports)
+    let selectionEncoder = JSONEncoder()
+    selectionEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let selectionData = try selectionEncoder.encode(selection)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try selectionData.write(to: url, options: .atomic)
+    }
+    print(String(decoding: selectionData, as: UTF8.self))
+
+case "verify-selection-rl":
+    let raw = Array(args.dropFirst())
+    guard raw.count >= 2 else {
+        fail("usage: avbd verify-selection-rl <selection.json> <test-report.json...>")
+    }
+    let selection = try JSONDecoder().decode(
+        PPOCheckpointSelection.self,
+        from: Data(contentsOf: URL(fileURLWithPath: raw[0])))
+    let reports = try raw.dropFirst().map {
+        try JSONDecoder().decode(
+            PPOEvaluationMetrics.self,
+            from: Data(contentsOf: URL(fileURLWithPath: $0)))
+    }
+    for report in reports { try selection.validateTestReport(report) }
+    let validationSeeds = selection.validationSeeds ?? [selection.validationSeed]
+    print("verified \(reports.count) test report(s) for immutable checkpoint "
+        + "\(selection.selectedCheckpointFingerprint); validation seeds "
+        + "\(validationSeeds.map(String.init).joined(separator: ",")) "
+        + "are absent from test reports")
+
+case "aggregate-rl":
+    let raw = Array(args.dropFirst())
+    let o = parseOptions(raw)
+    var reportPaths = [String]()
+    var index = 0
+    while index < raw.count {
+        if raw[index] == "--output" {
+            index += 2
+        } else {
+            reportPaths.append(raw[index])
+            index += 1
+        }
+    }
+    guard !reportPaths.isEmpty else {
+        fail("usage: avbd aggregate-rl <report.json...> [--output summary.json]")
+    }
+    let reports = try reportPaths.map {
+        try JSONDecoder().decode(
+            PPOEvaluationMetrics.self,
+            from: Data(contentsOf: URL(fileURLWithPath: $0)))
+    }
+    let aggregate = try PPOEvaluationAggregate.make(reports)
+    let aggregateEncoder = JSONEncoder()
+    aggregateEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let aggregateData = try aggregateEncoder.encode(aggregate)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try aggregateData.write(to: url, options: .atomic)
+    }
+    print(String(decoding: aggregateData, as: UTF8.self))
+    if !aggregate.publishable { exit(2) }
+
+case "aggregate-checkpoint-rl":
+    let raw = Array(args.dropFirst())
+    let o = parseOptions(raw)
+    var reportPaths = [String]()
+    var index = 0
+    while index < raw.count {
+        if raw[index] == "--output" {
+            index += 2
+        } else {
+            reportPaths.append(raw[index])
+            index += 1
+        }
+    }
+    guard !reportPaths.isEmpty else {
+        fail("usage: avbd aggregate-checkpoint-rl <report.json...> "
+            + "[--output summary.json]")
+    }
+    let reports = try reportPaths.map {
+        try JSONDecoder().decode(
+            PPOEvaluationMetrics.self,
+            from: Data(contentsOf: URL(fileURLWithPath: $0)))
+    }
+    let aggregate = try PPOCheckpointEvaluationAggregate.make(reports)
+    let aggregateEncoder = JSONEncoder()
+    aggregateEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let aggregateData = try aggregateEncoder.encode(aggregate)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try aggregateData.write(to: url, options: .atomic)
+    }
+    print(String(decoding: aggregateData, as: UTF8.self))
+    if !aggregate.robustAcrossEvaluationSeeds { exit(2) }
 
 case "run":
     guard args.count > 1 else { fail("usage: avbd run <demo>") }

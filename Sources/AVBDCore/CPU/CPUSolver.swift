@@ -27,18 +27,22 @@ public final class CPURigid {
     public var mass: Float
     public var moment: F3
     public var friction: Float
+    public var dynamicFriction: Float
     public var radius: Float
     public var shape: BodyShape
     public var isParticle = false
     public var forces: [CPUForce] = []
     public let index: Int
 
-    public init(index: Int, size: F3, density: Float, friction: Float, position: F3,
+    public init(index: Int, size: F3, density: Float, friction: Float,
+                dynamicFriction: Float? = nil, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
-                shape: BodyShape = .box) {
+                shape: BodyShape = .box, mass explicitMass: Float? = nil,
+                diagonalInertia: F3? = nil) {
         self.index = index
         self.size = size
         self.friction = friction
+        self.dynamicFriction = dynamicFriction ?? friction
         self.positionLin = position
         self.positionAng = rotation
         self.velocityLin = velocity
@@ -77,6 +81,10 @@ public final class CPURigid {
             let iPerp = m * (L * L / 12 + r * r / 4)
             self.moment = F3(iPerp, iPerp, iAxis)
             self.radius = L / 2 + r
+        }
+        if let explicitMass, let diagonalInertia {
+            self.mass = explicitMass
+            self.moment = diagonalInertia
         }
     }
 
@@ -118,6 +126,7 @@ public final class CPUSolver {
     public var betaAng: Float = 100.0
     public var gamma: Float = 0.999
     public var lambdaMax: Float = 1.0e6
+    public var frictionCombineMode: FrictionCombineMode = .geometricMean
 
     public private(set) var bodies: [CPURigid] = []
     public var forces: [CPUForce] = []
@@ -126,11 +135,17 @@ public final class CPUSolver {
     public init() {}
 
     @discardableResult
-    public func addBody(size: F3, density: Float, friction: Float, position: F3,
+    public func addBody(size: F3, density: Float, friction: Float,
+                        dynamicFriction: Float? = nil, position: F3,
                         rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
-                        shape: BodyShape = .box) -> CPURigid {
-        let b = CPURigid(index: bodies.count, size: size, density: density, friction: friction,
-                         position: position, rotation: rotation, velocity: velocity, shape: shape)
+                        shape: BodyShape = .box, mass: Float? = nil,
+                        diagonalInertia: F3? = nil) -> CPURigid {
+        let b = CPURigid(index: bodies.count, size: size, density: density,
+                         friction: friction,
+                         dynamicFriction: dynamicFriction,
+                         position: position, rotation: rotation, velocity: velocity,
+                         shape: shape, mass: mass,
+                         diagonalInertia: diagonalInertia)
         bodies.append(b)
         return b
     }
@@ -214,11 +229,14 @@ public final class CPUSolver {
             // Primal update (Gauss-Seidel over bodies on CPU)
             for body in bodies where body.mass > 0 {
                 var lhsLin = Mat3Rows.diagonal(F3(repeating: body.mass / (dt * dt)))
-                var lhsAng = Mat3Rows.diagonal(body.moment / (dt * dt))
+                let inertia = worldInertiaRows(body.positionAng, body.moment)
+                    * (1 / (dt * dt))
+                var lhsAng = inertia
                 var lhsCross = Mat3Rows()
 
                 var rhsLin = (body.positionLin - body.inertialLin) * (body.mass / (dt * dt))
-                var rhsAng = quatSub(body.positionAng, body.inertialAng) * (body.moment / (dt * dt))
+                var rhsAng = inertia.mul(
+                    quatSub(body.positionAng, body.inertialAng))
 
                 for force in body.forces {
                     force.updatePrimal(body, alpha, &lhsLin, &lhsAng, &lhsCross, &rhsLin, &rhsAng)

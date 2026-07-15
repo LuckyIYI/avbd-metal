@@ -10,32 +10,147 @@ public enum BodyShape: Equatable {
     case capsule    // size.x = cylinder length (along local z), size.y = radius
 }
 
+/// Contact-material coefficient combination. The legacy AVBD demos use the
+/// geometric mean; PhysX scenes can request their authored combine mode
+/// without pre-distorting either collider's material values.
+public enum FrictionCombineMode: UInt32, Equatable, Sendable {
+    case geometricMean = 0
+    case multiply = 1
+    case minimum = 2
+    case maximum = 3
+    case average = 4
+
+    public func combine(_ a: Float, _ b: Float) -> Float {
+        switch self {
+        case .geometricMean: return sqrt(max(a * b, 0))
+        case .multiply: return a * b
+        case .minimum: return min(a, b)
+        case .maximum: return max(a, b)
+        case .average: return 0.5 * (a + b)
+        }
+    }
+}
+
 public struct SceneBody {
     public var size: F3
     public var density: Float       // 0 = static
+    /// Static friction coefficient. `dynamicFriction` defaults to this value
+    /// for legacy scenes that author one Coulomb coefficient.
     public var friction: Float
+    public var dynamicFriction: Float
     public var position: F3
     public var rotation: Quat
     public var velocity: F3
     public var shape: BodyShape
+    /// Optional authoritative inertial properties in the body's local frame.
+    /// Importers use these instead of deriving mass and inertia from the
+    /// collision primitive's density. Both values must be supplied together.
+    public var mass: Float?
+    public var diagonalInertia: F3?
     /// 3-DOF particle (paper: vertices with M = mI, 3x3 blocks). Collides
     /// as a sphere of `size.x/2` (cloth/soft thickness) but carries no
     /// rotational state.
     public var isParticle: Bool = false
 
-    public init(size: F3, density: Float, friction: Float, position: F3,
+    public var isDynamic: Bool { (mass ?? (density > 0 ? 1 : 0)) > 0 }
+
+    public init(size: F3, density: Float, friction: Float,
+                dynamicFriction: Float? = nil, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
-                shape: BodyShape = .box) {
+                shape: BodyShape = .box, mass: Float? = nil,
+                diagonalInertia: F3? = nil) {
+        precondition((mass == nil) == (diagonalInertia == nil),
+                     "explicit mass and diagonal inertia must be supplied together")
+        if let mass, let diagonalInertia {
+            precondition(mass >= 0 && diagonalInertia.x >= 0
+                && diagonalInertia.y >= 0 && diagonalInertia.z >= 0,
+                "inertial properties must be nonnegative")
+            precondition(mass == 0 || (diagonalInertia.x > 0
+                && diagonalInertia.y > 0 && diagonalInertia.z > 0),
+                "dynamic bodies require positive principal inertia")
+        }
         switch shape {
         case .sphere: self.size = F3(repeating: size.x)
         default: self.size = size
         }
         self.density = density
         self.friction = friction
+        self.dynamicFriction = dynamicFriction ?? friction
         self.position = position
         self.rotation = rotation
         self.velocity = velocity
         self.shape = shape
+        self.mass = mass
+        self.diagonalInertia = diagonalInertia
+    }
+}
+
+/// A collision primitive rigidly attached to a `SceneBody`.
+///
+/// Keeping collision geometry separate from inertial bodies is required by
+/// real robot assets: one link can have several deliberately simplified
+/// contact shapes, while its mass and principal inertia come from the source
+/// MJCF/URDF instead of those shapes. `localPosition` and `localRotation` are
+/// expressed in the owning body's frame.
+public struct SceneCollider {
+    public var body: Int
+    public var size: F3
+    public var friction: Float
+    public var dynamicFriction: Float
+    public var localPosition: F3
+    public var localRotation: Quat
+    public var shape: BodyShape
+    /// Optional convex-hull vertices in the collider's centered local frame.
+    /// When non-empty they replace the analytic `shape` for collision while
+    /// `size` remains the local AABB extent used by broad phase/debug tools.
+    /// Keeping hull data on colliders (rather than inertial bodies) permits
+    /// exact imported robot contact geometry without changing link mass.
+    public var convexHullVertices: [F3]
+    /// Collision domain used by batched simulations. Group zero is shared
+    /// geometry; nonzero groups collide with shared geometry and themselves,
+    /// but never with a different nonzero group.
+    public var collisionGroup: UInt32
+    /// Whether this analytic primitive participates in broad-phase and
+    /// contact generation. Keeping this independent of `isRendered` lets
+    /// imported robot models retain their visual proxy geometry while a task
+    /// selects a reduced collision model (for example MuJoCo Playground's
+    /// feet-only H1 training scene).
+    public var collisionEnabled: Bool
+    /// Physics collision remains enabled when false; only analytic debug
+    /// rendering omits this primitive. Imported robot assets use this for
+    /// protective contact geoms that look misleading without the visual mesh.
+    public var isRendered: Bool
+    /// Preserve the legacy rotation-invariant contact anchor for a centered
+    /// standalone round body. Offset compound shapes use material/body-local
+    /// anchors so their centers rotate correctly with the link.
+    public var usesWorldSpaceRoundAnchor: Bool
+
+    public init(body: Int, size: F3, friction: Float,
+                dynamicFriction: Float? = nil,
+                localPosition: F3 = .zero,
+                localRotation: Quat = Quat(real: 1, imag: .zero),
+                shape: BodyShape = .box,
+                convexHullVertices: [F3] = [],
+                collisionGroup: UInt32 = 0,
+                collisionEnabled: Bool = true,
+                usesWorldSpaceRoundAnchor: Bool = false,
+                isRendered: Bool = true) {
+        precondition(body >= 0, "collider requires a valid body owner")
+        switch shape {
+        case .sphere: self.size = F3(repeating: size.x)
+        default: self.size = size
+        }
+        self.body = body
+        self.friction = friction
+        self.dynamicFriction = dynamicFriction ?? friction
+        self.localPosition = localPosition
+        self.localRotation = localRotation.normalized
+        self.shape = shape
+        self.convexHullVertices = convexHullVertices
+        self.collisionGroup = collisionGroup
+        self.collisionEnabled = collisionEnabled
+        self.isRendered = isRendered
+        self.usesWorldSpaceRoundAnchor = usesWorldSpaceRoundAnchor
     }
 }
 
@@ -58,6 +173,15 @@ public struct SceneJoint {
     /// with |lambda| bounded by motorTorque. 0 torque = no motor.
     public var motorTarget: Float
     public var motorTorque: Float
+    /// Fixed physical PD gains. A positive stiffness selects the fixed-gain
+    /// actuator; zero preserves the engine's legacy adaptive constraint
+    /// servo. Damping has units of torque per angular velocity.
+    public var motorStiffness: Float
+    public var motorDamping: Float
+    /// Reflected rotor/joint inertia about the hinge coordinate (kg m^2).
+    /// This is a joint-space mass term, distinct from damping and the two
+    /// links' spatial inertia.
+    public var armature: Float
     /// Continuous drive: the servo target ADVANCES at this rate (rad/s)
     /// every step — a velocity motor built on the bounded-torque servo
     /// (wheels, drums). 0 = positional servo only.
@@ -71,8 +195,12 @@ public struct SceneJoint {
                 stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
                 fracture: Float = .infinity, fractureLinear: Bool = false,
                 hingeAxis: F3? = nil, motorTarget: Float = 0,
-                motorTorque: Float = 0, motorRate: Float = 0,
+                motorTorque: Float = 0, motorStiffness: Float = 0,
+                motorDamping: Float = 0, armature: Float = 0,
+                motorRate: Float = 0,
                 limitLo: Float = 1, limitHi: Float = -1) {
+        precondition(motorStiffness >= 0 && motorDamping >= 0 && armature >= 0,
+                     "motor PD gains and armature must be nonnegative")
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
@@ -84,6 +212,9 @@ public struct SceneJoint {
         self.hingeAxis = hingeAxis.map(normalize)
         self.motorTarget = motorTarget
         self.motorTorque = motorTorque
+        self.motorStiffness = motorStiffness
+        self.motorDamping = motorDamping
+        self.armature = armature
         self.motorRate = motorRate
         self.limitLo = limitLo
         self.limitHi = limitHi
@@ -203,10 +334,25 @@ public struct SceneSpinner {
     }
 }
 
+/// A rigid-body pair that must not generate contacts. This complements the
+/// automatic exclusion of directly jointed and spring-connected bodies and
+/// maps directly to MJCF `<exclude>` entries.
+public struct SceneCollisionExclusion {
+    public var bodyA: Int
+    public var bodyB: Int
+
+    public init(bodyA: Int, bodyB: Int) {
+        precondition(bodyA >= 0 && bodyB >= 0 && bodyA != bodyB)
+        self.bodyA = bodyA
+        self.bodyB = bodyB
+    }
+}
+
 public struct SimSettings {
     public var dt: Float = 1.0 / 60.0
     public var gravity: Float = -10.0
     public var iterations: Int = 10
+    public var frictionCombineMode: FrictionCombineMode = .geometricMean
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note
     // calls the higher, unit-split betas "a minor upgrade from the paper");
@@ -236,6 +382,13 @@ public struct SimSettings {
     /// rigid-rig default distance of 30.
     public var cameraDistance: Float = 0
     public var cameraTargetZ: Float = 0
+    /// Optional scene-specific camera framing. NaN means that the renderer's
+    /// interactive default remains in charge. These values affect rendering
+    /// only; training scenes and physics never consume them.
+    public var cameraTargetX: Float = .nan
+    public var cameraTargetY: Float = .nan
+    public var cameraAzimuth: Float = .nan
+    public var cameraElevation: Float = .nan
     /// Cloth render thickness as a fraction of the contact radius.
     /// 0 (default) = flat sheets: one layer, no extrusion, no hem rims.
     /// 1 = extrude the full contact skin (layered cloth visually touches).
@@ -248,12 +401,14 @@ public struct SimSettings {
 public struct PhysicsScene {
     public var name: String
     public var bodies: [SceneBody] = []
+    public var colliders: [SceneCollider] = []
     public var joints: [SceneJoint] = []
     public var springs: [SceneSpring] = []
     public var tets: [SceneTet] = []
     public var tris: [SceneTri] = []
     public var skinnedMeshes: [SceneSkinnedMesh] = []
     public var spinners: [SceneSpinner] = []
+    public var collisionExclusions: [SceneCollisionExclusion] = []
     public var settings = SimSettings()
 
     public init(name: String) {
@@ -261,13 +416,94 @@ public struct PhysicsScene {
     }
 
     @discardableResult
-    public mutating func addBody(size: F3, density: Float, friction: Float, position: F3,
+    public mutating func addBody(size: F3, density: Float, friction: Float,
+                                 dynamicFriction: Float? = nil, position: F3,
                                  rotation: Quat = Quat(real: 1, imag: .zero),
-                                 velocity: F3 = .zero, shape: BodyShape = .box) -> Int {
+                                 velocity: F3 = .zero, shape: BodyShape = .box,
+                                 mass: Float? = nil,
+                                 diagonalInertia: F3? = nil,
+                                 collisionGroup: UInt32 = 0,
+                                 collisionEnabled: Bool = true) -> Int {
         bodies.append(SceneBody(size: size, density: density, friction: friction,
+                                dynamicFriction: dynamicFriction,
                                 position: position, rotation: rotation, velocity: velocity,
-                                shape: shape))
-        return bodies.count - 1
+                                shape: shape, mass: mass,
+                                diagonalInertia: diagonalInertia))
+        let body = bodies.count - 1
+        if collisionEnabled {
+            colliders.append(SceneCollider(
+                body: body, size: size, friction: friction,
+                dynamicFriction: dynamicFriction, shape: shape,
+                collisionGroup: collisionGroup,
+                usesWorldSpaceRoundAnchor: shape != .box))
+        }
+        return body
+    }
+
+    /// Attach an additional collision primitive without changing body mass or
+    /// inertia. Imported robot links normally call `addBody(...,
+    /// collisionEnabled: false)` and then add every source collision geom.
+    @discardableResult
+    public mutating func addCollider(body: Int, size: F3,
+                                     friction: Float? = nil,
+                                     dynamicFriction: Float? = nil,
+                                     localPosition: F3 = .zero,
+                                     localRotation: Quat = Quat(real: 1, imag: .zero),
+                                     shape: BodyShape = .box,
+                                     convexHullVertices: [F3] = [],
+                                     collisionGroup: UInt32 = 0,
+                                     collisionEnabled: Bool = true,
+                                     isRendered: Bool = true) -> Int {
+        precondition(bodies.indices.contains(body), "collider owner out of range")
+        colliders.append(SceneCollider(
+            body: body, size: size, friction: friction ?? bodies[body].friction,
+            dynamicFriction: dynamicFriction
+                ?? bodies[body].dynamicFriction,
+            localPosition: localPosition, localRotation: localRotation,
+            shape: shape, convexHullVertices: convexHullVertices,
+            collisionGroup: collisionGroup,
+            collisionEnabled: collisionEnabled,
+            usesWorldSpaceRoundAnchor: false,
+            isRendered: isRendered))
+        return colliders.count - 1
+    }
+
+    /// Attach an authored convex hull to a rigid body. `vertices` are in the
+    /// supplied collider frame and need not be centered; this method derives
+    /// a tight AABB and shifts the collider origin without changing geometry.
+    /// The current GPU narrow phase supports convex-vs-box contact, covering
+    /// robot hulls against flat/boxed terrain and box projectiles.
+    @discardableResult
+    public mutating func addConvexCollider(
+        body: Int, vertices: [F3], friction: Float? = nil,
+        dynamicFriction: Float? = nil,
+        localPosition: F3 = .zero,
+        localRotation: Quat = Quat(real: 1, imag: .zero),
+        collisionGroup: UInt32 = 0,
+        collisionEnabled: Bool = true,
+        isRendered: Bool = false
+    ) -> Int {
+        precondition(bodies.indices.contains(body), "collider owner out of range")
+        precondition(vertices.count >= 4 && vertices.count <= 64,
+                     "convex collider requires 4...64 cooked hull vertices")
+        var lo = F3(repeating: .greatestFiniteMagnitude)
+        var hi = F3(repeating: -.greatestFiniteMagnitude)
+        for vertex in vertices {
+            precondition(vertex.x.isFinite && vertex.y.isFinite && vertex.z.isFinite,
+                         "convex collider vertices must be finite")
+            lo = simd_min(lo, vertex)
+            hi = simd_max(hi, vertex)
+        }
+        let center = (lo + hi) * 0.5
+        let centered = vertices.map { $0 - center }
+        return addCollider(
+            body: body, size: hi - lo, friction: friction,
+            dynamicFriction: dynamicFriction,
+            localPosition: localPosition + localRotation.act(center),
+            localRotation: localRotation, shape: .box,
+            convexHullVertices: centered,
+            collisionGroup: collisionGroup,
+            collisionEnabled: collisionEnabled, isRendered: isRendered)
     }
 
     @discardableResult
@@ -297,6 +533,11 @@ public struct PhysicsScene {
 
     public mutating func addJoint(_ j: SceneJoint) { joints.append(j) }
     public mutating func addSpinner(_ sp: SceneSpinner) { spinners.append(sp) }
+    public mutating func addCollisionExclusion(bodyA: Int, bodyB: Int) {
+        precondition(bodies.indices.contains(bodyA) && bodies.indices.contains(bodyB),
+                     "collision exclusion body out of range")
+        collisionExclusions.append(.init(bodyA: bodyA, bodyB: bodyB))
+    }
 
     /// Adds an inert joint slot for interactive dragging (stiffness 0 keeps
     /// it disabled until GPUSolver.setDrag activates it). Returns its index.
@@ -318,7 +559,11 @@ public struct PhysicsScene {
                           velocity: velocity, shape: .sphere)
         b.isParticle = true
         bodies.append(b)
-        return bodies.count - 1
+        let body = bodies.count - 1
+        colliders.append(SceneCollider(
+            body: body, size: b.size, friction: friction, shape: .sphere,
+            usesWorldSpaceRoundAnchor: true))
+        return body
     }
 
     public mutating func addSpring(_ s: SceneSpring) { springs.append(s) }
@@ -337,11 +582,15 @@ public struct PhysicsScene {
         solver.betaAng = settings.betaAng
         solver.gamma = settings.gamma
         solver.lambdaMax = settings.lambdaMax
+        solver.frictionCombineMode = settings.frictionCombineMode
 
         for b in bodies {
-            let rb = solver.addBody(size: b.size, density: b.density, friction: b.friction,
+            let rb = solver.addBody(size: b.size, density: b.density,
+                                    friction: b.friction,
+                                    dynamicFriction: b.dynamicFriction,
                                     position: b.position, rotation: b.rotation,
-                                    velocity: b.velocity, shape: b.shape)
+                                    velocity: b.velocity, shape: b.shape,
+                                    mass: b.mass, diagonalInertia: b.diagonalInertia)
             rb.isParticle = b.isParticle
         }
         for j in joints {
