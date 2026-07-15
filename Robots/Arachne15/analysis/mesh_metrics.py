@@ -103,8 +103,8 @@ def main() -> None:
             "unique_printed_parts": len(parts),
             "total_printed_pieces": sum(spec["quantity"] for spec in ASSEMBLY.values()),
             "full_solid_mass_g": full_solid_mass_g,
-            "load_budget_rounded_up_g": 270.0,
-            "passes_load_budget": full_solid_mass_g <= 270.0,
+            "load_budget_rounded_up_g": 275.0,
+            "passes_load_budget": full_solid_mass_g <= 275.0,
         },
     }
     if not report["assembly"]["passes_load_budget"]:

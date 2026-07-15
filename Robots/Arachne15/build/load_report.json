@@ -4,14 +4,14 @@
   "mass_budget_g": {
     "iphone_15_pro": 187.0,
     "xc330_servos_16x": 368.0,
-    "printed_chassis_tray_links_feet_full_solid_upper_bound": 270.0,
+    "printed_chassis_dock_links_feet_full_solid_upper_bound": 275.0,
     "robotis_frames_horns_fasteners": 85.0,
     "2s_2200mah_battery": 135.0,
     "5v_20a_bec_and_distribution": 45.0,
     "wireless_ttl_bridge": 25.0,
     "wiring_padding_and_margin": 95.0
   },
-  "total_design_mass_g": 1210.0,
+  "total_design_mass_g": 1215.0,
   "actuator": {
     "model": "ROBOTIS XC330-M288-T",
     "stall_torque_nm_at_5v": 0.93,
@@ -24,62 +24,63 @@
     "horizontal_knee_moment_arm_mm": 44.37491748277344,
     "nominal_foot_positions_m": [
       [
-        -0.13829538110749068,
+        -0.14129538110749068,
         -0.12366302762311634
       ],
       [
-        -0.054278122803806325,
+        -0.05727812280380633,
         -0.15168341354584122
       ],
       [
-        0.05427812280380634,
+        0.05727812280380634,
         -0.1516834135458412
       ],
       [
-        0.13829538110749068,
+        0.14129538110749068,
         -0.12366302762311632
       ],
       [
-        -0.13829538110749068,
+        -0.14129538110749068,
         0.12366302762311634
       ],
       [
-        -0.054278122803806325,
+        -0.05727812280380633,
         0.15168341354584122
       ],
       [
-        0.05427812280380634,
+        0.05727812280380634,
         0.1516834135458412
       ],
       [
-        0.13829538110749068,
+        0.14129538110749068,
         0.12366302762311632
       ]
-    ]
+    ],
+    "minimum_dock_to_inner_hip_clearance_mm": 3.0
   },
   "load_cases": {
     "4": {
-      "per_leg_vertical_force_n": 2.966511625,
-      "dynamic_knee_torque_nm": 0.1974580628565947,
-      "safety_factor_at_20pct_stall": 0.9419721702379094,
+      "per_leg_vertical_force_n": 2.9787699375,
+      "dynamic_knee_torque_nm": 0.19827400526509303,
+      "safety_factor_at_20pct_stall": 0.9380957415538027,
       "passes": false
     },
     "5": {
-      "per_leg_vertical_force_n": 2.3732093,
-      "dynamic_knee_torque_nm": 0.15796645028527578,
-      "safety_factor_at_20pct_stall": 1.1774652127973866,
+      "per_leg_vertical_force_n": 2.38301595,
+      "dynamic_knee_torque_nm": 0.15861920421207443,
+      "safety_factor_at_20pct_stall": 1.1726196769422534,
       "passes": true
     },
     "6": {
-      "per_leg_vertical_force_n": 1.9776744166666667,
-      "dynamic_knee_torque_nm": 0.13163870857106313,
-      "safety_factor_at_20pct_stall": 1.412958255356864,
+      "per_leg_vertical_force_n": 1.985846625,
+      "dynamic_knee_torque_nm": 0.1321826701767287,
+      "safety_factor_at_20pct_stall": 1.407143612330704,
       "passes": true
     },
     "7": {
-      "per_leg_vertical_force_n": 1.6951494999999999,
-      "dynamic_knee_torque_nm": 0.11283317877519697,
-      "safety_factor_at_20pct_stall": 1.6484512979163415,
+      "per_leg_vertical_force_n": 1.70215425,
+      "dynamic_knee_torque_nm": 0.11329943158005318,
+      "safety_factor_at_20pct_stall": 1.6416675477191545,
       "passes": true
     }
   },
@@ -90,11 +91,11 @@
     "minimum_safety_factor": 1.15
   },
   "stability": {
-    "single_swing_min_origin_margin_mm": 96.18371527425236,
-    "single_swing_max_origin_margin_mm": 138.29538110749067,
+    "single_swing_min_origin_margin_mm": 99.053108696155,
+    "single_swing_max_origin_margin_mm": 141.29538110749067,
     "passes_origin_inside_support_polygon": true,
-    "estimated_center_of_mass_height_mm": 93.96537190082645,
-    "estimated_lateral_acceleration_to_tip_g": 1.0236080944346946,
+    "estimated_center_of_mass_height_mm": 88.1004938271605,
+    "estimated_lateral_acceleration_to_tip_g": 1.12431956273119,
     "note": "first-order rigid-body estimate; validate on a tethered prototype"
   },
   "power": {

@@ -24,7 +24,7 @@ servo_stall_torque_nm_5v = 0.93;
 frame_mount_spacing = 16.0;     // FPX330-S102 two-hole mounting pair
 horn_hub_clearance = 8.2;       // clears official 8 mm hub opening
 
-// Chassis and top-inserted portrait dock.  Robot forward is +X.  The phone's
+// Chassis and top-inserted landscape dock. Robot forward is +X. The phone's
 // rear cameras face +X and its screen faces -X.
 chassis_x = 178;
 chassis_y = 112;
@@ -34,18 +34,18 @@ chassis_window_x = 136;
 chassis_window_y = 58;
 
 dock_x = 24;
-dock_y = 84;
+dock_y = 160;
 dock_base_z = 8;
 dock_wall = 3;
-dock_guide_h = 94;
+dock_guide_h = 64;
 dock_phone_bottom_z = 2;
 phone_cavity_thickness = phone_body_z + 2 * phone_clearance;
-phone_cavity_width = phone_y + 2 * phone_clearance;
+phone_cavity_width = phone_x + 2 * phone_clearance;
 
 // Nominal flat-ground stance.
 body_floor_z = 76;
 hip_axis_z = 98;
-hip_xs = [-66, -22, 22, 66];
+hip_xs = [-69, -25, 25, 69];    // 3 mm clearance from landscape dock at inner hips
 hip_y = 63;
 coxa_length = 50;
 tibia_length = 105;
@@ -59,10 +59,10 @@ bec_size = [55, 30, 14];          // 5 V / 20 A-class BEC envelope
 
 assert(phone_cavity_thickness >= phone_body_z + 1.0,
        "phone thickness cavity needs at least 0.5 mm clearance per side");
-assert(phone_cavity_width >= phone_y + 1.0,
+assert(phone_cavity_width >= phone_x + 1.0,
        "phone cavity needs at least 0.5 mm clearance per side");
-assert(chassis_x >= dock_x + 40 && chassis_y >= dock_y + 20,
-       "dock leaves insufficient structural rail around phone");
+assert(chassis_x >= dock_x + 40 && chassis_y >= 100,
+       "dock mounting bridge leaves insufficient chassis structure");
 
 module rounded_prism(size = [10, 10, 2], r = 2) {
     x = size[0]; y = size[1]; z = size[2];
@@ -263,10 +263,10 @@ module leg_assembly(x, side, index) {
 
 module orient_phone(phone_bottom) {
     // Local Apple drawing axes: long X, short Y, thickness Z.  World axes:
-    // thickness -> +X, short side -> -Y, long side -> +Z.
+    // thickness -> +X, long side -> +Y, short side -> +Z (landscape).
     multmatrix([[0, 0, 1, -phone_body_z / 2],
-                [0, -1, 0, 0],
-                [1, 0, 0, phone_bottom],
+                [1, 0, 0, 0],
+                [0, 1, 0, phone_bottom + phone_y / 2],
                 [0, 0, 0, 1]]) children();
 }
 
@@ -284,8 +284,8 @@ module phone_visual() {
 }
 
 module camera_forward_visual() {
-    camera_z = body_floor_z + chassis_z + dock_phone_bottom_z + phone_x - 21;
-    camera_y = -phone_y / 2 + 18;
+    camera_z = body_floor_z + chassis_z + dock_phone_bottom_z + phone_y - 18;
+    camera_y = phone_x / 2 - 21;
     color([0.15, 0.55, 1.0, 0.65]) {
         beam_between([phone_body_z / 2 + camera_extra_z, camera_y, camera_z],
                      [72, camera_y, camera_z], 1.2, [0.15, 0.55, 1.0]);
@@ -324,7 +324,7 @@ module assembly() {
     for (side = [-1, 1])
         color([0.95, 0.62, 0.16])
             translate([-8, side * (phone_cavity_width / 2 + dock_wall),
-                       body_floor_z + chassis_z + 78])
+                       body_floor_z + chassis_z + dock_guide_h - 8])
                 rotate([90, 0, side > 0 ? 0 : 180]) retainer_clip();
 
     // Ground datum.
@@ -332,7 +332,7 @@ module assembly() {
         translate([0, 0, -1]) cube([430, 350, 1], center = true);
 }
 
-echo(str("Arachne-15 vertical dock cavity: ", phone_cavity_thickness,
+echo(str("Arachne-15 landscape dock cavity: ", phone_cavity_thickness,
          " thick x ", phone_cavity_width, " wide mm; bare phone: ", phone_x,
          " x ", phone_y, " x ", phone_body_z, " mm; rear camera faces +X"));
 echo(str("Nominal footprint approx 430 x 350 mm; chassis ground clearance ",

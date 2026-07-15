@@ -11,7 +11,7 @@ claims where possible.
 
 - Apple specifies the iPhone 15 Pro at **146.6 × 70.6 × 8.25 mm and 187 g**.
   Apple's accessory drawing also defines camera/sensor keep-outs. The central
-  portrait dock therefore points the rear cameras robot-forward, leaves both
+  landscape dock therefore points the rear cameras robot-forward, leaves both
   broad faces open, and models another 5.46 mm of camera-side clearance beyond
   the nominal 8.25 mm body.
 - The ROBOTIS XC330-M288-T is a plausible small leg actuator: **20 × 34 × 26
@@ -47,8 +47,8 @@ claims where possible.
 
 - No fabricated prototype has walked yet. The PASS report is a conservative
   analytical screen, not empirical proof.
-- Generated closed-mesh volume gives a 258.8 g full-solid PETG/TPU estimate;
-  the load budget rounds that up to 270 g. A slicer and physical scale still
+- Generated closed-mesh volume gives a 273.1 g full-solid PETG/TPU estimate;
+  the load budget rounds that up to 275 g. A slicer and physical scale still
   need to replace the density-only estimate.
 - Servo thermal behaviour, wiring voltage drop, joint backlash, foot friction,
   fatigue, shock loading, and phone retention require bench tests.

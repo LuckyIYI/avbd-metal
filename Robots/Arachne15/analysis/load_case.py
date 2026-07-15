@@ -19,7 +19,7 @@ G = 9.80665
 MASS_G = {
     "iphone_15_pro": 187.0,
     "xc330_servos_16x": 16 * 23.0,
-    "printed_chassis_tray_links_feet_full_solid_upper_bound": 270.0,
+    "printed_chassis_dock_links_feet_full_solid_upper_bound": 275.0,
     "robotis_frames_horns_fasteners": 85.0,
     "2s_2200mah_battery": 135.0,
     "5v_20a_bec_and_distribution": 45.0,
@@ -27,12 +27,12 @@ MASS_G = {
     "wiring_padding_and_margin": 95.0,
 }
 
-# Conservative component-centre heights for the vertical camera-forward phone
+# Conservative component-centre heights for the landscape camera-forward phone
 # layout. These are used only for a first-order level-floor tip-over check.
 MASS_Z_MM = {
-    "iphone_15_pro": 156.3,
+    "iphone_15_pro": 118.3,
     "xc330_servos_16x": 90.0,
-    "printed_chassis_tray_links_feet_full_solid_upper_bound": 90.0,
+    "printed_chassis_dock_links_feet_full_solid_upper_bound": 90.0,
     "robotis_frames_horns_fasteners": 90.0,
     "2s_2200mah_battery": 50.0,
     "5v_20a_bec_and_distribution": 55.0,
@@ -48,7 +48,7 @@ DYNAMIC_FACTOR = 1.50
 MIN_STANCE_LEGS = 5
 TARGET_MIN_SAFETY_FACTOR = 1.15
 
-HIP_XS_M = [-0.066, -0.022, 0.022, 0.066]
+HIP_XS_M = [-0.069, -0.025, 0.025, 0.069]
 HIP_Y_M = 0.063
 COXA_M = 0.050
 
@@ -147,6 +147,7 @@ def main() -> None:
             "tibia_pitch_deg_below_horizontal": TIBIA_PITCH_DEG,
             "horizontal_knee_moment_arm_mm": horizontal_arm * 1000,
             "nominal_foot_positions_m": feet,
+            "minimum_dock_to_inner_hip_clearance_mm": 3.0,
         },
         "load_cases": stance_cases,
         "required_gait": {

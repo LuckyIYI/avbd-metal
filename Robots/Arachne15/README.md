@@ -12,7 +12,7 @@ not yet been proven.
 | Item | Nominal dimension |
 |---|---:|
 | Bare iPhone 15 Pro | 146.60 × 70.60 × 8.25 mm; 187 g |
-| Vertical dock cavity | 9.45 mm thick × 71.80 mm wide |
+| Landscape dock cavity | 9.45 mm thick × 147.80 mm wide |
 | Chassis | 178 × 112 × 5 mm |
 | Body ground clearance | 76 mm |
 | Coxa axis spacing | 50 mm |
@@ -21,31 +21,34 @@ not yet been proven.
 | Approximate stance footprint | 430 × 350 mm |
 | Actuators | 16 × XC330-M288-T, 20 × 34 × 26 mm body |
 
-Robot forward is `+X`. The phone drops from above into a centred portrait dock:
+Robot forward is `+X`. The phone drops from above into a centred landscape dock:
 rear cameras face forward, the screen faces backward, and both broad faces stay
 open for vision, cooling, and access. Narrow end guides avoid the camera plateau;
 two TPU-backed wedges and a silicone safety strap retain the phone. The default
 0.60 mm-per-side fit is for a bare phone; measure and update the parameters
 before using any case.
 
+The two inner hip axes are shifted outward to ±25 mm, leaving 3 mm between the
+audited actuator envelope and the overhanging landscape dock.
+
 ## Can it carry the phone and walk?
 
-The current conservative analytical budget is 1.210 kg including the phone, 16
+The current conservative analytical budget is 1.215 kg including the phone, 16
 servos, battery, power electronics, brackets, fasteners, wiring, and margin.
-The generated meshes total about 259 g if printed completely solid; the load
-budget rounds this up to 270 g. At ROBOTIS's recommended general-use limit of
+The generated meshes total about 273 g if printed completely solid; the load
+budget rounds this up to 275 g. At ROBOTIS's recommended general-use limit of
 20% stall torque:
 
 - available design torque per knee: 0.186 N·m;
 - five-leg stance with 1.5× dynamic factor: about 0.158 N·m per knee;
-- safety factor: about 1.18;
-- seven-leg wave stance: about 1.65 safety factor;
+- safety factor: about 1.17;
+- seven-leg wave stance: about 1.64 safety factor;
 - four-leg dynamic stance: fails the design rule.
 
-With the phone vertical, the estimated whole-robot centre of mass is about 94
-mm above the floor. The worst seven-foot support polygon retains about 96 mm of
-horizontal margin, corresponding to a first-order lateral tip threshold of
-about 1.02 g. This is analytical, not a substitute for a tethered prototype.
+With the phone vertical in landscape, the estimated whole-robot centre of mass
+is 88.1 mm above the floor. The worst seven-foot support polygon retains 99.1
+mm of horizontal margin, corresponding to a first-order lateral tip threshold
+of 1.12 g. This remains analytical, not a substitute for a tethered prototype.
 
 Therefore the mechanism is *capable on paper* of slow, level-floor wave-gait
 walking while carrying the iPhone. It is not yet a walking prototype. Do not
