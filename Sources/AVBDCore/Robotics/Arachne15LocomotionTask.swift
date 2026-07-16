@@ -170,7 +170,7 @@ public final class Arachne15Env {
         // The legacy 1 cm rigid-world skin is thicker than the printable
         // 8 mm foot pad. A quarter-millimetre skin retains speculative
         // contact without letting the CAD settle visibly through the floor.
-        built.settings.rigidContactMargin = 0.00025
+        built.settings.collisionMargin = 0.00025
         built.settings.frictionCombineMode = .geometricMean
         built.settings.betaLin = 20_000
         built.settings.betaAng = 400
@@ -198,8 +198,8 @@ public final class Arachne15Env {
             let imported = try asset.instantiate(
                 in: &built,
                 defaultMotorGain: .init(stiffness: 2.0, damping: 0.08),
-                selfCollisions: false,
                 collisionGroup: UInt32(e + 1),
+                selfCollisions: false,
                 dynamicsScale: scale,
                 includeVisuals: numEnvironments <= 4)
             let bodies = asset.bodyNames.map { imported.bodiesByName[$0]! }

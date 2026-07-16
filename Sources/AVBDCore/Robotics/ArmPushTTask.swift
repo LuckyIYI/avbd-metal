@@ -17,9 +17,10 @@ public struct ArmPushTTaskConfig: Sendable {
     /// every motion and all contacts remain simulated.
     public var endEffectorDeltaActionScale: Float
     /// Physical actuator and reduced-arm parameters. These are serialized in
-    /// the task signature so a checkpoint cannot silently cross between the
-    /// legacy adaptive servo and the fixed-gain controller used by the
-    /// maintained Panda Push-T reference task.
+    /// the task signature so a checkpoint cannot silently cross actuator
+    /// plants used by the maintained Panda Push-T reference task.
+    public var linkLength1: Float
+    public var linkLength2: Float
     public var linkMass: Float
     public var tipMass: Float
     public var motorTorque: Float
@@ -132,6 +133,8 @@ public struct ArmPushTTaskConfig: Sendable {
                 autoReset: Bool = true,
                 jointDeltaActionScale: Float = 0.1,
                 endEffectorDeltaActionScale: Float = 0,
+                linkLength1: Float = ArmPushTEnv.linkLengths.x,
+                linkLength2: Float = ArmPushTEnv.linkLengths.y,
                 linkMass: Float = 2.7,
                 tipMass: Float = 0.75,
                 motorTorque: Float = 100,
@@ -183,6 +186,8 @@ public struct ArmPushTTaskConfig: Sendable {
         self.autoReset = autoReset
         self.jointDeltaActionScale = jointDeltaActionScale
         self.endEffectorDeltaActionScale = endEffectorDeltaActionScale
+        self.linkLength1 = linkLength1
+        self.linkLength2 = linkLength2
         self.linkMass = linkMass
         self.tipMass = tipMass
         self.motorTorque = motorTorque
@@ -264,11 +269,13 @@ public final class ArmPushTEnv {
     public static let jointRanges: [(Float, Float)] = [(-2.9, 2.9), (0.0, 3.05)]
     public static let defaultJointPositions: [Float] = [0, 0.15]
     public static let actionScales: [Float] = [2.8, 2.8]
-    /// The first prototype enlarged the workspace by 5x while retaining the
-    /// reference object's 0.8 kg mass. That made a visually large foam-density
-    /// T and destroyed dynamic similarity. Revision 12 uses real-scale task
-    /// geometry: the T is 20 x 5 x 4 cm, exactly as in ManiSkill PushT-v1.
-    public static let linkLengths: SIMD2<Float> = SIMD2(0.33, 0.31)
+    /// Real-scale T geometry requires the pusher to reach the object's far
+    /// face at the goal, not merely its centre. The original 0.64 m prototype
+    /// arm could not do so and made a subset of canonical resets physically
+    /// unrecoverable. These Panda-scale planar lengths retain the 20 x 5 x 4
+    /// cm ManiSkill PushT-v1 workpiece while providing explicit workspace
+    /// margin around every goal-face contact.
+    public static let linkLengths: SIMD2<Float> = SIMD2(0.42, 0.40)
     public static let basePosition = SIMD2<Float>(-0.40, 0)
     public static let goalPosition = SIMD2<Float>(0.17, 0.17)
     public static let blockBarSize = F3(0.20, 0.05, 0.04)
@@ -292,6 +299,7 @@ public final class ArmPushTEnv {
     public let blockSpawnRadius: Float
     public let blockSpawnYawRange: Float
     public let blockSpawnLateralBias: Float
+    public let configuredLinkLengths: SIMD2<Float>
     public let linkMass: Float
     public let tipMass: Float
     public let motorTorque: Float
@@ -308,6 +316,8 @@ public final class ArmPushTEnv {
                 blockSpawnRadius: Float = 0.07,
                 blockSpawnYawRange: Float = 0.35,
                 blockSpawnLateralBias: Float = 0,
+                linkLength1: Float = linkLengths.x,
+                linkLength2: Float = linkLengths.y,
                 linkMass: Float = 2.7,
                 tipMass: Float = 0.75,
                 motorTorque: Float = 100,
@@ -322,6 +332,7 @@ public final class ArmPushTEnv {
         precondition(blockSpawnRadius >= 0)
         precondition((0...Float.pi).contains(blockSpawnYawRange))
         precondition((-1...1).contains(blockSpawnLateralBias))
+        precondition(linkLength1 > 0 && linkLength2 > 0)
         precondition(linkMass > 0 && tipMass > 0 && blockMass > 0)
         precondition(motorTorque > 0 && motorStiffness > 0)
         precondition(motorDamping >= 0 && motorArmature >= 0)
@@ -331,6 +342,7 @@ public final class ArmPushTEnv {
         self.blockSpawnRadius = blockSpawnRadius
         self.blockSpawnYawRange = blockSpawnYawRange
         self.blockSpawnLateralBias = blockSpawnLateralBias
+        self.configuredLinkLengths = SIMD2(linkLength1, linkLength2)
         self.linkMass = linkMass
         self.tipMass = tipMass
         self.motorTorque = motorTorque
@@ -362,6 +374,7 @@ public final class ArmPushTEnv {
                 blockSpawnRadius: blockSpawnRadius,
                 blockSpawnYawRange: blockSpawnYawRange,
                 blockSpawnLateralBias: blockSpawnLateralBias,
+                linkLengths: configuredLinkLengths,
                 linkMass: linkMass, tipMass: tipMass,
                 motorTorque: motorTorque,
                 motorStiffness: motorStiffness,
@@ -400,6 +413,7 @@ public final class ArmPushTEnv {
                                  blockSpawnRadius: Float,
                                  blockSpawnYawRange: Float,
                                  blockSpawnLateralBias: Float,
+                                 linkLengths: SIMD2<Float>,
                                  linkMass: Float, tipMass: Float,
                                  motorTorque: Float,
                                  motorStiffness: Float,
@@ -412,7 +426,7 @@ public final class ArmPushTEnv {
         let baseCenter = c + F3(basePosition.x, basePosition.y, 0.056)
         let base = s.addBody(size: F3(0.064, 0.064, 0.112), density: 0,
                              friction: 0.8, position: baseCenter)
-        let lengths = [Self.linkLengths.x, Self.linkLengths.y]
+        let lengths = [linkLengths.x, linkLengths.y]
         var links = [Int]()
         var x = baseCenter.x
         for length in lengths {
@@ -553,6 +567,23 @@ public final class ArmPushTEnv {
     public static func normalizedJointTargets(
         tipTarget: SIMD2<Float>
     ) -> SIMD2<Float> {
+        normalizedJointTargets(tipTarget: tipTarget, linkLengths: linkLengths)
+    }
+
+    /// IK against this environment's signed workspace geometry. Controllers
+    /// must use the instance form so diagnostic overrides and serialized task
+    /// configurations cannot silently resolve targets with different links.
+    public func normalizedJointTargets(
+        tipTarget: SIMD2<Float>
+    ) -> SIMD2<Float> {
+        Self.normalizedJointTargets(
+            tipTarget: tipTarget, linkLengths: configuredLinkLengths)
+    }
+
+    public static func normalizedJointTargets(
+        tipTarget: SIMD2<Float>, linkLengths: SIMD2<Float>
+    ) -> SIMD2<Float> {
+        precondition(linkLengths.x > 0 && linkLengths.y > 0)
         let relative = tipTarget - basePosition
         let l1 = linkLengths.x, l2 = linkLengths.y
         let minimumReach = abs(l1 - l2) + 1e-4
@@ -776,22 +807,37 @@ public final class ArmPushTGeometricExpert {
     /// and applying an unintended impulse before the planned contact.
     private static let waypointTolerance: Float = 0.018
     private static let approachTolerance: Float = 0.012
+    private static let toolRadius: Float = 0.016
+    private static let barContactAnchors: [SIMD2<Float>] = [
+        SIMD2(-0.072, 0.025), SIMD2(-0.054, 0.025),
+        SIMD2(-0.036, 0.025), SIMD2(-0.018, 0.025),
+        SIMD2( 0.000, 0.025), SIMD2( 0.018, 0.025),
+        SIMD2( 0.036, 0.025), SIMD2( 0.054, 0.025),
+        SIMD2( 0.072, 0.025),
+    ]
 
     private let numEnvironments: Int
+    private let contactPreload: Float
     private var routeModes: [Int8]
     private var routePaths: [[SIMD2<Float>]]
     private var routeIndices: [Int]
     private var routeCenters: [SIMD2<Float>]
+    private var routeDirections: [SIMD2<Float>]
 
-    public init(numEnvironments: Int) {
+    public init(numEnvironments: Int, contactPreload: Float = 0.014) {
         precondition(numEnvironments > 0)
+        precondition(contactPreload > 0
+            && contactPreload < Self.toolRadius)
         self.numEnvironments = numEnvironments
+        self.contactPreload = contactPreload
         routeModes = [Int8](repeating: 0, count: numEnvironments)
         routePaths = [[SIMD2<Float>]](
             repeating: [], count: numEnvironments)
         routeIndices = [Int](repeating: 0, count: numEnvironments)
         routeCenters = [SIMD2<Float>](repeating: .zero,
                                       count: numEnvironments)
+        routeDirections = [SIMD2<Float>](repeating: .zero,
+                                         count: numEnvironments)
     }
 
     public func actions(
@@ -807,9 +853,13 @@ public final class ArmPushTGeometricExpert {
                 goal: environment.refs[e].goalPosition,
                 goalYaw: environment.refs[e].goalYaw)
             let delta = desired - states[e].tipPosition
+            let goalDistance = length(
+                environment.refs[e].goalPosition - states[e].blockPosition)
+            let maximumTargetStep: Float = goalDistance < 0.08 ? 0.035 : 0.10
             let target = states[e].tipPosition
-                + delta * min(1, 0.10 / max(length(delta), 1e-6))
-            let action = ArmPushTEnv.normalizedJointTargets(tipTarget: target)
+                + delta * min(
+                    1, maximumTargetStep / max(length(delta), 1e-6))
+            let action = environment.normalizedJointTargets(tipTarget: target)
             result[e * 2] = action.x
             result[e * 2 + 1] = action.y
         }
@@ -824,55 +874,88 @@ public final class ArmPushTGeometricExpert {
         yawError -= 2 * .pi * (yawError / (2 * .pi)).rounded()
         let block = state.blockPosition
         let tip = state.tipPosition
-        let keepsTranslation = routeModes[e] == 3 && abs(yawError) < 0.10
-        let rotates = !keepsTranslation && abs(yawError) > 0.035
+        let delta = goal - block
+        let goalDistance = length(delta)
+        if ArmPushTEnv.coverage(
+            blockPosition: block, blockYaw: state.blockYaw,
+            goalPosition: goal, goalYaw: goalYaw) > 0.92 {
+            return tip
+        }
+        let pushDirection = goalDistance > 1e-6
+            ? delta / goalDistance
+            : goal / max(length(goal), 1e-6)
+
+        // Correct initial yaw, retain a useful translation contact through
+        // the middle of the rollout, then tighten orientation only in the
+        // final goal neighbourhood. Each phase transition uses a collision-
+        // clear route instead of sliding a loaded pusher through the object.
+        let translationYawLimit: Float = goalDistance > 0.04 ? 0.14 : 0.055
+        let keepsTranslation = routeModes[e] == 3
+            && abs(yawError) < translationYawLimit
+        let rotates = !keepsTranslation && abs(yawError) > 0.025
         let mode: Int8 = rotates ? (yawError > 0 ? 1 : 2) : 3
 
-        let contact: SIMD2<Float>
-        let pushDirection: SIMD2<Float>
-        let standOff: Float
+        let u = SIMD2<Float>(cos(state.blockYaw), sin(state.blockYaw))
+        let v = SIMD2<Float>(-u.y, u.x)
+        let localCentreOfMass = SIMD2<Float>(0, -0.017857143)
+        let centreOfMass = block + v * localCentreOfMass.y
+        let contactSurface: SIMD2<Float>
         if rotates {
-            // Apply a tangential force at one end of the bar. The resulting
-            // moment has the opposite sign to the yaw error.
-            let u = SIMD2<Float>(cos(state.blockYaw), sin(state.blockYaw))
-            let v = SIMD2<Float>(-u.y, u.x)
-            let torqueSign: Float = yawError > 0 ? -1 : 1
-            let goalDirection = (goal - block)
-                / max(length(goal - block), 1e-6)
-            // Use the bar end nearest the rear translation contact. Either end
-            // can generate the requested moment when the force sign is paired
-            // with it, but this choice avoids a half-circle tool route after
-            // yaw alignment.
-            let endSign: Float = dot(u, -goalDirection) >= 0 ? 1 : -1
-            pushDirection = torqueSign * endSign * v
-            // Push the +u end from the face opposite the desired force. The
-            // old target used the bar centreline (local y=25 mm), which drove
-            // the 16 mm-radius tool through the bar before contact registered.
-            let forceAlongV = torqueSign * endSign
-            let surfaceY: Float = forceAlongV > 0 ? 0 : 0.050
-            let surface = block + u * (endSign * 0.082) + v * surfaceY
-            contact = surface - pushDirection * (0.016 - 0.015)
-            standOff = 0.050
-        } else {
-            let delta = goal - block
-            if length(delta) < 0.015 { return tip }
-            pushDirection = delta / max(length(delta), 1e-6)
-            let surface = Self.rearSurfacePoint(
+            let desiredMoment = simd_clamp(
+                -0.20 * yawError, -0.06, 0.06)
+            var bestSurface = Self.rearSurfacePoint(
                 block: block, yaw: state.blockYaw,
-                pushDirection: pushDirection)
-            contact = surface - pushDirection * (0.016 - 0.015)
-            standOff = 0.045
+                pushDirection: pushDirection,
+                localAnchor: Self.barContactAnchors[0])
+            var momentError = abs(Self.cross(
+                bestSurface - centreOfMass, pushDirection) - desiredMoment)
+            for anchor in Self.barContactAnchors.dropFirst() {
+                let surface = Self.rearSurfacePoint(
+                    block: block, yaw: state.blockYaw,
+                    pushDirection: pushDirection, localAnchor: anchor)
+                let candidateError = abs(Self.cross(
+                    surface - centreOfMass, pushDirection) - desiredMoment)
+                if candidateError < momentError {
+                    bestSurface = surface
+                    momentError = candidateError
+                }
+            }
+            contactSurface = bestSurface
+        } else {
+            // A ray through the compound body's actual area centroid produces
+            // zero moment by construction. Restricting this contact to the bar
+            // created a systematic residual torque during goal translation.
+            contactSurface = Self.rearSurfacePoint(
+                block: block, yaw: state.blockYaw,
+                pushDirection: pushDirection,
+                localAnchor: localCentreOfMass)
         }
+        // A deep preload is useful for overcoming static friction while far
+        // from the goal, but it becomes an impulse launcher during the final
+        // centimetres. Back it off with both pose error and outgoing object
+        // velocity; zero means tangent contact, never attraction or teleport.
+        let precisionPreload = min(
+            contactPreload, 0.002 + 0.10 * goalDistance)
+        let outgoingSpeed = max(0, dot(state.blockVelocity, pushDirection))
+        let effectivePreload = goalDistance < 0.08
+            ? max(0, precisionPreload - 0.04 * outgoingSpeed)
+            : contactPreload
+        let contact = contactSurface - pushDirection
+            * (Self.toolRadius - effectivePreload)
+        let standOff: Float = 0.045
 
         let approach = contact - pushDirection * standOff
         let centerMoved = length(routeCenters[e] - block) > 0.01
+        let contactSideChanged = dot(routeDirections[e], pushDirection) < 0.95
         if routeModes[e] != mode
+            || contactSideChanged
             || (routeIndices[e] < routePaths[e].count && centerMoved) {
             routeModes[e] = mode
             routePaths[e] = Self.collisionClearRoute(
                 from: tip, to: approach, around: block)
             routeIndices[e] = 0
             routeCenters[e] = block
+            routeDirections[e] = pushDirection
         }
         while routeIndices[e] < routePaths[e].count {
             let waypoint = routePaths[e][routeIndices[e]]
@@ -931,11 +1014,11 @@ public final class ArmPushTGeometricExpert {
     /// A short deterministic march is clearer and less error-prone here than
     /// special-casing the two touching rectangles' ray intervals.
     private static func rearSurfacePoint(
-        block: SIMD2<Float>, yaw: Float, pushDirection: SIMD2<Float>
+        block: SIMD2<Float>, yaw: Float, pushDirection: SIMD2<Float>,
+        localAnchor: SIMD2<Float> = SIMD2(0, -0.017857143)
     ) -> SIMD2<Float> {
         let u = SIMD2<Float>(cos(yaw), sin(yaw))
         let v = SIMD2<Float>(-u.y, u.x)
-        let centroid = SIMD2<Float>(0, -0.017857143)
         let localDirection = SIMD2(
             dot(pushDirection, u), dot(pushDirection, v))
         func inside(_ point: SIMD2<Float>) -> Bool {
@@ -948,20 +1031,26 @@ public final class ArmPushTGeometricExpert {
         var insideDistance: Float = 0
         var outsideDistance: Float = 0.002
         while outsideDistance <= 0.25,
-              inside(centroid - localDirection * outsideDistance) {
+              inside(localAnchor - localDirection * outsideDistance) {
             insideDistance = outsideDistance
             outsideDistance += 0.002
         }
         for _ in 0..<12 {
             let middle = (insideDistance + outsideDistance) * 0.5
-            if inside(centroid - localDirection * middle) {
+            if inside(localAnchor - localDirection * middle) {
                 insideDistance = middle
             } else {
                 outsideDistance = middle
             }
         }
-        let localSurface = centroid - localDirection * insideDistance
+        let localSurface = localAnchor - localDirection * insideDistance
         return block + u * localSurface.x + v * localSurface.y
+    }
+
+    private static func cross(
+        _ lhs: SIMD2<Float>, _ rhs: SIMD2<Float>
+    ) -> Float {
+        lhs.x * rhs.y - lhs.y * rhs.x
     }
 
 }
@@ -1063,6 +1152,8 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
               configuration.blockSpawnRadius >= 0,
               (0...Float.pi).contains(configuration.blockSpawnYawRange),
               (-1...1).contains(configuration.blockSpawnLateralBias),
+              configuration.linkLength1 > 0,
+              configuration.linkLength2 > 0,
               configuration.goalProgressWeight >= 0,
               configuration.reachProgressWeight >= 0,
               configuration.yawProgressWeight >= 0,
@@ -1108,6 +1199,8 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
             blockSpawnRadius: configuration.blockSpawnRadius,
             blockSpawnYawRange: configuration.blockSpawnYawRange,
             blockSpawnLateralBias: configuration.blockSpawnLateralBias,
+            linkLength1: configuration.linkLength1,
+            linkLength2: configuration.linkLength2,
             linkMass: configuration.linkMass,
             tipMass: configuration.tipMass,
             motorTorque: configuration.motorTorque,
@@ -1121,6 +1214,8 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
         self.configuration = configuration
         var configurationValues: [String: Float] = [
             "jointDeltaActionScale": configuration.jointDeltaActionScale,
+            "linkLength1": configuration.linkLength1,
+            "linkLength2": configuration.linkLength2,
             "linkMass": configuration.linkMass,
             "tipMass": configuration.tipMass,
             "motorTorque": configuration.motorTorque,
@@ -1198,7 +1293,10 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
                 configurationValues["freezeBasePolicyExpert"] = 1
             }
         }
-        let taskRevision = configuration.blockSpawnLateralBias != 0
+        // Changing workspace geometry invalidates both policy observations and
+        // joint-to-contact behavior. Offset the whole feature-revision family
+        // rather than pretending a revision-14/19 checkpoint is compatible.
+        let featureRevision = configuration.blockSpawnLateralBias != 0
             ? 22
             : (configuration.precisionGatedActor
                 && configuration.precisionExpertReleaseCoverage
@@ -1216,9 +1314,10 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
             ? 16
             : (configuration.pushContactCurriculumMaximumGoalDistance > 0
                 ? 15 : 14)))))))
+        let taskRevision = featureRevision + 100
         spec = RLTaskSpec(
             id: "arm-pusht-v0",
-            revision: taskRevision,
+            revision: RLPhysicsContract.fixedGainActuatorV2(taskRevision),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(name: "policy", shape: [19]),
             action: RLTensorSpec(
@@ -1283,7 +1382,7 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
                     currentPosition: previousTipPositions[e],
                     deltaActions: deltaAction,
                     deltaScale: configuration.endEffectorDeltaActionScale)
-                target = ArmPushTEnv.normalizedJointTargets(
+                target = environment.normalizedJointTargets(
                     tipTarget: tipTarget)
             } else {
                 target = ArmPushTEnv.normalizedJointTargets(

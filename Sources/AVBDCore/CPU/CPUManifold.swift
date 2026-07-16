@@ -49,7 +49,9 @@ public final class CPUManifold: CPUForce {
             bodyA.dynamicFriction, bodyB.dynamicFriction)
 
         var newContacts: [ContactPoint] = []
-        let count = Self.collide(bodyA, bodyB, &newContacts, &basis)
+        let count = Self.collide(
+            bodyA, bodyB, margin: solver.collisionMargin,
+            &newContacts, &basis)
 
         // Merge old contact data via feature keys (warm-start persistence).
         // Stick anchors are never restored for spheres: anchors rotate with

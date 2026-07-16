@@ -91,8 +91,8 @@ final class RLFrameworkTests: XCTestCase {
                         "arm-pusht-v0",
                         "humanoid-goal-v0",
                         "humanoid-isaac-flat-v0", "humanoid-isaac-goal-v0",
-                        "humanoid-velocity-v0",
-                        "humanoid-walk-v0", "pusht-state-v0"])
+                        "humanoid-velocity-v0", "humanoid-walk-v0",
+                        "maniskill-pusht-v1", "pusht-state-v0"])
         XCTAssertEqual(VectorRLAlgorithmRegistry.builtIn.algorithmIDs, ["ppo"])
 
         let task = try BuiltInRLTasks.registry.make(
@@ -137,7 +137,7 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(task.spec.controlStep, 0.02, accuracy: 1e-7)
         XCTAssertEqual(task.environment.scene.settings.iterations, 20)
         XCTAssertEqual(task.spec.configurationValues["solverIterations"], 20)
-        XCTAssertEqual(task.environment.scene.settings.rigidContactMargin,
+        XCTAssertEqual(task.environment.scene.settings.collisionMargin,
                        0.00025, accuracy: 1e-8)
         for key in [
             "massScaleLower", "massScaleUpper",
@@ -501,7 +501,8 @@ final class RLFrameworkTests: XCTestCase {
             "humanoid-walk-v0",
             configuration: RLTaskConfiguration(numEnvironments: 2, seed: 41))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 35)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(35))
         XCTAssertEqual(task.configuration.minimumCommandSpeed, 0.45)
         XCTAssertEqual(task.configuration.maximumCommandSpeed, 0.65)
         XCTAssertEqual(task.configuration.standingCommandProbability, 0)
@@ -541,7 +542,8 @@ final class RLFrameworkTests: XCTestCase {
                 numEnvironments: 4, seed: 44,
                 options: ["standingCommandProbability": 1]))
         let task = try XCTUnwrap(registered as? HumanoidVelocityTask)
-        XCTAssertEqual(task.spec.revision, 2)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(2))
         XCTAssertEqual(task.spec.observation.shape, [675])
         XCTAssertEqual(task.spec.action.shape, [19])
         XCTAssertEqual(task.spec.action.lowerBound, [Float](
@@ -682,7 +684,8 @@ final class RLFrameworkTests: XCTestCase {
                 options: ["observationNoise": 0]))
         let task = try XCTUnwrap(
             registered as? HumanoidIsaacVelocityTask)
-        XCTAssertEqual(task.spec.revision, 10)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(10))
         XCTAssertEqual(task.spec.observation.shape, [69])
         XCTAssertEqual(task.spec.action.shape, [19])
         XCTAssertEqual(task.spec.simulationStep, 0.005, accuracy: 1e-7)
@@ -788,6 +791,36 @@ final class RLFrameworkTests: XCTestCase {
             policy)
     }
 
+    func testExternalUnitreeH1PolicyRetainsVerifiedTenSecondTransfer() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let policyDirectory = repository.appendingPathComponent(
+            "checkpoints/external/unitree-h1").path
+        guard FileManager.default.fileExists(
+            atPath: policyDirectory + "/policy.safetensors"),
+              FileManager.default.fileExists(
+                atPath: policyDirectory + "/manifest.json") else {
+            throw XCTSkip("external Unitree H1 checkpoint is not installed")
+        }
+
+        let session = try UnitreeH1Sim2SimSession(
+            policyDirectory: policyDirectory,
+            command: SIMD3<Float>(0.5, 0, 0))
+        let report = try session.run(controlSteps: 500)
+
+        XCTAssertEqual(report.checkpointSHA256,
+            "44a0fbceb81f3877833ae9a398d039bea1759cb0d3c8188181013885f70589eb")
+        XCTAssertTrue(report.policyVerification.passed)
+        XCTAssertTrue(report.finite)
+        XCTAssertFalse(report.fell)
+        XCTAssertTrue((3.9...4.15).contains(report.forwardDistanceMeters))
+        XCTAssertGreaterThan(report.minimumPelvisHeightMeters, 0.96)
+        XCTAssertGreaterThan(report.minimumUprightAlignment, 0.995)
+        XCTAssertLessThan(abs(report.lateralDistanceMeters), 0.25)
+    }
+
     func testRegisteredIsaacH1GoalTransfersFlatPolicyAndOwnsArrival()
         throws {
         let registered = try BuiltInRLTasks.registry.make(
@@ -804,7 +837,8 @@ final class RLFrameworkTests: XCTestCase {
         let task = try XCTUnwrap(
             registered as? HumanoidIsaacVelocityTask)
         XCTAssertEqual(task.spec.id, "humanoid-isaac-goal-v0")
-        XCTAssertEqual(task.spec.revision, 2)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(2))
         XCTAssertTrue(task.usesPointGoal)
         XCTAssertEqual(task.spec.observation.shape, [71])
         XCTAssertEqual(task.spec.action.shape, [19])
@@ -877,7 +911,8 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(
             registered as? HumanoidIsaacVelocityTask)
-        XCTAssertEqual(task.spec.revision, 4)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(4))
         XCTAssertEqual(task.trainingProjectileProbability, 1)
         for e in 0..<2 {
             XCTAssertTrue(task.hasProjectile(environment: e))
@@ -986,7 +1021,8 @@ final class RLFrameworkTests: XCTestCase {
                     "standingCommandCurriculumControlSteps": 100,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 42)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(42))
         XCTAssertEqual(task.configuration.standingCommandProbability, 0.35)
         XCTAssertEqual(task.trainingStandingCommandProbability, 0.35)
         task.setTrainingMode(true)
@@ -1009,7 +1045,8 @@ final class RLFrameworkTests: XCTestCase {
                     "expertGateCommandSpeed": 0.45,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 44)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(44))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
         XCTAssertTrue(task.initializesPolicyExpertFromBaseOnTransfer)
@@ -1035,7 +1072,8 @@ final class RLFrameworkTests: XCTestCase {
             ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.id, "humanoid-goal-v0")
-        XCTAssertEqual(task.spec.revision, 10)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(10))
         XCTAssertTrue(task.usesPointGoal)
         XCTAssertEqual(task.spec.observation.shape, [630])
         let firstObservation = try task.reset(seed: 49)
@@ -1087,7 +1125,8 @@ final class RLFrameworkTests: XCTestCase {
                     "projectileProbability": 0,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 11)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(11))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertFalse(task.freezesBasePolicyExpert)
         var observation = try task.reset(seed: 49)
@@ -1108,7 +1147,8 @@ final class RLFrameworkTests: XCTestCase {
                     "projectileProbability": 0,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 14)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(14))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
         XCTAssertEqual(task.spec.configurationValues["freezeBasePolicyExpert"], 1)
@@ -1148,7 +1188,8 @@ final class RLFrameworkTests: XCTestCase {
                     "expertGateCommandSpeed": 0.4,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 444)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(444))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.usesPolicyStandExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
@@ -1413,7 +1454,8 @@ final class RLFrameworkTests: XCTestCase {
                     "projectileProbability": 0,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 18)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(18))
         XCTAssertEqual(task.spec.configurationValues["expertGateBlendWidth"], 0.2)
         var observation = try task.reset(seed: 53)
         let dimension = task.spec.observation.elementCount
@@ -2298,7 +2340,8 @@ final class RLFrameworkTests: XCTestCase {
                     "standStillFallPenalty": 20,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 45)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(45))
         XCTAssertEqual(task.configuration.standStillFallPenalty, 20)
         XCTAssertEqual(task.spec.configurationValues["standStillFallPenalty"], 20)
     }
@@ -2313,7 +2356,8 @@ final class RLFrameworkTests: XCTestCase {
                     "velocityTrackingErrorPenaltyWeight": 10,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
-        XCTAssertEqual(task.spec.revision, 2_435)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(2_435))
         XCTAssertEqual(task.spec.configurationValues[
             "velocityTrackingStandardDeviation"], 0.2)
         XCTAssertEqual(task.spec.configurationValues[
@@ -2545,10 +2589,17 @@ final class RLFrameworkTests: XCTestCase {
         let task = try ArmPushTTask(configuration: ArmPushTTaskConfig(
             numEnvironments: 3, seed: 13, maxEpisodeSteps: 8,
             controlDecimation: 1))
-        XCTAssertEqual(task.spec.revision, 14)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(114))
         XCTAssertEqual(task.spec.action.name, "joint_delta_position")
         XCTAssertEqual(task.configuration.jointDeltaActionScale, 0.1)
         XCTAssertEqual(task.configuration.endEffectorDeltaActionScale, 0)
+        XCTAssertEqual(task.configuration.linkLength1, 0.42)
+        XCTAssertEqual(task.configuration.linkLength2, 0.40)
+        XCTAssertEqual(task.environment.configuredLinkLengths,
+                       ArmPushTEnv.linkLengths)
+        XCTAssertEqual(task.spec.configurationValues["linkLength1"], 0.42)
+        XCTAssertEqual(task.spec.configurationValues["linkLength2"], 0.40)
         XCTAssertEqual(task.configuration.linkMass, 2.7)
         XCTAssertEqual(task.configuration.tipMass, 0.75)
         XCTAssertEqual(task.configuration.motorTorque, 100)
@@ -2698,6 +2749,26 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertTrue((-1...1).contains(action.y))
     }
 
+    func testArmPushTWorkspaceReachesEveryGoalFaceWithMargin() {
+        let localVertices: [SIMD2<Float>] = [
+            SIMD2(-0.10, 0), SIMD2(0.10, 0),
+            SIMD2(-0.10, 0.05), SIMD2(0.10, 0.05),
+            SIMD2(-0.025, -0.15), SIMD2(0.025, -0.15),
+        ]
+        let toolRadius: Float = 0.016
+        let requiredReach = localVertices.map {
+            simd_length(ArmPushTEnv.goalPosition + $0
+                - ArmPushTEnv.basePosition) + toolRadius
+        }.max()!
+        let availableReach = ArmPushTEnv.linkLengths.x
+            + ArmPushTEnv.linkLengths.y
+
+        XCTAssertGreaterThan(requiredReach, 0.64,
+            "the old arm could not reach the far goal face")
+        XCTAssertGreaterThanOrEqual(availableReach - requiredReach, 0.05,
+            "canonical goal-face contacts need recovery margin")
+    }
+
     func testArmPushTJointDeltaControllerUsesMeasuredPosition() {
         let current = SIMD2<Float>(0.6, 1.2)
         let target = ArmPushTEnv.normalizedJointTargets(
@@ -2725,7 +2796,8 @@ final class RLFrameworkTests: XCTestCase {
         let task = try ArmPushTTask(configuration: ArmPushTTaskConfig(
             numEnvironments: 1, maxEpisodeSteps: 32, controlDecimation: 1,
             endEffectorDeltaActionScale: 0.04))
-        XCTAssertEqual(task.spec.revision, 16)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(116))
         XCTAssertEqual(task.spec.action.name, "end_effector_delta_position")
         XCTAssertEqual(task.spec.configurationValues[
             "endEffectorDeltaActionScale"], 0.04)
@@ -2760,7 +2832,8 @@ final class RLFrameworkTests: XCTestCase {
             autoReset: false, endEffectorDeltaActionScale: 0.04,
             blockSpawnGoalBlend: 1, blockSpawnRadius: 0,
             blockSpawnYawRange: 0, continueAfterSuccess: true))
-        XCTAssertEqual(continuing.spec.revision, 17)
+        XCTAssertEqual(continuing.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(117))
         XCTAssertEqual(continuing.spec.configurationValues[
             "continueAfterSuccess"], 1)
         var result = RLStepBatch(spec: continuing.spec)
@@ -2787,7 +2860,8 @@ final class RLFrameworkTests: XCTestCase {
             autoReset: false, poseProgressRewardWeight: 100,
             poseRewardWeight: 0, reachingRewardWeight: 0,
             continueAfterSuccess: true))
-        XCTAssertEqual(task.spec.revision, 18)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(118))
         XCTAssertEqual(task.spec.configurationValues[
             "poseProgressRewardWeight"], 100)
         var result = RLStepBatch(spec: task.spec)
@@ -2802,7 +2876,8 @@ final class RLFrameworkTests: XCTestCase {
         let task = try ArmPushTTask(configuration: ArmPushTTaskConfig(
             numEnvironments: 1, maxEpisodeSteps: 4, controlDecimation: 1,
             autoReset: false, actionMagnitudePenaltyWeight: 0.05))
-        XCTAssertEqual(task.spec.revision, 19)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(119))
         XCTAssertEqual(task.spec.configurationValues[
             "actionMagnitudePenaltyWeight"], 0.05)
         var result = RLStepBatch(spec: task.spec)
@@ -2819,7 +2894,8 @@ final class RLFrameworkTests: XCTestCase {
             numEnvironments: 2, precisionGatedActor: true,
             precisionExpertGateCoverage: 0.75,
             freezeBasePolicyExpert: true))
-        XCTAssertEqual(task.spec.revision, 20)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(120))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
         XCTAssertEqual(task.spec.configurationValues[
@@ -2849,7 +2925,8 @@ final class RLFrameworkTests: XCTestCase {
             precisionExpertGateCoverage: 0.75,
             precisionExpertReleaseCoverage: 0.5,
             freezeBasePolicyExpert: true))
-        XCTAssertEqual(task.spec.revision, 21)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(121))
         XCTAssertEqual(task.spec.configurationValues[
             "precisionExpertReleaseCoverage"], 0.5)
 
@@ -2980,7 +3057,8 @@ final class RLFrameworkTests: XCTestCase {
         let absoluteTask = try? ArmPushTTask(configuration: ArmPushTTaskConfig(
             numEnvironments: 1,
             pushContactCurriculumMaximumGoalDistance: 0.04))
-        XCTAssertEqual(absoluteTask?.spec.revision, 15)
+        XCTAssertEqual(absoluteTask?.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(115))
         XCTAssertEqual(absoluteTask?.spec.configurationValues[
             "pushContactCurriculumMaximumGoalDistance"], 0.04)
     }
@@ -3151,7 +3229,8 @@ final class RLFrameworkTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(
                     bias * simd_dot(spawnOffset, lateral), -1e-5)
             }
-            XCTAssertEqual(task.spec.revision, 22)
+            XCTAssertEqual(task.spec.revision,
+                           RLPhysicsContract.fixedGainActuatorV2(122))
             XCTAssertEqual(
                 task.spec.configurationValues["blockSpawnLateralBias"], bias)
         }
@@ -3160,7 +3239,8 @@ final class RLFrameworkTests: XCTestCase {
             numEnvironments: 1, seed: 23, maxEpisodeSteps: 8,
             controlDecimation: 1))
         XCTAssertNil(canonical.spec.configurationValues["blockSpawnLateralBias"])
-        XCTAssertNotEqual(canonical.spec.revision, 22)
+        XCTAssertNotEqual(canonical.spec.revision,
+                          RLPhysicsContract.fixedGainActuatorV2(122))
     }
 
     func testArmPushTRepeatedResetReplaysIdenticalTrajectory() throws {
@@ -3268,6 +3348,27 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(measured, expected, accuracy: 1e-6)
         XCTAssertEqual(VectorPPOTrainer.weightedApproximateKL(
             logProbabilityDifferences: [20], weights: [0]), 0)
+    }
+
+    func testPPOKLStrategiesMatchReferenceSemantics() {
+        XCTAssertTrue(VectorPPOTrainer.shouldStopForKL(
+            minibatchKL: 0.100_001, targetKL: 0.1,
+            schedule: .earlyStop))
+        XCTAssertFalse(VectorPPOTrainer.shouldStopForKL(
+            minibatchKL: 0.100_001, targetKL: 0.1,
+            schedule: .adaptive))
+        XCTAssertTrue(VectorPPOTrainer.shouldStopForKL(
+            minibatchKL: 0.400_001, targetKL: 0.1,
+            schedule: .adaptive))
+        XCTAssertFalse(VectorPPOTrainer.shouldStopForKL(
+            minibatchKL: 1, targetKL: 0.1, schedule: .none))
+        XCTAssertFalse(VectorPPOTrainer.shouldStopForKL(
+            minibatchKL: 1, targetKL: 0, schedule: .earlyStop))
+
+        var historical = VectorPPOConfig()
+        XCTAssertEqual(historical.resolvedKLSchedule, .adaptive)
+        historical.klSchedule = .earlyStop
+        XCTAssertEqual(historical.resolvedKLSchedule, .earlyStop)
     }
 
     func testPPOFrozenActorRowsCannotDiluteRoutedExpertUpdates() {
@@ -3386,11 +3487,22 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(rescaledRewards.resumeIncompatibilities(
             with: checkpoint), ["rewardScale"])
 
+        XCTAssertEqual(checkpoint.resolvedOptimizerEpsilon, 1e-8)
+        var changedAdam = checkpoint
+        changedAdam.optimizerEpsilon = 1e-5
+        XCTAssertEqual(changedAdam.resumeIncompatibilities(
+            with: checkpoint), ["optimizerEpsilon"])
+
         var changedArchitecture = checkpoint
         changedArchitecture.hiddenDimensions = [128, 128, 128]
         changedArchitecture.actionDistribution = .gaussian
         XCTAssertEqual(Set(changedArchitecture.resumeIncompatibilities(
             with: checkpoint)), ["hiddenDimensions", "actionDistribution"])
+
+        var changedKLSemantics = checkpoint
+        changedKLSemantics.klSchedule = .earlyStop
+        XCTAssertEqual(changedKLSemantics.resumeIncompatibilities(
+            with: checkpoint), ["klSchedule"])
     }
 
     func testPPOResumePreservesInitializationProvenance() {
@@ -3445,7 +3557,8 @@ final class RLFrameworkTests: XCTestCase {
                     "maximumProjectileLaunchStep": 39,
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidIsaacVelocityTask)
-        XCTAssertEqual(task.spec.revision, 7)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(7))
         XCTAssertEqual(task.spec.observation.elementCount, 73)
         XCTAssertEqual(task.spec.configurationValues[
             "postImpactUprightRewardWeight"], 2)
@@ -3630,6 +3743,39 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(VectorPolicyCheckpointDiscovery.latestCompleteCheckpoint(
             inRunDirectory: run.path, task: "humanoid-walk-v0",
             taskRevision: 31)?.completedUpdates, 250)
+    }
+
+    func testResumeReconcilesMetricsLogToDurableCheckpoint() throws {
+        let manager = FileManager.default
+        let directory = manager.temporaryDirectory.appendingPathComponent(
+            "avbd-metrics-resume-\(UUID().uuidString)", isDirectory: true)
+        defer { try? manager.removeItem(at: directory) }
+        try manager.createDirectory(at: directory,
+                                    withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("metrics.jsonl")
+        let original = [
+            "{\"update\":0,\"marker\":\"durable-a\"}",
+            "{\"update\":1,\"marker\":\"durable-b\"}",
+            "{\"update\":2,\"marker\":\"uncommitted\"}",
+            "not-a-complete-json-row",
+            "{\"update\":1,\"marker\":\"duplicate\"}",
+        ].joined(separator: "\n")
+        try Data(original.utf8).write(to: url)
+
+        try VectorPPOTrainer.reconcileMetricsLog(
+            at: url, completedUpdates: 2)
+
+        let lines = try String(contentsOf: url, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines, [
+            "{\"update\":0,\"marker\":\"durable-a\"}",
+            "{\"update\":1,\"marker\":\"durable-b\"}",
+        ])
+
+        let missing = directory.appendingPathComponent("missing.jsonl")
+        try VectorPPOTrainer.reconcileMetricsLog(
+            at: missing, completedUpdates: 0)
+        XCTAssertEqual(try Data(contentsOf: missing), Data())
     }
 
     func testRunningObservationNormalization() {

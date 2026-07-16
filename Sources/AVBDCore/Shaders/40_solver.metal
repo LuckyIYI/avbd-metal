@@ -68,7 +68,7 @@ kernel void adj_count(
         if (joints[gid].header.z != 0) return;  // broken
         // inert (exclusion-only / inactive drag slots): nothing to stamp
         if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
-            && joints[gid].motor.w == 0.0f) return;
+            && joints[gid].motor.y == 0.0f) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
     } else if (gid < P.numJoints + P.numSprings) {
@@ -167,7 +167,7 @@ kernel void adj_scatter(
     if (gid < P.numJoints) {
         if (joints[gid].header.z != 0) return;
         if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
-            && joints[gid].motor.w == 0.0f) return;
+            && joints[gid].motor.y == 0.0f) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
         entry = (FK_JOINT << ADJ_KIND_SHIFT) | gid;
@@ -523,14 +523,34 @@ kernel void warmstart_joints(
         c0a = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
     }
     j.C0Ang = float4(c0a, j.C0Ang.w);
-    if (j.motor.w > 0.0f) {
-        if (j.limits.w > 0.0f) {
-            // Fixed PD has no augmented-Lagrangian warm start or adaptive
-            // gain. Its stiffness and damping remain physical scene data.
-            j.motor.z = 0.0f;
-        } else {
-            j.motor.z *= P.alpha * P.gamma;                     // lambda
-            j.motor.w = clamp(j.motor.w * P.gamma, 50.0f, 2.0e5f); // penalty
+    if (j.motor.y > 0.0f) {
+        // Motor gains are fixed physical scene data, never adaptive
+        // augmented-Lagrangian state.
+        j.motor.z = 0.0f;
+        j.dynamics.z = 0.0f;
+        if (motor_uses_explicit_effort(j.header.w)) {
+            // Evaluate one bounded effort from the state at the beginning of
+            // the physics step and hold it through the nonlinear solve.
+            float4 qAr = a == WORLD_BODY ? j.restRel
+                                         : q_mul(posAng[a], j.restRel);
+            float4 r = q_mul(q_inv(qAr), posAng[b]);
+            if (r.w < 0.0f) r = -r;
+            float twist = 2.0f * atan2(
+                dot(r.xyz, j.hingeAxis.xyz), r.w);
+            float3 axisW = q_rotate(posAng[b], j.hingeAxis.xyz);
+            float3 omegaA = a == WORLD_BODY ? float3(0)
+                                            : velAng[a].xyz;
+            float twistRate = dot(velAng[b].xyz - omegaA, axisW);
+            if (motor_uses_velocity_feedback(j.header.w)) {
+                j.dynamics.z = clamp(
+                    j.limits.z * (j.motor.x - twistRate),
+                    -j.motor.y, j.motor.y);
+            } else {
+                j.dynamics.z = clamp(
+                    j.motor.w * (j.motor.x - twist)
+                        - j.limits.z * twistRate,
+                    -j.motor.y, j.motor.y);
+            }
         }
     }
 
@@ -558,6 +578,7 @@ kernel void warmstart_bodies(
     device const uint* boundsBits   [[buffer(11)]],
     constant uint& doOgc            [[buffer(12)]],
     device const float4* shapeW     [[buffer(13)]],
+    device const float* gravityScale [[buffer(14)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -570,7 +591,8 @@ kernel void warmstart_bodies(
     float3 va = velAng[gid].xyz;
 
     float3 inertial = pl.xyz + vl * dt;
-    if (mass > 0.0f) inertial += float3(0, 0, P.gravity) * (dt * dt);
+    float bodyGravity = P.gravity * gravityScale[gid];
+    if (mass > 0.0f) inertial += float3(0, 0, bodyGravity) * (dt * dt);
     inertLin[gid] = float4(inertial, 0);
     inertAng[gid] = q_addw(pa, va * dt);
 
@@ -584,7 +606,7 @@ kernel void warmstart_bodies(
     initAng[gid] = pa;
     if (mass > 0.0f) {
         float3 guess = pl.xyz + vl * dt
-                     + float3(0, 0, P.gravity) * (accelWeight * dt * dt);
+                     + float3(0, 0, bodyGravity) * (accelWeight * dt * dt);
         // OGC anchor = the detection pose; the warmstart placement itself
         // is truncated within the bound (paper Eq 28) so the step STARTS
         // penetration-free — the in-loop refresh grants further budget
@@ -698,13 +720,10 @@ inline void stampJoint(device const JointGPU& j, uint self,
                 acc.lhsAng, m3_mulm(m3_mulm(JT, K), J));
             acc.rhsAng += m3_mul(JT, F);
 
-            // MOTOR (servo): drive the twist angle about the hinge axis
-            // toward the target, with bounded lambda = torque limit (the
-            // paper's bounded-multiplier machinery, like friction).
-            // A pure position spring oscillates — real actuators are
-            // damped, so add a dissipative term on the twist VELOCITY
-            // (measured against the start-of-step pose, implicit in dt).
-            if (j.motor.w > 0.0f || j.limits.x < j.limits.y) {
+            // MOTOR: fixed-gain position PD or velocity feedback with an
+            // authored effort bound. This is actuator physics, separate from
+            // the adaptive multipliers used by constraints and contacts.
+            if (j.motor.y > 0.0f || j.limits.x < j.limits.y) {
                 float4 r = q_mul(q_inv(q_mul(qA, j.restRel)), posAng[b]);
                 if (r.w < 0.0f) r = -r;
                 float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
@@ -739,34 +758,48 @@ inline void stampJoint(device const JointGPU& j, uint self,
                         acc.rhsAng += aB * (FL * sm);
                     }
                 }
-                if (j.motor.w <= 0.0f) { C = C; }
-                else {
-                float Cm = twist - j.motor.x;
-                // wrap to [-pi, pi]
-                Cm = Cm - 6.2831853f * floor((Cm + 3.14159265f) / 6.2831853f);
+                if (j.motor.y > 0.0f) {
+                    float sm = (self == a) ? -1.0f : 1.0f;
+                    float3 axW = aB;
+                    if (motor_uses_explicit_effort(j.header.w)) {
+                        // `dynamics.z` is positive child-axis torque. The VBD
+                        // residual uses the opposite force sign.
+                        acc.rhsAng += axW * (-j.dynamics.z * sm);
+                    } else {
+                        float Cm = twist - j.motor.x;
+                        Cm = Cm - 6.2831853f
+                            * floor((Cm + 3.14159265f) / 6.2831853f);
 
-                // twist at start of step (for the damping velocity)
-                float4 qA0 = (a == WORLD_BODY) ? float4(0,0,0,1) : initAng[a];
-                float4 r0 = q_mul(q_inv(q_mul(qA0, j.restRel)), initAng[b]);
-                if (r0.w < 0.0f) r0 = -r0;
-                float twist0 = 2.0f * atan2(dot(r0.xyz, j.hingeAxis.xyz), r0.w);
-                float dTwist = twist - twist0;
-                dTwist = dTwist - 6.2831853f * floor((dTwist + 3.14159265f) / 6.2831853f);
+                        // Position delta from the beginning of the step.
+                        // With kd in torque/(rad/s), its position-level
+                        // derivative is kd / dt.
+                        float4 qA0 = a == WORLD_BODY
+                            ? float4(0,0,0,1) : initAng[a];
+                        float4 r0 = q_mul(
+                            q_inv(q_mul(qA0, j.restRel)), initAng[b]);
+                        if (r0.w < 0.0f) r0 = -r0;
+                        float twist0 = 2.0f * atan2(
+                            dot(r0.xyz, j.hingeAxis.xyz), r0.w);
+                        float dTwist = twist - twist0;
+                        dTwist = dTwist - 6.2831853f
+                            * floor((dTwist + 3.14159265f) / 6.2831853f);
+                        float cD = j.limits.z / max(dt, 1e-6f);
+                        float rawEffort = j.motor.w * Cm + cD * dTwist;
+                        float effort = clamp(
+                            rawEffort, -j.motor.y, j.motor.y);
 
-                // For fixed PD, kd is stored in physical torque/(rad/s)
-                // units, so the position-level derivative is kd / dt. The
-                // legacy actuator retains its historical heuristic damping.
-                float cD = j.limits.w > 0.0f
-                    ? j.limits.z / max(dt, 1e-6f)
-                    : 0.30f * j.motor.w * dt * 60.0f;
-                float dual = j.limits.w > 0.0f ? 0.0f : j.motor.z;
-                float Fm = clamp(j.motor.w * Cm + dual + cD * dTwist,
-                                 -j.motor.y, j.motor.y);
-                float sm = (self == a) ? -1.0f : 1.0f;
-                float3 axW = aB;
-                acc.lhsAng = m3_add(acc.lhsAng,
-                                    m3_scale(m3_outer(axW, axW), j.motor.w + cD));
-                acc.rhsAng += axW * (Fm * sm);
+                        // The derivative of a saturated clamp is zero. Do
+                        // not retain an unsaturated spring Hessian at the
+                        // effort bound; doing so weakens the actuator and
+                        // makes its torque cap iteration-count dependent.
+                        if (fabs(rawEffort) < j.motor.y) {
+                            acc.lhsAng = m3_add(
+                                acc.lhsAng,
+                                m3_scale(m3_outer(axW, axW),
+                                         j.motor.w + cD));
+                        }
+                        acc.rhsAng += axW * (effort * sm);
+                    }
                 }
             }
         } else {
@@ -1591,21 +1624,6 @@ static inline void dual_joint_one(
             float3 aB = q_rotate(posAng[b], j.hingeAxis.xyz);
             float3 aA = q_rotate(q_mul(qA, j.restRel), j.hingeAxis.xyz);
             C = cross(aA, aB) * torqueArm;
-            if (j.motor.w > 0.0f) {
-                float4 qAr = a == WORLD_BODY ? j.restRel : q_mul(posAng[a], j.restRel);
-                float4 r = q_mul(q_inv(qAr), posAng[b]);
-                if (r.w < 0.0f) r = -r;
-                float twist = 2.0f * atan2(dot(r.xyz, j.hingeAxis.xyz), r.w);
-                float Cm = twist - j.motor.x;
-                Cm = Cm - 6.2831853f * floor((Cm + 3.14159265f) / 6.2831853f);
-                if (j.limits.w > 0.0f) {
-                    j.motor.z = 0.0f;
-                } else {
-                    j.motor.z = clamp(j.motor.w * Cm + j.motor.z,
-                                      -j.motor.y, j.motor.y);
-                    j.motor.w = min(j.motor.w + fabs(Cm) * P.betaAng, 2.0e5f);
-                }
-            }
         } else {
             C = q_sub(q_mul(qA, j.restRel), posAng[b]) * torqueArm;
         }
@@ -1958,6 +1976,7 @@ kernel void finalize_velocities(
     device float4* prevVelLin       [[buffer(6)]],
     constant SimParams& P           [[buffer(7)]],
     device const float4* shape      [[buffer(8)]],
+    device const float* gravityScale [[buffer(9)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -1972,7 +1991,8 @@ kernel void finalize_velocities(
         // bodies and rigids must fall at the same rate in gravity. Damp only
         // solver/contact/internal residual velocity relative to free fall.
         if (shape[gid].w < 0.0f && P.particleDamping > 0.0f) {
-            float3 ballistic = oldV + float3(0, 0, P.gravity) * P.dt;
+            float3 ballistic = oldV
+                + float3(0, 0, P.gravity * gravityScale[gid]) * P.dt;
             v = ballistic + (v - ballistic) / (1.0f + P.particleDamping * P.dt);
         }
         velLin[gid] = float4(v, 0);
@@ -2053,7 +2073,7 @@ kernel void diag_error(
             float3 xB = sphB ? posLin[b].xyz + m.contacts[i].rB.xyz
                              : xform(posLin[b].xyz, posAng[b], m.contacts[i].rB.xyz);
             float pen = dot(m.basisN.xyz, xA - xB)
-                + P.rigidContactMargin;
+                + P.collisionMargin;
             err = max(err, max(0.0f, -pen));
         }
     } else {

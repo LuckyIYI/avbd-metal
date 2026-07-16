@@ -20,12 +20,33 @@ public enum PPOActionDistribution: String, Codable, Sendable {
     }
 }
 
+public enum PPOActivation: String, Codable, Sendable {
+    case elu
+    case tanh
+}
+
+/// How PPO responds when a minibatch leaves the requested KL trust region.
+/// Different reference implementations attach materially different semantics
+/// to the same `target_kl` flag, so this must be explicit experiment state.
+public enum PPOKLSchedule: String, Codable, Sendable {
+    /// RSL-RL style adaptive learning rate with a large emergency stop.
+    case adaptive
+    /// CleanRL/ManiSkill style: keep the configured rate and stop the update
+    /// as soon as one minibatch exceeds the target.
+    case earlyStop = "early-stop"
+    /// Record KL without changing the optimizer or number of epochs.
+    case none
+}
+
 public struct VectorPPOConfig: Codable, Sendable {
     public var updates: Int
     public var rolloutSteps: Int
     public var updateEpochs: Int
     public var minibatchSize: Int
     public var learningRate: Float
+    /// Adam denominator epsilon. Optional so historical checkpoints retain
+    /// the former 1e-8 default; ManiSkill's CleanRL baseline uses 1e-5.
+    public var optimizerEpsilon: Float?
     public var gamma: Float
     public var gaeLambda: Float
     /// Multiplier applied to task rewards before value targets and GAE. Nil
@@ -35,14 +56,28 @@ public struct VectorPPOConfig: Codable, Sendable {
     public var rewardScale: Float?
     public var policyClip: Float
     public var valueClip: Float
+    /// Nil preserves historical clipped value loss. ManiSkill's published
+    /// PPO baseline uses the ordinary, unclipped squared value error.
+    public var clipValueLoss: Bool?
     public var valueCoefficient: Float
     public var entropyCoefficient: Float
     public var maxGradientNorm: Float
     public var targetKL: Float
+    /// Optional for checkpoint compatibility; nil is the historical adaptive
+    /// schedule. Reference presets set their implementation's exact behavior.
+    public var klSchedule: PPOKLSchedule?
     public var hiddenSize: Int
     /// Exact three-layer actor/critic widths. Nil preserves AVBD's historical
     /// `[hiddenSize, max(hiddenSize/2,64), max(hiddenSize/4,64)]` topology.
     public var hiddenDimensions: [Int]?
+    /// Optional so historical checkpoints decode as AVBD's ELU network.
+    public var activation: PPOActivation?
+    /// Reproduce CleanRL/ManiSkill's orthogonal layer initialization when
+    /// requested. Nil/false preserves MLXNN defaults for old experiments.
+    public var orthogonalInitialization: Bool?
+    /// Gain for the orthogonally initialized actor output. ManiSkill uses
+    /// 0.01 * sqrt(2); nil resolves to that value when orthogonal init is on.
+    public var actorOutputGain: Float?
     /// Optional for backward-compatible decoding; nil means the historical
     /// squashed Gaussian policy.
     public var actionDistribution: PPOActionDistribution?
@@ -113,13 +148,19 @@ public struct VectorPPOConfig: Codable, Sendable {
 
     public init(updates: Int = 3_000, rolloutSteps: Int = 24,
                 updateEpochs: Int = 5, minibatchSize: Int = 1_024,
-                learningRate: Float = 3e-4, gamma: Float = 0.99,
+                learningRate: Float = 3e-4, optimizerEpsilon: Float? = nil,
+                gamma: Float = 0.99,
                 gaeLambda: Float = 0.95, rewardScale: Float? = nil,
                 policyClip: Float = 0.2,
-                valueClip: Float = 0.2, valueCoefficient: Float = 1,
+                valueClip: Float = 0.2, clipValueLoss: Bool? = true,
+                valueCoefficient: Float = 1,
                 entropyCoefficient: Float = 0.01, maxGradientNorm: Float = 1,
-                targetKL: Float = 0.01, hiddenSize: Int = 512,
+                targetKL: Float = 0.01, klSchedule: PPOKLSchedule? = nil,
+                hiddenSize: Int = 512,
                 hiddenDimensions: [Int]? = nil,
+                activation: PPOActivation? = nil,
+                orthogonalInitialization: Bool? = nil,
+                actorOutputGain: Float? = nil,
                 actionDistribution: PPOActionDistribution? = nil,
                 initialActionStd: Float = 1.0,
                 minimumActionStd: Float? = nil,
@@ -140,17 +181,23 @@ public struct VectorPPOConfig: Codable, Sendable {
         self.updateEpochs = updateEpochs
         self.minibatchSize = minibatchSize
         self.learningRate = learningRate
+        self.optimizerEpsilon = optimizerEpsilon
         self.gamma = gamma
         self.gaeLambda = gaeLambda
         self.rewardScale = rewardScale
         self.policyClip = policyClip
         self.valueClip = valueClip
+        self.clipValueLoss = clipValueLoss
         self.valueCoefficient = valueCoefficient
         self.entropyCoefficient = entropyCoefficient
         self.maxGradientNorm = maxGradientNorm
         self.targetKL = targetKL
+        self.klSchedule = klSchedule
         self.hiddenSize = hiddenSize
         self.hiddenDimensions = hiddenDimensions
+        self.activation = activation
+        self.orthogonalInitialization = orthogonalInitialization
+        self.actorOutputGain = actorOutputGain
         self.actionDistribution = actionDistribution
         self.initialActionStd = initialActionStd
         self.minimumActionStd = minimumActionStd
@@ -180,7 +227,8 @@ public struct VectorPPOConfig: Codable, Sendable {
             throw RLEnvironmentError.invalidConfiguration(
                 "PPO minibatch must be in 1...rollout batch (\(batchSize))")
         }
-        guard learningRate > 0, gamma > 0, gamma <= 1,
+        guard learningRate > 0, resolvedOptimizerEpsilon > 0,
+              resolvedOptimizerEpsilon.isFinite, gamma > 0, gamma <= 1,
               gaeLambda >= 0, gaeLambda <= 1 else {
             throw RLEnvironmentError.invalidConfiguration("invalid PPO optimizer/discount values")
         }
@@ -200,6 +248,12 @@ public struct VectorPPOConfig: Codable, Sendable {
                   hiddenDimensions.allSatisfy({ $0 > 0 }) else {
                 throw RLEnvironmentError.invalidConfiguration(
                     "PPO hidden dimensions must contain three positive widths")
+            }
+        }
+        if let actorOutputGain {
+            guard actorOutputGain > 0, actorOutputGain.isFinite else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "PPO actor output initialization gain must be finite and positive")
             }
         }
         if let minimumActionStd {
@@ -268,12 +322,16 @@ public struct VectorPPOConfig: Codable, Sendable {
         require("updateEpochs", updateEpochs, checkpoint.updateEpochs)
         require("minibatchSize", minibatchSize, checkpoint.minibatchSize)
         require("learningRate", learningRate, checkpoint.learningRate)
+        require("optimizerEpsilon", resolvedOptimizerEpsilon,
+                checkpoint.resolvedOptimizerEpsilon)
         require("gamma", gamma, checkpoint.gamma)
         require("gaeLambda", gaeLambda, checkpoint.gaeLambda)
         require("rewardScale", rewardScale ?? 1,
                 checkpoint.rewardScale ?? 1)
         require("policyClip", policyClip, checkpoint.policyClip)
         require("valueClip", valueClip, checkpoint.valueClip)
+        require("clipValueLoss", resolvedClipValueLoss,
+                checkpoint.resolvedClipValueLoss)
         require("valueCoefficient", valueCoefficient,
                 checkpoint.valueCoefficient)
         require("entropyCoefficient", entropyCoefficient,
@@ -281,9 +339,17 @@ public struct VectorPPOConfig: Codable, Sendable {
         require("maxGradientNorm", maxGradientNorm,
                 checkpoint.maxGradientNorm)
         require("targetKL", targetKL, checkpoint.targetKL)
+        require("klSchedule", resolvedKLSchedule,
+                checkpoint.resolvedKLSchedule)
         require("hiddenSize", hiddenSize, checkpoint.hiddenSize)
         require("hiddenDimensions", resolvedHiddenDimensions,
                 checkpoint.resolvedHiddenDimensions)
+        require("activation", resolvedActivation,
+                checkpoint.resolvedActivation)
+        require("orthogonalInitialization", resolvedOrthogonalInitialization,
+                checkpoint.resolvedOrthogonalInitialization)
+        require("actorOutputGain", resolvedActorOutputGain,
+                checkpoint.resolvedActorOutputGain)
         require("actionDistribution", resolvedActionDistribution,
                 checkpoint.resolvedActionDistribution)
         require("initialActionStd", initialActionStd,
@@ -340,6 +406,17 @@ public struct VectorPPOConfig: Codable, Sendable {
     public var resolvedActionDistribution: PPOActionDistribution {
         actionDistribution ?? .squashedGaussian
     }
+
+    public var resolvedActivation: PPOActivation { activation ?? .elu }
+    public var resolvedOrthogonalInitialization: Bool {
+        orthogonalInitialization == true
+    }
+    public var resolvedActorOutputGain: Float {
+        actorOutputGain ?? (0.01 * sqrt(2))
+    }
+    public var resolvedClipValueLoss: Bool { clipValueLoss != false }
+    public var resolvedOptimizerEpsilon: Float { optimizerEpsilon ?? 1e-8 }
+    public var resolvedKLSchedule: PPOKLSchedule { klSchedule ?? .adaptive }
 
     public var resolvedRewardScale: Float { rewardScale ?? 1 }
 }
@@ -503,6 +580,7 @@ public final class VectorActorCritic: Module {
     @ParameterInfo var logStandardDeviation: MLXArray
 
     public let actionDimension: Int
+    public let activation: PPOActivation
     // Version 5 adds an independent task-routed stand expert. Versions 3 and
     // 4 remain inference/transfer compatible: the loader clones an existing
     // actor into every missing branch, so expansion is behavior-identical.
@@ -511,8 +589,13 @@ public final class VectorActorCritic: Module {
 
     public init(observationDimension: Int, actionDimension: Int,
                 hiddenSize: Int = 512, hiddenDimensions: [Int]? = nil,
-                initialActionStd: Float = 1.0) {
+                initialActionStd: Float = 1.0,
+                activation: PPOActivation = .elu,
+                orthogonalInitialization: Bool = false,
+                actorOutputGain: Float = 0.01 * sqrt(2),
+                initializationSeed: UInt64 = 1) {
         self.actionDimension = actionDimension
+        self.activation = activation
         let dimensions = hiddenDimensions ?? [
             hiddenSize, max(hiddenSize / 2, 64), max(hiddenSize / 4, 64),
         ]
@@ -521,28 +604,71 @@ public final class VectorActorCritic: Module {
         let firstSize = dimensions[0]
         let middleSize = dimensions[1]
         let finalSize = dimensions[2]
-        actor1 = Linear(observationDimension, firstSize)
-        actor2 = Linear(firstSize, middleSize)
-        actor3 = Linear(middleSize, finalSize)
-        actorOutput = Linear(weight: MLXArray.zeros([actionDimension, finalSize]),
-                        bias: MLXArray.zeros([actionDimension]))
-        expertActor1 = Linear(observationDimension, firstSize)
-        expertActor2 = Linear(firstSize, middleSize)
-        expertActor3 = Linear(middleSize, finalSize)
-        expertActorOutput = Linear(
-            weight: MLXArray.zeros([actionDimension, finalSize]),
-            bias: MLXArray.zeros([actionDimension]))
-        standActor1 = Linear(observationDimension, firstSize)
-        standActor2 = Linear(firstSize, middleSize)
-        standActor3 = Linear(middleSize, finalSize)
-        standActorOutput = Linear(
-            weight: MLXArray.zeros([actionDimension, finalSize]),
-            bias: MLXArray.zeros([actionDimension]))
-        critic1 = Linear(observationDimension, firstSize)
-        critic2 = Linear(firstSize, middleSize)
-        critic3 = Linear(middleSize, finalSize)
-        criticOutput = Linear(weight: MLXArray.zeros([1, finalSize]),
-                         bias: MLXArray.zeros([1]))
+        if orthogonalInitialization {
+            var rng = SplitMix64(seed: initializationSeed)
+            let initializedActor1 = Self.orthogonalLinear(
+                input: observationDimension, output: firstSize,
+                gain: sqrt(2), rng: &rng)
+            let initializedActor2 = Self.orthogonalLinear(
+                input: firstSize, output: middleSize,
+                gain: sqrt(2), rng: &rng)
+            let initializedActor3 = Self.orthogonalLinear(
+                input: middleSize, output: finalSize,
+                gain: sqrt(2), rng: &rng)
+            let initializedActorOutput = Self.orthogonalLinear(
+                input: finalSize, output: actionDimension,
+                gain: actorOutputGain, rng: &rng)
+            actor1 = initializedActor1
+            actor2 = initializedActor2
+            actor3 = initializedActor3
+            actorOutput = initializedActorOutput
+            // Routed branches are dormant for ordinary tasks. Give them exact
+            // copies of the base actor so turning a gate on starts as a
+            // behavior-preserving operation rather than arbitrary routing.
+            expertActor1 = Self.clonedLinear(initializedActor1)
+            expertActor2 = Self.clonedLinear(initializedActor2)
+            expertActor3 = Self.clonedLinear(initializedActor3)
+            expertActorOutput = Self.clonedLinear(initializedActorOutput)
+            standActor1 = Self.clonedLinear(initializedActor1)
+            standActor2 = Self.clonedLinear(initializedActor2)
+            standActor3 = Self.clonedLinear(initializedActor3)
+            standActorOutput = Self.clonedLinear(initializedActorOutput)
+            critic1 = Self.orthogonalLinear(
+                input: observationDimension, output: firstSize,
+                gain: sqrt(2), rng: &rng)
+            critic2 = Self.orthogonalLinear(
+                input: firstSize, output: middleSize,
+                gain: sqrt(2), rng: &rng)
+            critic3 = Self.orthogonalLinear(
+                input: middleSize, output: finalSize,
+                gain: sqrt(2), rng: &rng)
+            criticOutput = Self.orthogonalLinear(
+                input: finalSize, output: 1,
+                gain: sqrt(2), rng: &rng)
+        } else {
+            actor1 = Linear(observationDimension, firstSize)
+            actor2 = Linear(firstSize, middleSize)
+            actor3 = Linear(middleSize, finalSize)
+            actorOutput = Linear(weight: MLXArray.zeros([actionDimension, finalSize]),
+                            bias: MLXArray.zeros([actionDimension]))
+            expertActor1 = Linear(observationDimension, firstSize)
+            expertActor2 = Linear(firstSize, middleSize)
+            expertActor3 = Linear(middleSize, finalSize)
+            expertActorOutput = Linear(
+                weight: MLXArray.zeros([actionDimension, finalSize]),
+                bias: MLXArray.zeros([actionDimension]))
+            standActor1 = Linear(observationDimension, firstSize)
+            standActor2 = Linear(firstSize, middleSize)
+            standActor3 = Linear(middleSize, finalSize)
+            standActorOutput = Linear(
+                weight: MLXArray.zeros([actionDimension, finalSize]),
+                bias: MLXArray.zeros([actionDimension]))
+            critic1 = Linear(observationDimension, firstSize)
+            critic2 = Linear(firstSize, middleSize)
+            critic3 = Linear(middleSize, finalSize)
+            criticOutput = Linear(weight: MLXArray.zeros([1, finalSize]),
+                             bias: MLXArray.zeros([1]))
+        }
         logStandardDeviation = MLXArray(
             [Float](repeating: log(initialActionStd), count: actionDimension))
     }
@@ -553,26 +679,92 @@ public final class VectorActorCritic: Module {
                         freezeBaseActor: Bool = false,
                         freezeExpertActor: Bool = false)
         -> (mean: MLXArray, value: MLXArray, logStandardDeviation: MLXArray) {
-        var baseMean = actorOutput(Self.stableELU(actor3(Self.stableELU(
-            actor2(Self.stableELU(actor1(observations)))))))
+        var baseMean = actorOutput(activate(actor3(activate(
+            actor2(activate(actor1(observations)))))))
         if freezeBaseActor { baseMean = stopGradient(baseMean) }
-        var expertMean = expertActorOutput(Self.stableELU(expertActor3(
-            Self.stableELU(expertActor2(Self.stableELU(
-                expertActor1(observations)))))))
+        var expertMean = expertActorOutput(activate(expertActor3(
+            activate(expertActor2(activate(expertActor1(observations)))))))
         if freezeExpertActor { expertMean = stopGradient(expertMean) }
-        let standMean = standActorOutput(Self.stableELU(standActor3(
-            Self.stableELU(standActor2(Self.stableELU(
-                standActor1(observations)))))))
+        let standMean = standActorOutput(activate(standActor3(
+            activate(standActor2(activate(standActor1(observations)))))))
         let expert = expertGate ?? MLXArray.zeros([observations.shape[0], 1])
         let stand = standExpertGate
             ?? MLXArray.zeros([observations.shape[0], 1])
         let mean = (1 - expert - stand) * baseMean
             + expert * expertMean + stand * standMean
-        let value = criticOutput(
-            Self.stableELU(critic3(Self.stableELU(
-                critic2(Self.stableELU(critic1(observations)))))))
-            .squeezed(axis: -1)
+        let criticHidden = activate(critic3(activate(
+            critic2(activate(critic1(observations))))))
+        let value = criticOutput(criticHidden).squeezed(axis: -1)
         return (mean, value, clip(logStandardDeviation, min: -5, max: 1))
+    }
+
+    private func activate(_ value: MLXArray) -> MLXArray {
+        switch activation {
+        case .elu: Self.stableELU(value)
+        case .tanh: MLX.tanh(value)
+        }
+    }
+
+    private static func clonedLinear(_ source: Linear) -> Linear {
+        Linear(weight: source.weight, bias: source.bias)
+    }
+
+    /// CPU-side modified Gram-Schmidt runs only once at model creation and
+    /// produces the same orthogonal-weight contract as the published CleanRL
+    /// baseline without adding a runtime dependency to the training graph.
+    private static func orthogonalLinear(
+        input: Int, output: Int, gain: Float,
+        rng: inout SplitMix64
+    ) -> Linear {
+        let vectorCount = min(input, output)
+        let vectorLength = max(input, output)
+        var basis = [[Float]]()
+        basis.reserveCapacity(vectorCount)
+        for _ in 0..<vectorCount {
+            var vector = [Float](repeating: 0, count: vectorLength)
+            var index = 0
+            while index < vectorLength {
+                let u1 = max(rng.nextFloat(), 1e-7)
+                let u2 = rng.nextFloat()
+                let radius = sqrt(-2 * log(u1))
+                vector[index] = radius * cos(2 * .pi * u2)
+                if index + 1 < vectorLength {
+                    vector[index + 1] = radius * sin(2 * .pi * u2)
+                }
+                index += 2
+            }
+            // Two passes keep the square 256x256 layers well conditioned.
+            for _ in 0..<2 {
+                for previous in basis {
+                    var projection: Float = 0
+                    for i in 0..<vectorLength {
+                        projection += vector[i] * previous[i]
+                    }
+                    for i in 0..<vectorLength {
+                        vector[i] -= projection * previous[i]
+                    }
+                }
+            }
+            let norm = sqrt(max(vector.reduce(0) { $0 + $1 * $1 }, 1e-12))
+            basis.append(vector.map { $0 / norm })
+        }
+        var weights = [Float](repeating: 0, count: output * input)
+        if output <= input {
+            for row in 0..<output {
+                for column in 0..<input {
+                    weights[row * input + column] = gain * basis[row][column]
+                }
+            }
+        } else {
+            for row in 0..<output {
+                for column in 0..<input {
+                    weights[row * input + column] = gain * basis[column][row]
+                }
+            }
+        }
+        return Linear(
+            weight: MLXArray(weights).reshaped([output, input]),
+            bias: MLXArray.zeros([output]))
     }
 
     /// Expand a legacy checkpoint by cloning existing actors into missing
@@ -1777,7 +1969,8 @@ public final class VectorPolicyRunner {
             actionDimension: metadata.actionDimension,
             hiddenSize: metadata.ppo.hiddenSize,
             hiddenDimensions: metadata.ppo.hiddenDimensions,
-            initialActionStd: metadata.ppo.initialActionStd)
+            initialActionStd: metadata.ppo.initialActionStd,
+            activation: metadata.ppo.resolvedActivation)
         let sourceWeights = try loadArrays(
             url: URL(fileURLWithPath: "\(checkpointDirectory)/policy.safetensors"))
         let weights = try VectorActorCritic.compatibleWeights(
@@ -1860,6 +2053,20 @@ public final class VectorPPOTrainer {
     /// its diagnostics finite without changing the ordinary PPO trust region
     /// (exp(+-20) is already far outside the configured 0.8...1.2 clip).
     static let maximumImportanceLogRatio: Float = 20
+
+    /// Host-side trust-region policy used by the training loop and regression
+    /// tests. Keeping the reference semantics here prevents presets from
+    /// silently sharing a numeric target while doing different updates.
+    static func shouldStopForKL(
+        minibatchKL: Float, targetKL: Float, schedule: PPOKLSchedule
+    ) -> Bool {
+        guard targetKL > 0, minibatchKL.isFinite else { return false }
+        switch schedule {
+        case .adaptive: return minibatchKL > 4 * targetKL
+        case .earlyStop: return minibatchKL > targetKL
+        case .none: return false
+        }
+    }
 
     public init(configuration: VectorPPOConfig = VectorPPOConfig()) {
         self.configuration = configuration
@@ -1957,6 +2164,42 @@ public final class VectorPPOTrainer {
         return (advantages.map { ($0 - mean) * scale }, mean, variance, scale)
     }
 
+    /// Make the append-only training log agree with the last durable
+    /// checkpoint before an exact resume. Metrics are emitted before a
+    /// checkpoint is saved, so an interrupt can legitimately leave rows for
+    /// updates whose policy and optimizer state were never committed. Keeping
+    /// those rows would create duplicate update numbers on the next resume and
+    /// make experiment selection ambiguous.
+    static func reconcileMetricsLog(
+        at url: URL, completedUpdates: Int
+    ) throws {
+        precondition(completedUpdates >= 0)
+        struct MetricIdentity: Decodable { var update: Int }
+
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            try Data().write(to: url, options: .atomic)
+            return
+        }
+        let original = try Data(contentsOf: url)
+        var reconciled = Data()
+        var previousUpdate = -1
+        for rawLine in original.split(separator: 0x0A,
+                                      omittingEmptySubsequences: true) {
+            let line = Data(rawLine)
+            guard let identity = try? JSONDecoder().decode(
+                    MetricIdentity.self, from: line),
+                  identity.update >= 0,
+                  identity.update < completedUpdates,
+                  identity.update > previousUpdate else { continue }
+            reconciled.append(line)
+            reconciled.append(0x0A)
+            previousUpdate = identity.update
+        }
+        if reconciled != original {
+            try reconciled.write(to: url, options: .atomic)
+        }
+    }
+
     public func train(task: any VectorizedRLTask, outputDirectory: String) throws {
         try train(task: task, outputDirectory: outputDirectory, resume: false)
     }
@@ -2020,14 +2263,6 @@ public final class VectorPPOTrainer {
         try FileManager.default.createDirectory(atPath: outputDirectory,
                                                 withIntermediateDirectories: true)
         let metricsURL = URL(fileURLWithPath: "\(outputDirectory)/metrics.jsonl")
-        if !resume {
-            _ = FileManager.default.createFile(atPath: metricsURL.path, contents: nil)
-        } else if !FileManager.default.fileExists(atPath: metricsURL.path) {
-            _ = FileManager.default.createFile(atPath: metricsURL.path, contents: nil)
-        }
-        let metricsFile = try FileHandle(forWritingTo: metricsURL)
-        if resume { try metricsFile.seekToEnd() }
-        defer { try? metricsFile.close() }
         MLXRandom.seed(configuration.seed)
         if usesSymmetryMirrorLoss {
             Swift.print("using task-provided actor mirror loss with coefficient "
@@ -2042,7 +2277,13 @@ public final class VectorPPOTrainer {
                                        hiddenSize: configuration.hiddenSize,
                                        hiddenDimensions:
                                            configuration.hiddenDimensions,
-                                       initialActionStd: configuration.initialActionStd)
+                                       initialActionStd: configuration.initialActionStd,
+                                       activation: configuration.resolvedActivation,
+                                       orthogonalInitialization: configuration
+                                           .resolvedOrthogonalInitialization,
+                                       actorOutputGain: configuration
+                                           .resolvedActorOutputGain,
+                                       initializationSeed: configuration.seed)
         var normalizer = RunningObservationNormalizer(dimension: obsDim)
         var startingUpdate = 0
         var totalSteps = 0
@@ -2305,7 +2546,8 @@ public final class VectorPPOTrainer {
                 actionDimension: actionDim,
                 hiddenSize: configuration.hiddenSize,
                 hiddenDimensions: configuration.hiddenDimensions,
-                initialActionStd: configuration.initialActionStd)
+                initialActionStd: configuration.initialActionStd,
+                activation: configuration.resolvedActivation)
             let weights: [String: MLXArray]
             if resume {
                 let url = URL(fileURLWithPath:
@@ -2331,7 +2573,9 @@ public final class VectorPPOTrainer {
         // Robotics PPO implementations (RSL-RL, Brax, CleanRL) use Adam
         // without decoupled weight decay. Bias correction matters most after
         // a fresh start or policy-only resume.
-        let optimizer = CheckpointableAdam(learningRate: configuration.learningRate)
+        let optimizer = CheckpointableAdam(
+            learningRate: configuration.learningRate,
+            epsilon: configuration.resolvedOptimizerEpsilon)
         var adaptiveLearningRate = restoredTrainingState?.adaptiveLearningRate
             ?? configuration.learningRate
         if resume {
@@ -2402,11 +2646,18 @@ public final class VectorPPOTrainer {
             let policyLoss = sum(
                 maximum(loss1, loss2) * actorTrainingWeights)
                 / actorTrainingDenominator
-            let clippedValue = oldValues + clip(out.value - oldValues,
-                                                min: -self.configuration.valueClip,
-                                                max: self.configuration.valueClip)
-            let valueLoss = 0.5 * mean(maximum((out.value - returns).square(),
-                                               (clippedValue - returns).square()))
+            let valueLoss: MLXArray
+            if self.configuration.resolvedClipValueLoss {
+                let clippedValue = oldValues + clip(
+                    out.value - oldValues,
+                    min: -self.configuration.valueClip,
+                    max: self.configuration.valueClip)
+                valueLoss = 0.5 * mean(maximum(
+                    (out.value - returns).square(),
+                    (clippedValue - returns).square()))
+            } else {
+                valueLoss = 0.5 * mean((out.value - returns).square())
+            }
             let entropy: MLXArray
             switch actionDistribution {
             case .gaussian:
@@ -2500,6 +2751,16 @@ public final class VectorPPOTrainer {
             return [total, policyLoss, valueLoss, entropy, approximateKL,
                     symmetryLoss, successImitationLoss, referencePolicyLoss]
         }
+
+        if resume {
+            try Self.reconcileMetricsLog(
+                at: metricsURL, completedUpdates: startingUpdate)
+        } else {
+            try Data().write(to: metricsURL, options: .atomic)
+        }
+        let metricsFile = try FileHandle(forWritingTo: metricsURL)
+        try metricsFile.seekToEnd()
+        defer { try? metricsFile.close() }
 
         for localUpdate in 0..<configuration.updates {
             let update = startingUpdate + localUpdate
@@ -2725,7 +2986,8 @@ public final class VectorPPOTrainer {
                 for (name, values) in stepResult.metrics
                     where name.hasPrefix("reward/")
                         || name.hasPrefix("penalty/")
-                        || name.hasPrefix("gait/") {
+                        || name.hasPrefix("gait/")
+                        || name.hasPrefix("task/") {
                     taskMetricSums[name, default: 0] += values.reduce(0, +)
                     taskMetricCounts[name, default: 0] += values.count
                 }
@@ -2948,16 +3210,17 @@ public final class VectorPPOTrainer {
                     lastReferencePolicyLoss = scalarLosses[7]
                     klSum += lastKL
                     klCount += 1
-                    // Adaptive scheduling handles ordinary KL drift; stop the
-                    // epoch only on a genuine trust-region overshoot.
-                    if configuration.targetKL > 0
-                        && lastKL > 4 * configuration.targetKL {
+                    if Self.shouldStopForKL(
+                        minibatchKL: lastKL,
+                        targetKL: configuration.targetKL,
+                        schedule: configuration.resolvedKLSchedule) {
                         break epochLoop
                     }
                 }
             }
             let meanKL = klCount > 0 ? klSum / Float(klCount) : 0
-            if configuration.targetKL > 0 {
+            if configuration.targetKL > 0
+                && configuration.resolvedKLSchedule == .adaptive {
                 if meanKL > 2 * configuration.targetKL {
                     // Keep the floor relative to the requested rate.  A
                     // hard 1e-5 floor used to *increase* carefully calibrated
@@ -3112,7 +3375,8 @@ public final class VectorPPOTrainer {
             actionDimension: metadata.actionDimension,
             hiddenSize: metadata.ppo.hiddenSize,
             hiddenDimensions: metadata.ppo.hiddenDimensions,
-            initialActionStd: metadata.ppo.initialActionStd)
+            initialActionStd: metadata.ppo.initialActionStd,
+            activation: metadata.ppo.resolvedActivation)
         let sourceWeights = try loadArrays(
             url: URL(fileURLWithPath: "\(checkpointDirectory)/policy.safetensors"))
         let weights = try VectorActorCritic.compatibleWeights(
@@ -3516,6 +3780,14 @@ public final class VectorPPOTrainer {
             metrics.taskMetrics["episode/alternating_steps"] ?? 0,
             metrics.taskMetrics["episode/single_support_fraction"] ?? 0,
             metrics.successRate * 100))
+        let liveTaskMetrics = metrics.taskMetrics
+            .filter { $0.key.hasPrefix("task/") }
+            .sorted { $0.key < $1.key }
+        if !liveTaskMetrics.isEmpty {
+            Swift.print("  " + liveTaskMetrics.map {
+                String(format: "%@ %.4f", $0.key, $0.value)
+            }.joined(separator: "  "))
+        }
     }
 }
 

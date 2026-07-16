@@ -28,6 +28,7 @@ public final class CPURigid {
     public var moment: F3
     public var friction: Float
     public var dynamicFriction: Float
+    public var gravityScale: Float
     public var radius: Float
     public var shape: BodyShape
     public var isParticle = false
@@ -38,11 +39,12 @@ public final class CPURigid {
                 dynamicFriction: Float? = nil, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
                 shape: BodyShape = .box, mass explicitMass: Float? = nil,
-                diagonalInertia: F3? = nil) {
+                diagonalInertia: F3? = nil, gravityScale: Float = 1) {
         self.index = index
         self.size = size
         self.friction = friction
         self.dynamicFriction = dynamicFriction ?? friction
+        self.gravityScale = gravityScale
         self.positionLin = position
         self.positionAng = rotation
         self.velocityLin = velocity
@@ -140,13 +142,15 @@ public final class CPUSolver {
                         dynamicFriction: Float? = nil, position: F3,
                         rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
                         shape: BodyShape = .box, mass: Float? = nil,
-                        diagonalInertia: F3? = nil) -> CPURigid {
+                        diagonalInertia: F3? = nil,
+                        gravityScale: Float = 1) -> CPURigid {
         let b = CPURigid(index: bodies.count, size: size, density: density,
                          friction: friction,
                          dynamicFriction: dynamicFriction,
                          position: position, rotation: rotation, velocity: velocity,
                          shape: shape, mass: mass,
-                         diagonalInertia: diagonalInertia)
+                         diagonalInertia: diagonalInertia,
+                         gravityScale: gravityScale)
         bodies.append(b)
         return b
     }
@@ -208,7 +212,8 @@ public final class CPUSolver {
         for body in bodies {
             body.inertialLin = body.positionLin + body.velocityLin * dt
             if body.mass > 0 {
-                body.inertialLin += F3(0, 0, gravity) * (dt * dt)
+                body.inertialLin += F3(0, 0, gravity * body.gravityScale)
+                    * (dt * dt)
             }
             body.inertialAng = quatAdd(body.positionAng, body.velocityAng * dt)
 
@@ -220,7 +225,9 @@ public final class CPUSolver {
             body.initialLin = body.positionLin
             body.initialAng = body.positionAng
             if body.mass > 0 {
-                body.positionLin += body.velocityLin * dt + F3(0, 0, gravity) * (accelWeight * dt * dt)
+                body.positionLin += body.velocityLin * dt
+                    + F3(0, 0, gravity * body.gravityScale)
+                    * (accelWeight * dt * dt)
                 body.positionAng = quatAdd(body.positionAng, body.velocityAng * dt)
             }
         }

@@ -47,6 +47,10 @@ public struct SceneBody {
     /// collision primitive's density. Both values must be supplied together.
     public var mass: Float?
     public var diagonalInertia: F3?
+    /// Multiplier applied to world gravity for this body. Articulated robot
+    /// controllers commonly balance passive forces by disabling gravity on
+    /// their links while manipulated objects retain ordinary gravity.
+    public var gravityScale: Float
     /// 3-DOF particle (paper: vertices with M = mI, 3x3 blocks). Collides
     /// as a sphere of `size.x/2` (cloth/soft thickness) but carries no
     /// rotational state.
@@ -58,7 +62,9 @@ public struct SceneBody {
                 dynamicFriction: Float? = nil, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
                 shape: BodyShape = .box, mass: Float? = nil,
-                diagonalInertia: F3? = nil) {
+                diagonalInertia: F3? = nil, gravityScale: Float = 1) {
+        precondition(gravityScale >= 0 && gravityScale.isFinite,
+                     "gravity scale must be finite and nonnegative")
         precondition((mass == nil) == (diagonalInertia == nil),
                      "explicit mass and diagonal inertia must be supplied together")
         if let mass, let diagonalInertia {
@@ -82,6 +88,7 @@ public struct SceneBody {
         self.shape = shape
         self.mass = mass
         self.diagonalInertia = diagonalInertia
+        self.gravityScale = gravityScale
     }
 }
 
@@ -154,6 +161,24 @@ public struct SceneCollider {
     }
 }
 
+/// How a powered hinge converts its command into bounded joint effort.
+///
+/// All modes have fixed, authored gains. Solver conditioning is never used
+/// as actuator state, so the plant remains stationary across timesteps,
+/// solver iteration counts, and episode resets.
+public enum JointMotorMode: Sendable, Equatable {
+    /// Position PD stamped implicitly into the position-level solve. This is
+    /// robust for stiff interactive mechanisms and larger timesteps.
+    case implicitPositionPD
+    /// Position PD evaluated once at the beginning of the physics step and
+    /// applied as a constant bounded torque, matching MuJoCo/Isaac control
+    /// loops and common robot low-level controllers.
+    case explicitTorquePD
+    /// Velocity feedback evaluated once per physics step:
+    /// `torque = kd * (targetVelocity - jointVelocity)`.
+    case velocity
+}
+
 public struct SceneJoint {
     public var bodyA: Int           // -1 = world
     public var bodyB: Int
@@ -169,23 +194,22 @@ public struct SceneJoint {
     /// Hinge axis in body B's LOCAL frame. When set, the angular constraint
     /// leaves rotation about this axis free (1-DOF revolute joint).
     public var hingeAxis: F3?
-    /// Servo motor on the hinge: drive the twist angle toward motorTarget
-    /// with |lambda| bounded by motorTorque. 0 torque = no motor.
+    /// Motor command. This is a target angle in the two position-PD modes
+    /// and a target angular velocity in velocity mode.
     public var motorTarget: Float
+    /// Absolute joint-effort limit. Zero disables the motor.
     public var motorTorque: Float
-    /// Fixed physical PD gains. A positive stiffness selects the fixed-gain
-    /// actuator; zero preserves the engine's legacy adaptive constraint
-    /// servo. Damping has units of torque per angular velocity.
+    /// Fixed physical gains. Position modes use both `motorStiffness` (kp)
+    /// and `motorDamping` (kd). Velocity mode requires zero stiffness and
+    /// uses `motorDamping` as its velocity gain. Damping has units of torque
+    /// per angular velocity in every mode.
     public var motorStiffness: Float
     public var motorDamping: Float
+    public var motorMode: JointMotorMode
     /// Reflected rotor/joint inertia about the hinge coordinate (kg m^2).
     /// This is a joint-space mass term, distinct from damping and the two
     /// links' spatial inertia.
     public var armature: Float
-    /// Continuous drive: the servo target ADVANCES at this rate (rad/s)
-    /// every step — a velocity motor built on the bounded-torque servo
-    /// (wheels, drums). 0 = positional servo only.
-    public var motorRate: Float
     /// Hinge twist limits (radians). lo < hi enables; real arms have them —
     /// without limits a decelerating arm can tumble over the top and wedge.
     public var limitLo: Float
@@ -196,11 +220,29 @@ public struct SceneJoint {
                 fracture: Float = .infinity, fractureLinear: Bool = false,
                 hingeAxis: F3? = nil, motorTarget: Float = 0,
                 motorTorque: Float = 0, motorStiffness: Float = 0,
-                motorDamping: Float = 0, armature: Float = 0,
-                motorRate: Float = 0,
+                motorDamping: Float = 0,
+                motorMode: JointMotorMode = .implicitPositionPD,
+                armature: Float = 0,
                 limitLo: Float = 1, limitHi: Float = -1) {
-        precondition(motorStiffness >= 0 && motorDamping >= 0 && armature >= 0,
-                     "motor PD gains and armature must be nonnegative")
+        precondition(motorTarget.isFinite && motorTorque.isFinite
+            && motorStiffness.isFinite && motorDamping.isFinite
+            && armature.isFinite,
+            "motor parameters and armature must be finite")
+        precondition(motorTorque >= 0 && motorStiffness >= 0
+            && motorDamping >= 0 && armature >= 0,
+            "motor parameters and armature must be nonnegative")
+        if motorTorque > 0 {
+            precondition(hingeAxis != nil,
+                         "a powered joint must define a hinge axis")
+            switch motorMode {
+            case .implicitPositionPD, .explicitTorquePD:
+                precondition(motorStiffness > 0,
+                             "position PD requires positive stiffness")
+            case .velocity:
+                precondition(motorStiffness == 0 && motorDamping > 0,
+                    "velocity control requires zero stiffness and positive damping")
+            }
+        }
         self.bodyA = bodyA
         self.bodyB = bodyB
         self.rA = rA
@@ -214,8 +256,8 @@ public struct SceneJoint {
         self.motorTorque = motorTorque
         self.motorStiffness = motorStiffness
         self.motorDamping = motorDamping
+        self.motorMode = motorMode
         self.armature = armature
-        self.motorRate = motorRate
         self.limitLo = limitLo
         self.limitHi = limitHi
     }
@@ -380,12 +422,12 @@ public struct SimSettings {
     public var dt: Float = 1.0 / 60.0
     public var gravity: Float = -10.0
     public var iterations: Int = 10
-    /// Rigid contact skin in metres. The historical 1 cm default remains for
-    /// metre-scale demos, while small robots must select a margin appropriate
-    /// to their thinnest contact feature. This is an equilibrium offset, not
-    /// merely a broad-phase tolerance: an oversized value visibly permits
-    /// geometry to settle below the surface.
-    public var rigidContactMargin: Float = 0.01
+    /// Normal contact slop/detection margin in scene length units. Legacy
+    /// meter-scale demos use 1 cm; centimeter-scale robotics tasks should use
+    /// a smaller value so thin workpieces do not rest deeply interpenetrated.
+    /// This is also the rigid-contact equilibrium skin, so an oversized value
+    /// visibly permits geometry to settle below the rendered surface.
+    public var collisionMargin: Float = 0.01
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note
@@ -457,13 +499,15 @@ public struct PhysicsScene {
                                  velocity: F3 = .zero, shape: BodyShape = .box,
                                  mass: Float? = nil,
                                  diagonalInertia: F3? = nil,
+                                 gravityScale: Float = 1,
                                  collisionGroup: UInt32 = 0,
                                  collisionEnabled: Bool = true) -> Int {
         bodies.append(SceneBody(size: size, density: density, friction: friction,
                                 dynamicFriction: dynamicFriction,
                                 position: position, rotation: rotation, velocity: velocity,
                                 shape: shape, mass: mass,
-                                diagonalInertia: diagonalInertia))
+                                diagonalInertia: diagonalInertia,
+                                gravityScale: gravityScale))
         let body = bodies.count - 1
         if collisionEnabled {
             colliders.append(SceneCollider(
@@ -620,12 +664,12 @@ public struct PhysicsScene {
         solver.dt = settings.dt
         solver.gravity = settings.gravity
         solver.iterations = settings.iterations
-        solver.collisionMargin = settings.rigidContactMargin
         solver.alpha = settings.alpha
         solver.betaLin = settings.betaLin
         solver.betaAng = settings.betaAng
         solver.gamma = settings.gamma
         solver.lambdaMax = settings.lambdaMax
+        solver.collisionMargin = max(settings.collisionMargin, 0)
         solver.frictionCombineMode = settings.frictionCombineMode
 
         for b in bodies {
@@ -634,7 +678,8 @@ public struct PhysicsScene {
                                     dynamicFriction: b.dynamicFriction,
                                     position: b.position, rotation: b.rotation,
                                     velocity: b.velocity, shape: b.shape,
-                                    mass: b.mass, diagonalInertia: b.diagonalInertia)
+                                    mass: b.mass, diagonalInertia: b.diagonalInertia,
+                                    gravityScale: b.gravityScale)
             rb.isParticle = b.isParticle
         }
         for j in joints {

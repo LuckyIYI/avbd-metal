@@ -1,0 +1,91 @@
+<mujoco model="panda_stick">
+  <!--
+    Derived from MuJoCo Menagerie's Apache-2.0 Franka Emika Panda and
+    ManiSkill's PandaStick URDF. Source mesh collisions are replaced by
+    conservative primitive proxies for AVBD's batched Metal contact path.
+  -->
+  <default>
+    <default class="panda">
+      <joint armature="0.1" damping="1" axis="0 0 1" range="-2.8973 2.8973"/>
+      <geom friction="0.3 0.3 0"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="link0" childclass="panda">
+      <inertial mass="0.629769" pos="-0.041018 -0.00014 0.049974"
+        quat="0.997866762 -0.009703265 0.064553490 0.000787011"
+        diaginertia="0.003130511 0.003879839 0.004304650"/>
+      <!-- AABB of ManiSkill's link0.stl collision mesh. The previous
+           capsule extended 7.5 cm through the table and 21.5 cm above the
+           source mesh, creating a permanent fixed-base contact. -->
+      <geom type="box" size="0.113 0.095 0.0701" pos="-0.0413 0 0.0701"/>
+      <body name="link1" pos="0 0 0.333">
+        <inertial mass="4.970684" pos="0.003875 0.002081 -0.04762"
+          quat="0.501217692 -0.493869538 -0.492246575 -0.512412933"
+          diaginertia="0.008524556 0.703435429 0.707137014"/>
+        <joint name="joint1"/>
+        <geom type="capsule" size="0.065 0.12" pos="0 0 -0.10"/>
+        <body name="link2" quat="1 -1 0 0">
+          <inertial mass="0.646926" pos="-0.003141 -0.02872 0.003495"
+            quat="0.205805094 -0.953457905 -0.032029993 0.218028362"
+            diaginertia="0.002734251 0.028300107 0.031032643"/>
+          <joint name="joint2" range="-1.7628 1.7628"/>
+          <geom type="capsule" size="0.055 0.13" pos="0 -0.13 0" quat="0.70710678 0.70710678 0 0"/>
+          <body name="link3" pos="0 -0.316 0" quat="1 1 0 0">
+            <inertial mass="3.228604" pos="0.027518 0.039252 -0.066502"
+              quat="0.503374860 0.290419819 0.493781781 -0.646876829"
+              diaginertia="0.001246354 0.041479257 0.041501388"/>
+            <joint name="joint3"/>
+            <geom type="capsule" size="0.06 0.15" pos="0.04 0.02 -0.10" quat="0.92387953 0 0.38268343 0"/>
+            <body name="link4" pos="0.0825 0 0" quat="1 1 0 0">
+              <inertial mass="3.587895" pos="-0.05317 0.104419 0.027454"
+                quat="0.004027581 0.528055825 0.753308644 -0.392003712"
+                diaginertia="0.010620083 0.028148276 0.034959640"/>
+              <joint name="joint4" range="-3.0718 -0.0698"/>
+              <geom type="capsule" size="0.055 0.16" pos="-0.04 0.16 0" quat="0.70710678 0.70710678 0 0"/>
+              <body name="link5" pos="-0.0825 0.384 0" quat="1 -1 0 0">
+                <inertial mass="1.225946" pos="-0.011953 0.041065 -0.038437"
+                  quat="0.108351802 0.748990079 -0.091104973 0.647281725"
+                  diaginertia="0.008034370 0.028853091 0.036762538"/>
+                <joint name="joint5"/>
+                <geom type="capsule" size="0.05 0.11" pos="0.02 0 -0.08" quat="0.92387953 0 0.38268343 0"/>
+                <body name="link6" quat="1 1 0 0">
+                  <inertial mass="1.666555" pos="0.060149 -0.014117 -0.010517"
+                    quat="0.983867678 -0.091781102 -0.144786625 -0.051161073"
+                    diaginertia="0.001597865 0.004310374 0.005842761"/>
+                  <joint name="joint6" range="-0.0175 3.7525"/>
+                  <geom type="capsule" size="0.045 0.09" pos="0.07 0 0" quat="0.70710678 0 0.70710678 0"/>
+                  <body name="link7" pos="0.088 0 0" quat="1 1 0 0">
+                    <inertial mass="0.735522" pos="0.010517 -0.004252 0.061597"
+                      quat="0.091860790 0.753986575 0.015908111 0.650240549"
+                      diaginertia="0.004518030 0.010105477 0.012734493"/>
+                    <joint name="joint7"/>
+                    <geom type="capsule" size="0.045 0.06" pos="0 0 0.07"/>
+                    <!-- ManiSkill uses a radius-8 mm, length-100 mm cylinder.
+                         AVBD's capsule includes its spherical caps, so its
+                         axial segment is 100 - 2*8 = 84 mm. This preserves
+                         the source collision envelope and puts the physical
+                         tip exactly at the published TCP. -->
+                    <geom name="stick" type="capsule" size="0.008 0.042"
+                      pos="0 0 0.207" friction="0.3 0.3 0"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="actuator1" joint="joint1" ctrlrange="-100 100"/>
+    <motor name="actuator2" joint="joint2" ctrlrange="-100 100"/>
+    <motor name="actuator3" joint="joint3" ctrlrange="-100 100"/>
+    <motor name="actuator4" joint="joint4" ctrlrange="-100 100"/>
+    <motor name="actuator5" joint="joint5" ctrlrange="-100 100"/>
+    <motor name="actuator6" joint="joint6" ctrlrange="-100 100"/>
+    <motor name="actuator7" joint="joint7" ctrlrange="-100 100"/>
+  </actuator>
+</mujoco>

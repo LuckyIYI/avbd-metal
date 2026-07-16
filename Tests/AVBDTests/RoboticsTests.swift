@@ -82,11 +82,94 @@ final class RoboticsTests: XCTestCase {
         XCTAssertLessThan(maxAngle - 0.8, 0.08)
     }
 
-    func testFixedPDTorqueLimitMatchesOneStepImpulse() throws {
-        var scene = PhysicsScene(name: "fixed-pd-effort-limit")
+    func testUnsaturatedPDMatchesImplicitAndExplicitAnalyticSteps() throws {
+        let initialVelocity: Float = 0.7
+        let target: Float = 0.4
+        let kp: Float = 20
+        let kd: Float = 3
+
+        func step(_ mode: JointMotorMode, dt: Float,
+                  iterations: Int) throws -> Float {
+            var scene = PhysicsScene(name: "pd-analytic-step")
+            scene.settings.dt = dt
+            scene.settings.gravity = 0
+            scene.settings.iterations = iterations
+            let link = scene.addBody(
+                size: F3(repeating: 0.2), density: 0, friction: 0,
+                position: .zero, mass: 1,
+                diagonalInertia: F3(repeating: 1),
+                collisionEnabled: false)
+            scene.addJoint(SceneJoint(
+                bodyA: -1, bodyB: link, rA: .zero, rB: .zero,
+                stiffnessLin: .infinity, stiffnessAng: .infinity,
+                hingeAxis: F3(0, 0, 1), motorTarget: target,
+                motorTorque: 100, motorStiffness: kp,
+                motorDamping: kd, motorMode: mode))
+            let gpu = try GPUSolver(scene: scene)
+            gpu.setBodyStates([.init(
+                body: link, position: .zero,
+                rotation: Quat(real: 1, imag: .zero),
+                angularVelocity: F3(0, 0, initialVelocity))])
+            gpu.step()
+            return gpu.bodyStates([link])[0].angularVelocity.z
+        }
+
+        for dt: Float in [0.01, 0.002] {
+            let implicitExpected = (initialVelocity + kp * dt * target)
+                / (1 + kd * dt + kp * dt * dt)
+            let explicitExpected = initialVelocity
+                + (kp * target - kd * initialVelocity) * dt
+            for iterations in [1, 12] {
+                XCTAssertEqual(
+                    try step(.implicitPositionPD, dt: dt,
+                             iterations: iterations),
+                    implicitExpected, accuracy: 4e-4)
+                XCTAssertEqual(
+                    try step(.explicitTorquePD, dt: dt,
+                             iterations: iterations),
+                    explicitExpected, accuracy: 4e-4)
+            }
+        }
+    }
+
+    func testPDTorqueLimitMatchesOneStepImpulseAcrossModesAndIterations() throws {
+        for mode in [JointMotorMode.implicitPositionPD, .explicitTorquePD] {
+            for iterations in [1, 2, 12] {
+                var scene = PhysicsScene(name: "pd-effort-limit")
+                scene.settings.dt = 0.005
+                scene.settings.gravity = 0
+                scene.settings.iterations = iterations
+                let link = scene.addBody(
+                    size: F3(repeating: 0.2), density: 0, friction: 0,
+                    position: .zero, mass: 1,
+                    diagonalInertia: F3(repeating: 1),
+                    collisionEnabled: false)
+                scene.addJoint(SceneJoint(
+                    bodyA: -1, bodyB: link, rA: .zero, rB: .zero,
+                    stiffnessLin: .infinity, stiffnessAng: .infinity,
+                    hingeAxis: F3(0, 0, 1), motorTarget: 1,
+                    motorTorque: 10, motorStiffness: 200,
+                    motorDamping: 5, motorMode: mode))
+                let gpu = try GPUSolver(scene: scene)
+
+                gpu.step()
+
+                // The request exceeds 10 Nm, so delta omega must be exactly
+                // tau * dt / I = 0.05 rad/s. The active clamp has zero
+                // derivative and therefore cannot depend on solver sweeps.
+                let state = gpu.bodyStates([link])[0]
+                XCTAssertEqual(
+                    state.angularVelocity.z, 0.05, accuracy: 3e-4,
+                    "mode=\(mode), iterations=\(iterations)")
+            }
+        }
+    }
+
+    func testVelocityMotorAppliesBoundedPhysicalEffort() throws {
+        var scene = PhysicsScene(name: "velocity-effort-limit")
         scene.settings.dt = 0.005
         scene.settings.gravity = 0
-        scene.settings.iterations = 12
+        scene.settings.iterations = 1
         let link = scene.addBody(
             size: F3(repeating: 0.2), density: 0, friction: 0,
             position: .zero, mass: 1,
@@ -94,38 +177,110 @@ final class RoboticsTests: XCTestCase {
         scene.addJoint(SceneJoint(
             bodyA: -1, bodyB: link, rA: .zero, rB: .zero,
             stiffnessLin: .infinity, stiffnessAng: .infinity,
-            hingeAxis: F3(0, 0, 1), motorTarget: 1, motorTorque: 10,
-            motorStiffness: 200, motorDamping: 5))
+            hingeAxis: F3(0, 0, 1), motorTarget: 4, motorTorque: 10,
+            motorDamping: 20, motorMode: .velocity))
         let gpu = try GPUSolver(scene: scene)
 
         gpu.step()
 
-        // The PD request is 200 Nm, so the 10 Nm effort cap is active. A
-        // constrained implicit drive at its active bound is a constant
-        // torque for this step: delta omega = tau * dt / I = 0.05 rad/s.
-        // Retaining the unsaturated spring Hessian would silently weaken the
-        // capped actuator, especially for H1's low-inertia ankle links.
-        let state = gpu.bodyStates([link])[0]
-        XCTAssertEqual(state.angularVelocity.z, 0.05, accuracy: 2e-4)
+        XCTAssertEqual(gpu.bodyStates([link])[0].angularVelocity.z,
+                       0.05, accuracy: 3e-4)
+        gpu.setMotorVelocity(0, radiansPerSecond: -4)
+        gpu.step()
+        XCTAssertEqual(gpu.bodyStates([link])[0].angularVelocity.z,
+                       0, accuracy: 6e-4)
     }
 
-    func testServoStepResponseNoOvershoot() throws {
-        var scene = PhysicsScene(name: "step")
-        scene.settings.iterations = 16
-        let link = scene.addBody(size: F3(1.0, 0.14, 0.14), density: 1.2, friction: 0.4,
-                                 position: F3(0.5, 0, 2))
-        scene.addJoint(SceneJoint(bodyA: -1, bodyB: link,
-                                  rA: F3(0, 0, 2), rB: F3(-0.5, 0, 0),
-                                  stiffnessLin: .infinity, stiffnessAng: .infinity,
-                                  hingeAxis: F3(0, 1, 0),
-                                  motorTarget: 0, motorTorque: 260))
-        let gpu = try GPUSolver(scene: scene)
-        for _ in 0..<60 { gpu.step() }
-        gpu.setMotorTarget(0, angle: 0.8)
-        var maxA: Float = -9
-        for _ in 0..<240 { gpu.step(); maxA = max(maxA, gpu.motorAngle(0)) }
-        XCTAssertEqual(gpu.motorAngle(0), 0.8, accuracy: 0.03)
-        XCTAssertLessThan(maxA - 0.8, 0.05, "damped servo must not overshoot")
+    func testVelocityMotorGainHasPhysicalUnitsAndIgnoresAngle() throws {
+        let initialVelocity: Float = 0.7
+        let targetVelocity: Float = 2
+        let kd: Float = 3
+
+        for dt: Float in [0.01, 0.002] {
+            let expected = initialVelocity
+                + kd * (targetVelocity - initialVelocity) * dt
+            for initialAngle: Float in [0, 1.2] {
+                for iterations in [1, 12] {
+                    var scene = PhysicsScene(name: "velocity-analytic-step")
+                    scene.settings.dt = dt
+                    scene.settings.gravity = 0
+                    scene.settings.iterations = iterations
+                    let link = scene.addBody(
+                        size: F3(repeating: 0.2), density: 0,
+                        friction: 0, position: .zero, mass: 1,
+                        diagonalInertia: F3(repeating: 1),
+                        collisionEnabled: false)
+                    scene.addJoint(SceneJoint(
+                        bodyA: -1, bodyB: link, rA: .zero, rB: .zero,
+                        stiffnessLin: .infinity,
+                        stiffnessAng: .infinity,
+                        hingeAxis: F3(0, 0, 1),
+                        motorTarget: targetVelocity, motorTorque: 100,
+                        motorDamping: kd, motorMode: .velocity))
+                    let gpu = try GPUSolver(scene: scene)
+                    gpu.setBodyStates([.init(
+                        body: link, position: .zero,
+                        rotation: Quat(
+                            angle: initialAngle, axis: F3(0, 0, 1)),
+                        angularVelocity: F3(0, 0, initialVelocity))])
+
+                    gpu.step()
+
+                    XCTAssertEqual(
+                        gpu.bodyStates([link])[0].angularVelocity.z,
+                        expected, accuracy: 4e-4,
+                        "dt=\(dt), angle=\(initialAngle), "
+                            + "iterations=\(iterations)")
+                }
+            }
+        }
+    }
+
+    func testMotorModesReplayIdenticallyAfterInPlaceReset() throws {
+        for mode in [JointMotorMode.implicitPositionPD,
+                     .explicitTorquePD, .velocity] {
+            var scene = PhysicsScene(name: "motor-reset-replay")
+            scene.settings.dt = 0.005
+            scene.settings.gravity = 0
+            scene.settings.iterations = 4
+            let link = scene.addBody(
+                size: F3(repeating: 0.2), density: 0, friction: 0,
+                position: .zero, mass: 1,
+                diagonalInertia: F3(repeating: 1),
+                collisionEnabled: false)
+            let velocityMode = mode == .velocity
+            scene.addJoint(SceneJoint(
+                bodyA: -1, bodyB: link, rA: .zero, rB: .zero,
+                stiffnessLin: .infinity, stiffnessAng: .infinity,
+                hingeAxis: F3(0, 0, 1),
+                motorTarget: velocityMode ? 1 : 0.4,
+                motorTorque: 100,
+                motorStiffness: velocityMode ? 0 : 20,
+                motorDamping: 3, motorMode: mode))
+            let gpu = try GPUSolver(scene: scene)
+            let initial = GPUSolver.BodyStateUpdate(
+                body: link, position: .zero,
+                rotation: Quat(angle: 0.1, axis: F3(0, 0, 1)),
+                angularVelocity: F3(0, 0, 0.3))
+
+            func rollout() -> [(angle: Float, velocity: Float)] {
+                (0..<30).map { _ in
+                    gpu.step()
+                    return gpu.motorStates([0])[0]
+                }
+            }
+
+            gpu.setBodyStates([initial])
+            let first = rollout()
+            gpu.setBodyStates([initial])
+            let second = rollout()
+            for (a, b) in zip(first, second) {
+                XCTAssertEqual(a.angle, b.angle, accuracy: 1e-6,
+                               "mode=\(mode)")
+                XCTAssertEqual(a.velocity, b.velocity, accuracy: 1e-6,
+                               "mode=\(mode)")
+            }
+        }
     }
 
     func testJointLimitsHold() throws {
@@ -138,6 +293,7 @@ final class RoboticsTests: XCTestCase {
                                   stiffnessLin: .infinity, stiffnessAng: .infinity,
                                   hingeAxis: F3(0, 1, 0),
                                   motorTarget: 0, motorTorque: 500,
+                                  motorStiffness: 200, motorDamping: 5,
                                   limitLo: -0.3, limitHi: 0.6))
         let gpu = try GPUSolver(scene: scene)
         gpu.setMotorTarget(0, angle: 2.0)        // beyond the limit

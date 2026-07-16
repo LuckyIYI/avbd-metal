@@ -32,6 +32,17 @@ public struct RLTensorSpec: Equatable, Sendable {
     public var elementCount: Int { shape.reduce(1, *) }
 }
 
+/// Central compatibility namespace for physics changes shared by otherwise
+/// independent task revision families.
+public enum RLPhysicsContract {
+    /// Fixed-gain actuator model with explicit scene-authored modes, no
+    /// adaptive motor penalty, and an exact active-set effort clamp.
+    public static func fixedGainActuatorV2(_ taskRevision: Int) -> Int {
+        precondition(taskRevision > 0 && taskRevision < 1_000_000)
+        return 1_000_000 + taskRevision
+    }
+}
+
 public struct RLTaskSpec: Equatable, Sendable {
     public var id: String
     /// Compatibility revision for actuator, observation, reward, termination,

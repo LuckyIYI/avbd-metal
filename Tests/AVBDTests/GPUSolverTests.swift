@@ -3,6 +3,31 @@ import simd
 @testable import AVBDCore
 
 final class GPUSolverTests: XCTestCase {
+    func testPerBodyGravityScaleMatchesCPUAndGPU() throws {
+        var scene = PhysicsScene(name: "gravity-scale")
+        scene.settings.dt = 1 / 100
+        scene.settings.iterations = 4
+        _ = scene.addBody(
+            size: F3(repeating: 0.1), density: 1_000, friction: 0,
+            position: F3(0, 0, 2), shape: .sphere, gravityScale: 0)
+        _ = scene.addBody(
+            size: F3(repeating: 0.1), density: 1_000, friction: 0,
+            position: F3(2, 0, 2), shape: .sphere, gravityScale: 1)
+
+        let cpu = scene.makeCPUSolver()
+        let gpu = try GPUSolver(scene: scene)
+        for _ in 0..<10 {
+            cpu.step()
+            gpu.step()
+        }
+        let gpuStates = gpu.bodyStates([0, 1])
+        XCTAssertEqual(cpu.bodies[0].positionLin.z, 2, accuracy: 1e-5)
+        XCTAssertEqual(gpuStates[0].position.z, 2, accuracy: 1e-5)
+        XCTAssertLessThan(cpu.bodies[1].positionLin.z, 1.95)
+        XCTAssertEqual(gpuStates[1].position.z,
+                       cpu.bodies[1].positionLin.z, accuracy: 2e-3)
+    }
+
     func testWorldSpaceInertiaRotatesPrincipalAxes() {
         let principal = F3(1, 2, 3)
         let rotation = Quat(angle: .pi / 2, axis: F3(0, 0, 1))
