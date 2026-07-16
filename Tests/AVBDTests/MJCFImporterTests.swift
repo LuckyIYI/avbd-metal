@@ -44,7 +44,9 @@ final class MJCFImporterTests: XCTestCase {
         }
 
         var validationScene = PhysicsScene(name: "arachne-validation")
-        _ = try validation.instantiate(in: &validationScene)
+        _ = try validation.instantiate(
+            in: &validationScene,
+            defaultMotorGain: .init(stiffness: 2, damping: 0.08))
         XCTAssertEqual(validationScene.colliders.filter(\.collisionEnabled).count, 60)
         XCTAssertEqual(validationScene.rigidMeshes.count, 28)
 
