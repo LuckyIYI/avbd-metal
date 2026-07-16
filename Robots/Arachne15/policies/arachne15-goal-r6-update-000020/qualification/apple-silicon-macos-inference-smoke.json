@@ -1,0 +1,16 @@
+{
+  "buildConfiguration" : "Release",
+  "checkpointFingerprint" : "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027",
+  "controlDeadlineMilliseconds" : 20.000000949949026,
+  "iterations" : 500,
+  "maximumMilliseconds" : 3.9595,
+  "maximumParityError" : 0,
+  "p50Milliseconds" : 0.38875,
+  "p95Milliseconds" : 0.507416,
+  "p99Milliseconds" : 0.931208,
+  "platform" : "Apple Silicon macOS",
+  "task" : "arachne15-goal-v0",
+  "taskRevision" : 6,
+  "verifiedAtUTC" : "2026-07-16T03:25:00Z",
+  "verifier" : "avbd verify-policy-rl"
+}

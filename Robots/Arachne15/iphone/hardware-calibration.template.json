@@ -1,0 +1,16 @@
+{
+  "commissioned" : false,
+  "currentLimitsMilliamps" : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "jointLowerRadians" : [-0.55, -0.7, -0.55, -0.7, -0.55, -0.7, -0.55, -0.7, -0.55, -0.7, -0.55, -0.7, -0.55, -0.7, -0.55, -0.7],
+  "jointNames" : ["right_rear_hip", "right_rear_knee", "right_mid_rear_hip", "right_mid_rear_knee", "right_mid_front_hip", "right_mid_front_knee", "right_front_hip", "right_front_knee", "left_rear_hip", "left_rear_knee", "left_mid_rear_hip", "left_mid_rear_knee", "left_mid_front_hip", "left_mid_front_knee", "left_front_hip", "left_front_knee"],
+  "jointUpperRadians" : [0.55, 0.7, 0.55, 0.7, 0.55, 0.7, 0.55, 0.7, 0.55, 0.7, 0.55, 0.7, 0.55, 0.7, 0.55, 0.7],
+  "maximumServoTemperatureCelsius" : 55,
+  "measuredAtUTC" : "",
+  "measuredMaximumRoundTripLatencySeconds" : 0,
+  "policyCheckpointFingerprint" : "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027",
+  "robotSerial" : "",
+  "schemaVersion" : 1,
+  "servoDirectionSigns" : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  "servoIDs" : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+  "servoZeroRadians" : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}

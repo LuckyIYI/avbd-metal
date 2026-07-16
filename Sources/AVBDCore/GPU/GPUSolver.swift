@@ -452,7 +452,7 @@ public final class GPUSolver {
         source = "#include <metal_stdlib>\nusing namespace metal;\n" + source
         let options = MTLCompileOptions()
         let fastMath = ProcessInfo.processInfo.environment["AVBD_SAFE_MATH"] == nil
-        if #available(macOS 15.0, *) {
+        if #available(macOS 15.0, iOS 18.0, *) {
             options.mathMode = fastMath ? .fast : .safe
         } else {
             options.fastMathEnabled = fastMath

@@ -64,6 +64,7 @@ struct Options {
     var runName = "ppo"
     var checkpoint: String? = nil
     var output: String? = nil
+    var allowTaskTransfer = false
     /// Task-owned numeric configuration. Keeping these values out of the PPO
     /// parser lets new scenes expose curricula and control settings without
     /// adding task-specific branches to this executable.
@@ -170,6 +171,7 @@ func parseOptions(_ args: [String]) -> Options {
         case "--run": o.runName = value(after: args[i])
         case "--checkpoint": o.checkpoint = value(after: args[i])
         case "--output": o.output = value(after: args[i])
+        case "--allow-task-transfer": o.allowTaskTransfer = true
         case "--task-option":
             let assignment = value(after: args[i])
             let pieces = assignment.split(separator: "=", maxSplits: 1,
@@ -216,6 +218,8 @@ guard let command = args.first else {
       rl-smoke <task>  Step a vectorized task and validate finite tensors
       train-rl <task>  Train any registered task with MLX PPO
       eval-rl <task>   Evaluate a saved MLX policy deterministically
+      export-policy-rl <task>  Create an immutable optimizer-free field bundle
+      verify-policy-rl <task>  Verify immutable bundle identity and MLX inference
       trace-rl <task>  Trace one deterministic policy trajectory step by step
       eval-arm-expert  Evaluate the batched Push-T demonstration expert
       select-rl <reports...>  Select one checkpoint on validation-only reports
@@ -403,7 +407,8 @@ case "train-rl":
 
 case "eval-rl":
     guard args.count > 1 else {
-        fail("usage: avbd eval-rl <task> [--envs N --episodes N --seed N]")
+        fail("usage: avbd eval-rl <task> [--envs N --episodes N --seed N "
+            + "--allow-task-transfer]")
     }
     let o = parseOptions(Array(args.dropFirst(2)))
     let taskID = args[1]
@@ -414,7 +419,8 @@ case "eval-rl":
     let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
     let metrics = try VectorPPOTrainer.evaluate(
         task: task, checkpointDirectory: checkpointDirectory,
-        episodes: o.episodes, seed: o.seed)
+        episodes: o.episodes, seed: o.seed,
+        allowTaskConfigurationTransfer: o.allowTaskTransfer)
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let encodedMetrics = try encoder.encode(metrics)
@@ -440,6 +446,99 @@ case "eval-rl":
         }
     }
     if metrics.acceptance?.passed == false { exit(2) }
+
+case "export-policy-rl":
+    guard args.count > 1 else {
+        fail("usage: avbd export-policy-rl <task> --checkpoint DIR --output DIR")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    guard let checkpoint = o.checkpoint, let output = o.output else {
+        fail("export-policy-rl requires --checkpoint DIR and --output DIR")
+    }
+    let manifest = try VectorPolicyDeploymentBundle.export(
+        checkpointDirectory: checkpoint, outputDirectory: output)
+    guard manifest.task == args[1] else {
+        try? FileManager.default.removeItem(atPath: output)
+        fail("checkpoint task \(manifest.task) does not match requested \(args[1])")
+    }
+    let manifestData = try JSONEncoder().encode(manifest)
+    print("exported \(manifest.task) policy bundle to \(output) "
+        + "(\(manifest.checkpointFingerprint), "
+        + "\(String(format: "%.1f", manifest.controlFrequencyHz)) Hz, "
+        + "\(manifestData.count)-byte manifest)")
+
+case "verify-policy-rl":
+    guard args.count > 1 else {
+        fail("usage: avbd verify-policy-rl <task> --checkpoint BUNDLE "
+            + "[--frames N --json]")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    guard let bundle = o.checkpoint else {
+        fail("verify-policy-rl requires --checkpoint BUNDLE")
+    }
+    guard o.frames > 0 else { fail("--frames must be positive") }
+    let taskID = args[1]
+    let runtime = try VectorPolicyDeploymentRuntime(
+        bundleDirectory: bundle, expectedTask: taskID)
+    let checkpointRunner = try VectorPolicyRunner(
+        checkpointDirectory: bundle)
+    var observation = ContiguousArray(
+        repeating: Float(0), count: runtime.observationDimension)
+    if taskID.hasPrefix("arachne15-")
+        && runtime.observationDimension == Arachne15PolicyContract.observationDimension {
+        observation[8] = 1
+        observation[9] = 0.15
+    }
+    let deployed = try runtime.actions(for: observation)
+    let replayed = try checkpointRunner.actions(for: observation)
+    let maximumParityError = zip(deployed, replayed).map {
+        abs($0.0 - $0.1)
+    }.max() ?? .infinity
+    guard maximumParityError <= 1e-7,
+          deployed.allSatisfy(\.isFinite) else {
+        fail("deployed inference differs from checkpoint replay")
+    }
+    for _ in 0..<5 { _ = try runtime.actions(for: observation) }
+    var milliseconds = [Double]()
+    milliseconds.reserveCapacity(o.frames)
+    for _ in 0..<o.frames {
+        let start = DispatchTime.now().uptimeNanoseconds
+        _ = try runtime.actions(for: observation)
+        let end = DispatchTime.now().uptimeNanoseconds
+        milliseconds.append(Double(end - start) / 1_000_000)
+    }
+    milliseconds.sort()
+    func percentile(_ fraction: Double) -> Double {
+        milliseconds[min(Int(Double(milliseconds.count - 1) * fraction),
+                         milliseconds.count - 1)]
+    }
+    let report: [String: Any] = [
+        "task": runtime.manifest.task,
+        "taskRevision": runtime.manifest.taskRevision,
+        "checkpointFingerprint": runtime.checkpointFingerprint,
+        "iterations": o.frames,
+        "maximumParityError": maximumParityError,
+        "p50Milliseconds": percentile(0.50),
+        "p95Milliseconds": percentile(0.95),
+        "p99Milliseconds": percentile(0.99),
+        "maximumMilliseconds": milliseconds.last!,
+        "controlDeadlineMilliseconds":
+            runtime.controlPeriodSeconds * 1_000,
+    ]
+    if o.json {
+        let data = try JSONSerialization.data(
+            withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+        print(String(decoding: data, as: UTF8.self))
+    } else {
+        print("verified \(runtime.manifest.task) r\(runtime.manifest.taskRevision) "
+            + "\(runtime.checkpointFingerprint)")
+        print(String(format:
+            "inference %d runs: p50 %.3f ms  p95 %.3f ms  p99 %.3f ms  "
+                + "max %.3f ms  deadline %.1f ms  parity %.1e",
+            o.frames, percentile(0.50), percentile(0.95), percentile(0.99),
+            milliseconds.last!, runtime.controlPeriodSeconds * 1_000,
+            maximumParityError))
+    }
 
 case "trace-rl":
     guard args.count > 1 else {

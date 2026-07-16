@@ -126,4 +126,6 @@ openscad --export-format binstl -D 'PART="chassis"' \
 
 See [DESIGN.md](DESIGN.md) for the first-principles derivation,
 [RESEARCH.md](RESEARCH.md) for sources and unresolved risks, and
-[BOM.csv](BOM.csv) for the initial hardware list.
+[BOM.csv](BOM.csv) for the initial hardware list. The qualified MLX bundle,
+iPhone inference/watchdog interface, exact sensor and actuator schema, and
+commissioning gates are documented in [iphone/README.md](iphone/README.md).

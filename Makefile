@@ -1,6 +1,6 @@
 # AVBD Metal build helpers
 
-.PHONY: build test app cli bench clean
+.PHONY: build test app cli bench clean ml-tool app-ml ios-ml verify-arachne-policy
 
 build:
 	swift build -c release
@@ -51,7 +51,7 @@ app-ml:
 	mkdir -p AVBD.app/Contents/MacOS AVBD.app/Contents/Resources
 	cp .xcbuild/Build/Products/Release/AVBDApp AVBD.app/Contents/MacOS/AVBDApp
 	cp -R .xcbuild/Build/Products/Release/avbd-metal_AVBDCore.bundle AVBD.app/Contents/Resources/
-	cp -R checkpoints AVBD.app/Contents/Resources/
+	-cp -R checkpoints AVBD.app/Contents/Resources/ 2>/dev/null
 	-cp .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib AVBD.app/Contents/Resources/ 2>/dev/null
 	-cp -R .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle AVBD.app/Contents/Resources/ 2>/dev/null
 	cp AVBD.app/Contents/Info.plist.tmp AVBD.app/Contents/Info.plist 2>/dev/null || printf '%s\n' \
@@ -69,3 +69,19 @@ app-ml:
 	  '</dict></plist>' > AVBD.app/Contents/Info.plist
 	codesign --force --sign - AVBD.app 2>/dev/null || true
 	@echo "built AVBD.app (ML-enabled)"
+
+# Compile the reusable MLX runtime for a physical iOS device. Xcode must have
+# the matching iOS platform installed; no signing is required for this library.
+ios-ml:
+	xcodebuild -scheme AVBDLearn -configuration Release \
+	  -destination 'generic/platform=iOS' -derivedDataPath .xcbuild-ios \
+	  -clonedSourcePackagesDirPath .xcbuild/SourcePackages \
+	  -disableAutomaticPackageResolution \
+	  -onlyUsePackageVersionsFromResolvedFile build -quiet
+
+# Validate the tracked bundle, exact inference parity, and Metal latency.
+verify-arachne-policy: ml-tool
+	.xcbuild/Build/Products/Release/avbd verify-policy-rl \
+	  arachne15-goal-v0 \
+	  --checkpoint Robots/Arachne15/policies/arachne15-goal-r6-update-000020 \
+	  --frames 500 --json

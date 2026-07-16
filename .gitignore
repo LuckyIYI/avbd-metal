@@ -1,6 +1,7 @@
 refs/
 .build/
 .xcbuild/
+.xcbuild-ios/
 runs/
 .DS_Store
 *.profraw

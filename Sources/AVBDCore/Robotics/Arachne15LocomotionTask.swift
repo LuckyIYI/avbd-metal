@@ -5,6 +5,10 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
     public var seed: UInt64
     public var maxEpisodeSteps: Int
     public var controlDecimation: Int
+    /// Nonlinear AVBD sweeps per 2 ms physics step. Small, light feet need a
+    /// higher contact budget than the metre-scale demo default; keeping this
+    /// in the serialized task contract prevents silent train/replay drift.
+    public var solverIterations: Int
     public var commandResamplingSteps: Int
     public var minimumForwardVelocity: Float
     public var maximumForwardVelocity: Float
@@ -20,6 +24,7 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
     public var pointGoal: Bool
     public var minimumGoalDistance: Float
     public var maximumGoalDistance: Float
+    public var maximumGoalDirectionAngle: Float
     public var goalRadius: Float
     public var goalSlowdownDistance: Float
     public var goalCommandSpeed: Float
@@ -31,11 +36,13 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
     public var goalSuccessBonus: Float
     public var commandProgressRewardWeight: Float
     public var velocityErrorPenaltyWeight: Float
+    public var yawErrorPenaltyWeight: Float
     public var autoReset: Bool
 
     public init(
         numEnvironments: Int, seed: UInt64 = 1,
         maxEpisodeSteps: Int = 1_000, controlDecimation: Int = 10,
+        solverIterations: Int = 20,
         commandResamplingSteps: Int = 500,
         minimumForwardVelocity: Float = 0.05,
         maximumForwardVelocity: Float = 0.25,
@@ -52,23 +59,26 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
         pointGoal: Bool = false,
         minimumGoalDistance: Float = 0.60,
         maximumGoalDistance: Float = 2.0,
+        maximumGoalDirectionAngle: Float = .pi,
         goalRadius: Float = 0.12,
         goalSlowdownDistance: Float = 0.50,
-        goalCommandSpeed: Float = 0.20,
-        goalBoundaryCommandSpeed: Float = 0.05,
+        goalCommandSpeed: Float = 0.15,
+        goalBoundaryCommandSpeed: Float = 0.02,
         maximumGoalArrivalSpeed: Float = 0.08,
         goalDwellSteps: Int = 15,
-        goalProgressRewardWeight: Float = 2.0,
-        goalStableRewardWeight: Float = 0.5,
-        goalSuccessBonus: Float = 5.0,
-        commandProgressRewardWeight: Float = 8.0,
-        velocityErrorPenaltyWeight: Float = 2.0,
+        goalProgressRewardWeight: Float = 4.0,
+        goalStableRewardWeight: Float = 1.0,
+        goalSuccessBonus: Float = 8.0,
+        commandProgressRewardWeight: Float = 20.0,
+        velocityErrorPenaltyWeight: Float = 5.0,
+        yawErrorPenaltyWeight: Float = 5.0,
         autoReset: Bool = true
     ) {
         self.numEnvironments = numEnvironments
         self.seed = seed
         self.maxEpisodeSteps = maxEpisodeSteps
         self.controlDecimation = controlDecimation
+        self.solverIterations = solverIterations
         self.commandResamplingSteps = commandResamplingSteps
         self.minimumForwardVelocity = minimumForwardVelocity
         self.maximumForwardVelocity = maximumForwardVelocity
@@ -84,6 +94,7 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
         self.pointGoal = pointGoal
         self.minimumGoalDistance = minimumGoalDistance
         self.maximumGoalDistance = maximumGoalDistance
+        self.maximumGoalDirectionAngle = maximumGoalDirectionAngle
         self.goalRadius = goalRadius
         self.goalSlowdownDistance = goalSlowdownDistance
         self.goalCommandSpeed = goalCommandSpeed
@@ -95,6 +106,7 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
         self.goalSuccessBonus = goalSuccessBonus
         self.commandProgressRewardWeight = commandProgressRewardWeight
         self.velocityErrorPenaltyWeight = velocityErrorPenaltyWeight
+        self.yawErrorPenaltyWeight = yawErrorPenaltyWeight
         self.autoReset = autoReset
     }
 }
@@ -122,15 +134,13 @@ public final class Arachne15Env {
         public var goalMarker: Int?
     }
 
-    public static let actionDimension = 16
+    public static let actionDimension = Arachne15PolicyContract.actionDimension
     public static let footLinkOffset = F3(0.105, 0, 0)
     /// Must match the generated MJCF foot contact box. Keeping this value
     /// explicit here lets runtime diagnostics measure the actual contact
     /// envelope rather than inferring clearance from the foot-link origin.
     public static let footColliderHalfSize = F3(0.00875, 0.007, 0.004)
-    public static let actionScales: [Float] = (0..<actionDimension).map {
-        $0.isMultiple(of: 2) ? 0.35 : 0.45
-    }
+    public static let actionScales = Arachne15PolicyContract.actionScales
 
     public let numEnvironments: Int
     public let solver: GPUSolver
@@ -284,12 +294,35 @@ public final class Arachne15Env {
                     * Quat(angle: pitch, axis: F3(0, 1, 0))
                     * Quat(angle: roll, axis: F3(1, 0, 0))).normalized
             let pivot = spawnPoses[refs[e].root].0
+            var transformed: [(body: Int, position: F3, rotation: Quat)] = []
+            transformed.reserveCapacity(refs[e].bodies.count)
+            var minimumFootClearance = Float.infinity
             for body in refs[e].bodies {
                 let spawn = spawnPoses[body]
+                let position = pivot + perturbation.act(spawn.0 - pivot)
+                let rotation = (perturbation * spawn.1).normalized
+                transformed.append((body, position, rotation))
+                if refs[e].feet.contains(body) {
+                    let half = Self.footColliderHalfSize
+                    let verticalSupport =
+                        abs(rotation.act(F3(1, 0, 0)).z) * half.x
+                        + abs(rotation.act(F3(0, 1, 0)).z) * half.y
+                        + abs(rotation.act(F3(0, 0, 1)).z) * half.z
+                    minimumFootClearance = min(
+                        minimumFootClearance, position.z - verticalSupport)
+                }
+            }
+            // Roll/pitch randomization rotates the complete robot about its
+            // root. Without a compensating lift, one side starts millimetres
+            // inside the floor and falsely teaches recovery from an impossible
+            // assembled pose. Preserve the randomized attitude while placing
+            // the lowest authored foot just above the physical ground.
+            let verticalLift = max(0, 0.0001 - minimumFootClearance)
+            for transformedPose in transformed {
                 poses.append(.init(
-                    body: body,
-                    position: pivot + perturbation.act(spawn.0 - pivot),
-                    rotation: (perturbation * spawn.1).normalized))
+                    body: transformedPose.body,
+                    position: transformedPose.position + F3(0, 0, verticalLift),
+                    rotation: transformedPose.rotation))
             }
             for joint in refs[e].motors {
                 motors.append(.init(joint: joint, angle: 0))
@@ -399,9 +432,11 @@ public final class Arachne15Env {
 /// quantities available from an IMU, joint encoders, the commanded twist, and
 /// its previous applied action. No gait clock or authored trajectory is used.
 public final class Arachne15LocomotionTask: VectorizedRLTask,
-    RLEvaluationCriteriaProviding
+    RLEvaluationCriteriaProviding, PolicySymmetryProviding,
+    ObservationNormalizerTransferProviding
 {
-    public static let observationDimension = 60
+    public static let observationDimension =
+        Arachne15PolicyContract.observationDimension
     public let spec: RLTaskSpec
     public let environment: Arachne15Env
     public let configuration: Arachne15LocomotionTaskConfig
@@ -410,18 +445,37 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
 
     public var evaluationCriteria: RLEvaluationCriteria {
         if configuration.pointGoal {
+            var minimumTaskMetrics: [String: Float] = [
+                "episode/survived": 0.95,
+                "episode/goal_reached": 0.90,
+                "episode/goal_front_success_rate": 0.85,
+                "episode/goal_near_success_rate": 0.85,
+                "episode/goal_far_success_rate": 0.85,
+                // Keep a hard guard against gross tunnelling, then use the
+                // time-resolved metrics below to reject sustained contact
+                // exploitation without failing on one 2 ms impact sample.
+                "episode/minimum_foot_collider_clearance_m": -0.003,
+            ]
+            if configuration.maximumGoalDirectionAngle > .pi / 4 {
+                minimumTaskMetrics["episode/goal_left_success_rate"] = 0.85
+                minimumTaskMetrics["episode/goal_right_success_rate"] = 0.85
+            }
+            if configuration.maximumGoalDirectionAngle > 3 * .pi / 4 {
+                minimumTaskMetrics["episode/goal_rear_success_rate"] = 0.85
+            }
             return RLEvaluationCriteria(
-                minimumSuccessRate: 0.80,
+                minimumSuccessRate: 0.90,
                 minimumMeanEpisodeLengthFraction: 0.10,
-                minimumTaskMetrics: [
-                    "episode/survived": 0.90,
-                    "episode/goal_reached": 0.80,
-                ],
+                minimumTaskMetrics: minimumTaskMetrics,
                 maximumTaskMetrics: [
                     "episode/final_goal_distance_m":
-                        configuration.goalRadius * 1.5,
+                        configuration.goalRadius * 1.25,
                     "episode/minimum_goal_distance_m":
                         configuration.goalRadius,
+                    "episode/yaw_rate_rmse_rps": 0.40,
+                    "episode/foot_collider_penetration_rmse_m": 0.0005,
+                    "episode/foot_collider_penetration_over_1mm_fraction":
+                        0.025,
                 ])
         }
         return RLEvaluationCriteria(
@@ -451,10 +505,83 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     private var goalOverrides: [(direction: F3, distance: Float)?]
     private var previousGoalDistances: [Float]
     private var minimumGoalDistances: [Float]
+    private var initialGoalBearings: [Float]
+    private var initialGoalDistances: [Float]
     private var goalDwellCounts: [Int]
     private var enteredGoals: [Bool]
     private var previousRootPositions: [F3]
     private var commandProgressSums: [Float]
+    private var minimumFootColliderClearances: [Float]
+    private var footPenetrationSquaredSums: [Float]
+    private var footPenetrationOverOneMillimetreSteps: [Int]
+
+    /// Transfer from the accepted straight walker preserves proprioceptive
+    /// statistics, but that source policy saw constant forward and zero
+    /// lateral/yaw commands. These floors keep newly introduced navigation
+    /// commands in a sane normalized range from the first PPO update.
+    public var initializationObservationVarianceFloors: [Int: Double] {
+        [9: 0.01, 10: 0.01, 11: 0.16]
+    }
+
+    private static let mirroredJointSource = [
+        8, 9, 10, 11, 12, 13, 14, 15,
+        0, 1, 2, 3, 4, 5, 6, 7,
+    ]
+    private static let mirroredJointSign: [Float] = [
+        -1, 1, -1, 1, -1, 1, -1, 1,
+        -1, 1, -1, 1, -1, 1, -1, 1,
+    ]
+
+    public var policyActionMirrorSourceIndices: [Int] {
+        Self.mirroredJointSource
+    }
+
+    public var policyActionMirrorSigns: [Float] {
+        Self.mirroredJointSign
+    }
+
+    public func mirrorPolicyActions(
+        _ actions: ContiguousArray<Float>
+    ) -> ContiguousArray<Float> {
+        precondition(actions.count.isMultiple(of: actionDimension))
+        var mirrored = actions
+        for row in 0..<(actions.count / actionDimension) {
+            let base = row * actionDimension
+            for j in 0..<actionDimension {
+                mirrored[base + j] = Self.mirroredJointSign[j]
+                    * actions[base + Self.mirroredJointSource[j]]
+            }
+        }
+        return mirrored
+    }
+
+    public func mirrorPolicyObservations(
+        _ observations: ContiguousArray<Float>
+    ) -> ContiguousArray<Float> {
+        precondition(observations.count.isMultiple(
+            of: Self.observationDimension))
+        var mirrored = observations
+        for row in 0..<(observations.count / Self.observationDimension) {
+            let base = row * Self.observationDimension
+            // Polar vectors: lateral component changes sign. Axial angular
+            // velocity additionally flips roll and yaw under reflection.
+            mirrored[base + 1] = -observations[base + 1]
+            mirrored[base + 3] = -observations[base + 3]
+            mirrored[base + 5] = -observations[base + 5]
+            mirrored[base + 7] = -observations[base + 7]
+            mirrored[base + 10] = -observations[base + 10]
+            mirrored[base + 11] = -observations[base + 11]
+            for tensorBase in [12, 28, 44] {
+                for j in 0..<actionDimension {
+                    mirrored[base + tensorBase + j] =
+                        Self.mirroredJointSign[j]
+                        * observations[base + tensorBase
+                            + Self.mirroredJointSource[j]]
+                }
+            }
+        }
+        return mirrored
+    }
 
     static func creditedCommandProgress(
         measured: Float, commandSpeed: Float, controlStep: Float
@@ -474,6 +601,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         guard configuration.numEnvironments > 0,
               configuration.maxEpisodeSteps > 0,
               configuration.controlDecimation > 0,
+              configuration.solverIterations > 0,
               configuration.commandResamplingSteps > 0,
               configuration.minimumForwardVelocity >= 0,
               configuration.maximumForwardVelocity
@@ -489,6 +617,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 configuration.minimumGoalDistance > configuration.goalRadius
                 && configuration.maximumGoalDistance
                     >= configuration.minimumGoalDistance
+                && configuration.maximumGoalDirectionAngle > 0
+                && configuration.maximumGoalDirectionAngle <= .pi
                 && configuration.goalRadius > 0
                 && configuration.goalSlowdownDistance
                     > configuration.goalRadius
@@ -502,7 +632,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 && configuration.goalStableRewardWeight >= 0
                 && configuration.goalSuccessBonus >= 0),
               configuration.commandProgressRewardWeight >= 0,
-              configuration.velocityErrorPenaltyWeight >= 0 else {
+              configuration.velocityErrorPenaltyWeight >= 0,
+              configuration.yawErrorPenaltyWeight >= 0 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "invalid Arachne locomotion configuration")
         }
@@ -512,12 +643,13 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             collisionProfile: configuration.collisionProfile,
             domainRandomization: configuration.domainRandomization,
             includeGoalMarkers: configuration.pointGoal,
-            goalMarkerRadius: configuration.goalRadius)
+            goalMarkerRadius: configuration.goalRadius,
+            solverIterations: configuration.solverIterations)
         environment = env
         self.configuration = configuration
         let d = configuration.domainRandomization
         spec = RLTaskSpec(
-            id: taskID, revision: 4,
+            id: taskID, revision: 6,
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),
@@ -530,6 +662,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             controlDecimation: configuration.controlDecimation,
             autoReset: configuration.autoReset,
             configurationValues: [
+                "solverIterations": Float(configuration.solverIterations),
                 "commandResamplingSteps": Float(configuration.commandResamplingSteps),
                 "minimumForwardVelocity": configuration.minimumForwardVelocity,
                 "maximumForwardVelocity": configuration.maximumForwardVelocity,
@@ -546,6 +679,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 "pointGoal": configuration.pointGoal ? 1 : 0,
                 "minimumGoalDistance": configuration.minimumGoalDistance,
                 "maximumGoalDistance": configuration.maximumGoalDistance,
+                "maximumGoalDirectionAngle":
+                    configuration.maximumGoalDirectionAngle,
                 "goalRadius": configuration.goalRadius,
                 "goalSlowdownDistance": configuration.goalSlowdownDistance,
                 "goalCommandSpeed": configuration.goalCommandSpeed,
@@ -563,6 +698,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                     configuration.commandProgressRewardWeight,
                 "velocityErrorPenaltyWeight":
                     configuration.velocityErrorPenaltyWeight,
+                "yawErrorPenaltyWeight": configuration.yawErrorPenaltyWeight,
                 "massScaleLower": d.mass.lowerBound,
                 "massScaleUpper": d.mass.upperBound,
                 "inertiaScaleLower": d.inertia.lowerBound,
@@ -603,10 +739,15 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             repeating: nil, count: n)
         previousGoalDistances = [Float](repeating: 0, count: n)
         minimumGoalDistances = [Float](repeating: 0, count: n)
+        initialGoalBearings = [Float](repeating: 0, count: n)
+        initialGoalDistances = [Float](repeating: 0, count: n)
         goalDwellCounts = [Int](repeating: 0, count: n)
         enteredGoals = [Bool](repeating: false, count: n)
         previousRootPositions = [F3](repeating: .zero, count: n)
         commandProgressSums = [Float](repeating: 0, count: n)
+        minimumFootColliderClearances = [Float](repeating: .infinity, count: n)
+        footPenetrationSquaredSums = [Float](repeating: 0, count: n)
+        footPenetrationOverOneMillimetreSteps = [Int](repeating: 0, count: n)
         resetRNG = SplitMix64(seed: configuration.seed ^ 0xE7037ED1A0B428DB)
 
         let ids = Array(0..<n)
@@ -666,6 +807,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         goalOverrides[e] = (normalized, distance)
         installGoal(environment: e, rootPosition: state.root.position,
                     direction: normalized, distance: distance)
+        recordGoalCohort(environment: e, state: state,
+                         direction: normalized, distance: distance)
         previousGoalDistances[e] = distance
         minimumGoalDistances[e] = distance
         goalDwellCounts[e] = 0
@@ -694,7 +837,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             initialYawRange: configuration.initialYawRange)
         let states = environment.states()
         initializeEpisodes(envIDs, seeds: seeds, states: states)
-        fillObservations(states, into: &observations.policy)
+        try fillObservations(states, into: &observations.policy)
         try observations.validate(for: spec)
     }
 
@@ -715,6 +858,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         var orientationCost = ContiguousArray(repeating: Float(0), count: n)
         var verticalVelocityCost = ContiguousArray(repeating: Float(0), count: n)
         var angularVelocityCost = ContiguousArray(repeating: Float(0), count: n)
+        var yawErrorCost = ContiguousArray(repeating: Float(0), count: n)
         var actionRateCost = ContiguousArray(repeating: Float(0), count: n)
         var jointVelocityCost = ContiguousArray(repeating: Float(0), count: n)
         var footSlipCost = ContiguousArray(repeating: Float(0), count: n)
@@ -752,6 +896,36 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             repeating: Float(0), count: n)
         var episodeCommandProgressMetric = ContiguousArray(
             repeating: Float(0), count: n)
+        var episodeMinimumFootColliderClearanceMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeFootPenetrationRMSEMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeFootPenetrationOverOneMillimetreFractionMetric =
+            ContiguousArray(repeating: Float(0), count: n)
+        var episodeGoalFrontBinMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalFrontSuccessMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalLeftBinMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalLeftSuccessMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalRearBinMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalRearSuccessMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalRightBinMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalRightSuccessMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalNearBinMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalNearSuccessMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalFarBinMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalFarSuccessMetric = ContiguousArray(
+            repeating: Float(0), count: n)
         var resetIDs: [Int] = []
         var resetSeeds: [UInt64] = []
 
@@ -766,6 +940,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                                            localVelocity.y - command.y)
             let linearErrorSquared = simd_length_squared(linearError)
             let yawError = localAngularVelocity.z - command.z
+            yawErrorCost[e] = yawError * yawError
             let worldDisplacement = state.root.position
                 - previousRootPositions[e]
             let localDisplacement = qInverse.act(worldDisplacement)
@@ -820,6 +995,14 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                     + abs(foot.rotation.act(F3(0, 0, 1)).z) * half.z
                 return foot.position.z - verticalSupport
             }.min() ?? .infinity
+            minimumFootColliderClearances[e] = min(
+                minimumFootColliderClearances[e],
+                minimumFootColliderClearance[e])
+            let footPenetration = max(0, -minimumFootColliderClearance[e])
+            footPenetrationSquaredSums[e] += footPenetration * footPenetration
+            if footPenetration > 0.001 {
+                footPenetrationOverOneMillimetreSteps[e] += 1
+            }
             let fallen = state.root.position.z < 0.035
                 || projectedGravity.z < 0.25
                 || !state.root.position.x.isFinite
@@ -835,6 +1018,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 - 0.10 * footSlipCost[e]
                 - configuration.velocityErrorPenaltyWeight
                     * linearErrorSquared
+                - configuration.yawErrorPenaltyWeight * yawErrorCost[e]
             var reachedGoal = false
             var goalDistance: Float = 0
             if configuration.pointGoal {
@@ -892,6 +1076,13 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 episodeLinearRMSEMetric[e] = linearRMSE
                 episodeYawRMSEMetric[e] = yawRMSE
                 episodeCommandProgressMetric[e] = commandProgressSums[e]
+                episodeMinimumFootColliderClearanceMetric[e] =
+                    minimumFootColliderClearances[e]
+                episodeFootPenetrationRMSEMetric[e] = sqrt(
+                    footPenetrationSquaredSums[e] * inverseLength)
+                episodeFootPenetrationOverOneMillimetreFractionMetric[e] =
+                    Float(footPenetrationOverOneMillimetreSteps[e])
+                        * inverseLength
                 if configuration.pointGoal {
                     episodeGoalReachedMetric[e] = success ? 1 : 0
                     episodeGoalEnteredMetric[e] = enteredGoals[e] ? 1 : 0
@@ -904,6 +1095,31 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                             * state.root.linearVelocity.x
                         + state.root.linearVelocity.y
                             * state.root.linearVelocity.y)
+                    let bearing = initialGoalBearings[e]
+                    let absoluteBearing = abs(bearing)
+                    if absoluteBearing <= .pi / 4 {
+                        episodeGoalFrontBinMetric[e] = 1
+                        episodeGoalFrontSuccessMetric[e] = success ? 1 : 0
+                    } else if bearing > 0 && bearing < 3 * .pi / 4 {
+                        episodeGoalLeftBinMetric[e] = 1
+                        episodeGoalLeftSuccessMetric[e] = success ? 1 : 0
+                    } else if bearing < 0 && bearing > -3 * .pi / 4 {
+                        episodeGoalRightBinMetric[e] = 1
+                        episodeGoalRightSuccessMetric[e] = success ? 1 : 0
+                    } else {
+                        episodeGoalRearBinMetric[e] = 1
+                        episodeGoalRearSuccessMetric[e] = success ? 1 : 0
+                    }
+                    let distanceMidpoint = 0.5
+                        * (configuration.minimumGoalDistance
+                            + configuration.maximumGoalDistance)
+                    if initialGoalDistances[e] <= distanceMidpoint {
+                        episodeGoalNearBinMetric[e] = 1
+                        episodeGoalNearSuccessMetric[e] = success ? 1 : 0
+                    } else {
+                        episodeGoalFarBinMetric[e] = 1
+                        episodeGoalFarSuccessMetric[e] = success ? 1 : 0
+                    }
                 }
                 if configuration.autoReset {
                     resetIDs.append(e)
@@ -918,7 +1134,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             }
         }
 
-        fillObservations(states, into: &result.observations.policy)
+        try fillObservations(states, into: &result.observations.policy)
         for e in 0..<n where result.hasFinalObservation[e] {
             let base = e * Self.observationDimension
             for j in 0..<Self.observationDimension {
@@ -933,6 +1149,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         result.metrics["penalty/orientation"] = orientationCost
         result.metrics["penalty/vertical_velocity"] = verticalVelocityCost
         result.metrics["penalty/angular_velocity_xy"] = angularVelocityCost
+        result.metrics["penalty/yaw_rate_error"] = yawErrorCost
         result.metrics["penalty/action_rate"] = actionRateCost
         result.metrics["penalty/joint_velocity"] = jointVelocityCost
         result.metrics["penalty/foot_slip"] = footSlipCost
@@ -949,6 +1166,13 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         result.metrics["episode/yaw_rate_rmse_rps"] = episodeYawRMSEMetric
         result.metrics["episode/command_progress_m"] =
             episodeCommandProgressMetric
+        result.metrics["episode/minimum_foot_collider_clearance_m"] =
+            episodeMinimumFootColliderClearanceMetric
+        result.metrics["episode/foot_collider_penetration_rmse_m"] =
+            episodeFootPenetrationRMSEMetric
+        result.metrics[
+            "episode/foot_collider_penetration_over_1mm_fraction"] =
+                episodeFootPenetrationOverOneMillimetreFractionMetric
         if configuration.pointGoal {
             result.metrics["reward/goal_progress"] = goalProgressReward
             result.metrics["reward/goal_stable"] = goalStableReward
@@ -966,6 +1190,30 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 episodeGoalDwellMetric
             result.metrics["episode/arrival_speed_mps"] =
                 episodeArrivalSpeedMetric
+            result.metrics["episode/goal_front_bin"] =
+                episodeGoalFrontBinMetric
+            result.metrics["episode/goal_front_success"] =
+                episodeGoalFrontSuccessMetric
+            result.metrics["episode/goal_left_bin"] =
+                episodeGoalLeftBinMetric
+            result.metrics["episode/goal_left_success"] =
+                episodeGoalLeftSuccessMetric
+            result.metrics["episode/goal_rear_bin"] =
+                episodeGoalRearBinMetric
+            result.metrics["episode/goal_rear_success"] =
+                episodeGoalRearSuccessMetric
+            result.metrics["episode/goal_right_bin"] =
+                episodeGoalRightBinMetric
+            result.metrics["episode/goal_right_success"] =
+                episodeGoalRightSuccessMetric
+            result.metrics["episode/goal_near_bin"] =
+                episodeGoalNearBinMetric
+            result.metrics["episode/goal_near_success"] =
+                episodeGoalNearSuccessMetric
+            result.metrics["episode/goal_far_bin"] =
+                episodeGoalFarBinMetric
+            result.metrics["episode/goal_far_success"] =
+                episodeGoalFarSuccessMetric
         }
 
         if !resetIDs.isEmpty {
@@ -975,7 +1223,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 initialYawRange: configuration.initialYawRange)
             states = environment.states()
             initializeEpisodes(resetIDs, seeds: resetSeeds, states: states)
-            fillObservations(
+            try fillObservations(
                 states, into: &result.observations.policy,
                 environmentIDs: resetIDs)
         }
@@ -1031,8 +1279,15 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                     direction = override.direction
                     distance = override.distance
                 } else {
-                    let angle = (2 * commandRNGs[e].nextFloat() - 1) * .pi
-                    direction = F3(cos(angle), sin(angle), 0)
+                    let angle = (2 * commandRNGs[e].nextFloat() - 1)
+                        * configuration.maximumGoalDirectionAngle
+                    let worldDirection = states[e].root.rotation.act(
+                        F3(cos(angle), sin(angle), 0))
+                    let planarLength = max(sqrt(
+                        worldDirection.x * worldDirection.x
+                            + worldDirection.y * worldDirection.y), 1e-6)
+                    direction = F3(worldDirection.x / planarLength,
+                                   worldDirection.y / planarLength, 0)
                     distance = configuration.minimumGoalDistance
                         + (configuration.maximumGoalDistance
                             - configuration.minimumGoalDistance)
@@ -1041,6 +1296,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 installGoal(
                     environment: e, rootPosition: states[e].root.position,
                     direction: direction, distance: distance)
+                recordGoalCohort(environment: e, state: states[e],
+                                 direction: direction, distance: distance)
                 previousGoalDistances[e] = distance
                 minimumGoalDistances[e] = distance
                 goalDwellCounts[e] = 0
@@ -1057,6 +1314,9 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             yawSquaredErrorSums[e] = 0
             previousRootPositions[e] = states[e].root.position
             commandProgressSums[e] = 0
+            minimumFootColliderClearances[e] = .infinity
+            footPenetrationSquaredSums[e] = 0
+            footPenetrationOverOneMillimetreSteps[e] = 0
             let historyBase = e * historyDepth * actionDimension
             for i in 0..<(historyDepth * actionDimension) {
                 actionHistory[historyBase + i] = 0
@@ -1095,6 +1355,13 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         goals[e] = goalOrigins[e] + direction * distance
     }
 
+    private func recordGoalCohort(environment e: Int, state: Arachne15State,
+                                  direction: F3, distance: Float) {
+        let localDirection = state.root.rotation.conjugate.act(direction)
+        initialGoalBearings[e] = atan2(localDirection.y, localDirection.x)
+        initialGoalDistances[e] = distance
+    }
+
     private func planarGoalDistance(environment e: Int,
                                     rootPosition: F3) -> Float {
         let delta = goals[e] - rootPosition
@@ -1106,39 +1373,21 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     /// acquisition without changing observations 9...11 or the motor action.
     private func updateGoalCommand(environment e: Int,
                                    state: Arachne15State) {
-        let worldDelta = goals[e] - state.root.position
-        let localDelta = state.root.rotation.conjugate.act(
-            F3(worldDelta.x, worldDelta.y, 0))
-        let distance = sqrt(localDelta.x * localDelta.x
-            + localDelta.y * localDelta.y)
-        guard distance > configuration.goalRadius else {
-            commands[e] = .zero
-            return
-        }
-        let blend = simd_clamp(
-            (distance - configuration.goalRadius)
-                / (configuration.goalSlowdownDistance
-                    - configuration.goalRadius),
-            0, 1)
-        let speed = configuration.goalBoundaryCommandSpeed
-            + blend * (configuration.goalCommandSpeed
-                - configuration.goalBoundaryCommandSpeed)
-        let direction = SIMD2<Float>(localDelta.x, localDelta.y)
-            / max(distance, 1e-6)
-        let yawError = atan2(localDelta.y, localDelta.x)
-        commands[e] = F3(
-            direction.x * speed,
-            direction.y * speed,
-            simd_clamp(2 * yawError,
-                       -configuration.maximumYawRate,
-                       configuration.maximumYawRate))
+        commands[e] = Arachne15PolicyContract.pointGoalCommand(
+            worldGoal: goals[e], rootPosition: state.root.position,
+            rootRotation: state.root.rotation,
+            goalRadius: configuration.goalRadius,
+            slowdownDistance: configuration.goalSlowdownDistance,
+            cruiseSpeed: configuration.goalCommandSpeed,
+            boundarySpeed: configuration.goalBoundaryCommandSpeed,
+            maximumYawRate: configuration.maximumYawRate)
     }
 
     private func fillObservations(
         _ states: [Arachne15State],
         into output: inout ContiguousArray<Float>,
         environmentIDs: [Int]? = nil
-    ) {
+    ) throws {
         func uniformNoise(_ rng: inout SplitMix64, scale: Float) -> Float {
             (2 * rng.nextFloat() - 1) * scale
         }
@@ -1151,22 +1400,30 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             let base = e * Self.observationDimension
             var rng = noiseRNGs[e]
             let noisy = configuration.observationNoise
+            let encoded = try Arachne15PolicyContract.encode(.init(
+                bodyLinearVelocity: localVelocity,
+                bodyAngularVelocity: localAngularVelocity,
+                projectedGravity: projectedGravity,
+                commandedBodyTwist: commands[e],
+                jointPositions: state.jointAngles,
+                jointVelocities: state.jointVelocities,
+                previousActions: Array(previousActions[
+                    (e * actionDimension)..<((e + 1) * actionDimension)])))
             for axis in 0..<3 {
-                output[base + axis] = localVelocity[axis]
+                output[base + axis] = encoded[axis]
                     + (noisy ? uniformNoise(&rng, scale: 0.01) : 0)
-                output[base + 3 + axis] = localAngularVelocity[axis]
+                output[base + 3 + axis] = encoded[3 + axis]
                     + (noisy ? uniformNoise(&rng, scale: 0.05) : 0)
-                output[base + 6 + axis] = projectedGravity[axis]
+                output[base + 6 + axis] = encoded[6 + axis]
                     + (noisy ? uniformNoise(&rng, scale: 0.01) : 0)
-                output[base + 9 + axis] = commands[e][axis]
+                output[base + 9 + axis] = encoded[9 + axis]
             }
             for j in 0..<actionDimension {
-                output[base + 12 + j] = state.jointAngles[j]
+                output[base + 12 + j] = encoded[12 + j]
                     + (noisy ? uniformNoise(&rng, scale: 0.01) : 0)
-                output[base + 28 + j] = state.jointVelocities[j]
+                output[base + 28 + j] = encoded[28 + j]
                     + (noisy ? uniformNoise(&rng, scale: 0.10) : 0)
-                output[base + 44 + j] = previousActions[
-                    e * actionDimension + j]
+                output[base + 44 + j] = encoded[44 + j]
             }
             noiseRNGs[e] = rng
         }

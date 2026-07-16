@@ -5,6 +5,30 @@ import MLX
 @testable import AVBDCore
 @testable import AVBDLearn
 
+private final class TestVectorPolicyInference: VectorPolicyInferencing {
+    let observationDimension: Int
+    let actionDimension: Int
+    let controlPeriodSeconds: Double
+    let checkpointFingerprint: String
+    var result: ContiguousArray<Float> = [0.25, -0.5]
+    var error: Error?
+
+    init(observationDimension: Int = 3, actionDimension: Int = 2,
+         controlPeriodSeconds: Double = 0.02,
+         checkpointFingerprint: String = "qualified-test-policy") {
+        self.observationDimension = observationDimension
+        self.actionDimension = actionDimension
+        self.controlPeriodSeconds = controlPeriodSeconds
+        self.checkpointFingerprint = checkpointFingerprint
+    }
+
+    func actions(for observation: ContiguousArray<Float>) throws
+        -> ContiguousArray<Float> {
+        if let error { throw error }
+        return result
+    }
+}
+
 final class RLFrameworkTests: XCTestCase {
     func testRegisteredTasksExposeNormalizedBatchedSpaces() throws {
         XCTAssertEqual(BuiltInRLTasks.registry.taskIDs,
@@ -46,10 +70,18 @@ final class RLFrameworkTests: XCTestCase {
                     "domainRandomization": 0,
                 ]))
         let task = try XCTUnwrap(registered as? Arachne15LocomotionTask)
+        XCTAssertEqual(task.spec.revision, 6)
         XCTAssertEqual(task.spec.observation.shape, [60])
         XCTAssertEqual(task.spec.action.shape, [16])
+        XCTAssertEqual(task.configuration.goalCommandSpeed, 0.15)
+        XCTAssertEqual(task.configuration.goalBoundaryCommandSpeed, 0.02)
+        XCTAssertEqual(task.configuration.commandProgressRewardWeight, 20)
+        XCTAssertEqual(task.configuration.velocityErrorPenaltyWeight, 5)
+        XCTAssertEqual(task.configuration.yawErrorPenaltyWeight, 5)
         XCTAssertEqual(task.spec.simulationStep, 0.002, accuracy: 1e-7)
         XCTAssertEqual(task.spec.controlStep, 0.02, accuracy: 1e-7)
+        XCTAssertEqual(task.environment.scene.settings.iterations, 20)
+        XCTAssertEqual(task.spec.configurationValues["solverIterations"], 20)
         XCTAssertEqual(task.environment.scene.settings.rigidContactMargin,
                        0.00025, accuracy: 1e-8)
         for key in [
@@ -99,6 +131,7 @@ final class RLFrameworkTests: XCTestCase {
         let options: [String: Float] = [
             "minimumGoalDistance": 0.8,
             "maximumGoalDistance": 1.2,
+            "maximumGoalDirectionAngle": 3.1415927,
             "initialRollPitchRange": 0,
             "initialYawRange": 0,
             "observationNoise": 0,
@@ -113,8 +146,32 @@ final class RLFrameworkTests: XCTestCase {
         let task = try XCTUnwrap(registered as? Arachne15LocomotionTask)
         XCTAssertTrue(task.usesPointGoal)
         XCTAssertEqual(task.spec.id, "arachne15-goal-v0")
+        XCTAssertEqual(task.spec.revision, 6)
         XCTAssertEqual(task.spec.observation.shape, [60])
         XCTAssertEqual(task.spec.action.shape, [16])
+        XCTAssertEqual(task.configuration.maximumGoalDirectionAngle, .pi)
+        XCTAssertEqual(task.evaluationCriteria.minimumTaskMetrics[
+            "episode/minimum_foot_collider_clearance_m"], -0.003)
+        XCTAssertEqual(task.evaluationCriteria.maximumTaskMetrics[
+            "episode/foot_collider_penetration_rmse_m"], 0.0005)
+        XCTAssertEqual(task.evaluationCriteria.maximumTaskMetrics[
+            "episode/foot_collider_penetration_over_1mm_fraction"], 0.025)
+        XCTAssertEqual(task.initializationObservationVarianceFloors,
+                       [9: 0.01, 10: 0.01, 11: 0.16])
+        let actionsToMirror = ContiguousArray((0..<16).map(Float.init))
+        let mirroredActions = task.mirrorPolicyActions(actionsToMirror)
+        XCTAssertEqual(mirroredActions[0], -actionsToMirror[8])
+        XCTAssertEqual(mirroredActions[1], actionsToMirror[9])
+        XCTAssertEqual(task.mirrorPolicyActions(mirroredActions),
+                       actionsToMirror)
+        let observationsToMirror = ContiguousArray((0..<60).map(Float.init))
+        let mirroredObservations = task.mirrorPolicyObservations(
+            observationsToMirror)
+        XCTAssertEqual(mirroredObservations[9], observationsToMirror[9])
+        XCTAssertEqual(mirroredObservations[10], -observationsToMirror[10])
+        XCTAssertEqual(mirroredObservations[11], -observationsToMirror[11])
+        XCTAssertEqual(task.mirrorPolicyObservations(mirroredObservations),
+                       observationsToMirror)
         XCTAssertEqual(task.environment.scene.colliders
             .filter(\.collisionEnabled).count, 1 + 4 * 39,
             "visual goals must not change physical collision topology")
@@ -144,7 +201,7 @@ final class RLFrameworkTests: XCTestCase {
             let command = task.currentCommand(environment: e)
             XCTAssertLessThanOrEqual(
                 sqrt(command.x * command.x + command.y * command.y),
-                0.20 + 1e-6)
+                0.15 + 1e-6)
             XCTAssertLessThanOrEqual(abs(command.z), 0.8 + 1e-6)
         }
         _ = try task.reset(seed: 777)
@@ -186,6 +243,10 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertNotNil(result.metrics["reward/goal_progress"])
         XCTAssertNotNil(result.metrics["reward/command_progress"])
         XCTAssertNotNil(result.metrics["state/command_progress_m"])
+        XCTAssertNotNil(result.metrics[
+            "episode/foot_collider_penetration_rmse_m"])
+        XCTAssertNotNil(result.metrics[
+            "episode/foot_collider_penetration_over_1mm_fraction"])
 
         let replayTask = try BuiltInRLTasks.registry.make(
             "arachne15-goal-v0",
@@ -196,6 +257,144 @@ final class RLFrameworkTests: XCTestCase {
             replayTask.spec.configurationValues,
             task.spec.configurationValues,
             "serialized training configuration must reconstruct exact replay")
+    }
+
+    func testArachneHardwarePolicyContractMatchesSimulatorEncoding() throws {
+        XCTAssertEqual(Arachne15PolicyContract.jointNames.count, 16)
+        XCTAssertEqual(Arachne15PolicyContract.jointNames.first,
+                       "right_rear_hip")
+        XCTAssertEqual(Arachne15PolicyContract.jointNames.last,
+                       "left_front_knee")
+        XCTAssertEqual(Arachne15PolicyContract.actionScales,
+                       Arachne15Env.actionScales)
+        let task = try Arachne15LocomotionTask(configuration: .init(
+            numEnvironments: 1, seed: 710,
+            standingCommandProbability: 1,
+            initialRollPitchRange: 0, initialYawRange: 0,
+            observationNoise: false, maximumActionLatencySteps: 0,
+            domainRandomization: .init(), autoReset: false))
+        let actual = try task.reset(seed: 711)
+        let state = task.environment.states()[0]
+        let inverse = state.root.rotation.conjugate
+        let expected = try Arachne15PolicyContract.encode(.init(
+            bodyLinearVelocity: inverse.act(state.root.linearVelocity),
+            bodyAngularVelocity: inverse.act(state.root.angularVelocity),
+            projectedGravity: inverse.act(F3(0, 0, 1)),
+            commandedBodyTwist: .zero,
+            jointPositions: state.jointAngles,
+            jointVelocities: state.jointVelocities,
+            previousActions: [Float](repeating: 0, count: 16)))
+        XCTAssertEqual(actual.policy, expected)
+
+        let forward = Arachne15PolicyContract.pointGoalCommand(
+            worldGoal: F3(1, 0, 0), rootPosition: .zero,
+            rootRotation: Quat(ix: 0, iy: 0, iz: 0, r: 1),
+            goalRadius: 0.12, slowdownDistance: 0.5,
+            cruiseSpeed: 0.15, boundarySpeed: 0.02,
+            maximumYawRate: 0.8)
+        XCTAssertEqual(forward, F3(0.15, 0, 0))
+        let targets = try Arachne15PolicyContract.relativeJointTargets(
+            for: ContiguousArray((0..<16).map {
+                $0.isMultiple(of: 2) ? 1 : -1
+            }))
+        for j in targets.indices {
+            XCTAssertEqual(targets[j], j.isMultiple(of: 2) ? 0.35 : -0.45)
+        }
+    }
+
+    func testArachneHardwareCalibrationFailsClosedAndMapsActuators() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let templateURL = packageRoot.appendingPathComponent(
+            "Robots/Arachne15/iphone/hardware-calibration.template.json")
+        let template = try JSONDecoder().decode(
+            Arachne15HardwareCalibration.self,
+            from: Data(contentsOf: templateURL))
+        let fingerprint = template.policyCheckpointFingerprint
+        XCTAssertThrowsError(try template.validate(
+            expectedPolicyFingerprint: fingerprint))
+        XCTAssertTrue(template.validationFailures(
+            expectedPolicyFingerprint: fingerprint).contains(
+                "calibration is not commissioned"))
+
+        let lower: [Float] = (0..<16).map {
+            $0.isMultiple(of: 2) ? -0.55 : -0.7
+        }
+        let upper: [Float] = (0..<16).map {
+            $0.isMultiple(of: 2) ? 0.55 : 0.7
+        }
+        let calibration = Arachne15HardwareCalibration(
+            robotSerial: "AR15-001", commissioned: true,
+            measuredAtUTC: "2026-07-16T00:00:00Z",
+            policyCheckpointFingerprint: fingerprint,
+            servoIDs: Array(1...16),
+            servoZeroRadians: [Float](repeating: 2.5, count: 16),
+            servoDirectionSigns: (0..<16).map {
+                $0 < 8 ? Float(1) : Float(-1)
+            },
+            jointLowerRadians: lower, jointUpperRadians: upper,
+            currentLimitsMilliamps: [Int](repeating: 300, count: 16),
+            maximumServoTemperatureCelsius: 55,
+            measuredMaximumRoundTripLatencySeconds: 0.018)
+        try calibration.validate(expectedPolicyFingerprint: fingerprint)
+        let actions = ContiguousArray((0..<16).map {
+            $0.isMultiple(of: 2) ? Float(0.5) : Float(-0.5)
+        })
+        let servo = try calibration.servoPositionRadians(
+            for: actions, expectedPolicyFingerprint: fingerprint)
+        let recovered = try calibration.policyJointPositions(
+            servoPositionRadians: servo,
+            expectedPolicyFingerprint: fingerprint)
+        let expected = try Arachne15PolicyContract.relativeJointTargets(
+            for: actions)
+        for j in 0..<16 {
+            XCTAssertEqual(recovered[j], expected[j], accuracy: 1e-6)
+        }
+        let velocity = try calibration.policyJointVelocities(
+            servoVelocityRadiansPerSecond: [Float](repeating: 0.2, count: 16),
+            expectedPolicyFingerprint: fingerprint)
+        XCTAssertEqual(velocity[0], 0.2)
+        XCTAssertEqual(velocity[8], -0.2)
+        XCTAssertThrowsError(try calibration.validate(
+            expectedPolicyFingerprint: "another-policy"))
+    }
+
+    func testArachneGoalReportsDirectionalAcceptanceCohorts() throws {
+        let registered = try BuiltInRLTasks.registry.make(
+            "arachne15-goal-v0",
+            configuration: RLTaskConfiguration(
+                numEnvironments: 8, seed: 612, autoReset: false,
+                options: [
+                    "maxEpisodeSteps": 1,
+                    "minimumGoalDistance": 1,
+                    "maximumGoalDistance": 1,
+                    "maximumGoalDirectionAngle": 0.1,
+                    "initialRollPitchRange": 0,
+                    "initialYawRange": 0,
+                    "observationNoise": 0,
+                    "maximumActionLatencySteps": 0,
+                    "domainRandomization": 0,
+                ]))
+        let task = try XCTUnwrap(registered as? Arachne15LocomotionTask)
+        _ = try task.reset(seed: 613)
+        var result = RLStepBatch(spec: task.spec)
+        try task.step(actions: RLActionBatch(spec: task.spec), into: &result)
+        XCTAssertTrue(result.truncated.allSatisfy { $0 })
+        for e in 0..<task.spec.numEnvironments {
+            let directionalBins = [
+                "episode/goal_front_bin", "episode/goal_left_bin",
+                "episode/goal_rear_bin", "episode/goal_right_bin",
+            ].reduce(Float(0)) { partial, name in
+                partial + (result.metrics[name]?[e] ?? 0)
+            }
+            XCTAssertEqual(directionalBins, 1)
+            XCTAssertEqual(result.metrics["episode/goal_front_bin"]?[e], 1)
+            XCTAssertEqual(result.metrics["episode/goal_near_bin"]?[e], 1)
+            XCTAssertEqual(result.metrics["episode/goal_far_bin"]?[e], 0)
+            XCTAssertTrue(result.metrics[
+                "episode/minimum_foot_collider_clearance_m"]![e].isFinite)
+        }
     }
 
     func testBuiltInTasksRejectUnknownOptionsInsteadOfUsingDefaults() {
@@ -3580,6 +3779,13 @@ final class RLFrameworkTests: XCTestCase {
         differentCheckpoint[3].checkpointDirectory = "another/checkpoint"
         XCTAssertThrowsError(try PPOCheckpointEvaluationAggregate.make(
             differentCheckpoint))
+        var differentTaskContract = reports
+        differentTaskContract[3].evaluationTaskConfiguration = [
+            "validationCollisionProfile": 1,
+        ]
+        differentTaskContract[3].taskConfigurationTransferred = true
+        XCTAssertThrowsError(try PPOCheckpointEvaluationAggregate.make(
+            differentTaskContract))
         XCTAssertThrowsError(try PPOEvaluationAggregate.make(reports))
     }
 
@@ -3681,5 +3887,222 @@ final class RLFrameworkTests: XCTestCase {
         let changed = try VectorPPOTrainer.checkpointFingerprint(
             directory: directory.path)
         XCTAssertNotEqual(first, changed)
+    }
+
+    func testDeploymentBundlePreservesEvaluatedCheckpointIdentity() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "avbd-policy-export-\(UUID().uuidString)", isDirectory: true)
+        let checkpoint = root.appendingPathComponent("checkpoint", isDirectory: true)
+        let output = root.appendingPathComponent("field-bundle", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: checkpoint, withIntermediateDirectories: true)
+        let metadata = VectorPolicyMetadata(
+            architectureVersion: VectorActorCritic.architectureVersion,
+            task: "arachne15-goal-v0", taskRevision: 5,
+            taskConfiguration: ["pointGoal": 1],
+            observationDimension: 60, actionDimension: 16,
+            simulationStep: 0.002, controlDecimation: 10,
+            maxEpisodeSteps: 1_000,
+            ppo: VectorPPOConfig(normalizeObservations: true),
+            normalizer: RunningNormalizerSnapshot(
+                count: 2, mean: [Double](repeating: 0, count: 60),
+                variance: [Double](repeating: 1, count: 60)))
+        let trainingState = VectorPPOTrainingState(
+            completedUpdates: 42, environmentSteps: 1_376_256)
+        try JSONEncoder().encode(metadata).write(
+            to: checkpoint.appendingPathComponent("metadata.json"))
+        try JSONEncoder().encode(trainingState).write(
+            to: checkpoint.appendingPathComponent("training-state.json"))
+        try Data([1, 2, 3, 4]).write(
+            to: checkpoint.appendingPathComponent("policy.safetensors"))
+
+        let sourceFingerprint = try VectorPPOTrainer.checkpointFingerprint(
+            directory: checkpoint.path)
+        let manifest = try VectorPolicyDeploymentBundle.export(
+            checkpointDirectory: checkpoint.path,
+            outputDirectory: output.path)
+        XCTAssertEqual(manifest.checkpointFingerprint, sourceFingerprint)
+        XCTAssertEqual(manifest.controlFrequencyHz, 50, accuracy: 1e-4)
+        XCTAssertEqual(manifest.trainingUpdates, 42)
+        XCTAssertEqual(try VectorPPOTrainer.checkpointFingerprint(
+            directory: output.path), sourceFingerprint)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output
+            .appendingPathComponent(
+                VectorPolicyDeploymentBundle.manifestFileName).path))
+        XCTAssertThrowsError(try VectorPolicyDeploymentBundle.export(
+            checkpointDirectory: checkpoint.path,
+            outputDirectory: output.path))
+    }
+
+    func testTrackedArachneDeploymentRuntimeHasExactInferenceParity() throws {
+        guard ProcessInfo.processInfo.environment[
+            "AVBD_MLX_INTEGRATION_TESTS"] == "1" else {
+            throw XCTSkip(
+                "requires an Xcode-packaged MLX default.metallib")
+        }
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bundle = packageRoot.appendingPathComponent(
+            "Robots/Arachne15/policies/"
+                + "arachne15-goal-r6-update-000020", isDirectory: true)
+        let fingerprint =
+            "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027"
+        let runtime = try VectorPolicyDeploymentRuntime(
+            bundleDirectory: bundle.path,
+            expectedTask: "arachne15-goal-v0",
+            expectedTaskRevision: 6,
+            expectedCheckpointFingerprint: fingerprint)
+        XCTAssertEqual(runtime.observationDimension, 60)
+        XCTAssertEqual(runtime.actionDimension, 16)
+        XCTAssertEqual(runtime.controlPeriodSeconds, 0.02, accuracy: 1e-8)
+
+        let observation = ContiguousArray((0..<60).map {
+            Float(($0 % 9) - 4) * 0.01
+        })
+        let deployedActions = try runtime.actions(for: observation)
+        let checkpointRunner = try VectorPolicyRunner(
+            checkpointDirectory: bundle.path)
+        let checkpointActions = try checkpointRunner.actions(for: observation)
+        XCTAssertEqual(deployedActions.count, 16)
+        for (deployed, checkpoint) in zip(deployedActions, checkpointActions) {
+            XCTAssertEqual(deployed, checkpoint, accuracy: 1e-7)
+            XCTAssertTrue(deployed.isFinite)
+            XCTAssertLessThanOrEqual(abs(deployed), 1.0001)
+        }
+        XCTAssertThrowsError(try runtime.actions(
+            for: ContiguousArray(repeating: 0, count: 59)))
+        var nonFinite = observation
+        nonFinite[17] = .nan
+        XCTAssertThrowsError(try runtime.actions(for: nonFinite))
+    }
+
+    func testDeploymentRuntimeRejectsTamperedPolicy() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = packageRoot.appendingPathComponent(
+            "Robots/Arachne15/policies/"
+                + "arachne15-goal-r6-update-000020", isDirectory: true)
+        let copy = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "avbd-tampered-deployment-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: copy) }
+        try FileManager.default.copyItem(at: source, to: copy)
+        let policyURL = copy.appendingPathComponent("policy.safetensors")
+        var bytes = try Data(contentsOf: policyURL)
+        bytes[bytes.index(before: bytes.endIndex)] ^= 0xff
+        try bytes.write(to: policyURL, options: .atomic)
+        XCTAssertThrowsError(try VectorPolicyDeploymentRuntime(
+            bundleDirectory: copy.path)) { error in
+            XCTAssertTrue(String(describing: error).contains("SHA-256"))
+        }
+    }
+
+    func testGuardedPolicyControllerFailsClosedAndRequiresRearm() throws {
+        let inference = TestVectorPolicyInference()
+        let controller = GuardedPolicyController(inference: inference)
+        let values = ContiguousArray<Float>([1, 2, 3])
+        var command = controller.command(for: .init(
+            sequence: 10, timestampSeconds: 99.99, values: values),
+            nowSeconds: 100)
+        XCTAssertEqual(command.mode, .safeStop)
+        XCTAssertEqual(command.fault, .notArmed)
+
+        controller.arm()
+        command = controller.command(for: .init(
+            sequence: 10, timestampSeconds: 99.99, values: values),
+            nowSeconds: 100)
+        XCTAssertEqual(command.mode, .active)
+        XCTAssertNil(command.fault)
+        XCTAssertEqual(command.values, [0.25, -0.5])
+        XCTAssertEqual(command.policyFingerprint, "qualified-test-policy")
+        XCTAssertEqual(command.validUntilSeconds - command.createdAtSeconds,
+                       0.02, accuracy: 1e-8)
+
+        command = controller.command(for: .init(
+            sequence: 10, timestampSeconds: 100, values: values),
+            nowSeconds: 100.01)
+        XCTAssertEqual(command.mode, .safeStop)
+        XCTAssertEqual(command.fault, .outOfOrderObservation)
+        XCTAssertFalse(controller.isArmed)
+
+        controller.arm()
+        command = controller.command(for: .init(
+            sequence: 11, timestampSeconds: 99, values: values),
+            nowSeconds: 100)
+        XCTAssertEqual(command.fault, .staleObservation)
+        XCTAssertFalse(controller.isArmed)
+
+        controller.arm()
+        inference.result = [.nan, 0]
+        command = controller.command(for: .init(
+            sequence: 12, timestampSeconds: 100, values: values),
+            nowSeconds: 100.01)
+        XCTAssertEqual(command.fault, .invalidAction)
+        XCTAssertEqual(command.values, [0, 0])
+        XCTAssertFalse(controller.isArmed)
+    }
+
+    func testArachneDeploymentControllerEmitsCalibratedDeadlineFrame() throws {
+        let inference = TestVectorPolicyInference(
+            observationDimension: 60, actionDimension: 16,
+            checkpointFingerprint: "arachne-qualified")
+        inference.result = ContiguousArray((0..<16).map {
+            $0.isMultiple(of: 2) ? Float(0.5) : Float(-0.5)
+        })
+        let calibration = Arachne15HardwareCalibration(
+            robotSerial: "AR15-TEST", commissioned: true,
+            measuredAtUTC: "2026-07-16T00:00:00Z",
+            policyCheckpointFingerprint: "arachne-qualified",
+            servoIDs: Array(1...16),
+            servoZeroRadians: [Float](repeating: 2.5, count: 16),
+            servoDirectionSigns: [Float](repeating: 1, count: 16),
+            jointLowerRadians: (0..<16).map {
+                $0.isMultiple(of: 2) ? -0.55 : -0.7
+            },
+            jointUpperRadians: (0..<16).map {
+                $0.isMultiple(of: 2) ? 0.55 : 0.7
+            },
+            currentLimitsMilliamps: [Int](repeating: 300, count: 16),
+            maximumServoTemperatureCelsius: 55,
+            measuredMaximumRoundTripLatencySeconds: 0.018)
+        let deployment = try Arachne15DeploymentController(
+            inference: inference, calibration: calibration)
+        let input = Arachne15PolicyInput(
+            bodyLinearVelocity: .zero, bodyAngularVelocity: .zero,
+            projectedGravity: F3(0, 0, 1), commandedBodyTwist: .zero,
+            jointPositions: [Float](repeating: 0, count: 16),
+            jointVelocities: [Float](repeating: 0, count: 16),
+            previousActions: [Float](repeating: 0, count: 16))
+        var frame = deployment.command(
+            for: input, sequence: 1, sensorTimestampSeconds: 10,
+            nowSeconds: 10.01)
+        XCTAssertEqual(frame.mode, .safeStop)
+        XCTAssertEqual(frame.servoPositionRadians, [])
+
+        deployment.arm()
+        frame = deployment.command(
+            for: input, sequence: 2, sensorTimestampSeconds: 10,
+            nowSeconds: 10.01)
+        XCTAssertEqual(frame.mode, .active)
+        XCTAssertEqual(frame.servoIDs, Array(1...16))
+        XCTAssertEqual(frame.policyFingerprint, "arachne-qualified")
+        XCTAssertEqual(frame.servoPositionRadians.count, 16)
+        XCTAssertEqual(frame.servoPositionRadians[0], 2.675, accuracy: 1e-6)
+        XCTAssertEqual(frame.servoPositionRadians[1], 2.275, accuracy: 1e-6)
+        XCTAssertEqual(try JSONDecoder().decode(
+            Arachne15ServoCommandFrame.self,
+            from: JSONEncoder().encode(frame)), frame)
+
+        var corrupt = input
+        corrupt.projectedGravity = .zero
+        frame = deployment.command(
+            for: corrupt, sequence: 3, sensorTimestampSeconds: 10.02,
+            nowSeconds: 10.03)
+        XCTAssertEqual(frame.mode, .safeStop)
+        XCTAssertEqual(frame.fault, .invalidObservation)
+        XCTAssertTrue(frame.servoPositionRadians.isEmpty)
+        XCTAssertFalse(deployment.supervisor.isArmed)
     }
 }

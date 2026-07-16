@@ -119,7 +119,8 @@ public enum BuiltInRLTasks {
         "pushContactCurriculumMaximumGoalDistance",
     ]
     private static let arachne15OptionKeys: Set<String> = [
-        "maxEpisodeSteps", "controlDecimation", "commandResamplingSteps",
+        "maxEpisodeSteps", "controlDecimation", "solverIterations",
+        "commandResamplingSteps",
         "minimumForwardVelocity", "maximumForwardVelocity",
         "maximumLateralVelocity", "maximumYawRate",
         "standingCommandProbability", "initialRollPitchRange",
@@ -127,11 +128,13 @@ public enum BuiltInRLTasks {
         "maximumActionLatencySteps", "validationCollisionProfile",
         "domainRandomization",
         "pointGoal", "minimumGoalDistance", "maximumGoalDistance",
+        "maximumGoalDirectionAngle",
         "goalRadius", "goalSlowdownDistance", "goalCommandSpeed",
         "goalBoundaryCommandSpeed", "maximumGoalArrivalSpeed",
         "goalDwellSteps", "goalProgressRewardWeight",
         "goalStableRewardWeight", "goalSuccessBonus",
         "commandProgressRewardWeight", "velocityErrorPenaltyWeight",
+        "yawErrorPenaltyWeight",
         "massScaleLower", "massScaleUpper",
         "inertiaScaleLower", "inertiaScaleUpper",
         "frictionScaleLower", "frictionScaleUpper",
@@ -178,11 +181,24 @@ public enum BuiltInRLTasks {
                 "motorDampingScale", fallbackRandomization.motorDamping),
             armature: try range(
                 "armatureScale", fallbackRandomization.armature))
+        let requestedGoalDirectionAngle =
+            cfg.options["maximumGoalDirectionAngle"] ?? .pi
+        guard requestedGoalDirectionAngle > 0,
+              requestedGoalDirectionAngle <= Float.pi + 1e-6 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Arachne maximumGoalDirectionAngle must be in (0, pi]")
+        }
+        // Decimal CLI spellings of pi commonly round one Float ULP above
+        // `Float.pi`. Canonicalizing that tolerance keeps checkpoint metadata
+        // exact without accepting a genuinely wider-than-circle range.
+        let maximumGoalDirectionAngle = min(
+            requestedGoalDirectionAngle, Float.pi)
         return Arachne15LocomotionTaskConfig(
             numEnvironments: cfg.numEnvironments,
             seed: cfg.seed,
             maxEpisodeSteps: Int(cfg.options["maxEpisodeSteps"] ?? 1_000),
             controlDecimation: Int(cfg.options["controlDecimation"] ?? 10),
+            solverIterations: Int(cfg.options["solverIterations"] ?? 20),
             commandResamplingSteps: Int(
                 cfg.options["commandResamplingSteps"] ?? 500),
             minimumForwardVelocity:
@@ -210,24 +226,28 @@ public enum BuiltInRLTasks {
                 cfg.options["minimumGoalDistance"] ?? 0.60,
             maximumGoalDistance:
                 cfg.options["maximumGoalDistance"] ?? 2.0,
+            maximumGoalDirectionAngle:
+                maximumGoalDirectionAngle,
             goalRadius: cfg.options["goalRadius"] ?? 0.12,
             goalSlowdownDistance:
                 cfg.options["goalSlowdownDistance"] ?? 0.50,
-            goalCommandSpeed: cfg.options["goalCommandSpeed"] ?? 0.20,
+            goalCommandSpeed: cfg.options["goalCommandSpeed"] ?? 0.15,
             goalBoundaryCommandSpeed:
-                cfg.options["goalBoundaryCommandSpeed"] ?? 0.05,
+                cfg.options["goalBoundaryCommandSpeed"] ?? 0.02,
             maximumGoalArrivalSpeed:
                 cfg.options["maximumGoalArrivalSpeed"] ?? 0.08,
             goalDwellSteps: Int(cfg.options["goalDwellSteps"] ?? 15),
             goalProgressRewardWeight:
-                cfg.options["goalProgressRewardWeight"] ?? 2.0,
+                cfg.options["goalProgressRewardWeight"] ?? 4.0,
             goalStableRewardWeight:
-                cfg.options["goalStableRewardWeight"] ?? 0.5,
-            goalSuccessBonus: cfg.options["goalSuccessBonus"] ?? 5.0,
+                cfg.options["goalStableRewardWeight"] ?? 1.0,
+            goalSuccessBonus: cfg.options["goalSuccessBonus"] ?? 8.0,
             commandProgressRewardWeight:
-                cfg.options["commandProgressRewardWeight"] ?? 8.0,
+                cfg.options["commandProgressRewardWeight"] ?? 20.0,
             velocityErrorPenaltyWeight:
-                cfg.options["velocityErrorPenaltyWeight"] ?? 2.0,
+                cfg.options["velocityErrorPenaltyWeight"] ?? 5.0,
+            yawErrorPenaltyWeight:
+                cfg.options["yawErrorPenaltyWeight"] ?? 5.0,
             autoReset: cfg.autoReset)
     }
 

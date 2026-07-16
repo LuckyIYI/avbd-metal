@@ -1043,6 +1043,13 @@ public struct PPOEvaluationMetrics: Codable, Sendable {
     public var provenanceVersion: Int? = nil
     public var task: String
     public var taskRevision: Int? = nil
+    /// Exact serialized task contracts on the two sides of evaluation.
+    /// These are intentionally part of every new report: collision-profile
+    /// and domain-randomization validation must never masquerade as an
+    /// in-distribution checkpoint replay.
+    public var checkpointTaskConfiguration: [String: Float]? = nil
+    public var evaluationTaskConfiguration: [String: Float]? = nil
+    public var taskConfigurationTransferred: Bool? = nil
     public var checkpointDirectory: String
     public var checkpointFingerprint: String? = nil
     public var initializationCheckpoint: String? = nil
@@ -1075,6 +1082,8 @@ public struct PPOScalarSummary: Codable, Sendable, Equatable {
 
 public struct PPOEvaluationAggregate: Codable, Sendable {
     public var task: String
+    public var evaluationTaskConfiguration: [String: Float]?
+    public var taskConfigurationTransferred: Bool?
     public var trainingSeeds: [UInt64]
     public var evaluationSeeds: [UInt64]
     public var evaluationEnvironments: Int?
@@ -1114,9 +1123,13 @@ public struct PPOEvaluationAggregate: Codable, Sendable {
         }
         guard evaluations.allSatisfy({
             $0.evaluationEnvironments == first.evaluationEnvironments
+                && $0.evaluationTaskConfiguration
+                    == first.evaluationTaskConfiguration
+                && $0.taskConfigurationTransferred
+                    == first.taskConfigurationTransferred
         }) else {
             throw RLEnvironmentError.invalidConfiguration(
-                "evaluation reports must use the same replica count")
+                "evaluation reports must use the same replica count and task contract")
         }
         guard Set(evaluations.map(\.trainingSeed)).count == evaluations.count else {
             throw RLEnvironmentError.invalidConfiguration(
@@ -1144,12 +1157,18 @@ public struct PPOEvaluationAggregate: Codable, Sendable {
                 && $0.taskRevision != nil
                 && ($0.evaluationEnvironments ?? 0) > 0
                 && !($0.checkpointFingerprint ?? "").isEmpty
+                && (($0.provenanceVersion ?? 0) < 3
+                    || ($0.checkpointTaskConfiguration != nil
+                        && $0.evaluationTaskConfiguration != nil
+                        && $0.taskConfigurationTransferred != nil))
         }
         let allRunsFromScratch = evaluations.allSatisfy {
             $0.initializationCheckpoint == nil
         }
         return Self(
             task: first.task,
+            evaluationTaskConfiguration: first.evaluationTaskConfiguration,
+            taskConfigurationTransferred: first.taskConfigurationTransferred,
             trainingSeeds: evaluations.map(\.trainingSeed).sorted(),
             evaluationSeeds: evaluations.map(\.evaluationSeed).sorted(),
             evaluationEnvironments: first.evaluationEnvironments,
@@ -1204,6 +1223,8 @@ public struct PPOEvaluationAggregate: Codable, Sendable {
 public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
     public var scope: String
     public var task: String
+    public var evaluationTaskConfiguration: [String: Float]?
+    public var taskConfigurationTransferred: Bool?
     public var checkpointDirectory: String
     public var trainingSeed: UInt64
     public var checkpointFingerprint: String?
@@ -1247,6 +1268,12 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
                 && $0.trainingUpdates == first.trainingUpdates
                 && $0.trainingEnvironmentSteps == first.trainingEnvironmentSteps
                 && $0.evaluationEnvironments == first.evaluationEnvironments
+                && $0.checkpointTaskConfiguration
+                    == first.checkpointTaskConfiguration
+                && $0.evaluationTaskConfiguration
+                    == first.evaluationTaskConfiguration
+                && $0.taskConfigurationTransferred
+                    == first.taskConfigurationTransferred
         }) else {
             throw RLEnvironmentError.invalidConfiguration(
                 "checkpoint robustness reports must describe one immutable checkpoint")
@@ -1278,10 +1305,16 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
                 && $0.taskRevision != nil
                 && ($0.evaluationEnvironments ?? 0) > 0
                 && !($0.checkpointFingerprint ?? "").isEmpty
+                && (($0.provenanceVersion ?? 0) < 3
+                    || ($0.checkpointTaskConfiguration != nil
+                        && $0.evaluationTaskConfiguration != nil
+                        && $0.taskConfigurationTransferred != nil))
         }
         return Self(
             scope: "single_checkpoint_across_evaluation_seeds",
             task: first.task,
+            evaluationTaskConfiguration: first.evaluationTaskConfiguration,
+            taskConfigurationTransferred: first.taskConfigurationTransferred,
             checkpointDirectory: first.checkpointDirectory,
             trainingSeed: first.trainingSeed,
             checkpointFingerprint: first.checkpointFingerprint,
@@ -1344,6 +1377,8 @@ public struct PPOCheckpointSelection: Codable, Sendable {
     public var validationSeed: UInt64
     public var validationSeeds: [UInt64]? = nil
     public var validationEnvironments: Int? = nil
+    public var evaluationTaskConfiguration: [String: Float]? = nil
+    public var taskConfigurationTransferred: Bool? = nil
     public var validationEpisodesPerCandidate: Int
     public var validationEpisodesPerSeed: Int? = nil
     public var selectionRule: String
@@ -1373,6 +1408,10 @@ public struct PPOCheckpointSelection: Codable, Sendable {
                 && $0.trainingSeed == first.trainingSeed
                 && $0.initializationCheckpoint == first.initializationCheckpoint
                 && $0.evaluationEnvironments == evaluationEnvironments
+                && $0.evaluationTaskConfiguration
+                    == first.evaluationTaskConfiguration
+                && $0.taskConfigurationTransferred
+                    == first.taskConfigurationTransferred
                 && !($0.checkpointFingerprint ?? "").isEmpty
         }) else {
             throw RLEnvironmentError.invalidConfiguration(
@@ -1468,6 +1507,8 @@ public struct PPOCheckpointSelection: Codable, Sendable {
             validationSeed: expectedSeeds[0],
             validationSeeds: expectedSeeds,
             validationEnvironments: evaluationEnvironments,
+            evaluationTaskConfiguration: first.evaluationTaskConfiguration,
+            taskConfigurationTransferred: first.taskConfigurationTransferred,
             validationEpisodesPerCandidate: expectedEpisodes.values.reduce(0, +),
             validationEpisodesPerSeed: uniformEpisodesPerSeed,
             selectionRule: "all_validation_acceptance_pass,worst_seed_success_rate,pooled_success_rate,mean_return,earlier_update,fingerprint",
@@ -1484,6 +1525,12 @@ public struct PPOCheckpointSelection: Codable, Sendable {
               evaluation.initializationCheckpoint == initializationCheckpoint,
               evaluation.checkpointDirectory == selectedCheckpointDirectory,
               evaluation.checkpointFingerprint == selectedCheckpointFingerprint,
+              evaluationTaskConfiguration == nil
+                || evaluation.evaluationTaskConfiguration
+                    == evaluationTaskConfiguration,
+              taskConfigurationTransferred == nil
+                || evaluation.taskConfigurationTransferred
+                    == taskConfigurationTransferred,
               validationEnvironments == nil
                 || evaluation.evaluationEnvironments == validationEnvironments else {
             throw RLEnvironmentError.invalidConfiguration(
@@ -1745,13 +1792,35 @@ public final class VectorPolicyRunner {
         expertGates: ContiguousArray<Float>? = nil,
         standExpertGates: ContiguousArray<Float>? = nil
     ) throws -> RLActionBatch {
-        let n = observation.policy.count / metadata.observationDimension
-        guard n > 0, observation.policy.count == n * metadata.observationDimension else {
+        let values = try actions(
+            for: observation.policy, expertGates: expertGates,
+            standExpertGates: standExpertGates)
+        return try RLActionBatch(
+            numEnvironments: values.count / metadata.actionDimension,
+            actionDimension: metadata.actionDimension, values: values)
+    }
+
+    /// Deterministic inference over row-major policy observations without a
+    /// simulator-owned observation wrapper. This is the deployment entry
+    /// point used by an iPhone or other hardware controller.
+    public func actions(
+        for policyObservations: ContiguousArray<Float>,
+        expertGates: ContiguousArray<Float>? = nil,
+        standExpertGates: ContiguousArray<Float>? = nil
+    ) throws -> ContiguousArray<Float> {
+        let n = policyObservations.count / metadata.observationDimension
+        guard n > 0,
+              policyObservations.count == n * metadata.observationDimension else {
             throw RLEnvironmentError.invalidObservationCount(
-                expected: metadata.observationDimension, actual: observation.policy.count)
+                expected: metadata.observationDimension,
+                actual: policyObservations.count)
+        }
+        if let index = policyObservations.firstIndex(where: { !$0.isFinite }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "observation value at flat index \(index) is not finite")
         }
         let normalized = metadata.ppo.normalizeObservations
-            ? normalizer.normalize(observation.policy) : observation.policy
+            ? normalizer.normalize(policyObservations) : policyObservations
         let input = MLXArray(Array(normalized)).reshaped(
             [n, metadata.observationDimension])
         if let expertGates, expertGates.count != n {
@@ -1772,9 +1841,11 @@ public final class VectorPolicyRunner {
             policy.forward(
                 input, expertGate: gate, standExpertGate: standGate).mean)
         eval(output)
-        return try RLActionBatch(numEnvironments: n,
-                                 actionDimension: metadata.actionDimension,
-                                 values: ContiguousArray(output.asArray(Float.self)))
+        let values = ContiguousArray(output.asArray(Float.self))
+        if let index = values.firstIndex(where: { !$0.isFinite }) {
+            throw RLEnvironmentError.nonFiniteAction(index: index)
+        }
+        return values
     }
 }
 
@@ -2991,7 +3062,8 @@ public final class VectorPPOTrainer {
     public static func evaluate(task: any VectorizedRLTask,
                                 checkpointDirectory: String,
                                 episodes requestedEpisodes: Int,
-                                seed: UInt64 = 10_001) throws
+                                seed: UInt64 = 10_001,
+                                allowTaskConfigurationTransfer: Bool = false) throws
         -> PPOEvaluationMetrics {
         guard requestedEpisodes > 0 else {
             throw RLEnvironmentError.invalidConfiguration(
@@ -3023,7 +3095,7 @@ public final class VectorPPOTrainer {
         } ?? true
         guard metadata.task == spec.id,
               (metadata.taskRevision ?? 1) == spec.revision,
-              taskConfigurationMatches,
+              (taskConfigurationMatches || allowTaskConfigurationTransfer),
               metadata.observationDimension == spec.observation.elementCount,
               metadata.actionDimension == spec.action.elementCount,
               metadata.simulationStep == spec.simulationStep,
@@ -3188,8 +3260,11 @@ public final class VectorPPOTrainer {
             acceptance = nil
         }
         return PPOEvaluationMetrics(
-            provenanceVersion: 2,
+            provenanceVersion: 3,
             task: spec.id, taskRevision: spec.revision,
+            checkpointTaskConfiguration: metadata.taskConfiguration,
+            evaluationTaskConfiguration: spec.configurationValues,
+            taskConfigurationTransferred: !taskConfigurationMatches,
             checkpointDirectory: checkpointDirectory,
             checkpointFingerprint: checkpointFingerprint,
             initializationCheckpoint: metadata.ppo.initializationCheckpoint,
