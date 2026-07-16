@@ -256,11 +256,59 @@ public enum BuiltInRLTasks {
         "robotInitialJointNoise", "normalizedDenseReward",
     ]
 
+    /// Scalar experiment files stay portable while this schema restores the
+    /// option types before any task factory can truncate or coerce a value.
+    private static let integerOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "solverIterations",
+        "commandResamplingSteps", "commandCurriculumControlSteps",
+        "standingCommandCurriculumControlSteps",
+        "lateralPenaltyWarmupControlSteps", "lateralPenaltyRampControlSteps",
+        "goalDirectionCurriculumControlSteps",
+        "goalDistanceCurriculumControlSteps", "goalDwellSteps",
+        "projectileCurriculumControlSteps", "minimumProjectileLaunchStep",
+        "maximumProjectileLaunchStep", "maximumActionLatencySteps",
+    ]
+    private static let positiveIntegerOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "solverIterations",
+        "commandResamplingSteps", "goalDwellSteps",
+    ]
+    private static let booleanOptionKeys: Set<String> = [
+        "commandGatedActor", "threeModeActor",
+        "standExpertRequiresDoubleSupport", "standExpertUsesPlanarSpeed",
+        "freezeBasePolicyExpert", "freezeLowSpeedPolicyExpert",
+        "trainBasePolicyExpert", "pointGoal", "observationNoise",
+        "recoveryGatedActor", "recoveryContextObservations",
+        "recoveryExpertGateDecay",
+        "initializeRecoveryExpertFromBaseOnTransfer",
+        "initializeRecoveryExpertFromMirroredBaseOnTransfer",
+        "goalObservationUsesLateralVelocity",
+        "goalObservationIncludesLateralVelocity", "precisionGatedActor",
+        "continueAfterSuccess", "validationCollisionProfile",
+        "domainRandomization", "normalizedDenseReward",
+    ]
+
+    private static func optionSchema(
+        _ optionNames: Set<String>
+    ) -> RLTaskOptionSchema {
+        RLTaskOptionSchema(optionNames.sorted().map { name in
+            if booleanOptionKeys.contains(name) {
+                return RLTaskOptionDefinition(name, valueKind: .boolean)
+            }
+            if integerOptionKeys.contains(name) {
+                return RLTaskOptionDefinition(
+                    name,
+                    valueKind: .integer,
+                    lowerBound: positiveIntegerOptionKeys.contains(name) ? 1 : 0)
+            }
+            return RLTaskOptionDefinition(name)
+        })
+    }
+
     public static let registry: RLTaskRegistry = {
         let registry = RLTaskRegistry()
-        try! registry.register("pusht-state-v0") { cfg in
-            try cfg.validateOptions(
-                supported: pushTOptionKeys, taskID: "pusht-state-v0")
+        try! registry.register(
+            "pusht-state-v0", optionSchema: optionSchema(pushTOptionKeys)
+        ) { cfg in
             return try PushTTask(configuration: PushTTaskConfig(
                 numEnvironments: cfg.numEnvironments,
                 seed: cfg.seed,
@@ -269,9 +317,10 @@ public enum BuiltInRLTasks {
                 actionScale: cfg.options["actionScale"] ?? 0.18,
                 autoReset: cfg.autoReset))
         }
-        try! registry.register("humanoid-walk-v0") { cfg in
-            try cfg.validateOptions(
-                supported: humanoidWalkOptionKeys, taskID: "humanoid-walk-v0")
+        try! registry.register(
+            "humanoid-walk-v0",
+            optionSchema: optionSchema(humanoidWalkOptionKeys)
+        ) { cfg in
             return try HumanoidWalkTask(configuration: HumanoidWalkTaskConfig(
                 numEnvironments: cfg.numEnvironments,
                 seed: cfg.seed,
@@ -363,10 +412,10 @@ public enum BuiltInRLTasks {
                     + ((cfg.options["freezeLowSpeedPolicyExpert"] ?? 0) > 0
                         ? 3_200 : 0))
         }
-        try! registry.register("humanoid-velocity-v0") { cfg in
-            try cfg.validateOptions(
-                supported: humanoidVelocityOptionKeys,
-                taskID: "humanoid-velocity-v0")
+        try! registry.register(
+            "humanoid-velocity-v0",
+            optionSchema: optionSchema(humanoidVelocityOptionKeys)
+        ) { cfg in
             return try HumanoidVelocityTask(
                 configuration: HumanoidVelocityTaskConfig(
                     numEnvironments: cfg.numEnvironments,
@@ -397,10 +446,10 @@ public enum BuiltInRLTasks {
                         cfg.options["initialYawRange"] ?? .pi,
                     autoReset: cfg.autoReset))
         }
-        try! registry.register("humanoid-isaac-flat-v0") { cfg in
-            try cfg.validateOptions(
-                supported: humanoidIsaacVelocityOptionKeys,
-                taskID: "humanoid-isaac-flat-v0")
+        try! registry.register(
+            "humanoid-isaac-flat-v0",
+            optionSchema: optionSchema(humanoidIsaacVelocityOptionKeys)
+        ) { cfg in
             return try HumanoidIsaacVelocityTask(
                 configuration: HumanoidIsaacVelocityTaskConfig(
                     numEnvironments: cfg.numEnvironments,
@@ -419,10 +468,10 @@ public enum BuiltInRLTasks {
                         Int(cfg.options["solverIterations"] ?? 20),
                     autoReset: cfg.autoReset))
         }
-        try! registry.register("humanoid-isaac-goal-v0") { cfg in
-            try cfg.validateOptions(
-                supported: humanoidIsaacGoalOptionKeys,
-                taskID: "humanoid-isaac-goal-v0")
+        try! registry.register(
+            "humanoid-isaac-goal-v0",
+            optionSchema: optionSchema(humanoidIsaacGoalOptionKeys)
+        ) { cfg in
             guard (cfg.options["pointGoal"] ?? 1) == 1 else {
                 throw RLEnvironmentError.invalidConfiguration(
                     "humanoid-isaac-goal-v0 requires pointGoal=1")
@@ -513,9 +562,10 @@ public enum BuiltInRLTasks {
                         cfg.options["postImpactFallPenalty"] ?? 0),
                 taskID: "humanoid-isaac-goal-v0")
         }
-        try! registry.register("humanoid-goal-v0") { cfg in
-            try cfg.validateOptions(
-                supported: humanoidGoalOptionKeys, taskID: "humanoid-goal-v0")
+        try! registry.register(
+            "humanoid-goal-v0",
+            optionSchema: optionSchema(humanoidGoalOptionKeys)
+        ) { cfg in
             guard (cfg.options["standingCommandProbability"] ?? 0) == 0 else {
                 throw RLEnvironmentError.invalidConfiguration(
                     "humanoid-goal-v0 requires standingCommandProbability=0; "
@@ -685,9 +735,9 @@ public enum BuiltInRLTasks {
                         "goalObservationIncludesLateralVelocity"] ?? 0)
                         > 0 ? 204_800 : 0))
         }
-        try! registry.register("arm-pusht-v0") { cfg in
-            try cfg.validateOptions(
-                supported: armPushTOptionKeys, taskID: "arm-pusht-v0")
+        try! registry.register(
+            "arm-pusht-v0", optionSchema: optionSchema(armPushTOptionKeys)
+        ) { cfg in
             return try ArmPushTTask(configuration: ArmPushTTaskConfig(
                 numEnvironments: cfg.numEnvironments,
                 seed: cfg.seed,
@@ -782,27 +832,27 @@ public enum BuiltInRLTasks {
                     cfg.options[
                         "pushContactCurriculumMaximumGoalDistance"] ?? 0))
         }
-        try! registry.register("arachne15-velocity-v0") { cfg in
-            try cfg.validateOptions(
-                supported: arachne15OptionKeys,
-                taskID: "arachne15-velocity-v0")
+        try! registry.register(
+            "arachne15-velocity-v0",
+            optionSchema: optionSchema(arachne15OptionKeys)
+        ) { cfg in
             return try Arachne15LocomotionTask(
                 configuration: try arachne15Configuration(
                     cfg, pointGoal: false))
         }
-        try! registry.register("arachne15-goal-v0") { cfg in
-            try cfg.validateOptions(
-                supported: arachne15OptionKeys,
-                taskID: "arachne15-goal-v0")
+        try! registry.register(
+            "arachne15-goal-v0",
+            optionSchema: optionSchema(arachne15OptionKeys)
+        ) { cfg in
             return try Arachne15LocomotionTask(
                 configuration: try arachne15Configuration(
                     cfg, pointGoal: true),
                 taskID: "arachne15-goal-v0")
         }
-        try! registry.register("maniskill-pusht-v1") { cfg in
-            try cfg.validateOptions(
-                supported: maniSkillPushTOptionKeys,
-                taskID: "maniskill-pusht-v1")
+        try! registry.register(
+            "maniskill-pusht-v1",
+            optionSchema: optionSchema(maniSkillPushTOptionKeys)
+        ) { cfg in
             return try ManiSkillPushTTask(configuration: .init(
                 numEnvironments: cfg.numEnvironments,
                 seed: cfg.seed,

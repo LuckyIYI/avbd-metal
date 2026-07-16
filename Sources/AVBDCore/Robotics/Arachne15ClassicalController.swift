@@ -91,8 +91,10 @@ public final class Arachne15ClassicalController {
             activeSwingLeg: [], swingPhase: [], constrainedTargetCount: 0)
     }
 
-    public func reset(states: [Arachne15State]) {
-        environments = states.map { state in
+    public func reset(
+        states: [Arachne15State], environments environmentIDs: [Int]? = nil
+    ) {
+        let rebuilt = states.map { state in
             let inverse = state.root.rotation.conjugate
             let neutral = state.feet.map {
                 inverse.act($0.position - state.root.position)
@@ -100,10 +102,24 @@ public final class Arachne15ClassicalController {
             return EnvironmentState(
                 neutralFeetInBody: neutral)
         }
-        diagnostics = Diagnostics(
-            activeSwingLeg: [Int?](repeating: nil, count: states.count),
-            swingPhase: [Float](repeating: 0, count: states.count),
-            constrainedTargetCount: 0)
+        guard let environmentIDs,
+              environments.count == states.count,
+              diagnostics.activeSwingLeg.count == states.count,
+              diagnostics.swingPhase.count == states.count else {
+            environments = rebuilt
+            diagnostics = Diagnostics(
+                activeSwingLeg: [Int?](repeating: nil, count: states.count),
+                swingPhase: [Float](repeating: 0, count: states.count),
+                constrainedTargetCount: 0)
+            return
+        }
+        precondition(environmentIDs.allSatisfy(states.indices.contains))
+        for environment in environmentIDs {
+            environments[environment] = rebuilt[environment]
+            diagnostics.activeSwingLeg[environment] = nil
+            diagnostics.swingPhase[environment] = 0
+        }
+        diagnostics.constrainedTargetCount = 0
     }
 
     /// Produce one batched action for the task's current measured state and
@@ -273,5 +289,44 @@ public final class Arachne15ClassicalController {
 
     private static func wrappedAngle(_ angle: Float) -> Float {
         atan2(sin(angle), cos(angle))
+    }
+}
+
+extension Arachne15ClassicalController: RLActionProvider {
+    public var actionProviderID: String { "arachne-paired-ripple-cpg-ik" }
+
+    public func reset(
+        for task: any VectorizedRLTask,
+        environments environmentIDs: [Int]?,
+        observation: RLObservationBatch
+    ) throws {
+        try observation.validate(for: task.spec)
+        guard let arachne = task as? Arachne15LocomotionTask else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Arachne classical controller requires Arachne15LocomotionTask")
+        }
+        let checkedIDs = try task.checkedEnvironmentIDs(environmentIDs)
+        reset(
+            states: arachne.environment.states(),
+            environments: environmentIDs == nil ? nil : checkedIDs)
+    }
+
+    public func actions(
+        for observation: RLObservationBatch,
+        task: any VectorizedRLTask
+    ) throws -> RLActionBatch {
+        try observation.validate(for: task.spec)
+        guard let arachne = task as? Arachne15LocomotionTask else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Arachne classical controller requires Arachne15LocomotionTask")
+        }
+        let commands = (0..<task.spec.numEnvironments).map {
+            arachne.currentCommand(environment: $0)
+        }
+        let batch = actions(
+            states: arachne.environment.states(), commands: commands,
+            spec: task.spec)
+        try batch.validate(for: task.spec)
+        return batch
     }
 }

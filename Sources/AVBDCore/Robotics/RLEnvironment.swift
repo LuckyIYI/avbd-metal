@@ -275,6 +275,66 @@ public protocol VectorizedRLTask: AnyObject {
     func step(actions: RLActionBatch, into result: inout RLStepBatch) throws
 }
 
+/// Controller boundary shared by learned policies, classical baselines, and
+/// future planners that act on a `VectorizedRLTask`. Providers own inference
+/// or controller memory; tasks continue to own simulation state and physics.
+/// Keeping this contract in AVBDCore prevents replay/evaluation code from
+/// branching on a concrete controller implementation.
+public protocol RLActionProvider: AnyObject {
+    /// Stable diagnostic identity exposed to replay/evaluation front ends.
+    var actionProviderID: String { get }
+
+    /// Reset provider-owned state after the task has produced post-reset
+    /// observations. `environments == nil` means the complete batch; a list
+    /// supports task-side auto-reset without disturbing other controller rows.
+    func reset(
+        for task: any VectorizedRLTask,
+        environments: [Int]?,
+        observation: RLObservationBatch
+    ) throws
+
+    /// Produce one task-shaped action batch from the measured observation.
+    func actions(
+        for observation: RLObservationBatch,
+        task: any VectorizedRLTask
+    ) throws -> RLActionBatch
+}
+
+public extension RLActionProvider {
+    func reset(
+        for task: any VectorizedRLTask,
+        environments: [Int]?,
+        observation: RLObservationBatch
+    ) throws {}
+
+    /// Whole-batch convenience used after an explicit task reset.
+    func reset(
+        for task: any VectorizedRLTask,
+        observation: RLObservationBatch
+    ) throws {
+        try reset(for: task, environments: nil, observation: observation)
+    }
+
+    /// Synchronize stateful provider rows after a task performs Gymnasium
+    /// auto-reset inside `step`. Stateless learned policies use the default
+    /// no-op reset witness; CPGs and recurrent policies can reset only rows
+    /// whose returned observation belongs to a new episode.
+    func resetAfterStep(
+        for task: any VectorizedRLTask,
+        result: RLStepBatch
+    ) throws {
+        guard task.spec.autoReset else { return }
+        try result.validate(for: task.spec)
+        let resetEnvironments = (0..<task.spec.numEnvironments).filter {
+            result.terminated[$0] || result.truncated[$0]
+        }
+        guard !resetEnvironments.isEmpty else { return }
+        try reset(
+            for: task, environments: resetEnvironments,
+            observation: result.observations)
+    }
+}
+
 /// Optional exact symmetry of a task's policy tensors. Algorithms can use
 /// this for data augmentation or actor mirror consistency without a reference
 /// trajectory, gait phase, or task-specific branch in the learner. Both
@@ -504,20 +564,54 @@ public final class RLTaskRegistry: @unchecked Sendable {
 
     private let lock = NSLock()
     private var factories: [String: Factory] = [:]
+    private var optionSchemas: [String: RLTaskOptionSchema] = [:]
 
     public init() {}
 
-    public func register(_ id: String, factory: @escaping Factory) throws {
+    public func register(
+        _ id: String,
+        optionSchema: RLTaskOptionSchema? = nil,
+        factory: @escaping Factory
+    ) throws {
         lock.lock()
         defer { lock.unlock() }
         guard factories[id] == nil else { throw RLEnvironmentError.duplicateTask(id) }
         factories[id] = factory
+        optionSchemas[id] = optionSchema
     }
 
     public var taskIDs: [String] {
         lock.lock()
         defer { lock.unlock() }
         return factories.keys.sorted()
+    }
+
+    /// Returns the task's machine-readable option contract, if its factory
+    /// opted into central validation.
+    public func optionSchema(for id: String) -> RLTaskOptionSchema? {
+        lock.lock()
+        defer { lock.unlock() }
+        return optionSchemas[id]
+    }
+
+    /// Reconstruct task options from checkpoint metadata without injecting a
+    /// structural field into tasks that intentionally hardcode it. Exact
+    /// compatibility is still checked after the task has been constructed.
+    public func checkpointReplayOptions(
+        for id: String,
+        semanticOptions: [String: Float],
+        maxEpisodeSteps: Int,
+        controlDecimation: Int
+    ) -> [String: Float] {
+        var options = semanticOptions
+        let definitions = optionSchema(for: id)?.definitions ?? [:]
+        if definitions["maxEpisodeSteps"] != nil {
+            options["maxEpisodeSteps"] = Float(maxEpisodeSteps)
+        }
+        if definitions["controlDecimation"] != nil {
+            options["controlDecimation"] = Float(controlDecimation)
+        }
+        return options
     }
 
     public func make(_ id: String, configuration: RLTaskConfiguration) throws
@@ -528,11 +622,13 @@ public final class RLTaskRegistry: @unchecked Sendable {
         }
         lock.lock()
         let factory = factories[id]
+        let optionSchema = optionSchemas[id]
         let available = factories.keys.sorted()
         lock.unlock()
         guard let factory else {
             throw RLEnvironmentError.unknownTask(id, available: available)
         }
+        try optionSchema?.validate(configuration, taskID: id)
         return try factory(configuration)
     }
 }

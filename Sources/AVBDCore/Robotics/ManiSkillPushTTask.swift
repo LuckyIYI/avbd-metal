@@ -198,11 +198,16 @@ public final class PandaStickPushTEnv {
     ) throws -> EnvRefs {
         let collisionGroup = UInt32(scene.bodies.count + 1)
         let instance = try model.instantiate(
-            in: &scene, worldOffset: center + basePosition,
-            defaultMotorGain: MJCFMotorGain(stiffness: 1_000, damping: 100),
-            jointHomePositions: homePositionsByName,
-            fixedBase: true, gravityScale: 0,
-            collisionGroup: collisionGroup, selfCollisions: false)
+            in: &scene,
+            options: MJCFInstantiationOptions(
+                worldOffset: center + basePosition,
+                defaultMotorGain: MJCFMotorGain(
+                    stiffness: 1_000, damping: 100),
+                jointHomePositions: homePositionsByName,
+                fixedBase: true,
+                gravityScale: 0,
+                collisionGroup: collisionGroup,
+                selfCollisions: false))
         let robotBodies = try model.bodyNames.map { name in
             guard let body = instance.bodiesByName[name] else {
                 throw MJCFImportError.missing("Panda body \(name)")

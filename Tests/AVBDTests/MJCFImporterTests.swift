@@ -4,6 +4,95 @@ import XCTest
 @testable import AVBDCore
 
 final class MJCFImporterTests: XCTestCase {
+    func testInstantiationOptionsDefaults() {
+        let options = MJCFInstantiationOptions()
+        XCTAssertEqual(options.worldOffset, .zero)
+        XCTAssertEqual(
+            options.defaultMotorGain,
+            MJCFMotorGain(stiffness: 0, damping: 0))
+        XCTAssertTrue(options.motorGains.isEmpty)
+        XCTAssertTrue(options.jointHomePositions.isEmpty)
+        XCTAssertFalse(options.fixedBase)
+        XCTAssertEqual(options.gravityScale, 1)
+        XCTAssertEqual(options.collisionGroup, 0)
+        XCTAssertTrue(options.selfCollisions)
+        XCTAssertEqual(options.inertiaFrame, .principal)
+        XCTAssertEqual(options.dynamicsScale, .identity)
+        XCTAssertTrue(options.includeVisuals)
+    }
+
+    func testInstantiationOptionsApplyCombinedConfiguration() throws {
+        let xml = """
+        <mujoco model="options-fixture">
+          <worldbody>
+            <body name="root" pos="0 0 1">
+              <inertial pos="0.2 0 0"
+                        quat="0.70710678 0 0 0.70710678"
+                        mass="2" diaginertia="1 2 3"/>
+              <geom type="box" size="0.5 0.5 0.5" friction="0.4"/>
+              <geom type="sphere" size="0.2"
+                    contype="0" conaffinity="0"/>
+              <body name="child" pos="0 0 1">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="hinge" axis="0 1 0" range="-1 1"
+                       damping="2" armature="0.1"/>
+                <geom type="sphere" size="0.1" friction="0.5"/>
+              </body>
+            </body>
+          </worldbody>
+          <actuator>
+            <motor name="drive" joint="hinge" ctrlrange="-4 4"/>
+          </actuator>
+        </mujoco>
+        """
+        let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+        let options = MJCFInstantiationOptions(
+            worldOffset: F3(1, 2, 3),
+            defaultMotorGain: .init(stiffness: 10, damping: 3),
+            motorGains: ["drive": .init(stiffness: 20, damping: 4)],
+            jointHomePositions: ["hinge": 0.25],
+            fixedBase: true,
+            gravityScale: 0.25,
+            collisionGroup: 12,
+            selfCollisions: false,
+            inertiaFrame: .linkAligned,
+            dynamicsScale: .init(
+                mass: 1.5, inertia: 0.8, friction: 1.25,
+                motorTorque: 0.9, motorStiffness: 1.1,
+                motorDamping: 1.2, armature: 1.3),
+            includeVisuals: false)
+
+        var scene = PhysicsScene(name: "combined-options")
+        let imported = try asset.instantiate(in: &scene, options: options)
+        let root = scene.bodies[imported.rootBody]
+        XCTAssertEqual(root.position, F3(1.2, 2, 4))
+        XCTAssertEqual(root.rotation.real, 1, accuracy: 1e-6)
+        XCTAssertLessThan(simd_length(root.rotation.imag), 1e-6)
+        XCTAssertEqual(try XCTUnwrap(root.mass), 3, accuracy: 1e-6)
+        XCTAssertLessThan(
+            simd_length(try XCTUnwrap(root.diagonalInertia)
+                - F3(1.2, 2.4, 3.6)),
+            1e-6)
+        XCTAssertTrue(scene.bodies.allSatisfy { $0.gravityScale == 0.25 })
+        XCTAssertEqual(scene.colliders.count, 2)
+        XCTAssertTrue(scene.colliders.allSatisfy {
+            $0.collisionGroup == 12 && $0.isRendered
+        })
+        XCTAssertEqual(scene.colliders[0].friction, 0.5, accuracy: 1e-6)
+        XCTAssertEqual(scene.collisionExclusions.count, 1)
+
+        XCTAssertEqual(scene.joints.count, 2)
+        XCTAssertEqual(scene.joints[0].bodyA, -1)
+        let hingeIndex = try XCTUnwrap(imported.jointsByName["hinge"])
+        let hinge = scene.joints[hingeIndex]
+        XCTAssertEqual(hinge.motorTorque, 3.6, accuracy: 1e-6)
+        XCTAssertEqual(hinge.motorStiffness, 22, accuracy: 1e-6)
+        XCTAssertEqual(hinge.motorDamping, 4.8, accuracy: 1e-6)
+        XCTAssertEqual(hinge.armature, 0.13, accuracy: 1e-6)
+        XCTAssertEqual(hinge.limitLo, -1.25, accuracy: 1e-6)
+        XCTAssertEqual(hinge.limitHi, 0.75, accuracy: 1e-6)
+    }
+
     func testBundledArachneProfilesSeparateVisualsFromCollision() throws {
         let training = try MJCFAsset.bundledArachne15(profile: .training)
         let validation = try MJCFAsset.bundledArachne15(profile: .validation)
@@ -21,9 +110,10 @@ final class MJCFImporterTests: XCTestCase {
         var trainingScene = PhysicsScene(name: "arachne-training")
         let imported = try training.instantiate(
             in: &trainingScene,
-            defaultMotorGain: .init(stiffness: 2, damping: 0.08),
-            collisionGroup: 7,
-            selfCollisions: false)
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 2, damping: 0.08),
+                collisionGroup: 7,
+                selfCollisions: false))
         XCTAssertEqual(trainingScene.bodies.count, 17)
         XCTAssertEqual(trainingScene.joints.count, 16)
         XCTAssertEqual(trainingScene.rigidMeshes.count, 28)
@@ -46,7 +136,8 @@ final class MJCFImporterTests: XCTestCase {
         var validationScene = PhysicsScene(name: "arachne-validation")
         _ = try validation.instantiate(
             in: &validationScene,
-            defaultMotorGain: .init(stiffness: 2, damping: 0.08))
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 2, damping: 0.08)))
         XCTAssertEqual(validationScene.colliders.filter(\.collisionEnabled).count, 60)
         XCTAssertEqual(validationScene.rigidMeshes.count, 28)
 
@@ -70,9 +161,10 @@ final class MJCFImporterTests: XCTestCase {
         var scene = PhysicsScene(name: "unitree-rl-gym-transfer")
         let imported = try asset.instantiate(
             in: &scene,
-            defaultMotorGain: .init(stiffness: 100, damping: 2),
-            selfCollisions: false,
-            inertiaFrame: .principal)
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 100, damping: 2),
+                selfCollisions: false,
+                inertiaFrame: .principal))
         XCTAssertEqual(scene.bodies.count, 11)
         XCTAssertEqual(scene.joints.count, 10)
         XCTAssertEqual(imported.actuatorJoints.count, 10)
@@ -118,7 +210,8 @@ final class MJCFImporterTests: XCTestCase {
         var scene = PhysicsScene(name: "official-h1-import")
         let imported = try asset.instantiate(
             in: &scene,
-            defaultMotorGain: .init(stiffness: 100, damping: 5))
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 100, damping: 5)))
         XCTAssertEqual(scene.bodies.count, 20)
         XCTAssertEqual(scene.joints.count, 19)
         XCTAssertEqual(scene.colliders.count, 32)
@@ -172,14 +265,17 @@ final class MJCFImporterTests: XCTestCase {
         """
         let asset = try MJCFAsset.parse(data: Data(xml.utf8))
         var missingGainScene = PhysicsScene(name: "missing-gain")
-        XCTAssertThrowsError(try asset.instantiate(in: &missingGainScene)) {
+        XCTAssertThrowsError(try asset.instantiate(
+            in: &missingGainScene,
+            options: MJCFInstantiationOptions())) {
             XCTAssertTrue(String(describing: $0).contains(
                 "positive position-PD stiffness"))
         }
         var scene = PhysicsScene(name: "fixture")
         let imported = try asset.instantiate(
             in: &scene,
-            defaultMotorGain: .init(stiffness: 20, damping: 3))
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 20, damping: 3)))
 
         XCTAssertEqual(scene.bodies.count, 2)
         XCTAssertEqual(scene.colliders.count, 2)
@@ -212,12 +308,13 @@ final class MJCFImporterTests: XCTestCase {
         var scene = PhysicsScene(name: "scaled")
         let imported = try asset.instantiate(
             in: &scene,
-            defaultMotorGain: .init(stiffness: 10, damping: 3),
-            collisionGroup: 11,
-            dynamicsScale: .init(
-                mass: 1.5, inertia: 0.8, friction: 1.25,
-                motorTorque: 0.9, motorStiffness: 1.1,
-                motorDamping: 1.2, armature: 1.3))
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 10, damping: 3),
+                collisionGroup: 11,
+                dynamicsScale: .init(
+                    mass: 1.5, inertia: 0.8, friction: 1.25,
+                    motorTorque: 0.9, motorStiffness: 1.1,
+                    motorDamping: 1.2, armature: 1.3)))
         let root = scene.bodies[imported.rootBody]
         XCTAssertEqual(try XCTUnwrap(root.mass), 3, accuracy: 1e-6)
         XCTAssertEqual(try XCTUnwrap(root.diagonalInertia).x, 1.2,
@@ -253,10 +350,13 @@ final class MJCFImporterTests: XCTestCase {
         """
         let asset = try MJCFAsset.parse(data: Data(xml.utf8))
         var principalScene = PhysicsScene(name: "principal")
-        let principal = try asset.instantiate(in: &principalScene)
+        let principal = try asset.instantiate(
+            in: &principalScene,
+            options: MJCFInstantiationOptions())
         var linkScene = PhysicsScene(name: "link")
         let linkAligned = try asset.instantiate(
-            in: &linkScene, inertiaFrame: .linkAligned)
+            in: &linkScene,
+            options: MJCFInstantiationOptions(inertiaFrame: .linkAligned))
 
         let principalBody = principalScene.bodies[principal.rootBody]
         let linkBody = linkScene.bodies[linkAligned.rootBody]

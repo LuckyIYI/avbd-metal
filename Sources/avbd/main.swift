@@ -297,6 +297,7 @@ guard let command = args.first else {
       parity <demo>  Compare GPU vs CPU trajectories
       list           List demo scenes
       list-rl        List vectorized robot-learning tasks and algorithms
+      describe-rl <task>  Show accepted task options, types, and bounds
       rl-smoke <task>  Step a vectorized task and validate finite tensors
       eval-arachne-classical  Evaluate non-neural ripple-gait point-goal control
       train-rl <task>  Train any registered task with MLX PPO
@@ -325,6 +326,38 @@ case "list-rl":
     for id in BuiltInRLTasks.registry.taskIDs { print("  \(id)") }
     print("algorithms:")
     for id in VectorRLAlgorithmRegistry.builtIn.algorithmIDs { print("  \(id)") }
+
+case "describe-rl":
+    guard args.count > 1 else {
+        fail("usage: avbd describe-rl <task> [--json]")
+    }
+    let taskID = args[1]
+    guard BuiltInRLTasks.registry.taskIDs.contains(taskID) else {
+        fail("unknown RL task '\(taskID)'; available: "
+            + BuiltInRLTasks.registry.taskIDs.joined(separator: ", "))
+    }
+    guard let schema = BuiltInRLTasks.registry.optionSchema(for: taskID) else {
+        print("\(taskID) has no registered option schema")
+        break
+    }
+    if args.contains("--json") {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        print(String(decoding: try encoder.encode(schema), as: UTF8.self))
+        break
+    }
+    print("\(taskID) options:")
+    for name in schema.optionNames {
+        let definition = schema.definitions[name]!
+        var constraints = [definition.valueKind.rawValue]
+        if let lower = definition.lowerBound {
+            constraints.append("min=\(lower)")
+        }
+        if let upper = definition.upperBound {
+            constraints.append("max=\(upper)")
+        }
+        print("  \(name): \(constraints.joined(separator: ", "))")
+    }
 
 case "eval-arachne-classical":
     let o = parseOptions(Array(args.dropFirst(1)))
@@ -851,18 +884,16 @@ case "trace-rl":
     let runner = try VectorPolicyRunner(
         checkpointDirectory: checkpointDirectory)
     let metadata = runner.metadata
-    var replayOptions = metadata.taskConfiguration ?? [:]
-    replayOptions["maxEpisodeSteps"] = Float(metadata.maxEpisodeSteps)
-    replayOptions["controlDecimation"] = Float(metadata.controlDecimation)
+    let replayOptions = BuiltInRLTasks.registry.checkpointReplayOptions(
+        for: taskID,
+        semanticOptions: metadata.taskConfiguration ?? [:],
+        maxEpisodeSteps: metadata.maxEpisodeSteps,
+        controlDecimation: metadata.controlDecimation)
     let task = try BuiltInRLTasks.registry.make(
         taskID, configuration: RLTaskConfiguration(
             numEnvironments: 1, seed: o.seed, autoReset: false,
             options: replayOptions))
-    guard metadata.task == task.spec.id,
-          (metadata.taskRevision ?? 1) == task.spec.revision,
-          metadata.taskConfiguration == task.spec.configurationValues,
-          metadata.observationDimension == task.spec.observation.elementCount,
-          metadata.actionDimension == task.spec.action.elementCount else {
+    guard metadata.compatibilityMismatches(with: task.spec).isEmpty else {
         fail("checkpoint/task mismatch for deterministic trace")
     }
     var observation = try task.reset(seed: o.seed)

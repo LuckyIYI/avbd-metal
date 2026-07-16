@@ -468,8 +468,9 @@ public enum HumanoidLocomotionObjective {
         precondition(gain >= 0 && maximumRate > 0)
         let angleFromHeadingToGoal = -atan2(
             relativeHeading.y, relativeHeading.x)
-        return simd_clamp(gain * angleFromHeadingToGoal,
-                          -maximumRate, maximumRate)
+        return PointGoalNavigator.boundedYawRate(
+            bearing: angleFromHeadingToGoal,
+            gain: gain, maximumRate: maximumRate)
     }
 
     /// Smooth task-space speed command for genuine point navigation. Cruise
@@ -484,12 +485,13 @@ public enum HumanoidLocomotionObjective {
         precondition(remainingDistance >= 0 && cruiseSpeed >= 0)
         precondition(goalRadius > 0 && slowdownDistance > goalRadius)
         precondition(boundaryCommandSpeed >= 0)
-        guard remainingDistance > goalRadius else { return 0 }
-        let fraction = simd_clamp(
-            (remainingDistance - goalRadius)
-                / (slowdownDistance - goalRadius), 0, 1)
         let boundarySpeed = min(boundaryCommandSpeed, cruiseSpeed)
-        return boundarySpeed + (cruiseSpeed - boundarySpeed) * fraction
+        return PointGoalNavigator.commandSpeed(
+            remainingDistance: remainingDistance,
+            cruiseSpeed: cruiseSpeed,
+            goalRadius: goalRadius,
+            slowdownDistance: slowdownDistance,
+            boundarySpeed: boundarySpeed)
     }
 
     /// Bounded observation channel that is zero through normal cruising and
@@ -501,9 +503,10 @@ public enum HumanoidLocomotionObjective {
     ) -> Float {
         precondition(remainingDistance >= 0)
         precondition(goalRadius > 0 && slowdownDistance > goalRadius)
-        return 1 - simd_clamp(
-            (remainingDistance - goalRadius)
-                / (slowdownDistance - goalRadius), 0, 1)
+        return PointGoalNavigator.proximity(
+            remainingDistance: remainingDistance,
+            goalRadius: goalRadius,
+            slowdownDistance: slowdownDistance)
     }
 
     /// Smooth arrival-and-balance shaping used near a point goal. It depends
@@ -932,18 +935,18 @@ public final class HumanoidWalkEnv {
                 homePositions = [:]
             }
             let imported = try asset.instantiate(
-                in: &built, worldOffset: center,
-                motorGains: motorGains,
-                jointHomePositions: homePositions,
-                // IsaacLab's H1 articulation configuration disables internal
-                // self-collision; contacts with terrain/objects remain live.
-                selfCollisions: false,
-                // The public H1 USD copies Menagerie's diagonal inertia and
-                // COM values but does not author `physics:principalAxes`.
-                // PhysX therefore aligns those diagonals with each link,
-                // unlike MuJoCo's non-identity `<inertial quat>` convention.
-                inertiaFrame: controlProfile == .isaacLab
-                    ? .linkAligned : .principal)
+                in: &built,
+                options: MJCFInstantiationOptions(
+                    worldOffset: center,
+                    motorGains: motorGains,
+                    jointHomePositions: homePositions,
+                    // IsaacLab's H1 articulation configuration disables
+                    // internal self-collision; terrain contacts remain live.
+                    selfCollisions: false,
+                    // The public H1 USD copies Menagerie's diagonal inertia
+                    // and COM values but omits `physics:principalAxes`.
+                    inertiaFrame: controlProfile == .isaacLab
+                        ? .linkAligned : .principal))
             if controlProfile == .isaacLab {
                 // H1_CFG uses simulation effort caps of 300 Nm for the legs,
                 // torso, and arms, and 100 Nm for the ankles. The vendored

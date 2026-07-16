@@ -1355,24 +1355,20 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
 
     private func updateGoalCommand(environment e: Int, rootPosition: F3,
                                    rootRotation: Quat) {
-        let delta = goals[e] - rootPosition
-        let distance = sqrt(delta.x * delta.x + delta.y * delta.y)
-        guard distance > configuration.goalRadius else {
-            commands[e] = .zero
-            targetHeadings[e] = Self.headingAngle(rootRotation)
-            return
-        }
-        targetHeadings[e] = atan2(delta.y, delta.x)
-        let blend = simd_clamp(
-            (distance - configuration.goalRadius)
-                / (configuration.goalSlowdownDistance
-                    - configuration.goalRadius),
-            0, 1)
-        let speed = configuration.goalBoundaryCommandSpeed
-            + blend * (configuration.goalCommandSpeed
-                - configuration.goalBoundaryCommandSpeed)
-        commands[e] = F3(speed, 0, 0)
-        updateCommandYaw(environment: e, rootRotation: rootRotation)
+        let navigation = PointGoalNavigator.command(
+            worldGoal: goals[e],
+            bodyPosition: rootPosition,
+            bodyRotation: rootRotation,
+            parameters: PointGoalNavigationParameters(
+                goalRadius: configuration.goalRadius,
+                slowdownDistance: configuration.goalSlowdownDistance,
+                cruiseSpeed: configuration.goalCommandSpeed,
+                boundarySpeed: configuration.goalBoundaryCommandSpeed,
+                yawGain: 0.5,
+                maximumYawRate: 1,
+                mode: .forwardOnlyYaw))
+        commands[e] = navigation.bodyTwist
+        targetHeadings[e] = navigation.desiredWorldHeading
     }
 
     private func fillObservations(_ states: [HumanoidState],

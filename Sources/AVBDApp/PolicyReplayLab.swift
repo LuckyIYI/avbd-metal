@@ -115,12 +115,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var humanoid: HumanoidWalkTask?
     private var arm: ArmPushTTask?
     private var arachne: Arachne15LocomotionTask?
-    private var arachneClassical: Arachne15ClassicalController?
     private var unitreeH1: UnitreeH1Sim2SimSession?
     private var task: (any VectorizedRLTask)?
     private var observation: RLObservationBatch?
     private var result: RLStepBatch?
-    private var runner: VectorPolicyRunner?
+    private var actionProvider: (any RLActionProvider)?
     private var loadedCheckpointDirectory: String?
     private let liveRunDirectory = ProcessInfo.processInfo.environment[
         "AVBD_REPLAY_RUN_DIR"]
@@ -223,8 +222,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     func rebuild() {
         unitreeH1 = nil; isaacHumanoid = nil; humanoid = nil; arm = nil
         arachne = nil
-        arachneClassical = nil
-        task = nil; runner = nil
+        task = nil; actionProvider = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
         replaySeed = 21_001
@@ -259,10 +257,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 // These shape the task but live in the checkpoint's structural
                 // metadata rather than taskConfiguration. Restore them before
                 // constructing replay so non-default curricula load exactly.
-                replayOptions["maxEpisodeSteps"] =
-                    Float(checkpointMetadata.maxEpisodeSteps)
-                replayOptions["controlDecimation"] =
-                    Float(checkpointMetadata.controlDecimation)
+                replayOptions = BuiltInRLTasks.registry.checkpointReplayOptions(
+                    for: desiredTaskID,
+                    semanticOptions: replayOptions,
+                    maxEpisodeSteps: checkpointMetadata.maxEpisodeSteps,
+                    controlDecimation: checkpointMetadata.controlDecimation)
             }
             let configuredTask = try BuiltInRLTasks.registry.make(
                 desiredTaskID,
@@ -279,7 +278,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     throw RLEnvironmentError.invalidConfiguration(
                         "classical Arachne controller requires point-goal task")
                 }
-                arachneClassical = Arachne15ClassicalController()
+                actionProvider = Arachne15ClassicalController()
                 policyStatus = "non-neural controller · paired-ripple CPG · exact IK · no checkpoint"
             }
             if arachne?.usesPointGoal == true,
@@ -314,7 +313,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     loadFailures.append("\(path): \(error)")
                 }
             }
-            if runner == nil && arachneClassical == nil {
+            if actionProvider == nil {
                 running = false
                 policyStatus = loadFailures.isEmpty
                     ? "no promoted checkpoint for \(task.spec.id)"
@@ -537,13 +536,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             .latestCompleteCheckpoint(
                 inRunDirectory: liveRunDirectory, task: task.spec.id,
                 taskRevision: task.spec.revision) else {
-            if runner == nil {
+            if actionProvider == nil {
                 policyStatus = "waiting for first complete checkpoint in \(liveRunDirectory)"
             }
             return
         }
         newestUpdate = candidate.completedUpdates
-        if runner == nil,
+        if actionProvider == nil,
            let metadata = replayMetadata(
                 at: candidate.directory, task: task.spec.id),
            metadata.taskConfiguration != task.spec.configurationValues
@@ -573,57 +572,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     ) throws {
         guard let task else { return }
         let loaded = try VectorPolicyRunner(checkpointDirectory: path)
-        var mismatches = [String]()
-        if loaded.metadata.task != task.spec.id {
-            mismatches.append("task \(loaded.metadata.task) != \(task.spec.id)")
-        }
-        if (loaded.metadata.taskRevision ?? 1) != task.spec.revision {
-            mismatches.append(
-                "revision \(loaded.metadata.taskRevision ?? 1) != \(task.spec.revision)")
-        }
-        if let saved = loaded.metadata.taskConfiguration,
-           saved != task.spec.configurationValues {
-            let keys = Set(saved.keys).union(task.spec.configurationValues.keys)
-            let differences = keys.sorted().compactMap { key -> String? in
-                let checkpointValue = saved[key]
-                let replayValue = task.spec.configurationValues[key]
-                guard checkpointValue != replayValue else { return nil }
-                return "\(key)=\(checkpointValue.map { String($0) } ?? "missing")/"
-                    + "\(replayValue.map { String($0) } ?? "missing")"
-            }
-            mismatches.append("configuration [\(differences.joined(separator: ", "))]")
-        }
-        if loaded.metadata.observationDimension
-            != task.spec.observation.elementCount {
-            mismatches.append(
-                "observations \(loaded.metadata.observationDimension) != "
-                    + "\(task.spec.observation.elementCount)")
-        }
-        if loaded.metadata.actionDimension != task.spec.action.elementCount {
-            mismatches.append(
-                "actions \(loaded.metadata.actionDimension) != "
-                    + "\(task.spec.action.elementCount)")
-        }
-        if loaded.metadata.simulationStep != task.spec.simulationStep {
-            mismatches.append(
-                "simulation step \(loaded.metadata.simulationStep) != "
-                    + "\(task.spec.simulationStep)")
-        }
-        if loaded.metadata.controlDecimation != task.spec.controlDecimation {
-            mismatches.append(
-                "control decimation \(loaded.metadata.controlDecimation) != "
-                    + "\(task.spec.controlDecimation)")
-        }
-        if loaded.metadata.maxEpisodeSteps != task.spec.maxEpisodeSteps {
-            mismatches.append(
-                "episode steps \(loaded.metadata.maxEpisodeSteps) != "
-                    + "\(task.spec.maxEpisodeSteps)")
-        }
+        let mismatches = loaded.metadata.compatibilityMismatches(with: task.spec)
         guard mismatches.isEmpty else {
             throw RLEnvironmentError.invalidConfiguration(
                 "checkpoint/task mismatch: \(mismatches.joined(separator: "; "))")
         }
-        runner = loaded
+        actionProvider = loaded
         loadedCheckpointDirectory = path
         if let candidate {
             loadedUpdate = candidate.completedUpdates
@@ -656,8 +610,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
         guard let task else { return }
         observation = try task.reset(seed: replaySeed)
-        if let arachneClassical, let arachne {
-            arachneClassical.reset(states: arachne.environment.states())
+        if let observation, let actionProvider {
+            try actionProvider.reset(for: task, observation: observation)
         }
         if let arachne, arachne.usesPointGoal {
             let direction = arachne.currentGoalDirection(environment: 0)
@@ -669,7 +623,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         result = RLStepBatch(spec: task.spec)
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
         episodeFinished = false
-        running = runner != nil || arachneClassical != nil
+        running = actionProvider != nil
         updateCameraTargets()
         applyCameraPreset()
         cameraEpoch += 1
@@ -685,7 +639,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func refreshTrainingMetrics() {
-        if arachneClassical != nil {
+        if !usesCheckpoint {
             trainingStatus = "deterministic classical controller · training not required"
             return
         }
@@ -740,27 +694,14 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 let rootVelocityBeforeStep = isaacHumanoid?
                     .environment.states()[0].root.linearVelocity
                     ?? humanoid?.environment.states()[0].root.linearVelocity
-                let actions: RLActionBatch
-                if let arachneClassical, let arachne {
-                    actions = arachneClassical.actions(
-                        states: arachne.environment.states(),
-                        commands: [arachne.currentCommand(environment: 0)],
-                        spec: task.spec)
-                } else if let runner {
-                    let expertGates =
-                        (task as? any PolicyExpertGateProviding)?
-                            .policyExpertGates(observation.policy)
-                    let standExpertGates =
-                        (task as? any PolicyStandExpertGateProviding)?
-                            .policyStandExpertGates(observation.policy)
-                    actions = try runner.actions(
-                        for: observation, expertGates: expertGates,
-                        standExpertGates: standExpertGates)
-                } else {
+                guard let actionProvider else {
                     running = false
                     return
                 }
+                let actions = try actionProvider.actions(
+                    for: observation, task: task)
                 try task.step(actions: actions, into: &result)
+                try actionProvider.resetAfterStep(for: task, result: result)
                 if (result.metrics["state/projectile_robot_contact"]?[0] ?? 0) > 0,
                    let before = rootVelocityBeforeStep {
                     let after = isaacHumanoid?

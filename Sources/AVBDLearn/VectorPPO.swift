@@ -1751,6 +1751,58 @@ public struct VectorPolicyMetadata: Codable, Sendable {
     public var maxEpisodeSteps: Int
     public var ppo: VectorPPOConfig
     public var normalizer: RunningNormalizerSnapshot
+
+    /// Exact in-place replay compatibility. Explicit transfer paths may relax
+    /// selected fields, but a generic action provider must always fail closed.
+    public func compatibilityMismatches(with spec: RLTaskSpec) -> [String] {
+        var mismatches = [String]()
+        if task != spec.id {
+            mismatches.append("task \(task) != \(spec.id)")
+        }
+        if (taskRevision ?? 1) != spec.revision {
+            mismatches.append(
+                "revision \(taskRevision ?? 1) != \(spec.revision)")
+        }
+        if taskConfiguration == nil {
+            mismatches.append("configuration metadata is missing")
+        } else if let taskConfiguration,
+                  taskConfiguration != spec.configurationValues {
+            let keys = Set(taskConfiguration.keys)
+                .union(spec.configurationValues.keys)
+            let differences = keys.sorted().compactMap { key -> String? in
+                let saved = taskConfiguration[key]
+                let runtime = spec.configurationValues[key]
+                guard saved != runtime else { return nil }
+                return "\(key)=\(saved.map { String($0) } ?? "missing")/"
+                    + "\(runtime.map { String($0) } ?? "missing")"
+            }
+            mismatches.append(
+                "configuration [\(differences.joined(separator: ", "))]")
+        }
+        if observationDimension != spec.observation.elementCount {
+            mismatches.append(
+                "observations \(observationDimension) != "
+                    + "\(spec.observation.elementCount)")
+        }
+        if actionDimension != spec.action.elementCount {
+            mismatches.append(
+                "actions \(actionDimension) != \(spec.action.elementCount)")
+        }
+        if simulationStep != spec.simulationStep {
+            mismatches.append(
+                "simulation step \(simulationStep) != \(spec.simulationStep)")
+        }
+        if controlDecimation != spec.controlDecimation {
+            mismatches.append(
+                "control decimation \(controlDecimation) != "
+                    + "\(spec.controlDecimation)")
+        }
+        if maxEpisodeSteps != spec.maxEpisodeSteps {
+            mismatches.append(
+                "episode steps \(maxEpisodeSteps) != \(spec.maxEpisodeSteps)")
+        }
+        return mismatches
+    }
 }
 
 public struct VectorPPOTrainingState: Codable, Sendable {
@@ -2039,6 +2091,33 @@ public final class VectorPolicyRunner {
             throw RLEnvironmentError.nonFiniteAction(index: index)
         }
         return values
+    }
+}
+
+extension VectorPolicyRunner: RLActionProvider {
+    public var actionProviderID: String { "mlx-vector-policy" }
+
+    public func actions(
+        for observation: RLObservationBatch,
+        task: any VectorizedRLTask
+    ) throws -> RLActionBatch {
+        try observation.validate(for: task.spec)
+        let mismatches = metadata.compatibilityMismatches(with: task.spec)
+        guard mismatches.isEmpty else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "checkpoint/task mismatch: \(mismatches.joined(separator: "; "))")
+        }
+        let expertGates =
+            (task as? any PolicyExpertGateProviding)?
+                .policyExpertGates(observation.policy)
+        let standExpertGates =
+            (task as? any PolicyStandExpertGateProviding)?
+                .policyStandExpertGates(observation.policy)
+        let batch = try actions(
+            for: observation, expertGates: expertGates,
+            standExpertGates: standExpertGates)
+        try batch.validate(for: task.spec)
+        return batch
     }
 }
 
@@ -3789,44 +3868,4 @@ public final class VectorPPOTrainer {
             }.joined(separator: "  "))
         }
     }
-}
-
-/// Small algorithm registry used by experiment entry points. The protocol is
-/// deliberately task-agnostic: adding SAC, Dreamer, AMP, or distillation does
-/// not change any scene code.
-public protocol VectorRLAlgorithm: AnyObject {
-    var id: String { get }
-    func train(task: any VectorizedRLTask, outputDirectory: String) throws
-}
-
-extension VectorPPOTrainer: VectorRLAlgorithm {
-    public var id: String { "ppo" }
-}
-
-public final class VectorRLAlgorithmRegistry {
-    public typealias Factory = () -> any VectorRLAlgorithm
-    private var factories: [String: Factory] = [:]
-
-    public init() {}
-
-    public func register(_ id: String, factory: @escaping Factory) {
-        precondition(factories[id] == nil, "algorithm already registered")
-        factories[id] = factory
-    }
-
-    public var algorithmIDs: [String] { factories.keys.sorted() }
-
-    public func make(_ id: String) throws -> any VectorRLAlgorithm {
-        guard let factory = factories[id] else {
-            throw RLEnvironmentError.invalidConfiguration(
-                "unknown algorithm '\(id)'; available: \(algorithmIDs.joined(separator: ", "))")
-        }
-        return factory()
-    }
-
-    public static let builtIn: VectorRLAlgorithmRegistry = {
-        let registry = VectorRLAlgorithmRegistry()
-        registry.register("ppo") { VectorPPOTrainer() }
-        return registry
-    }()
 }

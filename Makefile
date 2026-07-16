@@ -1,6 +1,7 @@
 # AVBD Metal build helpers
 
-.PHONY: build test app cli bench clean ml-tool app-ml ios-ml verify-arachne-policy
+.PHONY: build test app cli bench clean ml-tool app-ml ios-ml \
+	generate-arachne-assets verify-arachne-assets verify-arachne-policy
 
 build:
 	swift build -c release
@@ -78,6 +79,17 @@ ios-ml:
 	  -clonedSourcePackagesDirPath .xcbuild/SourcePackages \
 	  -disableAutomaticPackageResolution \
 	  -onlyUsePackageVersionsFromResolvedFile build -quiet
+
+# Rewrite the tracked MJCF/bundled mesh copies from their canonical sources,
+# then validate both the robot-tree and SwiftPM-resource versions.
+generate-arachne-assets:
+	Robots/Arachne15/scripts/build_sim.sh
+
+# Read-only CI guard: fail when generated MJCF or bundled meshes are stale,
+# missing, or violate the structural/mass/articulation contract.
+verify-arachne-assets:
+	python3 Robots/Arachne15/sim/generate_model.py --check
+	python3 Robots/Arachne15/sim/validate_model.py
 
 # Validate the tracked bundle, exact inference parity, and Metal latency.
 verify-arachne-policy: ml-tool

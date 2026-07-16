@@ -207,13 +207,20 @@ extension Demos {
 
         // ---------------- pool ----------------
         do {
+            let poolCenter = poolAt + F3(1.2, 0, 0)
+            let entryDirection = dirAt(0)
             _ = s.addBody(size: F3(4.5, 4.5, 0.25), density: 0, friction: 0.3,
-                          position: poolAt + F3(1.2, 0, -0.4))
+                          position: poolCenter + F3(0, 0, -0.4))
             for (dx, dy, sx, sy) in [(2.2, 0.0, 0.25, 4.5), (-2.2, 0.0, 0.25, 4.5),
                                      (0.0, 2.2, 4.5, 0.25), (0.0, -2.2, 4.5, 0.25)] {
+                let offset = F3(Float(dx), Float(dy), 0)
+                // Leave the wall facing the incoming track open. The old
+                // four-wall pool put a static box directly across the final
+                // rail and turned the last helix into a marble traffic jam.
+                if dot(normalize(offset), entryDirection) < -0.5 { continue }
                 _ = s.addBody(size: F3(Float(sx), Float(sy), 0.8), density: 0,
                               friction: 0.3,
-                              position: poolAt + F3(Float(dx) + 1.2, Float(dy), 0.0))
+                              position: poolCenter + offset)
             }
         }
 

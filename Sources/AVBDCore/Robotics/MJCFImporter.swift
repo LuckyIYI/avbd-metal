@@ -18,7 +18,7 @@ public enum MJCFImportError: Error, CustomStringConvertible {
     }
 }
 
-public struct MJCFMotorGain: Sendable {
+public struct MJCFMotorGain: Sendable, Equatable {
     public var stiffness: Float
     public var damping: Float
 
@@ -61,6 +61,55 @@ public struct MJCFDynamicsScale: Sendable, Equatable {
     }
 
     public static let identity = MJCFDynamicsScale()
+}
+
+/// Complete configuration for constructing one articulation from a parsed
+/// MJCF asset. Keeping these settings in a value makes task configuration
+/// explicit, reusable, and safe to pass through batched scene builders.
+public struct MJCFInstantiationOptions: Sendable, Equatable {
+    public var worldOffset: F3
+    public var defaultMotorGain: MJCFMotorGain
+    public var motorGains: [String: MJCFMotorGain]
+    /// Source joint coordinates used as the reset/home configuration. The
+    /// solver's zero angle is rebased to this pose.
+    public var jointHomePositions: [String: Float]
+    /// Weld the root body to its authored world pose.
+    public var fixedBase: Bool
+    /// Per-link gravity multiplier.
+    public var gravityScale: Float
+    /// Collision domain shared by all primitives in this instance.
+    public var collisionGroup: UInt32
+    public var selfCollisions: Bool
+    public var inertiaFrame: MJCFInertiaFrame
+    public var dynamicsScale: MJCFDynamicsScale
+    /// Whether detailed render geometry should be replicated.
+    public var includeVisuals: Bool
+
+    public init(
+        worldOffset: F3 = .zero,
+        defaultMotorGain: MJCFMotorGain = .init(stiffness: 0, damping: 0),
+        motorGains: [String: MJCFMotorGain] = [:],
+        jointHomePositions: [String: Float] = [:],
+        fixedBase: Bool = false,
+        gravityScale: Float = 1,
+        collisionGroup: UInt32 = 0,
+        selfCollisions: Bool = true,
+        inertiaFrame: MJCFInertiaFrame = .principal,
+        dynamicsScale: MJCFDynamicsScale = .identity,
+        includeVisuals: Bool = true
+    ) {
+        self.worldOffset = worldOffset
+        self.defaultMotorGain = defaultMotorGain
+        self.motorGains = motorGains
+        self.jointHomePositions = jointHomePositions
+        self.fixedBase = fixedBase
+        self.gravityScale = gravityScale
+        self.collisionGroup = collisionGroup
+        self.selfCollisions = selfCollisions
+        self.inertiaFrame = inertiaFrame
+        self.dynamicsScale = dynamicsScale
+        self.includeVisuals = includeVisuals
+    }
 }
 
 public struct MJCFInstantiation {
@@ -327,30 +376,7 @@ public struct MJCFAsset {
     @discardableResult
     public func instantiate(
         in scene: inout PhysicsScene,
-        worldOffset: F3 = .zero,
-        defaultMotorGain: MJCFMotorGain = .init(stiffness: 0, damping: 0),
-        motorGains: [String: MJCFMotorGain] = [:],
-        /// Source joint coordinates used as the reset/home configuration.
-        /// The solver's zero angle is rebased to this pose, so policy actions
-        /// remain small offsets while source limits are shifted consistently.
-        jointHomePositions: [String: Float] = [:],
-        /// Weld the root body to its authored world pose. Locomotion models
-        /// leave this false; table-mounted manipulation arms set it true.
-        fixedBase: Bool = false,
-        /// Per-link gravity multiplier. Set to zero for controllers that
-        /// balance passive forces by disabling gravity on robot links.
-        gravityScale: Float = 1,
-        /// Collision domain for every primitive in this instance. Batched
-        /// tasks assign one nonzero domain per replica while shared terrain
-        /// stays in group zero.
-        collisionGroup: UInt32 = 0,
-        selfCollisions: Bool = true,
-        inertiaFrame: MJCFInertiaFrame = .principal,
-        dynamicsScale: MJCFDynamicsScale = .identity,
-        /// Detailed render meshes are unnecessary in a large headless batch.
-        /// Disabling them leaves dynamics and collision byte-for-byte
-        /// equivalent while avoiding replicated CAD vertex buffers.
-        includeVisuals: Bool = true
+        options: MJCFInstantiationOptions
     ) throws -> MJCFInstantiation {
         var linkWorldP = [F3](repeating: .zero, count: links.count)
         var linkWorldQ = [Quat](repeating: identityQuaternion, count: links.count)
@@ -364,7 +390,7 @@ public struct MJCFAsset {
             var posedLocalPosition = link.localPosition
             var posedLocalRotation = link.localRotation
             if let joint = link.joint,
-               let home = jointHomePositions[joint.name], home != 0 {
+               let home = options.jointHomePositions[joint.name], home != 0 {
                 guard home >= joint.range.0 && home <= joint.range.1 else {
                     throw MJCFImportError.invalidAttribute(
                         element: "joint", attribute: "home",
@@ -380,12 +406,12 @@ public struct MJCFAsset {
                     + linkWorldQ[parent].act(posedLocalPosition)
                 linkWorldQ[i] = (linkWorldQ[parent] * posedLocalRotation).normalized
             } else {
-                linkWorldP[i] = worldOffset + posedLocalPosition
+                linkWorldP[i] = options.worldOffset + posedLocalPosition
                 linkWorldQ[i] = posedLocalRotation
             }
             bodyWorldP[i] = linkWorldP[i]
                 + linkWorldQ[i].act(link.inertial.position)
-            let inertialRotation = inertiaFrame == .principal
+            let inertialRotation = options.inertiaFrame == .principal
                 ? link.inertial.rotation : identityQuaternion
             bodyWorldQ[i] = (linkWorldQ[i] * inertialRotation).normalized
 
@@ -397,12 +423,13 @@ public struct MJCFAsset {
             let body = scene.addBody(
                 size: F3(repeating: 2 * reach), density: 0,
                 friction: (link.geometries.first?.friction ?? 1)
-                    * dynamicsScale.friction,
+                    * options.dynamicsScale.friction,
                 position: bodyWorldP[i], rotation: bodyWorldQ[i],
-                mass: link.inertial.mass * dynamicsScale.mass,
+                mass: link.inertial.mass * options.dynamicsScale.mass,
                 diagonalInertia: link.inertial.diagonalInertia
-                    * dynamicsScale.mass * dynamicsScale.inertia,
-                gravityScale: gravityScale,
+                    * options.dynamicsScale.mass
+                    * options.dynamicsScale.inertia,
+                gravityScale: options.gravityScale,
                 collisionEnabled: false)
             bodyIndices[i] = body
             bodiesByName[link.name] = body
@@ -414,20 +441,22 @@ public struct MJCFAsset {
             for geom in link.geometries {
                 _ = scene.addCollider(
                     body: body, size: geom.size,
-                    friction: geom.friction * dynamicsScale.friction,
+                    friction: geom.friction
+                        * options.dynamicsScale.friction,
                     localPosition: inertialInverse.act(
                         geom.position - link.inertial.position),
                     localRotation: (inertialInverse * geom.rotation).normalized,
                     shape: geom.shape,
-                    collisionGroup: collisionGroup,
+                    collisionGroup: options.collisionGroup,
                     collisionEnabled: geom.collisionEnabled,
                     // Imported CAD owns appearance when present. Contact
                     // proxies stay inspectable in assets without being drawn
                     // through the detailed surface.
-                    isRendered: !includeVisuals
+                    isRendered: !options.includeVisuals
                         || link.visualGeometries.isEmpty)
             }
-            for visual in includeVisuals ? link.visualGeometries : [] {
+            for visual in options.includeVisuals
+                ? link.visualGeometries : [] {
                 let localPosition = inertialInverse.act(
                     visual.position - link.inertial.position)
                 let localRotation = (inertialInverse
@@ -444,13 +473,13 @@ public struct MJCFAsset {
                         body: body, size: size, friction: 0,
                         localPosition: localPosition,
                         localRotation: localRotation, shape: shape,
-                        collisionGroup: collisionGroup,
+                        collisionGroup: options.collisionGroup,
                         collisionEnabled: false, isRendered: true)
                 }
             }
         }
 
-        if fixedBase {
+        if options.fixedBase {
             scene.addJoint(SceneJoint(
                 bodyA: -1, bodyB: bodyIndices[0],
                 rA: bodyWorldP[0], rB: .zero,
@@ -470,14 +499,15 @@ public struct MJCFAsset {
             let axisWorld = linkWorldQ[i].act(joint.axis)
             let axisB = normalize(childQInverse.act(axisWorld))
             let actuator = actuatorByJoint[joint.name]
-            let gain = motorGains[actuator?.name ?? joint.name]
-                ?? motorGains[joint.name] ?? defaultMotorGain
+            let gain = options.motorGains[actuator?.name ?? joint.name]
+                ?? options.motorGains[joint.name]
+                ?? options.defaultMotorGain
             if let actuator, actuator.torque > 0, gain.stiffness <= 0 {
                 throw MJCFImportError.missing(
                     "positive position-PD stiffness for actuator "
                     + "\(actuator.name) on joint \(joint.name)")
             }
-            let home = jointHomePositions[joint.name] ?? 0
+            let home = options.jointHomePositions[joint.name] ?? 0
             let sceneJoint = SceneJoint(
                 bodyA: bodyIndices[parent], bodyB: bodyIndices[i],
                 rA: rA, rB: rB, stiffnessLin: .infinity,
@@ -487,15 +517,15 @@ public struct MJCFAsset {
                 stiffnessAng: .infinity, hingeAxis: axisB,
                 motorTarget: 0,
                 motorTorque: (actuator?.torque ?? 0)
-                    * dynamicsScale.motorTorque,
+                    * options.dynamicsScale.motorTorque,
                 motorStiffness: gain.stiffness
-                    * dynamicsScale.motorStiffness,
+                    * options.dynamicsScale.motorStiffness,
                 // The fixed-PD actuator has one damping channel; treat an
                 // explicitly supplied gain as the total and never undercut
                 // passive source damping.
                 motorDamping: max(gain.damping, joint.damping)
-                    * dynamicsScale.motorDamping,
-                armature: joint.armature * dynamicsScale.armature,
+                    * options.dynamicsScale.motorDamping,
+                armature: joint.armature * options.dynamicsScale.armature,
                 limitLo: joint.range.0 - home, limitHi: joint.range.1 - home)
             let index = scene.joints.count
             scene.addJoint(sceneJoint)
@@ -508,7 +538,7 @@ public struct MJCFAsset {
             }
             scene.addCollisionExclusion(bodyA: ia, bodyB: ib)
         }
-        if !selfCollisions {
+        if !options.selfCollisions {
             for a in 0..<bodyIndices.count {
                 for b in (a + 1)..<bodyIndices.count {
                     scene.addCollisionExclusion(
@@ -527,6 +557,41 @@ public struct MJCFAsset {
             jointsByName: jointsByName, actuatorJoints: actuatorJoints,
             actuatorNames: actuators.map(\.name), warnings: warnings,
             linkFramesInBody: linkFramesInBody)
+    }
+
+    /// Compatibility overload for existing call sites. New code should pass
+    /// an `MJCFInstantiationOptions` value so the complete plant setup is
+    /// visible and reusable as one configuration.
+    @available(*, deprecated, message: "Use instantiate(in:options:)")
+    @discardableResult
+    public func instantiate(
+        in scene: inout PhysicsScene,
+        worldOffset: F3 = .zero,
+        defaultMotorGain: MJCFMotorGain = .init(stiffness: 0, damping: 0),
+        motorGains: [String: MJCFMotorGain] = [:],
+        jointHomePositions: [String: Float] = [:],
+        fixedBase: Bool = false,
+        gravityScale: Float = 1,
+        collisionGroup: UInt32 = 0,
+        selfCollisions: Bool = true,
+        inertiaFrame: MJCFInertiaFrame = .principal,
+        dynamicsScale: MJCFDynamicsScale = .identity,
+        includeVisuals: Bool = true
+    ) throws -> MJCFInstantiation {
+        try instantiate(
+            in: &scene,
+            options: MJCFInstantiationOptions(
+                worldOffset: worldOffset,
+                defaultMotorGain: defaultMotorGain,
+                motorGains: motorGains,
+                jointHomePositions: jointHomePositions,
+                fixedBase: fixedBase,
+                gravityScale: gravityScale,
+                collisionGroup: collisionGroup,
+                selfCollisions: selfCollisions,
+                inertiaFrame: inertiaFrame,
+                dynamicsScale: dynamicsScale,
+                includeVisuals: includeVisuals))
     }
 }
 

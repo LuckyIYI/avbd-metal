@@ -102,21 +102,18 @@ public enum Arachne15PolicyContract {
         precondition(goalRadius > 0 && slowdownDistance > goalRadius)
         precondition(cruiseSpeed >= boundarySpeed && boundarySpeed >= 0)
         precondition(maximumYawRate >= 0)
-        let worldDelta = worldGoal - rootPosition
-        let localDelta = rootRotation.conjugate.act(
-            F3(worldDelta.x, worldDelta.y, 0))
-        let distance = sqrt(localDelta.x * localDelta.x
-            + localDelta.y * localDelta.y)
-        guard distance > goalRadius else { return .zero }
-        let blend = simd_clamp(
-            (distance - goalRadius) / (slowdownDistance - goalRadius), 0, 1)
-        let speed = boundarySpeed + blend * (cruiseSpeed - boundarySpeed)
-        let direction = SIMD2<Float>(localDelta.x, localDelta.y)
-            / max(distance, 1e-6)
-        let yawError = atan2(localDelta.y, localDelta.x)
-        return F3(direction.x * speed, direction.y * speed,
-                  simd_clamp(2 * yawError,
-                             -maximumYawRate, maximumYawRate))
+        return PointGoalNavigator.command(
+            worldGoal: worldGoal,
+            bodyPosition: rootPosition,
+            bodyRotation: rootRotation,
+            parameters: PointGoalNavigationParameters(
+                goalRadius: goalRadius,
+                slowdownDistance: slowdownDistance,
+                cruiseSpeed: cruiseSpeed,
+                boundarySpeed: boundarySpeed,
+                yawGain: 2,
+                maximumYawRate: maximumYawRate,
+                mode: .projectedBodyPlane)).bodyTwist
     }
 
     /// Convert policy actions to relative joint targets, matching simulation.

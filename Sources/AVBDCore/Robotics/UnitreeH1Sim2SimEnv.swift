@@ -52,8 +52,11 @@ public final class UnitreeH1Sim2SimEnv {
             "right_ankle": .init(stiffness: 40, damping: 2),
         ]
         let imported = try asset.instantiate(
-            in: &built, motorGains: gains, selfCollisions: false,
-            inertiaFrame: .principal)
+            in: &built,
+            options: MJCFInstantiationOptions(
+                motorGains: gains,
+                selfCollisions: false,
+                inertiaFrame: .principal))
         for joint in imported.actuatorJoints {
             built.joints[joint].motorMode = .explicitTorquePD
         }

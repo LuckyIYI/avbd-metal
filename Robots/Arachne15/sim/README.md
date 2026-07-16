@@ -16,11 +16,17 @@ but visual and collision geometry deliberately have different jobs:
 - The policy interface is stable: one floating base, eight hip-yaw joints,
   eight knee-pitch joints, and sixteen motors in deterministic XML order.
 
-Run:
+Regenerate the tracked MJCF and bundled mesh copies after changing the CAD or
+generator, then validate them with:
 
 ```sh
-../scripts/build_sim.sh
+make generate-arachne-assets
 ```
+
+CI and pre-commit checks should instead run `make verify-arachne-assets`. That
+target is read-only: it fails if either generated MJCF profile or any bundled
+mesh is missing/stale, then structurally validates both source and bundled
+models.
 
 This produces and validates two MJCF files:
 

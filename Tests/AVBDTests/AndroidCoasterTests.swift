@@ -19,7 +19,21 @@ final class AndroidCoasterTests: XCTestCase {
             && b.size.z > 1.0 && b.size.z < 1.2 { penWalls.append(b.position) }
         let penC = penWalls.reduce(F3.zero, +) / Float(penWalls.count)
         let gpu = try GPUSolver(scene: scene)
-        for _ in 0..<6000 { gpu.step() }
+        var reachedPen = false
+        for frame in 0..<9000 {
+            gpu.step()
+            if frame % 60 == 59 {
+                let p = gpu.bodyPosition(ball)
+                reachedPen = p.z < 1
+                    && distance(F3(p.x, p.y, 0), F3(penC.x, penC.y, 0)) < 5
+                if reachedPen { break }
+            }
+        }
+        XCTAssertTrue(
+            reachedPen,
+            "ball should complete the route and enter the catch pen")
+        // The pen must retain the ball, not merely register a fly-through.
+        for _ in 0..<300 { gpu.step() }
         let p = gpu.bodyPosition(ball)
         XCTAssertLessThan(distance(F3(p.x, p.y, 0), F3(penC.x, penC.y, 0)), 5.0,
                           "ball should finish near the catch pen")

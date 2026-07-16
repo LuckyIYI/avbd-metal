@@ -197,11 +197,13 @@ public final class Arachne15Env {
                 seed: seed &+ UInt64(e) &* 0x9E3779B97F4A7C15)
             let imported = try asset.instantiate(
                 in: &built,
-                defaultMotorGain: .init(stiffness: 2.0, damping: 0.08),
-                collisionGroup: UInt32(e + 1),
-                selfCollisions: false,
-                dynamicsScale: scale,
-                includeVisuals: numEnvironments <= 4)
+                options: MJCFInstantiationOptions(
+                    defaultMotorGain: .init(
+                        stiffness: 2.0, damping: 0.08),
+                    collisionGroup: UInt32(e + 1),
+                    selfCollisions: false,
+                    dynamicsScale: scale,
+                    includeVisuals: numEnvironments <= 4))
             let bodies = asset.bodyNames.map { imported.bodiesByName[$0]! }
             let feet = footNames.map { imported.bodiesByName[$0]! }
             let footFrames = footNames.map { imported.linkFramesInBody[$0]! }
