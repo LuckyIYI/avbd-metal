@@ -447,14 +447,17 @@ case "trace-rl":
     }
     let o = parseOptions(Array(args.dropFirst(2)))
     let taskID = args[1]
-    let task = try BuiltInRLTasks.registry.make(
-        taskID, configuration: RLTaskConfiguration(
-            numEnvironments: 1, seed: o.seed, autoReset: false,
-            options: o.taskOptions))
     let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
     let runner = try VectorPolicyRunner(
         checkpointDirectory: checkpointDirectory)
     let metadata = runner.metadata
+    var replayOptions = metadata.taskConfiguration ?? [:]
+    replayOptions["maxEpisodeSteps"] = Float(metadata.maxEpisodeSteps)
+    replayOptions["controlDecimation"] = Float(metadata.controlDecimation)
+    let task = try BuiltInRLTasks.registry.make(
+        taskID, configuration: RLTaskConfiguration(
+            numEnvironments: 1, seed: o.seed, autoReset: false,
+            options: replayOptions))
     guard metadata.task == task.spec.id,
           (metadata.taskRevision ?? 1) == task.spec.revision,
           metadata.taskConfiguration == task.spec.configurationValues,
@@ -488,6 +491,19 @@ case "trace-rl":
                 state.tipPosition.x, state.tipPosition.y,
                 state.blockPosition.x, state.blockPosition.y,
                 goalDistance, coverage, result.rewards[0],
+                result.terminated[0] || result.truncated[0]
+                    ? "true" : "false"))
+        } else if let arachne = task as? Arachne15LocomotionTask {
+            let state = arachne.environment.states()[0]
+            let clearance = result.metrics[
+                "state/minimum_foot_collider_clearance_m"]?[0] ?? .nan
+            print(String(format:
+                "%3d action_mean_abs %.5f root_z %.6f min_foot_clearance %.6f "
+                    + "reward %+.5f done %@",
+                step + 1,
+                actions.values.map(abs).reduce(0, +)
+                    / Float(max(actions.values.count, 1)),
+                state.root.position.z, clearance, result.rewards[0],
                 result.terminated[0] || result.truncated[0]
                     ? "true" : "false"))
         } else {

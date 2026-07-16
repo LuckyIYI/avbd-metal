@@ -277,6 +277,7 @@ struct SimParams {
     uint numSoftGroups;     // distinct soft-surface components
     uint frame;             // frame counter (tracker reseed staggering)
     uint frictionCombineMode; // 0 geometric, 1 multiply, 2 min, 3 max, 4 average
+    float rigidContactMargin; // scene-scale rigid equilibrium skin (metres)
 };
 
 inline float combine_friction(float a, float b, uint mode) {

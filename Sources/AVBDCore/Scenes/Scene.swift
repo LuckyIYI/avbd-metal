@@ -380,6 +380,12 @@ public struct SimSettings {
     public var dt: Float = 1.0 / 60.0
     public var gravity: Float = -10.0
     public var iterations: Int = 10
+    /// Rigid contact skin in metres. The historical 1 cm default remains for
+    /// metre-scale demos, while small robots must select a margin appropriate
+    /// to their thinnest contact feature. This is an equilibrium offset, not
+    /// merely a broad-phase tolerance: an oversized value visibly permits
+    /// geometry to settle below the surface.
+    public var rigidContactMargin: Float = 0.01
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note
@@ -614,6 +620,7 @@ public struct PhysicsScene {
         solver.dt = settings.dt
         solver.gravity = settings.gravity
         solver.iterations = settings.iterations
+        solver.collisionMargin = settings.rigidContactMargin
         solver.alpha = settings.alpha
         solver.betaLin = settings.betaLin
         solver.betaAng = settings.betaAng

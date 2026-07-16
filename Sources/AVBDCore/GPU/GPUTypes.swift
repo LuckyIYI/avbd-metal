@@ -44,6 +44,7 @@ public struct SimParamsGPU {
     public var numSoftGroups: UInt32 = 0
     public var frame: UInt32 = 0
     public var frictionCombineMode: UInt32 = 0
+    public var rigidContactMargin: Float = 0.01
 }
 
 extension SimParamsGPU: Equatable {}

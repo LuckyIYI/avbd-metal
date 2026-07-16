@@ -1603,6 +1603,7 @@ public final class GPUSolver {
         params.particleDamping = settings.particleDamping
         params.frame = UInt32(truncatingIfNeeded: frameIndex)
         params.frictionCombineMode = settings.frictionCombineMode.rawValue
+        params.rigidContactMargin = max(settings.rigidContactMargin, 0)
 
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
            let v = Float(env) {

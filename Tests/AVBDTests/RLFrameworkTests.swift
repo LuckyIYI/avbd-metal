@@ -50,6 +50,8 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(task.spec.action.shape, [16])
         XCTAssertEqual(task.spec.simulationStep, 0.002, accuracy: 1e-7)
         XCTAssertEqual(task.spec.controlStep, 0.02, accuracy: 1e-7)
+        XCTAssertEqual(task.environment.scene.settings.rigidContactMargin,
+                       0.00025, accuracy: 1e-8)
         for key in [
             "massScaleLower", "massScaleUpper",
             "inertiaScaleLower", "inertiaScaleUpper",
@@ -85,6 +87,11 @@ final class RLFrameworkTests: XCTestCase {
             XCTAssertTrue(result.observations.policy.allSatisfy(\.isFinite))
             XCTAssertTrue(result.metrics["state/root_height_m"]!
                 .allSatisfy { $0 > 0.035 })
+            let clearances = try XCTUnwrap(
+                result.metrics["state/minimum_foot_collider_clearance_m"])
+            XCTAssertTrue(clearances.allSatisfy(\.isFinite))
+            XCTAssertTrue(clearances.allSatisfy { $0 > -0.001 },
+                          "the 8 mm Arachne feet must not settle through the floor")
         }
     }
 

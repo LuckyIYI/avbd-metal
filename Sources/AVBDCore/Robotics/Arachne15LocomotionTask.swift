@@ -124,6 +124,10 @@ public final class Arachne15Env {
 
     public static let actionDimension = 16
     public static let footLinkOffset = F3(0.105, 0, 0)
+    /// Must match the generated MJCF foot contact box. Keeping this value
+    /// explicit here lets runtime diagnostics measure the actual contact
+    /// envelope rather than inferring clearance from the foot-link origin.
+    public static let footColliderHalfSize = F3(0.00875, 0.007, 0.004)
     public static let actionScales: [Float] = (0..<actionDimension).map {
         $0.isMultiple(of: 2) ? 0.35 : 0.45
     }
@@ -153,6 +157,10 @@ public final class Arachne15Env {
         built.settings.dt = 0.002
         built.settings.gravity = -9.80665
         built.settings.iterations = solverIterations
+        // The legacy 1 cm rigid-world skin is thicker than the printable
+        // 8 mm foot pad. A quarter-millimetre skin retains speculative
+        // contact without letting the CAD settle visibly through the floor.
+        built.settings.rigidContactMargin = 0.00025
         built.settings.frictionCombineMode = .geometricMean
         built.settings.betaLin = 20_000
         built.settings.betaAng = 400
@@ -713,6 +721,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         var rootHeight = ContiguousArray(repeating: Float(0), count: n)
         var projectedGravityZ = ContiguousArray(repeating: Float(0), count: n)
         var feetInContact = ContiguousArray(repeating: Float(0), count: n)
+        var minimumFootColliderClearance = ContiguousArray(
+            repeating: Float(0), count: n)
         var episodeReturnMetric = ContiguousArray(repeating: Float(0), count: n)
         var episodeLengthMetric = ContiguousArray(repeating: Float(0), count: n)
         var episodeSurvivedMetric = ContiguousArray(repeating: Float(0), count: n)
@@ -802,6 +812,14 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             rootHeight[e] = state.root.position.z
             projectedGravityZ[e] = projectedGravity.z
             feetInContact[e] = Float(contacts[e].filter { $0 }.count)
+            minimumFootColliderClearance[e] = state.feet.map { foot in
+                let half = Arachne15Env.footColliderHalfSize
+                let verticalSupport = abs(foot.rotation.act(F3(1, 0, 0)).z)
+                        * half.x
+                    + abs(foot.rotation.act(F3(0, 1, 0)).z) * half.y
+                    + abs(foot.rotation.act(F3(0, 0, 1)).z) * half.z
+                return foot.position.z - verticalSupport
+            }.min() ?? .infinity
             let fallen = state.root.position.z < 0.035
                 || projectedGravity.z < 0.25
                 || !state.root.position.x.isFinite
@@ -921,6 +939,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         result.metrics["state/root_height_m"] = rootHeight
         result.metrics["state/projected_gravity_z"] = projectedGravityZ
         result.metrics["state/feet_in_contact"] = feetInContact
+        result.metrics["state/minimum_foot_collider_clearance_m"] =
+            minimumFootColliderClearance
         result.metrics["episode/return"] = episodeReturnMetric
         result.metrics["episode/length"] = episodeLengthMetric
         result.metrics["episode/survived"] = episodeSurvivedMetric

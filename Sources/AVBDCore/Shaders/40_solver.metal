@@ -2052,7 +2052,8 @@ kernel void diag_error(
                              : xform(posLin[a].xyz, posAng[a], m.contacts[i].rA.xyz);
             float3 xB = sphB ? posLin[b].xyz + m.contacts[i].rB.xyz
                              : xform(posLin[b].xyz, posAng[b], m.contacts[i].rB.xyz);
-            float pen = dot(m.basisN.xyz, xA - xB) + COLLISION_MARGIN;
+            float pen = dot(m.basisN.xyz, xA - xB)
+                + P.rigidContactMargin;
             err = max(err, max(0.0f, -pen));
         }
     } else {
