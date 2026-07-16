@@ -30,6 +30,61 @@ private final class TestVectorPolicyInference: VectorPolicyInferencing {
 }
 
 final class RLFrameworkTests: XCTestCase {
+    func testArachneClassicalKinematicsAndWavePartition() {
+        XCTAssertEqual(
+            Arachne15ClassicalController.defaultWaveGroups.flatMap { $0 }
+                .sorted(), Array(0..<8))
+        for leg in 0..<8 {
+            let hip: Float = leg.isMultiple(of: 2) ? 0.21 : -0.18
+            let knee: Float = leg.isMultiple(of: 3) ? -0.22 : 0.16
+            let foot = Arachne15ClassicalController.forwardKinematics(
+                leg: leg, hip: hip, knee: knee)
+            let recovered = Arachne15ClassicalController.inverseKinematics(
+                leg: leg, footInBody: foot)
+            XCTAssertEqual(recovered.hip, hip, accuracy: 1e-5)
+            XCTAssertEqual(recovered.knee, knee, accuracy: 1e-5)
+            XCTAssertFalse(recovered.wasConstrained)
+        }
+    }
+
+    func testArachneClassicalControllerPhysicallyReachesFrontGoal() throws {
+        let task = try Arachne15LocomotionTask(
+            configuration: .init(
+                numEnvironments: 1, seed: 42_100,
+                maxEpisodeSteps: 800, initialRollPitchRange: 0,
+                initialYawRange: 0, observationNoise: false,
+                maximumActionLatencySteps: 0,
+                domainRandomization: .init(), pointGoal: true,
+                minimumGoalDistance: 0.6, maximumGoalDistance: 0.6,
+                maximumGoalDirectionAngle: .pi,
+                autoReset: false),
+            taskID: "arachne15-goal-v0")
+        try task.setGoal(
+            environment: 0, direction: F3(1, 0, 0), distance: 0.6)
+        _ = try task.reset(seed: 42_101)
+        let controller = Arachne15ClassicalController()
+        controller.reset(states: task.environment.states())
+        var result = RLStepBatch(spec: task.spec)
+        for _ in 0..<task.spec.maxEpisodeSteps {
+            let actions = controller.actions(
+                states: task.environment.states(),
+                commands: [task.currentCommand(environment: 0)],
+                spec: task.spec)
+            XCTAssertTrue(actions.values.allSatisfy { (-1...1).contains($0) })
+            try task.step(actions: actions, into: &result)
+            if result.terminated[0] || result.truncated[0] { break }
+        }
+        XCTAssertTrue(result.successes[0])
+        XCTAssertEqual(result.metrics["episode/survived"]?[0], 1)
+        XCTAssertLessThanOrEqual(
+            result.metrics["episode/final_goal_distance_m"]?[0] ?? .infinity,
+            task.configuration.goalRadius)
+        XCTAssertLessThan(
+            result.metrics["episode/foot_collider_penetration_rmse_m"]?[0]
+                ?? .infinity,
+            0.0005)
+    }
+
     func testRegisteredTasksExposeNormalizedBatchedSpaces() throws {
         XCTAssertEqual(BuiltInRLTasks.registry.taskIDs,
                        ["arachne15-goal-v0", "arachne15-velocity-v0",

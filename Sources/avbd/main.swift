@@ -69,6 +69,10 @@ struct Options {
     /// parser lets new scenes expose curricula and control settings without
     /// adding task-specific branches to this executable.
     var taskOptions: [String: Float] = [:]
+    var gaitSwingSteps = 4
+    var gaitSwingHeight: Float = 0.016
+    var gaitPlacementHorizon: Float = 0.35
+    var gaitMaximumPlacement: Float = 0.045
 }
 
 func parseOptions(_ args: [String]) -> Options {
@@ -181,6 +185,18 @@ func parseOptions(_ args: [String]) -> Options {
                 fail("--task-option expects key=value with a numeric value")
             }
             o.taskOptions[String(pieces[0])] = numericValue
+        case "--gait-swing-steps":
+            o.gaitSwingSteps = Int(value(after: args[i]))
+                ?? o.gaitSwingSteps
+        case "--gait-swing-height":
+            o.gaitSwingHeight = Float(value(after: args[i]))
+                ?? o.gaitSwingHeight
+        case "--gait-placement-horizon":
+            o.gaitPlacementHorizon = Float(value(after: args[i]))
+                ?? o.gaitPlacementHorizon
+        case "--gait-maximum-placement":
+            o.gaitMaximumPlacement = Float(value(after: args[i]))
+                ?? o.gaitMaximumPlacement
         default: break
         }
         i += 1
@@ -216,6 +232,7 @@ guard let command = args.first else {
       list           List demo scenes
       list-rl        List vectorized robot-learning tasks and algorithms
       rl-smoke <task>  Step a vectorized task and validate finite tensors
+      eval-arachne-classical  Evaluate non-neural ripple-gait point-goal control
       train-rl <task>  Train any registered task with MLX PPO
       eval-rl <task>   Evaluate a saved MLX policy deterministically
       export-policy-rl <task>  Create an immutable optimizer-free field bundle
@@ -241,6 +258,139 @@ case "list-rl":
     for id in BuiltInRLTasks.registry.taskIDs { print("  \(id)") }
     print("algorithms:")
     for id in VectorRLAlgorithmRegistry.builtIn.algorithmIDs { print("  \(id)") }
+
+case "eval-arachne-classical":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    let environmentCount = max(1, o.envs)
+    let registered = try BuiltInRLTasks.registry.make(
+        "arachne15-goal-v0", configuration: RLTaskConfiguration(
+            numEnvironments: environmentCount, seed: o.seed,
+            autoReset: false, options: o.taskOptions))
+    guard let task = registered as? Arachne15LocomotionTask else {
+        fail("arachne15-goal-v0 did not construct Arachne15LocomotionTask")
+    }
+    _ = try task.reset(seed: o.seed)
+    let initialStates = task.environment.states()
+    let controller = Arachne15ClassicalController(configuration: .init(
+        swingSteps: o.gaitSwingSteps,
+        swingHeight: o.gaitSwingHeight,
+        placementHorizon: o.gaitPlacementHorizon,
+        maximumPlanarPlacement: o.gaitMaximumPlacement))
+    controller.reset(states: initialStates)
+    var result = RLStepBatch(spec: task.spec)
+    var finished = [Bool](repeating: false, count: environmentCount)
+    var successCount = 0
+    var survivalCount = 0
+    var completionSteps = [Int](repeating: task.spec.maxEpisodeSteps,
+                                count: environmentCount)
+    var finalDistances = [Float](repeating: .nan, count: environmentCount)
+    var minimumDistances = [Float](repeating: .nan, count: environmentCount)
+    var clearances = [Float](repeating: .nan, count: environmentCount)
+    var penetrationRMSE = [Float](repeating: .nan, count: environmentCount)
+    let start = Date()
+    var executedSteps = 0
+    var constrainedTargetCount = 0
+    for step in 0..<task.spec.maxEpisodeSteps where finished.contains(false) {
+        executedSteps += 1
+        let states = task.environment.states()
+        let commands = (0..<environmentCount).map {
+            finished[$0] ? F3.zero : task.currentCommand(environment: $0)
+        }
+        let actions = controller.actions(
+            states: states, commands: commands, spec: task.spec)
+        constrainedTargetCount += controller.diagnostics.constrainedTargetCount
+        try task.step(actions: actions, into: &result)
+        if args.contains("--trace") && (step + 1).isMultiple(of: o.statsEvery) {
+            let state = task.environment.states()[0]
+            let command = task.currentCommand(environment: 0)
+            let localVelocity = state.root.rotation.conjugate.act(
+                state.root.linearVelocity)
+            let distance = task.currentGoalDistance(environment: 0)
+            let contacts = task.environment.groundContacts()[0]
+                .filter { $0 }.count
+            let up = state.root.rotation.conjugate.act(F3(0, 0, 1)).z
+            let meanAction = actions.values.prefix(16).map(abs).reduce(0, +)
+                / 16
+            print(String(format:
+                "step %4d goal %.3f root (%+.3f,%+.3f,%.3f) "
+                    + "velocity (%+.3f,%+.3f) command (%+.3f,%+.3f,%+.3f) "
+                    + "up %.3f contacts %d action %.3f constraints %d",
+                step + 1, distance, state.root.position.x,
+                state.root.position.y, state.root.position.z,
+                localVelocity.x, localVelocity.y, command.x, command.y,
+                command.z, up, contacts, meanAction,
+                controller.diagnostics.constrainedTargetCount))
+        }
+        for e in 0..<environmentCount where !finished[e]
+            && (result.terminated[e] || result.truncated[e]) {
+            finished[e] = true
+            completionSteps[e] = step + 1
+            if result.successes[e] { successCount += 1 }
+            if (result.metrics["episode/survived"]?[e] ?? 0) > 0.5 {
+                survivalCount += 1
+            }
+            finalDistances[e] = result.metrics[
+                "episode/final_goal_distance_m"]?[e] ?? .nan
+            minimumDistances[e] = result.metrics[
+                "episode/minimum_goal_distance_m"]?[e] ?? .nan
+            clearances[e] = result.metrics[
+                "episode/minimum_foot_collider_clearance_m"]?[e] ?? .nan
+            penetrationRMSE[e] = result.metrics[
+                "episode/foot_collider_penetration_rmse_m"]?[e] ?? .nan
+        }
+    }
+    func finiteMean(_ values: [Float]) -> Float {
+        let finite = values.filter(\.isFinite)
+        return finite.isEmpty ? .nan : finite.reduce(0, +) / Float(finite.count)
+    }
+    let elapsed = Date().timeIntervalSince(start)
+    let report: [String: Any] = [
+        "controller": "six-support-leg-paired-ripple-cpg-ik",
+        "controllerConfiguration": [
+            "swingSteps": controller.configuration.swingSteps,
+            "swingHeightM": controller.configuration.swingHeight,
+            "placementHorizonS": controller.configuration.placementHorizon,
+            "maximumPlanarPlacementM":
+                controller.configuration.maximumPlanarPlacement,
+            "minimumTranslationSpeedMPS":
+                controller.configuration.minimumTranslationSpeed,
+            "standingCommandThreshold":
+                controller.configuration.standingCommandThreshold,
+        ],
+        "task": task.spec.id,
+        "taskRevision": task.spec.revision,
+        "taskConfiguration": task.spec.configurationValues,
+        "seed": o.seed,
+        "episodes": environmentCount,
+        "completedEpisodes": finished.filter { $0 }.count,
+        "successRate": Float(successCount) / Float(environmentCount),
+        "survivalRate": Float(survivalCount) / Float(environmentCount),
+        "meanCompletionSteps": finiteMean(completionSteps.map(Float.init)),
+        "meanFinalGoalDistanceM": finiteMean(finalDistances),
+        "meanMinimumGoalDistanceM": finiteMean(minimumDistances),
+        "meanPlanarDisplacementM": finiteMean(zip(
+            initialStates, task.environment.states()).map { initial, final in
+                let delta = final.root.position - initial.root.position
+                return sqrt(delta.x * delta.x + delta.y * delta.y)
+            }),
+        "meanMinimumFootColliderClearanceM": finiteMean(clearances),
+        "meanFootPenetrationRMSEM": finiteMean(penetrationRMSE),
+        "elapsedSeconds": elapsed,
+        "simulatedStepsPerSecond": elapsed > 0
+            ? Double(environmentCount * executedSteps) / elapsed : 0,
+        "constrainedTargetFraction": Float(constrainedTargetCount)
+            / Float(max(executedSteps * environmentCount * 8, 1)),
+    ]
+    let reportData = try JSONSerialization.data(
+        withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try reportData.write(to: url, options: .atomic)
+    }
+    print(String(decoding: reportData, as: UTF8.self))
 
 case "rl-smoke":
     guard args.count > 1 else { fail("usage: avbd rl-smoke <task> [--envs N --frames N]") }
@@ -596,6 +746,18 @@ case "trace-rl":
             let state = arachne.environment.states()[0]
             let clearance = result.metrics[
                 "state/minimum_foot_collider_clearance_m"]?[0] ?? .nan
+            if args.contains("--trace-actions") {
+                let formatted = actions.values.map {
+                    String(format: "%+.3f", $0)
+                }.joined(separator: " ")
+                let velocity = state.root.rotation.conjugate.act(
+                    state.root.linearVelocity)
+                let angular = state.root.rotation.conjugate.act(
+                    state.root.angularVelocity)
+                print(String(format:
+                    "actions [%@] velocity (%+.3f,%+.3f) yawRate %+.3f",
+                    formatted, velocity.x, velocity.y, angular.z))
+            }
             print(String(format:
                 "%3d action_mean_abs %.5f root_z %.6f min_foot_clearance %.6f "
                     + "reward %+.5f done %@",

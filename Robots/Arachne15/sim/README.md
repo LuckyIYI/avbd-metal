@@ -109,6 +109,37 @@ Policy Replay exposes **Arachne Goal**. **Sample Task Goal** draws another
 seeded task target; bearing and distance controls install a deterministic
 target for diagnosis. The UI never supplies joint targets.
 
+### Classical CPG + IK baseline
+
+**Arachne Classical** runs without MLX or a checkpoint. A four-phase paired
+ripple oscillator lifts two diagonally separated legs while six legs execute a
+powered stance sweep. Exact yaw/pitch leg IK converts each foot trajectory into
+the same bounded 16 joint-position targets used by RL. Those targets go through
+the same randomized latency, servo gains, and torque limits; the body moves
+only through AVBD contact and friction. There is no root translation,
+visual-only animation, reference replay, or policy inference.
+
+Run the reproducible batched evaluator:
+
+```sh
+.build/release/avbd eval-arachne-classical --envs 32 --seed 21001 \
+  --output Robots/Arachne15/baselines/classical/seed-21001.json
+```
+
+The default controller uses a 16-tick cycle at 50 Hz, 16 mm swing clearance, a
+350 ms half-stride horizon, and a 45 mm planar placement bound. The CLI exposes
+`--gait-swing-steps`, `--gait-swing-height`,
+`--gait-placement-horizon`, and `--gait-maximum-placement` for explicit
+experiments. The tracked 2026-07-16 two-seed snapshot reached 56/64 randomized
+goals (87.5%; seed rates 81.25% and 93.75%), survived 64/64 episodes, and
+measured 0.28 mm mean foot-penetration RMSE. This is a useful baseline, not a
+deployment qualification: the immutable learned controller reaches about 95%
+on thousands of held-out episodes and remains the stronger candidate.
+
+Tests cover exact FK↔IK round trips and require a deterministic front goal to
+be physically reached. The latter fails if joint targets animate without
+producing body displacement through contacts.
+
 ## Why primitives instead of decomposed printable meshes?
 
 This is the standard robust robot path, rather than a limitation of the CAD.

@@ -49,6 +49,7 @@ rounds this up to 280 g. At ROBOTIS's recommended general-use limit of
 - available design torque per knee: 0.186 N·m;
 - five-leg stance with 1.5× dynamic factor: about 0.158 N·m per knee;
 - safety factor: about 1.17;
+- six-leg paired-ripple stance: about 1.40 safety factor;
 - seven-leg wave stance: about 1.63 safety factor;
 - four-leg dynamic stance: fails the design rule.
 
@@ -61,6 +62,12 @@ Therefore the mechanism is *capable on paper* of slow, level-floor wave-gait
 walking while carrying the iPhone. It is not yet a walking prototype. Do not
 use a fast alternating four-leg gait until measured current, temperature,
 deflection, and impact tests establish more margin.
+
+The simulator also includes a non-neural six-support-leg paired-ripple
+controller. It is a transparent commissioning fallback and a baseline against
+which learned control must earn its complexity; see
+[sim/README.md](sim/README.md#classical-cpg--ik-baseline). It does not change
+the analytical hardware gates above.
 
 Run the exact calculation:
 

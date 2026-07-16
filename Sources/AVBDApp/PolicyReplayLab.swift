@@ -17,6 +17,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case arm = "Arm Push-T"
         case arachne = "Arachne-15"
         case arachneGoal = "Arachne Goal"
+        case arachneClassical = "Arachne Classical"
 
         var taskID: String {
             switch self {
@@ -26,8 +27,22 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             case .humanoidGoal: return "humanoid-goal-v0"
             case .arm: return "arm-pusht-v0"
             case .arachne: return "arachne15-velocity-v0"
-            case .arachneGoal: return "arachne15-goal-v0"
+            case .arachneGoal, .arachneClassical: return "arachne15-goal-v0"
             }
+        }
+
+        var selectionID: String {
+            self == .arachneClassical
+                ? "arachne15-classical-goal-v0" : taskID
+        }
+
+        var usesClassicalController: Bool { self == .arachneClassical }
+
+        static func fromSelectionID(_ id: String) -> Robot? {
+            if id == "arachne15-classical-goal-v0" {
+                return .arachneClassical
+            }
+            return Robot(taskID: id)
         }
 
         init?(taskID: String) {
@@ -50,16 +65,18 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
     @Published var robot: Robot = {
         let environment = ProcessInfo.processInfo.environment
+        if environment["AVBD_REPLAY_CONTROLLER"]?.lowercased()
+            == "classical" { return .arachneClassical }
         let requestedTask = environment["AVBD_REPLAY_TASK"]
             ?? UserDefaults.standard.string(
                 forKey: "AVBDPolicyReplaySelectedTask")
-        return requestedTask.flatMap(Robot.init(taskID:))
+        return requestedTask.flatMap(Robot.fromSelectionID)
             ?? (environment["AVBD_REPLAY_ROBOT"] == "arm"
                 ? .arm : .humanoidIsaac)
     }() {
         didSet {
             UserDefaults.standard.set(
-                robot.taskID, forKey: "AVBDPolicyReplaySelectedTask")
+                robot.selectionID, forKey: "AVBDPolicyReplaySelectedTask")
             rebuild()
         }
     }
@@ -95,6 +112,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var humanoid: HumanoidWalkTask?
     private var arm: ArmPushTTask?
     private var arachne: Arachne15LocomotionTask?
+    private var arachneClassical: Arachne15ClassicalController?
     private var task: (any VectorizedRLTask)?
     private var observation: RLObservationBatch?
     private var result: RLStepBatch?
@@ -120,6 +138,15 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         isaacHumanoid?.usesPointGoal == true
             || humanoid?.usesPointGoal == true
             || arachne?.usesPointGoal == true
+    }
+    var usesCheckpoint: Bool { !robot.usesClassicalController }
+    var controllerSectionTitle: String {
+        usesCheckpoint ? "Parallel training" : "Controller"
+    }
+    var goalControlExplanation: String {
+        usesCheckpoint
+            ? "Changing the goal updates the learned policy's command; it does not steer the joints directly."
+            : "Changing the goal updates body-twist steering. The CPG and IK produce joint targets; only motor torque and physical contacts move the body."
     }
     var goalDistanceRange: ClosedRange<Double> {
         arachne?.usesPointGoal == true ? 0.4...3.0 : 2...12
@@ -157,6 +184,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             return "Arachne-15 velocity locomotion with the exact printable CAD visuals, explicit training colliders, measured mass budget, actuator limits, latency, and seeded plant variation."
         case .arachneGoal:
             return "Arachne-15 samples a random world target, converts it to the reusable local velocity/yaw command, and must enter the visible target slowly enough to stop there."
+        case .arachneClassical:
+            return "Non-neural paired-ripple CPG and exact two-axis leg IK drive the same torque-limited motors, contacts, randomized plant, and arbitrary point-goal task as the learned policy."
         }
     }
 
@@ -185,6 +214,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
     func rebuild() {
         isaacHumanoid = nil; humanoid = nil; arm = nil; arachne = nil
+        arachneClassical = nil
         task = nil; runner = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
@@ -199,7 +229,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 .appendingPathComponent("checkpoints/\(desiredTaskID)").path
             let overridePath = ProcessInfo.processInfo.environment[
                 "AVBD_REPLAY_CHECKPOINT"]
-            let configurationPaths = [
+            let configurationPaths = robot.usesClassicalController ? [] : [
                 autoLoadLatest ? liveRunDirectory : nil,
                 overridePath, bundledPath, packagedPath,
             ].compactMap { $0 }
@@ -226,6 +256,14 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             arm = configuredTask as? ArmPushTTask
             arachne = configuredTask as? Arachne15LocomotionTask
             task = configuredTask
+            if robot.usesClassicalController {
+                guard arachne?.usesPointGoal == true else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "classical Arachne controller requires point-goal task")
+                }
+                arachneClassical = Arachne15ClassicalController()
+                policyStatus = "non-neural controller · paired-ripple CPG · exact IK · no checkpoint"
+            }
             if arachne?.usesPointGoal == true,
                !goalDistanceRange.contains(goalDistance) {
                 goalDistance = 1.5
@@ -234,15 +272,18 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 try installSelectedGoal(in: humanoid)
             }
             guard let task else { return }
-            let liveCheckpoint = liveRunDirectory.flatMap {
+            let liveCheckpoint = robot.usesClassicalController ? nil
+                : liveRunDirectory.flatMap {
                 VectorPolicyCheckpointDiscovery.latestCompleteCheckpoint(
                     inRunDirectory: $0, task: task.spec.id,
                     taskRevision: task.spec.revision)
             }
             newestUpdate = liveCheckpoint?.completedUpdates
             let startupLiveCheckpoint = autoLoadLatest ? liveCheckpoint : nil
-            let candidates = [startupLiveCheckpoint?.directory, overridePath,
-                              bundledPath, packagedPath].compactMap { $0 }
+            let candidates = robot.usesClassicalController ? [] : [
+                startupLiveCheckpoint?.directory, overridePath,
+                bundledPath, packagedPath,
+            ].compactMap { $0 }
             var loadFailures = [String]()
             for path in candidates
                 where FileManager.default.fileExists(atPath: "\(path)/metadata.json") {
@@ -255,7 +296,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     loadFailures.append("\(path): \(error)")
                 }
             }
-            if runner == nil {
+            if runner == nil && arachneClassical == nil {
                 running = false
                 policyStatus = loadFailures.isEmpty
                     ? "no promoted checkpoint for \(task.spec.id)"
@@ -443,6 +484,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     /// opened while the trainer may be replacing its individual files.
     func pollForLatestCheckpoint(force: Bool = false) {
         refreshTrainingMetrics()
+        guard usesCheckpoint else { return }
         guard let liveRunDirectory, let task else { return }
         guard let candidate = VectorPolicyCheckpointDiscovery
             .latestCompleteCheckpoint(
@@ -549,6 +591,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private func restartEpisode() throws {
         guard let task else { return }
         observation = try task.reset(seed: replaySeed)
+        if let arachneClassical, let arachne {
+            arachneClassical.reset(states: arachne.environment.states())
+        }
         if let arachne, arachne.usesPointGoal {
             let direction = arachne.currentGoalDirection(environment: 0)
             goalBearingDegrees = Double(
@@ -558,7 +603,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
         result = RLStepBatch(spec: task.spec)
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
-        episodeFinished = false; running = runner != nil
+        episodeFinished = false
+        running = runner != nil || arachneClassical != nil
         updateCameraTargets()
         applyCameraPreset()
         cameraEpoch += 1
@@ -574,6 +620,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func refreshTrainingMetrics() {
+        if arachneClassical != nil {
+            trainingStatus = "deterministic classical controller · training not required"
+            return
+        }
         guard let liveRunDirectory else {
             trainingStatus = "static checkpoint replay"
             return
@@ -602,7 +652,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func tickIfRunning() {
-        guard running, let task, let runner, var observation, var result else { return }
+        guard running, let task, var observation, var result else { return }
         let now = CACurrentMediaTime()
         let wallStep = Double(task.spec.controlStep) / max(playbackRate, 0.1)
         if frameLockedCapture {
@@ -621,14 +671,26 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 let rootVelocityBeforeStep = isaacHumanoid?
                     .environment.states()[0].root.linearVelocity
                     ?? humanoid?.environment.states()[0].root.linearVelocity
-                let expertGates = (task as? any PolicyExpertGateProviding)?
-                    .policyExpertGates(observation.policy)
-                let standExpertGates =
-                    (task as? any PolicyStandExpertGateProviding)?
-                        .policyStandExpertGates(observation.policy)
-                let actions = try runner.actions(
-                    for: observation, expertGates: expertGates,
-                    standExpertGates: standExpertGates)
+                let actions: RLActionBatch
+                if let arachneClassical, let arachne {
+                    actions = arachneClassical.actions(
+                        states: arachne.environment.states(),
+                        commands: [arachne.currentCommand(environment: 0)],
+                        spec: task.spec)
+                } else if let runner {
+                    let expertGates =
+                        (task as? any PolicyExpertGateProviding)?
+                            .policyExpertGates(observation.policy)
+                    let standExpertGates =
+                        (task as? any PolicyStandExpertGateProviding)?
+                            .policyStandExpertGates(observation.policy)
+                    actions = try runner.actions(
+                        for: observation, expertGates: expertGates,
+                        standExpertGates: standExpertGates)
+                } else {
+                    running = false
+                    return
+                }
                 try task.step(actions: actions, into: &result)
                 if (result.metrics["state/projectile_robot_contact"]?[0] ?? 0) > 0,
                    let before = rootVelocityBeforeStep {
@@ -904,9 +966,11 @@ struct PolicyReplayLabView: View {
                         Button("Load Latest") {
                             model.pollForLatestCheckpoint(force: true)
                         }
+                        .disabled(!model.usesCheckpoint)
                     }
                     Toggle("Auto-load complete checkpoints",
                            isOn: $model.autoLoadLatest)
+                        .disabled(!model.usesCheckpoint)
                     Picker("Camera", selection: $model.cameraMode) {
                         ForEach(PolicyReplayModel.CameraMode.allCases, id: \.self) {
                             Text($0.rawValue).tag($0)
@@ -936,7 +1000,9 @@ struct PolicyReplayLabView: View {
                             Text("Distance").font(.caption).frame(width: 50, alignment: .leading)
                             Slider(value: $model.goalDistance,
                                    in: model.goalDistanceRange,
-                                   step: model.robot == .arachneGoal ? 0.1 : 0.5)
+                                   step: model.robot == .arachneGoal
+                                    || model.robot == .arachneClassical
+                                        ? 0.1 : 0.5)
                             Text(String(format: "%.1f m", model.goalDistance))
                                 .font(.caption.monospacedDigit()).frame(width: 42)
                         }
@@ -944,7 +1010,7 @@ struct PolicyReplayLabView: View {
                             Button("Apply & Reset") { model.applyGoalAndReset() }
                             Button("Sample Task Goal") { model.randomizeGoalAndReset() }
                         }
-                        Text("Changing the goal updates the learned policy's command; it does not steer the joints directly.")
+                        Text(model.goalControlExplanation)
                             .font(.caption2).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Divider()
@@ -972,7 +1038,7 @@ struct PolicyReplayLabView: View {
                         }
                     }
                     Divider()
-                    Text("Parallel training").font(.headline)
+                    Text(model.controllerSectionTitle).font(.headline)
                     Text(model.trainingStatus)
                         .font(.system(.caption, design: .monospaced))
                         .fixedSize(horizontal: false, vertical: true)
@@ -986,7 +1052,9 @@ struct PolicyReplayLabView: View {
                     Text("Drag to orbit, right-drag to pan, and scroll to zoom. Follow Robot keeps footfalls large enough to inspect; Show Course keeps the route in view.")
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("This view executes only the learned Safetensors checkpoint used by `eval-rl`; no scripted or reference controller is available in replay.")
+                    Text(model.usesCheckpoint
+                        ? "This view executes only the learned Safetensors checkpoint used by `eval-rl`; no scripted or reference controller is available in learned replay."
+                        : "This baseline contains no neural inference or checkpoint. Its motion is generated by the displayed CPG/IK controller through the exact same physical plant used by RL.")
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1028,6 +1096,7 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
             renderer.elevation = model.cameraMode == .follow ? 0.12 : 0.16
             let isArachne = model.robot == .arachne
                 || model.robot == .arachneGoal
+                || model.robot == .arachneClassical
             renderer.distance = model.cameraMode == .follow
                 ? (isArachne ? 0.65 : 3.2)
                 : (isArachne ? 1.5 : 15)

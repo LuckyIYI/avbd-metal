@@ -129,6 +129,17 @@ goal. Camera and hand-gesture experiments must separately report goal-estimator
 angular/range error and then the end-to-end navigation metrics; do not hide
 perception failures inside locomotion success.
 
+### Classical baseline as commissioning control
+
+The paired-ripple CPG/IK controller is deliberately evaluated on the same
+`arachne15-goal-v0` plant and success definition as the policy. Its tracked
+64-episode snapshot is under `baselines/classical/`; it achieved 87.5% goal
+success and 100% survival across two seeds, below the frozen learned policy's
+roughly 95% success. Keep it as a transparent fallback for suspended and
+tethered actuator/contact commissioning. Do not treat its deterministic gait
+logic as evidence that the hardware model is calibrated, and do not replace
+the minimum publish gates with this small baseline sample.
+
 ## Initial PPO run
 
 The existing task-agnostic MLX PPO path can train this task directly:
