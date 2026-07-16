@@ -99,8 +99,12 @@ def main() -> None:
     reports = [
         validate(ROOT / "arachne15_training.xml", "training"),
         validate(ROOT / "arachne15_validation.xml", "validation"),
+        validate(model.BUNDLED_ASSET_ROOT / "arachne15_training.xml", "training"),
+        validate(model.BUNDLED_ASSET_ROOT / "arachne15_validation.xml", "validation"),
     ]
     assert reports[0]["collision_geoms"] < reports[1]["collision_geoms"]
+    assert reports[0] == reports[2]
+    assert reports[1] == reports[3]
     for report in reports:
         fields = " ".join(f"{key}={value}" for key, value in report.items())
         print("PASS", fields)

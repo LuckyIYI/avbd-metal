@@ -86,6 +86,15 @@ public struct SkinVertexGPU {
     public var normal: SIMD4<Float> = .zero
 }
 
+/// Expanded visual-only rigid-mesh corner. `position.w` stores the owning
+/// body id as Float bit-pattern so the Metal vertex shader can fetch the live
+/// body pose without a per-mesh draw call or duplicated transforms.
+public struct RigidMeshVertexGPU {
+    public var positionBody: SIMD4<Float> = .zero
+    public var normal: SIMD4<Float> = .zero
+    public var color: SIMD4<Float> = .zero
+}
+
 public struct SoftContactGPU {
     public var ids: SIMD4<UInt32> = .zero
     public var normal: SIMD4<Float> = .zero

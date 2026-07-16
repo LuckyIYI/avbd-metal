@@ -41,6 +41,17 @@
       <geom name="guide_right_visual" class="visual" type="mesh" mesh="phone_guide_visual" pos="0 -0.0779 0" quat="0 0 0 1"/>
       <geom name="battery_cradle_visual" class="visual" type="mesh" mesh="battery_cradle_visual" pos="0 0 -0.028"/>
       <geom name="iphone_visual" class="visual" type="box" size="0.004125 0.0733 0.0353" pos="0 0 0.0373" rgba="0.18 0.2 0.24 1"/>
+      <geom name="hip_servo_right_0_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="-0.06 -0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="hip_servo_left_0_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="-0.06 0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="hip_servo_right_1_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="-0.024 -0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="hip_servo_left_1_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="-0.024 0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="hip_servo_right_2_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.024 -0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="hip_servo_left_2_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.024 0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="hip_servo_right_3_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.06 -0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="hip_servo_left_3_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.06 0.092 0.005" rgba="0.16 0.18 0.22 1"/>
+      <geom name="battery_visual" class="visual" type="box" size="0.0175 0.0525 0.009" pos="0 0 -0.02" rgba="0.10 0.12 0.16 1"/>
+      <geom name="bec_visual" class="visual" type="box" size="0.0275 0.015 0.007" pos="-0.034 0 -0.015" rgba="0.10 0.26 0.42 1"/>
+      <geom name="control_bridge_visual" class="visual" type="box" size="0.0275 0.0125 0.006" pos="0.024 0 -0.014" rgba="0.10 0.38 0.24 1"/>
       <geom name="base_x_rear" class="collision" type="box" size="0.007 0.088 0.0025" pos="-0.07 0 0.0025" friction="0.55 0.005 0.0001"/>
       <geom name="base_x_front" class="collision" type="box" size="0.007 0.088 0.0025" pos="0.07 0 0.0025" friction="0.55 0.005 0.0001"/>
       <geom name="base_y_right" class="collision" type="box" size="0.063 0.007 0.0025" pos="0 -0.081 0.0025" friction="0.55 0.005 0.0001"/>
@@ -74,6 +85,7 @@
         <joint name="right_rear_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="right_rear_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="right_rear_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="right_rear_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="right_rear_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="right_rear_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>
@@ -89,6 +101,7 @@
         <joint name="right_mid_rear_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="right_mid_rear_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="right_mid_rear_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="right_mid_rear_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="right_mid_rear_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="right_mid_rear_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>
@@ -104,6 +117,7 @@
         <joint name="right_mid_front_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="right_mid_front_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="right_mid_front_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="right_mid_front_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="right_mid_front_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="right_mid_front_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>
@@ -119,6 +133,7 @@
         <joint name="right_front_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="right_front_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="right_front_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="right_front_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="right_front_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="right_front_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>
@@ -134,6 +149,7 @@
         <joint name="left_rear_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="left_rear_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="left_rear_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="left_rear_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="left_rear_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="left_rear_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>
@@ -149,6 +165,7 @@
         <joint name="left_mid_rear_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="left_mid_rear_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="left_mid_rear_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="left_mid_rear_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="left_mid_rear_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="left_mid_rear_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>
@@ -164,6 +181,7 @@
         <joint name="left_mid_front_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="left_mid_front_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="left_mid_front_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="left_mid_front_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="left_mid_front_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="left_mid_front_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>
@@ -179,6 +197,7 @@
         <joint name="left_front_hip" class="hip_joint" axis="0 0 1"/>
         <geom name="left_front_coxa_visual" class="visual" type="mesh" mesh="coxa_visual" pos="0 0 -0.0035"/>
         <geom name="left_front_coxa_collision" class="footprint_collision" type="capsule" size="0.007" fromto="0 0 0 0.05 0 0"/>
+      <geom name="left_front_knee_servo_visual" class="visual" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781" rgba="0.16 0.18 0.22 1"/>
         <geom name="left_front_knee_servo" class="collision" type="box" size="0.01 0.0145 0.017" pos="0.05 0 0" quat="0.707106781 0 0 0.707106781"/>
         <body name="left_front_tibia" pos="0.05 0 0" quat="0.843391446 0 0.537299608 0">
           <inertial pos="0.0531758156 0 0.000739809129" mass="0.013517" diaginertia="3.59758367e-07 1.88701864e-05 1.89852491e-05"/>

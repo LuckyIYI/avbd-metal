@@ -39,6 +39,12 @@ struct SkinRenderVertex {
     float4 normal;
 };
 
+struct RigidMeshVertex {
+    float4 positionBody; // xyz body-local; w stores uint body id bits
+    float4 normal;
+    float4 color;
+};
+
 struct Uniforms {
     float4x4 viewProj;
     float4 lightDir;    // xyz
@@ -246,6 +252,30 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     o.normal = normalize(sv.normal.xyz);
     o.flatShade = 0.0;
     o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 5u + 11u), 0.76));
+    return o;
+}
+
+inline float3 rigidMeshRotate(float4 q, float3 v) {
+    return v + 2.0f * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+vertex VOut rigid_mesh_vertex(
+    uint vid [[vertex_id]],
+    device const RigidMeshVertex* vertices [[buffer(0)]],
+    constant Uniforms& U [[buffer(1)]],
+    device const float4* posLin [[buffer(2)]],
+    device const float4* posAng [[buffer(3)]])
+{
+    RigidMeshVertex v = vertices[vid];
+    uint body = as_type<uint>(v.positionBody.w);
+    float4 q = posAng[body];
+    float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
+    VOut o;
+    o.position = U.viewProj * float4(world, 1);
+    o.world = world;
+    o.normal = normalize(rigidMeshRotate(q, v.normal.xyz));
+    o.albedo = srgbToLin(v.color.rgb);
+    o.flatShade = 0;
     return o;
 }
 
@@ -726,8 +756,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     let queue: MTLCommandQueue
     weak var model: (AnyObject & RenderableModel)?
 
-    var boxP, sphereP, torusP, capsuleP, softP, skinP: MTLRenderPipelineState!
-    var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre: MTLRenderPipelineState!
+    var boxP, sphereP, torusP, capsuleP, softP, skinP, rigidMeshP: MTLRenderPipelineState!
+    var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre,
+        rigidMeshPre: MTLRenderPipelineState!
     var skyP, floorP, shadowP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
     var depthState, noDepthState, noWriteDepthState: MTLDepthStencilState!
 
@@ -793,6 +824,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         capsuleP = try pipe("capsule_vertex", "pbr_fragment")
         softP = try pipe("soft_vertex", "soft_fragment")
         skinP = try pipe("skin_vertex", "soft_fragment")
+        rigidMeshP = try pipe("rigid_mesh_vertex", "pbr_fragment")
         skyP = try pipe("fs_vertex", "sky_fragment")
         floorP = try pipe("floor_vertex", "floor_fragment")
         shadowP = try pipe("shadow_vertex", "shadow_fragment", blend: true)
@@ -805,6 +837,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         floorPreP = try pipe("floor_vertex", "floor_prepass_fragment", samples: 1, colorFormats: preFmt)
         softPre = try pipe("soft_vertex_front", "soft_prepass_fragment", samples: 1, colorFormats: preFmt)
         skinPre = try pipe("skin_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+        rigidMeshPre = try pipe("rigid_mesh_vertex", "prepass_fragment",
+                                samples: 1, colorFormats: preFmt)
         gtaoP = try pipe("fs_vertex", "gtao_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
         blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
@@ -1002,6 +1036,15 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: skin.triCount * 3)
             }
+            if let mesh = solver.renderRigidMeshSurface {
+                enc.setRenderPipelineState(rigidMeshPre)
+                enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
+                enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: mesh.vertexCount)
+            }
             enc.endEncoding()
         }
 
@@ -1111,6 +1154,17 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: skin.triCount * 3)
+        }
+        if let mesh = solver.renderRigidMeshSurface {
+            enc.setRenderPipelineState(rigidMeshP)
+            enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
+            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
+            enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexA, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: mesh.vertexCount)
         }
         enc.endEncoding()
 

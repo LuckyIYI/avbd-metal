@@ -296,6 +296,34 @@ public struct SceneSkinnedMesh {
     }
 }
 
+/// A visual-only triangle mesh rigidly attached to a simulated body. Physics
+/// remains owned by the body's authored primitive/convex colliders; this mesh
+/// exists so imported CAD can retain its true appearance without turning a
+/// high-resolution triangle surface into dynamic contact geometry.
+public struct SceneRigidMesh {
+    public var body: Int
+    public var vertices: [F3]
+    public var normals: [F3]
+    public var triangles: [(Int, Int, Int)]
+    public var localPosition: F3
+    public var localRotation: Quat
+    public var color: F3
+
+    public init(body: Int, mesh: SurfaceMesh,
+                localPosition: F3 = .zero,
+                localRotation: Quat = Quat(real: 1, imag: .zero),
+                color: F3 = F3(0.24, 0.28, 0.34)) {
+        precondition(body >= 0)
+        self.body = body
+        vertices = mesh.vertices
+        normals = mesh.normals
+        triangles = mesh.triangles
+        self.localPosition = localPosition
+        self.localRotation = localRotation.normalized
+        self.color = color
+    }
+}
+
 public struct SceneSpring {
     public var bodyA: Int
     public var bodyB: Int
@@ -407,6 +435,7 @@ public struct PhysicsScene {
     public var tets: [SceneTet] = []
     public var tris: [SceneTri] = []
     public var skinnedMeshes: [SceneSkinnedMesh] = []
+    public var rigidMeshes: [SceneRigidMesh] = []
     public var spinners: [SceneSpinner] = []
     public var collisionExclusions: [SceneCollisionExclusion] = []
     public var settings = SimSettings()
@@ -570,6 +599,14 @@ public struct PhysicsScene {
     public mutating func addTet(_ t: SceneTet) { tets.append(t) }
     public mutating func addTri(_ t: SceneTri) { tris.append(t) }
     public mutating func addSkinnedMesh(_ m: SceneSkinnedMesh) { skinnedMeshes.append(m) }
+
+    /// Attach detailed rendering geometry without adding mass or collision.
+    public mutating func addRigidMesh(_ mesh: SceneRigidMesh) {
+        precondition(bodies.indices.contains(mesh.body), "rigid mesh owner out of range")
+        precondition(mesh.vertices.count == mesh.normals.count,
+                     "rigid mesh needs one normal per vertex")
+        rigidMeshes.append(mesh)
+    }
 
     /// Build a CPU reference solver from this scene.
     public func makeCPUSolver() -> CPUSolver {

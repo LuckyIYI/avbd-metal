@@ -39,13 +39,15 @@ crossing protection with boundary release, runtime shader concatenation
 The vector RL path is task-agnostic and runs the simulator and MLX learner on
 Apple silicon. Built-in tasks include Cartesian Push-T, randomized articulated
 arm Push-T, the imported 19-DoF Unitree H1 Flat velocity task aligned to Isaac
-Lab, and earlier native humanoid experiments:
+Lab, the printable 16-DoF Arachne-15 spider, and earlier native humanoid
+experiments:
 
 ```bash
 .build/release/avbd list-rl
 .build/release/avbd rl-smoke pusht-state-v0 --envs 256 --frames 200
 .build/release/avbd rl-smoke arm-pusht-v0 --envs 128 --frames 200
 .build/release/avbd rl-smoke humanoid-isaac-flat-v0 --envs 128 --frames 200
+.build/release/avbd rl-smoke arachne15-velocity-v0 --envs 128 --frames 200
 
 # MLX's Metal library is only produced by xcodebuild, not plain SwiftPM.
 make ml-tool

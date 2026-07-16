@@ -15,6 +15,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case humanoidWalk = "Humanoid Walk"
         case humanoidGoal = "Legacy Goal"
         case arm = "Arm Push-T"
+        case arachne = "Arachne-15"
 
         var taskID: String {
             switch self {
@@ -23,6 +24,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             case .humanoidWalk: return "humanoid-walk-v0"
             case .humanoidGoal: return "humanoid-goal-v0"
             case .arm: return "arm-pusht-v0"
+            case .arachne: return "arachne15-velocity-v0"
             }
         }
     }
@@ -41,6 +43,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case "humanoid-walk-v0": return .humanoidWalk
         case "humanoid-goal-v0": return .humanoidGoal
         case "arm-pusht-v0": return .arm
+        case "arachne15-velocity-v0": return .arachne
         case "humanoid-isaac-flat-v0": return .humanoidIsaac
         default:
             return environment["AVBD_REPLAY_ROBOT"] == "arm"
@@ -84,6 +87,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var isaacHumanoid: HumanoidIsaacVelocityTask?
     private var humanoid: HumanoidWalkTask?
     private var arm: ArmPushTTask?
+    private var arachne: Arachne15LocomotionTask?
     private var task: (any VectorizedRLTask)?
     private var observation: RLObservationBatch?
     private var result: RLStepBatch?
@@ -137,19 +141,23 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             return "Experimental native-humanoid goal policy; this is not the accepted imported-H1 Flat policy."
         case .arm:
             return "Replay the learned articulated-arm Push-T policy."
+        case .arachne:
+            return "Arachne-15 velocity locomotion with the exact printable CAD visuals, explicit training colliders, measured mass budget, actuator limits, latency, and seeded plant variation."
         }
     }
 
     var solver: GPUSolver? {
         if let isaacHumanoid { return isaacHumanoid.environment.solver }
         if let humanoid { return humanoid.environment.solver }
-        return arm?.environment.solver
+        if let arm { return arm.environment.solver }
+        return arachne?.environment.solver
     }
 
     init() { rebuild() }
 
     func rebuild() {
-        isaacHumanoid = nil; humanoid = nil; arm = nil; task = nil; runner = nil
+        isaacHumanoid = nil; humanoid = nil; arm = nil; arachne = nil
+        task = nil; runner = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
         interactionStatus = ""
@@ -177,6 +185,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             isaacHumanoid = configuredTask as? HumanoidIsaacVelocityTask
             humanoid = configuredTask as? HumanoidWalkTask
             arm = configuredTask as? ArmPushTTask
+            arachne = configuredTask as? Arachne15LocomotionTask
             task = configuredTask
             if let humanoid, humanoid.usesPointGoal {
                 try installSelectedGoal(in: humanoid)
@@ -573,6 +582,19 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 0.5 * (state.blockPosition.x + goal.x),
                 0.5 * (state.blockPosition.y + goal.y), 0.25)
             courseCameraTarget = replayCameraTarget
+        } else if let arachne {
+            let state = arachne.environment.states()[0]
+            replayCameraTarget = state.root.position + F3(0.04, 0, 0.02)
+            let command = arachne.currentCommand(environment: 0)
+            let heading = state.root.rotation.act(F3(1, 0, 0))
+            let planarLength = sqrt(
+                heading.x * heading.x + heading.y * heading.y)
+            let planarHeading = planarLength > 1e-6
+                ? F3(heading.x / planarLength, heading.y / planarLength, 0)
+                : F3(1, 0, 0)
+            courseCameraTarget = state.root.position
+                + planarHeading * max(command.x, 0.05) * 2
+                + F3(0, 0, 0.02)
         }
     }
 
@@ -585,7 +607,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         guard let solver else { return }
         let selectedTarget = cameraMode == .follow
             ? replayCameraTarget : courseCameraTarget
-        solver.settings.cameraDistance = cameraMode == .follow ? 3.2 : 15
+        let isArachne = arachne != nil
+        solver.settings.cameraDistance = cameraMode == .follow
+            ? (isArachne ? 0.65 : 3.2)
+            : (isArachne ? 1.5 : 15)
         solver.settings.cameraTargetX = selectedTarget.x
         solver.settings.cameraTargetY = selectedTarget.y
         solver.settings.cameraTargetZ = selectedTarget.z
@@ -594,7 +619,22 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func refreshStats() {
-        if let isaacHumanoid {
+        if let arachne {
+            let state = arachne.environment.states()[0]
+            let command = arachne.currentCommand(environment: 0)
+            let inverse = state.root.rotation.conjugate
+            let velocity = inverse.act(state.root.linearVelocity)
+            let angular = inverse.act(state.root.angularVelocity)
+            let up = inverse.act(F3(0, 0, 1)).z
+            statsText = String(
+                format: "local velocity (%+.3f, %+.3f) / (%+.3f, %+.3f) m/s\n"
+                    + "yaw rate %+.3f / %+.3f rad/s   up %.3f\n"
+                    + "height %.3f m   frame %d/%d   episodes %d   success %d",
+                velocity.x, velocity.y, command.x, command.y,
+                angular.z, command.z, up, state.root.position.z,
+                controlSteps, arachne.spec.maxEpisodeSteps,
+                completed, successes)
+        } else if let isaacHumanoid {
             let state = isaacHumanoid.environment.states()[0]
             let command = isaacHumanoid.currentCommand(environment: 0)
             let forward3D = state.root.rotation.act(F3(1, 0, 0))
@@ -705,7 +745,7 @@ struct PolicyReplayLabView: View {
                             Text($0.rawValue).tag($0)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                     HStack {
                         Button(model.episodeFinished ? "Replay" : (model.running ? "Pause" : "Play")) {
                             model.togglePlayback()
@@ -836,7 +876,10 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
             context.coordinator.cameraMode = model.cameraMode
             renderer.azimuth = -.pi / 2
             renderer.elevation = model.cameraMode == .follow ? 0.12 : 0.16
-            renderer.distance = model.cameraMode == .follow ? 3.2 : 15
+            let isArachne = model.robot == .arachne
+            renderer.distance = model.cameraMode == .follow
+                ? (isArachne ? 0.65 : 3.2)
+                : (isArachne ? 1.5 : 15)
         }
         renderer.target = model.cameraMode == .follow
             ? model.replayCameraTarget : model.courseCameraTarget

@@ -109,6 +109,11 @@ public final class GPUSolver {
     let skinnedVertexCount: Int
     let skinnedTriCount: Int
     var skinBindingBuf, skinVertexBuf, skinTriBuf: MTLBuffer
+    // Visual-only rigid CAD meshes are expanded to triangle corners once.
+    // Each corner carries its body id and is transformed from live solver
+    // state in the renderer; it never enters collision or solver topology.
+    let rigidMeshVertexCount: Int
+    var rigidMeshVertexBuf: MTLBuffer
     // Voronoi temporal tracking: per-vertex / per-edge persistent closest-
     // element candidate sets, plus the topology they propagate through.
     var vtTrackBuf, eeTrackBuf, triAdjBuf: MTLBuffer
@@ -195,6 +200,9 @@ public final class GPUSolver {
         self.numTris = scene.tris.count + tetBoundaryTris.count
         self.skinnedVertexCount = scene.skinnedMeshes.reduce(0) { $0 + $1.vertices.count }
         self.skinnedTriCount = scene.skinnedMeshes.reduce(0) { $0 + $1.triangles.count }
+        self.rigidMeshVertexCount = scene.rigidMeshes.reduce(0) {
+            $0 + 3 * $1.triangles.count
+        }
         // capacity bound: V-T (4/vertex) + rigid-T (4/tri) + E-E (2/edge,
         // edges <= 3 per tri)
         let particleEstimate = scene.bodies.lazy.filter { $0.isParticle }.count
@@ -316,6 +324,9 @@ public final class GPUSolver {
         skinVertexBuf = try makeBuf(max(1, skinnedVertexCount) * MemoryLayout<SkinVertexGPU>.stride,
                                     "skinVertices")
         skinTriBuf = try makeBuf(max(1, skinnedTriCount) * 12, "skinTris")
+        rigidMeshVertexBuf = try makeBuf(
+            max(1, rigidMeshVertexCount) * MemoryLayout<RigidMeshVertexGPU>.stride,
+            "rigidMeshVertices")
         vtTrackBuf = try makeBuf(nb * 16, "vtTrack")
         eeTrackBuf = try makeBuf(max(1, maxEdges) * 16, "eeTrack")
         triAdjBuf = try makeBuf(max(1, numTris) * 16, "triAdj")
@@ -1397,6 +1408,37 @@ public final class GPUSolver {
                                                  capacity: skinCorners.count)
                     .update(from: skinCorners, count: skinCorners.count)
             }
+        }
+        if rigidMeshVertexCount > 0 {
+            var corners: [RigidMeshVertexGPU] = []
+            corners.reserveCapacity(rigidMeshVertexCount)
+            for mesh in scene.rigidMeshes {
+                precondition(scene.bodies.indices.contains(mesh.body),
+                             "rigid mesh owner out of range")
+                precondition(mesh.normals.count == mesh.vertices.count,
+                             "rigid mesh normal count mismatch")
+                let bodyBits = Float(bitPattern: UInt32(mesh.body))
+                let color = SIMD4(mesh.color, 1)
+                for triangle in mesh.triangles {
+                    for index in [triangle.0, triangle.1, triangle.2] {
+                        precondition(mesh.vertices.indices.contains(index),
+                                     "rigid mesh triangle index out of range")
+                        var corner = RigidMeshVertexGPU()
+                        let position = mesh.localPosition
+                            + mesh.localRotation.act(mesh.vertices[index])
+                        let normal = normalize(
+                            mesh.localRotation.act(mesh.normals[index]))
+                        corner.positionBody = SIMD4(position, bodyBits)
+                        corner.normal = SIMD4(normal, 0)
+                        corner.color = color
+                        corners.append(corner)
+                    }
+                }
+            }
+            precondition(corners.count == rigidMeshVertexCount)
+            rigidMeshVertexBuf.contents().bindMemory(
+                to: RigidMeshVertexGPU.self, capacity: corners.count)
+                .update(from: corners, count: corners.count)
         }
         let flags = surfacedFlags.contents().bindMemory(to: UInt32.self,
                                                         capacity: numBodies)
@@ -3168,6 +3210,16 @@ public final class GPUSolver {
                                       vertices: MTLBuffer)? {
         guard skinnedTriCount > 0 else { return nil }
         return (skinTriBuf, skinnedTriCount, skinVertexBuf)
+    }
+
+    /// Visual-only CAD triangles attached to live rigid bodies. Positions and
+    /// normals are local to each owning body's inertial frame.
+    public var renderRigidMeshSurface: (
+        vertices: MTLBuffer, vertexCount: Int,
+        positions: MTLBuffer, rotations: MTLBuffer
+    )? {
+        guard rigidMeshVertexCount > 0 else { return nil }
+        return (rigidMeshVertexBuf, rigidMeshVertexCount, posLin, posAng)
     }
 
     public var bodyCount: Int { numBodies }

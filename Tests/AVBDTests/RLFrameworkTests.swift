@@ -8,7 +8,8 @@ import MLX
 final class RLFrameworkTests: XCTestCase {
     func testRegisteredTasksExposeNormalizedBatchedSpaces() throws {
         XCTAssertEqual(BuiltInRLTasks.registry.taskIDs,
-                       ["arm-pusht-v0", "humanoid-goal-v0",
+                       ["arachne15-velocity-v0", "arm-pusht-v0",
+                        "humanoid-goal-v0",
                         "humanoid-isaac-flat-v0", "humanoid-isaac-goal-v0",
                         "humanoid-velocity-v0",
                         "humanoid-walk-v0", "pusht-state-v0"])
@@ -22,6 +23,51 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(task.spec.action.shape, [2])
         XCTAssertEqual(task.spec.action.lowerBound, [-1, -1])
         XCTAssertEqual(task.spec.action.upperBound, [1, 1])
+    }
+
+    func testArachneRegisteredTaskIsBatchedAndLoadBearing() throws {
+        let registered = try BuiltInRLTasks.registry.make(
+            "arachne15-velocity-v0",
+            configuration: RLTaskConfiguration(
+                numEnvironments: 8, seed: 91,
+                options: [
+                    "standingCommandProbability": 1,
+                    "initialRollPitchRange": 0,
+                    "initialYawRange": 0,
+                    "observationNoise": 0,
+                    "maximumActionLatencySteps": 0,
+                    "domainRandomization": 0,
+                ]))
+        let task = try XCTUnwrap(registered as? Arachne15LocomotionTask)
+        XCTAssertEqual(task.spec.observation.shape, [60])
+        XCTAssertEqual(task.spec.action.shape, [16])
+        XCTAssertEqual(task.spec.simulationStep, 0.002, accuracy: 1e-7)
+        XCTAssertEqual(task.spec.controlStep, 0.02, accuracy: 1e-7)
+        XCTAssertEqual(task.environment.refs.count, 8)
+        XCTAssertEqual(task.environment.scene.rigidMeshes.count, 0,
+                       "large headless batches must not replicate CAD meshes")
+        XCTAssertEqual(task.environment.scene.colliders
+            .filter(\.collisionEnabled).count, 1 + 8 * 39)
+        for e in 0..<8 {
+            XCTAssertEqual(task.currentCommand(environment: e), .zero)
+            let groups = Set(task.environment.scene.colliders
+                .filter { $0.body != task.environment.groundBody
+                    && task.environment.refs[e].bodies.contains($0.body) }
+                .map(\.collisionGroup))
+            XCTAssertEqual(groups, [UInt32(e + 1)])
+        }
+
+        let observation = try task.reset(seed: 92)
+        XCTAssertTrue(observation.policy.allSatisfy(\.isFinite))
+        let actions = RLActionBatch(spec: task.spec)
+        var result = RLStepBatch(spec: task.spec)
+        for _ in 0..<25 {
+            try task.step(actions: actions, into: &result)
+            XCTAssertFalse(result.terminated.contains(true))
+            XCTAssertTrue(result.observations.policy.allSatisfy(\.isFinite))
+            XCTAssertTrue(result.metrics["state/root_height_m"]!
+                .allSatisfy { $0 > 0.035 })
+        }
     }
 
     func testBuiltInTasksRejectUnknownOptionsInsteadOfUsingDefaults() {

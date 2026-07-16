@@ -29,6 +29,40 @@ This produces and validates two MJCF files:
 Both profiles contain 17 bodies, 16 joints, 16 actuators, the same mass and
 inertia tensors, and the same visual mesh instances. Only non-task-critical
 base collision detail changes. Feet and leg collision geometry are identical.
+The generator also installs byte-identical XML and mesh resources under
+`Sources/AVBDCore/Assets/arachne15`, so SwiftPM, the CLI, tests, and the app all
+consume the same checked asset rather than depending on a developer CAD path.
+
+## AVBD/MLX task
+
+`arachne15-velocity-v0` is a normal `VectorizedRLTask`; PPO and checkpointing
+need no spider-specific learner code. The policy contract is:
+
+- observation `[60]`: body-frame linear/angular velocity, projected gravity,
+  commanded planar twist, 16 encoder angles, 16 encoder velocities, and the
+  16 previous applied actions;
+- action `[16]`: bounded joint-position offsets in MJCF actuator order;
+- 2 ms physics with decimation 10 (50 Hz policy control);
+- eight physical foot contacts, no gait clock and no reference trajectory;
+- distinct termination/time-limit signals, decomposed metrics, terminal
+  observations, and a task-owned held-out evaluation gate.
+
+Large batches omit detailed CAD render buffers while retaining identical
+inertia and collisions. One-to-four-environment replay includes them, and the
+Policy Replay task selector exposes **Arachne-15** even before a checkpoint is
+available. Run the actual task boundary with:
+
+```sh
+.build/release/avbd rl-smoke arachne15-velocity-v0 \
+  --envs 128 --frames 200
+```
+
+The default training population deterministically samples mass, inertia,
+friction, torque, servo gains, reflected inertia, and 0--2 control ticks of
+latency. Disable the initial envelope for nominal-plant debugging with
+`--task-option domainRandomization=0 --task-option maximumActionLatencySteps=0`.
+Custom Swift tasks can supply any `ArticulationDomainRandomization` ranges.
+See [SIM_TO_REAL.md](SIM_TO_REAL.md) for the calibration and acceptance plan.
 
 ## Why primitives instead of decomposed printable meshes?
 

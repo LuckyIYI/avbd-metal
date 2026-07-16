@@ -10,11 +10,18 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+REPOSITORY_ROOT = ROOT.parents[2]
+BUNDLED_ASSET_ROOT = REPOSITORY_ROOT / "Sources/AVBDCore/Assets/arachne15"
+VISUAL_MESH_FILES = (
+    "chassis.stl", "phone_guide.stl", "battery_cradle.stl",
+    "coxa_link.stl", "tibia_link.stl", "foot_pad.stl",
+)
 
 HIP_X = (-0.060, -0.024, 0.024, 0.060)
 HIP_Y = 0.092
@@ -119,6 +126,34 @@ def box_geom(name: str, size, pos, *, friction: float = 0.55) -> str:
     )
 
 
+def visual_box(name: str, size, pos, *, rgba: str = "0.22 0.25 0.30 1",
+               quat: str | None = None) -> str:
+    half = tuple(value / 2 for value in size)
+    rotation = f' quat="{quat}"' if quat else ""
+    return (
+        f'<geom name="{name}" class="visual" type="box" '
+        f'size="{fmt(half)}" pos="{fmt(pos)}"{rotation} rgba="{rgba}"/>'
+    )
+
+
+def root_visual_components() -> list[str]:
+    geoms = []
+    for i, x in enumerate(HIP_X):
+        for side, y in (("right", -HIP_Y), ("left", HIP_Y)):
+            geoms.append(visual_box(
+                f"hip_servo_{side}_{i}_visual", (0.020, 0.029, 0.034),
+                (x, y, 0.005), rgba="0.16 0.18 0.22 1"))
+    geoms += [
+        visual_box("battery_visual", (0.035, 0.105, 0.018),
+                   (0, 0, -0.020), rgba="0.10 0.12 0.16 1"),
+        visual_box("bec_visual", (0.055, 0.030, 0.014),
+                   (-0.034, 0, -0.015), rgba="0.10 0.26 0.42 1"),
+        visual_box("control_bridge_visual", (0.055, 0.025, 0.012),
+                   (0.024, 0, -0.014), rgba="0.10 0.38 0.24 1"),
+    ]
+    return geoms
+
+
 def root_collision_geoms(profile: str) -> list[str]:
     geoms = [
         # Closed ring represented as four rails plus the structural phone spine.
@@ -173,6 +208,9 @@ def leg_xml(x_index: int, side: int) -> list[str]:
         f'mesh="coxa_visual" pos="0 0 -0.0035"/>',
         f'  <geom name="{prefix}_coxa_collision" class="footprint_collision" '
         f'type="capsule" size="0.007" fromto="0 0 0 {fmt(COXA_LENGTH)} 0 0"/>',
+        visual_box(f"{prefix}_knee_servo_visual", (0.020, 0.029, 0.034),
+                   (COXA_LENGTH, 0, 0), rgba="0.16 0.18 0.22 1",
+                   quat="0.707106781 0 0 0.707106781"),
         f'  <geom name="{prefix}_knee_servo" class="collision" type="box" '
         f'size="0.01 0.0145 0.017" pos="{fmt((COXA_LENGTH, 0, 0))}" '
         f'quat="0.707106781 0 0 0.707106781"/>',
@@ -247,6 +285,7 @@ def generate(profile: str) -> str:
         f'size="{fmt(tuple(v / 2 for v in PHONE_SIZE))}" pos="{fmt(PHONE_CENTER)}" '
         f'rgba="0.18 0.2 0.24 1"/>',
     ]
+    lines += indent(root_visual_components(), 3)
     lines += indent(root_collision_geoms(profile), 3)
     for side in (-1, 1):
         for index in range(len(HIP_X)):
@@ -289,15 +328,34 @@ def main() -> None:
                         help="fail if checked-in XML differs from generated output")
     args = parser.parse_args()
     mismatches = []
+    outputs: list[tuple[Path, str]] = []
     for profile in ("training", "validation"):
-        path = ROOT / f"arachne15_{profile}.xml"
         output = generate(profile)
+        outputs.append((ROOT / f"arachne15_{profile}.xml", output))
+        outputs.append((
+            BUNDLED_ASSET_ROOT / f"arachne15_{profile}.xml",
+            output.replace('meshdir="../build/stl"', 'meshdir="meshes"'),
+        ))
+    for path, output in outputs:
         if args.check:
             if not path.exists() or path.read_text() != output:
                 mismatches.append(str(path))
         else:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(output)
             print(path)
+    source_meshes = ROOT.parent / "build/stl"
+    bundled_meshes = BUNDLED_ASSET_ROOT / "meshes"
+    for filename in VISUAL_MESH_FILES:
+        source = source_meshes / filename
+        destination = bundled_meshes / filename
+        if args.check:
+            if not destination.exists() or destination.read_bytes() != source.read_bytes():
+                mismatches.append(str(destination))
+        else:
+            bundled_meshes.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            print(destination)
     if mismatches:
         raise SystemExit("stale generated assets: " + ", ".join(mismatches))
 

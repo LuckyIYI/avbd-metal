@@ -118,6 +118,15 @@ public enum BuiltInRLTasks {
         "pushContactCurriculumMinimumGoalProgress",
         "pushContactCurriculumMaximumGoalDistance",
     ]
+    private static let arachne15OptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "commandResamplingSteps",
+        "minimumForwardVelocity", "maximumForwardVelocity",
+        "maximumLateralVelocity", "maximumYawRate",
+        "standingCommandProbability", "initialRollPitchRange",
+        "initialYawRange", "observationNoise",
+        "maximumActionLatencySteps", "validationCollisionProfile",
+        "domainRandomization",
+    ]
 
     public static let registry: RLTaskRegistry = {
         let registry = RLTaskRegistry()
@@ -640,6 +649,46 @@ public enum BuiltInRLTasks {
                 pushContactCurriculumMaximumGoalDistance:
                     cfg.options[
                         "pushContactCurriculumMaximumGoalDistance"] ?? 0))
+        }
+        try! registry.register("arachne15-velocity-v0") { cfg in
+            try cfg.validateOptions(
+                supported: arachne15OptionKeys,
+                taskID: "arachne15-velocity-v0")
+            return try Arachne15LocomotionTask(
+                configuration: Arachne15LocomotionTaskConfig(
+                    numEnvironments: cfg.numEnvironments,
+                    seed: cfg.seed,
+                    maxEpisodeSteps: Int(
+                        cfg.options["maxEpisodeSteps"] ?? 1_000),
+                    controlDecimation: Int(
+                        cfg.options["controlDecimation"] ?? 10),
+                    commandResamplingSteps: Int(
+                        cfg.options["commandResamplingSteps"] ?? 500),
+                    minimumForwardVelocity:
+                        cfg.options["minimumForwardVelocity"] ?? 0.05,
+                    maximumForwardVelocity:
+                        cfg.options["maximumForwardVelocity"] ?? 0.25,
+                    maximumLateralVelocity:
+                        cfg.options["maximumLateralVelocity"] ?? 0.12,
+                    maximumYawRate:
+                        cfg.options["maximumYawRate"] ?? 0.8,
+                    standingCommandProbability:
+                        cfg.options["standingCommandProbability"] ?? 0.10,
+                    initialRollPitchRange:
+                        cfg.options["initialRollPitchRange"] ?? 0.02,
+                    initialYawRange:
+                        cfg.options["initialYawRange"] ?? .pi,
+                    observationNoise:
+                        (cfg.options["observationNoise"] ?? 1) > 0,
+                    maximumActionLatencySteps: Int(
+                        cfg.options["maximumActionLatencySteps"] ?? 2),
+                    collisionProfile:
+                        (cfg.options["validationCollisionProfile"] ?? 0) > 0
+                            ? .validation : .training,
+                    domainRandomization:
+                        (cfg.options["domainRandomization"] ?? 1) > 0
+                            ? .conservativeSimToReal : .init(),
+                    autoReset: cfg.autoReset))
         }
         return registry
     }()

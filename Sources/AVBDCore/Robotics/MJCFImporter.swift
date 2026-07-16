@@ -29,6 +29,40 @@ public struct MJCFMotorGain: Sendable {
     }
 }
 
+/// Replica-local physical multipliers applied while an MJCF articulation is
+/// instantiated. `mass` scales both mass and nominal inertia; `inertia`
+/// applies an additional inertia-only multiplier. Keeping this at the shared
+/// asset boundary lets any batched task construct a seeded population of
+/// slightly different plants without adding robot-specific solver branches.
+public struct MJCFDynamicsScale: Sendable, Equatable {
+    public var mass: Float
+    public var inertia: Float
+    public var friction: Float
+    public var motorTorque: Float
+    public var motorStiffness: Float
+    public var motorDamping: Float
+    public var armature: Float
+
+    public init(mass: Float = 1, inertia: Float = 1,
+                friction: Float = 1, motorTorque: Float = 1,
+                motorStiffness: Float = 1, motorDamping: Float = 1,
+                armature: Float = 1) {
+        let values = [mass, inertia, friction, motorTorque,
+                      motorStiffness, motorDamping, armature]
+        precondition(values.allSatisfy { $0.isFinite && $0 > 0 },
+                     "MJCF dynamics multipliers must be finite and positive")
+        self.mass = mass
+        self.inertia = inertia
+        self.friction = friction
+        self.motorTorque = motorTorque
+        self.motorStiffness = motorStiffness
+        self.motorDamping = motorDamping
+        self.armature = armature
+    }
+
+    public static let identity = MJCFDynamicsScale()
+}
+
 public struct MJCFInstantiation {
     public var rootBody: Int
     public var bodiesByName: [String: Int]
@@ -42,6 +76,11 @@ public struct MJCFInstantiation {
     /// inertial frame. Observation code uses this to report semantic link
     /// poses even though dynamics correctly integrate at the COM.
     public var linkFramesInBody: [String: MJCFLinkFrame]
+}
+
+public enum Arachne15CollisionProfile: String, Sendable, CaseIterable {
+    case training
+    case validation
 }
 
 public struct MJCFLinkFrame {
@@ -77,28 +116,49 @@ public struct MJCFAsset {
     public let jointNames: [String]
     public let actuatorNames: [String]
     public let warnings: [String]
+    public let visualGeometryCount: Int
 
     fileprivate var links: [Link]
     fileprivate var actuators: [Actuator]
     fileprivate var exclusions: [(String, String)]
 
     public static func parse(url: URL) throws -> MJCFAsset {
-        try parse(data: Data(contentsOf: url))
+        try parse(data: Data(contentsOf: url), baseURL: url.deletingLastPathComponent())
+    }
+
+    /// Resolve an MJCF plus any relative visual-mesh references from the
+    /// AVBDCore resource bundle. Physics assets can use this generic entry
+    /// point without adding importer branches for every robot.
+    public static func bundled(resource: String, subdirectory: String) throws
+        -> MJCFAsset {
+        guard let url = Bundle.module.url(
+            forResource: resource, withExtension: "xml",
+            subdirectory: subdirectory) else {
+            throw MJCFImportError.missing(
+                "bundled \(subdirectory)/\(resource).xml")
+        }
+        return try parse(url: url)
     }
 
     /// The collision/dynamics MJCF from MuJoCo Menagerie's Unitree H1 model,
     /// vendored with its BSD-3-Clause attribution. Visual STL meshes are not
     /// needed by the physics importer.
     public static func bundledUnitreeH1() throws -> MJCFAsset {
-        guard let url = Bundle.module.url(
-            forResource: "h1", withExtension: "xml",
-            subdirectory: "Assets/unitree_h1") else {
-            throw MJCFImportError.missing("bundled Assets/unitree_h1/h1.xml")
-        }
-        return try parse(url: url)
+        try bundled(resource: "h1", subdirectory: "Assets/unitree_h1")
+    }
+
+    public static func bundledArachne15(
+        profile: Arachne15CollisionProfile = .training
+    ) throws -> MJCFAsset {
+        try bundled(resource: "arachne15_\(profile.rawValue)",
+                    subdirectory: "Assets/arachne15")
     }
 
     public static func parse(data: Data) throws -> MJCFAsset {
+        try parse(data: data, baseURL: nil)
+    }
+
+    private static func parse(data: Data, baseURL: URL?) throws -> MJCFAsset {
         let tree = XMLTreeParser()
         guard tree.parse(data), let root = tree.root else {
             throw MJCFImportError.malformedXML(tree.errorMessage ?? "empty document")
@@ -112,16 +172,20 @@ public struct MJCFAsset {
             collectDefaults(node, inherited: DefaultBundle(), into: &defaults)
         }
 
+        var warnings: [String] = []
+        let visualMeshes = loadVisualMeshes(
+            root: root, baseURL: baseURL, warnings: &warnings)
+
         guard let world = root.children.first(where: { $0.name == "worldbody" }) else {
             throw MJCFImportError.missing("<worldbody>")
         }
         var links: [Link] = []
         var bodyNameSet = Set<String>()
         var jointNameSet = Set<String>()
-        var warnings: [String] = []
         for body in world.children where body.name == "body" {
             try parseBody(body, parent: nil, inheritedClass: nil,
-                          defaults: defaults, links: &links,
+                          defaults: defaults, visualMeshes: visualMeshes,
+                          links: &links,
                           bodyNameSet: &bodyNameSet,
                           jointNameSet: &jointNameSet, warnings: &warnings)
         }
@@ -165,6 +229,9 @@ public struct MJCFAsset {
             jointNames: links.compactMap { $0.joint?.name },
             actuatorNames: actuators.map(\.name),
             warnings: warnings,
+            visualGeometryCount: links.reduce(0) {
+                $0 + $1.visualGeometries.count
+            },
             links: links, actuators: actuators, exclusions: exclusions)
     }
 
@@ -183,7 +250,13 @@ public struct MJCFAsset {
         /// remain small offsets while source limits are shifted consistently.
         jointHomePositions: [String: Float] = [:],
         selfCollisions: Bool = true,
-        inertiaFrame: MJCFInertiaFrame = .principal
+        inertiaFrame: MJCFInertiaFrame = .principal,
+        collisionGroup: UInt32 = 0,
+        dynamicsScale: MJCFDynamicsScale = .identity,
+        /// Detailed render meshes are unnecessary in a large headless batch.
+        /// Disabling them leaves dynamics and collision byte-for-byte
+        /// equivalent while avoiding replicated CAD vertex buffers.
+        includeVisuals: Bool = true
     ) throws -> MJCFInstantiation {
         var linkWorldP = [F3](repeating: .zero, count: links.count)
         var linkWorldQ = [Quat](repeating: identityQuaternion, count: links.count)
@@ -229,10 +302,12 @@ public struct MJCFAsset {
             }
             let body = scene.addBody(
                 size: F3(repeating: 2 * reach), density: 0,
-                friction: link.geometries.first?.friction ?? 1,
+                friction: (link.geometries.first?.friction ?? 1)
+                    * dynamicsScale.friction,
                 position: bodyWorldP[i], rotation: bodyWorldQ[i],
-                mass: link.inertial.mass,
-                diagonalInertia: link.inertial.diagonalInertia,
+                mass: link.inertial.mass * dynamicsScale.mass,
+                diagonalInertia: link.inertial.diagonalInertia
+                    * dynamicsScale.mass * dynamicsScale.inertia,
                 collisionEnabled: false)
             bodyIndices[i] = body
             bodiesByName[link.name] = body
@@ -243,11 +318,39 @@ public struct MJCFAsset {
                 rotation: inertialInverse)
             for geom in link.geometries {
                 _ = scene.addCollider(
-                    body: body, size: geom.size, friction: geom.friction,
+                    body: body, size: geom.size,
+                    friction: geom.friction * dynamicsScale.friction,
                     localPosition: inertialInverse.act(
                         geom.position - link.inertial.position),
                     localRotation: (inertialInverse * geom.rotation).normalized,
-                    shape: geom.shape)
+                    shape: geom.shape,
+                    collisionGroup: collisionGroup,
+                    // Imported CAD owns appearance when present. Contact
+                    // proxies stay inspectable in assets without being drawn
+                    // through the detailed surface.
+                    isRendered: !includeVisuals
+                        || link.visualGeometries.isEmpty)
+            }
+            for visual in includeVisuals ? link.visualGeometries : [] {
+                let localPosition = inertialInverse.act(
+                    visual.position - link.inertial.position)
+                let localRotation = (inertialInverse
+                    * visual.rotation).normalized
+                switch visual.kind {
+                case .mesh(let mesh):
+                    scene.addRigidMesh(SceneRigidMesh(
+                        body: body, mesh: mesh,
+                        localPosition: localPosition,
+                        localRotation: localRotation,
+                        color: visual.color))
+                case .primitive(let shape, let size):
+                    _ = scene.addCollider(
+                        body: body, size: size, friction: 0,
+                        localPosition: localPosition,
+                        localRotation: localRotation, shape: shape,
+                        collisionGroup: collisionGroup,
+                        collisionEnabled: false, isRendered: true)
+                }
             }
         }
 
@@ -274,13 +377,17 @@ public struct MJCFAsset {
                 // `hingeAxis` changes that constraint from a weld to axis
                 // alignment and leaves only twist free for motor/limits.
                 stiffnessAng: .infinity, hingeAxis: axisB,
-                motorTarget: 0, motorTorque: actuator?.torque ?? 0,
-                motorStiffness: gain.stiffness,
+                motorTarget: 0,
+                motorTorque: (actuator?.torque ?? 0)
+                    * dynamicsScale.motorTorque,
+                motorStiffness: gain.stiffness
+                    * dynamicsScale.motorStiffness,
                 // The fixed-PD actuator has one damping channel; treat an
                 // explicitly supplied gain as the total and never undercut
                 // passive source damping.
-                motorDamping: max(gain.damping, joint.damping),
-                armature: joint.armature,
+                motorDamping: max(gain.damping, joint.damping)
+                    * dynamicsScale.motorDamping,
+                armature: joint.armature * dynamicsScale.armature,
                 limitLo: joint.range.0 - home, limitHi: joint.range.1 - home)
             let index = scene.joints.count
             scene.addJoint(sceneJoint)
@@ -327,6 +434,7 @@ private struct Link {
     var inertial: Inertial
     var joint: Joint?
     var geometries: [CollisionGeometry]
+    var visualGeometries: [VisualGeometry]
 }
 
 private struct Inertial {
@@ -352,6 +460,18 @@ private struct CollisionGeometry {
     var rotation: Quat
     var friction: Float
     var boundingRadius: Float
+}
+
+private enum VisualGeometryKind {
+    case mesh(SurfaceMesh)
+    case primitive(BodyShape, F3)
+}
+
+private struct VisualGeometry {
+    var kind: VisualGeometryKind
+    var position: F3
+    var rotation: Quat
+    var color: F3
 }
 
 private struct Actuator {
@@ -383,7 +503,8 @@ private func collectDefaults(_ node: XMLNode, inherited: DefaultBundle,
 
 private func parseBody(
     _ node: XMLNode, parent: Int?, inheritedClass: String?,
-    defaults: [String: DefaultBundle], links: inout [Link],
+    defaults: [String: DefaultBundle], visualMeshes: [String: SurfaceMesh],
+    links: inout [Link],
     bodyNameSet: inout Set<String>, jointNameSet: inout Set<String>,
     warnings: inout [String]
 ) throws {
@@ -443,12 +564,29 @@ private func parseBody(
     }
 
     var geometries: [CollisionGeometry] = []
+    var visualGeometries: [VisualGeometry] = []
     for geomNode in node.children where geomNode.name == "geom" {
         let className = geomNode.attributes["class"] ?? activeClass
         var attrs = className.flatMap { defaults[$0]?.geom } ?? [:]
         attrs.merge(geomNode.attributes) { _, new in new }
-        if attrs["contype"] == "0" || attrs["conaffinity"] == "0"
-            || attrs["type"] == "mesh" {
+        let isVisualOnly = attrs["contype"] == "0"
+            && attrs["conaffinity"] == "0"
+        if attrs["type"] == "mesh" {
+            if let meshName = attrs["mesh"],
+               let mesh = visualMeshes[meshName] {
+                visualGeometries.append(try parseVisualGeometry(
+                    attrs, kind: .mesh(mesh)))
+            } else if let meshName = attrs["mesh"] {
+                warnings.append("visual mesh \(meshName) is unavailable")
+            }
+            continue
+        }
+        if isVisualOnly {
+            let primitive = try parseCollisionGeometry(
+                attrs, bodyName: name, warnings: &warnings)
+            visualGeometries.append(try parseVisualGeometry(
+                attrs, kind: .primitive(primitive.shape, primitive.size),
+                position: primitive.position, rotation: primitive.rotation))
             continue
         }
         geometries.append(try parseCollisionGeometry(
@@ -458,10 +596,12 @@ private func parseBody(
     let index = links.count
     links.append(Link(name: name, parent: parent,
                       localPosition: localPosition, localRotation: localRotation,
-                      inertial: inertial, joint: joint, geometries: geometries))
+                      inertial: inertial, joint: joint, geometries: geometries,
+                      visualGeometries: visualGeometries))
     for child in node.children where child.name == "body" {
         try parseBody(child, parent: index, inheritedClass: activeClass,
-                      defaults: defaults, links: &links,
+                      defaults: defaults, visualMeshes: visualMeshes,
+                      links: &links,
                       bodyNameSet: &bodyNameSet, jointNameSet: &jointNameSet,
                       warnings: &warnings)
     }
@@ -536,6 +676,71 @@ private func parseCollisionGeometry(
     return CollisionGeometry(shape: shape, size: size, position: position,
                              rotation: rotation, friction: friction,
                              boundingRadius: radius)
+}
+
+private func parseVisualGeometry(
+    _ attrs: [String: String], kind: VisualGeometryKind,
+    position: F3? = nil, rotation: Quat? = nil
+) throws -> VisualGeometry {
+    let rgba = try floatList(attrs["rgba"] ?? "0.24 0.28 0.34 1",
+                             minimumCount: 3, element: "geom",
+                             attribute: "rgba")
+    return VisualGeometry(
+        kind: kind,
+        position: try position ?? vector3(
+            attrs["pos"] ?? "0 0 0", element: "geom", attribute: "pos"),
+        rotation: try rotation ?? quaternion(
+            attrs["quat"] ?? "1 0 0 0", element: "geom", attribute: "quat"),
+        color: F3(rgba[0], rgba[1], rgba[2]))
+}
+
+/// Load available visual assets without making rendering geometry a physics
+/// requirement. A package may intentionally vendor only dynamics/collision
+/// MJCF (the H1 asset does); missing visuals become explicit warnings while
+/// the articulation remains usable headlessly.
+private func loadVisualMeshes(
+    root: XMLNode, baseURL: URL?, warnings: inout [String]
+) -> [String: SurfaceMesh] {
+    guard let assets = root.children.first(where: { $0.name == "asset" }) else {
+        return [:]
+    }
+    let meshDirectory = root.children.first(where: { $0.name == "compiler" })?
+        .attributes["meshdir"] ?? ""
+    var result: [String: SurfaceMesh] = [:]
+    for node in assets.children where node.name == "mesh" {
+        guard let name = node.attributes["name"],
+              let file = node.attributes["file"] else {
+            warnings.append("visual <mesh> is missing name or file")
+            continue
+        }
+        guard let baseURL else {
+            warnings.append("visual mesh \(name) skipped without an asset base URL")
+            continue
+        }
+        let url = baseURL.appendingPathComponent(meshDirectory)
+            .appendingPathComponent(file).standardizedFileURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            warnings.append("visual mesh \(name) not bundled at \(file)")
+            continue
+        }
+        do {
+            let scale = try vector3(node.attributes["scale"] ?? "1 1 1",
+                                    element: "mesh", attribute: "scale")
+            let source = try SurfaceMesh.load(path: url.path, upAxis: .z)
+            let positions = source.vertices.map { $0 * scale }
+            let inverseScale = F3(
+                1 / max(abs(scale.x), Float.leastNormalMagnitude),
+                1 / max(abs(scale.y), Float.leastNormalMagnitude),
+                1 / max(abs(scale.z), Float.leastNormalMagnitude))
+            let normals = source.normals.map { normalize($0 * inverseScale) }
+            result[name] = SurfaceMesh(
+                vertices: positions, normals: normals,
+                triangles: source.triangles)
+        } catch {
+            warnings.append("visual mesh \(name) failed to load: \(error)")
+        }
+    }
+    return result
 }
 
 private func rotationFromZ(to direction: F3) -> Quat {

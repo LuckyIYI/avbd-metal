@@ -4,6 +4,45 @@ import XCTest
 @testable import AVBDCore
 
 final class MJCFImporterTests: XCTestCase {
+    func testBundledArachneProfilesSeparateVisualsFromCollision() throws {
+        let training = try MJCFAsset.bundledArachne15(profile: .training)
+        let validation = try MJCFAsset.bundledArachne15(profile: .validation)
+
+        XCTAssertEqual(training.bodyNames.count, 17)
+        XCTAssertEqual(training.jointNames.count, 16)
+        XCTAssertEqual(training.actuatorNames.count, 16)
+        XCTAssertEqual(training.actuatorNames, validation.actuatorNames)
+        XCTAssertEqual(training.bodyNames, validation.bodyNames)
+        XCTAssertEqual(training.visualGeometryCount, 48)
+        XCTAssertEqual(validation.visualGeometryCount, 48)
+        XCTAssertTrue(training.warnings.isEmpty, "\(training.warnings)")
+        XCTAssertTrue(validation.warnings.isEmpty, "\(validation.warnings)")
+
+        var trainingScene = PhysicsScene(name: "arachne-training")
+        let imported = try training.instantiate(
+            in: &trainingScene,
+            defaultMotorGain: .init(stiffness: 2, damping: 0.08),
+            selfCollisions: false,
+            collisionGroup: 7)
+        XCTAssertEqual(trainingScene.bodies.count, 17)
+        XCTAssertEqual(trainingScene.joints.count, 16)
+        XCTAssertEqual(trainingScene.rigidMeshes.count, 28)
+        XCTAssertEqual(trainingScene.colliders.filter(\.collisionEnabled).count, 39)
+        XCTAssertEqual(trainingScene.colliders.filter { !$0.collisionEnabled }.count, 20)
+        XCTAssertTrue(trainingScene.colliders.filter(\.collisionEnabled)
+            .allSatisfy { $0.collisionGroup == 7 && !$0.isRendered })
+        XCTAssertEqual(imported.actuatorJoints.count, 16)
+
+        var validationScene = PhysicsScene(name: "arachne-validation")
+        _ = try validation.instantiate(in: &validationScene)
+        XCTAssertEqual(validationScene.colliders.filter(\.collisionEnabled).count, 60)
+        XCTAssertEqual(validationScene.rigidMeshes.count, 28)
+
+        let solver = try GPUSolver(scene: trainingScene)
+        let surface = try XCTUnwrap(solver.renderRigidMeshSurface)
+        XCTAssertGreaterThan(surface.vertexCount, 0)
+    }
+
     /// Integration check against the vendored MuJoCo Menagerie H1 dynamics
     /// asset, including the exact source topology and foot collision shapes.
     func testBundledOfficialMenagerieH1() throws {
@@ -82,6 +121,55 @@ final class MJCFImporterTests: XCTestCase {
         XCTAssertEqual(scene.colliders[0].size.x, 1, accuracy: 1e-6)
         XCTAssertEqual(scene.joints[0].motorTorque, 7, accuracy: 1e-6)
         XCTAssertEqual(scene.joints[0].motorDamping, 3, accuracy: 1e-6)
+    }
+
+    func testReplicaDynamicsScaleIsAppliedAtImportBoundary() throws {
+        let xml = """
+        <mujoco model="scale-fixture">
+          <worldbody>
+            <body name="root">
+              <inertial mass="2" diaginertia="1 2 3"/>
+              <geom type="box" size="0.5 0.5 0.5" friction="0.4"/>
+              <body name="child" pos="0 0 1">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="hinge" damping="2" armature="0.1"/>
+                <geom type="sphere" size="0.1" friction="0.5"/>
+              </body>
+            </body>
+          </worldbody>
+          <actuator><motor name="hinge" joint="hinge" ctrlrange="-4 4"/></actuator>
+        </mujoco>
+        """
+        let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+        var scene = PhysicsScene(name: "scaled")
+        let imported = try asset.instantiate(
+            in: &scene,
+            defaultMotorGain: .init(stiffness: 10, damping: 3),
+            collisionGroup: 11,
+            dynamicsScale: .init(
+                mass: 1.5, inertia: 0.8, friction: 1.25,
+                motorTorque: 0.9, motorStiffness: 1.1,
+                motorDamping: 1.2, armature: 1.3))
+        let root = scene.bodies[imported.rootBody]
+        XCTAssertEqual(try XCTUnwrap(root.mass), 3, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap(root.diagonalInertia).x, 1.2,
+                       accuracy: 1e-6)
+        XCTAssertEqual(scene.colliders[0].friction, 0.5, accuracy: 1e-6)
+        XCTAssertTrue(scene.colliders.allSatisfy { $0.collisionGroup == 11 })
+        XCTAssertEqual(scene.joints[0].motorTorque, 3.6, accuracy: 1e-6)
+        XCTAssertEqual(scene.joints[0].motorStiffness, 11, accuracy: 1e-6)
+        XCTAssertEqual(scene.joints[0].motorDamping, 3.6, accuracy: 1e-6)
+        XCTAssertEqual(scene.joints[0].armature, 0.13, accuracy: 1e-6)
+    }
+
+    func testDomainRandomizationIsSeededAndBounded() {
+        let config = ArticulationDomainRandomization.conservativeSimToReal
+        XCTAssertEqual(config.sample(seed: 42), config.sample(seed: 42))
+        let sample = config.sample(seed: 43)
+        XCTAssertTrue((0.90...1.10).contains(sample.mass))
+        XCTAssertTrue((0.90...1.10).contains(sample.inertia))
+        XCTAssertTrue((0.75...1.25).contains(sample.friction))
+        XCTAssertTrue((0.85...1.05).contains(sample.motorTorque))
     }
 
     func testLinkAlignedInertiaMatchesUSDWithoutPrincipalAxes() throws {
