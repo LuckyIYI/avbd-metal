@@ -14,7 +14,6 @@ using namespace metal;
 // stiffness beyond ~1e6 adds nothing physically but destroys the fp32
 // conditioning of the rolling mode (linear/angular cancellation).
 #define PENALTY_MAX_T 1.0e6f
-#define COLLISION_MARGIN 0.01f
 #define STICK_THRESH 0.00001f
 #define MAX_COLORS 64
 // shapeType encoding: low nibble = shape kind, bit 4 = particle (3-DOF)
@@ -270,13 +269,13 @@ struct SimParams {
     // rigid bodies; this only bleeds solver/contact/internal jitter.
     float particleDamping;
     uint numHashedRigid;    // hashed non-particle bodies (rt scan skip)
-    // Element-contact detection margin: COLLISION_MARGIN is a rigid-world
-    // constant (1 cm) that exceeds the cloth skin itself at high resolution
-    // — every detection radius and grid cell would bloat with it.
+    // Element-contact detection margin is separate from the configurable
+    // rigid-world contact margin because cloth skin can be much thinner.
     float elemMargin;
     uint numSoftGroups;     // distinct soft-surface components
     uint frame;             // frame counter (tracker reseed staggering)
     uint frictionCombineMode; // 0 geometric, 1 multiply, 2 min, 3 max, 4 average
+    float collisionMargin;  // scene-scale normal contact slop/detection margin
 };
 
 inline float combine_friction(float a, float b, uint mode) {
@@ -285,6 +284,38 @@ inline float combine_friction(float a, float b, uint mode) {
     if (mode == 3u) return max(a, b);
     if (mode == 4u) return 0.5f * (a + b);
     return sqrt(max(a * b, 0.0f));
+}
+
+// Discrete motor semantics live in JointGPU.header.w beside the other joint
+// flags. A two-bit enum prevents impossible combinations while preserving the
+// float4-granular ABI: 0 off, 1 implicit position PD, 2 explicit position PD,
+// 3 velocity feedback.
+constant uint JOINT_MOTOR_MODE_MASK                 = 3u << 4;
+constant uint JOINT_MOTOR_MODE_IMPLICIT_POSITION_PD = 1u << 4;
+constant uint JOINT_MOTOR_MODE_EXPLICIT_TORQUE_PD   = 2u << 4;
+constant uint JOINT_MOTOR_MODE_VELOCITY             = 3u << 4;
+
+inline uint joint_motor_mode(uint flags) {
+    return flags & JOINT_MOTOR_MODE_MASK;
+}
+
+inline bool motor_uses_implicit_position_pd(uint flags) {
+    return joint_motor_mode(flags)
+        == JOINT_MOTOR_MODE_IMPLICIT_POSITION_PD;
+}
+
+inline bool motor_uses_explicit_torque_pd(uint flags) {
+    return joint_motor_mode(flags)
+        == JOINT_MOTOR_MODE_EXPLICIT_TORQUE_PD;
+}
+
+inline bool motor_uses_velocity_feedback(uint flags) {
+    return joint_motor_mode(flags) == JOINT_MOTOR_MODE_VELOCITY;
+}
+
+inline bool motor_uses_explicit_effort(uint flags) {
+    return motor_uses_explicit_torque_pd(flags)
+        || motor_uses_velocity_feedback(flags);
 }
 
 struct JointGPU {
@@ -299,10 +330,11 @@ struct JointGPU {
     float4 penaltyAng;
     float4 restRel;     // rest relative rotation qA^-1 * qB (quaternion)
     float4 hingeAxis;   // xyz: axis in B local; w != 0 -> 1-DOF hinge
-    float4 motor;       // x = target angle, y = max |lambda| (torque limit),
-                        // z = lambda, w = penalty (0 = no motor)
-    float4 limits;      // x/y = twist range, z = PD damping, w = fixed-PD flag
-    float4 dynamics;    // x = armature, y = inertial-predicted twist
+    float4 motor;       // x = angle/velocity target, y = effort limit,
+                        // z = pad, w = position-PD kp (zero for velocity)
+    float4 limits;      // x/y = twist range, z = kd, w = pad
+    float4 dynamics;    // x = armature, y = inertial-predicted twist,
+                        // z = start-of-step explicit effort
 };
 
 struct SpringGPU {

@@ -54,6 +54,16 @@ public struct MJCFLinkFrame {
     }
 }
 
+public struct MJCFBodyPose {
+    public var position: F3
+    public var rotation: Quat
+
+    public init(position: F3, rotation: Quat) {
+        self.position = position
+        self.rotation = rotation
+    }
+}
+
 /// Orientation convention for an MJCF body's authored diagonal inertia.
 ///
 /// MuJoCo interprets `diaginertia` in the `<inertial quat>` principal frame.
@@ -94,6 +104,34 @@ public struct MJCFAsset {
             forResource: "h1", withExtension: "xml",
             subdirectory: "Assets/unitree_h1") else {
             throw MJCFImportError.missing("bundled Assets/unitree_h1/h1.xml")
+        }
+        return try parse(url: url)
+    }
+
+    /// Exact reduced 10-DoF plant used by Unitree RL Gym's public H1
+    /// TorchScript/MuJoCo deployment, with analytic collision proxies.
+    public static func bundledUnitreeRLGymH1() throws -> MJCFAsset {
+        guard let url = Bundle.module.url(
+            forResource: "unitree_rl_gym_h1", withExtension: "xml",
+            subdirectory: "Assets/unitree_h1") else {
+            throw MJCFImportError.missing(
+                "bundled Assets/unitree_h1/unitree_rl_gym_h1.xml")
+        }
+        return try parse(url: url)
+    }
+
+    /// Collision/dynamics model for ManiSkill's seven-axis PandaStick.
+    /// Kinematics, inertias, limits, armature, and tool dimensions are copied
+    /// from the Apache-2.0 Panda model and ManiSkill PandaStick URDF. The
+    /// original mesh collisions are represented by explicit primitive proxies
+    /// because AVBD intentionally keeps batched contact on its Metal primitive
+    /// path.
+    public static func bundledPandaStick() throws -> MJCFAsset {
+        guard let url = Bundle.module.url(
+            forResource: "panda_stick", withExtension: "xml",
+            subdirectory: "Assets/panda_stick") else {
+            throw MJCFImportError.missing(
+                "bundled Assets/panda_stick/panda_stick.xml")
         }
         return try parse(url: url)
     }
@@ -168,6 +206,53 @@ public struct MJCFAsset {
             links: links, actuators: actuators, exclusions: exclusions)
     }
 
+    /// Resolve source joint coordinates to solver body (COM/principal-frame)
+    /// poses without constructing another scene. Batched task resets use this
+    /// to apply authored joint-position randomization immediately rather than
+    /// asking the motors to settle from a different pose after reset.
+    public func bodyPoses(
+        worldOffset: F3 = .zero,
+        jointPositions: [String: Float] = [:],
+        inertiaFrame: MJCFInertiaFrame = .principal
+    ) throws -> [String: MJCFBodyPose] {
+        var linkWorldP = [F3](repeating: .zero, count: links.count)
+        var linkWorldQ = [Quat](repeating: identityQuaternion,
+                                count: links.count)
+        var result: [String: MJCFBodyPose] = [:]
+        result.reserveCapacity(links.count)
+        for (i, link) in links.enumerated() {
+            var localPosition = link.localPosition
+            var localRotation = link.localRotation
+            if let joint = link.joint,
+               let angle = jointPositions[joint.name], angle != 0 {
+                guard angle >= joint.range.0 && angle <= joint.range.1 else {
+                    throw MJCFImportError.invalidAttribute(
+                        element: "joint", attribute: "position",
+                        value: "\(joint.name)=\(angle)")
+                }
+                let delta = Quat(angle: angle, axis: joint.axis)
+                localPosition += link.localRotation.act(
+                    joint.position - delta.act(joint.position))
+                localRotation = (link.localRotation * delta).normalized
+            }
+            if let parent = link.parent {
+                linkWorldP[i] = linkWorldP[parent]
+                    + linkWorldQ[parent].act(localPosition)
+                linkWorldQ[i] = (linkWorldQ[parent] * localRotation).normalized
+            } else {
+                linkWorldP[i] = worldOffset + localPosition
+                linkWorldQ[i] = localRotation
+            }
+            let principalRotation = inertiaFrame == .principal
+                ? link.inertial.rotation : identityQuaternion
+            result[link.name] = MJCFBodyPose(
+                position: linkWorldP[i]
+                    + linkWorldQ[i].act(link.inertial.position),
+                rotation: (linkWorldQ[i] * principalRotation).normalized)
+        }
+        return result
+    }
+
     /// Instantiate one copy. Rigid state is expressed in each source
     /// inertial/principal frame, not the link frame: COM offsets and inertial
     /// quaternions therefore remain exact while joints and colliders are
@@ -182,6 +267,16 @@ public struct MJCFAsset {
         /// The solver's zero angle is rebased to this pose, so policy actions
         /// remain small offsets while source limits are shifted consistently.
         jointHomePositions: [String: Float] = [:],
+        /// Weld the root body to its authored world pose. Locomotion models
+        /// leave this false; table-mounted manipulation arms set it true.
+        fixedBase: Bool = false,
+        /// Per-link gravity multiplier. Set to zero for controllers that
+        /// balance passive forces by disabling gravity on robot links.
+        gravityScale: Float = 1,
+        /// Collision domain for every primitive in this instance. Batched
+        /// tasks assign one nonzero domain per replica while shared terrain
+        /// stays in group zero.
+        collisionGroup: UInt32 = 0,
         selfCollisions: Bool = true,
         inertiaFrame: MJCFInertiaFrame = .principal
     ) throws -> MJCFInstantiation {
@@ -233,6 +328,7 @@ public struct MJCFAsset {
                 position: bodyWorldP[i], rotation: bodyWorldQ[i],
                 mass: link.inertial.mass,
                 diagonalInertia: link.inertial.diagonalInertia,
+                gravityScale: gravityScale,
                 collisionEnabled: false)
             bodyIndices[i] = body
             bodiesByName[link.name] = body
@@ -247,8 +343,17 @@ public struct MJCFAsset {
                     localPosition: inertialInverse.act(
                         geom.position - link.inertial.position),
                     localRotation: (inertialInverse * geom.rotation).normalized,
-                    shape: geom.shape)
+                    shape: geom.shape,
+                    collisionGroup: collisionGroup,
+                    collisionEnabled: geom.collisionEnabled)
             }
+        }
+
+        if fixedBase {
+            scene.addJoint(SceneJoint(
+                bodyA: -1, bodyB: bodyIndices[0],
+                rA: bodyWorldP[0], rB: .zero,
+                stiffnessLin: .infinity, stiffnessAng: .infinity))
         }
 
         let actuatorByJoint = Dictionary(uniqueKeysWithValues:
@@ -266,6 +371,11 @@ public struct MJCFAsset {
             let actuator = actuatorByJoint[joint.name]
             let gain = motorGains[actuator?.name ?? joint.name]
                 ?? motorGains[joint.name] ?? defaultMotorGain
+            if let actuator, actuator.torque > 0, gain.stiffness <= 0 {
+                throw MJCFImportError.missing(
+                    "positive position-PD stiffness for actuator "
+                    + "\(actuator.name) on joint \(joint.name)")
+            }
             let home = jointHomePositions[joint.name] ?? 0
             let sceneJoint = SceneJoint(
                 bodyA: bodyIndices[parent], bodyB: bodyIndices[i],
@@ -352,6 +462,7 @@ private struct CollisionGeometry {
     var rotation: Quat
     var friction: Float
     var boundingRadius: Float
+    var collisionEnabled: Bool
 }
 
 private struct Actuator {
@@ -447,8 +558,7 @@ private func parseBody(
         let className = geomNode.attributes["class"] ?? activeClass
         var attrs = className.flatMap { defaults[$0]?.geom } ?? [:]
         attrs.merge(geomNode.attributes) { _, new in new }
-        if attrs["contype"] == "0" || attrs["conaffinity"] == "0"
-            || attrs["type"] == "mesh" {
+        if attrs["type"] == "mesh" {
             continue
         }
         geometries.append(try parseCollisionGeometry(
@@ -474,6 +584,8 @@ private func parseCollisionGeometry(
     let friction = try floatList(attrs["friction"] ?? "1 0.005 0.0001",
                                  minimumCount: 1, element: "geom",
                                  attribute: "friction")[0]
+    let collisionEnabled = attrs["contype"] != "0"
+        && attrs["conaffinity"] != "0"
     var position = try vector3(attrs["pos"] ?? "0 0 0",
                                element: "geom", attribute: "pos")
     var rotation = try quaternion(attrs["quat"] ?? "1 0 0 0",
@@ -535,7 +647,8 @@ private func parseCollisionGeometry(
     }
     return CollisionGeometry(shape: shape, size: size, position: position,
                              rotation: rotation, friction: friction,
-                             boundingRadius: radius)
+                             boundingRadius: radius,
+                             collisionEnabled: collisionEnabled)
 }
 
 private func rotationFromZ(to direction: F3) -> Quat {

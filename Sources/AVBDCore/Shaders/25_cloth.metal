@@ -891,7 +891,8 @@ struct RTFeature {
 // with bounding sphere (center m, radius rT). Returns count (<= 4).
 inline int rtFeatures(device const float4* posLin, device const float4* posAng,
                       device const float4* shape, device const uint* shapeType,
-                      uint o, float3 m, float rT, thread RTFeature* out)
+                      uint o, float3 m, float rT, float collisionMargin,
+                      thread RTFeature* out)
 {
     uint st = shapeType[o] & SHAPE_KIND_MASK;
     float3 p = posLin[o].xyz;
@@ -909,7 +910,7 @@ inline int rtFeatures(device const float4* posLin, device const float4* posAng,
         float3 ax = q_rotate(q, float3(0, 0, 1));
         for (int i = -1; i <= 1; i++) {
             float3 w = p + ax * (half_ * float(i));
-            if (distance(w, m) > rT + r + 4.0f * COLLISION_MARGIN) continue;
+            if (distance(w, m) > rT + r + 4.0f * collisionMargin) continue;
             out[n].world = w;
             out[n].radius = r;
             out[n].id = uint(9 + i + 1);
@@ -925,7 +926,7 @@ inline int rtFeatures(device const float4* posLin, device const float4* posAng,
                               i & 2 ? h3.y : -h3.y,
                               i & 4 ? h3.z : -h3.z);
         float3 w = xform(p, q, local);
-        if (distance(w, m) > rT + 4.0f * COLLISION_MARGIN) continue;
+        if (distance(w, m) > rT + 4.0f * collisionMargin) continue;
         if (n < 4) {
             out[n].world = w;
             out[n].radius = 0.0f;
@@ -984,11 +985,11 @@ kernel void rt_emit(
         float rb = fabs(shape[o].w);                                           \
         /* surface-distance gate: center-distance is meaningless for huge   */\
         /* statics (the ground passes always and pays 8 corner tests/tri)   */\
-        bool nearO = distance(posLin[o].xyz, m) <= rT + rb + COLLISION_MARGIN; \
+        bool nearO = distance(posLin[o].xyz, m) <= rT + rb + P.collisionMargin; \
         if (nearO && (shapeType[o] & SHAPE_KIND_MASK) == 0u) {                 \
             float3 lm = q_rotate(q_conj(posAng[o]), m - posLin[o].xyz);        \
             float3 dq2 = max(fabs(lm) - shape[o].xyz * 0.5f, 0.0f);            \
-            nearO = length(dq2) <= rT + COLLISION_MARGIN + 0.05f;              \
+            nearO = length(dq2) <= rT + P.collisionMargin + 0.05f;              \
         }                                                                      \
         if (nearO) {                                                           \
             bool excl = pairExcluded(exclusions, numExclusions,                \
@@ -1000,7 +1001,7 @@ kernel void rt_emit(
             if (!excl) {                                                       \
                 RTFeature feats[4];                                            \
                 int nf = rtFeatures(posLin, posAng, shape, shapeType,          \
-                                    o, m, rT, feats);                          \
+                                    o, m, rT, P.collisionMargin, feats);       \
                 for (int fi = 0; fi < nf && emitted < RT_MAX_PER_TRI; fi++) {  \
                     float3 bary;                                               \
                     float3 q = closestPtTriangle(feats[fi].world, a, b, c, bary); \

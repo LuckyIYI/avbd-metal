@@ -76,16 +76,18 @@ inline bool npTestAxis(thread const NPBox& A, thread const NPBox& B, float3 delt
     return true;
 }
 
-inline float npSpeculativeCap(float radiusA, float radiusB) {
+inline float npSpeculativeCap(float radiusA, float radiusB,
+                              constant SimParams& P) {
     float r = min(fabs(radiusA), fabs(radiusB));
-    return min(0.25f, max(4.0f * COLLISION_MARGIN, 3.0f * r));
+    return min(0.25f, max(4.0f * P.collisionMargin, 3.0f * r));
 }
 
 inline float npDetectMargin(float3 n, float3 relVel, constant SimParams& P,
                             float radiusA, float radiusB) {
     float approach = max(0.0f, -dot(relVel, n));
-    float allowed = min(approach * P.dt, npSpeculativeCap(radiusA, radiusB));
-    return COLLISION_MARGIN + allowed;
+    float allowed = min(approach * P.dt,
+                        npSpeculativeCap(radiusA, radiusB, P));
+    return P.collisionMargin + allowed;
 }
 
 inline float3 npPenaltyFloor(device const float4* posLin, uint ia, uint ib,
@@ -444,7 +446,7 @@ kernel void np_collide(
         NPConvexBoxCandidate chosen[MAX_CONTACTS];
         int count = 1;
         chosen[0] = best;
-        float separationBand = max(0.002f, 0.75f * COLLISION_MARGIN);
+        float separationBand = max(0.002f, 0.75f * P.collisionMargin);
         while (count < MAX_CONTACTS) {
             NPConvexBoxCandidate next;
             bool haveNext = false;
@@ -526,7 +528,7 @@ kernel void np_collide(
             float3 xAw = xform(bodyPA4.xyz, qBodyA, rA);
             float3 xBw = xform(bodyPB4.xyz, qBodyB, rB);
             float3 d = xAw - xBw;
-            float3 C0 = float3(dot(normal, d) + COLLISION_MARGIN,
+            float3 C0 = float3(dot(normal, d) + P.collisionMargin,
                                dot(t1, d), dot(t2, d));
             C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
                                       xAw - bodyPA4.xyz,
@@ -725,7 +727,8 @@ kernel void np_collide(
             xBw = roundB ? bodyPB4.xyz + rB_
                          : xform(bodyPB4.xyz, qBodyB, rB_);
             float3 d = xAw - xBw;
-            float3 C0 = float3(dot(nrmC, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+            float3 C0 = float3(dot(nrmC, d) + P.collisionMargin,
+                               dot(t1, d), dot(t2, d));
             C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
                                       xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
                                       t1, t2, P.dt, P.alpha);
@@ -755,7 +758,7 @@ kernel void np_collide(
 
         uint otherType = tIsA ? stB : stA;
         // detection margin: catch fast approaches before deep penetration
-        float detectM = max(COLLISION_MARGIN, 0.8f * T.r);
+        float detectM = max(P.collisionMargin, 0.8f * T.r);
 
         if (otherType == 1) {
             // torus - sphere (exact closed form)
@@ -945,7 +948,8 @@ kernel void np_collide(
                 }
             }
             float3 d = xAw - xBw;
-            float3 C0 = float3(dot(nrmT, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+            float3 C0 = float3(dot(nrmT, d) + P.collisionMargin,
+                               dot(t1, d), dot(t2, d));
             C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
                                       xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
                                       t1, t2, P.dt, P.alpha);
@@ -1108,7 +1112,8 @@ kernel void np_collide(
             float3 xBw = roundB ? bodyPB4.xyz + rB_
                                 : xform(bodyPB4.xyz, qBodyB, rB_);
             float3 d = xAw - xBw;
-            float3 C0 = float3(dot(nrm, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+            float3 C0 = float3(dot(nrm, d) + P.collisionMargin,
+                               dot(t1, d), dot(t2, d));
             C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
                                       xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
                                       t1, t2, P.dt, P.alpha);
@@ -1130,19 +1135,22 @@ kernel void np_collide(
     bool separated = false;
     for (int i = 0; i < 3 && !separated; i++) {
         if (!npTestAxis(A, B, delta, npAxis(A, i), 0, i, -1,
-                        relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
+                        relVel, npSpeculativeCap(
+                            shape[ia].w, shape[ib].w, P),
                         P, bestFace)) separated = true;
     }
     for (int i = 0; i < 3 && !separated; i++) {
         if (!npTestAxis(A, B, delta, npAxis(B, i), 1, -1, i,
-                        relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
+                        relVel, npSpeculativeCap(
+                            shape[ia].w, shape[ib].w, P),
                         P, bestFace)) separated = true;
     }
     for (int i = 0; i < 3 && !separated; i++) {
         for (int j = 0; j < 3 && !separated; j++) {
             float3 axis = cross(npAxis(A, i), npAxis(B, j));
             if (!npTestAxis(A, B, delta, axis, 2, i, j,
-                            relVel, npSpeculativeCap(shape[ia].w, shape[ib].w),
+                            relVel, npSpeculativeCap(
+                                shape[ia].w, shape[ib].w, P),
                             P, bestEdge)) separated = true;
         }
     }
@@ -1288,7 +1296,8 @@ kernel void np_collide(
         float3 xAw = xform(bodyPA4.xyz, qBodyA, rA);
         float3 xBw = xform(bodyPB4.xyz, qBodyB, rB);
         float3 d = xAw - xBw;
-        float3 C0 = float3(dot(nrm, d) + COLLISION_MARGIN, dot(t1, d), dot(t2, d));
+        float3 C0 = float3(dot(nrm, d) + P.collisionMargin,
+                           dot(t1, d), dot(t2, d));
         C0.yz -= spinSurfaceShift(spinVel[ba], spinVel[bb],
                                   xAw - bodyPA4.xyz, xBw - bodyPB4.xyz,
                                   t1, t2, P.dt, P.alpha);

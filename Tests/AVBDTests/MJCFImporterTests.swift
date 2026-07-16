@@ -4,6 +4,57 @@ import XCTest
 @testable import AVBDCore
 
 final class MJCFImporterTests: XCTestCase {
+    func testBundledUnitreeRLGymTransferPlantContract() throws {
+        let asset = try MJCFAsset.bundledUnitreeRLGymH1()
+        XCTAssertEqual(asset.name, "unitree_rl_gym_h1")
+        XCTAssertEqual(asset.bodyNames.count, 11)
+        XCTAssertEqual(asset.jointNames.count, 10)
+        XCTAssertEqual(asset.actuatorNames, [
+            "left_hip_yaw", "left_hip_roll", "left_hip_pitch",
+            "left_knee", "left_ankle", "right_hip_yaw",
+            "right_hip_roll", "right_hip_pitch", "right_knee",
+            "right_ankle",
+        ])
+
+        var scene = PhysicsScene(name: "unitree-rl-gym-transfer")
+        let imported = try asset.instantiate(
+            in: &scene,
+            defaultMotorGain: .init(stiffness: 100, damping: 2),
+            selfCollisions: false,
+            inertiaFrame: .principal)
+        XCTAssertEqual(scene.bodies.count, 11)
+        XCTAssertEqual(scene.joints.count, 10)
+        XCTAssertEqual(imported.actuatorJoints.count, 10)
+        XCTAssertEqual(scene.collisionExclusions.count, 55)
+
+        let pelvis = try XCTUnwrap(imported.bodiesByName["pelvis"])
+        XCTAssertEqual(try XCTUnwrap(scene.bodies[pelvis].mass),
+                       29.847, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap(scene.bodies[pelvis].diagonalInertia),
+                       F3(1.32807, 0.960733, 0.53795))
+
+        let leftFoot = try XCTUnwrap(
+            imported.bodiesByName["left_ankle_link"])
+        let foot = try XCTUnwrap(
+            scene.colliders.first(where: { $0.body == leftFoot }))
+        XCTAssertEqual(foot.shape, .box)
+        XCTAssertEqual(foot.size, F3(0.30, 0.08, 0.02))
+        XCTAssertEqual(scene.joints[
+            try XCTUnwrap(imported.jointsByName["left_ankle"])
+        ].motorTorque, 40, accuracy: 1e-6)
+
+        XCTAssertTrue(imported.actuatorJoints.allSatisfy {
+            scene.joints[$0].motorMode == .implicitPositionPD
+        })
+
+        let transfer = try UnitreeH1Sim2SimEnv()
+        XCTAssertEqual(transfer.scene.settings.dt, 0.002)
+        XCTAssertEqual(transfer.refs.motors.count, 10)
+        XCTAssertTrue(transfer.refs.motors.allSatisfy {
+            transfer.scene.joints[$0].motorMode == .explicitTorquePD
+        })
+    }
+
     /// Integration check against the vendored MuJoCo Menagerie H1 dynamics
     /// asset, including the exact source topology and foot collision shapes.
     func testBundledOfficialMenagerieH1() throws {
@@ -69,6 +120,11 @@ final class MJCFImporterTests: XCTestCase {
         </mujoco>
         """
         let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+        var missingGainScene = PhysicsScene(name: "missing-gain")
+        XCTAssertThrowsError(try asset.instantiate(in: &missingGainScene)) {
+            XCTAssertTrue(String(describing: $0).contains(
+                "positive position-PD stiffness"))
+        }
         var scene = PhysicsScene(name: "fixture")
         let imported = try asset.instantiate(
             in: &scene,

@@ -93,6 +93,7 @@ public enum BuiltInRLTasks {
     private static let armPushTOptionKeys: Set<String> = [
         "maxEpisodeSteps", "controlDecimation", "jointDeltaActionScale",
         "endEffectorDeltaActionScale",
+        "linkLength1", "linkLength2",
         "linkMass", "tipMass", "motorTorque", "motorStiffness",
         "motorDamping", "motorArmature", "blockMass",
         "blockStaticFriction", "blockDynamicFriction",
@@ -117,6 +118,10 @@ public enum BuiltInRLTasks {
         "pushContactCurriculumMaximumGoalRegression",
         "pushContactCurriculumMinimumGoalProgress",
         "pushContactCurriculumMaximumGoalDistance",
+    ]
+    private static let maniSkillPushTOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "controlDecimation", "jointDeltaActionScale",
+        "robotInitialJointNoise", "normalizedDenseReward",
     ]
 
     public static let registry: RLTaskRegistry = {
@@ -564,6 +569,10 @@ public enum BuiltInRLTasks {
                     cfg.options["jointDeltaActionScale"] ?? 0.1,
                 endEffectorDeltaActionScale:
                     cfg.options["endEffectorDeltaActionScale"] ?? 0,
+                linkLength1:
+                    cfg.options["linkLength1"] ?? ArmPushTEnv.linkLengths.x,
+                linkLength2:
+                    cfg.options["linkLength2"] ?? ArmPushTEnv.linkLengths.y,
                 linkMass: cfg.options["linkMass"] ?? 2.7,
                 tipMass: cfg.options["tipMass"] ?? 0.75,
                 motorTorque: cfg.options["motorTorque"] ?? 100,
@@ -640,6 +649,25 @@ public enum BuiltInRLTasks {
                 pushContactCurriculumMaximumGoalDistance:
                     cfg.options[
                         "pushContactCurriculumMaximumGoalDistance"] ?? 0))
+        }
+        try! registry.register("maniskill-pusht-v1") { cfg in
+            try cfg.validateOptions(
+                supported: maniSkillPushTOptionKeys,
+                taskID: "maniskill-pusht-v1")
+            return try ManiSkillPushTTask(configuration: .init(
+                numEnvironments: cfg.numEnvironments,
+                seed: cfg.seed,
+                maxEpisodeSteps: Int(
+                    cfg.options["maxEpisodeSteps"] ?? 100),
+                controlDecimation: Int(
+                    cfg.options["controlDecimation"] ?? 5),
+                autoReset: cfg.autoReset,
+                jointDeltaActionScale:
+                    cfg.options["jointDeltaActionScale"] ?? 0.1,
+                robotInitialJointNoise:
+                    cfg.options["robotInitialJointNoise"] ?? 0.02,
+                normalizedDenseReward:
+                    (cfg.options["normalizedDenseReward"] ?? 1) > 0))
         }
         return registry
     }()

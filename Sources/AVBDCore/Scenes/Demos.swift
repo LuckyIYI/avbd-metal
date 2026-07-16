@@ -175,9 +175,11 @@ public enum Demos {
         }
     }
 
-    static func addGround(_ s: inout PhysicsScene, friction: Float = 0.7) {
-        _ = s.addBody(size: F3(200, 200, 2), density: 0, friction: friction,
-                      position: F3(0, 0, -1))
+    @discardableResult
+    static func addGround(_ s: inout PhysicsScene,
+                          friction: Float = 0.7) -> Int {
+        s.addBody(size: F3(200, 200, 2), density: 0, friction: friction,
+                  position: F3(0, 0, -1))
     }
 
     public static func ground(count: Int = 1) -> PhysicsScene {

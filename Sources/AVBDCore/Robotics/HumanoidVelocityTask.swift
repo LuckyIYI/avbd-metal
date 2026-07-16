@@ -154,7 +154,8 @@ public final class HumanoidVelocityTask: VectorizedRLTask,
         environment = env
         self.configuration = configuration
         spec = RLTaskSpec(
-            id: "humanoid-velocity-v0", revision: 2,
+            id: "humanoid-velocity-v0",
+            revision: RLPhysicsContract.fixedGainActuatorV2(2),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),

@@ -443,7 +443,8 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
             taskRevision = 4
         }
         spec = RLTaskSpec(
-            id: taskID, revision: taskRevision,
+            id: taskID,
+            revision: RLPhysicsContract.fixedGainActuatorV2(taskRevision),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [configuration.recoveryContextObservations

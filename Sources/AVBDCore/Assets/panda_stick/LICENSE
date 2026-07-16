@@ -1,0 +1,9 @@
+Apache License
+Version 2.0, January 2004
+http://www.apache.org/licenses/
+
+The Panda source model and ManiSkill PandaStick derivative are distributed
+under the Apache License, Version 2.0. The complete license text is available
+at https://www.apache.org/licenses/LICENSE-2.0 and in the upstream sources:
+https://github.com/google-deepmind/mujoco_menagerie/tree/main/franka_emika_panda
+https://github.com/haosulab/ManiSkill

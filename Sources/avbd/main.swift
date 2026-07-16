@@ -27,6 +27,7 @@ struct Options {
     var batch = 1024
     var latent = 128
     var lr: Float = 3e-4
+    var optimizerEpsilon: Float? = nil
     var gamma: Float = 0.99
     var gaeLambda: Float = 0.95
     var rewardScale: Float = 1
@@ -53,13 +54,19 @@ struct Options {
     var normalizeObservations = true
     var entropy: Float = 0.01
     var targetKL: Float = 0.01
+    var klSchedule: PPOKLSchedule? = nil
     var policyClip: Float = 0.2
     var valueClip: Float = 0.2
+    var clipValueLoss = true
     var valueCoefficient: Float = 1
     var maxGradientNorm: Float = 1
     var successImitationCoefficient: Float = 0
     var referencePolicyCoefficient: Float = 0
     var checkpointInterval = 50
+    var activation: PPOActivation? = nil
+    var orthogonalInitialization = false
+    var actorOutputGain: Float? = nil
+    var preset: String? = nil
     var resume = false
     var runName = "ppo"
     var checkpoint: String? = nil
@@ -80,6 +87,46 @@ func parseOptions(_ args: [String]) -> Options {
     }
     while i < args.count {
         switch args[i] {
+        case "--preset":
+            let name = value(after: args[i])
+            o.preset = name
+            switch name {
+            case "maniskill-pusht-ppo":
+                // Official examples/baselines/ppo/baselines.sh and
+                // ppo_fast.py profile for PushT-v1 (50M transitions).
+                o.envs = 4_096
+                o.updates = 762
+                o.horizon = 16
+                o.epochs = 8
+                o.batch = 2_048
+                o.lr = 3e-4
+                o.optimizerEpsilon = 1e-5
+                o.gamma = 0.99
+                o.gaeLambda = 0.9
+                o.hidden = 256
+                o.hiddenLayers = [256, 256, 256]
+                o.actionDistribution = .gaussian
+                o.actionStd = 1
+                o.symmetryAugmentation = false
+                o.symmetryMirrorLossCoefficient = 0
+                o.normalizeObservations = false
+                o.updateObservationNormalizer = false
+                o.entropy = 0
+                o.targetKL = 0.1
+                o.klSchedule = .earlyStop
+                o.policyClip = 0.2
+                o.clipValueLoss = false
+                o.valueCoefficient = 0.5
+                o.maxGradientNorm = 0.5
+                o.checkpointInterval = 25
+                o.activation = .tanh
+                o.orthogonalInitialization = true
+                o.actorOutputGain = 0.01 * sqrt(2)
+                o.seed = 9_351
+                o.runName = "ppo-maniskill-reference"
+            default:
+                fail("unknown training preset '\(name)'; available: maniskill-pusht-ppo")
+            }
         case "--frames": o.frames = Int(value(after: args[i])) ?? o.frames
         case "--iterations": o.iterations = Int(value(after: args[i]))
         case "--scale": o.scale = Int(value(after: args[i])) ?? o.scale
@@ -94,6 +141,8 @@ func parseOptions(_ args: [String]) -> Options {
         case "--batch": o.batch = Int(value(after: args[i])) ?? o.batch
         case "--latent": o.latent = Int(value(after: args[i])) ?? o.latent
         case "--lr": o.lr = Float(value(after: args[i])) ?? o.lr
+        case "--adam-epsilon":
+            o.optimizerEpsilon = Float(value(after: args[i]))
         case "--gamma": o.gamma = Float(value(after: args[i])) ?? o.gamma
         case "--gae-lambda":
             o.gaeLambda = Float(value(after: args[i])) ?? o.gaeLambda
@@ -147,10 +196,17 @@ func parseOptions(_ args: [String]) -> Options {
             o.normalizeObservations = false
         case "--entropy": o.entropy = Float(value(after: args[i])) ?? o.entropy
         case "--target-kl": o.targetKL = Float(value(after: args[i])) ?? o.targetKL
+        case "--kl-schedule":
+            let name = value(after: args[i])
+            guard let schedule = PPOKLSchedule(rawValue: name) else {
+                fail("--kl-schedule must be adaptive, early-stop, or none")
+            }
+            o.klSchedule = schedule
         case "--policy-clip":
             o.policyClip = Float(value(after: args[i])) ?? o.policyClip
         case "--value-clip":
             o.valueClip = Float(value(after: args[i])) ?? o.valueClip
+        case "--no-value-clip-loss": o.clipValueLoss = false
         case "--value-coef":
             o.valueCoefficient = Float(value(after: args[i]))
                 ?? o.valueCoefficient
@@ -166,6 +222,16 @@ func parseOptions(_ args: [String]) -> Options {
         case "--checkpoint-interval":
             o.checkpointInterval = Int(value(after: args[i]))
                 ?? o.checkpointInterval
+        case "--activation":
+            let name = value(after: args[i])
+            guard let activation = PPOActivation(rawValue: name) else {
+                fail("--activation must be elu or tanh")
+            }
+            o.activation = activation
+        case "--orthogonal-initialization":
+            o.orthogonalInitialization = true
+        case "--actor-output-gain":
+            o.actorOutputGain = Float(value(after: args[i]))
         case "--resume": o.resume = true
         case "--run": o.runName = value(after: args[i])
         case "--checkpoint": o.checkpoint = value(after: args[i])
@@ -222,6 +288,7 @@ guard let command = args.first else {
       verify-selection-rl <selection.json> <reports...>  Reject seed leakage or drift
       aggregate-rl <reports...>  Aggregate distinct-seed evaluation JSON files
       aggregate-checkpoint-rl <reports...>  Aggregate one checkpoint over reset seeds
+      sim2sim-h1       Run Unitree's imported recurrent H1 policy unchanged
 
     Options: --frames N --iterations N --scale N --dt T --cpu --json --watch BODY --stats-every N
     """)
@@ -237,6 +304,79 @@ case "list-rl":
     for id in BuiltInRLTasks.registry.taskIDs { print("  \(id)") }
     print("algorithms:")
     for id in VectorRLAlgorithmRegistry.builtIn.algorithmIDs { print("  \(id)") }
+
+case "sim2sim-h1":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    let policyDirectory = o.checkpoint ?? "checkpoints/external/unitree-h1"
+    let command = SIMD3<Float>(
+        o.taskOptions["forward"] ?? 0.5,
+        o.taskOptions["lateral"] ?? 0,
+        o.taskOptions["yaw"] ?? 0)
+    let session = try UnitreeH1Sim2SimSession(
+        policyDirectory: policyDirectory, command: command,
+        solverIterations: o.iterations)
+    let report = try session.run(controlSteps: o.frames) { step, state in
+        if args.contains("--trace") {
+            func values(_ input: some Collection<Float>) -> String {
+                input.map { String(format: "%+.7f", $0) }
+                    .joined(separator: ",")
+            }
+            let rootValues: [Float] = [
+                state.root.position.x, state.root.position.y,
+                state.root.position.z,
+            ]
+            print("trace \(step) root [\(values(rootValues))] "
+                + "q [\(values(state.jointAngles.prefix(10)))] "
+                + "dq [\(values(state.jointVelocities.prefix(10)))] "
+                + "obs [\(values(session.lastObservation))] "
+                + "action [\(values(session.previousAction))]")
+        }
+        guard !o.json, step == 1 || step % max(o.statsEvery, 1) == 0 else {
+            return
+        }
+        let upright = state.root.rotation.act(F3(0, 0, 1)).z
+        let meanAbsoluteAction = session.previousAction.map(abs).reduce(0, +)
+            / Float(session.previousAction.count)
+        print(String(format:
+            "step %4d  t %6.2f  root (%+.3f,%+.3f,%.3f)  "
+            + "upright %.3f  |action| %.3f",
+            step, session.elapsedTime, state.root.position.x,
+            state.root.position.y, state.root.position.z, upright,
+            meanAbsoluteAction))
+    }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let encoded = try encoder.encode(report)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try encoded.write(to: url, options: .atomic)
+    }
+    if o.json {
+        print(String(decoding: encoded, as: UTF8.self))
+    } else {
+        print(String(format:
+            "sim2sim H1  %.2fs  forward %+.3fm (%.3fm/s)  "
+            + "lateral %+.3fm  min height %.3fm  min upright %.3f  %@",
+            report.simulatedSeconds, report.forwardDistanceMeters,
+            report.meanForwardSpeedMetersPerSecond,
+            report.lateralDistanceMeters, report.minimumPelvisHeightMeters,
+            report.minimumUprightAlignment,
+            report.fell
+                ? String(format: "FELL at %.2fs",
+                         report.firstFallTimeSeconds ?? .nan)
+                : "STABLE"))
+        print(String(format:
+            "TorchScript->MLX max errors: action %.3g  hidden %.3g  cell %.3g  %@",
+            report.policyVerification.maximumActionError,
+            report.policyVerification.maximumHiddenStateError,
+            report.policyVerification.maximumCellStateError,
+            report.policyVerification.passed ? "PASS" : "FAIL"))
+        print("source sha256 \(report.checkpointSHA256)")
+    }
+    if !report.finite || !report.policyVerification.passed { exit(2) }
 
 case "rl-smoke":
     guard args.count > 1 else { fail("usage: avbd rl-smoke <task> [--envs N --frames N]") }
@@ -309,7 +449,8 @@ case "rl-smoke":
         rewardSum += result.rewards.reduce(0, +)
         for (name, values) in result.metrics
             where name.hasPrefix("reward/") || name.hasPrefix("penalty/")
-                || name.hasPrefix("gait/") || name.hasPrefix("state/") {
+                || name.hasPrefix("gait/") || name.hasPrefix("state/")
+                || name.hasPrefix("task/") {
             diagnosticMetricSums[name, default: 0] += values.reduce(0, +)
         }
         if let lengths = result.metrics["episode/length"] {
@@ -357,6 +498,10 @@ case "train-rl":
     }
     let o = parseOptions(Array(args.dropFirst(2)))
     let taskID = args[1]
+    if o.preset == "maniskill-pusht-ppo"
+        && taskID != "maniskill-pusht-v1" {
+        fail("maniskill-pusht-ppo preset requires task maniskill-pusht-v1")
+    }
     let task = try BuiltInRLTasks.registry.make(
         taskID, configuration: RLTaskConfiguration(
             numEnvironments: o.envs, seed: o.seed, options: o.taskOptions))
@@ -367,12 +512,14 @@ case "train-rl":
     let config = VectorPPOConfig(
         updates: o.updates, rolloutSteps: o.horizon,
         updateEpochs: o.epochs, minibatchSize: o.batch,
-        learningRate: o.lr, gamma: o.gamma, gaeLambda: o.gaeLambda,
+        learningRate: o.lr, optimizerEpsilon: o.optimizerEpsilon,
+        gamma: o.gamma, gaeLambda: o.gaeLambda,
         rewardScale: o.rewardScale,
         hiddenSize: o.hidden, seed: o.seed)
     var tunedConfig = config
     tunedConfig.policyClip = o.policyClip
     tunedConfig.valueClip = o.valueClip
+    tunedConfig.clipValueLoss = o.clipValueLoss
     tunedConfig.valueCoefficient = o.valueCoefficient
     tunedConfig.maxGradientNorm = o.maxGradientNorm
     tunedConfig.successImitationCoefficient =
@@ -381,6 +528,9 @@ case "train-rl":
         o.referencePolicyCoefficient
     tunedConfig.initialActionStd = o.actionStd
     tunedConfig.hiddenDimensions = o.hiddenLayers
+    tunedConfig.activation = o.activation
+    tunedConfig.orthogonalInitialization = o.orthogonalInitialization
+    tunedConfig.actorOutputGain = o.actorOutputGain
     tunedConfig.actionDistribution = o.actionDistribution
     tunedConfig.minimumActionStd = o.minimumActionStd
     tunedConfig.maximumActionStd = o.maximumActionStd
@@ -396,6 +546,7 @@ case "train-rl":
     tunedConfig.normalizeObservations = o.normalizeObservations
     tunedConfig.entropyCoefficient = o.entropy
     tunedConfig.targetKL = o.targetKL
+    tunedConfig.klSchedule = o.klSchedule
     tunedConfig.checkpointInterval = o.checkpointInterval
     let trainer = VectorPPOTrainer(configuration: tunedConfig)
     try trainer.train(task: task, outputDirectory: "runs/\(taskID)/\(o.runName)",
@@ -464,8 +615,9 @@ case "trace-rl":
     }
     var observation = try task.reset(seed: o.seed)
     var result = RLStepBatch(spec: task.spec)
-    print("step action0 action1 q0 q1 tip_x tip_y block_x block_y "
-        + "goal_m coverage reward done")
+    print("step actions[7] joints[7] tip_x tip_y block_x block_y block_yaw "
+        + "goal_m coverage tcp_speed block_speed block_yaw_rate robot_contact "
+        + "reward done")
     for step in 0..<min(o.frames, task.spec.maxEpisodeSteps) {
         let expertGates = (task as? any PolicyExpertGateProviding)?
             .policyExpertGates(observation.policy)
@@ -475,7 +627,41 @@ case "trace-rl":
             for: observation, expertGates: expertGates,
             standExpertGates: standExpertGates)
         try task.step(actions: actions, into: &result)
-        if let arm = task as? ArmPushTTask {
+        if let pushT = task as? ManiSkillPushTTask {
+            let state = pushT.environment.states()[0]
+            let ref = pushT.environment.refs[0]
+            let goal = ref.goalPosition
+            let goalDistance = simd_length(
+                SIMD2(state.blockPosition.x, state.blockPosition.y) - goal)
+            let coverage = pushT.environment.coverage(0, state: state)
+            let forward = state.blockRotation.act(F3(1, 0, 0))
+            let blockYaw = atan2(forward.y, forward.x)
+            let robotBodies = Set(ref.robotBodies)
+            let robotContact = pushT.environment.solver
+                .activeRigidContactPairs().contains { pair in
+                    (pair.0 == ref.block && robotBodies.contains(pair.1))
+                        || (pair.1 == ref.block && robotBodies.contains(pair.0))
+                }
+            let actionText = actions.values.prefix(7).map {
+                String(format: "%+.5f", $0)
+            }.joined(separator: ",")
+            let jointText = state.jointPositions.map {
+                String(format: "%+.5f", $0)
+            }.joined(separator: ",")
+            print(String(format:
+                "%3d [%@] [%@] %+.5f %+.5f %+.5f %+.5f %+.5f "
+                + "%.5f %.5f %.5f %.5f %+.5f %@ %+.5f %@",
+                step + 1, actionText, jointText,
+                state.tcpPosition.x, state.tcpPosition.y,
+                state.blockPosition.x, state.blockPosition.y,
+                blockYaw, goalDistance, coverage,
+                simd_length(state.tcpLinearVelocity),
+                simd_length(state.blockLinearVelocity),
+                state.blockAngularVelocity.z,
+                robotContact ? "true" : "false", result.rewards[0],
+                result.terminated[0] || result.truncated[0]
+                    ? "true" : "false"))
+        } else if let arm = task as? ArmPushTTask {
             let state = arm.environment.states()[0]
             let goalDistance = simd_length(
                 arm.environment.refs[0].goalPosition - state.blockPosition)
@@ -505,12 +691,23 @@ case "trace-rl":
 
 case "eval-arm-expert":
     let o = parseOptions(Array(args.dropFirst(1)))
-    let env = try ArmPushTEnv(numEnvironments: o.envs, seed: o.seed)
+    let env = try ArmPushTEnv(
+        numEnvironments: o.envs, seed: o.seed,
+        linkLength1: o.taskOptions["linkLength1"]
+            ?? ArmPushTEnv.linkLengths.x,
+        linkLength2: o.taskOptions["linkLength2"]
+            ?? ArmPushTEnv.linkLengths.y)
     let ids = Array(0..<o.envs)
     env.reset(ids, seeds: ids.map {
         o.seed &+ UInt64($0) &* 0x9E3779B97F4A7C15
     })
-    let expert = ArmPushTGeometricExpert(numEnvironments: o.envs)
+    let expert = ArmPushTGeometricExpert(
+        numEnvironments: o.envs,
+        contactPreload: o.taskOptions["expertContactPreload"] ?? 0.014)
+    let actionSmoothing = o.taskOptions["expertActionSmoothing"] ?? 0.60
+    guard actionSmoothing > 0, actionSmoothing <= 1 else {
+        fail("expertActionSmoothing must be in (0, 1]")
+    }
     var maximumCoverage = [Float](repeating: 0, count: o.envs)
     var firstSuccessStep = [Int?](repeating: nil, count: o.envs)
     var appliedActions = ContiguousArray(repeating: Float(0), count: o.envs * 2)
@@ -518,7 +715,8 @@ case "eval-arm-expert":
         let states = env.states()
         let requestedActions = expert.actions(environment: env, states: states)
         for i in appliedActions.indices {
-            appliedActions[i] += 0.60 * (requestedActions[i] - appliedActions[i])
+            appliedActions[i] += actionSmoothing
+                * (requestedActions[i] - appliedActions[i])
         }
         if let watch = o.watch, (0..<o.envs).contains(watch), step % 20 == 0 {
             let s = states[watch]

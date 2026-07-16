@@ -10,6 +10,7 @@ import AVBDLearn
 final class PolicyReplayModel: ObservableObject, RenderableModel {
     nonisolated let captureID = "policy"
     enum Robot: String, CaseIterable {
+        case unitreeH1 = "Unitree H1 Sim2Sim"
         case humanoidIsaac = "H1 Flat Walk"
         case humanoidIsaacGoal = "H1 Goal"
         case humanoidWalk = "Humanoid Walk"
@@ -18,6 +19,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
         var taskID: String {
             switch self {
+            case .unitreeH1: return "unitree-h1-sim2sim-v0"
             case .humanoidIsaac: return "humanoid-isaac-flat-v0"
             case .humanoidIsaacGoal: return "humanoid-isaac-goal-v0"
             case .humanoidWalk: return "humanoid-walk-v0"
@@ -37,6 +39,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             ?? UserDefaults.standard.string(
                 forKey: "AVBDPolicyReplaySelectedTask")
         switch requestedTask {
+        case "unitree-h1-sim2sim-v0": return .unitreeH1
         case "humanoid-isaac-goal-v0": return .humanoidIsaacGoal
         case "humanoid-walk-v0": return .humanoidWalk
         case "humanoid-goal-v0": return .humanoidGoal
@@ -84,6 +87,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var isaacHumanoid: HumanoidIsaacVelocityTask?
     private var humanoid: HumanoidWalkTask?
     private var arm: ArmPushTTask?
+    private var unitreeH1: UnitreeH1Sim2SimSession?
     private var task: (any VectorizedRLTask)?
     private var observation: RLObservationBatch?
     private var result: RLStepBatch?
@@ -103,6 +107,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var completed = 0
     private var successes = 0
     private var nextProjectileSide: Float = 1
+    private var unitreeInitialPosition = F3.zero
 
     var supportsGoalPlacement: Bool {
         isaacHumanoid?.usesPointGoal == true
@@ -127,6 +132,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
     var scenarioSummary: String {
         switch robot {
+        case .unitreeH1:
+            return "Unchanged public Unitree RL Gym H1 recurrent policy, imported from TorchScript to MLX and running on AVBD Metal physics."
         case .humanoidIsaac:
             return "Replay the accepted H1 policy on the exact public Flat velocity task. Markers show the current command segment, not a point goal."
         case .humanoidIsaacGoal:
@@ -141,6 +148,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     var solver: GPUSolver? {
+        if let unitreeH1 { return unitreeH1.environment.solver }
         if let isaacHumanoid { return isaacHumanoid.environment.solver }
         if let humanoid { return humanoid.environment.solver }
         return arm?.environment.solver
@@ -149,13 +157,23 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     init() { rebuild() }
 
     func rebuild() {
-        isaacHumanoid = nil; humanoid = nil; arm = nil; task = nil; runner = nil
+        unitreeH1 = nil; isaacHumanoid = nil; humanoid = nil; arm = nil
+        task = nil; runner = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
         interactionStatus = ""
         episodeFinished = false
         running = true
         do {
+            if robot == .unitreeH1 {
+                try installUnitreeH1Replay()
+                updateCameraTargets()
+                applyCameraPreset()
+                cameraEpoch += 1
+                lastTime = CACurrentMediaTime()
+                refreshStats()
+                return
+            }
             let desiredTaskID = robot.taskID
             let packagedPath = "checkpoints/\(desiredTaskID)"
             let bundledPath = Bundle.main.resourceURL?
@@ -219,6 +237,35 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         cameraEpoch += 1
         lastTime = CACurrentMediaTime()
         refreshStats()
+    }
+
+    private func installUnitreeH1Replay() throws {
+        let overridePath = ProcessInfo.processInfo.environment[
+            "AVBD_REPLAY_CHECKPOINT"]
+        let bundledPath = Bundle.main.resourceURL?
+            .appendingPathComponent("checkpoints/external/unitree-h1").path
+        let candidates = [overridePath, bundledPath,
+                          "checkpoints/external/unitree-h1"].compactMap { $0 }
+        guard let directory = candidates.first(where: {
+            FileManager.default.fileExists(atPath: "\($0)/manifest.json")
+                && FileManager.default.fileExists(
+                    atPath: "\($0)/policy.safetensors")
+        }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "imported Unitree H1 policy not found; run "
+                    + "Tools/import_unitree_h1_policy.py first")
+        }
+        let session = try UnitreeH1Sim2SimSession(policyDirectory: directory)
+        unitreeH1 = session
+        loadedCheckpointDirectory = directory
+        unitreeInitialPosition = session.environment.state().root.position
+        controlSteps = 0
+        episodeFinished = false
+        running = true
+        policyStatus = "loaded verified Unitree checkpoint "
+            + String(session.policy.manifest.source.checkpointSHA256.prefix(12))
+            + "…\n\(directory)"
+        trainingStatus = "external pretrained policy · recurrent MLX inference"
     }
 
     /// Configure the simulator from the checkpoint's serialized task options
@@ -420,6 +467,24 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func restartEpisode() throws {
+        if robot == .unitreeH1 {
+            guard let loadedCheckpointDirectory else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "Unitree H1 checkpoint directory is unavailable")
+            }
+            let session = try UnitreeH1Sim2SimSession(
+                policyDirectory: loadedCheckpointDirectory)
+            unitreeH1 = session
+            unitreeInitialPosition = session.environment.state().root.position
+            completed = 0; successes = 0; controlSteps = 0; accumulator = 0
+            episodeFinished = false; running = true
+            updateCameraTargets()
+            applyCameraPreset()
+            cameraEpoch += 1
+            lastTime = CACurrentMediaTime()
+            refreshStats()
+            return
+        }
         guard let task else { return }
         observation = try task.reset(seed: 21_001)
         result = RLStepBatch(spec: task.spec)
@@ -468,6 +533,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func tickIfRunning() {
+        if unitreeH1 != nil {
+            tickUnitreeH1IfRunning()
+            return
+        }
         guard running, let task, let runner, var observation, var result else { return }
         let now = CACurrentMediaTime()
         let wallStep = Double(task.spec.controlStep) / max(playbackRate, 0.1)
@@ -530,6 +599,41 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         if controlSteps.isMultiple(of: 10) { refreshStats() }
     }
 
+    private func tickUnitreeH1IfRunning() {
+        guard running, let session = unitreeH1 else { return }
+        let now = CACurrentMediaTime()
+        let wallStep = 0.02 / max(playbackRate, 0.1)
+        if frameLockedCapture {
+            accumulator = wallStep
+        } else {
+            accumulator += min(now - lastTime, 0.1)
+        }
+        lastTime = now
+        var ticks = 0
+        let maximumTicks = frameLockedCapture ? 1 : 3
+        while accumulator >= wallStep, ticks < maximumTicks {
+            do {
+                _ = try session.step()
+                controlSteps += 1
+                updateCameraTargets()
+                if controlSteps >= 500 {
+                    running = false
+                    episodeFinished = true
+                    completed = 1
+                    accumulator = 0
+                    refreshStats()
+                    break
+                }
+            } catch {
+                policyStatus = "step failed: \(error.localizedDescription)"
+                running = false
+            }
+            accumulator -= wallStep
+            ticks += 1
+        }
+        if controlSteps.isMultiple(of: 10) { refreshStats() }
+    }
+
     func singleStep() {
         guard !episodeFinished else { return }
         let wasRunning = running
@@ -538,14 +642,20 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         // reset the 0.1-second catch-up allowance executes three control
         // transitions, making the button visibly skip frames.
         lastTime = CACurrentMediaTime()
-        accumulator = Double(task?.spec.controlStep ?? 1 / 30) / max(playbackRate, 0.1)
+        let controlStep = robot == .unitreeH1
+            ? 0.02 : Double(task?.spec.controlStep ?? 1 / 30)
+        accumulator = controlStep / max(playbackRate, 0.1)
         tickIfRunning()
         running = wasRunning
         refreshStats()
     }
 
     private func updateCameraTargets() {
-        if let isaacHumanoid {
+        if let unitreeH1 {
+            let state = unitreeH1.environment.state()
+            replayCameraTarget = state.root.position + F3(0.15, 0, 0.15)
+            courseCameraTarget = unitreeInitialPosition + F3(2, 0, 0.9)
+        } else if let isaacHumanoid {
             let state = isaacHumanoid.environment.states()[0]
             replayCameraTarget = state.root.position + F3(0.15, 0, 0.15)
             let origin = isaacHumanoid.environment.refs[0].center
@@ -594,7 +704,19 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func refreshStats() {
-        if let isaacHumanoid {
+        if let unitreeH1 {
+            let state = unitreeH1.environment.state()
+            let displacement = state.root.position - unitreeInitialPosition
+            let duration = max(Float(controlSteps) * 0.02, 0.02)
+            let upright = state.root.rotation.act(F3(0, 0, 1)).z
+            statsText = String(
+                format: "forward %+.3f m   mean %.3f / command %.3f m/s\n"
+                    + "lateral %+.3f m   height %.3f m   upright %.4f\n"
+                    + "frame %d/500   time %.2f/10.00 s",
+                displacement.x, displacement.x / duration, 0.5,
+                displacement.y, state.root.position.z, upright,
+                controlSteps, duration)
+        } else if let isaacHumanoid {
             let state = isaacHumanoid.environment.states()[0]
             let command = isaacHumanoid.currentCommand(environment: 0)
             let forward3D = state.root.rotation.act(F3(1, 0, 0))
@@ -705,7 +827,7 @@ struct PolicyReplayLabView: View {
                             Text($0.rawValue).tag($0)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                     HStack {
                         Button(model.episodeFinished ? "Replay" : (model.running ? "Pause" : "Play")) {
                             model.togglePlayback()
@@ -802,7 +924,7 @@ struct PolicyReplayLabView: View {
                 }
                 .padding(14)
             }
-            .frame(minWidth: 440, idealWidth: 480, maxWidth: 560)
+            .frame(minWidth: 520, idealWidth: 600, maxWidth: 720)
         }
         .onReceive(checkpointTimer) { _ in
             model.pollForLatestCheckpoint()

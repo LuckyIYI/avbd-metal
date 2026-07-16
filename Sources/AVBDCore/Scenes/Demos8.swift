@@ -43,7 +43,10 @@ extension Demos {
                                       stiffnessLin: .infinity,
                                       stiffnessAng: .infinity,
                                       hingeAxis: F3(0, 0, 1),
-                                      motorTorque: 300, motorRate: -drive))
+                                      motorTarget: -drive,
+                                      motorTorque: 300,
+                                      motorDamping: 50,
+                                      motorMode: .velocity))
 
                 // rubber tire: voxelized torus around the hub, axis along y
                 let h = 2 * (R + tube) / Float(max(8, res))

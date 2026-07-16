@@ -725,6 +725,11 @@ public enum HumanoidControlProfile: String, Sendable {
     /// keyframe, compiler-resolved critically damped position servos, and the
     /// reduced feet-only collision model used during published training.
     case mujocoPlayground
+    /// Unitree RL Gym's public recurrent H1 deployment contract: 2 ms
+    /// physics, 50 Hz policy updates, the published 10-joint gains, and a
+    /// rigid upper body. This profile exists for unchanged-policy sim-to-sim
+    /// validation rather than native AVBD training.
+    case unitreeRLGym
 }
 
 public final class HumanoidWalkEnv {
@@ -837,6 +842,19 @@ public final class HumanoidWalkEnv {
         "right_elbow": .init(stiffness: 400, damping: 15.034399),
     ]
 
+    private static let unitreeRLGymMotorGains: [String: MJCFMotorGain] = [
+        "left_hip_yaw": .init(stiffness: 150, damping: 2),
+        "left_hip_roll": .init(stiffness: 150, damping: 2),
+        "left_hip_pitch": .init(stiffness: 150, damping: 2),
+        "left_knee": .init(stiffness: 200, damping: 4),
+        "left_ankle": .init(stiffness: 40, damping: 2),
+        "right_hip_yaw": .init(stiffness: 150, damping: 2),
+        "right_hip_roll": .init(stiffness: 150, damping: 2),
+        "right_hip_pitch": .init(stiffness: 150, damping: 2),
+        "right_knee": .init(stiffness: 200, damping: 4),
+        "right_ankle": .init(stiffness: 40, damping: 2),
+    ]
+
     public let numEnvironments: Int
     public let controlProfile: HumanoidControlProfile
     public let projectileMass: Float
@@ -862,8 +880,11 @@ public final class HumanoidWalkEnv {
         self.controlProfile = controlProfile
         self.projectileMass = projectileMass
         var built = PhysicsScene(name: "humanoid-walk")
-        built.settings.dt = controlProfile == .mujocoPlayground
-            ? 0.004 : 1 / 200
+        switch controlProfile {
+        case .mujocoPlayground: built.settings.dt = 0.004
+        case .unitreeRLGym: built.settings.dt = 0.002
+        case .isaacLab: built.settings.dt = 1 / 200
+        }
         // Both public source environments use SI gravity. The generic AVBD
         // demo default is -10 m/s², but that 1.9% plant mismatch compounds in
         // a transferred 50 Hz feedback policy.
@@ -889,7 +910,7 @@ public final class HumanoidWalkEnv {
         let groundBody = built.addBody(
             size: F3(80, 40, 2),
             density: 0,
-            friction: controlProfile == .isaacLab ? 1.0 : 1.1,
+            friction: controlProfile == .mujocoPlayground ? 1.1 : 1.0,
             position: F3(10, 0, -1))
         let asset = try MJCFAsset.bundledUnitreeH1()
         var builtRefs = [EnvRefs]()
@@ -897,12 +918,19 @@ public final class HumanoidWalkEnv {
         for e in 0..<numEnvironments {
             let center = F3.zero
             let firstReplicaCollider = built.colliders.count
-            let motorGains = controlProfile == .mujocoPlayground
-                ? Self.mujocoPlaygroundMotorGains
-                : Self.isaacLabMotorGains
-            let homePositions = controlProfile == .mujocoPlayground
-                ? Self.mujocoPlaygroundHomePositions
-                : Self.isaacLabHomePositions
+            let motorGains: [String: MJCFMotorGain]
+            let homePositions: [String: Float]
+            switch controlProfile {
+            case .isaacLab:
+                motorGains = Self.isaacLabMotorGains
+                homePositions = Self.isaacLabHomePositions
+            case .mujocoPlayground:
+                motorGains = Self.mujocoPlaygroundMotorGains
+                homePositions = Self.mujocoPlaygroundHomePositions
+            case .unitreeRLGym:
+                motorGains = Self.unitreeRLGymMotorGains
+                homePositions = [:]
+            }
             let imported = try asset.instantiate(
                 in: &built, worldOffset: center,
                 motorGains: motorGains,
@@ -928,6 +956,25 @@ public final class HumanoidWalkEnv {
                         name.hasSuffix("_ankle") ? 100 : 300
                 }
             }
+            if controlProfile == .unitreeRLGym {
+                // Unitree's deployment XML exposes only ten leg hinges; its
+                // torso and arm meshes are rigidly attached to the pelvis.
+                // Welding the corresponding full-H1 links preserves their
+                // composite mass and visual geometry without inventing nine
+                // policy outputs. The source deploy model also uses 0.01
+                // kg*m^2 reflected armature on every leg hinge.
+                for (index, joint) in imported.actuatorJoints.enumerated() {
+                    if index < 10 {
+                        built.joints[joint].armature = 0.01
+                    } else {
+                        built.joints[joint].hingeAxis = nil
+                        built.joints[joint].motorTorque = 0
+                        built.joints[joint].motorStiffness = 0
+                        built.joints[joint].motorDamping = 0
+                        built.joints[joint].armature = 0
+                    }
+                }
+            }
             let leftFoot = imported.bodiesByName["left_ankle_link"]!
             let rightFoot = imported.bodiesByName["right_ankle_link"]!
             let torso = imported.bodiesByName["torso_link"]!
@@ -951,6 +998,10 @@ public final class HumanoidWalkEnv {
                 case .mujocoPlayground:
                     built.colliders[collider].collisionEnabled =
                         body == leftFoot || body == rightFoot
+                case .unitreeRLGym:
+                    // Unitree's MuJoCo deployment uses collision meshes on
+                    // every leg and on the rigid upper-body compound.
+                    built.colliders[collider].collisionEnabled = true
                 }
             }
             if controlProfile == .isaacLab {
@@ -1392,6 +1443,32 @@ public final class HumanoidWalkEnv {
                                  joint.limitLo, joint.limitHi)
                     : requestedTarget
                 commands.append(.init(joint: refs[e].motors[j], angle: target))
+            }
+        }
+        solver.setMotorTargets(commands)
+        for _ in 0..<decimation { solver.step() }
+    }
+
+    /// Step absolute source-joint position targets. Imported policies use
+    /// their own offset/scale contract and must not be remapped through the
+    /// native task's normalized 0.5-radian action convention.
+    public func step(jointPositionTargets: ContiguousArray<Float>,
+                     decimation: Int, clampTargetsToLimits: Bool = true) {
+        precondition(jointPositionTargets.count
+            == numEnvironments * Self.jointRanges.count)
+        precondition(decimation > 0)
+        var commands = [GPUSolver.MotorTargetUpdate]()
+        commands.reserveCapacity(jointPositionTargets.count)
+        for environment in 0..<numEnvironments {
+            for jointOffset in 0..<Self.jointRanges.count {
+                let jointIndex = refs[environment].motors[jointOffset]
+                let requested = jointPositionTargets[
+                    environment * Self.jointRanges.count + jointOffset]
+                let joint = scene.joints[jointIndex]
+                let target = clampTargetsToLimits
+                    ? simd_clamp(requested, joint.limitLo, joint.limitHi)
+                    : requested
+                commands.append(.init(joint: jointIndex, angle: target))
             }
         }
         solver.setMotorTargets(commands)
@@ -1943,7 +2020,8 @@ public final class HumanoidWalkTask: VectorizedRLTask, RLEvaluationCriteriaProvi
                 Float(configuration.maximumProjectileLaunchStep)
         }
         spec = RLTaskSpec(
-            id: taskID, revision: taskRevision,
+            id: taskID,
+            revision: RLPhysicsContract.fixedGainActuatorV2(taskRevision),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy",

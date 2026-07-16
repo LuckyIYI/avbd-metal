@@ -38,7 +38,7 @@ public final class CPUManifold: CPUForce {
         guard let bodyA, let bodyB else { return 0 }
         let xA = anchorWorld(bodyA, contacts[i].rA)
         let xB = anchorWorld(bodyB, contacts[i].rB)
-        return dot(basis.0, xA - xB) + AVBDConstants.collisionMargin
+        return dot(basis.0, xA - xB) + solver.collisionMargin
     }
 
     override func initialize() -> Bool {
@@ -49,7 +49,9 @@ public final class CPUManifold: CPUForce {
             bodyA.dynamicFriction, bodyB.dynamicFriction)
 
         var newContacts: [ContactPoint] = []
-        let count = Self.collide(bodyA, bodyB, &newContacts, &basis)
+        let count = Self.collide(
+            bodyA, bodyB, margin: solver.collisionMargin,
+            &newContacts, &basis)
 
         // Merge old contact data via feature keys (warm-start persistence).
         // Stick anchors are never restored for spheres: anchors rotate with
@@ -79,7 +81,7 @@ public final class CPUManifold: CPUForce {
             let xA = anchorWorld(bodyA, contacts[i].rA)
             let xB = anchorWorld(bodyB, contacts[i].rB)
             let d = xA - xB
-            contacts[i].C0 = F3(dot(basis.0, d) + AVBDConstants.collisionMargin,
+            contacts[i].C0 = F3(dot(basis.0, d) + solver.collisionMargin,
                                 dot(basis.1, d), dot(basis.2, d))
             let sA = cross(wA, xA - bodyA.positionLin) * solver.dt
             let sB = cross(wB, xB - bodyB.positionLin) * solver.dt

@@ -1,0 +1,135 @@
+<!--
+  Dynamics and kinematic tree from unitreerobotics/unitree_rl_gym
+  resources/robots/h1/h1.xml at revision
+  276801e46c5d433564f24658bac64f254b7d2d4b (BSD-3-Clause; see LICENSE).
+
+  The source deployment uses STL collision meshes. AVBD intentionally keeps
+  batched contact on analytic Metal primitives, so the collision-only geoms
+  below are conservative proxies in the same link frames. Inertias, joint
+  frames, limits, damping, armature, and actuator bounds are source-exact.
+-->
+<mujoco model="unitree_rl_gym_h1">
+  <compiler angle="radian" autolimits="true"/>
+  <default>
+    <default class="h1">
+      <joint damping="0.001" armature="0.01"/>
+      <geom friction="1 0.005 0.0001"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="pelvis" pos="0 0 1.05" childclass="h1">
+      <inertial pos="0.0097494 0.00167425 0.174644"
+                quat="0.999936 -0.00259707 -0.0109997 -0.0000779805"
+                mass="29.847" diaginertia="1.32807 0.960733 0.53795"/>
+      <geom type="box" size=".12 .15 .12" pos="0 0 .10"/>
+      <geom type="box" size=".08 .18 .23" pos=".01 0 .40"/>
+      <geom type="sphere" size=".10" pos=".05 0 .70"/>
+      <geom type="capsule" size=".045"
+            fromto=".005 .16 .44 .005 .21 .29"/>
+      <geom type="capsule" size=".032"
+            fromto=".005 .21 .29 .30 .21 .10"/>
+      <geom type="sphere" size=".038" pos=".30 .21 .10"/>
+      <geom type="capsule" size=".045"
+            fromto=".005 -.16 .44 .005 -.21 .29"/>
+      <geom type="capsule" size=".032"
+            fromto=".005 -.21 .29 .30 -.21 .10"/>
+      <geom type="sphere" size=".038" pos=".30 -.21 .10"/>
+
+      <body name="left_hip_yaw_link" pos="0 .0875 -.1742">
+        <inertial pos="-.04923 .0001 .0072"
+                  quat=".69699 .219193 .233287 .641667"
+                  mass="2.244" diaginertia=".00304494 .00296885 .00189201"/>
+        <joint name="left_hip_yaw" axis="0 0 1" range="-.43 .43"/>
+        <geom type="cylinder" size=".06 .035" pos="-.067 0 0"
+              quat=".707123 0 .70709 0"/>
+        <body name="left_hip_roll_link" pos=".039468 0 0">
+          <inertial pos="-.0058 -.00319 -.00009"
+                    quat=".0438242 .70721 -.0729075 .701867"
+                    mass="2.232" diaginertia=".00243264 .00225325 .00205492"/>
+          <joint name="left_hip_roll" axis="1 0 0" range="-.43 .43"/>
+          <geom type="cylinder" size=".05 .03" pos="0 -.02 0"
+                quat=".707107 .707107 0 0"/>
+          <body name="left_hip_pitch_link" pos="0 .11536 0">
+            <inertial pos=".00746 -.02346 -.08193"
+                      quat=".979828 .0513522 -.0169854 -.192382"
+                      mass="4.152" diaginertia=".0829503 .0821457 .00510909"/>
+            <joint name="left_hip_pitch" axis="0 1 0" range="-1.57 1.57"/>
+            <geom type="capsule" size=".03" fromto=".02 0 -.4 -.02 0 .02"/>
+            <body name="left_knee_link" pos="0 0 -.4">
+              <inertial pos="-.00136 -.00512 -.1384"
+                        quat=".626132 -.034227 -.0416277 .777852"
+                        mass="1.721" diaginertia=".0125237 .0123104 .0019428"/>
+              <joint name="left_knee" axis="0 1 0" range="-.26 2.05"/>
+              <geom type="capsule" size=".025" fromto=".02 0 -.4 .02 0 0"/>
+              <geom type="sphere" size=".05" pos="0 0 -.115"/>
+              <body name="left_ankle_link" pos="0 0 -.4">
+                <inertial pos=".048568 0 -.045609"
+                          quat=".489385 .510394 .510394 .489385"
+                          mass=".552448"
+                          diaginertia=".00362 .00355701 .000149987"/>
+                <joint name="left_ankle" axis="0 1 0" range="-.87 .52"/>
+                <!-- Contact support bounds of MuJoCo's convexified source
+                     ankle STL: x [-.10,.20], y [-.04,.04], z floor -.07. -->
+                <geom type="box" size=".15 .04 .01" pos=".05 0 -.06"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <body name="right_hip_yaw_link" pos="0 -.0875 -.1742">
+        <inertial pos="-.04923 -.0001 .0072"
+                  quat=".641667 .233287 .219193 .69699"
+                  mass="2.244" diaginertia=".00304494 .00296885 .00189201"/>
+        <joint name="right_hip_yaw" axis="0 0 1" range="-.43 .43"/>
+        <geom type="cylinder" size=".06 .035" pos="-.067 0 0"
+              quat=".707123 0 .70709 0"/>
+        <body name="right_hip_roll_link" pos=".039468 0 0">
+          <inertial pos="-.0058 .00319 -.00009"
+                    quat="-.0438242 .70721 .0729075 .701867"
+                    mass="2.232" diaginertia=".00243264 .00225325 .00205492"/>
+          <joint name="right_hip_roll" axis="1 0 0" range="-.43 .43"/>
+          <geom type="cylinder" size=".05 .03" pos="0 .02 0"
+                quat=".707107 .707107 0 0"/>
+          <body name="right_hip_pitch_link" pos="0 -.11536 0">
+            <inertial pos=".00746 .02346 -.08193"
+                      quat=".979828 -.0513522 -.0169854 .192382"
+                      mass="4.152" diaginertia=".0829503 .0821457 .00510909"/>
+            <joint name="right_hip_pitch" axis="0 1 0" range="-1.57 1.57"/>
+            <geom type="capsule" size=".03" fromto=".02 0 -.4 -.02 0 .02"/>
+            <body name="right_knee_link" pos="0 0 -.4">
+              <inertial pos="-.00136 .00512 -.1384"
+                        quat=".777852 -.0416277 -.034227 .626132"
+                        mass="1.721" diaginertia=".0125237 .0123104 .0019428"/>
+              <joint name="right_knee" axis="0 1 0" range="-.26 2.05"/>
+              <geom type="capsule" size=".025" fromto=".02 0 -.4 .02 0 0"/>
+              <geom type="sphere" size=".05" pos="0 0 -.115"/>
+              <body name="right_ankle_link" pos="0 0 -.4">
+                <inertial pos=".048568 0 -.045609"
+                          quat=".489385 .510394 .510394 .489385"
+                          mass=".552448"
+                          diaginertia=".00362 .00355701 .000149987"/>
+                <joint name="right_ankle" axis="0 1 0" range="-.87 .52"/>
+                <geom type="box" size=".15 .04 .01" pos=".05 0 -.06"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="left_hip_yaw" joint="left_hip_yaw" ctrlrange="-200 200"/>
+    <motor name="left_hip_roll" joint="left_hip_roll" ctrlrange="-200 200"/>
+    <motor name="left_hip_pitch" joint="left_hip_pitch" ctrlrange="-200 200"/>
+    <motor name="left_knee" joint="left_knee" ctrlrange="-300 300"/>
+    <motor name="left_ankle" joint="left_ankle" ctrlrange="-40 40"/>
+    <motor name="right_hip_yaw" joint="right_hip_yaw" ctrlrange="-200 200"/>
+    <motor name="right_hip_roll" joint="right_hip_roll" ctrlrange="-200 200"/>
+    <motor name="right_hip_pitch" joint="right_hip_pitch" ctrlrange="-200 200"/>
+    <motor name="right_knee" joint="right_knee" ctrlrange="-300 300"/>
+    <motor name="right_ankle" joint="right_ankle" ctrlrange="-40 40"/>
+  </actuator>
+</mujoco>

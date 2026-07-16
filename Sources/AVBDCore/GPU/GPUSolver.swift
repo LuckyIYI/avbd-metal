@@ -14,6 +14,11 @@ import simd
 //   5. n iterations of: per-color primal solve (6x6 LDL) + dual update
 //   6. BDF1 velocity finalize
 public final class GPUSolver {
+    private static let jointMotorModeMask: UInt32 = 3 << 4
+    private static let jointMotorModeImplicitPositionPD: UInt32 = 1 << 4
+    private static let jointMotorModeExplicitTorquePD: UInt32 = 2 << 4
+    private static let jointMotorModeVelocity: UInt32 = 3 << 4
+
     public let device: MTLDevice
     let queue: MTLCommandQueue
 
@@ -44,6 +49,7 @@ public final class GPUSolver {
     var posLin, posAng, initLin, initAng, inertLin, inertAng: MTLBuffer
     var velLin, velAng, prevVelLin: MTLBuffer
     var props, shape: MTLBuffer
+    var gravityScale: MTLBuffer
     var shapeType: MTLBuffer       // 0 box, 1 sphere, 2 torus
     var spinVel: MTLBuffer         // angular velocity of kinematic spinners
     // Collision geometry is independent of body inertia. Every legacy body
@@ -62,10 +68,6 @@ public final class GPUSolver {
     /// previous fall's augmented-Lagrangian conditioning.
     private var initialJointPenaltyLin: [SIMD4<Float>] = []
     private var initialJointPenaltyAng: [SIMD4<Float>] = []
-    /// Legacy bounded-torque motors use an adaptive angular penalty in
-    /// `motor.w`. It is just as episode-local as the joint AL penalties;
-    /// carrying it across a reset changes the actuator gain seen by PPO.
-    private var initialJointMotorPenalty: [Float] = []
     var springs: MTLBuffer
     var manifolds: MTLBuffer       // current frame
     var prevManifolds: MTLBuffer   // previous frame (swapped)
@@ -152,11 +154,11 @@ public final class GPUSolver {
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
-    /// (joint index, rad/s) — servo targets advanced each step
-    private var rateMotors: [(Int, Float)] = []
-
     public init(scene: PhysicsScene, device: MTLDevice? = nil,
                 maxPairsPerBody: Int = 16) throws {
+        precondition(scene.settings.collisionMargin >= 0
+            && scene.settings.collisionMargin.isFinite,
+            "collision margin must be finite and nonnegative")
         guard let dev = device ?? MTLCreateSystemDefaultDevice() else {
             throw AVBDError.noDevice
         }
@@ -223,6 +225,7 @@ public final class GPUSolver {
         prevVelLin = try makeBuf(nb * 16, "prevVelLin")
         props = try makeBuf(nb * 16, "props")
         shape = try makeBuf(nb * 16, "shape")
+        gravityScale = try makeBuf(nb * 4, "gravityScale")
         shapeType = try makeBuf(nb * 4, "shapeType")
         spinVel = try makeBuf(nb * 16, "spinVel")
         colliderOwner = try makeBuf(numColliders * 4, "colliderOwner")
@@ -487,6 +490,8 @@ public final class GPUSolver {
         let pr = props.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let sh = shape.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let st = shapeType.contents().bindMemory(to: UInt32.self, capacity: numBodies)
+        let gs = gravityScale.contents().bindMemory(to: Float.self,
+                                                    capacity: numBodies)
         let colA = colorsA.contents().bindMemory(to: UInt32.self, capacity: numBodies)
         let colB = colorsB.contents().bindMemory(to: UInt32.self, capacity: numBodies)
 
@@ -535,6 +540,7 @@ public final class GPUSolver {
             pv[i] = SIMD4(b.velocity, 0)
             pr[i] = SIMD4(moment, b.friction)
             sh[i] = SIMD4(b.size, b.isParticle ? -radius : radius)
+            gs[i] = b.gravityScale
             switch b.shape {
             case .box: st[i] = 0
             case .sphere: st[i] = 1
@@ -662,6 +668,29 @@ public final class GPUSolver {
         // Joints
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
         for (i, j) in scene.joints.enumerated() {
+            if j.motorTorque > 0 {
+                precondition(j.hingeAxis != nil,
+                             "powered joint \(i) must define a hinge axis")
+                precondition(j.motorTarget.isFinite
+                    && j.motorTorque.isFinite
+                    && j.motorStiffness.isFinite
+                    && j.motorDamping.isFinite
+                    && j.armature.isFinite,
+                    "powered joint \(i) has non-finite motor parameters")
+                precondition(j.motorTorque > 0 && j.motorStiffness >= 0
+                    && j.motorDamping >= 0 && j.armature >= 0,
+                    "powered joint \(i) has negative motor parameters")
+                switch j.motorMode {
+                case .implicitPositionPD, .explicitTorquePD:
+                    precondition(j.motorStiffness > 0
+                        && j.motorDamping >= 0,
+                        "position-PD joint \(i) requires physical kp/kd gains")
+                case .velocity:
+                    precondition(j.motorStiffness == 0
+                        && j.motorDamping > 0,
+                        "velocity joint \(i) requires kp=0 and kd>0")
+                }
+            }
             var g = JointGPU()
             let aIdx: UInt32 = j.bodyA >= 0 ? UInt32(j.bodyA) : 0xFFFFFFFF
             // Flag bits avoid inf comparisons under fast math:
@@ -687,12 +716,18 @@ public final class GPUSolver {
                 g.hingeAxis = SIMD4(axis, 1)
                 g.dynamics.x = j.armature
                 if j.motorTorque > 0 {
-                    let fixedPD = j.motorStiffness > 0
                     g.motor = SIMD4(j.motorTarget, j.motorTorque, 0,
-                                    fixedPD ? j.motorStiffness : 400)
+                                    j.motorStiffness)
                     g.limits = SIMD4(j.limitLo, j.limitHi,
-                                    max(j.motorDamping, 0), fixedPD ? 1 : 0)
-                    if j.motorRate != 0 { rateMotors.append((i, j.motorRate)) }
+                                    j.motorDamping, 0)
+                    switch j.motorMode {
+                    case .implicitPositionPD:
+                        g.header.w |= Self.jointMotorModeImplicitPositionPD
+                    case .explicitTorquePD:
+                        g.header.w |= Self.jointMotorModeExplicitTorquePD
+                    case .velocity:
+                        g.header.w |= Self.jointMotorModeVelocity
+                    }
                 }
                 if j.limitLo < j.limitHi && j.motorTorque == 0 {
                     g.limits = SIMD4(j.limitLo, j.limitHi, 0, 0)
@@ -730,7 +765,6 @@ public final class GPUSolver {
         }
         initialJointPenaltyLin = (0..<numJoints).map { jp[$0].penaltyLin }
         initialJointPenaltyAng = (0..<numJoints).map { jp[$0].penaltyAng }
-        initialJointMotorPenalty = (0..<numJoints).map { jp[$0].motor.w }
 
         // Springs (rest length resolved here if negative)
         let sp = springs.contents().bindMemory(to: SpringGPU.self, capacity: max(1, numSprings))
@@ -1561,6 +1595,7 @@ public final class GPUSolver {
         params.particleDamping = settings.particleDamping
         params.frame = UInt32(truncatingIfNeeded: frameIndex)
         params.frictionCombineMode = settings.frictionCombineMode.rawValue
+        params.collisionMargin = settings.collisionMargin
 
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
            let v = Float(env) {
@@ -1764,10 +1799,10 @@ public final class GPUSolver {
             // first post-reset prediction depend on the previous episode.
             pvl[u.body] = SIMD4(u.linearVelocity, 0)
         }
-        // A teleported episode must not inherit augmented-Lagrangian or motor
-        // impulses from its previous trajectory. Clear warm starts for every
+        // A teleported episode must not inherit augmented-Lagrangian state
+        // from its previous trajectory. Clear warm starts for every
         // constraint incident to a reset body while leaving other replicas'
-        // solver state untouched.
+        // solver state untouched. Motor gains are fixed scene data.
         let resetBodies = Set(updates.map { UInt32($0.body) })
         if numJoints > 0 {
             let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: numJoints)
@@ -1778,8 +1813,8 @@ public final class GPUSolver {
                     jp[i].lambdaLin = .zero
                     jp[i].lambdaAng = .zero
                     jp[i].motor.z = 0
-                    jp[i].motor.w = initialJointMotorPenalty[i]
                     jp[i].dynamics.y = 0
+                    jp[i].dynamics.z = 0
                     jp[i].penaltyLin = initialJointPenaltyLin[i]
                     jp[i].penaltyAng = initialJointPenaltyAng[i]
                 }
@@ -1837,6 +1872,19 @@ public final class GPUSolver {
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
         for u in updates {
             precondition(u.joint >= 0 && u.joint < numJoints, "joint index out of range")
+            precondition(u.angle.isFinite, "motor angle must be finite")
+            let mode = jp[u.joint].header.w & Self.jointMotorModeMask
+            // Dense robot action layouts may retain welded/disabled joints.
+            // Their commands are intentional no-ops, never an implicit
+            // request to create a motor after static coloring.
+            if mode == 0 {
+                precondition(jp[u.joint].motor.y == 0,
+                             "active motor is missing an authored mode")
+                continue
+            }
+            precondition(mode == Self.jointMotorModeImplicitPositionPD
+                || mode == Self.jointMotorModeExplicitTorquePD,
+                         "setMotorTargets requires a position-PD motor")
             jp[u.joint].motor.x = u.angle
         }
     }
@@ -1845,10 +1893,51 @@ public final class GPUSolver {
         setMotorTargets([MotorTargetUpdate(joint: jointIndex, angle: angle)])
     }
 
+    public struct MotorVelocityUpdate {
+        public var joint: Int
+        public var radiansPerSecond: Float
+
+        public init(joint: Int, radiansPerSecond: Float) {
+            self.joint = joint
+            self.radiansPerSecond = radiansPerSecond
+        }
+    }
+
+    /// Set commands for physically defined velocity motors.
+    public func setMotorVelocities(_ updates: [MotorVelocityUpdate]) {
+        guard !updates.isEmpty else { return }
+        sync()
+        let jp = joints.contents().bindMemory(
+            to: JointGPU.self, capacity: max(1, numJoints))
+        for update in updates {
+            precondition(update.joint >= 0 && update.joint < numJoints,
+                         "joint index out of range")
+            precondition(update.radiansPerSecond.isFinite,
+                         "motor velocity must be finite")
+            precondition((jp[update.joint].header.w
+                          & Self.jointMotorModeMask)
+                         == Self.jointMotorModeVelocity,
+                         "setMotorVelocities requires a velocity motor")
+            jp[update.joint].motor.x = update.radiansPerSecond
+        }
+    }
+
+    public func setMotorVelocity(_ jointIndex: Int,
+                                 radiansPerSecond: Float) {
+        setMotorVelocities([MotorVelocityUpdate(
+            joint: jointIndex, radiansPerSecond: radiansPerSecond)])
+    }
+
     /// Robotics: set a motor joint's torque limit at runtime.
     public func setMotorTorque(_ jointIndex: Int, torque: Float) {
+        precondition(torque >= 0 && torque.isFinite,
+                     "motor torque limit must be finite and nonnegative")
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
+        precondition(jointIndex >= 0 && jointIndex < numJoints,
+                     "joint index out of range")
+        precondition((jp[jointIndex].header.w & Self.jointMotorModeMask) != 0,
+                     "cannot enable a motor that was not authored in the scene")
         jp[jointIndex].motor.y = torque
     }
 
@@ -2442,6 +2531,7 @@ public final class GPUSolver {
             var doOgc: UInt32 = self.numTris > 0 ? 1 : 0
             e.setBytes(&doOgc, length: 4, index: 12)
             e.setBuffer(self.shape, offset: 0, index: 13)
+            e.setBuffer(self.gravityScale, offset: 0, index: 14)
         }
 
         stage("adjacency")
@@ -2785,6 +2875,7 @@ public final class GPUSolver {
             e.setBuffer(self.prevVelLin, offset: 0, index: 6)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
             e.setBuffer(self.shape, offset: 0, index: 8)
+            e.setBuffer(self.gravityScale, offset: 0, index: 9)
         }
         enc.endEncoding()
         var visc = settings.clothViscosity
@@ -2892,17 +2983,6 @@ public final class GPUSolver {
 
     /// Advance kinematic spinners (static bodies with prescribed rotation).
     private func advanceSpinners() {
-        // velocity motors: advance the bounded-torque servo target (wrapped;
-        // the motor constraint wraps its error the same way)
-        if !rateMotors.isEmpty {
-            let jp = joints.contents().bindMemory(to: JointGPU.self,
-                                                  capacity: max(1, numJoints))
-            for (ji, rate) in rateMotors {
-                var t = jp[ji].motor.x + rate * settings.dt
-                t -= (2 * Float.pi) * (t / (2 * .pi)).rounded()
-                jp[ji].motor.x = t
-            }
-        }
         guard !spinners.isEmpty else { return }
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         for sp in spinners {

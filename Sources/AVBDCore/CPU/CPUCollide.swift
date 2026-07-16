@@ -274,52 +274,81 @@ extension CPUManifold {
     /// Shape-dispatching collision. Returns contact count; fills basis
     /// (rows n, t1, t2) with the normal pointing from B toward A.
     static func collide(_ bodyA: CPURigid, _ bodyB: CPURigid,
+                        margin: Float = AVBDConstants.collisionMargin,
                         _ contacts: inout [ContactPoint],
                         _ basisOut: inout (F3, F3, F3)) -> Int {
         switch (bodyA.shape, bodyB.shape) {
         case (.sphere, .sphere):
-            return collideSphereSphere(bodyA, bodyB, &contacts, &basisOut)
+            return collideSphereSphere(
+                bodyA, bodyB, margin: margin, &contacts, &basisOut)
         case (.sphere, .box):
-            return collideSphereBox(bodyA, bodyB, sphereIsA: true, &contacts, &basisOut)
+            return collideSphereBox(
+                bodyA, bodyB, sphereIsA: true, margin: margin,
+                &contacts, &basisOut)
         case (.box, .sphere):
-            return collideSphereBox(bodyB, bodyA, sphereIsA: false, &contacts, &basisOut)
+            return collideSphereBox(
+                bodyB, bodyA, sphereIsA: false, margin: margin,
+                &contacts, &basisOut)
         case (.box, .box):
             return collideBoxBox(bodyA, bodyB, &contacts, &basisOut)
         case (.torus, .sphere):
-            return collideTorusSphere(bodyA, bodyB, torusIsA: true, &contacts, &basisOut)
+            return collideTorusSphere(
+                bodyA, bodyB, torusIsA: true, margin: margin,
+                &contacts, &basisOut)
         case (.sphere, .torus):
-            return collideTorusSphere(bodyB, bodyA, torusIsA: false, &contacts, &basisOut)
+            return collideTorusSphere(
+                bodyB, bodyA, torusIsA: false, margin: margin,
+                &contacts, &basisOut)
         case (.torus, .box):
-            return collideTorusBox(bodyA, bodyB, torusIsA: true, &contacts, &basisOut)
+            return collideTorusBox(
+                bodyA, bodyB, torusIsA: true, margin: margin,
+                &contacts, &basisOut)
         case (.box, .torus):
-            return collideTorusBox(bodyB, bodyA, torusIsA: false, &contacts, &basisOut)
+            return collideTorusBox(
+                bodyB, bodyA, torusIsA: false, margin: margin,
+                &contacts, &basisOut)
         case (.torus, .torus):
-            return collideTorusTorus(bodyA, bodyB, &contacts, &basisOut)
+            return collideTorusTorus(
+                bodyA, bodyB, margin: margin, &contacts, &basisOut)
         case (.capsule, .sphere):
-            return collideCapsuleSphere(bodyA, bodyB, capsuleIsA: true, &contacts, &basisOut)
+            return collideCapsuleSphere(
+                bodyA, bodyB, capsuleIsA: true, margin: margin,
+                &contacts, &basisOut)
         case (.sphere, .capsule):
-            return collideCapsuleSphere(bodyB, bodyA, capsuleIsA: false, &contacts, &basisOut)
+            return collideCapsuleSphere(
+                bodyB, bodyA, capsuleIsA: false, margin: margin,
+                &contacts, &basisOut)
         case (.capsule, .box):
-            return collideCapsuleBox(bodyA, bodyB, capsuleIsA: true, &contacts, &basisOut)
+            return collideCapsuleBox(
+                bodyA, bodyB, capsuleIsA: true, margin: margin,
+                &contacts, &basisOut)
         case (.box, .capsule):
-            return collideCapsuleBox(bodyB, bodyA, capsuleIsA: false, &contacts, &basisOut)
+            return collideCapsuleBox(
+                bodyB, bodyA, capsuleIsA: false, margin: margin,
+                &contacts, &basisOut)
         case (.capsule, .capsule):
-            return collideCapsuleCapsule(bodyA, bodyB, &contacts, &basisOut)
+            return collideCapsuleCapsule(
+                bodyA, bodyB, margin: margin, &contacts, &basisOut)
         case (.torus, .capsule):
-            return collideTorusCapsule(bodyA, bodyB, torusIsA: true, &contacts, &basisOut)
+            return collideTorusCapsule(
+                bodyA, bodyB, torusIsA: true, margin: margin,
+                &contacts, &basisOut)
         case (.capsule, .torus):
-            return collideTorusCapsule(bodyB, bodyA, torusIsA: false, &contacts, &basisOut)
+            return collideTorusCapsule(
+                bodyB, bodyA, torusIsA: false, margin: margin,
+                &contacts, &basisOut)
         }
     }
 
     static func collideSphereSphere(_ a: CPURigid, _ b: CPURigid,
+                                    margin: Float,
                                     _ contacts: inout [ContactPoint],
                                     _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
         let rA = a.size.x / 2, rB = b.size.x / 2
         let d = a.positionLin - b.positionLin
         let dist = length(d)
-        if dist > rA + rB + AVBDConstants.collisionMargin { return 0 }
+        if dist > rA + rB + margin { return 0 }
         let n = dist > 1e-9 ? d / dist : F3(0, 0, 1)   // B -> A
         basisOut = orthonormalBasis(n)
         var c = ContactPoint()
@@ -334,7 +363,8 @@ extension CPUManifold {
     }
 
     /// sphere vs box; `sphereIsA` says whether the sphere is manifold body A.
-    static func collideSphereBox(_ sphere: CPURigid, _ box: CPURigid, sphereIsA: Bool,
+    static func collideSphereBox(_ sphere: CPURigid, _ box: CPURigid,
+                                 sphereIsA: Bool, margin: Float,
                                  _ contacts: inout [ContactPoint],
                                  _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -360,7 +390,7 @@ extension CPUManifold {
         } else {
             let d = local - clamped
             let dist = length(d)
-            if dist > r + AVBDConstants.collisionMargin { return 0 }
+            if dist > r + margin { return 0 }
             nLocal = d / max(dist, 1e-9)
             qLocal = clamped
         }
@@ -449,7 +479,8 @@ private func projectToSpine(_ p: F3, _ R: Float) -> F3 {
 
 extension CPUManifold {
     /// Exact torus-sphere: project sphere center onto spine; tube vs sphere.
-    static func collideTorusSphere(_ torus: CPURigid, _ sphere: CPURigid, torusIsA: Bool,
+    static func collideTorusSphere(_ torus: CPURigid, _ sphere: CPURigid,
+                                   torusIsA: Bool, margin: Float,
                                    _ contacts: inout [ContactPoint],
                                    _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -460,7 +491,7 @@ extension CPUManifold {
         let spine = projectToSpine(local, R)
         let d = local - spine
         let dist = length(d)
-        if dist > r + rs + AVBDConstants.collisionMargin { return 0 }
+        if dist > r + rs + margin { return 0 }
         let nLocal = dist > 1e-6 ? d / dist : F3(0, 0, 1)
         let nW = torus.positionAng.act(nLocal)          // torus -> sphere
         let xTorus = torus.positionLin + torus.positionAng.act(spine + nLocal * r)
@@ -482,7 +513,8 @@ extension CPUManifold {
     /// Torus-box via alternating projection: seed points around the spine,
     /// project box<->spine until converged; keep up to 4 distinct contacts
     /// (a torus resting flat on a box needs a multi-point base).
-    static func collideTorusBox(_ torus: CPURigid, _ box: CPURigid, torusIsA: Bool,
+    static func collideTorusBox(_ torus: CPURigid, _ box: CPURigid,
+                                torusIsA: Bool, margin: Float,
                                 _ contacts: inout [ContactPoint],
                                 _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -530,7 +562,7 @@ extension CPUManifold {
                 n = d / dist
             }
             bestSep = min(bestSep, dist - r)
-            if dist - r > AVBDConstants.collisionMargin { continue }
+            if dist - r > margin { continue }
             // dedup by spine point
             if found.contains(where: { length($0.q - q) < 0.25 * R }) { continue }
             if found.count < 4 { found.append((q, b, n, dist)) }
@@ -568,6 +600,7 @@ extension CPUManifold {
     /// Torus-torus: alternating projection between the two spine circles
     /// from several seeds; multiple contacts support interlocked rings.
     static func collideTorusTorus(_ a: CPURigid, _ b: CPURigid,
+                                  margin: Float,
                                   _ contacts: inout [ContactPoint],
                                   _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -605,7 +638,7 @@ extension CPUManifold {
                 qb = projB(qa)
                 qa = projA(qb)
             }
-            if length(qa - qb) > ra + rb + AVBDConstants.collisionMargin { continue }
+            if length(qa - qb) > ra + rb + margin { continue }
             if found.contains(where: { length($0.pa - qa) < 0.25 * Ra }) { continue }
             if found.count < 4 { found.append((qa, qb)) }
         }
@@ -661,7 +694,8 @@ extension CPUManifold {
                            : x - body.positionLin
     }
 
-    static func collideCapsuleSphere(_ cap: CPURigid, _ sph: CPURigid, capsuleIsA: Bool,
+    static func collideCapsuleSphere(_ cap: CPURigid, _ sph: CPURigid,
+                                     capsuleIsA: Bool, margin: Float,
                                      _ contacts: inout [ContactPoint],
                                      _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -670,7 +704,7 @@ extension CPUManifold {
         let q = closestOnSegment(sph.positionLin, p0, p1)
         let d = sph.positionLin - q
         let dist = length(d)
-        if dist > rc + rs + AVBDConstants.collisionMargin { return 0 }
+        if dist > rc + rs + margin { return 0 }
         let nCS = dist > 1e-6 ? d / dist : F3(0, 0, 1)   // capsule -> sphere
         let n = capsuleIsA ? -nCS : nCS                   // B -> A
         basisOut = orthonormalBasis(n)
@@ -685,7 +719,8 @@ extension CPUManifold {
         return 1
     }
 
-    static func collideCapsuleBox(_ cap: CPURigid, _ box: CPURigid, capsuleIsA: Bool,
+    static func collideCapsuleBox(_ cap: CPURigid, _ box: CPURigid,
+                                  capsuleIsA: Bool, margin: Float,
                                   _ contacts: inout [ContactPoint],
                                   _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -717,7 +752,7 @@ extension CPUManifold {
                 bw = q + n * pen[axisI]
                 dist = 0
             } else {
-                if dist - rc > AVBDConstants.collisionMargin { continue }
+                if dist - rc > margin { continue }
                 n = d / dist
             }
             if found.contains(where: { length($0.q - q) < 0.3 * rc + 0.05 }) { continue }
@@ -741,6 +776,7 @@ extension CPUManifold {
     }
 
     static func collideCapsuleCapsule(_ a: CPURigid, _ b: CPURigid,
+                                      margin: Float,
                                       _ contacts: inout [ContactPoint],
                                       _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -749,7 +785,7 @@ extension CPUManifold {
         let (pa, pb) = closestPointsOnSegments(a0, a1, b0, b1)
         let d = pa - pb
         let dist = length(d)
-        if dist > ra + rb + AVBDConstants.collisionMargin { return 0 }
+        if dist > ra + rb + margin { return 0 }
         let n = dist > 1e-6 ? d / dist : F3(0, 0, 1)   // B -> A
         basisOut = orthonormalBasis(n)
         var c = ContactPoint()
@@ -761,7 +797,8 @@ extension CPUManifold {
 
     /// Torus spine sampled against the capsule segment (exact per sample) —
     /// the round-on-round bearing pair.
-    static func collideTorusCapsule(_ torus: CPURigid, _ cap: CPURigid, torusIsA: Bool,
+    static func collideTorusCapsule(_ torus: CPURigid, _ cap: CPURigid,
+                                    torusIsA: Bool, margin: Float,
                                     _ contacts: inout [ContactPoint],
                                     _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -781,7 +818,7 @@ extension CPUManifold {
             let b = closestOnSegment(q, p0, p1)
             let dist = length(q - b)
             if best == nil || dist < best!.dist { best = (q, b, dist) }
-            if dist - rt - rc > AVBDConstants.collisionMargin { continue }
+            if dist - rt - rc > margin { continue }
             if found.contains(where: { length($0.q - q) < 0.35 * R }) { continue }
             if found.count < 4 { found.append((q, b)) }
         }
