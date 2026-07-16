@@ -29,6 +29,19 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             case .arachneGoal: return "arachne15-goal-v0"
             }
         }
+
+        init?(taskID: String) {
+            switch taskID {
+            case "humanoid-isaac-flat-v0": self = .humanoidIsaac
+            case "humanoid-isaac-goal-v0": self = .humanoidIsaacGoal
+            case "humanoid-walk-v0": self = .humanoidWalk
+            case "humanoid-goal-v0": self = .humanoidGoal
+            case "arm-pusht-v0": self = .arm
+            case "arachne15-velocity-v0": self = .arachne
+            case "arachne15-goal-v0": self = .arachneGoal
+            default: return nil
+            }
+        }
     }
     enum CameraMode: String, CaseIterable {
         case follow = "Follow Robot"
@@ -40,18 +53,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let requestedTask = environment["AVBD_REPLAY_TASK"]
             ?? UserDefaults.standard.string(
                 forKey: "AVBDPolicyReplaySelectedTask")
-        switch requestedTask {
-        case "humanoid-isaac-goal-v0": return .humanoidIsaacGoal
-        case "humanoid-walk-v0": return .humanoidWalk
-        case "humanoid-goal-v0": return .humanoidGoal
-        case "arm-pusht-v0": return .arm
-        case "arachne15-velocity-v0": return .arachne
-        case "arachne15-goal-v0": return .arachneGoal
-        case "humanoid-isaac-flat-v0": return .humanoidIsaac
-        default:
-            return environment["AVBD_REPLAY_ROBOT"] == "arm"
-                ? .arm : .humanoidIsaac
-        }
+        return requestedTask.flatMap(Robot.init(taskID:))
+            ?? (environment["AVBD_REPLAY_ROBOT"] == "arm"
+                ? .arm : .humanoidIsaac)
     }() {
         didSet {
             UserDefaults.standard.set(
@@ -163,7 +167,21 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         return arachne?.environment.solver
     }
 
-    init() { rebuild() }
+    init() {
+        // An explicit checkpoint is authoritative. This prevents persisted UI
+        // selection/restoration from constructing a different task and then
+        // rejecting the requested policy as incompatible.
+        if let path = ProcessInfo.processInfo.environment[
+                "AVBD_REPLAY_CHECKPOINT"],
+           let data = try? Data(contentsOf: URL(fileURLWithPath: path)
+                .appendingPathComponent("metadata.json")),
+           let metadata = try? JSONDecoder().decode(
+                VectorPolicyMetadata.self, from: data),
+           let checkpointRobot = Robot(taskID: metadata.task) {
+            robot = checkpointRobot
+        }
+        rebuild()
+    }
 
     func rebuild() {
         isaacHumanoid = nil; humanoid = nil; arm = nil; arachne = nil
@@ -188,11 +206,21 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let checkpointMetadata = configurationPaths.lazy.compactMap {
                 self.replayMetadata(at: $0, task: desiredTaskID)
             }.first
+            var replayOptions = checkpointMetadata?.taskConfiguration ?? [:]
+            if let checkpointMetadata {
+                // These shape the task but live in the checkpoint's structural
+                // metadata rather than taskConfiguration. Restore them before
+                // constructing replay so non-default curricula load exactly.
+                replayOptions["maxEpisodeSteps"] =
+                    Float(checkpointMetadata.maxEpisodeSteps)
+                replayOptions["controlDecimation"] =
+                    Float(checkpointMetadata.controlDecimation)
+            }
             let configuredTask = try BuiltInRLTasks.registry.make(
                 desiredTaskID,
                 configuration: RLTaskConfiguration(
                     numEnvironments: 1, seed: 21_001, autoReset: false,
-                    options: checkpointMetadata?.taskConfiguration ?? [:]))
+                    options: replayOptions))
             isaacHumanoid = configuredTask as? HumanoidIsaacVelocityTask
             humanoid = configuredTask as? HumanoidWalkTask
             arm = configuredTask as? ArmPushTTask
@@ -426,6 +454,19 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             return
         }
         newestUpdate = candidate.completedUpdates
+        if runner == nil,
+           let metadata = replayMetadata(
+                at: candidate.directory, task: task.spec.id),
+           metadata.taskConfiguration != task.spec.configurationValues
+                || metadata.maxEpisodeSteps != task.spec.maxEpisodeSteps
+                || metadata.controlDecimation != task.spec.controlDecimation {
+            // The viewer may launch before a new trainer has written its
+            // metadata. Rebuild once from the first atomic checkpoint rather
+            // than rejecting later checkpoints against provisional default
+            // task options or structural horizon settings.
+            rebuild()
+            return
+        }
         guard force || (autoLoadLatest
             && candidate.directory != loadedCheckpointDirectory
             && candidate.completedUpdates > (loadedUpdate ?? -1)) else { return }
@@ -443,20 +484,55 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     ) throws {
         guard let task else { return }
         let loaded = try VectorPolicyRunner(checkpointDirectory: path)
-        let taskConfigurationMatches = loaded.metadata.taskConfiguration.map {
-            $0 == task.spec.configurationValues
-        } ?? true
-        guard loaded.metadata.task == task.spec.id,
-              (loaded.metadata.taskRevision ?? 1) == task.spec.revision,
-              taskConfigurationMatches,
-              loaded.metadata.observationDimension
-                == task.spec.observation.elementCount,
-              loaded.metadata.actionDimension == task.spec.action.elementCount,
-              loaded.metadata.simulationStep == task.spec.simulationStep,
-              loaded.metadata.controlDecimation == task.spec.controlDecimation,
-              loaded.metadata.maxEpisodeSteps == task.spec.maxEpisodeSteps else {
+        var mismatches = [String]()
+        if loaded.metadata.task != task.spec.id {
+            mismatches.append("task \(loaded.metadata.task) != \(task.spec.id)")
+        }
+        if (loaded.metadata.taskRevision ?? 1) != task.spec.revision {
+            mismatches.append(
+                "revision \(loaded.metadata.taskRevision ?? 1) != \(task.spec.revision)")
+        }
+        if let saved = loaded.metadata.taskConfiguration,
+           saved != task.spec.configurationValues {
+            let keys = Set(saved.keys).union(task.spec.configurationValues.keys)
+            let differences = keys.sorted().compactMap { key -> String? in
+                let checkpointValue = saved[key]
+                let replayValue = task.spec.configurationValues[key]
+                guard checkpointValue != replayValue else { return nil }
+                return "\(key)=\(checkpointValue.map { String($0) } ?? "missing")/"
+                    + "\(replayValue.map { String($0) } ?? "missing")"
+            }
+            mismatches.append("configuration [\(differences.joined(separator: ", "))]")
+        }
+        if loaded.metadata.observationDimension
+            != task.spec.observation.elementCount {
+            mismatches.append(
+                "observations \(loaded.metadata.observationDimension) != "
+                    + "\(task.spec.observation.elementCount)")
+        }
+        if loaded.metadata.actionDimension != task.spec.action.elementCount {
+            mismatches.append(
+                "actions \(loaded.metadata.actionDimension) != "
+                    + "\(task.spec.action.elementCount)")
+        }
+        if loaded.metadata.simulationStep != task.spec.simulationStep {
+            mismatches.append(
+                "simulation step \(loaded.metadata.simulationStep) != "
+                    + "\(task.spec.simulationStep)")
+        }
+        if loaded.metadata.controlDecimation != task.spec.controlDecimation {
+            mismatches.append(
+                "control decimation \(loaded.metadata.controlDecimation) != "
+                    + "\(task.spec.controlDecimation)")
+        }
+        if loaded.metadata.maxEpisodeSteps != task.spec.maxEpisodeSteps {
+            mismatches.append(
+                "episode steps \(loaded.metadata.maxEpisodeSteps) != "
+                    + "\(task.spec.maxEpisodeSteps)")
+        }
+        guard mismatches.isEmpty else {
             throw RLEnvironmentError.invalidConfiguration(
-                "checkpoint/task tensor mismatch")
+                "checkpoint/task mismatch: \(mismatches.joined(separator: "; "))")
         }
         runner = loaded
         loadedCheckpointDirectory = path

@@ -29,8 +29,20 @@ HIP_Z = 0.022
 COXA_LENGTH = 0.050
 TIBIA_LENGTH = 0.105
 TIBIA_PITCH = math.radians(65.0)
-FOOT_RADIUS = 0.0045
-ROOT_WORLD_Z = FOOT_RADIUS + TIBIA_LENGTH * math.sin(TIBIA_PITCH) - HIP_Z
+# Conservative half-extents of the printable TPU pad. The previous spherical
+# contact represented only its thickness; when the tibia pitched, the much
+# longer pad visibly passed through the floor. An oriented box preserves the
+# physical support envelope and remains deterministic and GPU-friendly.
+FOOT_HALF_SIZE = (0.00875, 0.00700, 0.00400)
+FOOT_VERTICAL_SUPPORT = (
+    FOOT_HALF_SIZE[0] * math.sin(TIBIA_PITCH)
+    + FOOT_HALF_SIZE[2] * math.cos(TIBIA_PITCH)
+)
+ROOT_WORLD_Z = (
+    FOOT_VERTICAL_SUPPORT
+    + TIBIA_LENGTH * math.sin(TIBIA_PITCH)
+    - HIP_Z
+)
 
 PHONE_SIZE = (0.00825, 0.14660, 0.07060)
 PHONE_CENTER = (0.0, 0.0, 0.002 + PHONE_SIZE[2] / 2)
@@ -226,7 +238,8 @@ def leg_xml(x_index: int, side: int) -> list[str]:
         f'    <geom name="{prefix}_tibia_collision" class="footprint_collision" '
         f'type="capsule" size="0.0055" fromto="0.008 0 0 {fmt(TIBIA_LENGTH)} 0 0"/>',
         f'    <geom name="{prefix}_foot_collision" class="foot_collision" '
-        f'type="sphere" size="{fmt(FOOT_RADIUS)}" pos="{fmt((TIBIA_LENGTH, 0, 0))}"/>',
+        f'type="box" size="{fmt(FOOT_HALF_SIZE)}" '
+        f'pos="{fmt((TIBIA_LENGTH, 0, 0))}"/>',
         "  </body>",
         "</body>",
     ]

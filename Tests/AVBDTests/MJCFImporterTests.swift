@@ -32,6 +32,16 @@ final class MJCFImporterTests: XCTestCase {
         XCTAssertTrue(trainingScene.colliders.filter(\.collisionEnabled)
             .allSatisfy { $0.collisionGroup == 7 && !$0.isRendered })
         XCTAssertEqual(imported.actuatorJoints.count, 16)
+        for name in training.bodyNames where name.hasSuffix("_tibia") {
+            let body = try XCTUnwrap(imported.bodiesByName[name])
+            let foot = try XCTUnwrap(trainingScene.colliders.first {
+                $0.body == body && $0.collisionEnabled && $0.shape == .box
+                    && abs($0.friction - 0.9) < 1e-6
+            })
+            XCTAssertEqual(foot.size.x, 0.0175, accuracy: 1e-7)
+            XCTAssertEqual(foot.size.y, 0.0140, accuracy: 1e-7)
+            XCTAssertEqual(foot.size.z, 0.0080, accuracy: 1e-7)
+        }
 
         var validationScene = PhysicsScene(name: "arachne-validation")
         _ = try validation.instantiate(in: &validationScene)

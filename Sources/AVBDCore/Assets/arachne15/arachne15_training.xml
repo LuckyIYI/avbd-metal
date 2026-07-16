@@ -33,7 +33,7 @@
   </asset>
   <worldbody>
     <geom name="floor" type="plane" size="2 2 0.05" friction="0.9 0.01 0.0002"/>
-    <body name="base" pos="0 0 0.0776623176">
+    <body name="base" pos="0 0 0.0827829838">
       <freejoint/>
       <inertial pos="-0.00114203123 -2.62049155e-19 0.00559625308" mass="0.82748" diaginertia="0.00344118531 0.00132602737 0.00387924709"/>
       <geom name="chassis_visual" class="visual" type="mesh" mesh="chassis_visual"/>
@@ -72,7 +72,7 @@
           <geom name="right_rear_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="right_rear_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="right_rear_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="right_rear_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="right_rear_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
       <body name="right_mid_rear_coxa" pos="-0.024 -0.092 0.022" quat="0.573576436 0 0 -0.819152044">
@@ -88,7 +88,7 @@
           <geom name="right_mid_rear_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="right_mid_rear_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="right_mid_rear_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="right_mid_rear_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="right_mid_rear_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
       <body name="right_mid_front_coxa" pos="0.024 -0.092 0.022" quat="0.819152044 0 0 -0.573576436">
@@ -104,7 +104,7 @@
           <geom name="right_mid_front_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="right_mid_front_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="right_mid_front_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="right_mid_front_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="right_mid_front_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
       <body name="right_front_coxa" pos="0.06 -0.092 0.022" quat="0.939692621 0 0 -0.342020143">
@@ -120,7 +120,7 @@
           <geom name="right_front_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="right_front_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="right_front_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="right_front_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="right_front_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
       <body name="left_rear_coxa" pos="-0.06 0.092 0.022" quat="0.342020143 0 0 0.939692621">
@@ -136,7 +136,7 @@
           <geom name="left_rear_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="left_rear_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="left_rear_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="left_rear_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="left_rear_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
       <body name="left_mid_rear_coxa" pos="-0.024 0.092 0.022" quat="0.573576436 0 0 0.819152044">
@@ -152,7 +152,7 @@
           <geom name="left_mid_rear_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="left_mid_rear_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="left_mid_rear_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="left_mid_rear_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="left_mid_rear_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
       <body name="left_mid_front_coxa" pos="0.024 0.092 0.022" quat="0.819152044 0 0 0.573576436">
@@ -168,7 +168,7 @@
           <geom name="left_mid_front_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="left_mid_front_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="left_mid_front_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="left_mid_front_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="left_mid_front_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
       <body name="left_front_coxa" pos="0.06 0.092 0.022" quat="0.939692621 0 0 0.342020143">
@@ -184,7 +184,7 @@
           <geom name="left_front_tibia_visual" class="visual" type="mesh" mesh="tibia_visual" pos="0 0 -0.0045"/>
           <geom name="left_front_foot_visual" class="visual" type="mesh" mesh="foot_visual" pos="0.105 0 0"/>
           <geom name="left_front_tibia_collision" class="footprint_collision" type="capsule" size="0.0055" fromto="0.008 0 0 0.105 0 0"/>
-          <geom name="left_front_foot_collision" class="foot_collision" type="sphere" size="0.0045" pos="0.105 0 0"/>
+          <geom name="left_front_foot_collision" class="foot_collision" type="box" size="0.00875 0.007 0.004" pos="0.105 0 0"/>
         </body>
       </body>
     </body>

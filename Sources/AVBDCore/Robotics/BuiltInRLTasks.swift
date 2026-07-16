@@ -131,6 +131,7 @@ public enum BuiltInRLTasks {
         "goalBoundaryCommandSpeed", "maximumGoalArrivalSpeed",
         "goalDwellSteps", "goalProgressRewardWeight",
         "goalStableRewardWeight", "goalSuccessBonus",
+        "commandProgressRewardWeight", "velocityErrorPenaltyWeight",
         "massScaleLower", "massScaleUpper",
         "inertiaScaleLower", "inertiaScaleUpper",
         "frictionScaleLower", "frictionScaleUpper",
@@ -223,6 +224,10 @@ public enum BuiltInRLTasks {
             goalStableRewardWeight:
                 cfg.options["goalStableRewardWeight"] ?? 0.5,
             goalSuccessBonus: cfg.options["goalSuccessBonus"] ?? 5.0,
+            commandProgressRewardWeight:
+                cfg.options["commandProgressRewardWeight"] ?? 8.0,
+            velocityErrorPenaltyWeight:
+                cfg.options["velocityErrorPenaltyWeight"] ?? 2.0,
             autoReset: cfg.autoReset)
     }
 

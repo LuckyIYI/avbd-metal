@@ -5,8 +5,11 @@ but visual and collision geometry deliberately have different jobs:
 
 - Generated printable STLs are scaled from millimetres to metres and used only
   for rendering.
-- Collision is an authored union of boxes, capsules, and spheres per rigid
+- Collision is an authored union of boxes and capsules per rigid
   link. No dynamic link collides as a raw triangle mesh.
+- Each TPU foot uses an oriented 17.5 × 14 × 8 mm box contact matching its
+  printable support envelope. This prevents tilted feet or tibia tips from
+  rendering below the floor while retaining primitive-only batched contact.
 - Every body has explicit mass, centre of mass, and diagonal inertia. The
   initial values come from the design mass budget and component envelopes;
   measured assembled-link values must replace them after fabrication.
@@ -44,6 +47,9 @@ need no spider-specific learner code. The policy contract is:
 - action `[16]`: bounded joint-position offsets in MJCF actuator order;
 - 2 ms physics with decimation 10 (50 Hz policy control);
 - eight physical foot contacts, no gait clock and no reference trajectory;
+- command-direction progress from measured root displacement, capped at the
+  commanded displacement per step and paired with velocity tracking, so
+  neither standing nor overspeed can maximize locomotion reward;
 - distinct termination/time-limit signals, decomposed metrics, terminal
   observations, and a task-owned held-out evaluation gate.
 

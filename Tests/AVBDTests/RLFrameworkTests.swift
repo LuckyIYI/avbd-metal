@@ -27,6 +27,12 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testArachneRegisteredTaskIsBatchedAndLoadBearing() throws {
+        XCTAssertEqual(Arachne15LocomotionTask.creditedCommandProgress(
+            measured: 0.02, commandSpeed: 0.15, controlStep: 0.02),
+            0.003, accuracy: 1e-7)
+        XCTAssertEqual(Arachne15LocomotionTask.creditedCommandProgress(
+            measured: -0.01, commandSpeed: 0.15, controlStep: 0.02),
+            -0.01, accuracy: 1e-7)
         let registered = try BuiltInRLTasks.registry.make(
             "arachne15-velocity-v0",
             configuration: RLTaskConfiguration(
@@ -44,6 +50,17 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(task.spec.action.shape, [16])
         XCTAssertEqual(task.spec.simulationStep, 0.002, accuracy: 1e-7)
         XCTAssertEqual(task.spec.controlStep, 0.02, accuracy: 1e-7)
+        for key in [
+            "massScaleLower", "massScaleUpper",
+            "inertiaScaleLower", "inertiaScaleUpper",
+            "frictionScaleLower", "frictionScaleUpper",
+            "motorTorqueScaleLower", "motorTorqueScaleUpper",
+            "motorStiffnessScaleLower", "motorStiffnessScaleUpper",
+            "motorDampingScaleLower", "motorDampingScaleUpper",
+            "armatureScaleLower", "armatureScaleUpper",
+        ] {
+            XCTAssertEqual(task.spec.configurationValues[key], 1, key)
+        }
         XCTAssertEqual(task.environment.refs.count, 8)
         XCTAssertEqual(task.environment.scene.rigidMeshes.count, 0,
                        "large headless batches must not replicate CAD meshes")
@@ -160,6 +177,8 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertTrue(result.observations.policy.allSatisfy(\.isFinite))
         XCTAssertNotNil(result.metrics["state/goal_distance_m"])
         XCTAssertNotNil(result.metrics["reward/goal_progress"])
+        XCTAssertNotNil(result.metrics["reward/command_progress"])
+        XCTAssertNotNil(result.metrics["state/command_progress_m"])
 
         let replayTask = try BuiltInRLTasks.registry.make(
             "arachne15-goal-v0",

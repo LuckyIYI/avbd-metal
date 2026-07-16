@@ -76,10 +76,19 @@ def validate(path: Path, expected_profile: str) -> dict:
         assert math.isclose(low, -model.DESIGN_TORQUE, abs_tol=1e-9)
         assert math.isclose(high, model.DESIGN_TORQUE, abs_tol=1e-9)
 
+    foot_colliders = [
+        geom for geom in collision_geoms
+        if geom.attrib.get("name", "").endswith("_foot_collision")
+    ]
+    assert len(foot_colliders) == 8
+    for geom in foot_colliders:
+        assert geom.attrib["type"] == "box"
+        assert floats(geom.attrib["size"]) == list(model.FOOT_HALF_SIZE)
+
     foot_bottom = (
         model.ROOT_WORLD_Z + model.HIP_Z
         - model.TIBIA_LENGTH * math.sin(model.TIBIA_PITCH)
-        - model.FOOT_RADIUS
+        - model.FOOT_VERTICAL_SUPPORT
     )
     assert abs(foot_bottom) < 1e-10, foot_bottom
 

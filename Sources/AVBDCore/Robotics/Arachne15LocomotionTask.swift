@@ -29,6 +29,8 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
     public var goalProgressRewardWeight: Float
     public var goalStableRewardWeight: Float
     public var goalSuccessBonus: Float
+    public var commandProgressRewardWeight: Float
+    public var velocityErrorPenaltyWeight: Float
     public var autoReset: Bool
 
     public init(
@@ -59,6 +61,8 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
         goalProgressRewardWeight: Float = 2.0,
         goalStableRewardWeight: Float = 0.5,
         goalSuccessBonus: Float = 5.0,
+        commandProgressRewardWeight: Float = 8.0,
+        velocityErrorPenaltyWeight: Float = 2.0,
         autoReset: Bool = true
     ) {
         self.numEnvironments = numEnvironments
@@ -89,6 +93,8 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
         self.goalProgressRewardWeight = goalProgressRewardWeight
         self.goalStableRewardWeight = goalStableRewardWeight
         self.goalSuccessBonus = goalSuccessBonus
+        self.commandProgressRewardWeight = commandProgressRewardWeight
+        self.velocityErrorPenaltyWeight = velocityErrorPenaltyWeight
         self.autoReset = autoReset
     }
 }
@@ -439,6 +445,14 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     private var minimumGoalDistances: [Float]
     private var goalDwellCounts: [Int]
     private var enteredGoals: [Bool]
+    private var previousRootPositions: [F3]
+    private var commandProgressSums: [Float]
+
+    static func creditedCommandProgress(
+        measured: Float, commandSpeed: Float, controlStep: Float
+    ) -> Float {
+        min(measured, commandSpeed * controlStep)
+    }
     private var resetRNG: SplitMix64
 
     public init(configuration: Arachne15LocomotionTaskConfig,
@@ -478,7 +492,9 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 && configuration.goalDwellSteps > 0
                 && configuration.goalProgressRewardWeight >= 0
                 && configuration.goalStableRewardWeight >= 0
-                && configuration.goalSuccessBonus >= 0) else {
+                && configuration.goalSuccessBonus >= 0),
+              configuration.commandProgressRewardWeight >= 0,
+              configuration.velocityErrorPenaltyWeight >= 0 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "invalid Arachne locomotion configuration")
         }
@@ -493,7 +509,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         self.configuration = configuration
         let d = configuration.domainRandomization
         spec = RLTaskSpec(
-            id: taskID, revision: 1,
+            id: taskID, revision: 4,
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),
@@ -535,6 +551,10 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 "goalStableRewardWeight":
                     configuration.goalStableRewardWeight,
                 "goalSuccessBonus": configuration.goalSuccessBonus,
+                "commandProgressRewardWeight":
+                    configuration.commandProgressRewardWeight,
+                "velocityErrorPenaltyWeight":
+                    configuration.velocityErrorPenaltyWeight,
                 "massScaleLower": d.mass.lowerBound,
                 "massScaleUpper": d.mass.upperBound,
                 "inertiaScaleLower": d.inertia.lowerBound,
@@ -577,6 +597,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         minimumGoalDistances = [Float](repeating: 0, count: n)
         goalDwellCounts = [Int](repeating: 0, count: n)
         enteredGoals = [Bool](repeating: false, count: n)
+        previousRootPositions = [F3](repeating: .zero, count: n)
+        commandProgressSums = [Float](repeating: 0, count: n)
         resetRNG = SplitMix64(seed: configuration.seed ^ 0xE7037ED1A0B428DB)
 
         let ids = Array(0..<n)
@@ -698,6 +720,10 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         var episodeYawRMSEMetric = ContiguousArray(repeating: Float(0), count: n)
         var goalProgressReward = ContiguousArray(repeating: Float(0), count: n)
         var goalStableReward = ContiguousArray(repeating: Float(0), count: n)
+        var commandProgressReward = ContiguousArray(
+            repeating: Float(0), count: n)
+        var commandProgressMetric = ContiguousArray(
+            repeating: Float(0), count: n)
         var goalDistanceMetric = ContiguousArray(repeating: Float(0), count: n)
         var minimumGoalDistanceMetric = ContiguousArray(
             repeating: Float(0), count: n)
@@ -714,6 +740,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             repeating: Float(0), count: n)
         var episodeArrivalSpeedMetric = ContiguousArray(
             repeating: Float(0), count: n)
+        var episodeCommandProgressMetric = ContiguousArray(
+            repeating: Float(0), count: n)
         var resetIDs: [Int] = []
         var resetSeeds: [UInt64] = []
 
@@ -728,6 +756,29 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                                            localVelocity.y - command.y)
             let linearErrorSquared = simd_length_squared(linearError)
             let yawError = localAngularVelocity.z - command.z
+            let worldDisplacement = state.root.position
+                - previousRootPositions[e]
+            let localDisplacement = qInverse.act(worldDisplacement)
+            let planarCommand = SIMD2<Float>(command.x, command.y)
+            let planarCommandSpeed = simd_length(planarCommand)
+            let commandProgress = planarCommandSpeed > 1e-5
+                ? simd_dot(
+                    SIMD2<Float>(localDisplacement.x, localDisplacement.y),
+                    planarCommand / planarCommandSpeed)
+                : 0
+            previousRootPositions[e] = state.root.position
+            commandProgressSums[e] += commandProgress
+            commandProgressMetric[e] = commandProgress
+            // Credit only the requested displacement for this control step.
+            // Raw progress remains observable in metrics, but racing beyond
+            // the commanded speed cannot increase return.
+            let creditedCommandProgress = Self.creditedCommandProgress(
+                measured: commandProgress,
+                commandSpeed: planarCommandSpeed,
+                controlStep: dt)
+            commandProgressReward[e] =
+                configuration.commandProgressRewardWeight
+                    * creditedCommandProgress
             trackingLinear[e] = exp(-linearErrorSquared / 0.04)
             trackingYaw[e] = exp(-(yawError * yawError) / 0.25)
             orientationCost[e] = projectedGravity.x * projectedGravity.x
@@ -764,6 +815,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 - 0.02 * actionRateCost[e]
                 - 0.0005 * jointVelocityCost[e]
                 - 0.10 * footSlipCost[e]
+                - configuration.velocityErrorPenaltyWeight
+                    * linearErrorSquared
             var reachedGoal = false
             var goalDistance: Float = 0
             if configuration.pointGoal {
@@ -793,6 +846,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 previousGoalDistances[e] = goalDistance
             }
             result.rewards[e] = rewardRate * dt - (fallen ? 1 : 0)
+                + commandProgressReward[e]
                 + goalProgressReward[e] + goalStableReward[e]
                 + (reachedGoal ? configuration.goalSuccessBonus : 0)
             episodeReturns[e] += result.rewards[e]
@@ -819,6 +873,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                     : (timedOut && !fallen ? 1 : 0)
                 episodeLinearRMSEMetric[e] = linearRMSE
                 episodeYawRMSEMetric[e] = yawRMSE
+                episodeCommandProgressMetric[e] = commandProgressSums[e]
                 if configuration.pointGoal {
                     episodeGoalReachedMetric[e] = success ? 1 : 0
                     episodeGoalEnteredMetric[e] = enteredGoals[e] ? 1 : 0
@@ -855,6 +910,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         }
         result.metrics["reward/tracking_linear_velocity"] = trackingLinear
         result.metrics["reward/tracking_yaw_rate"] = trackingYaw
+        result.metrics["reward/command_progress"] = commandProgressReward
+        result.metrics["state/command_progress_m"] = commandProgressMetric
         result.metrics["penalty/orientation"] = orientationCost
         result.metrics["penalty/vertical_velocity"] = verticalVelocityCost
         result.metrics["penalty/angular_velocity_xy"] = angularVelocityCost
@@ -870,6 +927,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         result.metrics["episode/linear_velocity_rmse_mps"] =
             episodeLinearRMSEMetric
         result.metrics["episode/yaw_rate_rmse_rps"] = episodeYawRMSEMetric
+        result.metrics["episode/command_progress_m"] =
+            episodeCommandProgressMetric
         if configuration.pointGoal {
             result.metrics["reward/goal_progress"] = goalProgressReward
             result.metrics["reward/goal_stable"] = goalStableReward
@@ -976,6 +1035,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             episodeReturns[e] = 0
             linearSquaredErrorSums[e] = 0
             yawSquaredErrorSums[e] = 0
+            previousRootPositions[e] = states[e].root.position
+            commandProgressSums[e] = 0
             let historyBase = e * historyDepth * actionDimension
             for i in 0..<(historyDepth * actionDimension) {
                 actionHistory[historyBase + i] = 0
