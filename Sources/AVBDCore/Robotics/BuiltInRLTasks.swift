@@ -126,7 +126,105 @@ public enum BuiltInRLTasks {
         "initialYawRange", "observationNoise",
         "maximumActionLatencySteps", "validationCollisionProfile",
         "domainRandomization",
+        "pointGoal", "minimumGoalDistance", "maximumGoalDistance",
+        "goalRadius", "goalSlowdownDistance", "goalCommandSpeed",
+        "goalBoundaryCommandSpeed", "maximumGoalArrivalSpeed",
+        "goalDwellSteps", "goalProgressRewardWeight",
+        "goalStableRewardWeight", "goalSuccessBonus",
+        "massScaleLower", "massScaleUpper",
+        "inertiaScaleLower", "inertiaScaleUpper",
+        "frictionScaleLower", "frictionScaleUpper",
+        "motorTorqueScaleLower", "motorTorqueScaleUpper",
+        "motorStiffnessScaleLower", "motorStiffnessScaleUpper",
+        "motorDampingScaleLower", "motorDampingScaleUpper",
+        "armatureScaleLower", "armatureScaleUpper",
     ]
+
+    private static func arachne15Configuration(
+        _ cfg: RLTaskConfiguration, pointGoal: Bool
+    ) throws -> Arachne15LocomotionTaskConfig {
+        if let serializedMode = cfg.options["pointGoal"],
+           (serializedMode > 0) != pointGoal {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Arachne pointGoal option disagrees with selected task")
+        }
+        let fallbackRandomization =
+            (cfg.options["domainRandomization"] ?? 1) > 0
+                ? ArticulationDomainRandomization.conservativeSimToReal
+                : .init()
+        func range(_ prefix: String,
+                   _ fallback: DynamicsMultiplierRange)
+            throws -> DynamicsMultiplierRange {
+            let lower = cfg.options["\(prefix)Lower"] ?? fallback.lowerBound
+            let upper = cfg.options["\(prefix)Upper"] ?? fallback.upperBound
+            guard lower.isFinite, upper.isFinite,
+                  lower > 0, upper >= lower else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "invalid Arachne \(prefix) range \(lower)...\(upper)")
+            }
+            return DynamicsMultiplierRange(lower, upper)
+        }
+        let randomization = ArticulationDomainRandomization(
+            mass: try range("massScale", fallbackRandomization.mass),
+            inertia: try range("inertiaScale", fallbackRandomization.inertia),
+            friction: try range(
+                "frictionScale", fallbackRandomization.friction),
+            motorTorque: try range(
+                "motorTorqueScale", fallbackRandomization.motorTorque),
+            motorStiffness: try range(
+                "motorStiffnessScale", fallbackRandomization.motorStiffness),
+            motorDamping: try range(
+                "motorDampingScale", fallbackRandomization.motorDamping),
+            armature: try range(
+                "armatureScale", fallbackRandomization.armature))
+        return Arachne15LocomotionTaskConfig(
+            numEnvironments: cfg.numEnvironments,
+            seed: cfg.seed,
+            maxEpisodeSteps: Int(cfg.options["maxEpisodeSteps"] ?? 1_000),
+            controlDecimation: Int(cfg.options["controlDecimation"] ?? 10),
+            commandResamplingSteps: Int(
+                cfg.options["commandResamplingSteps"] ?? 500),
+            minimumForwardVelocity:
+                cfg.options["minimumForwardVelocity"] ?? 0.05,
+            maximumForwardVelocity:
+                cfg.options["maximumForwardVelocity"] ?? 0.25,
+            maximumLateralVelocity:
+                cfg.options["maximumLateralVelocity"] ?? 0.12,
+            maximumYawRate: cfg.options["maximumYawRate"] ?? 0.8,
+            standingCommandProbability:
+                cfg.options["standingCommandProbability"]
+                    ?? (pointGoal ? 0 : 0.10),
+            initialRollPitchRange:
+                cfg.options["initialRollPitchRange"] ?? 0.02,
+            initialYawRange: cfg.options["initialYawRange"] ?? .pi,
+            observationNoise: (cfg.options["observationNoise"] ?? 1) > 0,
+            maximumActionLatencySteps: Int(
+                cfg.options["maximumActionLatencySteps"] ?? 2),
+            collisionProfile:
+                (cfg.options["validationCollisionProfile"] ?? 0) > 0
+                    ? .validation : .training,
+            domainRandomization: randomization,
+            pointGoal: pointGoal,
+            minimumGoalDistance:
+                cfg.options["minimumGoalDistance"] ?? 0.60,
+            maximumGoalDistance:
+                cfg.options["maximumGoalDistance"] ?? 2.0,
+            goalRadius: cfg.options["goalRadius"] ?? 0.12,
+            goalSlowdownDistance:
+                cfg.options["goalSlowdownDistance"] ?? 0.50,
+            goalCommandSpeed: cfg.options["goalCommandSpeed"] ?? 0.20,
+            goalBoundaryCommandSpeed:
+                cfg.options["goalBoundaryCommandSpeed"] ?? 0.05,
+            maximumGoalArrivalSpeed:
+                cfg.options["maximumGoalArrivalSpeed"] ?? 0.08,
+            goalDwellSteps: Int(cfg.options["goalDwellSteps"] ?? 15),
+            goalProgressRewardWeight:
+                cfg.options["goalProgressRewardWeight"] ?? 2.0,
+            goalStableRewardWeight:
+                cfg.options["goalStableRewardWeight"] ?? 0.5,
+            goalSuccessBonus: cfg.options["goalSuccessBonus"] ?? 5.0,
+            autoReset: cfg.autoReset)
+    }
 
     public static let registry: RLTaskRegistry = {
         let registry = RLTaskRegistry()
@@ -655,40 +753,17 @@ public enum BuiltInRLTasks {
                 supported: arachne15OptionKeys,
                 taskID: "arachne15-velocity-v0")
             return try Arachne15LocomotionTask(
-                configuration: Arachne15LocomotionTaskConfig(
-                    numEnvironments: cfg.numEnvironments,
-                    seed: cfg.seed,
-                    maxEpisodeSteps: Int(
-                        cfg.options["maxEpisodeSteps"] ?? 1_000),
-                    controlDecimation: Int(
-                        cfg.options["controlDecimation"] ?? 10),
-                    commandResamplingSteps: Int(
-                        cfg.options["commandResamplingSteps"] ?? 500),
-                    minimumForwardVelocity:
-                        cfg.options["minimumForwardVelocity"] ?? 0.05,
-                    maximumForwardVelocity:
-                        cfg.options["maximumForwardVelocity"] ?? 0.25,
-                    maximumLateralVelocity:
-                        cfg.options["maximumLateralVelocity"] ?? 0.12,
-                    maximumYawRate:
-                        cfg.options["maximumYawRate"] ?? 0.8,
-                    standingCommandProbability:
-                        cfg.options["standingCommandProbability"] ?? 0.10,
-                    initialRollPitchRange:
-                        cfg.options["initialRollPitchRange"] ?? 0.02,
-                    initialYawRange:
-                        cfg.options["initialYawRange"] ?? .pi,
-                    observationNoise:
-                        (cfg.options["observationNoise"] ?? 1) > 0,
-                    maximumActionLatencySteps: Int(
-                        cfg.options["maximumActionLatencySteps"] ?? 2),
-                    collisionProfile:
-                        (cfg.options["validationCollisionProfile"] ?? 0) > 0
-                            ? .validation : .training,
-                    domainRandomization:
-                        (cfg.options["domainRandomization"] ?? 1) > 0
-                            ? .conservativeSimToReal : .init(),
-                    autoReset: cfg.autoReset))
+                configuration: try arachne15Configuration(
+                    cfg, pointGoal: false))
+        }
+        try! registry.register("arachne15-goal-v0") { cfg in
+            try cfg.validateOptions(
+                supported: arachne15OptionKeys,
+                taskID: "arachne15-goal-v0")
+            return try Arachne15LocomotionTask(
+                configuration: try arachne15Configuration(
+                    cfg, pointGoal: true),
+                taskID: "arachne15-goal-v0")
         }
         return registry
     }()

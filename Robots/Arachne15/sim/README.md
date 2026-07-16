@@ -64,6 +64,45 @@ latency. Disable the initial envelope for nominal-plant debugging with
 Custom Swift tasks can supply any `ArticulationDomainRandomization` ranges.
 See [SIM_TO_REAL.md](SIM_TO_REAL.md) for the calibration and acceptance plan.
 
+### Random point-goal navigation
+
+`arachne15-goal-v0` keeps the exact `[60]` observation and `[16]` action
+interface. At every reset it samples a uniformly random bearing and a target
+distance in `0.60...2.0 m`. A task-owned command provider continuously converts
+the world target into a body-frame planar-velocity/yaw command, slows near the
+target, and commands zero inside the `0.12 m` acceptance radius. Success
+requires remaining inside that radius below the arrival-speed limit for 15
+control steps; merely crossing the marker at speed is not success.
+
+Replay scenes render the start as a flat square and the destination as a
+beacon sphere plus an acceptance-radius ring. Both are static, non-colliding
+visualization primitives. Their poses
+never enter policy observations, contacts, or reward computation, and large
+training batches omit them completely. This prevents privileged target data
+from leaking into the motor policy. A future iPhone camera/gesture module can
+replace the command provider with an estimated goal while preserving the same
+locomotion and actuator interfaces.
+
+```sh
+.build/release/avbd rl-smoke arachne15-goal-v0 \
+  --envs 128 --frames 200
+```
+
+After a velocity run passes evaluation, reuse its locomotion network explicitly
+instead of relearning contact dynamics from scratch (the hidden-layer layout
+must match):
+
+```sh
+.xcbuild/Build/Products/Release/avbd train-rl arachne15-goal-v0 \
+  --run arachne-goal-seed-1 --seed 1 --envs 2048 --updates 500 \
+  --horizon 32 --epochs 5 --batch 16384 --hidden-layers 256,256,128 \
+  --initialize-from runs/arachne15-velocity-v0/arachne-velocity-seed-1
+```
+
+Policy Replay exposes **Arachne Goal**. **Sample Task Goal** draws another
+seeded task target; bearing and distance controls install a deterministic
+target for diagnosis. The UI never supplies joint targets.
+
 ## Why primitives instead of decomposed printable meshes?
 
 This is the standard robust robot path, rather than a limitation of the CAD.

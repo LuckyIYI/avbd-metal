@@ -17,6 +17,18 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
     public var maximumActionLatencySteps: Int
     public var collisionProfile: Arachne15CollisionProfile
     public var domainRandomization: ArticulationDomainRandomization
+    public var pointGoal: Bool
+    public var minimumGoalDistance: Float
+    public var maximumGoalDistance: Float
+    public var goalRadius: Float
+    public var goalSlowdownDistance: Float
+    public var goalCommandSpeed: Float
+    public var goalBoundaryCommandSpeed: Float
+    public var maximumGoalArrivalSpeed: Float
+    public var goalDwellSteps: Int
+    public var goalProgressRewardWeight: Float
+    public var goalStableRewardWeight: Float
+    public var goalSuccessBonus: Float
     public var autoReset: Bool
 
     public init(
@@ -35,6 +47,18 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
         collisionProfile: Arachne15CollisionProfile = .training,
         domainRandomization: ArticulationDomainRandomization =
             .conservativeSimToReal,
+        pointGoal: Bool = false,
+        minimumGoalDistance: Float = 0.60,
+        maximumGoalDistance: Float = 2.0,
+        goalRadius: Float = 0.12,
+        goalSlowdownDistance: Float = 0.50,
+        goalCommandSpeed: Float = 0.20,
+        goalBoundaryCommandSpeed: Float = 0.05,
+        maximumGoalArrivalSpeed: Float = 0.08,
+        goalDwellSteps: Int = 15,
+        goalProgressRewardWeight: Float = 2.0,
+        goalStableRewardWeight: Float = 0.5,
+        goalSuccessBonus: Float = 5.0,
         autoReset: Bool = true
     ) {
         self.numEnvironments = numEnvironments
@@ -53,6 +77,18 @@ public struct Arachne15LocomotionTaskConfig: Sendable {
         self.maximumActionLatencySteps = maximumActionLatencySteps
         self.collisionProfile = collisionProfile
         self.domainRandomization = domainRandomization
+        self.pointGoal = pointGoal
+        self.minimumGoalDistance = minimumGoalDistance
+        self.maximumGoalDistance = maximumGoalDistance
+        self.goalRadius = goalRadius
+        self.goalSlowdownDistance = goalSlowdownDistance
+        self.goalCommandSpeed = goalCommandSpeed
+        self.goalBoundaryCommandSpeed = goalBoundaryCommandSpeed
+        self.maximumGoalArrivalSpeed = maximumGoalArrivalSpeed
+        self.goalDwellSteps = goalDwellSteps
+        self.goalProgressRewardWeight = goalProgressRewardWeight
+        self.goalStableRewardWeight = goalStableRewardWeight
+        self.goalSuccessBonus = goalSuccessBonus
         self.autoReset = autoReset
     }
 }
@@ -76,6 +112,8 @@ public final class Arachne15Env {
         public var motors: [Int]
         public var feet: [Int]
         public var footFrames: [MJCFLinkFrame]
+        public var startMarker: Int?
+        public var goalMarker: Int?
     }
 
     public static let actionDimension = 16
@@ -98,9 +136,12 @@ public final class Arachne15Env {
         numEnvironments: Int, seed: UInt64 = 1,
         collisionProfile: Arachne15CollisionProfile = .training,
         domainRandomization: ArticulationDomainRandomization = .init(),
+        includeGoalMarkers: Bool = false,
+        goalMarkerRadius: Float = 0.12,
         solverIterations: Int = 20
     ) throws {
-        precondition(numEnvironments > 0 && solverIterations > 0)
+        precondition(numEnvironments > 0 && solverIterations > 0
+            && goalMarkerRadius > 0)
         self.numEnvironments = numEnvironments
         var built = PhysicsScene(name: "arachne15-locomotion")
         built.settings.dt = 0.002
@@ -140,13 +181,41 @@ public final class Arachne15Env {
             let bodies = asset.bodyNames.map { imported.bodiesByName[$0]! }
             let feet = footNames.map { imported.bodiesByName[$0]! }
             let footFrames = footNames.map { imported.linkFramesInBody[$0]! }
-            builtRefs.append(EnvRefs(
+            var ref = EnvRefs(
                 root: imported.rootBody,
                 rootFrame: imported.linkFramesInBody["base"]!,
                 bodies: bodies,
                 motors: imported.actuatorJoints,
                 feet: feet,
-                footFrames: footFrames))
+                footFrames: footFrames,
+                startMarker: nil,
+                goalMarker: nil)
+            if includeGoalMarkers && numEnvironments <= 4 {
+                // Visual-only navigation landmarks. Static marker colliders
+                // are rendered by the normal scene path but deliberately do
+                // not participate in broadphase, contacts, or robot state.
+                ref.startMarker = built.addBody(
+                    size: F3(0.10, 0.10, 0.006), density: 0, friction: 0,
+                    position: F3(0, 0, 0.003), collisionEnabled: false)
+                built.addCollider(
+                    body: ref.startMarker!, size: F3(0.10, 0.10, 0.006),
+                    friction: 0, collisionEnabled: false, isRendered: true)
+                ref.goalMarker = built.addBody(
+                    size: F3(repeating: 0.08), density: 0, friction: 0,
+                    position: F3(1, 0, 0.04), shape: .sphere,
+                    collisionEnabled: false)
+                built.addCollider(
+                    body: ref.goalMarker!, size: F3(repeating: 0.08),
+                    friction: 0, shape: .sphere,
+                    collisionEnabled: false, isRendered: true)
+                built.addCollider(
+                    body: ref.goalMarker!,
+                    size: F3(goalMarkerRadius, 0.012, 0),
+                    friction: 0, localPosition: F3(0, 0, -0.028),
+                    shape: .torus,
+                    collisionEnabled: false, isRendered: true)
+            }
+            builtRefs.append(ref)
             scales.append(scale)
         }
         refs = builtRefs
@@ -214,6 +283,32 @@ public final class Arachne15Env {
         }
         solver.setBodyPoses(poses)
         solver.setMotorTargets(motors)
+    }
+
+    /// Reposition render-only start and destination markers. These bodies are
+    /// excluded from `EnvRefs.bodies`, so robot resets and policy state cannot
+    /// accidentally depend on them.
+    public func setGoalMarkers(environmentIDs: [Int], goals: [F3],
+                               origins: [F3]) {
+        precondition(environmentIDs.count == goals.count
+            && environmentIDs.count == origins.count)
+        var poses = [GPUSolver.BodyPoseUpdate]()
+        poses.reserveCapacity(environmentIDs.count * 2)
+        for (offset, e) in environmentIDs.enumerated() {
+            if let start = refs[e].startMarker {
+                poses.append(.init(
+                    body: start,
+                    position: F3(origins[offset].x, origins[offset].y, 0.003),
+                    rotation: Quat(real: 1, imag: .zero)))
+            }
+            if let goal = refs[e].goalMarker {
+                poses.append(.init(
+                    body: goal,
+                    position: F3(goals[offset].x, goals[offset].y, 0.04),
+                    rotation: Quat(real: 1, imag: .zero)))
+            }
+        }
+        if !poses.isEmpty { solver.setBodyPoses(poses) }
     }
 
     public func groundContacts() -> [[Bool]] {
@@ -297,8 +392,25 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     public let environment: Arachne15Env
     public let configuration: Arachne15LocomotionTaskConfig
 
+    public var usesPointGoal: Bool { configuration.pointGoal }
+
     public var evaluationCriteria: RLEvaluationCriteria {
-        RLEvaluationCriteria(
+        if configuration.pointGoal {
+            return RLEvaluationCriteria(
+                minimumSuccessRate: 0.80,
+                minimumMeanEpisodeLengthFraction: 0.10,
+                minimumTaskMetrics: [
+                    "episode/survived": 0.90,
+                    "episode/goal_reached": 0.80,
+                ],
+                maximumTaskMetrics: [
+                    "episode/final_goal_distance_m":
+                        configuration.goalRadius * 1.5,
+                    "episode/minimum_goal_distance_m":
+                        configuration.goalRadius,
+                ])
+        }
+        return RLEvaluationCriteria(
             minimumSuccessRate: 0.80,
             minimumMeanEpisodeLengthFraction: 0.90,
             minimumTaskMetrics: ["episode/survived": 0.90],
@@ -320,9 +432,23 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     private var episodeReturns: [Float]
     private var linearSquaredErrorSums: [Float]
     private var yawSquaredErrorSums: [Float]
+    private var goals: [F3]
+    private var goalOrigins: [F3]
+    private var goalOverrides: [(direction: F3, distance: Float)?]
+    private var previousGoalDistances: [Float]
+    private var minimumGoalDistances: [Float]
+    private var goalDwellCounts: [Int]
+    private var enteredGoals: [Bool]
     private var resetRNG: SplitMix64
 
-    public init(configuration: Arachne15LocomotionTaskConfig) throws {
+    public init(configuration: Arachne15LocomotionTaskConfig,
+                taskID: String = "arachne15-velocity-v0") throws {
+        guard (configuration.pointGoal && taskID == "arachne15-goal-v0")
+                || (!configuration.pointGoal
+                    && taskID == "arachne15-velocity-v0") else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Arachne task ID and point-goal mode disagree")
+        }
         guard configuration.numEnvironments > 0,
               configuration.maxEpisodeSteps > 0,
               configuration.controlDecimation > 0,
@@ -336,7 +462,23 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
               configuration.initialRollPitchRange >= 0,
               configuration.initialYawRange >= 0,
               configuration.initialYawRange <= .pi,
-              configuration.maximumActionLatencySteps >= 0 else {
+              configuration.maximumActionLatencySteps >= 0,
+              !configuration.pointGoal || (
+                configuration.minimumGoalDistance > configuration.goalRadius
+                && configuration.maximumGoalDistance
+                    >= configuration.minimumGoalDistance
+                && configuration.goalRadius > 0
+                && configuration.goalSlowdownDistance
+                    > configuration.goalRadius
+                && configuration.goalCommandSpeed > 0
+                && configuration.goalBoundaryCommandSpeed >= 0
+                && configuration.goalBoundaryCommandSpeed
+                    <= configuration.goalCommandSpeed
+                && configuration.maximumGoalArrivalSpeed >= 0
+                && configuration.goalDwellSteps > 0
+                && configuration.goalProgressRewardWeight >= 0
+                && configuration.goalStableRewardWeight >= 0
+                && configuration.goalSuccessBonus >= 0) else {
             throw RLEnvironmentError.invalidConfiguration(
                 "invalid Arachne locomotion configuration")
         }
@@ -344,12 +486,14 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             numEnvironments: configuration.numEnvironments,
             seed: configuration.seed,
             collisionProfile: configuration.collisionProfile,
-            domainRandomization: configuration.domainRandomization)
+            domainRandomization: configuration.domainRandomization,
+            includeGoalMarkers: configuration.pointGoal,
+            goalMarkerRadius: configuration.goalRadius)
         environment = env
         self.configuration = configuration
         let d = configuration.domainRandomization
         spec = RLTaskSpec(
-            id: "arachne15-velocity-v0", revision: 1,
+            id: taskID, revision: 1,
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),
@@ -375,6 +519,22 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                     configuration.maximumActionLatencySteps),
                 "validationCollisionProfile":
                     configuration.collisionProfile == .validation ? 1 : 0,
+                "pointGoal": configuration.pointGoal ? 1 : 0,
+                "minimumGoalDistance": configuration.minimumGoalDistance,
+                "maximumGoalDistance": configuration.maximumGoalDistance,
+                "goalRadius": configuration.goalRadius,
+                "goalSlowdownDistance": configuration.goalSlowdownDistance,
+                "goalCommandSpeed": configuration.goalCommandSpeed,
+                "goalBoundaryCommandSpeed":
+                    configuration.goalBoundaryCommandSpeed,
+                "maximumGoalArrivalSpeed":
+                    configuration.maximumGoalArrivalSpeed,
+                "goalDwellSteps": Float(configuration.goalDwellSteps),
+                "goalProgressRewardWeight":
+                    configuration.goalProgressRewardWeight,
+                "goalStableRewardWeight":
+                    configuration.goalStableRewardWeight,
+                "goalSuccessBonus": configuration.goalSuccessBonus,
                 "massScaleLower": d.mass.lowerBound,
                 "massScaleUpper": d.mass.upperBound,
                 "inertiaScaleLower": d.inertia.lowerBound,
@@ -409,6 +569,14 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         episodeReturns = [Float](repeating: 0, count: n)
         linearSquaredErrorSums = [Float](repeating: 0, count: n)
         yawSquaredErrorSums = [Float](repeating: 0, count: n)
+        goals = [F3](repeating: .zero, count: n)
+        goalOrigins = [F3](repeating: .zero, count: n)
+        goalOverrides = [Optional<(direction: F3, distance: Float)>](
+            repeating: nil, count: n)
+        previousGoalDistances = [Float](repeating: 0, count: n)
+        minimumGoalDistances = [Float](repeating: 0, count: n)
+        goalDwellCounts = [Int](repeating: 0, count: n)
+        enteredGoals = [Bool](repeating: false, count: n)
         resetRNG = SplitMix64(seed: configuration.seed ^ 0xE7037ED1A0B428DB)
 
         let ids = Array(0..<n)
@@ -416,12 +584,71 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         env.reset(ids, seeds: seeds,
                   initialRollPitchRange: configuration.initialRollPitchRange,
                   initialYawRange: configuration.initialYawRange)
-        initializeEpisodes(ids, seeds: seeds)
+        initializeEpisodes(ids, seeds: seeds, states: env.states())
     }
 
     public func currentCommand(environment: Int) -> F3 {
         precondition(environment >= 0 && environment < spec.numEnvironments)
         return commands[environment]
+    }
+
+    public func currentGoalPosition(environment: Int) -> F3 {
+        precondition(configuration.pointGoal)
+        precondition((0..<spec.numEnvironments).contains(environment))
+        return goals[environment]
+    }
+
+    public func currentGoalDistance(environment e: Int) -> Float {
+        precondition(configuration.pointGoal)
+        precondition((0..<spec.numEnvironments).contains(e))
+        let root = environment.states()[e].root.position
+        return planarGoalDistance(environment: e, rootPosition: root)
+    }
+
+    public func currentGoalDirection(environment e: Int) -> F3 {
+        precondition(configuration.pointGoal)
+        precondition((0..<spec.numEnvironments).contains(e))
+        let root = environment.states()[e].root.position
+        let delta = goals[e] - root
+        let length = max(sqrt(delta.x * delta.x + delta.y * delta.y), 1e-6)
+        return F3(delta.x / length, delta.y / length, 0)
+    }
+
+    /// Installs a world-space point goal for replay or deterministic tests.
+    /// It changes the command source only; joint actions remain policy-owned.
+    public func setGoal(environment e: Int, direction: F3,
+                        distance: Float) throws {
+        guard configuration.pointGoal,
+              (0..<spec.numEnvironments).contains(e),
+              direction.x.isFinite, direction.y.isFinite,
+              distance.isFinite, distance > configuration.goalRadius else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "invalid Arachne point-goal override")
+        }
+        let length = sqrt(direction.x * direction.x
+            + direction.y * direction.y)
+        guard length > 1e-6 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Arachne point-goal direction must be planar and nonzero")
+        }
+        let normalized = F3(direction.x / length, direction.y / length, 0)
+        let state = environment.states()[e]
+        goalOverrides[e] = (normalized, distance)
+        installGoal(environment: e, rootPosition: state.root.position,
+                    direction: normalized, distance: distance)
+        previousGoalDistances[e] = distance
+        minimumGoalDistances[e] = distance
+        goalDwellCounts[e] = 0
+        enteredGoals[e] = false
+        updateGoalCommand(environment: e, state: state)
+        environment.setGoalMarkers(
+            environmentIDs: [e], goals: [goals[e]], origins: [goalOrigins[e]])
+    }
+
+    public func clearGoalOverride(environment e: Int) {
+        precondition(configuration.pointGoal)
+        precondition((0..<spec.numEnvironments).contains(e))
+        goalOverrides[e] = nil
     }
 
     public func reset(environments ids: [Int]?, seed: UInt64,
@@ -435,8 +662,9 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             envIDs, seeds: seeds,
             initialRollPitchRange: configuration.initialRollPitchRange,
             initialYawRange: configuration.initialYawRange)
-        initializeEpisodes(envIDs, seeds: seeds)
-        fillObservations(environment.states(), into: &observations.policy)
+        let states = environment.states()
+        initializeEpisodes(envIDs, seeds: seeds, states: states)
+        fillObservations(states, into: &observations.policy)
         try observations.validate(for: spec)
     }
 
@@ -468,6 +696,24 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         var episodeSurvivedMetric = ContiguousArray(repeating: Float(0), count: n)
         var episodeLinearRMSEMetric = ContiguousArray(repeating: Float(0), count: n)
         var episodeYawRMSEMetric = ContiguousArray(repeating: Float(0), count: n)
+        var goalProgressReward = ContiguousArray(repeating: Float(0), count: n)
+        var goalStableReward = ContiguousArray(repeating: Float(0), count: n)
+        var goalDistanceMetric = ContiguousArray(repeating: Float(0), count: n)
+        var minimumGoalDistanceMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var goalDwellMetric = ContiguousArray(repeating: Float(0), count: n)
+        var episodeGoalReachedMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalEnteredMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeFinalGoalDistanceMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeMinimumGoalDistanceMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeGoalDwellMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeArrivalSpeedMetric = ContiguousArray(
+            repeating: Float(0), count: n)
         var resetIDs: [Int] = []
         var resetSeeds: [UInt64] = []
 
@@ -518,33 +764,84 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 - 0.02 * actionRateCost[e]
                 - 0.0005 * jointVelocityCost[e]
                 - 0.10 * footSlipCost[e]
+            var reachedGoal = false
+            var goalDistance: Float = 0
+            if configuration.pointGoal {
+                goalDistance = planarGoalDistance(
+                    environment: e, rootPosition: state.root.position)
+                goalDistanceMetric[e] = goalDistance
+                minimumGoalDistances[e] = min(
+                    minimumGoalDistances[e], goalDistance)
+                minimumGoalDistanceMetric[e] = minimumGoalDistances[e]
+                goalProgressReward[e] = configuration.goalProgressRewardWeight
+                    * (previousGoalDistances[e] - goalDistance)
+                if goalDistance <= configuration.goalRadius {
+                    enteredGoals[e] = true
+                }
+                let planarSpeed = sqrt(
+                    state.root.linearVelocity.x * state.root.linearVelocity.x
+                        + state.root.linearVelocity.y
+                            * state.root.linearVelocity.y)
+                let stable = goalDistance <= configuration.goalRadius
+                    && planarSpeed <= configuration.maximumGoalArrivalSpeed
+                goalDwellCounts[e] = stable ? goalDwellCounts[e] + 1 : 0
+                goalDwellMetric[e] = Float(goalDwellCounts[e])
+                goalStableReward[e] = stable
+                    ? configuration.goalStableRewardWeight * dt : 0
+                reachedGoal = goalDwellCounts[e]
+                    >= configuration.goalDwellSteps
+                previousGoalDistances[e] = goalDistance
+            }
             result.rewards[e] = rewardRate * dt - (fallen ? 1 : 0)
+                + goalProgressReward[e] + goalStableReward[e]
+                + (reachedGoal ? configuration.goalSuccessBonus : 0)
             episodeReturns[e] += result.rewards[e]
             linearSquaredErrorSums[e] += linearErrorSquared
             yawSquaredErrorSums[e] += yawError * yawError
             episodeLengths[e] += 1
             let timedOut = episodeLengths[e] >= configuration.maxEpisodeSteps
-            if fallen || timedOut {
+            if fallen || timedOut || reachedGoal {
                 let inverseLength = 1 / Float(max(episodeLengths[e], 1))
                 let linearRMSE = sqrt(linearSquaredErrorSums[e] * inverseLength)
                 let yawRMSE = sqrt(yawSquaredErrorSums[e] * inverseLength)
-                result.terminated[e] = fallen
-                result.truncated[e] = !fallen && timedOut
-                result.successes[e] = timedOut && !fallen
-                    && linearRMSE <= 0.15 && yawRMSE <= 0.40
+                let success = configuration.pointGoal
+                    ? reachedGoal && !fallen
+                    : timedOut && !fallen
+                        && linearRMSE <= 0.15 && yawRMSE <= 0.40
+                result.terminated[e] = fallen || reachedGoal
+                result.truncated[e] = !fallen && !reachedGoal && timedOut
+                result.successes[e] = success
                 result.hasFinalObservation[e] = true
                 episodeReturnMetric[e] = episodeReturns[e]
                 episodeLengthMetric[e] = Float(episodeLengths[e])
-                episodeSurvivedMetric[e] = timedOut && !fallen ? 1 : 0
+                episodeSurvivedMetric[e] = configuration.pointGoal
+                    ? (!fallen ? 1 : 0)
+                    : (timedOut && !fallen ? 1 : 0)
                 episodeLinearRMSEMetric[e] = linearRMSE
                 episodeYawRMSEMetric[e] = yawRMSE
+                if configuration.pointGoal {
+                    episodeGoalReachedMetric[e] = success ? 1 : 0
+                    episodeGoalEnteredMetric[e] = enteredGoals[e] ? 1 : 0
+                    episodeFinalGoalDistanceMetric[e] = goalDistance
+                    episodeMinimumGoalDistanceMetric[e] =
+                        minimumGoalDistances[e]
+                    episodeGoalDwellMetric[e] = Float(goalDwellCounts[e])
+                    episodeArrivalSpeedMetric[e] = sqrt(
+                        state.root.linearVelocity.x
+                            * state.root.linearVelocity.x
+                        + state.root.linearVelocity.y
+                            * state.root.linearVelocity.y)
+                }
                 if configuration.autoReset {
                     resetIDs.append(e)
                     resetSeeds.append(resetRNG.next())
                 }
-            } else if episodeLengths[e]
+            } else if !configuration.pointGoal && episodeLengths[e]
                 .isMultiple(of: configuration.commandResamplingSteps) {
                 sampleCommand(environment: e)
+            }
+            if configuration.pointGoal && !fallen && !reachedGoal {
+                updateGoalCommand(environment: e, state: state)
             }
         }
 
@@ -573,14 +870,32 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         result.metrics["episode/linear_velocity_rmse_mps"] =
             episodeLinearRMSEMetric
         result.metrics["episode/yaw_rate_rmse_rps"] = episodeYawRMSEMetric
+        if configuration.pointGoal {
+            result.metrics["reward/goal_progress"] = goalProgressReward
+            result.metrics["reward/goal_stable"] = goalStableReward
+            result.metrics["state/goal_distance_m"] = goalDistanceMetric
+            result.metrics["state/minimum_goal_distance_m"] =
+                minimumGoalDistanceMetric
+            result.metrics["state/goal_dwell_steps"] = goalDwellMetric
+            result.metrics["episode/goal_reached"] = episodeGoalReachedMetric
+            result.metrics["episode/goal_entered"] = episodeGoalEnteredMetric
+            result.metrics["episode/final_goal_distance_m"] =
+                episodeFinalGoalDistanceMetric
+            result.metrics["episode/minimum_goal_distance_m"] =
+                episodeMinimumGoalDistanceMetric
+            result.metrics["episode/goal_dwell_steps"] =
+                episodeGoalDwellMetric
+            result.metrics["episode/arrival_speed_mps"] =
+                episodeArrivalSpeedMetric
+        }
 
         if !resetIDs.isEmpty {
             environment.reset(
                 resetIDs, seeds: resetSeeds,
                 initialRollPitchRange: configuration.initialRollPitchRange,
                 initialYawRange: configuration.initialYawRange)
-            initializeEpisodes(resetIDs, seeds: resetSeeds)
             states = environment.states()
+            initializeEpisodes(resetIDs, seeds: resetSeeds, states: states)
             fillObservations(
                 states, into: &result.observations.policy,
                 environmentIDs: resetIDs)
@@ -613,7 +928,12 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         return result
     }
 
-    private func initializeEpisodes(_ ids: [Int], seeds: [UInt64]) {
+    private func initializeEpisodes(_ ids: [Int], seeds: [UInt64],
+                                    states: [Arachne15State]) {
+        var markerGoals = [F3]()
+        var markerOrigins = [F3]()
+        markerGoals.reserveCapacity(ids.count)
+        markerOrigins.reserveCapacity(ids.count)
         for (offset, e) in ids.enumerated() {
             commandRNGs[e] = SplitMix64(seed: seeds[offset]
                 ^ 0xA0761D6478BD642F)
@@ -625,7 +945,33 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             } else {
                 actionLatencies[e] = 0
             }
-            sampleCommand(environment: e)
+            if configuration.pointGoal {
+                let direction: F3
+                let distance: Float
+                if let override = goalOverrides[e] {
+                    direction = override.direction
+                    distance = override.distance
+                } else {
+                    let angle = (2 * commandRNGs[e].nextFloat() - 1) * .pi
+                    direction = F3(cos(angle), sin(angle), 0)
+                    distance = configuration.minimumGoalDistance
+                        + (configuration.maximumGoalDistance
+                            - configuration.minimumGoalDistance)
+                            * commandRNGs[e].nextFloat()
+                }
+                installGoal(
+                    environment: e, rootPosition: states[e].root.position,
+                    direction: direction, distance: distance)
+                previousGoalDistances[e] = distance
+                minimumGoalDistances[e] = distance
+                goalDwellCounts[e] = 0
+                enteredGoals[e] = false
+                updateGoalCommand(environment: e, state: states[e])
+                markerGoals.append(goals[e])
+                markerOrigins.append(goalOrigins[e])
+            } else {
+                sampleCommand(environment: e)
+            }
             episodeLengths[e] = 0
             episodeReturns[e] = 0
             linearSquaredErrorSums[e] = 0
@@ -637,6 +983,11 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             for j in 0..<actionDimension {
                 previousActions[e * actionDimension + j] = 0
             }
+        }
+        if configuration.pointGoal {
+            environment.setGoalMarkers(
+                environmentIDs: ids, goals: markerGoals,
+                origins: markerOrigins)
         }
     }
 
@@ -655,6 +1006,51 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 * configuration.maximumLateralVelocity,
             (2 * commandRNGs[e].nextFloat() - 1)
                 * configuration.maximumYawRate)
+    }
+
+    private func installGoal(environment e: Int, rootPosition: F3,
+                             direction: F3, distance: Float) {
+        goalOrigins[e] = F3(rootPosition.x, rootPosition.y, 0)
+        goals[e] = goalOrigins[e] + direction * distance
+    }
+
+    private func planarGoalDistance(environment e: Int,
+                                    rootPosition: F3) -> Float {
+        let delta = goals[e] - rootPosition
+        return sqrt(delta.x * delta.x + delta.y * delta.y)
+    }
+
+    /// Converts a world point into the same local twist interface used by the
+    /// reusable velocity locomotion policy. Future vision can replace goal
+    /// acquisition without changing observations 9...11 or the motor action.
+    private func updateGoalCommand(environment e: Int,
+                                   state: Arachne15State) {
+        let worldDelta = goals[e] - state.root.position
+        let localDelta = state.root.rotation.conjugate.act(
+            F3(worldDelta.x, worldDelta.y, 0))
+        let distance = sqrt(localDelta.x * localDelta.x
+            + localDelta.y * localDelta.y)
+        guard distance > configuration.goalRadius else {
+            commands[e] = .zero
+            return
+        }
+        let blend = simd_clamp(
+            (distance - configuration.goalRadius)
+                / (configuration.goalSlowdownDistance
+                    - configuration.goalRadius),
+            0, 1)
+        let speed = configuration.goalBoundaryCommandSpeed
+            + blend * (configuration.goalCommandSpeed
+                - configuration.goalBoundaryCommandSpeed)
+        let direction = SIMD2<Float>(localDelta.x, localDelta.y)
+            / max(distance, 1e-6)
+        let yawError = atan2(localDelta.y, localDelta.x)
+        commands[e] = F3(
+            direction.x * speed,
+            direction.y * speed,
+            simd_clamp(2 * yawError,
+                       -configuration.maximumYawRate,
+                       configuration.maximumYawRate))
     }
 
     private func fillObservations(

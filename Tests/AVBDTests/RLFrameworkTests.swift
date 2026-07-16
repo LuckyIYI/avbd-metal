@@ -8,7 +8,8 @@ import MLX
 final class RLFrameworkTests: XCTestCase {
     func testRegisteredTasksExposeNormalizedBatchedSpaces() throws {
         XCTAssertEqual(BuiltInRLTasks.registry.taskIDs,
-                       ["arachne15-velocity-v0", "arm-pusht-v0",
+                       ["arachne15-goal-v0", "arachne15-velocity-v0",
+                        "arm-pusht-v0",
                         "humanoid-goal-v0",
                         "humanoid-isaac-flat-v0", "humanoid-isaac-goal-v0",
                         "humanoid-velocity-v0",
@@ -70,6 +71,107 @@ final class RLFrameworkTests: XCTestCase {
         }
     }
 
+    func testArachneGoalSamplesDeterministicVisibleNonCollidingTargets() throws {
+        let options: [String: Float] = [
+            "minimumGoalDistance": 0.8,
+            "maximumGoalDistance": 1.2,
+            "initialRollPitchRange": 0,
+            "initialYawRange": 0,
+            "observationNoise": 0,
+            "maximumActionLatencySteps": 0,
+            "domainRandomization": 0,
+        ]
+        let registered = try BuiltInRLTasks.registry.make(
+            "arachne15-goal-v0",
+            configuration: RLTaskConfiguration(
+                numEnvironments: 4, seed: 501, autoReset: false,
+                options: options))
+        let task = try XCTUnwrap(registered as? Arachne15LocomotionTask)
+        XCTAssertTrue(task.usesPointGoal)
+        XCTAssertEqual(task.spec.id, "arachne15-goal-v0")
+        XCTAssertEqual(task.spec.observation.shape, [60])
+        XCTAssertEqual(task.spec.action.shape, [16])
+        XCTAssertEqual(task.environment.scene.colliders
+            .filter(\.collisionEnabled).count, 1 + 4 * 39,
+            "visual goals must not change physical collision topology")
+        for ref in task.environment.refs {
+            let start = try XCTUnwrap(ref.startMarker)
+            let goal = try XCTUnwrap(ref.goalMarker)
+            let markerColliders = task.environment.scene.colliders.filter {
+                $0.body == start || $0.body == goal
+            }
+            XCTAssertEqual(markerColliders.count, 3)
+            XCTAssertTrue(markerColliders.allSatisfy {
+                !$0.collisionEnabled && $0.isRendered
+            })
+            XCTAssertFalse(ref.bodies.contains(start))
+            XCTAssertFalse(ref.bodies.contains(goal))
+        }
+
+        _ = try task.reset(seed: 777)
+        let firstGoals = (0..<4).map {
+            task.currentGoalPosition(environment: $0)
+        }
+        let firstRoots = task.environment.states().map(\.root.position)
+        for e in 0..<4 {
+            let delta = firstGoals[e] - firstRoots[e]
+            let distance = sqrt(delta.x * delta.x + delta.y * delta.y)
+            XCTAssertTrue((0.8...1.2).contains(distance))
+            let command = task.currentCommand(environment: e)
+            XCTAssertLessThanOrEqual(
+                sqrt(command.x * command.x + command.y * command.y),
+                0.20 + 1e-6)
+            XCTAssertLessThanOrEqual(abs(command.z), 0.8 + 1e-6)
+        }
+        _ = try task.reset(seed: 777)
+        XCTAssertEqual((0..<4).map {
+            task.currentGoalPosition(environment: $0)
+        }, firstGoals)
+
+        try task.setGoal(
+            environment: 0, direction: F3(0, 2, 0), distance: 1.1)
+        let northObservation = try task.reset(seed: 778)
+        let state = task.environment.states()[0]
+        let goal = task.currentGoalPosition(environment: 0)
+        XCTAssertEqual(goal.x, state.root.position.x, accuracy: 1e-5)
+        XCTAssertEqual(goal.y - state.root.position.y, 1.1, accuracy: 1e-5)
+        let marker = try XCTUnwrap(task.environment.refs[0].goalMarker)
+        let markerState = task.environment.solver.bodyStates([marker])[0]
+        XCTAssertEqual(markerState.position.x, goal.x, accuracy: 1e-5)
+        XCTAssertEqual(markerState.position.y, goal.y, accuracy: 1e-5)
+
+        try task.setGoal(
+            environment: 0, direction: F3(2, 0, 0), distance: 1.1)
+        let eastObservation = try task.reset(seed: 778)
+        for i in 0..<Arachne15LocomotionTask.observationDimension
+            where !(9..<12).contains(i) {
+            XCTAssertEqual(
+                northObservation.policy[i], eastObservation.policy[i],
+                accuracy: 1e-6,
+                "goal marker/coordinates leaked into observation index \(i)")
+        }
+        XCTAssertNotEqual(
+            northObservation.policy[9], eastObservation.policy[9],
+            "only the documented local command should expose target intent")
+
+        let actions = RLActionBatch(spec: task.spec)
+        var result = RLStepBatch(spec: task.spec)
+        try task.step(actions: actions, into: &result)
+        XCTAssertTrue(result.observations.policy.allSatisfy(\.isFinite))
+        XCTAssertNotNil(result.metrics["state/goal_distance_m"])
+        XCTAssertNotNil(result.metrics["reward/goal_progress"])
+
+        let replayTask = try BuiltInRLTasks.registry.make(
+            "arachne15-goal-v0",
+            configuration: RLTaskConfiguration(
+                numEnvironments: 1, seed: 501, autoReset: false,
+                options: task.spec.configurationValues))
+        XCTAssertEqual(
+            replayTask.spec.configurationValues,
+            task.spec.configurationValues,
+            "serialized training configuration must reconstruct exact replay")
+    }
+
     func testBuiltInTasksRejectUnknownOptionsInsteadOfUsingDefaults() {
         XCTAssertThrowsError(try BuiltInRLTasks.registry.make(
             "humanoid-goal-v0",
@@ -79,6 +181,16 @@ final class RLFrameworkTests: XCTestCase {
             let message = String(describing: error)
             XCTAssertTrue(message.contains("goalSlowdownDistanceMeters"))
             XCTAssertTrue(message.contains("goalSlowdownDistance"))
+        }
+        XCTAssertThrowsError(try BuiltInRLTasks.registry.make(
+            "arachne15-goal-v0",
+            configuration: RLTaskConfiguration(
+                numEnvironments: 1,
+                options: [
+                    "massScaleLower": 1.2,
+                    "massScaleUpper": 0.8,
+                ]))) { error in
+            XCTAssertTrue(String(describing: error).contains("massScale"))
         }
     }
 

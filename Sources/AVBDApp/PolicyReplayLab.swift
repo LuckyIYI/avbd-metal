@@ -16,6 +16,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case humanoidGoal = "Legacy Goal"
         case arm = "Arm Push-T"
         case arachne = "Arachne-15"
+        case arachneGoal = "Arachne Goal"
 
         var taskID: String {
             switch self {
@@ -25,6 +26,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             case .humanoidGoal: return "humanoid-goal-v0"
             case .arm: return "arm-pusht-v0"
             case .arachne: return "arachne15-velocity-v0"
+            case .arachneGoal: return "arachne15-goal-v0"
             }
         }
     }
@@ -44,6 +46,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case "humanoid-goal-v0": return .humanoidGoal
         case "arm-pusht-v0": return .arm
         case "arachne15-velocity-v0": return .arachne
+        case "arachne15-goal-v0": return .arachneGoal
         case "humanoid-isaac-flat-v0": return .humanoidIsaac
         default:
             return environment["AVBD_REPLAY_ROBOT"] == "arm"
@@ -107,10 +110,15 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var completed = 0
     private var successes = 0
     private var nextProjectileSide: Float = 1
+    private var replaySeed: UInt64 = 21_001
 
     var supportsGoalPlacement: Bool {
         isaacHumanoid?.usesPointGoal == true
             || humanoid?.usesPointGoal == true
+            || arachne?.usesPointGoal == true
+    }
+    var goalDistanceRange: ClosedRange<Double> {
+        arachne?.usesPointGoal == true ? 0.4...3.0 : 2...12
     }
     var supportsBoxThrows: Bool {
         isaacHumanoid?.hasProjectile(environment: 0) == true
@@ -143,6 +151,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             return "Replay the learned articulated-arm Push-T policy."
         case .arachne:
             return "Arachne-15 velocity locomotion with the exact printable CAD visuals, explicit training colliders, measured mass budget, actuator limits, latency, and seeded plant variation."
+        case .arachneGoal:
+            return "Arachne-15 samples a random world target, converts it to the reusable local velocity/yaw command, and must enter the visible target slowly enough to stop there."
         }
     }
 
@@ -160,6 +170,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         task = nil; runner = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
+        replaySeed = 21_001
         interactionStatus = ""
         episodeFinished = false
         running = true
@@ -187,6 +198,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             arm = configuredTask as? ArmPushTTask
             arachne = configuredTask as? Arachne15LocomotionTask
             task = configuredTask
+            if arachne?.usesPointGoal == true,
+               !goalDistanceRange.contains(goalDistance) {
+                goalDistance = 1.5
+            }
             if let humanoid, humanoid.usesPointGoal {
                 try installSelectedGoal(in: humanoid)
             }
@@ -268,6 +283,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 try installSelectedGoal(in: isaacHumanoid)
             } else if let humanoid, humanoid.usesPointGoal {
                 try installSelectedGoal(in: humanoid)
+            } else if let arachne, arachne.usesPointGoal {
+                try installSelectedGoal(in: arachne)
             } else {
                 return
             }
@@ -287,14 +304,31 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 isaacHumanoid.clearGoalOverride(environment: 0)
             } else if let humanoid, humanoid.usesPointGoal {
                 humanoid.clearGoalOverride(environment: 0)
+            } else if let arachne, arachne.usesPointGoal {
+                arachne.clearGoalOverride(environment: 0)
             } else {
                 return
             }
+            replaySeed &+= 0x9E3779B97F4A7C15
             try restartEpisode()
-            let direction = isaacHumanoid?.usesPointGoal == true
-                ? isaacHumanoid!.currentGoalDirection(environment: 0)
-                : humanoid!.currentGoalDirection(environment: 0)
+            let direction: F3
+            let distance: Float
+            if isaacHumanoid?.usesPointGoal == true {
+                direction = isaacHumanoid!.currentGoalDirection(environment: 0)
+                distance = simd_length(
+                    isaacHumanoid!.currentGoalPosition(environment: 0)
+                        - isaacHumanoid!.environment.states()[0].root.position)
+            } else if humanoid?.usesPointGoal == true {
+                direction = humanoid!.currentGoalDirection(environment: 0)
+                distance = simd_length(
+                    humanoid!.currentGoalPosition(environment: 0)
+                        - humanoid!.environment.states()[0].root.position)
+            } else {
+                direction = arachne!.currentGoalDirection(environment: 0)
+                distance = arachne!.currentGoalDistance(environment: 0)
+            }
             goalBearingDegrees = Double(atan2(direction.y, direction.x) * 180 / .pi)
+            goalDistance = Double(distance)
             interactionStatus = "goal sampled from the checkpoint task distribution"
         } catch {
             policyStatus = "goal reset failed: \(error.localizedDescription)"
@@ -315,6 +349,14 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     ) throws {
         let bearing = Float(goalBearingDegrees * .pi / 180)
         try humanoid.setGoal(
+            environment: 0,
+            direction: F3(cos(bearing), sin(bearing), 0),
+            distance: Float(goalDistance))
+    }
+
+    private func installSelectedGoal(in arachne: Arachne15LocomotionTask) throws {
+        let bearing = Float(goalBearingDegrees * .pi / 180)
+        try arachne.setGoal(
             environment: 0,
             direction: F3(cos(bearing), sin(bearing), 0),
             distance: Float(goalDistance))
@@ -430,7 +472,14 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
     private func restartEpisode() throws {
         guard let task else { return }
-        observation = try task.reset(seed: 21_001)
+        observation = try task.reset(seed: replaySeed)
+        if let arachne, arachne.usesPointGoal {
+            let direction = arachne.currentGoalDirection(environment: 0)
+            goalBearingDegrees = Double(
+                atan2(direction.y, direction.x) * 180 / .pi)
+            goalDistance = Double(
+                arachne.currentGoalDistance(environment: 0))
+        }
         result = RLStepBatch(spec: task.spec)
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
         episodeFinished = false; running = runner != nil
@@ -585,6 +634,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         } else if let arachne {
             let state = arachne.environment.states()[0]
             replayCameraTarget = state.root.position + F3(0.04, 0, 0.02)
+            if arachne.usesPointGoal {
+                courseCameraTarget = 0.5 * (
+                    state.root.position
+                        + arachne.currentGoalPosition(environment: 0))
+                    + F3(0, 0, 0.05)
+                return
+            }
             let command = arachne.currentCommand(environment: 0)
             let heading = state.root.rotation.act(F3(1, 0, 0))
             let planarLength = sqrt(
@@ -626,14 +682,30 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let velocity = inverse.act(state.root.linearVelocity)
             let angular = inverse.act(state.root.angularVelocity)
             let up = inverse.act(F3(0, 0, 1)).z
-            statsText = String(
-                format: "local velocity (%+.3f, %+.3f) / (%+.3f, %+.3f) m/s\n"
-                    + "yaw rate %+.3f / %+.3f rad/s   up %.3f\n"
-                    + "height %.3f m   frame %d/%d   episodes %d   success %d",
-                velocity.x, velocity.y, command.x, command.y,
-                angular.z, command.z, up, state.root.position.z,
-                controlSteps, arachne.spec.maxEpisodeSteps,
-                completed, successes)
+            if arachne.usesPointGoal {
+                statsText = String(
+                    format: "goal remaining %.3f m   planar speed %.3f m/s\n"
+                        + "local velocity (%+.3f, %+.3f) / (%+.3f, %+.3f) m/s\n"
+                        + "yaw rate %+.3f / %+.3f rad/s   up %.3f\n"
+                        + "height %.3f m   frame %d/%d   success %d",
+                    arachne.currentGoalDistance(environment: 0),
+                    sqrt(state.root.linearVelocity.x
+                        * state.root.linearVelocity.x
+                        + state.root.linearVelocity.y
+                            * state.root.linearVelocity.y),
+                    velocity.x, velocity.y, command.x, command.y,
+                    angular.z, command.z, up, state.root.position.z,
+                    controlSteps, arachne.spec.maxEpisodeSteps, successes)
+            } else {
+                statsText = String(
+                    format: "local velocity (%+.3f, %+.3f) / (%+.3f, %+.3f) m/s\n"
+                        + "yaw rate %+.3f / %+.3f rad/s   up %.3f\n"
+                        + "height %.3f m   frame %d/%d   episodes %d   success %d",
+                    velocity.x, velocity.y, command.x, command.y,
+                    angular.z, command.z, up, state.root.position.z,
+                    controlSteps, arachne.spec.maxEpisodeSteps,
+                    completed, successes)
+            }
         } else if let isaacHumanoid {
             let state = isaacHumanoid.environment.states()[0]
             let command = isaacHumanoid.currentCommand(environment: 0)
@@ -786,7 +858,9 @@ struct PolicyReplayLabView: View {
                         }
                         HStack {
                             Text("Distance").font(.caption).frame(width: 50, alignment: .leading)
-                            Slider(value: $model.goalDistance, in: 2...12, step: 0.5)
+                            Slider(value: $model.goalDistance,
+                                   in: model.goalDistanceRange,
+                                   step: model.robot == .arachneGoal ? 0.1 : 0.5)
                             Text(String(format: "%.1f m", model.goalDistance))
                                 .font(.caption.monospacedDigit()).frame(width: 42)
                         }
@@ -877,6 +951,7 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
             renderer.azimuth = -.pi / 2
             renderer.elevation = model.cameraMode == .follow ? 0.12 : 0.16
             let isArachne = model.robot == .arachne
+                || model.robot == .arachneGoal
             renderer.distance = model.cameraMode == .follow
                 ? (isArachne ? 0.65 : 3.2)
                 : (isArachne ? 1.5 : 15)

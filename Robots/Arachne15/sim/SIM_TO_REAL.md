@@ -31,13 +31,16 @@ overwrite the nominal file without retaining the measurement provenance.
    error, not only the fitted parameters.
 3. **Nominal velocity:** train on the explicit primitive collision profile.
    Evaluate fixed seeds on both training and validation collision profiles.
-4. **Measured randomization:** expand each range only to cover repeated
+4. **Point-goal navigation:** initialize from a passing velocity controller,
+   then evaluate random bearing/distance targets. Require stable arrival, not
+   only minimum distance, and publish final/minimum distance distributions.
+5. **Measured randomization:** expand each range only to cover repeated
    hardware measurements plus sensor uncertainty. Keep a nominal cohort so
    excessive randomization cannot hide model regressions.
-5. **Disturbance validation:** randomized payload placement, foot friction,
+6. **Disturbance validation:** randomized payload placement, foot friction,
    voltage, latency, slope, and external pushes. Hold out combinations and
    random seeds from training.
-6. **Hardware crawl:** suspended gait, tethered stand, low-body straight crawl,
+7. **Hardware crawl:** suspended gait, tethered stand, low-body straight crawl,
    turns, then untethered trials. The ESP32 watchdog and physical kill switch
    remain independent of the learned policy at every stage.
 
@@ -59,6 +62,15 @@ gravity, contact count, and individual reward/penalty terms. Experiment reports
 must retain the checkpoint fingerprint, complete serialized task configuration,
 trainer configuration, commit, seed list, raw JSONL metrics, and evaluation
 JSON. A screenshot or one successful replay is never an acceptance result.
+
+The point-goal task additionally exports `episode/goal_reached`, goal-entry,
+arrival-speed and dwell metrics,
+`episode/final_goal_distance_m`, `episode/minimum_goal_distance_m`, live goal
+distance, progress reward, and stable-arrival reward. Before camera input is
+enabled, these measure navigation/controller performance with an exact task
+goal. Camera and hand-gesture experiments must separately report goal-estimator
+angular/range error and then the end-to-end navigation metrics; do not hide
+perception failures inside locomotion success.
 
 ## Initial PPO run
 
