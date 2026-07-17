@@ -46,25 +46,70 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
         })
     }
 
-    func testTrackedMetadataReconstructionExposesPhysicsRevisionStaleness()
-        throws {
+    func testTrackedReplayCatalogContainsOnlyExactCurrentPolicies() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let metadataPaths: [(path: String, expectsStalePhysics: Bool)] = [
-            ("checkpoints/humanoid-walk-v0/metadata.json", true),
-            ("checkpoints/humanoid-goal-v0/metadata.json", true),
-            ("checkpoints/humanoid-isaac-flat-v0/metadata.json", true),
-            ("checkpoints/humanoid-isaac-goal-v0/metadata.json", true),
-            ("Robots/Arachne15/policies/"
-                + "arachne15-goal-r6-update-000020/metadata.json", false),
-        ]
+        let selectionIDs = PolicyReplayCatalog.entries.map(\.selectionID)
+        XCTAssertEqual(Set(selectionIDs).count, selectionIDs.count)
+        for entry in PolicyReplayCatalog.entries {
+            XCTAssertEqual(
+                entry.runtime == .classicalController,
+                entry.checkpointRelativeDirectory == nil,
+                "only the explicitly non-neural baseline may omit a checkpoint")
+            XCTAssertEqual(
+                entry.runtime == .classicalController,
+                entry.evidenceRelativePath == nil,
+                "every learned replay must name machine-readable evidence")
+            if let evidence = entry.evidenceRelativePath {
+                XCTAssertTrue(
+                    FileManager.default.fileExists(
+                        atPath: root.appendingPathComponent(evidence).path),
+                    evidence)
+            }
+        }
+        let policyDirectories = PolicyReplayCatalog.nativeLearnedEntries.map {
+            "checkpoints/" + $0.checkpointRelativeDirectory!
+        }
 
-        for entry in metadataPaths {
+        let checkpointRoot = root.appendingPathComponent("checkpoints")
+        let actualTaskDirectories = try FileManager.default.contentsOfDirectory(
+            at: checkpointRoot, includingPropertiesForKeys: nil)
+            .filter {
+                FileManager.default.fileExists(
+                    atPath: $0.appendingPathComponent("metadata.json").path)
+            }
+            .map(\.lastPathComponent)
+            .sorted()
+        XCTAssertEqual(actualTaskDirectories, policyDirectories.map {
+            URL(fileURLWithPath: $0).lastPathComponent
+        }.sorted(), "deprecated or unregistered replay checkpoints must not ship")
+
+        for entry in PolicyReplayCatalog.entries
+            where entry.runtime == .unitreeRecurrentMLX {
+            let directory = checkpointRoot.appendingPathComponent(
+                try XCTUnwrap(entry.checkpointRelativeDirectory))
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent("manifest.json").path))
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(
+                    "policy.safetensors").path))
+        }
+
+        for directory in policyDirectories {
+            let policyDirectory = root.appendingPathComponent(directory)
+            let metadataPath = policyDirectory.appendingPathComponent(
+                "metadata.json")
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: policyDirectory.appendingPathComponent(
+                    "policy.safetensors").path), directory)
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: policyDirectory.appendingPathComponent(
+                    "training-state.json").path), directory)
             let metadata = try JSONDecoder().decode(
                 VectorPolicyMetadata.self,
-                from: Data(contentsOf: root.appendingPathComponent(entry.path)))
+                from: Data(contentsOf: metadataPath))
             let options = BuiltInRLTasks.registry.checkpointReplayOptions(
                 for: metadata.task,
                 semanticOptions: try XCTUnwrap(metadata.taskConfiguration),
@@ -76,14 +121,9 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                     numEnvironments: 1, seed: 1, autoReset: false,
                     options: options))
             let mismatches = metadata.compatibilityMismatches(with: task.spec)
-            if entry.expectsStalePhysics {
-                XCTAssertEqual(mismatches.count, 1, entry.path)
-                XCTAssertTrue(mismatches[0].hasPrefix("revision "), entry.path)
-            } else {
-                XCTAssertTrue(
-                    mismatches.isEmpty,
-                    "\(entry.path): \(mismatches.joined(separator: "; "))")
-            }
+            XCTAssertTrue(
+                mismatches.isEmpty,
+                "\(directory): \(mismatches.joined(separator: "; "))")
         }
     }
 }

@@ -9,42 +9,41 @@ import AVBDLearn
 @MainActor
 final class PolicyReplayModel: ObservableObject, RenderableModel {
     nonisolated let captureID = "policy"
-    enum Robot: String, CaseIterable {
-        case unitreeH1 = "Unitree H1 Sim2Sim"
-        case humanoidIsaac = "H1 Flat Walk"
-        case humanoidIsaacGoal = "H1 Goal"
-        case humanoidWalk = "Humanoid Walk"
-        case humanoidGoal = "Legacy Goal"
-        case arm = "Arm Push-T"
-        case arachne = "Arachne-15"
-        case arachneGoal = "Arachne Goal"
-        case arachneClassical = "Arachne Classical"
+    enum Robot: CaseIterable {
+        case unitreeH1
+        case humanoidIsaac
+        case humanoidIsaacGoal
+        case arachne
+        case arachneGoal
+        case arachneClassical
 
-        var taskID: String {
+        var selectionID: String {
             switch self {
             case .unitreeH1: return "unitree-h1-sim2sim-v0"
             case .humanoidIsaac: return "humanoid-isaac-flat-v0"
             case .humanoidIsaacGoal: return "humanoid-isaac-goal-v0"
-            case .humanoidWalk: return "humanoid-walk-v0"
-            case .humanoidGoal: return "humanoid-goal-v0"
-            case .arm: return "arm-pusht-v0"
             case .arachne: return "arachne15-velocity-v0"
-            case .arachneGoal, .arachneClassical: return "arachne15-goal-v0"
+            case .arachneGoal: return "arachne15-goal-v0"
+            case .arachneClassical: return "arachne15-classical-goal-v0"
             }
         }
 
-        var selectionID: String {
-            self == .arachneClassical
-                ? "arachne15-classical-goal-v0" : taskID
+        private var catalogEntry: PolicyReplayCatalogEntry {
+            // Every UI case is intentionally backed by the shared, tested
+            // catalog; adding a case without a packaged-policy declaration is
+            // a programmer error rather than a silent empty replay.
+            PolicyReplayCatalog.entry(selectionID: selectionID)!
         }
 
-        var usesClassicalController: Bool { self == .arachneClassical }
+        var displayName: String { catalogEntry.displayName }
+        var taskID: String { catalogEntry.taskID }
+
+        var usesClassicalController: Bool {
+            catalogEntry.runtime == .classicalController
+        }
 
         static func fromSelectionID(_ id: String) -> Robot? {
-            if id == "arachne15-classical-goal-v0" {
-                return .arachneClassical
-            }
-            return Robot(taskID: id)
+            allCases.first { $0.selectionID == id }
         }
 
         init?(taskID: String) {
@@ -52,9 +51,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             case "unitree-h1-sim2sim-v0": self = .unitreeH1
             case "humanoid-isaac-flat-v0": self = .humanoidIsaac
             case "humanoid-isaac-goal-v0": self = .humanoidIsaacGoal
-            case "humanoid-walk-v0": self = .humanoidWalk
-            case "humanoid-goal-v0": self = .humanoidGoal
-            case "arm-pusht-v0": self = .arm
             case "arachne15-velocity-v0": self = .arachne
             case "arachne15-goal-v0": self = .arachneGoal
             default: return nil
@@ -74,8 +70,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             ?? UserDefaults.standard.string(
                 forKey: "AVBDPolicyReplaySelectedTask")
         return requestedTask.flatMap(Robot.fromSelectionID)
-            ?? (environment["AVBD_REPLAY_ROBOT"] == "arm"
-                ? .arm : .humanoidIsaac)
+            ?? .humanoidIsaac
     }() {
         didSet {
             UserDefaults.standard.set(
@@ -112,8 +107,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private(set) var cameraEpoch = 0
 
     private var isaacHumanoid: HumanoidIsaacVelocityTask?
-    private var humanoid: HumanoidWalkTask?
-    private var arm: ArmPushTTask?
     private var arachne: Arachne15LocomotionTask?
     private var unitreeH1: UnitreeH1Sim2SimSession?
     private var task: (any VectorizedRLTask)?
@@ -140,7 +133,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
     var supportsGoalPlacement: Bool {
         isaacHumanoid?.usesPointGoal == true
-            || humanoid?.usesPointGoal == true
             || arachne?.usesPointGoal == true
     }
     var usesCheckpoint: Bool { !robot.usesClassicalController }
@@ -157,18 +149,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
     var supportsBoxThrows: Bool {
         isaacHumanoid?.hasProjectile(environment: 0) == true
-            || humanoid?.hasProjectile(environment: 0) == true
     }
     var impactModelSummary: String {
         if let isaacHumanoid, isaacHumanoid.hasProjectile(environment: 0) {
             return String(
                 format: "%.1f kg box · full imported H1 collision primitives",
                 isaacHumanoid.environment.projectileMass)
-        }
-        if let humanoid, humanoid.hasProjectile(environment: 0) {
-            return String(
-                format: "%.1f kg box · articulated robot collision bodies",
-                humanoid.environment.projectileMass)
         }
         return "no physical projectile in this checkpoint scene"
     }
@@ -179,15 +165,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case .humanoidIsaac:
             return "Replay the accepted H1 policy on the exact public Flat velocity task. Markers show the current command segment, not a point goal."
         case .humanoidIsaacGoal:
-            return "Imported H1 point-goal task transferred from the accepted Flat locomotion policy; PPO owns every joint action."
-        case .humanoidWalk:
-            return "One complete A→B evaluation of a learned velocity policy."
-        case .humanoidGoal:
-            return "Experimental native-humanoid goal policy; this is not the accepted imported-H1 Flat policy."
-        case .arm:
-            return "Replay the learned articulated-arm Push-T policy."
+            return "Development H1 point-goal/8 kg impact policy on the current actuator contract (78.1% sealed-test goal success); PPO owns every joint action, but this policy is not acceptance-qualified yet."
         case .arachne:
-            return "Arachne-15 velocity locomotion with the exact printable CAD visuals, explicit training colliders, measured mass budget, actuator limits, latency, and seeded plant variation."
+            return "Accepted Arachne-15 straight-walk benchmark at 0.15 m/s with the exact printable CAD visuals and corrected revision-6 foot collision model."
         case .arachneGoal:
             return "Arachne-15 samples a random world target, converts it to the reusable local velocity/yaw command, and must enter the visible target slowly enough to stop there."
         case .arachneClassical:
@@ -198,8 +178,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     var solver: GPUSolver? {
         if let unitreeH1 { return unitreeH1.environment.solver }
         if let isaacHumanoid { return isaacHumanoid.environment.solver }
-        if let humanoid { return humanoid.environment.solver }
-        if let arm { return arm.environment.solver }
         return arachne?.environment.solver
     }
 
@@ -220,7 +198,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func rebuild() {
-        unitreeH1 = nil; isaacHumanoid = nil; humanoid = nil; arm = nil
+        unitreeH1 = nil; isaacHumanoid = nil
         arachne = nil
         task = nil; actionProvider = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
@@ -240,9 +218,22 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 return
             }
             let desiredTaskID = robot.taskID
-            let packagedPath = "checkpoints/\(desiredTaskID)"
+            let checkpointRelativeDirectory: String
+            if robot.usesClassicalController {
+                checkpointRelativeDirectory = desiredTaskID
+            } else {
+                guard let declared = PolicyReplayCatalog
+                    .entry(selectionID: robot.selectionID)?
+                    .checkpointRelativeDirectory else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "learned replay has no packaged checkpoint declaration")
+                }
+                checkpointRelativeDirectory = declared
+            }
+            let packagedPath = "checkpoints/\(checkpointRelativeDirectory)"
             let bundledPath = Bundle.main.resourceURL?
-                .appendingPathComponent("checkpoints/\(desiredTaskID)").path
+                .appendingPathComponent(
+                    "checkpoints/\(checkpointRelativeDirectory)").path
             let overridePath = ProcessInfo.processInfo.environment[
                 "AVBD_REPLAY_CHECKPOINT"]
             let configurationPaths = robot.usesClassicalController ? [] : [
@@ -269,8 +260,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     numEnvironments: 1, seed: 21_001, autoReset: false,
                     options: replayOptions))
             isaacHumanoid = configuredTask as? HumanoidIsaacVelocityTask
-            humanoid = configuredTask as? HumanoidWalkTask
-            arm = configuredTask as? ArmPushTTask
             arachne = configuredTask as? Arachne15LocomotionTask
             task = configuredTask
             if robot.usesClassicalController {
@@ -284,9 +273,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             if arachne?.usesPointGoal == true,
                !goalDistanceRange.contains(goalDistance) {
                 goalDistance = 1.5
-            }
-            if let humanoid, humanoid.usesPointGoal {
-                try installSelectedGoal(in: humanoid)
             }
             guard let task else { return }
             let liveCheckpoint = robot.usesClassicalController ? nil
@@ -396,8 +382,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         do {
             if let isaacHumanoid, isaacHumanoid.usesPointGoal {
                 try installSelectedGoal(in: isaacHumanoid)
-            } else if let humanoid, humanoid.usesPointGoal {
-                try installSelectedGoal(in: humanoid)
             } else if let arachne, arachne.usesPointGoal {
                 try installSelectedGoal(in: arachne)
             } else {
@@ -417,8 +401,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         do {
             if let isaacHumanoid, isaacHumanoid.usesPointGoal {
                 isaacHumanoid.clearGoalOverride(environment: 0)
-            } else if let humanoid, humanoid.usesPointGoal {
-                humanoid.clearGoalOverride(environment: 0)
             } else if let arachne, arachne.usesPointGoal {
                 arachne.clearGoalOverride(environment: 0)
             } else {
@@ -433,11 +415,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 distance = simd_length(
                     isaacHumanoid!.currentGoalPosition(environment: 0)
                         - isaacHumanoid!.environment.states()[0].root.position)
-            } else if humanoid?.usesPointGoal == true {
-                direction = humanoid!.currentGoalDirection(environment: 0)
-                distance = simd_length(
-                    humanoid!.currentGoalPosition(environment: 0)
-                        - humanoid!.environment.states()[0].root.position)
             } else {
                 direction = arachne!.currentGoalDirection(environment: 0)
                 distance = arachne!.currentGoalDistance(environment: 0)
@@ -449,14 +426,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             policyStatus = "goal reset failed: \(error.localizedDescription)"
             running = false
         }
-    }
-
-    private func installSelectedGoal(in humanoid: HumanoidWalkTask) throws {
-        let bearing = Float(goalBearingDegrees * .pi / 180)
-        try humanoid.setGoalOverride(
-            environment: 0,
-            direction: F3(cos(bearing), sin(bearing), 0),
-            distance: Float(goalDistance))
     }
 
     private func installSelectedGoal(
@@ -483,13 +452,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             return
         }
         let state = isaacHumanoid?.environment.states()[0]
-            ?? humanoid?.environment.states()[0]
         guard let state else { return }
         let forward: F3
         if let isaacHumanoid, isaacHumanoid.usesPointGoal {
             forward = isaacHumanoid.currentGoalDirection(environment: 0)
-        } else if let humanoid, humanoid.usesPointGoal {
-            forward = humanoid.currentGoalDirection(environment: 0)
         } else {
             forward = F3(1, 0, 0)
         }
@@ -500,7 +466,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             + forward * 0.15
         let flightTime = launchDistance / Float(boxSpeed)
         let gravityValue = isaacHumanoid?.environment.scene.settings.gravity
-            ?? humanoid?.environment.scene.settings.gravity ?? -9.81
+            ?? -9.81
         let gravity = F3(0, 0, gravityValue)
         let predictedTarget = target + state.torso.linearVelocity * flightTime
         let velocity = (predictedTarget - launch
@@ -508,18 +474,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let angularVelocity = F3(
             nextProjectileSide * 2.5, -nextProjectileSide * 1.5,
             nextProjectileSide * 3.5)
-        if let isaacHumanoid {
-            isaacHumanoid.environment.throwProjectiles(
-                environmentIDs: [0], positions: [launch],
-                velocities: [velocity], angularVelocities: [angularVelocity])
-        } else if let humanoid {
-            humanoid.environment.throwProjectiles(
-                environmentIDs: [0], positions: [launch],
-                velocities: [velocity], angularVelocities: [angularVelocity])
-        }
+        isaacHumanoid?.environment.throwProjectiles(
+            environmentIDs: [0], positions: [launch],
+            velocities: [velocity], angularVelocities: [angularVelocity])
         let side = nextProjectileSide > 0 ? "left" : "right"
-        let mass = isaacHumanoid?.environment.projectileMass
-            ?? humanoid?.environment.projectileMass ?? 0
+        let mass = isaacHumanoid?.environment.projectileMass ?? 0
         interactionStatus = String(
             format: "%.1f kg physical box thrown from robot's %@ at %.1f m/s",
             mass, side, boxSpeed)
@@ -693,7 +652,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             do {
                 let rootVelocityBeforeStep = isaacHumanoid?
                     .environment.states()[0].root.linearVelocity
-                    ?? humanoid?.environment.states()[0].root.linearVelocity
                 guard let actionProvider else {
                     running = false
                     return
@@ -706,7 +664,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                    let before = rootVelocityBeforeStep {
                     let after = isaacHumanoid?
                         .environment.states()[0].root.linearVelocity
-                        ?? humanoid?.environment.states()[0].root.linearVelocity
                         ?? before
                     interactionStatus = String(
                         format: "physical contact registered · root Δv %.3f m/s",
@@ -799,27 +756,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let projection = isaacHumanoid.currentCommandProjection(environment: 0)
             courseCameraTarget = 0.5 * (origin + projection)
                 + F3(0, 0, 0.9)
-        } else if let humanoid {
-            let state = humanoid.environment.states()[0]
-            replayCameraTarget = state.root.position + F3(0.15, 0, 0.15)
-            if humanoid.usesPointGoal {
-                courseCameraTarget = 0.5 * (
-                    humanoid.environment.refs[0].center
-                        + humanoid.currentGoalPosition(environment: 0))
-                    + F3(0, 0, 0.9)
-            } else {
-                let commandTarget = humanoid.currentCommandSpeed(environment: 0)
-                    * Float(humanoid.spec.maxEpisodeSteps) * humanoid.spec.controlStep
-                courseCameraTarget = humanoid.environment.refs[0].center
-                    + F3(commandTarget * 0.5, 0, 0.9)
-            }
-        } else if let arm {
-            let state = arm.environment.states()[0]
-            let goal = arm.environment.refs[0].goalPosition
-            replayCameraTarget = F3(
-                0.5 * (state.blockPosition.x + goal.x),
-                0.5 * (state.blockPosition.y + goal.y), 0.25)
-            courseCameraTarget = replayCameraTarget
         } else if let arachne {
             let state = arachne.environment.states()[0]
             replayCameraTarget = state.root.position + F3(0.04, 0, 0.02)
@@ -950,51 +886,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     controlSteps, isaacHumanoid.spec.maxEpisodeSteps,
                     completed, successes)
             }
-        } else if let humanoid {
-            let s = humanoid.environment.states()[0]
-            let forward = s.torso.rotation.act(F3(1, 0, 0))
-            let headingMagnitude = max(
-                sqrt(forward.x * forward.x + forward.y * forward.y), 1e-6)
-            let headingAlignment = forward.x / headingMagnitude
-            let command = humanoid.currentCommandSpeed(environment: 0)
-            let measuredVelocity = humanoid.currentMeasuredRootVelocity(environment: 0)
-            if humanoid.usesPointGoal {
-                let toGoal = humanoid.currentGoalPosition(environment: 0)
-                    - s.root.position
-                let distance = simd_length(F3(toGoal.x, toGoal.y, 0))
-                let direction = distance > 1e-6
-                    ? F3(toGoal.x, toGoal.y, 0) / distance : F3(1, 0, 0)
-                let goalHeading = simd_dot(
-                    F3(forward.x, forward.y, 0) / Float(headingMagnitude), direction)
-                statsText = String(
-                    format: "goal remaining %.3f m   speed %.3f / %.3f m/s\n"
-                        + "goal heading %.3f   foot exchanges %d\n"
-                        + "height %.3f m   frame %d/%d   episodes %d   success %d",
-                    distance, simd_length(F3(
-                        measuredVelocity.x, measuredVelocity.y, 0)), command,
-                    goalHeading, humanoid.currentAlternatingSteps(environment: 0),
-                    s.root.position.z, controlSteps, humanoid.spec.maxEpisodeSteps,
-                    completed, successes)
-            } else {
-                let target = command * Float(humanoid.spec.maxEpisodeSteps)
-                    * humanoid.spec.controlStep
-                statsText = String(format: "A→B x %+.3f / %.3f m   speed %+.3f / %.3f m/s\nheading %.3f   lateral %+.3f m   forward foot exchanges %d\nheight %.3f m   frame %d/%d   episodes %d   success %d",
-                                   s.root.position.x - humanoid.environment.refs[0].center.x,
-                                   target, measuredVelocity.x, command,
-                                   headingAlignment,
-                                   s.root.position.y - humanoid.environment.refs[0].center.y,
-                                   humanoid.currentAlternatingSteps(environment: 0),
-                                   s.root.position.z,
-                                   controlSteps, humanoid.spec.maxEpisodeSteps,
-                                   completed, successes)
-            }
-        } else if let arm {
-            let s = arm.environment.states()[0], goal = arm.environment.refs[0].goalPosition
-            statsText = String(format: "T (%.2f, %.2f)   goal (%.2f, %.2f)\ndistance %.3f m   yaw error %.3f rad\nstep %d/%d   episodes %d   success %d",
-                               s.blockPosition.x, s.blockPosition.y, goal.x, goal.y,
-                               simd_length(goal - s.blockPosition), abs(s.blockYaw),
-                               controlSteps, arm.spec.maxEpisodeSteps,
-                               completed, successes)
         }
     }
 }
@@ -1015,7 +906,7 @@ struct PolicyReplayLabView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Picker("Task", selection: $model.robot) {
                         ForEach(PolicyReplayModel.Robot.allCases, id: \.self) {
-                            Text($0.rawValue).tag($0)
+                            Text($0.displayName).tag($0)
                         }
                     }
                     .pickerStyle(.menu)

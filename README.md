@@ -38,9 +38,10 @@ crossing protection with boundary release, runtime shader concatenation
 
 The vector RL path is task-agnostic and runs the simulator and MLX learner on
 Apple silicon. Built-in tasks include Cartesian Push-T, randomized articulated
-arm Push-T, the imported 19-DoF Unitree H1 Flat velocity task aligned to Isaac
-Lab, the printable 16-DoF Arachne-15 spider, and earlier native humanoid
-experiments:
+arm Push-T, the full seven-axis Panda port of ManiSkill PushT-v1, the imported
+19-DoF Unitree H1 tasks aligned to Isaac Lab, the printable 16-DoF Arachne-15
+spider, and earlier native humanoid research tasks. Policy Replay is narrower:
+it exposes only maintained examples with a packaged current-contract policy.
 
 ```bash
 .build/release/avbd list-rl
@@ -78,26 +79,34 @@ publish gates and exits nonzero when a policy stands still, falls early, misses
 Push-T, or otherwise fails its contract. See
 [the RL architecture and research notes](docs/RL_ARCHITECTURE.md).
 
-The packaged revision-10 H1 PPO checkpoint passes its documented held-out
-gate. Update 300 was chosen across three validation seeds (758/768 successes),
-then achieved 507/512 successes on untouched seed 28001, with 0.471 m/s
-achieved versus 0.495 m/s commanded velocity, 0.089 m/s linear RMSE, 0.133
-rad/s yaw-rate RMSE, and 9.38 m mean forward path. Its immutable fingerprint is
-`a26559e...16fb8`. This is one training seed and therefore not yet the required
-multi-training-seed algorithm claim. The older revision-35 native humanoid also
-has a separately accepted checkpoint. The articulated-arm checkpoint remains
-rejected because its legacy policy exposed staged controller features. Replay
-refuses incompatible checkpoints instead of silently applying zero actions.
+The packaged H1 Flat actor has been transferred onto the corrected fixed-gain
+actuator contract (`taskRevision=1000010`) and passes its documented held-out
+gate. A sealed 512-episode test at seed 41010 achieved 507/512 successes
+(99.02%), 0.089 m/s linear RMSE, and 0.134 rad/s yaw-rate RMSE. Its immutable
+fingerprint is `d6b5d416...e777ab`. This transfer descends from one training
+seed and is therefore not a multi-training-seed algorithm claim.
 
-The packaged **H1 Goal** replay is the current experimental robustness best:
+The packaged **H1 Goal** replay is also on the corrected actuator contract and
+is the current experimental robustness best:
 it walks 4--8 m to a sampled point goal while one physical 8 kg box is launched
-at 4--6 m/s into the full articulated body. Across four 512-episode evaluation
-seeds it reached 1,604/2,048 goals (78.32%) with 82.03% median survival; every
-box launched and made physical contact. It is intentionally not labeled an
-accepted result yet because the unconditional final/minimum goal-distance
-medians, 1.234/1.200 m, exceed the 1.125/0.750 m gates. Select **H1 Goal** in
-Policy Replay and press **Load Latest** to run fingerprint
-`b6e449d...7afa`.
+at 4--6 m/s into the full articulated body. The sealed seed-42010 test reached
+400/512 goals (78.12%) and survived 80.66%; every box launched and made
+physical contact. It is intentionally not labeled an accepted result yet
+because unconditional final/minimum goal distances, 1.208/1.179 m, exceed the
+1.125/0.750 m gates. Its current fingerprint is `15710d3f...113f6`.
+
+The packaged **Arachne Straight Walk** actor is an accepted deterministic
+0.15 m/s regression benchmark on the corrected revision-6 foot collider. Its
+sealed seed-45010 test passed 512/512 episodes, with 0.068 m/s linear and 0.284
+rad/s yaw-rate RMSE and no control steps deeper than 1 mm below the floor.
+**Arachne Goal** remains the randomized, arbitrary-direction sim-to-real policy;
+its multi-seed qualification reports are shipped beside the robot assets.
+
+The earlier native humanoids and obsolete two-link Arm policy were removed from
+Policy Replay. The full Panda Push-T task remains trainable, but its best
+current held-out policy does not pass the 80% task-success gate and is therefore
+not shown as a solved example. Replay refuses incompatible checkpoints instead
+of silently applying zero actions.
 
 For H1 replay, the colored floor bars delimit the current velocity-command
 segment: its direction is the sampled absolute heading and its length is the
