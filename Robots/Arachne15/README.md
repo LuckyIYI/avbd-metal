@@ -69,6 +69,43 @@ which learned control must earn its complexity; see
 [sim/README.md](sim/README.md#classical-cpg--ik-baseline). It does not change
 the analytical hardware gates above.
 
+## Arachne Reveal
+
+![Arachne Reveal compact guard pose](build/arachne15-folded.png)
+
+The existing 16 actuators can also produce a physical compact/deploy sequence;
+no extra hinge or visual-only animation is required. The compact guard target
+sweeps the hip yaws to `±0.52 rad` and pitches each tibia to `+0.82 rad`. With
+the authored 65° tibia mounting angle this carries each foot 22.0° past
+vertical and under the chassis, with 0.08 rad remaining before the knee stop.
+
+The verified kinematic envelope changes from **284.6 × 381.4 mm** deployed to
+**238.4 × 268.6 mm** compact, a **41.0% area reduction**. The compact support
+polygon retains 70.5 mm of origin margin and the closest pair of leg beams
+retains 9.24 mm clearance. This is a stable guard/storage pose, not a flat or
+pocket-sized fold.
+
+The simulator executes the reveal through the ordinary position motors,
+gravity, friction, joint limits, and contacts. Two balanced diagonal four-leg
+waves lift, sweep, and plant to fold. Deployment first lowers all eight knees
+into a shared-load transport crouch, reverses those waves, then raises the
+body. The brief commissioning maneuver uses 0.372 N·m per joint—40% of
+the selected servo's 5 V stall torque—and restores the 0.186 N·m walking
+budget before handing the measured state back to the learned or classical
+controller. The deployed geometry and learned action contract are unchanged,
+so existing revision-6 policies do not require retraining.
+
+Run the exact geometry gate with:
+
+```sh
+python3 analysis/reveal_pose.py --check
+```
+
+This is still a pre-prototype result. Servo brackets, cables, connector loops,
+current limiting, temperature, and the complete swept volume need a slow,
+tethered hardware test. Do not copy the simulated transient torque scale to a
+robot until the bridge enforces measured current and thermal limits.
+
 Run the exact calculation:
 
 ```sh
@@ -106,9 +143,9 @@ OpenSCAD `2026.06.12` is installed at `/Applications/OpenSCAD.app` and linked as
 ./scripts/build_cad.sh
 ```
 
-That exports one STL per printable part, a rendered assembly PNG, a load report,
-and mesh bounds/volume metrics under `build/`. Individual parts can also be
-exported directly:
+That exports one STL per printable part, deployed and folded assembly PNGs,
+load/reveal reports, and mesh bounds/volume metrics under `build/`. Individual
+parts can also be exported directly:
 
 ```sh
 openscad --export-format binstl -D 'PART="chassis"' \

@@ -115,6 +115,27 @@ Policy Replay exposes **Arachne Goal**. **Sample Task Goal** draws another
 seeded task target; bearing and distance controls install a deterministic
 target for diagnosis. The UI never supplies joint targets.
 
+### Physical fold and reveal
+
+Every Arachne Policy Replay scene exposes **Fold & Reveal**. It resets to the
+authored assembly, then sends a bounded 482-tick commissioning trajectory to
+the same sixteen torque-limited motors used for walking. The renderer never
+edits the root or link poses. Folding uses two balanced diagonal
+lift/sweep/plant waves; unfolding uses a shared-load knee crouch and the
+complementary waves so no final two-leg pair has to raise the iPhone and
+chassis alone. When the
+sequence completes, the normal 20%-stall walking effort budget is restored and
+the selected learned or classical controller receives the measured physical
+observation.
+
+The compact targets are outside the learned action envelope but inside the
+authored MJCF reserve limits. Therefore this feature does not alter task revision 6,
+the deployed collision model, or the checkpoint tensor contract. The exact
+pre-check is part of `make verify-arachne-assets`; focused Swift tests require
+the compact pose to be reached by motor/contact dynamics, remain upright, stay
+near its start point, return to the loaded neutral stance, and survive the
+first post-commissioning task step.
+
 ### Classical CPG + IK baseline
 
 **Arachne Classical** runs without MLX or a checkpoint. A four-phase paired

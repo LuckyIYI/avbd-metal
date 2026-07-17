@@ -90,6 +90,7 @@ generate-arachne-assets:
 verify-arachne-assets:
 	python3 Robots/Arachne15/sim/generate_model.py --check
 	python3 Robots/Arachne15/sim/validate_model.py
+	python3 Robots/Arachne15/analysis/reveal_pose.py --check
 
 # Validate the tracked bundle, exact inference parity, and Metal latency.
 verify-arachne-policy: ml-tool

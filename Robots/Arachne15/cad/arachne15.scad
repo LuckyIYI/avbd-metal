@@ -4,6 +4,7 @@
 
 $fn = 48;
 PART = is_undef(PART) ? "assembly" : PART;
+POSE = is_undef(POSE) ? "deployed" : POSE;
 SHOW_KEEP_OUTS = is_undef(SHOW_KEEP_OUTS) ? true : SHOW_KEEP_OUTS;
 
 // Apple iPhone 15 Pro, Apple dimensional drawing / tech specs.
@@ -54,6 +55,16 @@ coxa_length = 50;
 tibia_length = 105;
 tibia_pitch_deg = 65;
 foot_radius = 4.5;
+
+// The reveal pose uses already-authored mechanical reserve travel; deployed
+// geometry remains byte-for-byte the walking datum. Rear coxae sweep backward,
+// front coxae forward, and tibias curl back toward the hip. Radian controller
+// targets are converted explicitly because OpenSCAD trigonometry uses degrees.
+reveal_hip_offset_deg = 0.52 * 180 / PI;
+reveal_knee_offset_deg = 0.82 * 180 / PI;
+reveal_body_lift = tibia_length
+    * (sin(tibia_pitch_deg + reveal_knee_offset_deg)
+        - sin(tibia_pitch_deg));
 
 // Power/electronics envelopes, intentionally not powered from the iPhone.
 battery_size = [105, 35, 18];     // typical 2S 2200 mAh pack envelope
@@ -252,13 +263,18 @@ module beam_between(p1, p2, radius, colour = [0.15, 0.35, 0.42]) {
 function outward_angle(x, side) =
     side * (x < -44 ? 140 : x < 0 ? 110 : x < 44 ? 70 : 40);
 
-module leg_assembly(x, side, index) {
-    a = outward_angle(x, side);
-    hip = [x, side * hip_y, hip_axis_z];
+function reveal_hip_offset(index, side) =
+    side * (index < 2 ? reveal_hip_offset_deg : -reveal_hip_offset_deg);
+
+module leg_assembly(x, side, index, body_z, hip_offset = 0,
+                    knee_offset = 0) {
+    a = outward_angle(x, side) + hip_offset;
+    pitch = tibia_pitch_deg + knee_offset;
+    hip = [x, side * hip_y, body_z + hip_axis_z - body_floor_z];
     knee = hip + [coxa_length * cos(a), coxa_length * sin(a), 0];
-    foot = knee + [tibia_length * cos(tibia_pitch_deg) * cos(a),
-                   tibia_length * cos(tibia_pitch_deg) * sin(a),
-                   -tibia_length * sin(tibia_pitch_deg)];
+    foot = knee + [tibia_length * cos(pitch) * cos(a),
+                   tibia_length * cos(pitch) * sin(a),
+                   -tibia_length * sin(pitch)];
 
     translate(hip) xc330_visual(true);
     beam_between(hip, knee, 5.5, index % 2 == 0 ? [0.13, 0.38, 0.46]
@@ -278,8 +294,8 @@ module orient_phone(phone_bottom) {
                 [0, 0, 0, 1]]) children();
 }
 
-module phone_visual() {
-    phone_bottom = body_floor_z + dock_phone_bottom_z;
+module phone_visual(body_z) {
+    phone_bottom = body_z + dock_phone_bottom_z;
     color([0.28, 0.31, 0.34, 0.93])
         orient_phone(phone_bottom)
             rounded_prism([phone_x, phone_y, phone_body_z], phone_corner_r);
@@ -291,8 +307,8 @@ module phone_visual() {
                     rounded_prism([42, 36, camera_extra_z], 7);
 }
 
-module camera_forward_visual() {
-    camera_z = body_floor_z + dock_phone_bottom_z + phone_y - 18;
+module camera_forward_visual(body_z) {
+    camera_z = body_z + dock_phone_bottom_z + phone_y - 18;
     camera_y = phone_x / 2 - 21;
     color([0.15, 0.55, 1.0, 0.65]) {
         beam_between([phone_body_z / 2 + camera_extra_z, camera_y, camera_z],
@@ -302,39 +318,44 @@ module camera_forward_visual() {
     }
 }
 
-module electronics_visual() {
+module electronics_visual(body_z) {
     color([0.20, 0.65, 0.28, 0.8])
-        translate([24, 0, body_floor_z - 20])
+        translate([24, 0, body_z - 20])
             rounded_prism(bridge_size, 3);
     color([0.18, 0.35, 0.75, 0.8])
-        translate([-34, 0, body_floor_z - 22])
+        translate([-34, 0, body_z - 22])
             rounded_prism(bec_size, 3);
     color([0.35, 0.25, 0.12, 0.9])
-        translate([0, 0, body_floor_z - 29])
+        translate([0, 0, body_z - 29])
             rounded_prism([battery_size[1], battery_size[0], battery_size[2]], 4);
 }
 
 module assembly() {
-    color([0.13, 0.14, 0.16]) translate([0, 0, body_floor_z]) chassis();
+    folded = POSE == "folded";
+    body_z = body_floor_z + (folded ? reveal_body_lift : 0);
+    color([0.13, 0.14, 0.16]) translate([0, 0, body_z]) chassis();
     for (side = [-1, 1])
         color([0.92, 0.52, 0.10])
-            translate([0, side * guide_center_y, body_floor_z])
+            translate([0, side * guide_center_y, body_z])
                 rotate([0, 0, side > 0 ? 0 : 180]) phone_guide();
-    phone_visual();
-    camera_forward_visual();
-    electronics_visual();
+    phone_visual(body_z);
+    camera_forward_visual(body_z);
+    electronics_visual(body_z);
     color([0.18, 0.18, 0.20])
-        translate([0, 0, body_floor_z - 28]) battery_cradle();
+        translate([0, 0, body_z - 28]) battery_cradle();
 
     for (side = [-1, 1])
         for (i = [0 : len(hip_xs) - 1])
-            leg_assembly(hip_xs[i], side, i + (side > 0 ? 0 : 4));
+            leg_assembly(
+                hip_xs[i], side, i + (side > 0 ? 0 : 4), body_z,
+                folded ? reveal_hip_offset(i, side) : 0,
+                folded ? reveal_knee_offset_deg : 0);
 
     // Two removable edge wedges; the walking build also uses a silicone strap.
     for (side = [-1, 1])
         color([0.95, 0.62, 0.16])
             translate([-8, side * (guide_center_y + guide_depth / 2),
-                       body_floor_z + guide_h - 8])
+                       body_z + guide_h - 8])
                 rotate([90, 0, side > 0 ? 0 : 180]) retainer_clip();
 
     // Ground datum.
@@ -347,6 +368,8 @@ echo(str("Arachne-15 landscape dock cavity: ", phone_cavity_thickness,
          " x ", phone_y, " x ", phone_body_z, " mm; rear camera faces +X"));
 echo(str("Nominal stance footprint approx 265 x 362 mm; chassis ground clearance ",
          body_floor_z, " mm"));
+echo(str("Arachne Reveal pose: ", POSE,
+         "; folded hip/knee reserve targets ±0.52 / +0.82 rad"));
 
 if (PART == "assembly") assembly();
 else if (PART == "chassis") chassis();

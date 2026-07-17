@@ -113,6 +113,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var observation: RLObservationBatch?
     private var result: RLStepBatch?
     private var actionProvider: (any RLActionProvider)?
+    private var arachneRevealController: Arachne15RevealController?
     private var loadedCheckpointDirectory: String?
     private let liveRunDirectory = ProcessInfo.processInfo.environment[
         "AVBD_REPLAY_RUN_DIR"]
@@ -135,6 +136,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         isaacHumanoid?.usesPointGoal == true
             || arachne?.usesPointGoal == true
     }
+    var supportsArachneReveal: Bool { arachne != nil }
+    var isRunningArachneReveal: Bool { arachneRevealController != nil }
     var usesCheckpoint: Bool { !robot.usesClassicalController }
     var controllerSectionTitle: String {
         usesCheckpoint ? "Parallel training" : "Controller"
@@ -200,6 +203,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     func rebuild() {
         unitreeH1 = nil; isaacHumanoid = nil
         arachne = nil
+        arachneRevealController = nil
         task = nil; actionProvider = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
@@ -306,6 +310,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     : "no compatible checkpoint: \(loadFailures.joined(separator: "; "))"
             }
             try restartEpisode()
+            if ProcessInfo.processInfo.environment[
+                    "AVBD_REPLAY_AUTO_REVEAL"] == "1",
+               arachne != nil {
+                runArachneReveal()
+            }
             refreshTrainingMetrics()
         } catch {
             policyStatus = "replay unavailable: \(error.localizedDescription)"
@@ -374,6 +383,31 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             try restartEpisode()
         } catch {
             policyStatus = "reset failed: \(error.localizedDescription)"
+            running = false
+        }
+    }
+
+    func runArachneReveal() {
+        guard let arachne else { return }
+        do {
+            // Start from the authored neutral assembly so the reveal is
+            // repeatable and never tries to fold an already-fallen robot.
+            try restartEpisode()
+            arachne.environment.setCommissioningTorqueScale(
+                Arachne15RevealController.commissioningTorqueScale)
+            let measured = arachne.environment.states()[0].jointAngles
+            arachneRevealController = Arachne15RevealController(
+                initialJointTargets: measured)
+            interactionStatus =
+                "physical reveal started · motor targets only · no pose animation"
+            episodeFinished = false
+            running = true
+            accumulator = 0
+            lastTime = CACurrentMediaTime()
+            refreshStats()
+        } catch {
+            arachne.environment.setCommissioningTorqueScale(1)
+            policyStatus = "reveal failed: \(error.localizedDescription)"
             running = false
         }
     }
@@ -549,6 +583,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func restartEpisode() throws {
+        if arachneRevealController != nil {
+            arachne?.environment.setCommissioningTorqueScale(1)
+        }
+        arachneRevealController = nil
         if robot == .unitreeH1 {
             guard let loadedCheckpointDirectory else {
                 throw RLEnvironmentError.invalidConfiguration(
@@ -650,6 +688,33 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         // to three steps per draw, keeping UI input latency bounded.
         while accumulator >= wallStep, ticks < maximumTicks {
             do {
+                if let reveal = arachneRevealController, let arachne {
+                    let targets = reveal.nextJointTargets()
+                    arachne.environment.stepJointTargets(
+                        targets,
+                        decimation: arachne.configuration.controlDecimation)
+                    controlSteps += 1
+                    updateCameraTargets()
+                    if reveal.isComplete {
+                        arachne.environment.setCommissioningTorqueScale(1)
+                        try arachne.resumeAfterCommissioning(
+                            into: &observation)
+                        if let actionProvider {
+                            try actionProvider.reset(
+                                for: task, observation: observation)
+                        }
+                        arachneRevealController = nil
+                        controlSteps = 0
+                        interactionStatus = actionProvider == nil
+                            ? "reveal complete · deployed pose physically holding"
+                            : "reveal complete · locomotion controller has physical state"
+                        running = actionProvider != nil
+                    }
+                    accumulator -= wallStep
+                    ticks += 1
+                    refreshStats()
+                    continue
+                }
                 let rootVelocityBeforeStep = isaacHumanoid?
                     .environment.states()[0].root.linearVelocity
                 guard let actionProvider else {
@@ -682,6 +747,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     break
                 }
             } catch {
+                if arachneRevealController != nil {
+                    arachne?.environment.setCommissioningTorqueScale(1)
+                    arachneRevealController = nil
+                }
                 policyStatus = "step failed: \(error.localizedDescription)"
                 running = false
             }
@@ -819,6 +888,16 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let velocity = inverse.act(state.root.linearVelocity)
             let angular = inverse.act(state.root.angularVelocity)
             let up = inverse.act(F3(0, 0, 1)).z
+            if let reveal = arachneRevealController {
+                statsText = String(
+                    format: "ARACHNE REVEAL · %@ · %.0f%%\n"
+                        + "all motion from 16 torque-limited joints + contact\n"
+                        + "height %.3f m   upright %.3f   tick %d/%d",
+                    reveal.phase.rawValue, reveal.progress * 100,
+                    state.root.position.z, up,
+                    reveal.stepIndex, reveal.totalSteps)
+                return
+            }
             if arachne.usesPointGoal {
                 statsText = String(
                     format: "goal remaining %.3f m   planar speed %.3f m/s\n"
@@ -940,6 +1019,18 @@ struct PolicyReplayLabView: View {
                     Text(model.statsText)
                         .font(.system(.caption, design: .monospaced))
                         .fixedSize(horizontal: false, vertical: true)
+                    if model.supportsArachneReveal {
+                        Divider()
+                        Text("Physical transformation").font(.headline)
+                        Button(model.isRunningArachneReveal
+                            ? "Reveal Running…" : "Fold & Reveal") {
+                            model.runArachneReveal()
+                        }
+                        .disabled(model.isRunningArachneReveal)
+                        Text("Folds into a compact guard pose, holds, then deploys through a shared-load crouch and two four-leg waves. The short commissioning budget is restored to walking torque before handoff. During the transformation, no root or link pose is edited.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if model.supportsGoalPlacement {
                         Divider()
                         Text("Interactive goal").font(.headline)
@@ -1007,7 +1098,7 @@ struct PolicyReplayLabView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(model.usesCheckpoint
-                        ? "This view executes only the learned Safetensors checkpoint used by `eval-rl`; no scripted or reference controller is available in learned replay."
+                        ? "Normal motion executes the learned Safetensors checkpoint used by `eval-rl`. The explicit Reveal button temporarily commands a bounded commissioning trajectory through the same motors and physics, then returns control to the policy."
                         : "This baseline contains no neural inference or checkpoint. Its motion is generated by the displayed CPG/IK controller through the exact same physical plant used by RL.")
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

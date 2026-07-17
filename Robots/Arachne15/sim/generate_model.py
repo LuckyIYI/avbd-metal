@@ -270,7 +270,7 @@ def generate(profile: str) -> str:
         '      <joint type="hinge" range="-0.55 0.55" damping="0.02" armature="0.00005"/>',
         '    </default>',
         '    <default class="knee_joint">',
-        '      <joint type="hinge" range="-0.70 0.70" damping="0.02" armature="0.00005"/>',
+        '      <joint type="hinge" range="-0.70 0.90" damping="0.02" armature="0.00005"/>',
         '    </default>',
         '  </default>',
         '  <asset>',

@@ -261,23 +261,62 @@ public final class Arachne15Env {
 
     public func step(actions: ContiguousArray<Float>, decimation: Int) {
         precondition(actions.count == numEnvironments * Self.actionDimension)
-        var targets: [GPUSolver.MotorTargetUpdate] = []
-        targets.reserveCapacity(actions.count)
+        var relativeTargets = ContiguousArray(
+            repeating: Float(0), count: actions.count)
         for e in 0..<numEnvironments {
             for j in 0..<Self.actionDimension {
-                let joint = refs[e].motors[j]
                 let requested = simd_clamp(actions[e * Self.actionDimension + j],
                                            -1, 1)
                     * Self.actionScales[j]
+                relativeTargets[e * Self.actionDimension + j] = requested
+            }
+        }
+        stepJointTargets(relativeTargets, decimation: decimation)
+    }
+
+    /// Commissioning/reveal path for targets beyond the learned action scale
+    /// but still inside authored mechanical limits. This does not move the
+    /// root or link poses directly; it only drives the same torque-limited
+    /// motors used by policies.
+    public func stepJointTargets(
+        _ relativeTargets: ContiguousArray<Float>, decimation: Int
+    ) {
+        precondition(relativeTargets.count
+            == numEnvironments * Self.actionDimension)
+        precondition(decimation > 0)
+        var targets: [GPUSolver.MotorTargetUpdate] = []
+        targets.reserveCapacity(relativeTargets.count)
+        for e in 0..<numEnvironments {
+            for j in 0..<Self.actionDimension {
+                let joint = refs[e].motors[j]
                 targets.append(.init(
                     joint: joint,
-                    angle: simd_clamp(requested,
-                                      scene.joints[joint].limitLo,
-                                      scene.joints[joint].limitHi)))
+                    angle: simd_clamp(
+                        relativeTargets[e * Self.actionDimension + j],
+                        scene.joints[joint].limitLo,
+                        scene.joints[joint].limitHi)))
             }
         }
         solver.setMotorTargets(targets)
         for _ in 0..<decimation { solver.step() }
+    }
+
+    /// Temporarily scale the authored effort budget for short commissioning
+    /// maneuvers. A scale of one restores the exact training/runtime torque.
+    /// The default reveal scale remains only 40% of the selected servo's
+    /// 5 V stall torque (the walking budget is 20%).
+    public func setCommissioningTorqueScale(_ scale: Float) {
+        precondition(scale.isFinite && scale >= 1 && scale <= 2)
+        var updates: [GPUSolver.MotorTorqueUpdate] = []
+        updates.reserveCapacity(numEnvironments * Self.actionDimension)
+        for ref in refs {
+            for joint in ref.motors {
+                updates.append(.init(
+                    joint: joint,
+                    torque: scene.joints[joint].motorTorque * scale))
+            }
+        }
+        solver.setMotorTorques(updates)
     }
 
     public func reset(_ environmentIDs: [Int], seeds: [UInt64],
@@ -824,6 +863,46 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         precondition(configuration.pointGoal)
         precondition((0..<spec.numEnvironments).contains(e))
         goalOverrides[e] = nil
+    }
+
+    /// Rebuild policy-facing history after an explicit commissioning motion
+    /// without teleporting the physically settled robot. This is the handoff
+    /// boundary from reveal trajectories back to learned or classical control.
+    public func resumeAfterCommissioning(
+        into observations: inout RLObservationBatch
+    ) throws {
+        try observations.validate(for: spec)
+        let states = environment.states()
+        let ids = Array(0..<spec.numEnvironments)
+        for e in ids {
+            episodeLengths[e] = 0
+            episodeReturns[e] = 0
+            linearSquaredErrorSums[e] = 0
+            yawSquaredErrorSums[e] = 0
+            previousRootPositions[e] = states[e].root.position
+            commandProgressSums[e] = 0
+            minimumFootColliderClearances[e] = .infinity
+            footPenetrationSquaredSums[e] = 0
+            footPenetrationOverOneMillimetreSteps[e] = 0
+            let historyBase = e * historyDepth * actionDimension
+            for i in 0..<(historyDepth * actionDimension) {
+                actionHistory[historyBase + i] = 0
+            }
+            for j in 0..<actionDimension {
+                previousActions[e * actionDimension + j] = 0
+            }
+            if configuration.pointGoal {
+                let distance = planarGoalDistance(
+                    environment: e, rootPosition: states[e].root.position)
+                previousGoalDistances[e] = distance
+                minimumGoalDistances[e] = distance
+                goalDwellCounts[e] = 0
+                enteredGoals[e] = distance <= configuration.goalRadius
+                updateGoalCommand(environment: e, state: states[e])
+            }
+        }
+        try fillObservations(states, into: &observations.policy)
+        try observations.validate(for: spec)
     }
 
     public func reset(environments ids: [Int]?, seed: UInt64,

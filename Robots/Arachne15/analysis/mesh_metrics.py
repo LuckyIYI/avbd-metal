@@ -21,6 +21,7 @@ ASSEMBLY = {
     "retainer_clip.stl": {"quantity": 2, "material": "PETG", "density_g_cm3": 1.27},
     "tibia_link.stl": {"quantity": 8, "material": "PETG", "density_g_cm3": 1.27},
 }
+REPORT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def triangles(path: Path):
@@ -62,8 +63,12 @@ def metrics(path: Path) -> dict:
                 maxs[axis] = max(maxs[axis], vertex[axis])
     if count == 0:
         raise ValueError(f"{path}: no STL triangles")
+    try:
+        report_path = path.resolve().relative_to(REPORT_ROOT).as_posix()
+    except ValueError:
+        report_path = path.name
     return {
-        "file": str(path),
+        "file": report_path,
         "triangles": count,
         "bounds_min_mm": mins,
         "bounds_max_mm": maxs,

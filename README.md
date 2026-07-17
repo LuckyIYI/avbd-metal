@@ -101,6 +101,10 @@ sealed seed-45010 test passed 512/512 episodes, with 0.068 m/s linear and 0.284
 rad/s yaw-rate RMSE and no control steps deeper than 1 mm below the floor.
 **Arachne Goal** remains the randomized, arbitrary-direction sim-to-real policy;
 its multi-seed qualification reports are shipped beside the robot assets.
+All three Arachne replay modes also expose **Fold & Reveal**, a physical
+motor/contact sequence that reduces the articulated footprint by 41.0% and
+then hands the measured deployed state back to the selected controller. It is
+not a render animation and does not change the revision-6 policy contract.
 
 The earlier native humanoids and obsolete two-link Arm policy were removed from
 Policy Replay. The full Panda Push-T task remains trainable, but its best

@@ -1,0 +1,50 @@
+{
+  "status": "PASS",
+  "scope": "kinematic pre-check; servo housings, cables, and printed brackets require physical sweep validation",
+  "compact_joint_targets_rad": [
+    -0.52,
+    0.82,
+    -0.52,
+    0.82,
+    0.52,
+    0.82,
+    0.52,
+    0.82,
+    0.52,
+    0.82,
+    0.52,
+    0.82,
+    -0.52,
+    0.82,
+    -0.52,
+    0.82
+  ],
+  "deployed_articulated_envelope_mm": [
+    284.59076221498134,
+    381.36682709168247
+  ],
+  "compact_articulated_envelope_mm": [
+    238.41764563294274,
+    268.5540263358575
+  ],
+  "compact_to_deployed_area_ratio": 0.5899379715893329,
+  "area_reduction_fraction": 0.4100620284106671,
+  "compact_support_polygon_origin_margin_mm": 70.52672981319562,
+  "minimum_inter_leg_beam_clearance_mm": 9.239449480908698,
+  "closest_beam_pair": [
+    [
+      0,
+      "coxa"
+    ],
+    [
+      1,
+      "coxa"
+    ]
+  ],
+  "checks": {
+    "targets_inside_mechanical_limits": true,
+    "compact_area_ratio_at_most_0_65": true,
+    "inter_leg_beam_clearance_at_least_8mm": true,
+    "support_polygon_margin_at_least_65mm": true
+  }
+}

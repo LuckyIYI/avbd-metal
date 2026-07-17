@@ -18,6 +18,11 @@ openscad --render --imgsize 1800,1200 --viewall --autocenter \
   --projection perspective --colorscheme "Tomorrow Night" \
   -D 'PART="assembly"' -o "$OUT/arachne15-assembly.png" "$SCAD"
 
+openscad --render --imgsize 1800,1200 --viewall --autocenter \
+  --projection perspective --colorscheme "Tomorrow Night" \
+  -D 'PART="assembly"' -D 'POSE="folded"' \
+  -o "$OUT/arachne15-folded.png" "$SCAD"
+
 openscad --render --imgsize 1600,1000 --viewall \
   --camera 450,0,110,0,0,80 --projection ortho \
   --colorscheme "Tomorrow Night" -D 'PART="assembly"' \
@@ -29,6 +34,7 @@ openscad --render --imgsize 1600,1200 --viewall \
   -o "$OUT/arachne15-top.png" "$SCAD"
 
 python3 "$ROOT/analysis/load_case.py"
+python3 "$ROOT/analysis/reveal_pose.py"
 python3 "$ROOT/analysis/mesh_metrics.py" "$STL"/*.stl
 
 echo "CAD outputs: $OUT"

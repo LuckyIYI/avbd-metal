@@ -3,7 +3,7 @@
   "method": "closed-mesh signed volume times conservative nominal density",
   "parts": [
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/battery_cradle.stl",
+      "file": "build/stl/battery_cradle.stl",
       "triangles": 1898,
       "bounds_min_mm": [
         -20.0,
@@ -27,7 +27,7 @@
       "assembly_full_solid_mass_g": 14.681023735038421
     },
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/chassis.stl",
+      "file": "build/stl/chassis.stl",
       "triangles": 6286,
       "bounds_min_mm": [
         -77.0,
@@ -51,7 +51,7 @@
       "assembly_full_solid_mass_g": 121.84321732954864
     },
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/coxa_link.stl",
+      "file": "build/stl/coxa_link.stl",
       "triangles": 2396,
       "bounds_min_mm": [
         -9.0,
@@ -75,7 +75,7 @@
       "assembly_full_solid_mass_g": 36.381310184850975
     },
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/foot_pad.stl",
+      "file": "build/stl/foot_pad.stl",
       "triangles": 2432,
       "bounds_min_mm": [
         -8.731266021728516,
@@ -99,7 +99,7 @@
       "assembly_full_solid_mass_g": 9.39239165643648
     },
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/phone_guide.stl",
+      "file": "build/stl/phone_guide.stl",
       "triangles": 1096,
       "bounds_min_mm": [
         -11.0,
@@ -123,7 +123,7 @@
       "assembly_full_solid_mass_g": 19.694448058985834
     },
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/retainer_clip.stl",
+      "file": "build/stl/retainer_clip.stl",
       "triangles": 630,
       "bounds_min_mm": [
         -7.0,
@@ -147,7 +147,7 @@
       "assembly_full_solid_mass_g": 1.8763477627896972
     },
     {
-      "file": "/private/tmp/avbd-metal-spider/Robots/Arachne15/build/stl/tibia_link.stl",
+      "file": "build/stl/tibia_link.stl",
       "triangles": 1620,
       "bounds_min_mm": [
         -8.0,

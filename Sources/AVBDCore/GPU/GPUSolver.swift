@@ -1970,17 +1970,37 @@ public final class GPUSolver {
             joint: jointIndex, radiansPerSecond: radiansPerSecond)])
     }
 
-    /// Robotics: set a motor joint's torque limit at runtime.
-    public func setMotorTorque(_ jointIndex: Int, torque: Float) {
-        precondition(torque >= 0 && torque.isFinite,
-                     "motor torque limit must be finite and nonnegative")
+    public struct MotorTorqueUpdate {
+        public var joint: Int
+        public var torque: Float
+
+        public init(joint: Int, torque: Float) {
+            self.joint = joint
+            self.torque = torque
+        }
+    }
+
+    /// Robotics: set several motor effort limits behind one GPU fence.
+    public func setMotorTorques(_ updates: [MotorTorqueUpdate]) {
+        guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
-        precondition(jointIndex >= 0 && jointIndex < numJoints,
-                     "joint index out of range")
-        precondition((jp[jointIndex].header.w & Self.jointMotorModeMask) != 0,
-                     "cannot enable a motor that was not authored in the scene")
-        jp[jointIndex].motor.y = torque
+        for update in updates {
+            precondition(update.torque >= 0 && update.torque.isFinite,
+                         "motor torque limit must be finite and nonnegative")
+            precondition(update.joint >= 0 && update.joint < numJoints,
+                         "joint index out of range")
+            precondition((jp[update.joint].header.w
+                            & Self.jointMotorModeMask) != 0,
+                         "cannot enable a motor that was not authored in the scene")
+            jp[update.joint].motor.y = update.torque
+        }
+    }
+
+    /// Robotics: set one motor joint's torque limit at runtime.
+    public func setMotorTorque(_ jointIndex: Int, torque: Float) {
+        setMotorTorques([MotorTorqueUpdate(
+            joint: jointIndex, torque: torque)])
     }
 
     /// Robotics: read a motor joint's current twist angle.

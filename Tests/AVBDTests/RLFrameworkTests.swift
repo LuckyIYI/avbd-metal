@@ -47,6 +47,107 @@ final class RLFrameworkTests: XCTestCase {
         }
     }
 
+    func testArachneRevealPlannerUsesReserveTravelAndReturnsHome() {
+        let reveal = Arachne15RevealController()
+        XCTAssertEqual(reveal.totalSteps, 482)
+        XCTAssertEqual(reveal.phase, .folding)
+        XCTAssertEqual(
+            Arachne15RevealController.foldOrder.flatMap { $0 }.sorted(),
+            Array(0..<8))
+        XCTAssertTrue(
+            Arachne15RevealController.foldOrder.allSatisfy { $0.count == 4 })
+        XCTAssertEqual(
+            Arachne15RevealController.unfoldOrder.flatMap { $0 }.sorted(),
+            Array(0..<8))
+        XCTAssertTrue(
+            Arachne15RevealController.unfoldOrder.allSatisfy { $0.count == 4 })
+        XCTAssertTrue(Arachne15RevealController.targetsRespectMechanicalLimits(
+            Arachne15RevealController.compactJointTargets))
+        XCTAssertGreaterThan(
+            Arachne15RevealController.compactJointTargets[1],
+            Arachne15PolicyContract.actionScales[1],
+            "reveal should use reserved mechanical travel unavailable to RL")
+
+        let compact = reveal.jointTargets(at: reveal.foldingSteps)
+        XCTAssertEqual(
+            compact, Arachne15RevealController.compactJointTargets)
+        let final = reveal.jointTargets(at: reveal.totalSteps)
+        XCTAssertEqual(final, Arachne15RevealController.deployedJointTargets)
+
+        var previous = reveal.nextJointTargets()
+        var maximumPerTickChange: Float = 0
+        while !reveal.isComplete {
+            let current = reveal.nextJointTargets()
+            for index in current.indices {
+                maximumPerTickChange = max(
+                    maximumPerTickChange,
+                    abs(current[index] - previous[index]))
+            }
+            previous = current
+        }
+        XCTAssertLessThan(maximumPerTickChange, 0.08)
+        XCTAssertEqual(Array(previous),
+                       Arachne15RevealController.deployedJointTargets)
+    }
+
+    func testArachneRevealIsExecutedByMotorsAndHandsBackPhysicalState()
+        throws {
+        let task = try Arachne15LocomotionTask(configuration: .init(
+            numEnvironments: 1, seed: 42_050,
+            maxEpisodeSteps: 500,
+            standingCommandProbability: 1,
+            initialRollPitchRange: 0, initialYawRange: 0,
+            observationNoise: false, maximumActionLatencySteps: 0,
+            domainRandomization: .init(), autoReset: false))
+        var observation = try task.reset(seed: 42_051)
+        let initial = task.environment.states()[0]
+        let reveal = Arachne15RevealController(
+            initialJointTargets: initial.jointAngles)
+        task.environment.setCommissioningTorqueScale(
+            Arachne15RevealController.commissioningTorqueScale)
+        var minimumUpright: Float = 1
+        var maximumMinimumCompactKnee: Float = -.infinity
+        while !reveal.isComplete {
+            let targets = reveal.nextJointTargets()
+            task.environment.stepJointTargets(
+                targets, decimation: task.configuration.controlDecimation)
+            let state = task.environment.states()[0]
+            minimumUpright = min(
+                minimumUpright,
+                state.root.rotation.conjugate.act(F3(0, 0, 1)).z)
+            if reveal.phase == .compactHold {
+                var minimumKneeThisTick = Float.infinity
+                for knee in stride(from: 1, to: 16, by: 2) {
+                    minimumKneeThisTick = min(
+                        minimumKneeThisTick, state.jointAngles[knee])
+                }
+                maximumMinimumCompactKnee = max(
+                    maximumMinimumCompactKnee, minimumKneeThisTick)
+            }
+        }
+        task.environment.setCommissioningTorqueScale(1)
+        let final = task.environment.states()[0]
+        let planarDisplacement = simd_length(SIMD2<Float>(
+            final.root.position.x - initial.root.position.x,
+            final.root.position.y - initial.root.position.y))
+        XCTAssertGreaterThan(
+            maximumMinimumCompactKnee, 0.70,
+            "every knee must physically reach the under-body compact pose")
+        XCTAssertGreaterThan(minimumUpright, 0.85)
+        XCTAssertGreaterThan(final.root.position.z, 0.06)
+        XCTAssertLessThan(planarDisplacement, 0.04)
+        XCTAssertLessThan(
+            final.jointAngles.map(abs).max() ?? .infinity, 0.12,
+            "final joints: \(final.jointAngles); root: \(final.root.position)")
+
+        try task.resumeAfterCommissioning(into: &observation)
+        XCTAssertTrue(observation.policy.allSatisfy(\.isFinite))
+        var result = RLStepBatch(spec: task.spec)
+        try task.step(
+            actions: RLActionBatch(spec: task.spec), into: &result)
+        XCTAssertFalse(result.terminated[0])
+    }
+
     func testArachneClassicalControllerPhysicallyReachesFrontGoal() throws {
         let task = try Arachne15LocomotionTask(
             configuration: .init(
