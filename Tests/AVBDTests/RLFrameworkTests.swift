@@ -71,6 +71,14 @@ final class RLFrameworkTests: XCTestCase {
         let compact = reveal.jointTargets(at: reveal.foldingSteps)
         XCTAssertEqual(
             compact, Arachne15RevealController.compactJointTargets)
+
+        let splitReveal = Arachne15RevealController()
+        for _ in 0..<(splitReveal.foldingSteps + 10) {
+            _ = splitReveal.nextJointTargets()
+        }
+        XCTAssertEqual(splitReveal.phase, .compactHold)
+        splitReveal.beginUnfolding()
+        XCTAssertEqual(splitReveal.phase, .unfolding)
         let final = reveal.jointTargets(at: reveal.totalSteps)
         XCTAssertEqual(final, Arachne15RevealController.deployedJointTargets)
 

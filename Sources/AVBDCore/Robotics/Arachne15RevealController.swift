@@ -157,6 +157,15 @@ public final class Arachne15RevealController {
         return ContiguousArray(targets)
     }
 
+    /// Resume a controller paused in its compact hold at the first deployment
+    /// tick. Policy Replay uses this to expose folding and unfolding as two
+    /// explicit physical actions without duplicating the trajectory.
+    public func beginUnfolding() {
+        stepIndex = min(
+            max(stepIndex, foldingSteps + configuration.compactHoldSteps),
+            totalSteps)
+    }
+
     public func jointTargets(at step: Int) -> [Float] {
         let clampedStep = min(max(step, 0), totalSteps)
         var targets: [Float]

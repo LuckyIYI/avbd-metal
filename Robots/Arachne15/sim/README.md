@@ -117,9 +117,11 @@ target for diagnosis. The UI never supplies joint targets.
 
 ### Physical fold and reveal
 
-Every Arachne Policy Replay scene exposes **Fold & Reveal**. It resets to the
-authored assembly, then sends a bounded 482-tick commissioning trajectory to
-the same sixteen torque-limited motors used for walking. The renderer never
+Every Arachne Policy Replay scene exposes separate **Fold** and
+**Unfold & Walk** actions. Fold resets to the authored assembly, sends the
+folding portion of a bounded commissioning trajectory to the same sixteen
+torque-limited motors used for walking, and physically holds the compact pose.
+Unfold & Walk resumes at the deployment phase. The renderer never
 edits the root or link poses. Folding uses two balanced diagonal
 lift/sweep/plant waves; unfolding uses a shared-load knee crouch and the
 complementary waves so no final two-leg pair has to raise the iPhone and

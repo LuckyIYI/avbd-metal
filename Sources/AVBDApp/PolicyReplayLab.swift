@@ -101,6 +101,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     @Published private(set) var loadedUpdate: Int?
     @Published private(set) var newestUpdate: Int?
     @Published private(set) var episodeFinished = false
+    @Published private(set) var arachneFolded = false
     @Published private(set) var replayCameraTarget = F3(0, 0, 1)
     @Published private(set) var courseCameraTarget = F3(6.5, 0, 0.9)
     var colorByGraphColor = false
@@ -114,6 +115,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var result: RLStepBatch?
     private var actionProvider: (any RLActionProvider)?
     private var arachneRevealController: Arachne15RevealController?
+    private var arachneAutoUnfold = false
     private var loadedCheckpointDirectory: String?
     private let liveRunDirectory = ProcessInfo.processInfo.environment[
         "AVBD_REPLAY_RUN_DIR"]
@@ -137,7 +139,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             || arachne?.usesPointGoal == true
     }
     var supportsArachneReveal: Bool { arachne != nil }
-    var isRunningArachneReveal: Bool { arachneRevealController != nil }
+    var hasArachneTransformation: Bool {
+        arachneRevealController != nil
+    }
+    var isArachneTransforming: Bool {
+        arachneRevealController != nil && !arachneFolded
+    }
     var usesCheckpoint: Bool { !robot.usesClassicalController }
     var controllerSectionTitle: String {
         usesCheckpoint ? "Parallel training" : "Controller"
@@ -204,6 +211,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         unitreeH1 = nil; isaacHumanoid = nil
         arachne = nil
         arachneRevealController = nil
+        arachneFolded = false
+        arachneAutoUnfold = false
         task = nil; actionProvider = nil
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
@@ -313,7 +322,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             if ProcessInfo.processInfo.environment[
                     "AVBD_REPLAY_AUTO_REVEAL"] == "1",
                arachne != nil {
-                runArachneReveal()
+                startArachneFold(autoUnfold: true)
             }
             refreshTrainingMetrics()
         } catch {
@@ -370,6 +379,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func togglePlayback() {
+        guard arachneRevealController == nil else { return }
         if episodeFinished {
             resetEpisode()
         } else {
@@ -387,7 +397,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
     }
 
-    func runArachneReveal() {
+    func foldArachne() {
+        startArachneFold(autoUnfold: false)
+    }
+
+    private func startArachneFold(autoUnfold: Bool) {
         guard let arachne else { return }
         do {
             // Start from the authored neutral assembly so the reveal is
@@ -398,8 +412,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let measured = arachne.environment.states()[0].jointAngles
             arachneRevealController = Arachne15RevealController(
                 initialJointTargets: measured)
+            arachneFolded = false
+            arachneAutoUnfold = autoUnfold
             interactionStatus =
-                "physical reveal started · motor targets only · no pose animation"
+                "physical fold started · motor targets only · no pose animation"
             episodeFinished = false
             running = true
             accumulator = 0
@@ -410,6 +426,20 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             policyStatus = "reveal failed: \(error.localizedDescription)"
             running = false
         }
+    }
+
+    func unfoldArachneAndWalk() {
+        guard arachneFolded,
+              let reveal = arachneRevealController else { return }
+        reveal.beginUnfolding()
+        arachneFolded = false
+        arachneAutoUnfold = true
+        interactionStatus =
+            "physical unfold started · learned control resumes after settling"
+        running = true
+        accumulator = 0
+        lastTime = CACurrentMediaTime()
+        refreshStats()
     }
 
     func applyGoalAndReset() {
@@ -587,6 +617,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             arachne?.environment.setCommissioningTorqueScale(1)
         }
         arachneRevealController = nil
+        arachneFolded = false
+        arachneAutoUnfold = false
         if robot == .unitreeH1 {
             guard let loadedCheckpointDirectory else {
                 throw RLEnvironmentError.invalidConfiguration(
@@ -689,12 +721,37 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         while accumulator >= wallStep, ticks < maximumTicks {
             do {
                 if let reveal = arachneRevealController, let arachne {
+                    if arachneFolded {
+                        arachne.environment.stepJointTargets(
+                            ContiguousArray(
+                                Arachne15RevealController.compactJointTargets),
+                            decimation: arachne.configuration.controlDecimation)
+                        controlSteps += 1
+                        updateCameraTargets()
+                        accumulator -= wallStep
+                        ticks += 1
+                        refreshStats()
+                        continue
+                    }
                     let targets = reveal.nextJointTargets()
                     arachne.environment.stepJointTargets(
                         targets,
                         decimation: arachne.configuration.controlDecimation)
                     controlSteps += 1
                     updateCameraTargets()
+                    let compactSettleEnd = reveal.foldingSteps
+                        + min(25, reveal.configuration.compactHoldSteps)
+                    if !arachneAutoUnfold
+                        && reveal.phase == .compactHold
+                        && reveal.stepIndex >= compactSettleEnd {
+                        arachneFolded = true
+                        interactionStatus =
+                            "compact pose physically holding · choose Unfold & Walk"
+                        accumulator -= wallStep
+                        ticks += 1
+                        refreshStats()
+                        continue
+                    }
                     if reveal.isComplete {
                         arachne.environment.setCommissioningTorqueScale(1)
                         try arachne.resumeAfterCommissioning(
@@ -704,10 +761,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                                 for: task, observation: observation)
                         }
                         arachneRevealController = nil
+                        arachneFolded = false
+                        arachneAutoUnfold = false
                         controlSteps = 0
                         interactionStatus = actionProvider == nil
-                            ? "reveal complete · deployed pose physically holding"
-                            : "reveal complete · locomotion controller has physical state"
+                            ? "unfold complete · deployed pose physically holding"
+                            : "unfold complete · locomotion controller has physical state"
                         running = actionProvider != nil
                     }
                     accumulator -= wallStep
@@ -750,6 +809,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 if arachneRevealController != nil {
                     arachne?.environment.setCommissioningTorqueScale(1)
                     arachneRevealController = nil
+                    arachneFolded = false
+                    arachneAutoUnfold = false
                 }
                 policyStatus = "step failed: \(error.localizedDescription)"
                 running = false
@@ -798,7 +859,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func singleStep() {
-        guard !episodeFinished else { return }
+        guard !episodeFinished, arachneRevealController == nil else { return }
         let wasRunning = running
         running = true
         // Do not fold wall time spent paused into a manual step. Without this
@@ -889,11 +950,14 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let angular = inverse.act(state.root.angularVelocity)
             let up = inverse.act(F3(0, 0, 1)).z
             if let reveal = arachneRevealController {
+                let title = arachneFolded
+                    ? "ARACHNE COMPACT · HOLDING"
+                    : "ARACHNE TRANSFORMATION · \(reveal.phase.rawValue)"
                 statsText = String(
-                    format: "ARACHNE REVEAL · %@ · %.0f%%\n"
+                    format: "%@ · %.0f%%\n"
                         + "all motion from 16 torque-limited joints + contact\n"
                         + "height %.3f m   upright %.3f   tick %d/%d",
-                    reveal.phase.rawValue, reveal.progress * 100,
+                    title, reveal.progress * 100,
                     state.root.position.z, up,
                     reveal.stepIndex, reveal.totalSteps)
                 return
@@ -993,8 +1057,10 @@ struct PolicyReplayLabView: View {
                         Button(model.episodeFinished ? "Replay" : (model.running ? "Pause" : "Play")) {
                             model.togglePlayback()
                         }
+                        .disabled(model.hasArachneTransformation)
                         Button("Step") { model.singleStep() }
-                            .disabled(model.episodeFinished)
+                            .disabled(model.episodeFinished
+                                || model.hasArachneTransformation)
                         Button("Reset") { model.resetEpisode() }
                         Button("Load Latest") {
                             model.pollForLatestCheckpoint(force: true)
@@ -1022,12 +1088,18 @@ struct PolicyReplayLabView: View {
                     if model.supportsArachneReveal {
                         Divider()
                         Text("Physical transformation").font(.headline)
-                        Button(model.isRunningArachneReveal
-                            ? "Reveal Running…" : "Fold & Reveal") {
-                            model.runArachneReveal()
+                        HStack {
+                            Button(model.isArachneTransforming
+                                ? "Transforming…" : "Fold") {
+                                model.foldArachne()
+                            }
+                            .disabled(model.hasArachneTransformation)
+                            Button("Unfold & Walk") {
+                                model.unfoldArachneAndWalk()
+                            }
+                            .disabled(!model.arachneFolded)
                         }
-                        .disabled(model.isRunningArachneReveal)
-                        Text("Folds into a compact guard pose, holds, then deploys through a shared-load crouch and two four-leg waves. The short commissioning budget is restored to walking torque before handoff. During the transformation, no root or link pose is edited.")
+                        Text("Fold stops and physically holds the compact guard pose. Unfold & Walk deploys through a shared-load crouch and two four-leg waves, restores the walking torque budget, then hands the measured state to the selected controller. During either transformation, no root or link pose is edited.")
                             .font(.caption2).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -1098,7 +1170,7 @@ struct PolicyReplayLabView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(model.usesCheckpoint
-                        ? "Normal motion executes the learned Safetensors checkpoint used by `eval-rl`. The explicit Reveal button temporarily commands a bounded commissioning trajectory through the same motors and physics, then returns control to the policy."
+                        ? "Normal motion executes the learned Safetensors checkpoint used by `eval-rl`. The Fold and Unfold & Walk controls temporarily command a bounded commissioning trajectory through the same motors and physics; learned control resumes only after deployment settles."
                         : "This baseline contains no neural inference or checkpoint. Its motion is generated by the displayed CPG/IK controller through the exact same physical plant used by RL.")
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
