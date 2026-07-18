@@ -150,6 +150,9 @@ public enum PushTCEMCovarianceMode: String, Codable, Sendable {
 
 public struct PushTPhysicalFlowConfiguration: Sendable {
     public var populationSize: Int
+    /// Number of collision-isolated replicas advanced by one solver instance.
+    /// Larger search populations are evaluated in deterministic microbatches.
+    public var simulationBatchSize: Int
     public var generations: Int
     public var horizon: Int
     public var controlPointCount: Int
@@ -166,6 +169,7 @@ public struct PushTPhysicalFlowConfiguration: Sendable {
 
     public init(
         populationSize: Int = 256,
+        simulationBatchSize: Int = 32,
         generations: Int = 6,
         horizon: Int = 48,
         controlPointCount: Int = 6,
@@ -181,6 +185,7 @@ public struct PushTPhysicalFlowConfiguration: Sendable {
         seed: UInt64 = 1
     ) {
         self.populationSize = populationSize
+        self.simulationBatchSize = simulationBatchSize
         self.generations = generations
         self.horizon = horizon
         self.controlPointCount = controlPointCount
@@ -198,6 +203,8 @@ public struct PushTPhysicalFlowConfiguration: Sendable {
 
     func validate() throws {
         guard populationSize >= 8,
+              simulationBatchSize >= 3,
+              simulationBatchSize <= 32,
               generations > 0,
               horizon >= 8,
               controlPointCount >= 4,
@@ -240,10 +247,76 @@ public struct PushTPhysicalFlowGeneration: Codable, Sendable {
     public var meanStandardDeviationMeters: Float
 }
 
+/// Translation- and rotation-invariant endpoint encoding plus the minimal
+/// frame data needed to decode a learned spline proposal back into task space.
+public struct PushTPhysicalFlowProposalContext: Sendable {
+    public static let inputDimension = 22
+
+    public var input: [Float]
+    public var sourceBlockCenter: SIMD2<Float>
+    public var sourceBlockYaw: Float
+    public var sourceCommandedTipTarget: SIMD2<Float>
+    public var targetCommandedTipTarget: SIMD2<Float>
+
+    public func canonicalGeometricInternalControlPointsXY(
+        controlPointCount: Int
+    ) -> [Float] {
+        precondition(controlPointCount >= 4)
+        let targetCenter = SIMD2(input[0], input[1])
+        let direction = length(targetCenter) > 1e-4
+            ? normalize(targetCenter) : SIMD2<Float>(1, 0)
+        var points = [-direction * 0.48]
+        let middleCount = controlPointCount - 4
+        if middleCount > 0 {
+            for index in 1...middleCount {
+                let progress = Float(index) / Float(middleCount + 1)
+                points.append(targetCenter * progress)
+            }
+        }
+        points.append(targetCenter + direction * 0.22)
+        precondition(points.count == controlPointCount - 2)
+        return points.flatMap { [$0.x, $0.y] }
+    }
+
+    public func controlPoints(
+        canonicalInternalPointsXY values: [Float]
+    ) throws -> [SIMD2<Float>] {
+        guard values.count.isMultiple(of: 2) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "learned physical-flow proposal must contain x/y pairs")
+        }
+        let c = cos(sourceBlockYaw), s = sin(sourceBlockYaw)
+        let internalPoints = stride(from: 0, to: values.count, by: 2).map {
+            let local = SIMD2(values[$0], values[$0 + 1])
+            let world = SIMD2(c * local.x - s * local.y,
+                              s * local.x + c * local.y)
+                + sourceBlockCenter
+            return simd_clamp(
+                world, SIMD2(repeating: -3), SIMD2(repeating: 3))
+        }
+        return [sourceCommandedTipTarget] + internalPoints
+            + [targetCommandedTipTarget]
+    }
+}
+
+/// One physically verified teacher row for amortized inverse-flow learning.
+public struct PushTPhysicalFlowTeacherSample: Codable, Sendable {
+    public static let schemaVersion = 1
+
+    public var schemaVersion: Int
+    public var seed: UInt64
+    public var input: [Float]
+    public var canonicalInternalControlPointsXY: [Float]
+    public var teacherLoss: Float
+    public var robustReplaySuccessFraction: Float
+    public var goGatePassed: Bool
+}
+
 public struct PushTPhysicalFlowReport: Codable, Sendable {
     public var experiment: String
     public var seed: UInt64
     public var populationSize: Int
+    public var simulationBatchSize: Int
     public var generations: Int
     public var horizon: Int
     public var controlPointCount: Int
@@ -265,9 +338,14 @@ public struct PushTPhysicalFlowReport: Codable, Sendable {
     public var targetTipBlockContact: Bool
     public var targetCloneSpreadLoss: Float
     public var targetCloneMaximumStateError: Float
+    public var targetCloneWorstEnvironment: Int
+    public var targetCloneFirstDivergentStep: Int?
+    public var targetCloneMaximumErrorByStep: [Float]
+    public var targetGenerationStable: Bool
     public var referenceReplay: PushTPhysicalFlowMetrics
     public var linearInterpolation: PushTPhysicalFlowMetrics
     public var fittedReferenceSpline: PushTPhysicalFlowMetrics
+    public var geometricProposalSpline: PushTPhysicalFlowMetrics
     public var initialProposalSpline: PushTPhysicalFlowMetrics
     public var randomShooting: PushTPhysicalFlowMetrics
     public var optimizedSpline: PushTPhysicalFlowMetrics
@@ -275,7 +353,13 @@ public struct PushTPhysicalFlowReport: Codable, Sendable {
     public var optimizedToRandomLossRatio: Float
     public var selectedReplayLoss: Float
     public var selectedReplayMaximumStateError: Float
+    public var robustReplaySuccessFraction: Float
+    public var robustReplayMedianLoss: Float
+    public var robustReplayWorstLoss: Float
+    public var robustReplayMaximumBlockPositionErrorMeters: Float
+    public var robustReplayMaximumBlockYawErrorRadians: Float
     public var bestControlPointsXY: [Float]
+    public var teacherSample: PushTPhysicalFlowTeacherSample
     public var generationHistory: [PushTPhysicalFlowGeneration]
     public var candidateRollouts: Int
     public var simulatedEnvironmentControlSteps: Int
@@ -283,6 +367,7 @@ public struct PushTPhysicalFlowReport: Codable, Sendable {
     public var infrastructureGatePassed: Bool
     public var poseReconstructionGatePassed: Bool
     public var dynamicStateReconstructionGatePassed: Bool
+    public var robustReplayGatePassed: Bool
     public var goGatePassed: Bool
 }
 
@@ -298,13 +383,16 @@ public enum PushTPhysicalFlowExperiment {
     }
 
     public static func run(
-        configuration: PushTPhysicalFlowConfiguration = .init()
+        configuration: PushTPhysicalFlowConfiguration = .init(),
+        proposalProvider: ((PushTPhysicalFlowProposalContext) throws -> [Float])?
+            = nil
     ) throws -> PushTPhysicalFlowReport {
         try configuration.validate()
         let startTime = Date()
         let population = configuration.populationSize
+        let simulationBatch = configuration.simulationBatchSize
         let environment = try PushTEnv(
-            numEnvs: population, seed: configuration.seed,
+            numEnvs: simulationBatch, seed: configuration.seed,
             layout: .coLocated)
         environment.resetAll(seed: configuration.seed &+ 17)
 
@@ -314,9 +402,10 @@ public enum PushTPhysicalFlowExperiment {
               !sourceHasContact {
             let action = environment.oracleAction(0)
             environment.step(
-                actions: [SIMD2<Float>](repeating: action, count: population),
+                actions: [SIMD2<Float>](
+                    repeating: action, count: simulationBatch),
                 substeps: configuration.substeps,
-                maxStep: configuration.targetGenerationMaximumStep)
+                maxStep: 0.16)
             sourcePreparationSteps += 1
             sourceHasContact = hasTipBlockContact(environment, environment: 0)
         }
@@ -325,7 +414,20 @@ public enum PushTPhysicalFlowExperiment {
                 "Push-T oracle failed to establish source contact")
         }
         let source = environment.physicalStates()[0]
-        environment.fork(source, into: Array(0..<population))
+        environment.fork(source, into: Array(0..<simulationBatch))
+
+        var targetReplicas = environment.physicalStates()
+        func cloneMaximumError(_ states: [PushTPhysicalState]) -> Float {
+            guard let canonical = states.first else { return 0 }
+            return states.dropFirst().map {
+                maximumStateError($0, canonical)
+            }.max() ?? 0
+        }
+        var targetCloneMaximumErrorByStep = [
+            cloneMaximumError(targetReplicas)
+        ]
+        var targetCloneFirstDivergentStep: Int? =
+            targetCloneMaximumErrorByStep[0] >= 1e-4 ? 0 : nil
 
         var referenceActions = [SIMD2<Float>]()
         referenceActions.reserveCapacity(configuration.horizon)
@@ -353,11 +455,20 @@ public enum PushTPhysicalFlowExperiment {
             }
             referenceActions.append(action)
             environment.step(
-                actions: [SIMD2<Float>](repeating: action, count: population),
-                substeps: configuration.substeps, maxStep: 0.16)
+                actions: [SIMD2<Float>](
+                    repeating: action, count: simulationBatch),
+                substeps: configuration.substeps,
+                maxStep: configuration.targetGenerationMaximumStep)
+            targetReplicas = environment.physicalStates()
+            let cloneError = cloneMaximumError(targetReplicas)
+            targetCloneMaximumErrorByStep.append(cloneError)
+            if targetCloneFirstDivergentStep == nil, cloneError >= 1e-4 {
+                targetCloneFirstDivergentStep = targetStep + 1
+            }
         }
-        let targetReplicas = environment.physicalStates()
         let target = targetReplicas[0]
+        let proposalContext = makeProposalContext(
+            source: source, target: target)
         let targetContactPairs = environment.solver.activeRigidContactPairs()
         let targetReference = environment.refs[0]
         let targetBlockGroundContact = targetContactPairs.contains { pair in
@@ -376,12 +487,18 @@ public enum PushTPhysicalFlowExperiment {
                     && (pair.0 == targetReference.blockBar
                         || pair.0 == targetReference.blockStem))
         }
-        let targetCloneSpread = targetReplicas.dropFirst().map {
-            metrics(from: $0, to: target).loss
-        }.max() ?? 0
-        let targetCloneMaximumError = targetReplicas.dropFirst().map {
-            maximumStateError($0, target)
-        }.max() ?? 0
+        let targetCloneDiagnostics = targetReplicas.enumerated().dropFirst()
+            .map { environment, state in
+                (environment: environment,
+                 loss: metrics(from: state, to: target).loss,
+                 maximumError: maximumStateError(state, target))
+            }
+        let targetCloneSpread = targetCloneDiagnostics.map(\.loss).max() ?? 0
+        let worstTargetClone = targetCloneDiagnostics.max {
+            $0.maximumError < $1.maximumError
+        }
+        let targetCloneMaximumError = worstTargetClone?.maximumError ?? 0
+        let targetCloneWorstEnvironment = worstTargetClone?.environment ?? 0
 
         let motionSteps = configuration.horizon
             - configuration.terminalHoldSteps
@@ -400,7 +517,7 @@ public enum PushTPhysicalFlowExperiment {
             controlPoints: fittedControlPoints, horizon: configuration.horizon,
             terminalHoldSteps: configuration.terminalHoldSteps)
         var calibrationPaths = [[SIMD2<Float>]](
-            repeating: linearPath, count: population)
+            repeating: linearPath, count: 3)
         // Index zero generated the canonical target, so replay the reference
         // there. Cross-replica agreement remains a separate reported guard.
         calibrationPaths[0] = referenceActions
@@ -414,10 +531,30 @@ public enum PushTPhysicalFlowExperiment {
 
         var generator = PhysicalFlowRandomNumberGenerator(
             seed: configuration.seed &+ 0xA11CE)
-        let initialProposal = proposalControlPoints(
+        let geometricProposal = proposalControlPoints(
             source: source, target: target,
             count: configuration.controlPointCount,
             proposal: configuration.proposal)
+        let initialProposal: [SIMD2<Float>]
+        if let proposalProvider {
+            let canonicalInternal = try proposalProvider(proposalContext)
+            let expected = 2 * (configuration.controlPointCount - 2)
+            guard canonicalInternal.count == expected,
+                  canonicalInternal.allSatisfy(\.isFinite) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "learned physical-flow proposal returned "
+                        + "\(canonicalInternal.count) values; expected \(expected)")
+            }
+            initialProposal = try proposalContext.controlPoints(
+                canonicalInternalPointsXY: canonicalInternal)
+        } else {
+            initialProposal = geometricProposal
+        }
+        let hasLearnedProposal = proposalProvider != nil
+        let geometricParameters = Array(
+            geometricProposal.dropFirst().dropLast()).flatMap {
+                [$0.x, $0.y]
+            }
         var searchMean = Array(
             initialProposal.dropFirst().dropLast()).flatMap {
             [$0.x, $0.y]
@@ -433,6 +570,7 @@ public enum PushTPhysicalFlowExperiment {
         var overallBest: Candidate?
         var randomShootingBest: Candidate?
         var initialProposalMetrics: PushTPhysicalFlowMetrics?
+        var geometricProposalMetrics: PushTPhysicalFlowMetrics?
         var generationHistory = [PushTPhysicalFlowGeneration]()
 
         for generation in 0..<configuration.generations {
@@ -443,17 +581,25 @@ public enum PushTPhysicalFlowExperiment {
                 let parameters: [Float]
                 if candidateIndex == 0 {
                     parameters = searchMean
+                } else if generation == 0, hasLearnedProposal,
+                          candidateIndex == 1 {
+                    parameters = geometricParameters
                 } else if candidateIndex == 1, let overallBest {
                     parameters = Array(overallBest.controlPoints
                         .dropFirst().dropLast())
                         .flatMap { [$0.x, $0.y] }
                 } else {
                     let noise = searchMean.map { _ in generator.normal() }
+                    let samplingCenter = generation == 0
+                            && hasLearnedProposal
+                            && candidateIndex.isMultiple(of: 2)
+                        ? geometricParameters : searchMean
                     parameters = searchMean.indices.map { row in
                         let delta = (0...row).reduce(Float(0)) {
                             $0 + samplingTransform[row][$1] * noise[$1]
                         }
-                        return simd_clamp(searchMean[row] + delta, -3, 3)
+                        return simd_clamp(
+                            samplingCenter[row] + delta, -3, 3)
                     }
                 }
                 controls.append(
@@ -470,7 +616,7 @@ public enum PushTPhysicalFlowExperiment {
                 environment: environment, source: source,
                 paths: paths, configuration: configuration)
             let candidates = (0..<population).map { index in
-                Candidate(environment: index,
+                Candidate(environment: index % simulationBatch,
                           controlPoints: controls[index],
                           metrics: metrics(from: terminals[index], to: target),
                           terminal: terminals[index])
@@ -486,7 +632,10 @@ public enum PushTPhysicalFlowExperiment {
             }
             if generation == 0 {
                 initialProposalMetrics = candidates[0].metrics
-                randomShootingBest = candidates[1...].min {
+                geometricProposalMetrics = hasLearnedProposal
+                    ? candidates[1].metrics : candidates[0].metrics
+                let firstRandomCandidate = hasLearnedProposal ? 2 : 1
+                randomShootingBest = candidates[firstRandomCandidate...].min {
                     $0.metrics.loss < $1.metrics.loss
                 }
             }
@@ -571,13 +720,35 @@ public enum PushTPhysicalFlowExperiment {
             terminalHoldSteps: configuration.terminalHoldSteps)
         let replayStates = rollout(
             environment: environment, source: source,
-            paths: [[SIMD2<Float>]](repeating: bestPath, count: population),
+            paths: [[SIMD2<Float>]](
+                repeating: bestPath, count: simulationBatch),
             configuration: configuration)
         let selectedReplayState = replayStates[best.environment]
         let selectedReplay = metrics(
             from: selectedReplayState, to: best.terminal)
         let selectedReplayMaximumError = maximumStateError(
             selectedReplayState, best.terminal)
+        let robustReplayMetrics = replayStates.map {
+            metrics(from: $0, to: target)
+        }
+        let robustReplayLosses = robustReplayMetrics.map(\.loss).sorted()
+        let robustReplaySuccesses = robustReplayMetrics.filter {
+            $0.blockPositionErrorMeters < 0.05
+                && $0.blockYawErrorRadians < 0.1
+                && $0.blockLinearVelocityErrorMPS < 0.1
+                && $0.blockAngularVelocityErrorRadPS < 0.25
+                && $0.tipPositionErrorMeters < 0.1
+                && $0.commandedTargetErrorMeters < 0.1
+        }.count
+        let robustReplaySuccessFraction = Float(robustReplaySuccesses)
+            / Float(robustReplayMetrics.count)
+        let robustReplayMedianLoss = robustReplayLosses[
+            robustReplayLosses.count / 2]
+        let robustReplayWorstLoss = robustReplayLosses.last!
+        let robustReplayMaximumBlockPositionError = robustReplayMetrics.map(
+            \.blockPositionErrorMeters).max() ?? 0
+        let robustReplayMaximumBlockYawError = robustReplayMetrics.map(
+            \.blockYawErrorRadians).max() ?? 0
         let sourceBlockCenter = blockCenter(source)
         let targetBlockCenter = blockCenter(target)
         let targetDisplacement = length(SIMD2(
@@ -590,8 +761,8 @@ public enum PushTPhysicalFlowExperiment {
             target.blockBar.angularVelocity + target.blockStem.angularVelocity)
         let optimizedToLinear = best.metrics.loss / max(linearMetrics.loss, 1e-12)
         let optimizedToRandom = best.metrics.loss / max(random.metrics.loss, 1e-12)
-        let infrastructureGatePassed = targetCloneMaximumError < 0.005
-            && referenceMetrics.loss < 1e-7
+        let targetGenerationStable = targetCloneMaximumError < 0.005
+        let infrastructureGatePassed = referenceMetrics.loss < 1e-7
             && selectedReplayMaximumError < 1e-4
         let poseGatePassed = targetDisplacement >= 0.05
             && best.metrics.blockPositionErrorMeters < 0.05
@@ -603,11 +774,28 @@ public enum PushTPhysicalFlowExperiment {
             && best.metrics.blockAngularVelocityErrorRadPS < 0.25
             && best.metrics.tipPositionErrorMeters < 0.1
             && best.metrics.commandedTargetErrorMeters < 0.1
-        let batchedPhysicalFlows = configuration.generations + 3
+        let robustReplayGatePassed = robustReplaySuccessFraction >= 0.8
+        let teacherSample = PushTPhysicalFlowTeacherSample(
+            schemaVersion: PushTPhysicalFlowTeacherSample.schemaVersion,
+            seed: configuration.seed,
+            input: proposalContext.input,
+            canonicalInternalControlPointsXY: canonicalInternalControlPoints(
+                best.controlPoints, context: proposalContext),
+            teacherLoss: best.metrics.loss,
+            robustReplaySuccessFraction: robustReplaySuccessFraction,
+            goGatePassed: infrastructureGatePassed && dynamicGatePassed
+                && robustReplayGatePassed)
+        let paddedPopulation = ((population + simulationBatch - 1)
+            / simulationBatch) * simulationBatch
+        let simulatedEnvironmentControlSteps = simulationBatch * (
+            sourcePreparationSteps + 3 * configuration.horizon)
+            + paddedPopulation * configuration.generations
+                * configuration.horizon
         return PushTPhysicalFlowReport(
             experiment: "pusht-state-to-state-physical-flow-v0",
             seed: configuration.seed,
             populationSize: population,
+            simulationBatchSize: simulationBatch,
             generations: configuration.generations,
             horizon: configuration.horizon,
             controlPointCount: configuration.controlPointCount,
@@ -630,9 +818,14 @@ public enum PushTPhysicalFlowExperiment {
             targetTipBlockContact: targetTipBlockContact,
             targetCloneSpreadLoss: targetCloneSpread,
             targetCloneMaximumStateError: targetCloneMaximumError,
+            targetCloneWorstEnvironment: targetCloneWorstEnvironment,
+            targetCloneFirstDivergentStep: targetCloneFirstDivergentStep,
+            targetCloneMaximumErrorByStep: targetCloneMaximumErrorByStep,
+            targetGenerationStable: targetGenerationStable,
             referenceReplay: referenceMetrics,
             linearInterpolation: linearMetrics,
             fittedReferenceSpline: fittedMetrics,
+            geometricProposalSpline: geometricProposalMetrics!,
             initialProposalSpline: initialProposalMetrics!,
             randomShooting: random.metrics,
             optimizedSpline: best.metrics,
@@ -640,17 +833,27 @@ public enum PushTPhysicalFlowExperiment {
             optimizedToRandomLossRatio: optimizedToRandom,
             selectedReplayLoss: selectedReplay.loss,
             selectedReplayMaximumStateError: selectedReplayMaximumError,
+            robustReplaySuccessFraction: robustReplaySuccessFraction,
+            robustReplayMedianLoss: robustReplayMedianLoss,
+            robustReplayWorstLoss: robustReplayWorstLoss,
+            robustReplayMaximumBlockPositionErrorMeters:
+                robustReplayMaximumBlockPositionError,
+            robustReplayMaximumBlockYawErrorRadians:
+                robustReplayMaximumBlockYawError,
             bestControlPointsXY: best.controlPoints.flatMap { [$0.x, $0.y] },
+            teacherSample: teacherSample,
             generationHistory: generationHistory,
-            candidateRollouts: population * (configuration.generations + 2),
-            simulatedEnvironmentControlSteps: population * (
-                sourcePreparationSteps + configuration.horizon
-                    * batchedPhysicalFlows),
+            candidateRollouts: population * configuration.generations
+                + 3 + simulationBatch,
+            simulatedEnvironmentControlSteps:
+                simulatedEnvironmentControlSteps,
             elapsedSeconds: Date().timeIntervalSince(startTime),
             infrastructureGatePassed: infrastructureGatePassed,
             poseReconstructionGatePassed: poseGatePassed,
             dynamicStateReconstructionGatePassed: dynamicGatePassed,
-            goGatePassed: infrastructureGatePassed && dynamicGatePassed)
+            robustReplayGatePassed: robustReplayGatePassed,
+            goGatePassed: infrastructureGatePassed && dynamicGatePassed
+                && robustReplayGatePassed)
     }
 
     private static func rollout(
@@ -659,15 +862,33 @@ public enum PushTPhysicalFlowExperiment {
         paths: [[SIMD2<Float>]],
         configuration: PushTPhysicalFlowConfiguration
     ) -> [PushTPhysicalState] {
-        precondition(paths.count == configuration.populationSize)
+        precondition(!paths.isEmpty)
         precondition(paths.allSatisfy { $0.count == configuration.horizon })
-        environment.fork(source, into: Array(0..<configuration.populationSize))
-        for step in 0..<configuration.horizon {
-            environment.step(
-                actions: paths.map { $0[step] },
-                substeps: configuration.substeps, maxStep: 0.16)
+        precondition(environment.numEnvs == configuration.simulationBatchSize)
+        let batch = environment.numEnvs
+        var terminals = [PushTPhysicalState]()
+        terminals.reserveCapacity(paths.count)
+        for start in stride(from: 0, to: paths.count, by: batch) {
+            let end = min(start + batch, paths.count)
+            let count = end - start
+            var batchedPaths = Array(paths[start..<end])
+            // The environment requires one action per resident replica. Pad a
+            // partial final microbatch with a real candidate; padded terminals
+            // are deliberately discarded and never enter CEM statistics.
+            while batchedPaths.count < batch {
+                batchedPaths.append(batchedPaths[0])
+            }
+            environment.fork(source, into: Array(0..<batch))
+            for step in 0..<configuration.horizon {
+                environment.step(
+                    actions: batchedPaths.map { $0[step] },
+                    substeps: configuration.substeps,
+                    maxStep: configuration.targetGenerationMaximumStep)
+            }
+            terminals.append(contentsOf:
+                environment.physicalStates().prefix(count))
         }
-        return environment.physicalStates()
+        return terminals
     }
 
     private static func path(
@@ -701,6 +922,82 @@ public enum PushTPhysicalFlowExperiment {
             }
         }
         return lower
+    }
+
+    private static func makeProposalContext(
+        source: PushTPhysicalState, target: PushTPhysicalState
+    ) -> PushTPhysicalFlowProposalContext {
+        let sourceCenter3 = blockCenter(source)
+        let targetCenter3 = blockCenter(target)
+        let sourceCenter = SIMD2(sourceCenter3.x, sourceCenter3.y)
+        let targetCenter = SIMD2(targetCenter3.x, targetCenter3.y)
+        let sourceYaw = blockYaw(source)
+        let targetYaw = blockYaw(target)
+        let yawDelta = wrappedAngle(targetYaw - sourceYaw)
+        func planar(_ value: F3) -> SIMD2<Float> {
+            SIMD2(value.x, value.y)
+        }
+        func rotateIntoFrame(
+            _ value: SIMD2<Float>, yaw: Float
+        ) -> SIMD2<Float> {
+            let c = cos(yaw), s = sin(yaw)
+            return SIMD2(c * value.x + s * value.y,
+                         -s * value.x + c * value.y)
+        }
+        let sourceBlockVelocity = 0.5 * (
+            source.blockBar.linearVelocity + source.blockStem.linearVelocity)
+        let targetBlockVelocity = 0.5 * (
+            target.blockBar.linearVelocity + target.blockStem.linearVelocity)
+        let sourceBlockAngularVelocity = 0.5 * (
+            source.blockBar.angularVelocity + source.blockStem.angularVelocity)
+        let targetBlockAngularVelocity = 0.5 * (
+            target.blockBar.angularVelocity + target.blockStem.angularVelocity)
+        var input = [Float]()
+        input.reserveCapacity(PushTPhysicalFlowProposalContext.inputDimension)
+        func append(_ value: SIMD2<Float>) {
+            input.append(value.x)
+            input.append(value.y)
+        }
+        append(rotateIntoFrame(targetCenter - sourceCenter, yaw: sourceYaw))
+        input.append(sin(yawDelta))
+        input.append(cos(yawDelta))
+        append(rotateIntoFrame(planar(sourceBlockVelocity), yaw: sourceYaw))
+        append(rotateIntoFrame(planar(targetBlockVelocity), yaw: targetYaw))
+        input.append(sourceBlockAngularVelocity.z)
+        input.append(targetBlockAngularVelocity.z)
+        append(rotateIntoFrame(
+            planar(source.tip.position) - sourceCenter, yaw: sourceYaw))
+        append(rotateIntoFrame(
+            planar(target.tip.position) - targetCenter, yaw: targetYaw))
+        append(rotateIntoFrame(
+            planar(source.tip.linearVelocity), yaw: sourceYaw))
+        append(rotateIntoFrame(
+            planar(target.tip.linearVelocity), yaw: targetYaw))
+        append(rotateIntoFrame(
+            source.commandedTipTarget - sourceCenter, yaw: sourceYaw))
+        append(rotateIntoFrame(
+            target.commandedTipTarget - targetCenter, yaw: targetYaw))
+        precondition(input.count == PushTPhysicalFlowProposalContext.inputDimension)
+        return PushTPhysicalFlowProposalContext(
+            input: input,
+            sourceBlockCenter: sourceCenter,
+            sourceBlockYaw: sourceYaw,
+            sourceCommandedTipTarget: source.commandedTipTarget,
+            targetCommandedTipTarget: target.commandedTipTarget)
+    }
+
+    private static func canonicalInternalControlPoints(
+        _ controlPoints: [SIMD2<Float>],
+        context: PushTPhysicalFlowProposalContext
+    ) -> [Float] {
+        let c = cos(context.sourceBlockYaw)
+        let s = sin(context.sourceBlockYaw)
+        return controlPoints.dropFirst().dropLast().flatMap { point in
+            let delta = point - context.sourceBlockCenter
+            let local = SIMD2(c * delta.x + s * delta.y,
+                              -s * delta.x + c * delta.y)
+            return [local.x, local.y]
+        }
     }
 
     /// State-only imagination proposal. It does not use the reference action

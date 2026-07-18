@@ -52,14 +52,17 @@ final class PushTPhysicalFlowExperimentTests: XCTestCase {
         XCTAssertLessThan(rmse, 1e-4)
     }
 
-    func testSelectedPhysicalFlowReplaysFromColdFork() throws {
+    func testMicrobatchedPhysicalFlowReplaysFromColdFork() throws {
         let report = try PushTPhysicalFlowExperiment.run(configuration: .init(
-            populationSize: 8, generations: 1, horizon: 8,
+            populationSize: 40, simulationBatchSize: 8,
+            generations: 1, horizon: 8,
             controlPointCount: 4, substeps: 2,
             sourcePreparationSteps: 160,
             initialStandardDeviation: 0.5, eliteFraction: 0.25,
             seed: 73))
         XCTAssertTrue(report.sourceHadActiveContact)
+        XCTAssertEqual(report.populationSize, 40)
+        XCTAssertEqual(report.simulationBatchSize, 8)
         XCTAssertLessThan(report.targetCloneSpreadLoss, 1e-5)
         XCTAssertLessThan(report.targetCloneMaximumStateError, 3e-4)
         XCTAssertLessThan(report.referenceReplay.loss, 1e-7)
@@ -67,5 +70,40 @@ final class PushTPhysicalFlowExperimentTests: XCTestCase {
         XCTAssertLessThan(report.selectedReplayMaximumStateError, 1e-5)
         XCTAssertTrue(report.optimizedSpline.loss.isFinite)
         XCTAssertEqual(report.bestControlPointsXY.count, 8)
+        XCTAssertEqual(
+            report.teacherSample.schemaVersion,
+            PushTPhysicalFlowTeacherSample.schemaVersion)
+        XCTAssertEqual(
+            report.teacherSample.input.count,
+            PushTPhysicalFlowProposalContext.inputDimension)
+        XCTAssertEqual(
+            report.teacherSample.canonicalInternalControlPointsXY.count, 4)
+        XCTAssertEqual(report.teacherSample.seed, 73)
+    }
+
+    func testLearnedProposalProviderReceivesStructuredStateAndDecodesKnots()
+        throws {
+        var observedInput = [Float]()
+        let report = try PushTPhysicalFlowExperiment.run(configuration: .init(
+            populationSize: 8, simulationBatchSize: 8,
+            generations: 1, horizon: 8,
+            controlPointCount: 4, substeps: 2,
+            sourcePreparationSteps: 160,
+            initialStandardDeviation: 0.5, eliteFraction: 0.25,
+            seed: 79), proposalProvider: { context in
+                observedInput = context.input
+                return [0.1, -0.2, 0.3, 0.4]
+            })
+        XCTAssertEqual(
+            observedInput.count,
+            PushTPhysicalFlowProposalContext.inputDimension)
+        XCTAssertTrue(observedInput.allSatisfy(\.isFinite))
+        XCTAssertEqual(
+            report.teacherSample.canonicalInternalControlPointsXY.count, 4)
+        XCTAssertTrue(report.initialProposalSpline.loss.isFinite)
+        XCTAssertLessThanOrEqual(
+            report.optimizedSpline.loss,
+            min(report.initialProposalSpline.loss,
+                report.geometricProposalSpline.loss) + 1e-6)
     }
 }

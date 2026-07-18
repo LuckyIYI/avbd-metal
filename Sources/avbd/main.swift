@@ -307,6 +307,37 @@ func makeScene(_ name: String, _ o: Options) -> PhysicsScene {
     return scene
 }
 
+func makePushTPhysicalFlowConfiguration(
+    _ o: Options, arguments: [String], defaultGenerations: Int = 6
+) -> PushTPhysicalFlowConfiguration {
+    PushTPhysicalFlowConfiguration(
+        populationSize: max(8, o.envs),
+        simulationBatchSize: max(
+            3, min(32, Int(o.taskOptions["simulationBatchSize"] ?? 32))),
+        generations: max(1, o.iterations ?? defaultGenerations),
+        horizon: arguments.contains("--horizon") ? max(8, o.horizon) : 48,
+        controlPointCount: max(
+            4, Int(o.taskOptions["controlPointCount"] ?? 6)),
+        substeps: max(1, Int(o.taskOptions["substeps"] ?? 4)),
+        sourcePreparationSteps: max(
+            1, Int(o.taskOptions["sourcePreparationSteps"] ?? 160)),
+        targetSettlingSteps: max(
+            0, Int(o.taskOptions["targetSettlingSteps"] ?? 0)),
+        terminalHoldSteps: max(
+            0, Int(o.taskOptions["terminalHoldSteps"] ?? 0)),
+        targetGenerationMaximumStep:
+            o.taskOptions["targetGenerationMaximumStep"] ?? 0.16,
+        proposal: o.algorithm == "endpoint-contact-cem"
+                || o.algorithm == "endpoint-contact-full-cem"
+            ? .endpointContact : .linearEndpoints,
+        covarianceMode: o.algorithm == "endpoint-contact-full-cem"
+            ? .full : .diagonal,
+        initialStandardDeviation:
+            o.taskOptions["initialStandardDeviation"] ?? 0.65,
+        eliteFraction: o.taskOptions["eliteFraction"] ?? 0.1,
+        seed: o.seed)
+}
+
 setvbuf(stdout, nil, _IOLBF, 0)   // line-buffer even when redirected to a log
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -332,6 +363,10 @@ guard let command = args.first else {
       probe-h1-box-lift  Audit bounded H1 grasp-to-lift actuation in parallel
       eval-arm-expert  Evaluate the batched Push-T demonstration expert
       experiment-pusht-flow  Reconstruct a real Push-T future with spline CEM
+      collect-pusht-flow-teacher  Build physically verified inverse-flow rows
+      train-pusht-flow-proposal  Train one structured MLX spline proposal net
+      eval-pusht-flow-proposal  Evaluate learned proposals in exact physics
+      eval-pusht-flow-retrieval  Evaluate nearest verified spline proposals
       select-rl <reports...>  Select one checkpoint on validation-only reports
       verify-selection-rl <selection.json> <reports...>  Reject seed leakage or drift
       aggregate-rl <reports...>  Aggregate distinct-seed evaluation JSON files
@@ -1424,30 +1459,9 @@ case "eval-arm-expert":
 
 case "experiment-pusht-flow":
     let o = parseOptions(Array(args.dropFirst(1)))
-    let report = try PushTPhysicalFlowExperiment.run(configuration: .init(
-        populationSize: max(8, o.envs),
-        generations: max(1, o.iterations ?? 6),
-        horizon: args.contains("--horizon") ? max(8, o.horizon) : 48,
-        controlPointCount: max(
-            4, Int(o.taskOptions["controlPointCount"] ?? 6)),
-        substeps: max(1, Int(o.taskOptions["substeps"] ?? 4)),
-        sourcePreparationSteps: max(
-            1, Int(o.taskOptions["sourcePreparationSteps"] ?? 160)),
-        targetSettlingSteps: max(
-            0, Int(o.taskOptions["targetSettlingSteps"] ?? 0)),
-        terminalHoldSteps: max(
-            0, Int(o.taskOptions["terminalHoldSteps"] ?? 0)),
-        targetGenerationMaximumStep:
-            o.taskOptions["targetGenerationMaximumStep"] ?? 0.16,
-        proposal: o.algorithm == "endpoint-contact-cem"
-                || o.algorithm == "endpoint-contact-full-cem"
-            ? .endpointContact : .linearEndpoints,
-        covarianceMode: o.algorithm == "endpoint-contact-full-cem"
-            ? .full : .diagonal,
-        initialStandardDeviation:
-            o.taskOptions["initialStandardDeviation"] ?? 0.65,
-        eliteFraction: o.taskOptions["eliteFraction"] ?? 0.1,
-        seed: o.seed))
+    let report = try PushTPhysicalFlowExperiment.run(
+        configuration: makePushTPhysicalFlowConfiguration(
+            o, arguments: args))
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let reportData = try encoder.encode(report)
@@ -1459,6 +1473,141 @@ case "experiment-pusht-flow":
         try reportData.write(to: url, options: .atomic)
     }
     print(String(decoding: reportData, as: UTF8.self))
+
+case "collect-pusht-flow-teacher":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let output = o.output else {
+        fail("usage: avbd collect-pusht-flow-teacher --output <dataset.json> "
+            + "[--episodes N] [physical-flow options]")
+    }
+    let configuration = makePushTPhysicalFlowConfiguration(
+        o, arguments: args, defaultGenerations: 10)
+    let dataset = try PushTPhysicalFlowDatasetBuilder.collect(
+        requestedSamples: max(1, o.episodes),
+        seedStart: o.seed,
+        seedStride: UInt64(max(
+            1, Int(o.taskOptions["seedStride"] ?? 104_729))),
+        experimentConfiguration: configuration)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(dataset)
+    let url = URL(fileURLWithPath: output)
+    try FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(),
+        withIntermediateDirectories: true)
+    try data.write(to: url, options: .atomic)
+    print("flow dataset -> \(output)  accepted \(dataset.samples.count)/"
+        + "\(dataset.requestedSamples)  rejected \(dataset.rejected.count)")
+
+case "train-pusht-flow-proposal":
+    guard args.count > 1, !args[1].hasPrefix("--") else {
+        fail("usage: avbd train-pusht-flow-proposal <dataset.json> "
+            + "--output <checkpoint-dir> [--epochs N] [--hidden N] [--lr R]")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    guard let output = o.output else {
+        fail("train-pusht-flow-proposal requires --output <checkpoint-dir>")
+    }
+    let dataset = try JSONDecoder().decode(
+        PushTPhysicalFlowDataset.self,
+        from: Data(contentsOf: URL(fileURLWithPath: args[1])))
+    let report = try PushTPhysicalFlowProposalTrainer.train(
+        dataset: dataset,
+        epochs: args.contains("--epochs") ? max(1, o.epochs) : 2_000,
+        hiddenDimension: args.contains("--hidden") ? max(16, o.hidden) : 128,
+        learningRate: o.lr,
+        seed: o.seed,
+        checkpointDirectory: output)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let reportData = try encoder.encode(report)
+    try reportData.write(
+        to: URL(fileURLWithPath: "\(output)/training-report.json"),
+        options: .atomic)
+    print(String(decoding: reportData, as: UTF8.self))
+
+case "eval-pusht-flow-proposal":
+    guard args.count > 1, !args[1].hasPrefix("--") else {
+        fail("usage: avbd eval-pusht-flow-proposal <checkpoint-dir> "
+            + "[--episodes N] [--output reports.json] [physical-flow options]")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let proposal = try PushTPhysicalFlowMLXProposal(
+        checkpointDirectory: args[1])
+    let seedStride = UInt64(max(
+        1, Int(o.taskOptions["seedStride"] ?? 104_729)))
+    var reports = [PushTPhysicalFlowReport]()
+    for index in 0..<max(1, o.episodes) {
+        var configuration = makePushTPhysicalFlowConfiguration(
+            o, arguments: args, defaultGenerations: 2)
+        configuration.seed = o.seed &+ UInt64(index) &* seedStride
+        let report = try PushTPhysicalFlowExperiment.run(
+            configuration: configuration,
+            proposalProvider: { try proposal($0) })
+        reports.append(report)
+        print(String(format:
+            "learned flow %3d/%3d seed %llu  initial %.5g  refined %.5g  robust %.0f%%  go %d",
+            index + 1, max(1, o.episodes), configuration.seed,
+            report.initialProposalSpline.loss, report.optimizedSpline.loss,
+            100 * report.robustReplaySuccessFraction,
+            report.goGatePassed ? 1 : 0))
+    }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let reportData = try encoder.encode(reports)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try reportData.write(to: url, options: .atomic)
+    } else {
+        print(String(decoding: reportData, as: UTF8.self))
+    }
+
+case "eval-pusht-flow-retrieval":
+    guard args.count > 1, !args[1].hasPrefix("--") else {
+        fail("usage: avbd eval-pusht-flow-retrieval <dataset.json> "
+            + "[--episodes N] [--output reports.json] [physical-flow options]")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let dataset = try JSONDecoder().decode(
+        PushTPhysicalFlowDataset.self,
+        from: Data(contentsOf: URL(fileURLWithPath: args[1])))
+    let proposal = try PushTPhysicalFlowNearestNeighborProposal(
+        dataset: dataset)
+    let seedStride = UInt64(max(
+        1, Int(o.taskOptions["seedStride"] ?? 104_729)))
+    var reports = [PushTPhysicalFlowReport]()
+    for index in 0..<max(1, o.episodes) {
+        var configuration = makePushTPhysicalFlowConfiguration(
+            o, arguments: args, defaultGenerations: 2)
+        configuration.seed = o.seed &+ UInt64(index) &* seedStride
+        let report = try PushTPhysicalFlowExperiment.run(
+            configuration: configuration,
+            proposalProvider: { proposal($0) })
+        reports.append(report)
+        print(String(format:
+            "retrieved flow %3d/%3d seed %llu  neighbor %llu d %.3f  initial %.5g  refined %.5g  robust %.0f%%  go %d",
+            index + 1, max(1, o.episodes), configuration.seed,
+            proposal.lastNeighborSeed ?? 0,
+            proposal.lastNormalizedDistance ?? .infinity,
+            report.initialProposalSpline.loss, report.optimizedSpline.loss,
+            100 * report.robustReplaySuccessFraction,
+            report.goGatePassed ? 1 : 0))
+    }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let reportData = try encoder.encode(reports)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try reportData.write(to: url, options: .atomic)
+    } else {
+        print(String(decoding: reportData, as: UTF8.self))
+    }
 
 case "select-rl":
     let raw = Array(args.dropFirst())
