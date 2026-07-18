@@ -92,6 +92,55 @@ final class ConvergenceTests: XCTestCase {
                        "Coulomb decel \(decel) vs expected \(expected)")
     }
 
+    /// The legacy Push-T object is two overlapping boxes joined by a hard
+    /// weld. It must dissipate sliding and spinning energy just like one rigid
+    /// body; otherwise state-flow targets never become quasi-static.
+    func testWeldedPushTCompoundDissipatesSlidingEnergy() throws {
+        var scene = PhysicsScene(name: "welded-pusht-friction")
+        scene.settings.iterations = 16
+        scene.settings.betaLin = 20_000
+        scene.settings.lambdaMax = 600
+        _ = scene.addBody(
+            size: F3(20, 20, 2), density: 0, friction: 1.3,
+            position: F3(0, 0, -1))
+        let group: UInt32 = 1
+        let bar = scene.addBody(
+            size: F3(1, 0.25, 0.18), density: 3, friction: 1.1,
+            position: F3(0, 0.125, 0.09), collisionGroup: group)
+        let stem = scene.addBody(
+            size: F3(0.25, 0.65, 0.18), density: 3, friction: 1.1,
+            position: F3(0, -0.325, 0.09), collisionGroup: group)
+        let midpoint = 0.5 * (
+            scene.bodies[bar].position + scene.bodies[stem].position)
+        scene.addJoint(SceneJoint(
+            bodyA: bar, bodyB: stem,
+            rA: midpoint - scene.bodies[bar].position,
+            rB: midpoint - scene.bodies[stem].position,
+            stiffnessLin: .infinity, stiffnessAng: .infinity))
+        scene.addJoint(SceneJoint(
+            bodyA: bar, bodyB: stem, rA: .zero, rB: .zero,
+            stiffnessLin: 0, stiffnessAng: 0))
+        let solver = try GPUSolver(scene: scene)
+        solver.setBodyStates([
+            .init(body: bar, position: scene.bodies[bar].position,
+                  rotation: scene.bodies[bar].rotation,
+                  linearVelocity: F3(0.8, 0, 0),
+                  angularVelocity: F3(0, 0, 0.46)),
+            .init(body: stem, position: scene.bodies[stem].position,
+                  rotation: scene.bodies[stem].rotation,
+                  linearVelocity: F3(0.8, 0, 0),
+                  angularVelocity: F3(0, 0, 0.46)),
+        ])
+        for _ in 0..<64 { solver.step() }
+        let states = solver.bodyStates([bar, stem])
+        let linearSpeed = length(0.5 * (
+            states[0].linearVelocity + states[1].linearVelocity))
+        let angularSpeed = length(0.5 * (
+            states[0].angularVelocity + states[1].angularVelocity))
+        XCTAssertLessThan(linearSpeed, 0.1)
+        XCTAssertLessThan(angularSpeed, 0.1)
+    }
+
     /// Paper Fig. 2/4: springs with a 10,000x stiffness ratio must not show
     /// excessive sagging of the stiff spring.
     func testStiffnessRatioSpringsGPU() throws {

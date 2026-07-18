@@ -68,6 +68,14 @@ public struct PushTPhysicalStateUpdate {
     }
 }
 
+/// Grid replicas are independently visible and suit ordinary RL. Speculative
+/// replicas use collision domains to overlap at the origin, eliminating
+/// coordinate-magnitude differences from counterfactual comparisons.
+public enum PushTBatchLayout: Sendable {
+    case grid
+    case coLocated
+}
+
 // Robotics mode: massively parallel 3D Push-T environments.
 //
 // The robot is a GANTRY PUSHER (industry-standard for tabletop pushing
@@ -88,6 +96,7 @@ public final class PushTEnv: RoboticsEnv {
 
     public let numEnvs: Int
     public private(set) var refs: [EnvRefs] = []
+    public let groundBody: Int
     public let solver: GPUSolver
     public var scene: PhysicsScene
     public let envPitch: Float = 7.0
@@ -99,21 +108,38 @@ public final class PushTEnv: RoboticsEnv {
     private var spawnPoses: [(F3, Quat)] = []
     private var commanded: [SIMD2<Float>] = []
 
-    public init(numEnvs: Int, seed: UInt64 = 1, goalMarkers: Bool = false) throws {
+    public init(numEnvs: Int, seed: UInt64 = 1,
+                goalMarkers: Bool = false,
+                layout: PushTBatchLayout = .grid) throws {
         self.numEnvs = numEnvs
         var s = PhysicsScene(name: "pusht")
         s.settings.iterations = 16
         s.settings.betaLin = 20000
         s.settings.lambdaMax = 600
-        Demos.addGround(&s, friction: 1.3)
+        let columns = Int(ceil(Double(numEnvs).squareRoot()))
+        let rows = Int(ceil(Double(numEnvs) / Double(columns)))
+        let halfGridX = layout == .grid
+            ? 0.5 * Float(columns - 1) * envPitch : 0
+        let halfGridY = layout == .grid
+            ? 0.5 * Float(rows - 1) * envPitch : 0
+        // A fixed 200 m plane silently left the last row/column of batches
+        // larger than 225 environments beyond its edge. Center the replicas
+        // to improve Float32 conditioning and derive terrain from batch size.
+        groundBody = s.addBody(
+            size: F3(2 * (halfGridX + 3.5),
+                     2 * (halfGridY + 3.5), 2),
+            density: 0, friction: 1.3, position: F3(0, 0, -1))
 
         var rng = SplitMix64(seed: seed)
-        let side = Int(ceil(Double(numEnvs).squareRoot()))
         for e in 0..<numEnvs {
-            let cx = Float(e % side) * envPitch
-            let cy = Float(e / side) * envPitch
+            let cx = layout == .grid
+                ? Float(e % columns) * envPitch - halfGridX : 0
+            let cy = layout == .grid
+                ? Float(e / columns) * envPitch - halfGridY : 0
             let c = F3(cx, cy, 0)
-            refs.append(Self.buildOne(&s, center: c, rng: &rng))
+            let collisionGroup = UInt32(e + 1)
+            refs.append(Self.buildOne(
+                &s, center: c, collisionGroup: collisionGroup, rng: &rng))
             if goalMarkers {
                 let r = refs[e]
                 let gq = Quat(angle: r.goalYaw, axis: F3(0, 0, 1))
@@ -123,10 +149,12 @@ public final class PushTEnv: RoboticsEnv {
                 // goal!) — excluded pairwise below
                 let m1 = s.addBody(size: F3(1.0, 0.25, 0.1), density: 0, friction: 0.9,
                                    position: gc + gq.act(F3(0, 0.125, 0)) + F3(0, 0, -0.038),
-                                   rotation: gq)
+                                   rotation: gq,
+                                   collisionGroup: collisionGroup)
                 let m2 = s.addBody(size: F3(0.25, 0.65, 0.1), density: 0, friction: 0.9,
                                    position: gc + gq.act(F3(0, -0.325, 0)) + F3(0, 0, -0.038),
-                                   rotation: gq)
+                                   rotation: gq,
+                                   collisionGroup: collisionGroup)
                 for m in [m1, m2] {
                     for b in [r.blockBar, r.blockStem, r.tip] {
                         s.addJoint(SceneJoint(bodyA: m, bodyB: b, rA: .zero, rB: .zero,
@@ -136,10 +164,12 @@ public final class PushTEnv: RoboticsEnv {
                 // cosmetic gantry frame
                 for sx in [Float(-1), 1] {
                     _ = s.addBody(size: F3(0.14, 0.14, 2.6), density: 0, friction: 0.3,
-                                  position: c + F3(sx * 2.9, -2.9, 1.3))
+                                  position: c + F3(sx * 2.9, -2.9, 1.3),
+                                  collisionGroup: collisionGroup)
                 }
                 _ = s.addBody(size: F3(6.0, 0.12, 0.12), density: 0, friction: 0.3,
-                              position: c + F3(0, -2.9, 2.6))
+                              position: c + F3(0, -2.9, 2.6),
+                              collisionGroup: collisionGroup)
             }
         }
         scene = s
@@ -152,11 +182,13 @@ public final class PushTEnv: RoboticsEnv {
     }
 
     static func buildOne(_ s: inout PhysicsScene, center c: F3,
+                         collisionGroup: UInt32,
                          rng: inout SplitMix64) -> EnvRefs {
         // ---- the pusher tool head ----
-        let tip = s.addCapsule(length: 0.7, radius: 0.09, density: 1.2,
-                               friction: 0.35,
-                               position: c + F3(1.4, 0, tipHeight))
+        let tip = s.addBody(
+            size: F3(0.7, 0.09, 0), density: 1.2, friction: 0.35,
+            position: c + F3(1.4, 0, tipHeight), shape: .capsule,
+            collisionGroup: collisionGroup)
         // Cartesian actuator: world->tip soft joint with bounded force.
         // Stiffness chosen so force saturates over ~1 tip radius of error.
         let dragJoint = s.joints.count
@@ -178,10 +210,12 @@ public final class PushTEnv: RoboticsEnv {
         let blockC = c + F3(bx, by, 0)
         let bar = s.addBody(size: F3(1.0, 0.25, 0.18), density: 3.0, friction: 1.1,
                             position: blockC + q.act(F3(0, 0.125, 0)) + F3(0, 0, 0.09),
-                            rotation: q)
+                            rotation: q,
+                            collisionGroup: collisionGroup)
         let stem = s.addBody(size: F3(0.25, 0.65, 0.18), density: 3.0, friction: 1.1,
                              position: blockC + q.act(F3(0, -0.325, 0)) + F3(0, 0, 0.09),
-                             rotation: q)
+                             rotation: q,
+                             collisionGroup: collisionGroup)
         let mid = (s.bodies[bar].position + s.bodies[stem].position) * 0.5
         s.addJoint(SceneJoint(bodyA: bar, bodyB: stem,
                               rA: s.bodies[bar].rotation.inverse.act(mid - s.bodies[bar].position),
@@ -193,9 +227,11 @@ public final class PushTEnv: RoboticsEnv {
         // containment fence
         for sgn in [Float(-1), 1] {
             _ = s.addBody(size: F3(6.4, 0.12, 0.45), density: 0, friction: 0.4,
-                          position: c + F3(0, sgn * 3.2, 0.22))
+                          position: c + F3(0, sgn * 3.2, 0.22),
+                          collisionGroup: collisionGroup)
             _ = s.addBody(size: F3(0.12, 6.4, 0.45), density: 0, friction: 0.4,
-                          position: c + F3(sgn * 3.2, 0, 0.22))
+                          position: c + F3(sgn * 3.2, 0, 0.22),
+                          collisionGroup: collisionGroup)
         }
 
         return EnvRefs(dragJoint: dragJoint, tip: tip,

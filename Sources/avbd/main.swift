@@ -331,6 +331,7 @@ guard let command = args.first else {
       distill-h1-box-lift  Distill a verified physical lift trajectory into MLX
       probe-h1-box-lift  Audit bounded H1 grasp-to-lift actuation in parallel
       eval-arm-expert  Evaluate the batched Push-T demonstration expert
+      experiment-pusht-flow  Reconstruct a real Push-T future with spline CEM
       select-rl <reports...>  Select one checkpoint on validation-only reports
       verify-selection-rl <selection.json> <reports...>  Reject seed leakage or drift
       aggregate-rl <reports...>  Aggregate distinct-seed evaluation JSON files
@@ -1420,6 +1421,44 @@ case "eval-arm-expert":
         "arm expert  envs %d  success %d (%.1f%%)  coverage mean %.3f median %.3f  success_step %.1f",
         o.envs, successes.count, 100 * Float(successes.count) / Float(o.envs),
         meanCoverage, medianCoverage, meanSuccessStep))
+
+case "experiment-pusht-flow":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    let report = try PushTPhysicalFlowExperiment.run(configuration: .init(
+        populationSize: max(8, o.envs),
+        generations: max(1, o.iterations ?? 6),
+        horizon: args.contains("--horizon") ? max(8, o.horizon) : 48,
+        controlPointCount: max(
+            4, Int(o.taskOptions["controlPointCount"] ?? 6)),
+        substeps: max(1, Int(o.taskOptions["substeps"] ?? 4)),
+        sourcePreparationSteps: max(
+            1, Int(o.taskOptions["sourcePreparationSteps"] ?? 160)),
+        targetSettlingSteps: max(
+            0, Int(o.taskOptions["targetSettlingSteps"] ?? 0)),
+        terminalHoldSteps: max(
+            0, Int(o.taskOptions["terminalHoldSteps"] ?? 0)),
+        targetGenerationMaximumStep:
+            o.taskOptions["targetGenerationMaximumStep"] ?? 0.16,
+        proposal: o.algorithm == "endpoint-contact-cem"
+                || o.algorithm == "endpoint-contact-full-cem"
+            ? .endpointContact : .linearEndpoints,
+        covarianceMode: o.algorithm == "endpoint-contact-full-cem"
+            ? .full : .diagonal,
+        initialStandardDeviation:
+            o.taskOptions["initialStandardDeviation"] ?? 0.65,
+        eliteFraction: o.taskOptions["eliteFraction"] ?? 0.1,
+        seed: o.seed))
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let reportData = try encoder.encode(report)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try reportData.write(to: url, options: .atomic)
+    }
+    print(String(decoding: reportData, as: UTF8.self))
 
 case "select-rl":
     let raw = Array(args.dropFirst())
