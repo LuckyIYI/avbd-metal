@@ -38,6 +38,36 @@ public struct PushTState {
     public var blockYaw: Float
 }
 
+/// Complete task-local rigid state needed to branch Push-T futures. Positions
+/// are expressed relative to the environment origin so one physical state can
+/// be copied to any translated replica without changing its dynamics.
+public struct PushTPhysicalState {
+    public var tip: GPUSolver.RigidBodyState
+    public var blockBar: GPUSolver.RigidBodyState
+    public var blockStem: GPUSolver.RigidBodyState
+    public var commandedTipTarget: SIMD2<Float>
+
+    public init(tip: GPUSolver.RigidBodyState,
+                blockBar: GPUSolver.RigidBodyState,
+                blockStem: GPUSolver.RigidBodyState,
+                commandedTipTarget: SIMD2<Float>) {
+        self.tip = tip
+        self.blockBar = blockBar
+        self.blockStem = blockStem
+        self.commandedTipTarget = commandedTipTarget
+    }
+}
+
+public struct PushTPhysicalStateUpdate {
+    public var environment: Int
+    public var state: PushTPhysicalState
+
+    public init(environment: Int, state: PushTPhysicalState) {
+        self.environment = environment
+        self.state = state
+    }
+}
+
 // Robotics mode: massively parallel 3D Push-T environments.
 //
 // The robot is a GANTRY PUSHER (industry-standard for tabletop pushing
@@ -115,6 +145,10 @@ public final class PushTEnv: RoboticsEnv {
         scene = s
         solver = try GPUSolver(scene: s)
         spawnPoses = s.bodies.map { ($0.position, $0.rotation) }
+        commanded = refs.map { reference in
+            let p = spawnPoses[reference.tip].0 - reference.center
+            return SIMD2(p.x, p.y)
+        }
     }
 
     static func buildOne(_ s: inout PhysicsScene, center c: F3,
@@ -244,6 +278,103 @@ public final class PushTEnv: RoboticsEnv {
                 blockPosition: SIMD2(mid.x, mid.y),
                 blockYaw: atan2(fwd.y, fwd.x))
         }
+    }
+
+    /// Capture every dynamic Push-T body and its actuator target after one GPU
+    /// fence. This is deliberately more complete than `states()`: speculative
+    /// rollouts must preserve velocities and the rate limiter's target history.
+    public func physicalStates() -> [PushTPhysicalState] {
+        var ids = [Int]()
+        ids.reserveCapacity(numEnvs * 3)
+        for reference in refs {
+            ids.append(reference.tip)
+            ids.append(reference.blockBar)
+            ids.append(reference.blockStem)
+        }
+        let bodies = solver.bodyStates(ids)
+        return (0..<numEnvs).map { environment in
+            let reference = refs[environment]
+            func localized(_ state: GPUSolver.RigidBodyState)
+                -> GPUSolver.RigidBodyState {
+                GPUSolver.RigidBodyState(
+                    position: state.position - reference.center,
+                    rotation: state.rotation,
+                    linearVelocity: state.linearVelocity,
+                    angularVelocity: state.angularVelocity)
+            }
+            return PushTPhysicalState(
+                tip: localized(bodies[environment * 3]),
+                blockBar: localized(bodies[environment * 3 + 1]),
+                blockStem: localized(bodies[environment * 3 + 2]),
+                commandedTipTarget: commanded[environment])
+        }
+    }
+
+    /// Restore portable task-local physical states into arbitrary replicas.
+    /// All bodies are written behind one fence and all actuator anchors behind
+    /// one more, making this suitable for batched speculative branching.
+    public func setPhysicalStates(_ updates: [PushTPhysicalStateUpdate]) {
+        guard !updates.isEmpty else { return }
+        var bodyUpdates = [GPUSolver.BodyStateUpdate]()
+        var anchorUpdates = [GPUSolver.JointAnchorUpdate]()
+        bodyUpdates.reserveCapacity(updates.count * 3)
+        anchorUpdates.reserveCapacity(updates.count)
+        for update in updates {
+            let environment = update.environment
+            precondition(environment >= 0 && environment < numEnvs,
+                         "environment index out of range")
+            let reference = refs[environment]
+            let state = update.state
+            precondition(Self.isFinite(state),
+                         "speculative state must be finite")
+            func worldUpdate(_ body: Int,
+                             _ local: GPUSolver.RigidBodyState)
+                -> GPUSolver.BodyStateUpdate {
+                GPUSolver.BodyStateUpdate(
+                    body: body,
+                    position: local.position + reference.center,
+                    rotation: local.rotation,
+                    linearVelocity: local.linearVelocity,
+                    angularVelocity: local.angularVelocity)
+            }
+            bodyUpdates.append(worldUpdate(reference.tip, state.tip))
+            bodyUpdates.append(worldUpdate(reference.blockBar, state.blockBar))
+            bodyUpdates.append(worldUpdate(reference.blockStem, state.blockStem))
+            let target = state.commandedTipTarget
+            anchorUpdates.append(.init(
+                joint: reference.dragJoint,
+                point: reference.center
+                    + F3(target.x, target.y, Self.tipHeight)))
+            commanded[environment] = target
+        }
+        solver.setBodyStates(bodyUpdates)
+        solver.setJointWorldAnchors(anchorUpdates)
+    }
+
+    /// Copy one captured future into many replicas for branched rollouts.
+    public func fork(_ state: PushTPhysicalState,
+                     into environments: [Int]) {
+        setPhysicalStates(environments.map {
+            PushTPhysicalStateUpdate(environment: $0, state: state)
+        })
+    }
+
+    private static func isFinite(_ state: PushTPhysicalState) -> Bool {
+        func vector(_ value: F3) -> Bool {
+            value.x.isFinite && value.y.isFinite && value.z.isFinite
+        }
+        func quaternion(_ value: Quat) -> Bool {
+            value.real.isFinite && vector(value.imag)
+        }
+        func rigid(_ value: GPUSolver.RigidBodyState) -> Bool {
+            vector(value.position) && quaternion(value.rotation)
+                && vector(value.linearVelocity)
+                && vector(value.angularVelocity)
+        }
+        return rigid(state.tip) && rigid(state.blockBar)
+            && rigid(state.blockStem)
+            && state.commandedTipTarget.x.isFinite
+            && state.commandedTipTarget.y.isFinite
     }
 
     /// In-place per-env reset: teleport pusher + re-randomize block.
