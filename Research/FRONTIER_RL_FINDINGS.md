@@ -302,6 +302,81 @@ humanoid remains upright and the grasp stays bilateral. It is still not the
 complete table-to-table task. Destination approach, lowering, support transfer,
 release, and post-release survival remain unverified.
 
+### 2026-07-18 — E5 dynamic whole-body flow and robust DAgger amortization
+
+Continuing arm-only physical flows extended the exact reconstructed frontier to
+28.05 cm and then 32.03 cm. Beyond that boundary, the frozen v147 loaded-leg
+controller stalled. Fixed interpolation toward the imported point-goal walker
+did not solve the mismatch: 25%, 50%, 75%, and 100% base-leg blends reached
+30.67, 23.73, 5.96, and 5.38 cm respectively. Treating an entire locomotion
+policy as a plug-in was therefore rejected.
+
+A three-knot time-varying leg blend was then added to the same compact physical
+flow. Exact-physics discovery selected only a small pulse (approximately
+0 -> 9.5% -> 0), not a wholesale controller switch. Together with the arm
+spline, it produced a verified target at 35.17 cm carry, 1.44 cm clearance,
+robot/box upright alignment 0.981/0.986, bilateral contact, and no source-table
+support. The generating flow replayed from a fresh source state with normalized
+state error 0.0058. Attempts to reconstruct a different trajectory plateaued
+near 33.8 cm, so the exact planner trajectory is a valid online action but not
+yet a robust alternate state-to-state reconstruction.
+
+Vanilla PPO continuation from v147 was tested under the same task configuration
+for 25 updates. It improved maximum stable carry by only 3.7 mm (33.27 ->
+33.64 cm), with zero task success. More PPO was deprioritized.
+
+Offline behavioral cloning of the dynamic physical flow reduced action MSE
+from 0.01884 to 0.00628 but carried only 5.99 cm stably with 0% success. An
+earlier verifier had incorrectly counted post-failure box motion as 36.4 cm;
+failure latching, bilateral contact, source-support, lift, upright, and
+clearance checks now reject that result. This is the clearest negative result
+so far: low supervised error on a contact trajectory does not imply a useful
+closed-loop policy.
+
+State-aligned DAgger fixed the covariate-shift failure. It monotonically matches
+learner states to the simulator teacher using body, object, hand, contact,
+clearance, and carry observations; labels only pre-failure states; mixes the
+teacher from 98% toward 60%; and selects immutable checkpoints by exact physical
+replay rather than training loss. The robustness-targeted run used 256
+environments, 240 MLX epochs in six aggregation rounds, learning rate 1e-5,
+and rollout action noise 0.003. It grew 15,360 teacher rows to 68,941 rows and
+selected epoch 200 rather than the final checkpoint.
+
+| policy / assay | stable carry | deterministic success | target-action noise success |
+|---|---:|---:|---:|
+| inherited v147 branch | 4.13 cm | 0/64 | 0/64 at sigma=0.001 |
+| offline cloning | 5.99 cm | 0/32 | not promoted |
+| first DAgger, epoch 160 | 35.33 cm | 32/32 | 50/64 at sigma=0.001 |
+| robustness-targeted DAgger, epoch 200 | **35.15 cm** | **64/64** | **62/64 at sigma=0.001** |
+
+Across four independent noise seeds, the selected epoch-200 checkpoint passed
+249/256 target-branch replays at sigma=0.001 (97.3%). It also passed 55/64 at
+sigma=0.002 (85.9%) and failed at sigma=0.003 with 41/64 (64.1%), giving an
+honest measured robustness boundary instead of a binary demo claim.
+
+This result is deliberately scoped. The 16-frame verified lift flow is still
+replayed to establish the carried source state; only the subsequent 44-frame
+carry segment is an observation-to-action policy with no trajectory input.
+Adding sigma=0.001 noise through the inherited approach and source lift yields
+0/64 before carry begins. End-to-end approach, grasp, lift, transport,
+destination support, release, and survival remain the task-level objective.
+
+Reproduction:
+
+```sh
+.build/release/avbd distill-h1-box-flow \
+  --checkpoint runs/humanoid-box-carry-v0/carry-mlx-v147-placement-curriculum/checkpoints/update-000150 \
+  --run runs/physical-flow/humanoid-box-flow/dynamic-leg-blend-carry35cm-discovery128x8-smoke.json \
+  --output runs/humanoid-box-carry-v0/carry-flow-distill-v7-dagger-robust \
+  --envs 256 --updates 240 --lr 0.00001 \
+  --task-option aggregationRounds=6 \
+  --task-option initialTeacherMix=0.98 \
+  --task-option finalTeacherMix=0.6 \
+  --task-option rolloutActionNoiseStandardDeviation=0.003 \
+  --task-option validationActionNoiseStandardDeviation=0.001 \
+  --task-option robustReplayCount=64
+```
+
 ### Rejected results and dead ends
 
 - A first apparent 53x CEM gain was rejected: the 16x16 batch exceeded the old
@@ -329,15 +404,25 @@ release, and post-release survival remain unverified.
 - Predicting absolute spline points made held-out proposals worse than the
   geometric prior. The network and retrieval index now predict only invariant
   residual corrections, and checkpoint schema v3 rejects old absolute models.
+- Calling identical evaluation replicas "robust" was rejected. The standalone
+  carry-flow evaluator now reports deterministic replay separately from seeded
+  action perturbations and records whether noise applies only to the learned
+  target segment or to the full inherited sequence.
 
 ## Next experiment: carry to destination and transfer support
 
-Extend the now-verified multistage lineage toward the receiving table. Target
+Extend the now-verified and amortized carry frontier toward the receiving table.
+Use the robust DAgger checkpoint as the carried-state action prior while exact
+physics proposes and verifies the next destination-directed segment. Target
 discovery should include destination progress and a clearance corridor, then
 branch into separate lowering/support-transfer and release/survival goal sets.
 Do not collapse these into one sparse terminal reward: accept each stage only
 after exact reconstruction and robust replay, then preserve the complete
 simulator-executed ancestry in the next artifact.
+
+In parallel, remove the explicit lift bootstrap by aggregating learner-state
+labels across grasp and lift, so the complete manipulation sequence becomes one
+observation-to-action policy rather than a policy after a scripted boundary.
 
 The imagination layer should next retain multiple frontier hypotheses rather
 than only the lowest scalar-loss mode. After enough accepted stages and failed

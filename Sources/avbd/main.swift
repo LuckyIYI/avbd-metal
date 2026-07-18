@@ -112,19 +112,14 @@ func humanoidBoxTrajectory(from data: Data) -> [Float]? {
 /// lineage needed to reproduce its terminal state. Older single-stage flow
 /// reports are accepted and become a one-element lineage.
 func humanoidBoxFlowSourceStages(
-    from data: Data, useTargetGeneratingTrajectory: Bool = false
+    from data: Data, useTargetGeneratingTrajectory: Bool = false,
+    includeOwnStage: Bool = true
 ) -> [HumanoidBoxPhysicalFlowStage]? {
     guard let object = try? JSONSerialization.jsonObject(with: data),
-          let dictionary = object as? [String: Any],
-          let ownValues = dictionary[
-            useTargetGeneratingTrajectory
-                ? "targetGeneratingTrajectory" : "bestTrajectory"]
-            as? [NSNumber],
-          let ownSteps = dictionary["selectedTargetStep"] as? NSNumber,
-          ownSteps.intValue > 0 else {
+          let dictionary = object as? [String: Any] else {
         return nil
     }
-    if useTargetGeneratingTrajectory {
+    if includeOwnStage && useTargetGeneratingTrajectory {
         let explicitPass = dictionary["targetPlanningGatePassed"] as? Bool
         let inferredPass = (dictionary["targetGatePassed"] as? Bool) == true
             && ((dictionary["targetCloneSuccessFraction"]
@@ -139,9 +134,18 @@ func humanoidBoxFlowSourceStages(
     if let encodedStages = dictionary["sourceStages"]
             as? [[String: Any]] {
         for encoded in encodedStages {
-            guard let values = encoded["trajectory"] as? [NSNumber],
-                  let steps = encoded["controlSteps"] as? NSNumber,
+            guard let steps = encoded["controlSteps"] as? NSNumber,
                   steps.intValue > 0 else { return nil }
+            let policyOnly = encoded["policyOnly"] as? Bool == true
+            if policyOnly {
+                stages.append(.init(
+                    trajectory: [], controlSteps: steps.intValue,
+                    policyOnly: true))
+                continue
+            }
+            guard let values = encoded["trajectory"] as? [NSNumber] else {
+                return nil
+            }
             let duration = (encoded["trajectoryDurationSteps"]
                 as? NSNumber)?.intValue
             let trajectory = values.map(\.floatValue)
@@ -152,15 +156,23 @@ func humanoidBoxFlowSourceStages(
                 trajectoryDurationSteps: duration))
         }
     }
-    let ownTrajectory = ownValues.map(\.floatValue)
-    guard !ownTrajectory.isEmpty,
-          ownTrajectory.allSatisfy(\.isFinite) else { return nil }
-    stages.append(.init(
-        trajectory: ownTrajectory, controlSteps: ownSteps.intValue,
-        trajectoryDurationSteps: useTargetGeneratingTrajectory
-            ? (dictionary["targetGenerationSteps"] as? NSNumber)?.intValue
-            : nil))
-    return stages
+    if includeOwnStage {
+        guard let ownValues = dictionary[
+                useTargetGeneratingTrajectory
+                    ? "targetGeneratingTrajectory" : "bestTrajectory"]
+                as? [NSNumber],
+              let ownSteps = dictionary["selectedTargetStep"] as? NSNumber,
+              ownSteps.intValue > 0 else { return nil }
+        let ownTrajectory = ownValues.map(\.floatValue)
+        guard !ownTrajectory.isEmpty,
+              ownTrajectory.allSatisfy(\.isFinite) else { return nil }
+        stages.append(.init(
+            trajectory: ownTrajectory, controlSteps: ownSteps.intValue,
+            trajectoryDurationSteps: useTargetGeneratingTrajectory
+                ? (dictionary["targetGenerationSteps"] as? NSNumber)?.intValue
+                : nil))
+    }
+    return stages.isEmpty ? nil : stages
 }
 
 func humanoidBoxTargetGeneratingTrajectory(from data: Data) -> [Float]? {
@@ -1431,16 +1443,85 @@ case "distill-h1-box-flow":
             maximumGradientNorm: o.maxGradientNorm,
             targetRowWeight:
                 o.taskOptions["targetRowWeight"] ?? 4,
+            policySourceRowWeight:
+                o.taskOptions["policySourceRowWeight"] ?? 4,
+            aggregationRounds: Int(
+                o.taskOptions["aggregationRounds"] ?? 4),
+            initialTeacherMix:
+                o.taskOptions["initialTeacherMix"] ?? 0.75,
+            finalTeacherMix:
+                o.taskOptions["finalTeacherMix"] ?? 0,
+            rolloutActionNoiseStandardDeviation:
+                o.taskOptions["rolloutActionNoiseStandardDeviation"]
+                    ?? 0.005,
+            stateAlignmentLookahead: Int(
+                o.taskOptions["stateAlignmentLookahead"] ?? 12),
+            validationActionNoiseStandardDeviation:
+                o.taskOptions[
+                    "validationActionNoiseStandardDeviation"] ?? 0.001,
+            validationNoiseIncludesSource:
+                o.taskOptions["validationNoiseIncludesSource"] == 1,
             robustReplayCount: Int(
                 o.taskOptions["robustReplayCount"] ?? 32),
             seed: o.seed))
     print(String(format:
-        "flow distillation %d rows action MSE %.6g -> %.6g, teacher %.3fm learner %.3fm robust %.0f%% %@",
-        report.teacherRows, report.initialActionMSE,
+        "flow distillation %d -> %d rows/%d rounds action MSE %.6g -> %.6g, teacher %.3fm learner %.3fm deterministic %.0f%% robust %.0f%% best@%d %@",
+        report.teacherRows, report.aggregatedRows,
+        report.aggregationRounds, report.initialActionMSE,
         report.finalActionMSE, report.teacherCarryDistanceMeters,
         report.learnerMaximumStableCarryDistanceMeters,
+        100 * report.learnerDeterministicFinalSuccessFraction,
         100 * report.learnerRobustFinalSuccessFraction,
+        report.bestEpoch,
         report.distillationGatePassed ? "PASS" : "FAIL"))
+
+case "eval-h1-box-flow":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let checkpoint = o.checkpoint, o.runName != "ppo" else {
+        fail("usage: avbd eval-h1-box-flow --checkpoint DIR "
+            + "--run FLOW_REPORT_JSON [--envs REPLAYS]")
+    }
+    let configuration = HumanoidBoxFlowDistillationConfiguration(
+        collectionEnvironments: 1,
+        contactDwellSteps: Int(
+            o.taskOptions["contactDwellSteps"] ?? 8),
+        epochs: 1,
+        aggregationRounds: 1,
+        validationActionNoiseStandardDeviation:
+            o.taskOptions[
+                "validationActionNoiseStandardDeviation"] ?? 0.001,
+        validationNoiseIncludesSource:
+            o.taskOptions["validationNoiseIncludesSource"] == 1,
+        robustReplayCount: o.envs,
+        seed: o.seed)
+    let report = try HumanoidBoxFlowDistillation.evaluate(
+        checkpointDirectory: checkpoint,
+        flowReportPath: o.runName,
+        configuration: configuration)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(report)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+    if o.json {
+        print(String(decoding: data, as: UTF8.self))
+    } else {
+        print(String(format:
+            "H1 box flow eval required %.3fm deterministic %.3fm/%.0f%% %@ noise %.4f robust %.3fm/%.0f%% %@",
+            report.requiredCarryDistanceMeters,
+            report.deterministicMaximumStableCarryDistanceMeters,
+            100 * report.deterministicFinalSuccessFraction,
+            report.deterministicGatePassed ? "PASS" : "FAIL",
+            report.actionNoiseStandardDeviation,
+            report.robustMaximumStableCarryDistanceMeters,
+            100 * report.robustFinalSuccessFraction,
+            report.robustGatePassed ? "PASS" : "FAIL"))
+    }
 
 case "experiment-h1-box-flow":
     guard args.count > 1, !args[1].hasPrefix("--") else {
@@ -1476,9 +1557,22 @@ case "experiment-h1-box-flow":
     }
     let legBlendKnotCount = Int(
         o.taskOptions["legBlendKnotCount"] ?? 0)
-    let targetArmParameterCount = targetTrajectory.count.isMultiple(of: 4)
-        ? targetTrajectory.count
-        : targetTrajectory.count - legBlendKnotCount
+    let legResidualKnotCount = Int(
+        o.taskOptions["legResidualKnotCount"] ?? 0)
+    let legResidualParameterCount = 10 * legResidualKnotCount
+    let targetArmParameterCount: Int
+    if targetTrajectory.count.isMultiple(of: 4) {
+        targetArmParameterCount = targetTrajectory.count
+    } else if targetTrajectory.count
+                > legBlendKnotCount + legResidualParameterCount,
+              (targetTrajectory.count - legBlendKnotCount
+                - legResidualParameterCount).isMultiple(of: 4) {
+        targetArmParameterCount = targetTrajectory.count
+            - legBlendKnotCount - legResidualParameterCount
+    } else {
+        targetArmParameterCount = targetTrajectory.count
+            - legBlendKnotCount
+    }
     guard targetArmParameterCount > 0,
           targetArmParameterCount.isMultiple(of: 4) else {
         fail("target probe trajectory has an invalid knot schema")
@@ -1487,20 +1581,25 @@ case "experiment-h1-box-flow":
     let acceptedTrajectoryCounts = Set([
         targetArmParameterCount,
         targetArmParameterCount + legBlendKnotCount,
+        targetArmParameterCount + legBlendKnotCount
+            + legResidualParameterCount,
     ])
     if let proposalTrajectory,
        !acceptedTrajectoryCounts.contains(proposalTrajectory.count) {
         fail("proposal and target probe knot schemas differ")
     }
-    let sourceStages: [HumanoidBoxPhysicalFlowStage]
+    var sourceStages: [HumanoidBoxPhysicalFlowStage]
     if o.runName != "ppo" {
         let data = try Data(contentsOf: URL(fileURLWithPath: o.runName))
         let useTargetGeneratingSource =
             o.taskOptions["useTargetGeneratingTrajectoryAsSource"] == 1
+        let sourceStagesOnly =
+            o.taskOptions["sourceStagesOnly"] == 1
         if let stages = humanoidBoxFlowSourceStages(
             from: data,
             useTargetGeneratingTrajectory:
-                useTargetGeneratingSource) {
+                useTargetGeneratingSource,
+            includeOwnStage: !sourceStagesOnly) {
             sourceStages = stages
         } else if useTargetGeneratingSource {
             fail("--run target-generating source did not pass its planner gate")
@@ -1515,12 +1614,19 @@ case "experiment-h1-box-flow":
             fail("--run source must be a box physical-flow or probe report")
         }
         if sourceStages.contains(where: {
-            !acceptedTrajectoryCounts.contains($0.trajectory.count)
+            $0.policyOnly != true
+                && !acceptedTrajectoryCounts.contains($0.trajectory.count)
         }) {
             fail("source and target trajectory knot schemas differ")
         }
     } else {
         sourceStages = []
+    }
+    if let policySourceSteps = o.taskOptions["policySourceSteps"],
+       policySourceSteps > 0 {
+        sourceStages.append(.init(
+            trajectory: [], controlSteps: Int(policySourceSteps),
+            policyOnly: true))
     }
     let configuration = HumanoidBoxPhysicalFlowConfiguration(
         populationSize: o.envs,
@@ -1532,6 +1638,9 @@ case "experiment-h1-box-flow":
         contactDwellSteps: Int(
             o.taskOptions["contactDwellSteps"] ?? 8),
         targetGenerationSteps: args.contains("--frames") ? o.frames : 400,
+        targetExecutionSteps: o.taskOptions["targetExecutionSteps"].map {
+            Int($0)
+        },
         targetDiscoveryPopulationSize: Int(
             o.taskOptions["targetDiscoveryPopulationSize"] ?? 0),
         targetDiscoveryGenerations: Int(
@@ -1541,8 +1650,16 @@ case "experiment-h1-box-flow":
         carryBaseLegActionFractionOverride:
             o.taskOptions["carryBaseLegActionFractionOverride"],
         legBlendKnotCount: legBlendKnotCount,
+        legResidualKnotCount: legResidualKnotCount,
+        maximumLegResidualAction:
+            o.taskOptions["maximumLegResidualAction"] ?? 0.25,
         minimumTargetCarryDistanceMeters:
             o.taskOptions["minimumTargetCarryDistanceMeters"] ?? 0,
+        targetDiscoveryObjectiveCarryDistanceMeters:
+            o.taskOptions[
+                "targetDiscoveryObjectiveCarryDistanceMeters"],
+        requireStableCarryPath:
+            o.taskOptions["requireStableCarryPath"] == 1,
         trajectoryKnotCount: knotCount,
         robustReplayCount: Int(
             o.taskOptions["robustReplayCount"] ?? 32),

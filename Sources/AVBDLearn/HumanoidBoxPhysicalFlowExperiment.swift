@@ -9,12 +9,17 @@ public struct HumanoidBoxPhysicalFlowConfiguration: Sendable {
     public var maximumWarmupSteps: Int
     public var contactDwellSteps: Int
     public var targetGenerationSteps: Int
+    public var targetExecutionSteps: Int?
     public var targetDiscoveryPopulationSize: Int
     public var targetDiscoveryGenerations: Int
     public var targetDiscoveryInitialStandardDeviation: Float
     public var carryBaseLegActionFractionOverride: Float?
     public var legBlendKnotCount: Int
+    public var legResidualKnotCount: Int
+    public var maximumLegResidualAction: Float
     public var minimumTargetCarryDistanceMeters: Float
+    public var targetDiscoveryObjectiveCarryDistanceMeters: Float?
+    public var requireStableCarryPath: Bool
     public var trajectoryKnotCount: Int
     public var robustReplayCount: Int
     public var initialStandardDeviation: Float
@@ -28,12 +33,17 @@ public struct HumanoidBoxPhysicalFlowConfiguration: Sendable {
         maximumWarmupSteps: Int = 600,
         contactDwellSteps: Int = 8,
         targetGenerationSteps: Int = 400,
+        targetExecutionSteps: Int? = nil,
         targetDiscoveryPopulationSize: Int = 0,
         targetDiscoveryGenerations: Int = 0,
         targetDiscoveryInitialStandardDeviation: Float = 0.25,
         carryBaseLegActionFractionOverride: Float? = nil,
         legBlendKnotCount: Int = 0,
+        legResidualKnotCount: Int = 0,
+        maximumLegResidualAction: Float = 0.25,
         minimumTargetCarryDistanceMeters: Float = 0,
+        targetDiscoveryObjectiveCarryDistanceMeters: Float? = nil,
+        requireStableCarryPath: Bool = false,
         trajectoryKnotCount: Int = 5,
         robustReplayCount: Int = 32,
         initialStandardDeviation: Float = 0.25,
@@ -46,6 +56,7 @@ public struct HumanoidBoxPhysicalFlowConfiguration: Sendable {
         self.maximumWarmupSteps = maximumWarmupSteps
         self.contactDwellSteps = contactDwellSteps
         self.targetGenerationSteps = targetGenerationSteps
+        self.targetExecutionSteps = targetExecutionSteps
         self.targetDiscoveryPopulationSize = targetDiscoveryPopulationSize
         self.targetDiscoveryGenerations = targetDiscoveryGenerations
         self.targetDiscoveryInitialStandardDeviation =
@@ -53,8 +64,13 @@ public struct HumanoidBoxPhysicalFlowConfiguration: Sendable {
         self.carryBaseLegActionFractionOverride =
             carryBaseLegActionFractionOverride
         self.legBlendKnotCount = legBlendKnotCount
+        self.legResidualKnotCount = legResidualKnotCount
+        self.maximumLegResidualAction = maximumLegResidualAction
         self.minimumTargetCarryDistanceMeters =
             minimumTargetCarryDistanceMeters
+        self.targetDiscoveryObjectiveCarryDistanceMeters =
+            targetDiscoveryObjectiveCarryDistanceMeters
+        self.requireStableCarryPath = requireStableCarryPath
         self.trajectoryKnotCount = trajectoryKnotCount
         self.robustReplayCount = robustReplayCount
         self.initialStandardDeviation = initialStandardDeviation
@@ -70,6 +86,9 @@ public struct HumanoidBoxPhysicalFlowConfiguration: Sendable {
               maximumWarmupSteps > 0,
               contactDwellSteps > 0,
               targetGenerationSteps >= 8,
+              (targetExecutionSteps.map {
+                  $0 > 0 && $0 <= targetGenerationSteps
+              } ?? true),
               ((targetDiscoveryPopulationSize == 0
                     && targetDiscoveryGenerations == 0)
                 || (targetDiscoveryPopulationSize >= 8
@@ -80,8 +99,16 @@ public struct HumanoidBoxPhysicalFlowConfiguration: Sendable {
                   $0.isFinite && (0...1).contains($0)
               } ?? true),
               legBlendKnotCount >= 0,
+              legResidualKnotCount >= 0,
+              maximumLegResidualAction.isFinite,
+              maximumLegResidualAction > 0,
+              maximumLegResidualAction <= 1,
               minimumTargetCarryDistanceMeters.isFinite,
               minimumTargetCarryDistanceMeters >= 0,
+              (targetDiscoveryObjectiveCarryDistanceMeters.map {
+                  $0.isFinite
+                    && $0 >= minimumTargetCarryDistanceMeters
+              } ?? true),
               trajectoryKnotCount > 0,
               robustReplayCount > 0,
               initialStandardDeviation.isFinite,
@@ -101,14 +128,17 @@ public struct HumanoidBoxPhysicalFlowStage: Codable, Sendable {
     public var trajectory: [Float]
     public var controlSteps: Int
     public var trajectoryDurationSteps: Int?
+    public var policyOnly: Bool?
 
     public init(
         trajectory: [Float], controlSteps: Int,
-        trajectoryDurationSteps: Int? = nil
+        trajectoryDurationSteps: Int? = nil,
+        policyOnly: Bool = false
     ) {
         self.trajectory = trajectory
         self.controlSteps = controlSteps
         self.trajectoryDurationSteps = trajectoryDurationSteps
+        self.policyOnly = policyOnly ? true : nil
     }
 }
 
@@ -160,12 +190,18 @@ public struct HumanoidBoxPhysicalFlowReport: Codable, Sendable {
     public var generations: Int
     public var targetTrajectoryWithheldFromSearch: Bool
     public var targetGenerationSteps: Int
+    public var targetExecutionSteps: Int
     public var targetDiscoveryPopulationSize: Int
     public var targetDiscoveryGenerations: Int
     public var targetDiscoveryCandidateRollouts: Int
     public var targetGeneratingTrajectory: [Float]
     public var carryBaseLegActionFractionOverride: Float?
     public var legBlendKnotCount: Int
+    public var legResidualKnotCount: Int
+    public var maximumLegResidualAction: Float
+    public var minimumTargetCarryDistanceMeters: Float
+    public var targetDiscoveryObjectiveCarryDistanceMeters: Float
+    public var requireStableCarryPath: Bool
     public var sourceTrajectorySteps: Int
     public var sourceStages: [HumanoidBoxPhysicalFlowStage]
     public var sourceReplaySuccessFraction: Float
@@ -174,6 +210,7 @@ public struct HumanoidBoxPhysicalFlowReport: Codable, Sendable {
     public var targetBoxUprightAlignment: Float
     public var targetRobotUprightAlignment: Float
     public var targetCarryDistanceMeters: Float
+    public var targetStableCarryPath: Bool
     public var targetCloneSuccessFraction: Float
     public var targetReplayMaximumNormalizedError: Float
     public var providedProposal: HumanoidBoxPhysicalFlowMetrics?
@@ -251,6 +288,7 @@ public enum HumanoidBoxPhysicalFlowExperiment {
         var replicaCarryDistances: [Float]
         var warmupSteps: Int
         var sourceReplaySuccessFraction: Float
+        var stableCarryPath: Bool
     }
 
     private struct WarmTask {
@@ -270,17 +308,25 @@ public enum HumanoidBoxPhysicalFlowExperiment {
     ) throws -> HumanoidBoxPhysicalFlowReport {
         try configuration.validate()
         let armParameterCount = 4 * configuration.trajectoryKnotCount
+        let legBlendParameterCount = configuration.legBlendKnotCount
+        let legResidualParameterCount = 10
+            * configuration.legResidualKnotCount
         let parameterCount = armParameterCount
-            + configuration.legBlendKnotCount
+            + legBlendParameterCount + legResidualParameterCount
 
         func normalizedTrajectory(_ values: [Float]) -> [Float]? {
             guard values.allSatisfy(\.isFinite) else { return nil }
             if values.count == parameterCount { return values }
-            if values.count == armParameterCount,
-               configuration.legBlendKnotCount > 0 {
+            if values.count == armParameterCount {
                 return values + [Float](
                     repeating: 0,
-                    count: configuration.legBlendKnotCount)
+                    count: legBlendParameterCount
+                        + legResidualParameterCount)
+            }
+            if values.count == armParameterCount + legBlendParameterCount,
+               legResidualParameterCount > 0 {
+                return values + [Float](
+                    repeating: 0, count: legResidualParameterCount)
             }
             return nil
         }
@@ -290,8 +336,11 @@ public enum HumanoidBoxPhysicalFlowExperiment {
                 || normalizedTrajectory(proposalTrajectory!) != nil,
               sourceStages.allSatisfy({
                   $0.controlSteps > 0
-                      && ($0.trajectoryDurationSteps ?? $0.controlSteps) > 0
-                      && normalizedTrajectory($0.trajectory) != nil
+                      && ($0.policyOnly == true
+                        ? $0.trajectory.isEmpty
+                            && $0.trajectoryDurationSteps == nil
+                        : ($0.trajectoryDurationSteps ?? $0.controlSteps) > 0
+                            && normalizedTrajectory($0.trajectory) != nil)
               }) else {
             throw RLEnvironmentError.invalidConfiguration(
                 "humanoid-box flow trajectories do not match the knot schema")
@@ -299,17 +348,23 @@ public enum HumanoidBoxPhysicalFlowExperiment {
         let proposalTrajectory = proposalTrajectory.flatMap(
             normalizedTrajectory)
         let sourceStages = sourceStages.map {
-            HumanoidBoxPhysicalFlowStage(
+            if $0.policyOnly == true {
+                return HumanoidBoxPhysicalFlowStage(
+                    trajectory: [], controlSteps: $0.controlSteps,
+                    policyOnly: true)
+            }
+            return HumanoidBoxPhysicalFlowStage(
                 trajectory: normalizedTrajectory($0.trajectory)!,
                 controlSteps: $0.controlSteps,
-                trajectoryDurationSteps: $0.trajectoryDurationSteps)
+                trajectoryDurationSteps: $0.trajectoryDurationSteps,
+                policyOnly: false)
         }
         if let proposalTrajectory, proposalTrajectory == targetTrajectory {
             throw RLEnvironmentError.invalidConfiguration(
                 "target-generating trajectory must be withheld from search")
         }
         if sourceStages.contains(where: {
-            $0.trajectory == targetTrajectory
+            $0.policyOnly != true && $0.trajectory == targetTrajectory
         }) {
             throw RLEnvironmentError.invalidConfiguration(
                 "carried target trajectory must differ from the source flow")
@@ -317,6 +372,8 @@ public enum HumanoidBoxPhysicalFlowExperiment {
         let sourceControlSteps = sourceStages.reduce(0) {
             $0 + $1.controlSteps
         }
+        let targetExecutionSteps = configuration.targetExecutionSteps
+            ?? configuration.targetGenerationSteps
 
         let startTime = Date()
         let runner = try VectorPolicyRunner(
@@ -452,6 +509,23 @@ public enum HumanoidBoxPhysicalFlowExperiment {
                             + blend * baseLegActions.values[index]
                     }
                 }
+                if configuration.legResidualKnotCount > 0 {
+                    for action in 0..<10 {
+                        actions.values[base + action] = simd_clamp(
+                            actions.values[base + action]
+                                + legResidualAction(
+                                    parameters[environment],
+                                    action: action, progress: progress,
+                                    armParameterCount: armParameterCount,
+                                    blendKnotCount:
+                                        configuration.legBlendKnotCount,
+                                    residualKnotCount:
+                                        configuration.legResidualKnotCount,
+                                    maximumAction: configuration
+                                        .maximumLegResidualAction),
+                            -0.999, 0.999)
+                    }
+                }
                 for arm in 0..<armActionCount {
                     let index = base + firstArmAction + arm
                     actions.values[index] = simd_clamp(
@@ -499,15 +573,22 @@ public enum HumanoidBoxPhysicalFlowExperiment {
         func prepareSource(count: Int) throws -> WarmTask {
             var runtime = try makeWarmTask(count: count)
             for stage in sourceStages {
-                let repeated = [[Float]](
-                    repeating: stage.trajectory, count: count)
                 for step in 0..<stage.controlSteps {
-                    let actions = try applyTrajectory(
-                        repeated, step: step,
-                        denominator: stage.trajectoryDurationSteps
-                            ?? stage.controlSteps,
-                        task: runtime.task,
-                        observation: runtime.observation)
+                    let actions: RLActionBatch
+                    if stage.policyOnly == true {
+                        actions = try policyActions(
+                            task: runtime.task,
+                            observation: runtime.observation)
+                    } else {
+                        actions = try applyTrajectory(
+                            [[Float]](
+                                repeating: stage.trajectory, count: count),
+                            step: step,
+                            denominator: stage.trajectoryDurationSteps
+                                ?? stage.controlSteps,
+                            task: runtime.task,
+                            observation: runtime.observation)
+                    }
                     try runtime.task.step(
                         actions: actions, into: &runtime.result)
                     runtime.observation = runtime.result.observations
@@ -540,9 +621,10 @@ public enum HumanoidBoxPhysicalFlowExperiment {
             var maximumCarryDistance: Float = 0
             var maximumStableCarryDistance: Float = 0
             var everLifted = false
+            var stableCarryPath = true
             let repeated = [[Float]](
                 repeating: trajectory, count: count)
-            for step in 0..<configuration.targetGenerationSteps {
+            for step in 0..<targetExecutionSteps {
                 let actions = try applyTrajectory(
                     repeated, step: step,
                     denominator: configuration.targetGenerationSteps,
@@ -575,11 +657,14 @@ public enum HumanoidBoxPhysicalFlowExperiment {
                     && boxUp > 0.9
                     && !allFlags[0].failed
                     && clearances[0] >= 0.01
+                stableCarryPath = stableCarryPath && stableCarryManifold
                 if stableCarryManifold {
                     maximumStableCarryDistance = max(
                         maximumStableCarryDistance, carryDistances[0])
                 }
                 let feasible = stableCarryManifold
+                    && (!configuration.requireStableCarryPath
+                        || stableCarryPath)
                     && carryDistances[0]
                         >= configuration.minimumTargetCarryDistanceMeters
                 guard feasible else { continue }
@@ -610,7 +695,8 @@ public enum HumanoidBoxPhysicalFlowExperiment {
                         replicaCarryDistances: Array(carryDistances),
                         warmupSteps: runtime.warmupSteps,
                         sourceReplaySuccessFraction:
-                            runtime.sourceReplaySuccessFraction)
+                            runtime.sourceReplaySuccessFraction,
+                        stableCarryPath: stableCarryPath)
                 }
             }
             guard let best else {
@@ -683,7 +769,9 @@ public enum HumanoidBoxPhysicalFlowExperiment {
                 var bestErrors = [Float](
                     repeating: .infinity, count: parameters.count)
                 var bestSteps = [Int](repeating: 0, count: parameters.count)
-                for step in 0..<configuration.targetGenerationSteps {
+                var stableCarryPaths = [Bool](
+                    repeating: true, count: parameters.count)
+                for step in 0..<targetExecutionSteps {
                     let actions = try applyTrajectory(
                         parameters, step: step,
                         denominator: configuration.targetGenerationSteps,
@@ -702,13 +790,30 @@ public enum HumanoidBoxPhysicalFlowExperiment {
                     let carryDistances = runtime.result.metrics[
                         "state/carry_distance_m"]!
                     for environment in parameters.indices {
+                        let rootUp = allStates[environment].humanoid.root
+                            .rotation.act(F3(0, 0, 1)).z
+                        let boxUp = allStates[environment].manipulation.object
+                            .rotation.act(F3(0, 0, 1)).z
+                        stableCarryPaths[environment] =
+                            stableCarryPaths[environment]
+                            && allFlags[environment].bilateral
+                            && allFlags[environment].unsupported
+                            && allFlags[environment].physicallyLifted
+                            && rootUp > 0.9 && boxUp > 0.9
+                            && clearances[environment] >= 0.01
+                            && !allFlags[environment].failed
                         let evaluation = frontierEvaluation(
                             state: allStates[environment],
                             flags: allFlags[environment],
                             clearance: clearances[environment],
                             carryDistance: carryDistances[environment],
-                            minimumCarryDistance:
-                                configuration.minimumTargetCarryDistanceMeters)
+                            minimumCarryDistance: configuration
+                                .targetDiscoveryObjectiveCarryDistanceMeters
+                                ?? configuration
+                                    .minimumTargetCarryDistanceMeters,
+                            stableCarryPath: stableCarryPaths[environment],
+                            requireStableCarryPath:
+                                configuration.requireStableCarryPath)
                         if evaluation.bottleneckLoss
                             < bestLosses[environment] {
                             bestLosses[environment] =
@@ -720,8 +825,8 @@ public enum HumanoidBoxPhysicalFlowExperiment {
                     }
                 }
                 simulatedEnvironmentControlSteps += parameters.count
-                    * (runtime.warmupSteps + sourceControlSteps
-                        + configuration.targetGenerationSteps)
+                        * (runtime.warmupSteps + sourceControlSteps
+                        + targetExecutionSteps)
                 targetDiscoveryCandidateRollouts += parameters.count
                 return parameters.indices.map {
                     TargetDiscoveryCandidate(
@@ -813,25 +918,57 @@ public enum HumanoidBoxPhysicalFlowExperiment {
         let target = try generateTarget(using: selectedTargetTrajectory)
         simulatedEnvironmentControlSteps += target.replicas.count
             * (target.warmupSteps + sourceControlSteps
-                + configuration.targetGenerationSteps)
+                + targetExecutionSteps)
 
         func evaluate(_ parameters: [[Float]]) throws -> [Candidate] {
             precondition(!parameters.isEmpty)
             var runtime = try prepareSource(count: parameters.count)
+            var stableCarryPaths = [Bool](
+                repeating: true, count: parameters.count)
             for step in 0..<target.step {
                 let actions = try applyTrajectory(
                     parameters, step: step, denominator: target.step,
                     task: runtime.task, observation: runtime.observation)
                 try runtime.task.step(actions: actions, into: &runtime.result)
                 runtime.observation = runtime.result.observations
+                if configuration.requireStableCarryPath {
+                    let intermediateStates = states(runtime.task)
+                    let intermediateFlags = flags(
+                        task: runtime.task,
+                        observation: runtime.observation,
+                        result: runtime.result)
+                    let clearances = runtime.result.metrics[
+                        "state/box_clearance_m"]!
+                    for environment in parameters.indices {
+                        let rootUp = intermediateStates[environment].humanoid
+                            .root.rotation.act(F3(0, 0, 1)).z
+                        let boxUp = intermediateStates[environment]
+                            .manipulation.object.rotation
+                            .act(F3(0, 0, 1)).z
+                        stableCarryPaths[environment] =
+                            stableCarryPaths[environment]
+                            && intermediateFlags[environment].bilateral
+                            && intermediateFlags[environment].unsupported
+                            && intermediateFlags[environment].physicallyLifted
+                            && rootUp > 0.9 && boxUp > 0.9
+                            && clearances[environment] >= 0.01
+                            && !intermediateFlags[environment].failed
+                    }
+                }
             }
             simulatedEnvironmentControlSteps += parameters.count
                 * (runtime.warmupSteps + sourceControlSteps
                     + target.step)
             let terminals = states(runtime.task)
-            let terminalFlags = flags(
+            var terminalFlags = flags(
                 task: runtime.task, observation: runtime.observation,
                 result: runtime.result)
+            if configuration.requireStableCarryPath {
+                for environment in parameters.indices
+                    where !stableCarryPaths[environment] {
+                    terminalFlags[environment].failed = true
+                }
+            }
             let carryDistances = runtime.result.metrics[
                 "state/carry_distance_m"]!
             return parameters.indices.map { index in
@@ -1092,6 +1229,8 @@ public enum HumanoidBoxPhysicalFlowExperiment {
             && target.clearance >= 0.01
             && target.carryDistance
                 >= configuration.minimumTargetCarryDistanceMeters
+            && (!configuration.requireStableCarryPath
+                || target.stableCarryPath)
         let reconstructionGatePassed = best.metrics.endpointPassed
         let robustReplayGatePassed = robustSuccessFraction >= 0.8
         let targetPlanningGatePassed = targetGatePassed
@@ -1110,6 +1249,7 @@ public enum HumanoidBoxPhysicalFlowExperiment {
             targetTrajectoryWithheldFromSearch:
                 targetTrajectoryWasWithheld,
             targetGenerationSteps: configuration.targetGenerationSteps,
+            targetExecutionSteps: targetExecutionSteps,
             targetDiscoveryPopulationSize:
                 configuration.targetDiscoveryPopulationSize,
             targetDiscoveryGenerations:
@@ -1120,6 +1260,15 @@ public enum HumanoidBoxPhysicalFlowExperiment {
             carryBaseLegActionFractionOverride:
                 configuration.carryBaseLegActionFractionOverride,
             legBlendKnotCount: configuration.legBlendKnotCount,
+            legResidualKnotCount: configuration.legResidualKnotCount,
+            maximumLegResidualAction:
+                configuration.maximumLegResidualAction,
+            minimumTargetCarryDistanceMeters:
+                configuration.minimumTargetCarryDistanceMeters,
+            targetDiscoveryObjectiveCarryDistanceMeters: configuration
+                .targetDiscoveryObjectiveCarryDistanceMeters
+                ?? configuration.minimumTargetCarryDistanceMeters,
+            requireStableCarryPath: configuration.requireStableCarryPath,
             sourceTrajectorySteps: sourceControlSteps,
             sourceStages: sourceStages,
             sourceReplaySuccessFraction:
@@ -1129,6 +1278,7 @@ public enum HumanoidBoxPhysicalFlowExperiment {
             targetBoxUprightAlignment: target.boxUpright,
             targetRobotUprightAlignment: target.robotUpright,
             targetCarryDistanceMeters: target.carryDistance,
+            targetStableCarryPath: target.stableCarryPath,
             targetCloneSuccessFraction: targetCloneSuccessFraction,
             targetReplayMaximumNormalizedError:
                 targetReplayMetrics.maximumNormalizedError,
@@ -1179,12 +1329,38 @@ public enum HumanoidBoxPhysicalFlowExperiment {
             + fraction * knot(min(lower + 1, knotCount))
     }
 
+    static func legResidualAction(
+        _ parameters: [Float], action: Int, progress: Float,
+        armParameterCount: Int, blendKnotCount: Int,
+        residualKnotCount: Int, maximumAction: Float
+    ) -> Float {
+        precondition((0..<10).contains(action))
+        precondition(residualKnotCount > 0)
+        precondition(maximumAction > 0)
+        let offset = armParameterCount + blendKnotCount
+        precondition(parameters.count
+            >= offset + 10 * residualKnotCount)
+        let scaled = simd_clamp(progress, 0, 1)
+            * Float(residualKnotCount)
+        let lower = min(Int(floor(scaled)), residualKnotCount - 1)
+        let fraction = scaled - Float(lower)
+        func knot(_ index: Int) -> Float {
+            guard index > 0 else { return 0 }
+            return simd_clamp(parameters[
+                offset + (index - 1) * 10 + action], -1, 1)
+                * maximumAction
+        }
+        return (1 - fraction) * knot(lower)
+            + fraction * knot(min(lower + 1, residualKnotCount))
+    }
+
     /// Goal-set score used only to discover a new physically valid frontier
     /// state. The subsequent reconstruction still targets the exact selected
     /// simulator state and never receives its generating trajectory.
     private static func frontierEvaluation(
         state: State, flags: Flags, clearance: Float,
-        carryDistance: Float, minimumCarryDistance: Float
+        carryDistance: Float, minimumCarryDistance: Float,
+        stableCarryPath: Bool, requireStableCarryPath: Bool
     ) -> PhysicalFlowEndpointEvaluation {
         let rootUp = state.humanoid.root.rotation
             .act(F3(0, 0, 1)).z
@@ -1208,6 +1384,7 @@ public enum HumanoidBoxPhysicalFlowExperiment {
             rootUp > 0.9 ? 0 : 10,
             boxUp > 0.9 ? 0 : 10,
             clearance >= 0.01 ? 0 : 10,
+            !requireStableCarryPath || stableCarryPath ? 0 : 20,
             flags.failed ? 20 : 0,
         ])
     }
