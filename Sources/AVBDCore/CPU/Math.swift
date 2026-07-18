@@ -6,6 +6,26 @@ import simd
 public typealias F3 = SIMD3<Float>
 public typealias Quat = simd_quatf
 
+/// Right-handed orthographic projection using Metal's `[0, 1]` clip-depth
+/// convention. View-space `-near` maps to 0 and `-far` maps to 1.
+///
+/// Kept in the testable core math layer because renderer depth conventions are
+/// easy to get subtly wrong and directly affect shadow comparison sampling.
+@inlinable public func metalOrthographicProjection(
+    left: Float, right: Float,
+    bottom: Float, top: Float,
+    near: Float, far: Float
+) -> simd_float4x4 {
+    simd_float4x4(columns: (
+        SIMD4(2 / (right - left), 0, 0, 0),
+        SIMD4(0, 2 / (top - bottom), 0, 0),
+        SIMD4(0, 0, 1 / (near - far), 0),
+        SIMD4(-(right + left) / (right - left),
+              -(top + bottom) / (top - bottom),
+              near / (near - far), 1)
+    ))
+}
+
 @inlinable public func skew(_ r: F3) -> simd_float3x3 {
     // Row-major semantic: result * v == cross(r, v)
     simd_float3x3(columns: (

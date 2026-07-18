@@ -35,6 +35,14 @@ inline bool collisionGroupsCompatible(uint a, uint b) {
     return a == 0u || b == 0u || a == b;
 }
 
+inline bool colliderDomainsCompatible(uint groupA, uint groupB,
+                                      uint sharedA, uint sharedB) {
+    if (!collisionGroupsCompatible(groupA, groupB)) return false;
+    if (groupA == 0u && groupB != 0u) return sharedB != 0u;
+    if (groupB == 0u && groupA != 0u) return sharedA != 0u;
+    return true;
+}
+
 inline float3 bpColliderCenter(device const float4* posLin,
                                device const float4* posAng,
                                device const uint* colliderOwner,
@@ -292,6 +300,7 @@ inline uint bpProcessProducer(
     device const float4* colliderLocalPosition,
     device const float4* posAng,
     device const uint* colliderGroup,
+    device const uint* colliderSharedCollision,
     constant SimParams& P,
     uint producer,
     bool emit,
@@ -329,8 +338,10 @@ inline uint bpProcessProducer(
                 for (uint k = s; k < e; k++) {
                     uint b = cellBodies[k];
                     if (b <= a) continue;
-                    if (!collisionGroupsCompatible(collisionGroupA,
-                                                   colliderGroup[b])) continue;
+                    if (!colliderDomainsCompatible(
+                            collisionGroupA, colliderGroup[b],
+                            colliderSharedCollision[a],
+                            colliderSharedCollision[b])) continue;
                     uint ownerB = colliderOwner[b];
                     if (ownerA == ownerB) continue;
                     if (!aDyn && posLin[ownerB].w <= 0.0f) continue;
@@ -353,8 +364,10 @@ inline uint bpProcessProducer(
         }
         for (uint g = 0; g < P.numGlobals; g++) {
             uint b = globalIdx[g];
-            if (!collisionGroupsCompatible(collisionGroupA,
-                                           colliderGroup[b])) continue;
+            if (!colliderDomainsCompatible(
+                    collisionGroupA, colliderGroup[b],
+                    colliderSharedCollision[a],
+                    colliderSharedCollision[b])) continue;
             uint ownerB = colliderOwner[b];
             if (ownerA == ownerB) continue;
             if (!aDyn && posLin[ownerB].w <= 0.0f) continue;
@@ -385,8 +398,10 @@ inline uint bpProcessProducer(
         uint ga = clothGroup[ownerA];
         for (uint g = globalProducer + 1; g < P.numGlobals; g++) {
             uint b = globalIdx[g];
-            if (!collisionGroupsCompatible(collisionGroupA,
-                                           colliderGroup[b])) continue;
+            if (!colliderDomainsCompatible(
+                    collisionGroupA, colliderGroup[b],
+                    colliderSharedCollision[a],
+                    colliderSharedCollision[b])) continue;
             uint ownerB = colliderOwner[b];
             if (ownerA == ownerB) continue;
             if (!aDyn && posLin[ownerB].w <= 0.0f) continue;
@@ -427,6 +442,7 @@ kernel void bp_count_pairs_deterministic(
     device const float4* colliderLocalPosition [[buffer(15)]],
     device const float4* posAng     [[buffer(16)]],
     device const uint* colliderGroup [[buffer(17)]],
+    device const uint* colliderSharedCollision [[buffer(18)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numHashed + P.numGlobals) return;
@@ -434,6 +450,7 @@ kernel void bp_count_pairs_deterministic(
         posLin, shape, hashedIdx, cellStart, cellCount, cellBodies,
         globalIdx, exclusions, numExclusions, clothGroup, cellRigid,
         colliderOwner, colliderLocalPosition, posAng, colliderGroup,
+        colliderSharedCollision,
         P, gid, false, 0, pairs);
 }
 
@@ -456,13 +473,15 @@ kernel void bp_emit_pairs_deterministic(
     device const float4* colliderLocalPosition [[buffer(15)]],
     device const float4* posAng     [[buffer(16)]],
     device const uint* colliderGroup [[buffer(17)]],
+    device const uint* colliderSharedCollision [[buffer(18)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numHashed + P.numGlobals) return;
     (void)bpProcessProducer(
         posLin, shape, hashedIdx, cellStart, cellCount, cellBodies,
         globalIdx, exclusions, numExclusions, clothGroup, cellRigid,
-        colliderOwner, colliderLocalPosition, posAng, colliderGroup, P, gid, true,
+        colliderOwner, colliderLocalPosition, posAng, colliderGroup,
+        colliderSharedCollision, P, gid, true,
         pairStarts[gid], pairs);
 }
 

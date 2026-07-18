@@ -15,7 +15,7 @@ final class PointGoalNavigationTests: XCTestCase {
                 maximumYawRate: 1.2,
                 mode: .projectedBodyPlane))
 
-        XCTAssertEqual(PointGoalNavigator.revision, 1)
+        XCTAssertEqual(PointGoalNavigator.revision, 3)
         XCTAssertEqual(command.revision, PointGoalNavigator.revision)
         XCTAssertEqual(command.remainingDistance, 4, accuracy: 1e-6)
         XCTAssertEqual(command.bodyPlanarDelta.x, 0, accuracy: 1e-6)
@@ -109,6 +109,23 @@ final class PointGoalNavigationTests: XCTestCase {
                     slowdownDistance: 3).bitPattern,
                 expectedProximity.bitPattern)
         }
+    }
+
+    func testForwardAlignmentGateKeepsConfiguredSlowTurningArc() {
+        let command = PointGoalNavigator.command(
+            worldGoal: F3(0, 2, 0), bodyPosition: .zero,
+            bodyRotation: Quat(ix: 0, iy: 0, iz: 0, r: 1),
+            parameters: .init(
+                goalRadius: 0.05, slowdownDistance: 0.35,
+                cruiseSpeed: 0.3, boundarySpeed: 0.03,
+                yawGain: 0.5, maximumYawRate: 1,
+                forwardAlignmentSpeedExponent: 2,
+                minimumForwardAlignmentScale: 0.25,
+                mode: .forwardOnlyYaw))
+
+        XCTAssertEqual(command.bodyTwist.x, 0.075, accuracy: 1e-6)
+        XCTAssertEqual(command.bodyTwist.y, 0, accuracy: 1e-6)
+        XCTAssertGreaterThan(command.bodyTwist.z, 0)
     }
 
     private func legacyArachneCommand(

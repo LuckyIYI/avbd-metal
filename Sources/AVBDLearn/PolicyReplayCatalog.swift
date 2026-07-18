@@ -3,6 +3,10 @@
 public enum PolicyReplayRuntime: String, Sendable, Codable {
     case nativeMLX
     case unitreeRecurrentMLX
+    /// Static external policy whose action is conditioned on a reference clip.
+    /// Its locally imported weights are not part of the native PPO checkpoint
+    /// discovery or hot-reload path.
+    case externalReferenceMLX
     case classicalController
 }
 
@@ -21,7 +25,8 @@ public struct PolicyReplayCatalogEntry: Sendable, Equatable {
     /// Relative to the app's `checkpoints` resource directory.
     public var checkpointRelativeDirectory: String?
     public var qualification: PolicyReplayQualification
-    /// Repository-relative machine-readable parity or evaluation evidence.
+    /// Repository-relative parity/evaluation evidence or deterministic,
+    /// source-locked importer for a locally installed external artifact.
     public var evidenceRelativePath: String?
 
     public init(
@@ -53,6 +58,14 @@ public enum PolicyReplayCatalog {
             checkpointRelativeDirectory: "external/unitree-h1",
             qualification: .externalParityVerified,
             evidenceRelativePath: "checkpoints/external/unitree-h1/manifest.json"),
+        .init(
+            selectionID: "gear-sonic-g1-reference-v0",
+            displayName: "GEAR-SONIC G1",
+            taskID: "gear-sonic-g1-reference-v0",
+            runtime: .externalReferenceMLX,
+            checkpointRelativeDirectory: "external/gear-sonic-g1",
+            qualification: .development,
+            evidenceRelativePath: "Tools/import_gear_sonic_policy.py"),
         .init(
             selectionID: "humanoid-isaac-flat-v0",
             displayName: "H1 Flat Walk",

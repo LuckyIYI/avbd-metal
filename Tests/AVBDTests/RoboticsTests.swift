@@ -3,6 +3,27 @@ import simd
 @testable import AVBDCore
 
 final class RoboticsTests: XCTestCase {
+    func testHumanoidManipulationStateReadsPhysicalHandTipsAndBox() throws {
+        let env = try HumanoidWalkEnv(
+            numEnvironments: 1, seed: 40, includeProjectile: true,
+            projectileDimensions: F3(0.28, 0.24, 0.50),
+            projectileMass: 2, projectileFriction: 1.2,
+            controlProfile: .isaacLab)
+        env.placeCarryBoxes(
+            environmentIDs: [0], positions: [F3(0.55, 0, 0.25)])
+        let state = env.manipulationStates()[0]
+        XCTAssertEqual(state.object.position.x, 0.55, accuracy: 1e-5)
+        XCTAssertEqual(state.object.position.z, 0.25, accuracy: 1e-5)
+        // The terminal collision spheres are bilateral and substantially
+        // forward/downstream of their elbow-body COMs.
+        XCTAssertGreaterThan(state.leftHand.position.y, 0)
+        XCTAssertLessThan(state.rightHand.position.y, 0)
+        XCTAssertGreaterThan(state.leftHand.position.x, 0.05)
+        XCTAssertGreaterThan(state.rightHand.position.x, 0.05)
+        XCTAssertGreaterThan(state.leftHand.position.z, 0.25)
+        XCTAssertGreaterThan(state.rightHand.position.z, 0.25)
+    }
+
     func testHumanoidResetRestoresIdenticalSolverTrajectory() throws {
         let env = try HumanoidWalkEnv(
             numEnvironments: 1, seed: 41, controlProfile: .isaacLab)

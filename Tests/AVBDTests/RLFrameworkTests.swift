@@ -1257,7 +1257,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(14))
+                       RLPhysicsContract.fixedGainActuatorV2(15))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
         XCTAssertEqual(task.spec.configurationValues["freezeBasePolicyExpert"], 1)
@@ -1471,12 +1471,56 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertNoThrow(try configuration.validate(batchSize: 24))
     }
 
+    func testPolicyExpertBranchCompositionPreservesTheTrainedBranch() throws {
+        let destination: [String: MLXArray] = [
+            "expertActor1.weight": MLXArray.zeros([1, 2]),
+            "expertActor1.bias": MLXArray.zeros([1]),
+        ]
+        var source: [String: MLXArray] = [
+            "expertActor1.weight": MLXArray([Float(3), 5]).reshaped([1, 2]),
+            "expertActor1.bias": MLXArray([Float(7)]),
+            // A distinct base proves this operation did not promote actor1.
+            "actor1.weight": MLXArray([Float(30), 50]).reshaped([1, 2]),
+            "actor1.bias": MLXArray([Float(70)]),
+        ]
+        for layer in ["expertActor2", "expertActor3", "expertActorOutput"] {
+            source["\(layer).weight"] = MLXArray.ones([1, 1])
+            source["\(layer).bias"] = MLXArray.ones([1])
+        }
+        let normalizer = RunningNormalizerSnapshot(
+            count: 10, mean: [0, 0], variance: [1, 1])
+        let composed = try VectorActorCritic
+            .initializingPolicyExpertFromExpert(
+                destination, from: source,
+                sourceNormalizer: normalizer,
+                destinationNormalizer: normalizer,
+                sourceNormalizesObservations: false,
+                destinationNormalizesObservations: false)
+
+        XCTAssertEqual(composed["expertActor1.weight"]!
+            .asArray(Float.self), [3, 5])
+        XCTAssertEqual(composed["expertActor1.bias"]!
+            .asArray(Float.self), [7])
+        XCTAssertEqual(composed["expertActor2.weight"]!
+            .asArray(Float.self), [1])
+
+        var configuration = VectorPPOConfig()
+        configuration.minibatchSize = 24
+        configuration.policyExpertBranchInitializationCheckpoint = "/routed"
+        XCTAssertThrowsError(try configuration.validate(batchSize: 24))
+        configuration.initializationCheckpoint = "/base"
+        XCTAssertNoThrow(try configuration.validate(batchSize: 24))
+        configuration.policyExpertInitializationCheckpoint = "/promoted-base"
+        XCTAssertThrowsError(try configuration.validate(batchSize: 24))
+    }
+
     func testObservationSchemaTransferPreservesOldPolicyAndAddsZeroColumns()
         throws {
         let sourceValues: [Float] = [1, 2, 3, 4, 5, 6]
         var weights = [String: MLXArray]()
         for name in ["actor1.weight", "expertActor1.weight",
-                     "standActor1.weight", "critic1.weight"] {
+                     "standActor1.weight", "auxiliaryActor1.weight",
+                     "critic1.weight"] {
             weights[name] = MLXArray(sourceValues).reshaped([2, 3])
         }
         weights["actor1.bias"] = MLXArray([Float(9), 10])
@@ -1484,13 +1528,71 @@ final class RLFrameworkTests: XCTestCase {
             weights, sourceIndices: [0, nil, 2, 1])
         let expected: [Float] = [1, 0, 3, 2, 4, 0, 6, 5]
         for name in ["actor1.weight", "expertActor1.weight",
-                     "standActor1.weight", "critic1.weight"] {
+                     "standActor1.weight", "auxiliaryActor1.weight",
+                     "critic1.weight"] {
             XCTAssertEqual(remapped[name]?.shape, [2, 4])
             XCTAssertEqual(remapped[name]?.asArray(Float.self), expected)
         }
         XCTAssertEqual(remapped["actor1.bias"]?.asArray(Float.self), [9, 10])
         XCTAssertThrowsError(try VectorActorCritic.remappingObservationInputs(
             weights, sourceIndices: [3]))
+    }
+
+    func testVersion5CheckpointExpandsAuxiliaryActorFromBaseExactly() throws {
+        var weights = [String: MLXArray]()
+        for suffix in ["weight", "bias"] {
+            for layer in ["1", "2", "3"] {
+                let value = Float(layer)! + (suffix == "bias" ? 10 : 0)
+                weights["actor\(layer).\(suffix)"] = MLXArray([value])
+            }
+            weights["actorOutput.\(suffix)"] = MLXArray([
+                suffix == "bias" ? Float(19) : Float(9),
+            ])
+        }
+        let expanded = try VectorActorCritic.compatibleWeights(
+            weights, architectureVersion: 5)
+        for suffix in ["weight", "bias"] {
+            for layer in ["1", "2", "3"] {
+                XCTAssertEqual(
+                    expanded["auxiliaryActor\(layer).\(suffix)"]?
+                        .asArray(Float.self),
+                    weights["actor\(layer).\(suffix)"]?.asArray(Float.self))
+            }
+            XCTAssertEqual(
+                expanded["auxiliaryActorOutput.\(suffix)"]?
+                    .asArray(Float.self),
+                weights["actorOutput.\(suffix)"]?.asArray(Float.self))
+        }
+    }
+
+    func testFourthActorCanTrainLoadedLegsWithoutUpdatingPreservedSkills() {
+        let expert = [Float(0), 0.75]
+        let stand = [Float(1), 0.25]
+        let auxiliary = [Float(1), 0.25]
+        let upper = [Float(0), 1]
+        let lower = [Float(1), 0]
+        XCTAssertTrue(VectorPPOTrainer.hasValidActorComposition(
+            expertGates: expert, standExpertGates: stand,
+            actionDimension: 2, expertActionMask: nil,
+            standExpertActionMask: upper,
+            auxiliaryExpertGates: auxiliary,
+            auxiliaryExpertActionMask: lower))
+        XCTAssertEqual(VectorPPOTrainer.actorTrainingWeights(
+            expertGates: expert, standExpertGates: stand,
+            actionDimension: 2, expertActionMask: nil,
+            standExpertActionMask: upper,
+            freezesBaseActor: true, freezesExpertActor: true,
+            auxiliaryExpertGates: auxiliary,
+            auxiliaryExpertActionMask: lower,
+            freezesStandActor: true), [0.5, 0.125])
+        XCTAssertEqual(VectorPPOTrainer.actorExplorationActionScales(
+            expertGates: expert, standExpertGates: stand,
+            actionDimension: 2, expertActionMask: nil,
+            standExpertActionMask: upper,
+            freezesBaseActor: true, freezesExpertActor: true,
+            auxiliaryExpertGates: auxiliary,
+            auxiliaryExpertActionMask: lower,
+            freezesStandActor: true), [1, 0, 0.25, 0])
     }
 
     func testThreeModeTaskCanFreezeVerifiedLowSpeedExpert() throws {
@@ -3184,6 +3286,12 @@ final class RLFrameworkTests: XCTestCase {
             0, 1, 0,
             0, 0, 0,
         ])
+        XCTAssertEqual(VectorPPOTrainer.imitationSegmentStart(
+            episodeStart: 3, milestoneStep: 100, historySteps: nil), 3)
+        XCTAssertEqual(VectorPPOTrainer.imitationSegmentStart(
+            episodeStart: 3, milestoneStep: 100, historySteps: 32), 69)
+        XCTAssertEqual(VectorPPOTrainer.imitationSegmentStart(
+            episodeStart: 90, milestoneStep: 100, historySteps: 32), 90)
     }
 
     func testPPORecoversTaskObservationSignedPermutation() throws {
@@ -3459,6 +3567,27 @@ final class RLFrameworkTests: XCTestCase {
             logProbabilityDifferences: [20], weights: [0]), 0)
     }
 
+    func testPPOExactGaussianKLMatchesClosedFormAndRowWeights() {
+        let standardDeviation: Float = 0.05
+        let delta: Float = 0.01
+        let measured = VectorPPOTrainer.weightedDiagonalGaussianKL(
+            oldMeans: [0, 0, 100, 100],
+            oldLogStandardDeviations: [Float](
+                repeating: log(standardDeviation), count: 4),
+            newMeans: [delta, -delta, -100, -100],
+            newLogStandardDeviations: [Float](
+                repeating: log(standardDeviation), count: 4),
+            actionDimension: 2, weights: [1, 0])
+        let expected = delta * delta / (standardDeviation * standardDeviation)
+        XCTAssertEqual(measured, expected, accuracy: 1e-5)
+        XCTAssertEqual(VectorPPOTrainer.weightedDiagonalGaussianKL(
+            oldMeans: [1, -2],
+            oldLogStandardDeviations: [log(0.2), log(0.3)],
+            newMeans: [1, -2],
+            newLogStandardDeviations: [log(0.2), log(0.3)],
+            actionDimension: 2, weights: [1]), 0, accuracy: 1e-6)
+    }
+
     func testPPOKLStrategiesMatchReferenceSemantics() {
         XCTAssertTrue(VectorPPOTrainer.shouldStopForKL(
             minibatchKL: 0.100_001, targetKL: 0.1,
@@ -3500,6 +3629,94 @@ final class RLFrameworkTests: XCTestCase {
             [1, 2], weights: [0, 0])
         XCTAssertEqual(noTrainableRows.values, [0, 0])
         XCTAssertEqual(noTrainableRows.scale, 0)
+
+        XCTAssertEqual(VectorPPOTrainer.actorExplorationActionScales(
+            expertGates: [0, 1, 0], standExpertGates: [0, 0, 1],
+            actionDimension: 2, standExpertActionMask: [0, 1],
+            freezesBaseActor: true, freezesExpertActor: true), [
+                0, 0,  // frozen base row
+                0, 0,  // frozen manipulation expert row
+                0, 1,  // trainable carry arm, frozen walking leg
+            ])
+        XCTAssertEqual(VectorPPOTrainer.actorExplorationActionScales(
+            expertGates: [0], standExpertGates: [0],
+            actionDimension: 2, standExpertActionMask: nil,
+            freezesBaseActor: false, freezesExpertActor: false), [1, 1])
+        XCTAssertEqual(VectorPPOTrainer.actorExplorationActionScales(
+            expertGates: [0], standExpertGates: [1],
+            actionDimension: 2, standExpertActionMask: [0.25, 1],
+            freezesBaseActor: true, freezesExpertActor: true), [0.25, 1])
+        XCTAssertEqual(VectorPPOTrainer.likelihoodActionMask(
+            explorationActionScales: [0, 0.25, 1, 0]), [0, 1, 1, 0])
+    }
+
+    func testPolicyRunnerChunksLargerBatchesAtRecordedMetalGeometry() {
+        XCTAssertEqual(
+            VectorPolicyRunner.inferenceBatchRanges(
+                rowCount: 512, recordedBatchSize: 128),
+            [0..<128, 128..<256, 256..<384, 384..<512])
+        XCTAssertEqual(
+            VectorPolicyRunner.inferenceBatchRanges(
+                rowCount: 300, recordedBatchSize: 128),
+            [0..<128, 128..<256, 256..<300])
+        XCTAssertEqual(
+            VectorPolicyRunner.inferenceBatchRanges(
+                rowCount: 1, recordedBatchSize: 128),
+            [0..<1])
+    }
+
+    func testDisjointActionExpertsCanOverlapInTimeWithoutOverlappingActuators() {
+        let upper = [Float](repeating: 0, count: 10)
+            + [Float](repeating: 1, count: 9)
+        let lower = [Float](repeating: 1, count: 10)
+            + [Float](repeating: 0, count: 9)
+        XCTAssertTrue(VectorPPOTrainer.hasValidActorComposition(
+            expertGates: [1], standExpertGates: [1],
+            actionDimension: 19,
+            expertActionMask: upper, standExpertActionMask: lower))
+        XCTAssertFalse(VectorPPOTrainer.hasValidActorComposition(
+            expertGates: [1], standExpertGates: [1],
+            actionDimension: 19,
+            expertActionMask: nil, standExpertActionMask: nil))
+        XCTAssertEqual(
+            VectorPPOTrainer.actorTrainingWeights(
+                expertGates: [1], standExpertGates: [1],
+                actionDimension: 19,
+                expertActionMask: upper, standExpertActionMask: lower,
+                freezesBaseActor: true, freezesExpertActor: true)[0],
+            Float(10) / 19, accuracy: 1e-6)
+        XCTAssertEqual(
+            VectorPPOTrainer.actorExplorationActionScales(
+                expertGates: [1], standExpertGates: [1],
+                actionDimension: 19,
+                expertActionMask: upper, standExpertActionMask: lower,
+                freezesBaseActor: true, freezesExpertActor: true),
+            lower)
+    }
+
+    func testPPOSuccessReplayRequiresBoundedStableRepresentation() throws {
+        var replay = VectorPPOConfig(
+            updates: 1, rolloutSteps: 4, minibatchSize: 4,
+            successImitationCoefficient: 2,
+            successReplayCapacity: 32, successReplayBatchSize: 8,
+            normalizeObservations: false)
+        XCTAssertNoThrow(try replay.validate(batchSize: 4))
+
+        replay.successImitationCoefficient = 0
+        XCTAssertThrowsError(try replay.validate(batchSize: 4))
+        replay.successImitationCoefficient = 2
+        replay.successReplayBatchSize = 33
+        XCTAssertThrowsError(try replay.validate(batchSize: 4))
+        replay.successReplayBatchSize = 8
+        replay.normalizeObservations = true
+        replay.updateObservationNormalizer = true
+        XCTAssertThrowsError(try replay.validate(batchSize: 4))
+        replay.updateObservationNormalizer = false
+        XCTAssertNoThrow(try replay.validate(batchSize: 4))
+        replay.successImitationHistorySteps = 0
+        XCTAssertThrowsError(try replay.validate(batchSize: 4))
+        replay.successImitationHistorySteps = 32
+        XCTAssertNoThrow(try replay.validate(batchSize: 4))
     }
 
     func testPPOExplorationBoundsRejectInvalidSchedules() throws {
@@ -3520,6 +3737,40 @@ final class RLFrameworkTests: XCTestCase {
         fixed.maximumActionStd = nil
         fixed.rewardScale = 0
         XCTAssertThrowsError(try fixed.validate(batchSize: 4))
+        var ragged = VectorPPOConfig(
+            updates: 1, rolloutSteps: 6, minibatchSize: 4)
+        XCTAssertThrowsError(try ragged.validate(batchSize: 6))
+        ragged.minibatchSize = 3
+        XCTAssertNoThrow(try ragged.validate(batchSize: 6))
+
+        var annealed = VectorPPOConfig(
+            updates: 1, rolloutSteps: 4, minibatchSize: 4,
+            initialActionStd: 0.04, finalActionStd: 0.01,
+            actionStdAnnealStartUpdate: 10,
+            actionStdAnnealEndUpdate: 30)
+        XCTAssertNoThrow(try annealed.validate(batchSize: 4))
+        XCTAssertEqual(annealed.actionLogStandardDeviationBounds(
+            completedUpdate: 0).minimum, log(Float(0.04)), accuracy: 1e-6)
+        XCTAssertEqual(exp(annealed.actionLogStandardDeviationBounds(
+            completedUpdate: 20).minimum), 0.02, accuracy: 1e-6)
+        XCTAssertEqual(exp(annealed.actionLogStandardDeviationBounds(
+            completedUpdate: 40).maximum), 0.01, accuracy: 1e-6)
+        annealed.maximumActionStd = 0.04
+        XCTAssertThrowsError(try annealed.validate(batchSize: 4))
+        annealed.maximumActionStd = nil
+        annealed.actionStdAnnealEndUpdate = 10
+        XCTAssertThrowsError(try annealed.validate(batchSize: 4))
+
+        var historicalSemantics = VectorPPOConfig(
+            updates: 1, rolloutSteps: 4, minibatchSize: 4)
+        historicalSemantics.routedExplorationMaskVersion = nil
+        historicalSemantics.trainingProgressUpdateVersion = nil
+        XCTAssertEqual(
+            historicalSemantics.resolvedRoutedExplorationMaskVersion, 1)
+        XCTAssertEqual(
+            historicalSemantics.resolvedTrainingProgressUpdateVersion, 1)
+        historicalSemantics.trainingProgressUpdateVersion = 3
+        XCTAssertThrowsError(try historicalSemantics.validate(batchSize: 4))
     }
 
     func testPPOAcceptsExactIsaacFlatNetworkAndGaussianPolicy() throws {
@@ -3625,6 +3876,7 @@ final class RLFrameworkTests: XCTestCase {
         resumedCommand.updates = 100
         resumedCommand.initializationCheckpoint = nil
         resumedCommand.policyExpertInitializationCheckpoint = nil
+        resumedCommand.policyExpertBranchInitializationCheckpoint = nil
         resumedCommand.standExpertInitializationCheckpoint = nil
 
         let persisted = resumedCommand
@@ -3634,6 +3886,7 @@ final class RLFrameworkTests: XCTestCase {
                        "/policies/locomotion-parent")
         XCTAssertEqual(persisted.policyExpertInitializationCheckpoint,
                        "/policies/recovery-parent")
+        XCTAssertNil(persisted.policyExpertBranchInitializationCheckpoint)
         XCTAssertEqual(persisted.standExpertInitializationCheckpoint,
                        "/policies/stand-parent")
     }

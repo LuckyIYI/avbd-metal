@@ -328,6 +328,15 @@ public struct HumanoidState {
     public var jointVelocities: [Float]
 }
 
+/// Measured state used by whole-body manipulation tasks.  `leftHand` and
+/// `rightHand` are the actual terminal collision-sphere centers, not link COM
+/// poses; `object` is the physical rigid body owned by the same replica.
+public struct HumanoidManipulationState {
+    public var object: GPUSolver.RigidBodyState
+    public var leftHand: GPUSolver.RigidBodyState
+    public var rightHand: GPUSolver.RigidBodyState
+}
+
 public struct HumanoidLocomotionSuccessComponents: Equatable, Sendable {
     public var fullHorizon: Bool
     public var distanceBand: Bool
@@ -757,9 +766,28 @@ public final class HumanoidWalkEnv {
         public var torsoFrame: MJCFLinkFrame
         public var leftFootFrame: MJCFLinkFrame
         public var rightFootFrame: MJCFLinkFrame
+        /// Frames of the centers of the terminal 33 mm hand collision
+        /// spheres.  The public H1 model has no wrist body, so reading the
+        /// elbow body's COM would put manipulation observations roughly a
+        /// forearm length away from the actual contact point.
+        public var leftHandFrame: MJCFLinkFrame
+        public var rightHandFrame: MJCFLinkFrame
         public var bodies: [Int]
         public var motors: [Int]
         public var projectile: Int?
+        public var carryPedestal: Int?
+        /// Additional static parts belonging to the same carry support. The
+        /// primary body above is the load-bearing top; these are ordinary
+        /// colliders such as table legs, stored with top-relative offsets so
+        /// the complete prop can move during episode layout.
+        public var carryPedestalParts: [Int]
+        public var carryPedestalPartOffsets: [F3]
+        /// Optional receiving support for transport/manipulation tasks. It is
+        /// kept distinct from the source support so task success can be based
+        /// on the exact physical manifold that supports the object.
+        public var carryDestinationPedestal: Int?
+        public var carryDestinationPedestalParts: [Int]
+        public var carryDestinationPedestalPartOffsets: [F3]
         public var startMarker: Int?
         public var goalMarker: Int?
     }
@@ -870,15 +898,85 @@ public final class HumanoidWalkEnv {
     private let groundContactSlots: [Int: Int]
     private let projectileOwners: [Int: Int]
     private let robotBodyOwners: [Int: Int]
+    /// terminal hand body -> environment * 2 + (left, right)
+    private let handContactSlots: [Int: Int]
+
+    private static func addCarrySupport(
+        to scene: inout PhysicsScene, size: F3, center: F3,
+        friction: Float, includeLegs: Bool, collisionGroup: UInt32
+    ) -> (top: Int, parts: [Int], offsets: [F3]) {
+        let top = scene.addBody(
+            size: size, density: 0, friction: friction,
+            dynamicFriction: friction, position: center,
+            collisionGroup: collisionGroup)
+        guard includeLegs else { return (top, [], []) }
+
+        let legHeight = center.z - 0.5 * size.z
+        let legSize = F3(
+            min(0.055, 0.2 * size.x), min(0.055, 0.2 * size.y),
+            legHeight)
+        let inset = F3(
+            0.5 * (size.x - legSize.x) - 0.025,
+            0.5 * (size.y - legSize.y) - 0.025, 0)
+        let legZ = -0.5 * (size.z + legHeight)
+        var parts = [Int]()
+        var offsets = [F3]()
+        for xSign: Float in [-1, 1] {
+            for ySign: Float in [-1, 1] {
+                let offset = F3(xSign * inset.x, ySign * inset.y, legZ)
+                parts.append(scene.addBody(
+                    size: legSize, density: 0, friction: friction,
+                    dynamicFriction: friction, position: center + offset,
+                    collisionGroup: collisionGroup))
+                offsets.append(offset)
+            }
+        }
+        return (top, parts, offsets)
+    }
 
     public init(numEnvironments: Int, seed: UInt64 = 1,
                 includeProjectile: Bool = false,
                 projectileSize: Float = 0.25,
+                projectileDimensions: F3? = nil,
                 projectileMass: Float = 8,
+                projectileFriction: Float = 0.7,
+                carryPedestalSize: F3? = nil,
+                carryPedestalCenter: F3 = F3(0.62, 0, 0.32),
+                carryPedestalLegs: Bool = false,
+                carryDestinationPedestalSize: F3? = nil,
+                carryDestinationPedestalCenter: F3 = F3(1.40, 0, 0.32),
+                carryDestinationPedestalLegs: Bool = false,
+                preserveMinimalTerrainContactProfile: Bool = false,
                 controlProfile: HumanoidControlProfile = .isaacLab,
                 solverIterations: Int? = nil) throws {
         precondition(numEnvironments > 0)
-        precondition(projectileSize > 0 && projectileMass > 0)
+        let projectileDimensions = projectileDimensions
+            ?? F3(repeating: projectileSize)
+        precondition(projectileSize > 0 && projectileMass > 0
+            && projectileFriction >= 0
+            && projectileDimensions.x > 0
+            && projectileDimensions.y > 0
+            && projectileDimensions.z > 0)
+        if let carryPedestalSize {
+            precondition(carryPedestalSize.x > 0
+                && carryPedestalSize.y > 0
+                && carryPedestalSize.z > 0)
+            if carryPedestalLegs {
+                precondition(carryPedestalCenter.z
+                    > 0.5 * carryPedestalSize.z)
+            }
+        }
+        if let carryDestinationPedestalSize {
+            precondition(carryDestinationPedestalSize.x > 0
+                && carryDestinationPedestalSize.y > 0
+                && carryDestinationPedestalSize.z > 0)
+            if carryDestinationPedestalLegs {
+                precondition(carryDestinationPedestalCenter.z
+                    > 0.5 * carryDestinationPedestalSize.z)
+            }
+        }
+        precondition(!preserveMinimalTerrainContactProfile
+            || (includeProjectile && controlProfile == .isaacLab))
         self.numEnvironments = numEnvironments
         self.controlProfile = controlProfile
         self.projectileMass = projectileMass
@@ -983,6 +1081,13 @@ public final class HumanoidWalkEnv {
             let torso = imported.bodiesByName["torso_link"]!
             let leftHand = imported.bodiesByName["left_elbow_link"]!
             let rightHand = imported.bodiesByName["right_elbow_link"]!
+            let handTipInLink = F3(0.28, 0, -0.015)
+            func handFrame(_ linkFrame: MJCFLinkFrame) -> MJCFLinkFrame {
+                MJCFLinkFrame(
+                    position: linkFrame.position
+                        + linkFrame.rotation.act(handTipInLink),
+                    rotation: linkFrame.rotation)
+            }
             for collider in firstReplicaCollider..<built.colliders.count {
                 built.colliders[collider].collisionGroup = UInt32(e + 1)
                 let body = built.colliders[collider].body
@@ -996,8 +1101,22 @@ public final class HumanoidWalkEnv {
                     // body-pair exclusions for `selfCollisions: false`, so
                     // this expands real external contact without making
                     // neighboring robot links collide with one another.
-                    built.colliders[collider].collisionEnabled =
-                        includeProjectile
+                    if preserveMinimalTerrainContactProfile {
+                        // A manual replay probe must not change the nominal
+                        // H1_MINIMAL floor/contact trajectory before launch.
+                        // Keep the cooked ankle/torso hulls below and expose
+                        // every other authored primitive only to same-replica
+                        // bodies such as the projectile, never shared terrain.
+                        let coveredByMinimalHull = body == leftFoot
+                            || body == rightFoot || body == torso
+                        built.colliders[collider].collisionEnabled =
+                            !coveredByMinimalHull
+                        built.colliders[collider]
+                            .collidesWithSharedGeometry = false
+                    } else {
+                        built.colliders[collider].collisionEnabled =
+                            includeProjectile
+                    }
                 case .mujocoPlayground:
                     built.colliders[collider].collisionEnabled =
                         body == leftFoot || body == rightFoot
@@ -1032,7 +1151,8 @@ public final class HumanoidWalkEnv {
                         // three H1_MINIMAL hulls over those same links: that
                         // would create duplicate contact manifolds and an
                         // artificially rigid impact response.
-                        collisionEnabled: !includeProjectile,
+                        collisionEnabled: !includeProjectile
+                            || preserveMinimalTerrainContactProfile,
                         isRendered: false)
                 }
             }
@@ -1089,18 +1209,51 @@ public final class HumanoidWalkEnv {
                 torsoFrame: imported.linkFramesInBody["torso_link"]!,
                 leftFootFrame: imported.linkFramesInBody["left_ankle_link"]!,
                 rightFootFrame: imported.linkFramesInBody["right_ankle_link"]!,
+                leftHandFrame: handFrame(
+                    imported.linkFramesInBody["left_elbow_link"]!),
+                rightHandFrame: handFrame(
+                    imported.linkFramesInBody["right_elbow_link"]!),
                 bodies: importedBodies,
                 motors: imported.actuatorJoints,
                 projectile: nil,
+                carryPedestal: nil,
+                carryPedestalParts: [],
+                carryPedestalPartOffsets: [],
+                carryDestinationPedestal: nil,
+                carryDestinationPedestalParts: [],
+                carryDestinationPedestalPartOffsets: [],
                 startMarker: nil, goalMarker: nil)
             if includeProjectile {
                 let density = projectileMass
-                    / (projectileSize * projectileSize * projectileSize)
+                    / (projectileDimensions.x * projectileDimensions.y
+                        * projectileDimensions.z)
                 ref.projectile = built.addBody(
-                    size: F3(repeating: projectileSize),
-                    density: density, friction: 0.7,
+                    size: projectileDimensions,
+                    density: density, friction: projectileFriction,
+                    dynamicFriction: projectileFriction,
                     position: center + F3(0, 0, -4),
                     collisionGroup: UInt32(e + 1))
+            }
+            if let carryPedestalSize {
+                let support = Self.addCarrySupport(
+                    to: &built, size: carryPedestalSize,
+                    center: center + carryPedestalCenter,
+                    friction: projectileFriction, includeLegs: carryPedestalLegs,
+                    collisionGroup: UInt32(e + 1))
+                ref.carryPedestal = support.top
+                ref.carryPedestalParts = support.parts
+                ref.carryPedestalPartOffsets = support.offsets
+            }
+            if let carryDestinationPedestalSize {
+                let support = Self.addCarrySupport(
+                    to: &built, size: carryDestinationPedestalSize,
+                    center: center + carryDestinationPedestalCenter,
+                    friction: projectileFriction,
+                    includeLegs: carryDestinationPedestalLegs,
+                    collisionGroup: UInt32(e + 1))
+                ref.carryDestinationPedestal = support.top
+                ref.carryDestinationPedestalParts = support.parts
+                ref.carryDestinationPedestalPartOffsets = support.offsets
             }
             if numEnvironments <= 4 {
                 // Visible acceptance gates for Policy Replay: the learned
@@ -1130,14 +1283,18 @@ public final class HumanoidWalkEnv {
         groundContactSlots = contactSlots
         var projectileOwners = [Int: Int]()
         var robotBodyOwners = [Int: Int]()
+        var handContactSlots = [Int: Int]()
         for (environment, ref) in builtRefs.enumerated() {
             if let projectile = ref.projectile {
                 projectileOwners[projectile] = environment
             }
             for body in ref.bodies { robotBodyOwners[body] = environment }
+            handContactSlots[ref.leftHand] = environment * 2
+            handContactSlots[ref.rightHand] = environment * 2 + 1
         }
         self.projectileOwners = projectileOwners
         self.robotBodyOwners = robotBodyOwners
+        self.handContactSlots = handContactSlots
         spawnPoses = built.bodies.map { ($0.position, $0.rotation) }
         solver = try GPUSolver(scene: built)
         _ = seed
@@ -1196,6 +1353,83 @@ public final class HumanoidWalkEnv {
             }
         }
         return contacts
+    }
+
+    /// Per-hand object contact from the solver's active physical manifolds.
+    /// The signal is intentionally diagnostic/task state rather than a
+    /// geometric distance proxy: a hand counts only after actual contact.
+    public func boxHandContacts() -> (left: [Bool], right: [Bool]) {
+        var left = [Bool](repeating: false, count: numEnvironments)
+        var right = [Bool](repeating: false, count: numEnvironments)
+        guard !projectileOwners.isEmpty else { return (left, right) }
+        for (a, b) in solver.activeRigidContactPairs() {
+            let slot: Int?
+            if let environment = projectileOwners[a],
+               let candidate = handContactSlots[b], candidate / 2 == environment {
+                slot = candidate
+            } else if let environment = projectileOwners[b],
+                      let candidate = handContactSlots[a],
+                      candidate / 2 == environment {
+                slot = candidate
+            } else {
+                slot = nil
+            }
+            guard let slot else { continue }
+            if slot.isMultiple(of: 2) { left[slot / 2] = true }
+            else { right[slot / 2] = true }
+        }
+        return (left, right)
+    }
+
+    /// Physical support contacts for each task-owned box.  A carry task must
+    /// not infer a drop from height alone: after the box has moved beyond a
+    /// pedestal, its top plane no longer exists beneath the box.  Reporting
+    /// the solver manifolds keeps drop termination tied to geometry that is
+    /// actually present in the scene.
+    public func boxCarrySupportContacts() -> (
+        ground: [Bool], source: [Bool], destination: [Bool]
+    ) {
+        var ground = [Bool](repeating: false, count: numEnvironments)
+        var source = [Bool](repeating: false, count: numEnvironments)
+        var destination = [Bool](repeating: false, count: numEnvironments)
+        guard !projectileOwners.isEmpty else {
+            return (ground, source, destination)
+        }
+        for (a, b) in solver.activeRigidContactPairs() {
+            let environment: Int
+            let other: Int
+            if let owner = projectileOwners[a] {
+                environment = owner
+                other = b
+            } else if let owner = projectileOwners[b] {
+                environment = owner
+                other = a
+            } else {
+                continue
+            }
+            if other == groundBody {
+                ground[environment] = true
+            }
+            if refs[environment].carryPedestal == other
+                || refs[environment].carryPedestalParts.contains(other) {
+                source[environment] = true
+            }
+            if refs[environment].carryDestinationPedestal == other
+                || refs[environment].carryDestinationPedestalParts.contains(other) {
+                destination[environment] = true
+            }
+        }
+        return (ground, source, destination)
+    }
+
+    /// Compatibility view for tasks that only distinguish world support from
+    /// unsupported flight. New transport tasks should use the source- and
+    /// destination-specific contact API above.
+    public func boxSupportContacts() -> (ground: [Bool], pedestal: [Bool]) {
+        let contacts = boxCarrySupportContacts()
+        return (
+            contacts.ground,
+            zip(contacts.source, contacts.destination).map { $0 || $1 })
     }
 
     private static func buildOne(_ s: inout PhysicsScene, center c: F3) -> EnvRefs {
@@ -1367,7 +1601,17 @@ public final class HumanoidWalkEnv {
                                            rotation: Quat(real: 1, imag: .zero)),
                        rightFootFrame: .init(position: .zero,
                                             rotation: Quat(real: 1, imag: .zero)),
+                       leftHandFrame: .init(position: .zero,
+                                           rotation: Quat(real: 1, imag: .zero)),
+                       rightHandFrame: .init(position: .zero,
+                                            rotation: Quat(real: 1, imag: .zero)),
                        bodies: bodies, motors: motors, projectile: nil,
+                       carryPedestal: nil,
+                       carryPedestalParts: [],
+                       carryPedestalPartOffsets: [],
+                       carryDestinationPedestal: nil,
+                       carryDestinationPedestalParts: [],
+                       carryDestinationPedestalPartOffsets: [],
                        startMarker: nil, goalMarker: nil)
     }
 
@@ -1420,6 +1664,154 @@ public final class HumanoidWalkEnv {
                 angularVelocity: angularVelocities[offset]))
         }
         solver.setBodyStates(updates)
+    }
+
+    /// Place task-owned boxes and clear their velocities plus incident
+    /// warm-start state.  Unlike `throwProjectiles`, this name states the
+    /// reset semantics used by manipulation curricula.
+    public func placeCarryBoxes(
+        environmentIDs: [Int], positions: [F3], rotations: [Quat]? = nil,
+        linearVelocities: [F3]? = nil, angularVelocities: [F3]? = nil
+    ) {
+        precondition(environmentIDs.count == positions.count)
+        precondition(rotations == nil || rotations?.count == positions.count)
+        precondition(linearVelocities == nil
+            || linearVelocities?.count == positions.count)
+        precondition(angularVelocities == nil
+            || angularVelocities?.count == positions.count)
+        let identity = Quat(real: 1, imag: .zero)
+        solver.setBodyStates(environmentIDs.enumerated().compactMap { offset, e in
+            refs[e].projectile.map { projectile in
+                GPUSolver.BodyStateUpdate(
+                    body: projectile, position: positions[offset],
+                    rotation: rotations?[offset] ?? identity,
+                    linearVelocity: linearVelocities?[offset] ?? .zero,
+                    angularVelocity: angularVelocities?[offset] ?? .zero)
+            }
+        })
+    }
+
+    /// Move the static support and its dynamic box together at episode reset.
+    /// The support remains ordinary collision geometry; this only authors the
+    /// initial task layout before control begins.
+    public func placeCarryStations(
+        environmentIDs: [Int], pedestalCenters: [F3], boxCenters: [F3],
+        destinationPedestalCenters: [F3]? = nil
+    ) {
+        precondition(environmentIDs.count == pedestalCenters.count
+            && environmentIDs.count == boxCenters.count)
+        precondition(destinationPedestalCenters == nil
+            || destinationPedestalCenters?.count == environmentIDs.count)
+        let identity = Quat(real: 1, imag: .zero)
+        var poses = [GPUSolver.BodyPoseUpdate]()
+        var boxes = [GPUSolver.BodyStateUpdate]()
+        for (offset, e) in environmentIDs.enumerated() {
+            if let pedestal = refs[e].carryPedestal {
+                poses.append(.init(
+                    body: pedestal, position: pedestalCenters[offset],
+                    rotation: identity))
+            }
+            for (part, localOffset) in zip(
+                refs[e].carryPedestalParts,
+                refs[e].carryPedestalPartOffsets
+            ) {
+                poses.append(.init(
+                    body: part,
+                    position: pedestalCenters[offset] + localOffset,
+                    rotation: identity))
+            }
+            if let destination = refs[e].carryDestinationPedestal,
+               let destinationPedestalCenters {
+                poses.append(.init(
+                    body: destination,
+                    position: destinationPedestalCenters[offset],
+                    rotation: identity))
+            }
+            if let destinationPedestalCenters {
+                for (part, localOffset) in zip(
+                    refs[e].carryDestinationPedestalParts,
+                    refs[e].carryDestinationPedestalPartOffsets
+                ) {
+                    poses.append(.init(
+                        body: part,
+                        position: destinationPedestalCenters[offset] + localOffset,
+                        rotation: identity))
+                }
+            }
+            if let box = refs[e].projectile {
+                boxes.append(.init(
+                    body: box, position: boxCenters[offset],
+                    rotation: identity))
+            }
+        }
+        if !poses.isEmpty { solver.setBodyPoses(poses) }
+        if !boxes.isEmpty { solver.setBodyStates(boxes) }
+    }
+
+    /// Launch reusable replay boxes from robot-local left/right toward the
+    /// measured moving torso. This is an external disturbance only: no robot
+    /// pose, joint target, observation, or policy action is modified.
+    public func throwBoxes(
+        environmentIDs: [Int], sideSigns: [Float],
+        launchDistance: Float = 1.2, speed: Float = 6
+    ) {
+        precondition(environmentIDs.count == sideSigns.count)
+        precondition(Set(environmentIDs).count == environmentIDs.count
+            && environmentIDs.allSatisfy(refs.indices.contains))
+        precondition(launchDistance.isFinite && launchDistance > 0
+            && speed.isFinite && speed > 0
+            && sideSigns.allSatisfy { $0.isFinite && $0 != 0 })
+        let measured = states()
+        let flightTime = launchDistance / speed
+        let gravity = F3(0, 0, scene.settings.gravity)
+        var positions = [F3]()
+        var velocities = [F3]()
+        var angularVelocities = [F3]()
+        positions.reserveCapacity(environmentIDs.count)
+        velocities.reserveCapacity(environmentIDs.count)
+        angularVelocities.reserveCapacity(environmentIDs.count)
+        for (offset, environment) in environmentIDs.enumerated() {
+            let state = measured[environment]
+            let heading = state.root.rotation.act(F3(1, 0, 0))
+            let headingLength = max(
+                sqrt(heading.x * heading.x + heading.y * heading.y), 1e-6)
+            let forward = F3(
+                heading.x / headingLength, heading.y / headingLength, 0)
+            let lateral = F3(-forward.y, forward.x, 0)
+            let side: Float = sideSigns[offset] > 0 ? 1 : -1
+            let target = state.torso.position
+            let launch = target + lateral * (launchDistance * side)
+                + forward * 0.15
+            let predictedTarget = target
+                + state.torso.linearVelocity * flightTime
+            positions.append(launch)
+            velocities.append((predictedTarget - launch
+                - 0.5 * gravity * flightTime * flightTime) / flightTime)
+            angularVelocities.append(F3(
+                side * 2.5, -side * 1.5, side * 3.5))
+        }
+        throwProjectiles(
+            environmentIDs: environmentIDs, positions: positions,
+            velocities: velocities, angularVelocities: angularVelocities)
+    }
+
+    /// Park selected replay boxes below their replica and clear all velocity
+    /// and incident warm-start state through the solver's reset API.
+    public func hideBoxes(environmentIDs: [Int]) {
+        precondition(Set(environmentIDs).count == environmentIDs.count
+            && environmentIDs.allSatisfy(refs.indices.contains))
+        solver.setBodyStates(environmentIDs.compactMap { environment in
+            refs[environment].projectile.map { projectile in
+                GPUSolver.BodyStateUpdate(
+                    body: projectile,
+                    position: refs[environment].center + F3(0, 0, -4),
+                    rotation: Quat(real: 1, imag: .zero))
+            }
+        })
+    }
+
+    public func boxRobotContacts() -> [Bool] {
+        projectileRobotContacts()
     }
 
     public func step(normalizedActions: ContiguousArray<Float>, decimation: Int,
@@ -1546,6 +1938,34 @@ public final class HumanoidWalkEnv {
                                     j..<(j + Self.jointRanges.count)].map(\.angle),
                                  jointVelocities: jointStates[
                                     j..<(j + Self.jointRanges.count)].map(\.velocity))
+        }
+    }
+
+    public func boxStates() -> [GPUSolver.RigidBodyState] {
+        precondition(refs.allSatisfy { $0.projectile != nil },
+                     "boxStates requires one task-owned box per environment")
+        return solver.bodyStates(refs.map { $0.projectile! })
+    }
+
+    public func manipulationStates() -> [HumanoidManipulationState] {
+        precondition(refs.allSatisfy { $0.projectile != nil },
+                     "manipulationStates requires one box per environment")
+        var bodyIDs = [Int]()
+        bodyIDs.reserveCapacity(numEnvironments * 3)
+        for ref in refs {
+            bodyIDs.append(ref.projectile!)
+            bodyIDs.append(ref.leftHand)
+            bodyIDs.append(ref.rightHand)
+        }
+        let bodies = solver.bodyStates(bodyIDs)
+        return (0..<numEnvironments).map { e in
+            let base = e * 3
+            return HumanoidManipulationState(
+                object: bodies[base],
+                leftHand: Self.linkState(
+                    bodies[base + 1], refs[e].leftHandFrame),
+                rightHand: Self.linkState(
+                    bodies[base + 2], refs[e].rightHandFrame))
         }
     }
 

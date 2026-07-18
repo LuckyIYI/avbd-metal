@@ -251,8 +251,11 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
     private var disturbedEpisodes: [Bool]
     private var resetRNG: SplitMix64
 
-    public init(configuration: HumanoidIsaacVelocityTaskConfig,
-                taskID: String = "humanoid-isaac-flat-v0") throws {
+    public init(
+        configuration: HumanoidIsaacVelocityTaskConfig,
+        taskID: String = "humanoid-isaac-flat-v0",
+        includeInteractiveRobustnessProbe: Bool = false
+    ) throws {
         guard configuration.numEnvironments > 0,
               configuration.maxEpisodeSteps > 0,
               configuration.commandResamplingSteps > 0,
@@ -326,9 +329,13 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
         let env = try HumanoidWalkEnv(
             numEnvironments: configuration.numEnvironments,
             seed: configuration.seed,
-            includeProjectile: configuration.projectileProbability > 0,
+            includeProjectile: configuration.projectileProbability > 0
+                || includeInteractiveRobustnessProbe,
             projectileSize: configuration.projectileSize,
             projectileMass: configuration.projectileMass,
+            preserveMinimalTerrainContactProfile:
+                includeInteractiveRobustnessProbe
+                    && configuration.projectileProbability == 0,
             controlProfile: .isaacLab,
             solverIterations: configuration.solverIterations)
         environment = env
@@ -537,6 +544,36 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
     public func hasProjectile(environment e: Int) -> Bool {
         precondition((0..<spec.numEnvironments).contains(e))
         return environment.refs[e].projectile != nil
+    }
+
+    /// Inject an interactive physical disturbance while keeping scheduled
+    /// projectile and recovery-gate bookkeeping coherent. Marking the body as
+    /// launched prevents the task curriculum from silently relaunching the
+    /// same rigid body later in the episode.
+    public func throwRobustnessBoxes(
+        environmentIDs: [Int], sideSigns: [Float],
+        launchDistance: Float = 1.2, speed: Float = 6
+    ) {
+        precondition(environmentIDs.count == sideSigns.count)
+        environment.throwBoxes(
+            environmentIDs: environmentIDs, sideSigns: sideSigns,
+            launchDistance: launchDistance, speed: speed)
+        let measured = environment.states()
+        for (offset, environmentID) in environmentIDs.enumerated() {
+            precondition((0..<spec.numEnvironments).contains(environmentID))
+            disturbedEpisodes[environmentID] = true
+            projectileLaunched[environmentID] = true
+            projectileImpacted[environmentID] = false
+            projectileImpactSteps[environmentID] = .max
+            projectileLaunchSteps[environmentID] = episodeLengths[environmentID]
+            projectileSpeeds[environmentID] = speed
+            projectileSides[environmentID] = sideSigns[offset] > 0 ? 1 : -1
+            let root = measured[environmentID].root
+            minimumPostImpactUprightCosines[environmentID] =
+                root.rotation.act(F3(0, 0, 1)).z
+            minimumPostImpactTorsoHeights[environmentID] =
+                measured[environmentID].torso.position.z
+        }
     }
 
     public func currentCommand(environment: Int) -> F3 {

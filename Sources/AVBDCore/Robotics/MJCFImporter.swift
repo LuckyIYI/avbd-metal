@@ -70,6 +70,12 @@ public struct MJCFInstantiationOptions: Sendable, Equatable {
     public var worldOffset: F3
     public var defaultMotorGain: MJCFMotorGain
     public var motorGains: [String: MJCFMotorGain]
+    /// Per-actuator effort-limit overrides. Keys may be either source
+    /// actuator names or source joint names; actuator names take precedence.
+    public var motorEffortLimits: [String: Float]
+    /// Per-joint reflected armature overrides. Keys may be either source
+    /// actuator names or source joint names; actuator names take precedence.
+    public var jointArmatures: [String: Float]
     /// Source joint coordinates used as the reset/home configuration. The
     /// solver's zero angle is rebased to this pose.
     public var jointHomePositions: [String: Float]
@@ -80,6 +86,10 @@ public struct MJCFInstantiationOptions: Sendable, Equatable {
     /// Collision domain shared by all primitives in this instance.
     public var collisionGroup: UInt32
     public var selfCollisions: Bool
+    /// Whether to preserve the legacy connected-body contact configuration.
+    /// When false, the importer records every direct parent-child pair as an
+    /// explicit exclusion, including nested bodies without a hinge.
+    public var collideConnectedBodies: Bool
     public var inertiaFrame: MJCFInertiaFrame
     public var dynamicsScale: MJCFDynamicsScale
     /// Whether detailed render geometry should be replicated.
@@ -90,10 +100,13 @@ public struct MJCFInstantiationOptions: Sendable, Equatable {
         defaultMotorGain: MJCFMotorGain = .init(stiffness: 0, damping: 0),
         motorGains: [String: MJCFMotorGain] = [:],
         jointHomePositions: [String: Float] = [:],
+        motorEffortLimits: [String: Float] = [:],
+        jointArmatures: [String: Float] = [:],
         fixedBase: Bool = false,
         gravityScale: Float = 1,
         collisionGroup: UInt32 = 0,
         selfCollisions: Bool = true,
+        collideConnectedBodies: Bool = true,
         inertiaFrame: MJCFInertiaFrame = .principal,
         dynamicsScale: MJCFDynamicsScale = .identity,
         includeVisuals: Bool = true
@@ -101,11 +114,20 @@ public struct MJCFInstantiationOptions: Sendable, Equatable {
         self.worldOffset = worldOffset
         self.defaultMotorGain = defaultMotorGain
         self.motorGains = motorGains
+        precondition(motorEffortLimits.values.allSatisfy {
+            $0.isFinite && $0 >= 0
+        }, "MJCF motor effort limits must be finite and nonnegative")
+        self.motorEffortLimits = motorEffortLimits
+        precondition(jointArmatures.values.allSatisfy {
+            $0.isFinite && $0 >= 0
+        }, "MJCF joint armatures must be finite and nonnegative")
+        self.jointArmatures = jointArmatures
         self.jointHomePositions = jointHomePositions
         self.fixedBase = fixedBase
         self.gravityScale = gravityScale
         self.collisionGroup = collisionGroup
         self.selfCollisions = selfCollisions
+        self.collideConnectedBodies = collideConnectedBodies
         self.inertiaFrame = inertiaFrame
         self.dynamicsScale = dynamicsScale
         self.includeVisuals = includeVisuals
@@ -280,16 +302,30 @@ public struct MJCFAsset {
             throw MJCFImportError.missing("at least one articulated <body>")
         }
 
+        let jointEffortLimits = Dictionary(uniqueKeysWithValues:
+            links.compactMap { link -> (String, Float)? in
+                guard let joint = link.joint,
+                      let effortLimit = joint.actuatorForceLimit else {
+                    return nil
+                }
+                return (joint.name, effortLimit)
+            })
         var actuators: [Actuator] = []
         if let actuatorNode = root.children.first(where: { $0.name == "actuator" }) {
             for motor in actuatorNode.children where motor.name == "motor" {
                 let joint = try required(motor, "joint")
                 let name = motor.attributes["name"] ?? joint
-                let range = try floatList(motor.attributes["ctrlrange"] ?? "-1 1",
-                                          count: 2, element: "motor",
-                                          attribute: "ctrlrange")
+                let forceLimit = try rangeMagnitude(
+                    motor.attributes["forcerange"], element: "motor",
+                    attribute: "forcerange")
+                let controlLimit = try rangeMagnitude(
+                    motor.attributes["ctrlrange"], element: "motor",
+                    attribute: "ctrlrange")
                 actuators.append(Actuator(name: name, joint: joint,
-                                          torque: max(abs(range[0]), abs(range[1]))))
+                    effortLimit: forceLimit
+                        ?? jointEffortLimits[joint]
+                        ?? controlLimit
+                        ?? 1))
             }
         }
 
@@ -499,13 +535,23 @@ public struct MJCFAsset {
             let axisWorld = linkWorldQ[i].act(joint.axis)
             let axisB = normalize(childQInverse.act(axisWorld))
             let actuator = actuatorByJoint[joint.name]
-            let gain = options.motorGains[actuator?.name ?? joint.name]
+            let actuatorName = actuator?.name
+            let gain = actuatorName.flatMap { options.motorGains[$0] }
                 ?? options.motorGains[joint.name]
                 ?? options.defaultMotorGain
-            if let actuator, actuator.torque > 0, gain.stiffness <= 0 {
+            let effortLimit = actuatorName.flatMap {
+                options.motorEffortLimits[$0]
+            } ?? options.motorEffortLimits[joint.name]
+                ?? actuator?.effortLimit
+                ?? 0
+            let armature = actuatorName.flatMap {
+                options.jointArmatures[$0]
+            } ?? options.jointArmatures[joint.name]
+                ?? joint.armature
+            if effortLimit > 0, gain.stiffness <= 0 {
                 throw MJCFImportError.missing(
                     "positive position-PD stiffness for actuator "
-                    + "\(actuator.name) on joint \(joint.name)")
+                    + "\(actuatorName ?? joint.name) on joint \(joint.name)")
             }
             let home = options.jointHomePositions[joint.name] ?? 0
             let sceneJoint = SceneJoint(
@@ -516,7 +562,7 @@ public struct MJCFAsset {
                 // alignment and leaves only twist free for motor/limits.
                 stiffnessAng: .infinity, hingeAxis: axisB,
                 motorTarget: 0,
-                motorTorque: (actuator?.torque ?? 0)
+                motorTorque: effortLimit
                     * options.dynamicsScale.motorTorque,
                 motorStiffness: gain.stiffness
                     * options.dynamicsScale.motorStiffness,
@@ -525,7 +571,7 @@ public struct MJCFAsset {
                 // passive source damping.
                 motorDamping: max(gain.damping, joint.damping)
                     * options.dynamicsScale.motorDamping,
-                armature: joint.armature * options.dynamicsScale.armature,
+                armature: armature * options.dynamicsScale.armature,
                 limitLo: joint.range.0 - home, limitHi: joint.range.1 - home)
             let index = scene.joints.count
             scene.addJoint(sceneJoint)
@@ -544,6 +590,12 @@ public struct MJCFAsset {
                     scene.addCollisionExclusion(
                         bodyA: bodyIndices[a], bodyB: bodyIndices[b])
                 }
+            }
+        } else if !options.collideConnectedBodies {
+            for (child, link) in links.enumerated() {
+                guard let parent = link.parent else { continue }
+                scene.addCollisionExclusion(
+                    bodyA: bodyIndices[parent], bodyB: bodyIndices[child])
             }
         }
         let actuatorJoints = try actuators.map { actuator -> Int in
@@ -570,10 +622,13 @@ public struct MJCFAsset {
         defaultMotorGain: MJCFMotorGain = .init(stiffness: 0, damping: 0),
         motorGains: [String: MJCFMotorGain] = [:],
         jointHomePositions: [String: Float] = [:],
+        motorEffortLimits: [String: Float] = [:],
+        jointArmatures: [String: Float] = [:],
         fixedBase: Bool = false,
         gravityScale: Float = 1,
         collisionGroup: UInt32 = 0,
         selfCollisions: Bool = true,
+        collideConnectedBodies: Bool = true,
         inertiaFrame: MJCFInertiaFrame = .principal,
         dynamicsScale: MJCFDynamicsScale = .identity,
         includeVisuals: Bool = true
@@ -585,10 +640,13 @@ public struct MJCFAsset {
                 defaultMotorGain: defaultMotorGain,
                 motorGains: motorGains,
                 jointHomePositions: jointHomePositions,
+                motorEffortLimits: motorEffortLimits,
+                jointArmatures: jointArmatures,
                 fixedBase: fixedBase,
                 gravityScale: gravityScale,
                 collisionGroup: collisionGroup,
                 selfCollisions: selfCollisions,
+                collideConnectedBodies: collideConnectedBodies,
                 inertiaFrame: inertiaFrame,
                 dynamicsScale: dynamicsScale,
                 includeVisuals: includeVisuals))
@@ -624,6 +682,7 @@ private struct Joint {
     var range: (Float, Float)
     var damping: Float
     var armature: Float
+    var actuatorForceLimit: Float?
 }
 
 private struct CollisionGeometry {
@@ -651,7 +710,7 @@ private struct VisualGeometry {
 private struct Actuator {
     var name: String
     var joint: String
-    var torque: Float
+    var effortLimit: Float
 }
 
 private struct DefaultBundle {
@@ -705,7 +764,9 @@ private func parseBody(
         diagonalInertia: try vector3(try required(inertialNode, "diaginertia"),
                                      element: "inertial", attribute: "diaginertia"))
 
-    let jointNodes = node.children.filter { $0.name == "joint" }
+    let jointNodes = node.children.filter {
+        $0.name == "joint" || $0.name == "freejoint"
+    }
     if jointNodes.count > 1 {
         throw MJCFImportError.unsupported("body \(name) has multiple joints")
     }
@@ -714,27 +775,42 @@ private func parseBody(
         let jointClass = jointNode.attributes["class"] ?? activeClass
         var attrs = jointClass.flatMap { defaults[$0]?.joint } ?? [:]
         attrs.merge(jointNode.attributes) { _, new in new }
-        let type = attrs["type"] ?? "hinge"
-        guard type == "hinge" else {
+        let type = jointNode.name == "freejoint"
+            ? "free" : attrs["type"] ?? "hinge"
+        if type == "free" {
+            guard parent == nil else {
+                throw MJCFImportError.unsupported(
+                    "free joint on \(name) must be on a top-level body")
+            }
+            // AVBD root bodies already carry a free six-DoF pose. A source
+            // root free joint therefore requires no solver constraint and is
+            // intentionally absent from the policy hinge ordering.
+            joint = nil
+        } else if type == "hinge" {
+            let jointName = attrs["name"] ?? "\(name)_joint"
+            guard jointNameSet.insert(jointName).inserted else {
+                throw MJCFImportError.unsupported("duplicate joint name \(jointName)")
+            }
+            let rangeValues = try floatList(
+                attrs["range"] ?? "-3.1415927 3.1415927",
+                count: 2, element: "joint", attribute: "range")
+            joint = Joint(
+                name: jointName,
+                position: try vector3(attrs["pos"] ?? "0 0 0",
+                                      element: "joint", attribute: "pos"),
+                axis: normalize(try vector3(attrs["axis"] ?? "0 0 1",
+                                            element: "joint", attribute: "axis")),
+                range: (rangeValues[0], rangeValues[1]),
+                damping: try scalar(attrs["damping"] ?? "0",
+                                    element: "joint", attribute: "damping"),
+                armature: try scalar(attrs["armature"] ?? "0",
+                                     element: "joint", attribute: "armature"),
+                actuatorForceLimit: try rangeMagnitude(
+                    attrs["actuatorfrcrange"], element: "joint",
+                    attribute: "actuatorfrcrange"))
+        } else {
             throw MJCFImportError.unsupported("joint type \(type) on \(name)")
         }
-        let jointName = attrs["name"] ?? "\(name)_joint"
-        guard jointNameSet.insert(jointName).inserted else {
-            throw MJCFImportError.unsupported("duplicate joint name \(jointName)")
-        }
-        let rangeValues = try floatList(attrs["range"] ?? "-3.1415927 3.1415927",
-                                        count: 2, element: "joint", attribute: "range")
-        joint = Joint(
-            name: jointName,
-            position: try vector3(attrs["pos"] ?? "0 0 0",
-                                  element: "joint", attribute: "pos"),
-            axis: normalize(try vector3(attrs["axis"] ?? "0 0 1",
-                                        element: "joint", attribute: "axis")),
-            range: (rangeValues[0], rangeValues[1]),
-            damping: try scalar(attrs["damping"] ?? "0",
-                                element: "joint", attribute: "damping"),
-            armature: try scalar(attrs["armature"] ?? "0",
-                                 element: "joint", attribute: "armature"))
     }
 
     var geometries: [CollisionGeometry] = []
@@ -982,6 +1058,15 @@ private func scalar(_ value: String, element: String,
             element: element, attribute: attribute, value: value)
     }
     return result
+}
+
+private func rangeMagnitude(
+    _ value: String?, element: String, attribute: String
+) throws -> Float? {
+    guard let value else { return nil }
+    let range = try floatList(value, count: 2, element: element,
+                              attribute: attribute)
+    return max(abs(range[0]), abs(range[1]))
 }
 
 private func floatList(_ value: String, count: Int, element: String,

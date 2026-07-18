@@ -130,6 +130,8 @@ public final class Arachne15Env {
         public var motors: [Int]
         public var feet: [Int]
         public var footFrames: [MJCFLinkFrame]
+        /// Reusable physical robustness box owned by this replica.
+        public var projectile: Int?
         public var startMarker: Int?
         public var goalMarker: Int?
     }
@@ -147,10 +149,15 @@ public final class Arachne15Env {
     public let scene: PhysicsScene
     public let groundBody: Int
     public let dynamicsScales: [MJCFDynamicsScale]
+    public let projectileSize: Float
+    public let projectileMass: Float
     public private(set) var refs: [EnvRefs]
 
     private let spawnPoses: [(F3, Quat)]
     private let groundContactSlots: [Int: Int]
+    private let projectileHiddenPositions: [F3]
+    private let projectileOwners: [Int: Int]
+    private let robotBodyOwners: [Int: Int]
 
     public init(
         numEnvironments: Int, seed: UInt64 = 1,
@@ -158,11 +165,18 @@ public final class Arachne15Env {
         domainRandomization: ArticulationDomainRandomization = .init(),
         includeGoalMarkers: Bool = false,
         goalMarkerRadius: Float = 0.12,
-        solverIterations: Int = 20
+        solverIterations: Int = 20,
+        includeProjectiles: Bool = false,
+        projectileSize: Float = 0.05,
+        projectileMass: Float = 0.10
     ) throws {
         precondition(numEnvironments > 0 && solverIterations > 0
-            && goalMarkerRadius > 0)
+            && goalMarkerRadius > 0
+            && projectileSize.isFinite && projectileSize > 0
+            && projectileMass.isFinite && projectileMass > 0)
         self.numEnvironments = numEnvironments
+        self.projectileSize = projectileSize
+        self.projectileMass = projectileMass
         var built = PhysicsScene(name: "arachne15-locomotion")
         built.settings.dt = 0.002
         built.settings.gravity = -9.80665
@@ -207,6 +221,17 @@ public final class Arachne15Env {
             let bodies = asset.bodyNames.map { imported.bodiesByName[$0]! }
             let feet = footNames.map { imported.bodiesByName[$0]! }
             let footFrames = footNames.map { imported.linkFramesInBody[$0]! }
+            let projectile: Int?
+            if includeProjectiles {
+                projectile = built.addBody(
+                    size: F3(repeating: projectileSize),
+                    density: projectileMass / pow(projectileSize, 3),
+                    friction: 0.7,
+                    position: F3(0, 0, -4),
+                    collisionGroup: UInt32(e + 1))
+            } else {
+                projectile = nil
+            }
             var ref = EnvRefs(
                 root: imported.rootBody,
                 rootFrame: imported.linkFramesInBody["base"]!,
@@ -214,6 +239,7 @@ public final class Arachne15Env {
                 motors: imported.actuatorJoints,
                 feet: feet,
                 footFrames: footFrames,
+                projectile: projectile,
                 startMarker: nil,
                 goalMarker: nil)
             if includeGoalMarkers && numEnvironments <= 4 {
@@ -256,6 +282,16 @@ public final class Arachne15Env {
             }
         }
         groundContactSlots = slots
+        projectileHiddenPositions = [F3](
+            repeating: F3(0, 0, -4), count: numEnvironments)
+        projectileOwners = Dictionary(uniqueKeysWithValues:
+            builtRefs.indices.compactMap { environment in
+                builtRefs[environment].projectile.map { ($0, environment) }
+            })
+        robotBodyOwners = Dictionary(uniqueKeysWithValues:
+            builtRefs.enumerated().flatMap { environment, reference in
+                reference.bodies.map { ($0, environment) }
+            })
         solver = try GPUSolver(scene: built)
     }
 
@@ -323,7 +359,7 @@ public final class Arachne15Env {
                       initialRollPitchRange: Float = 0,
                       initialYawRange: Float = 0) {
         precondition(environmentIDs.count == seeds.count)
-        var poses: [GPUSolver.BodyPoseUpdate] = []
+        var bodyStates: [GPUSolver.BodyStateUpdate] = []
         var motors: [GPUSolver.MotorTargetUpdate] = []
         for (offset, e) in environmentIDs.enumerated() {
             var rng = SplitMix64(seed: seeds[offset] ^ 0xD1B54A32D192ED03)
@@ -360,16 +396,21 @@ public final class Arachne15Env {
             // the lowest authored foot just above the physical ground.
             let verticalLift = max(0, 0.0001 - minimumFootClearance)
             for transformedPose in transformed {
-                poses.append(.init(
+                bodyStates.append(.init(
                     body: transformedPose.body,
                     position: transformedPose.position + F3(0, 0, verticalLift),
                     rotation: transformedPose.rotation))
+            }
+            if let projectile = refs[e].projectile {
+                bodyStates.append(Self.hiddenProjectileState(
+                    body: projectile,
+                    position: projectileHiddenPositions[e]))
             }
             for joint in refs[e].motors {
                 motors.append(.init(joint: joint, angle: 0))
             }
         }
-        solver.setBodyPoses(poses)
+        solver.setBodyStates(bodyStates)
         solver.setMotorTargets(motors)
     }
 
@@ -397,6 +438,93 @@ public final class Arachne15Env {
             }
         }
         if !poses.isEmpty { solver.setBodyPoses(poses) }
+    }
+
+    /// Launch one reusable colliding box per selected replica toward the
+    /// measured chassis. `sideSigns` is robot-local left (+) or right (-).
+    /// Gravity and current chassis velocity are included in the intercept.
+    public func throwBoxes(
+        environmentIDs: [Int], sideSigns: [Float],
+        launchDistance: Float = 0.35, speed: Float = 2.5
+    ) {
+        precondition(environmentIDs.count == sideSigns.count)
+        precondition(Set(environmentIDs).count == environmentIDs.count
+            && environmentIDs.allSatisfy(refs.indices.contains))
+        precondition(launchDistance.isFinite && launchDistance > 0
+            && speed.isFinite && speed > 0
+            && sideSigns.allSatisfy { $0.isFinite && $0 != 0 })
+        guard !environmentIDs.isEmpty else { return }
+
+        let measured = states()
+        let flightTime = launchDistance / speed
+        let gravity = F3(0, 0, scene.settings.gravity)
+        var updates: [GPUSolver.BodyStateUpdate] = []
+        updates.reserveCapacity(environmentIDs.count)
+        for (offset, environment) in environmentIDs.enumerated() {
+            let state = measured[environment]
+            let rootForward = state.root.rotation.act(F3(1, 0, 0))
+            let forwardLength = max(
+                sqrt(rootForward.x * rootForward.x
+                    + rootForward.y * rootForward.y),
+                1e-6)
+            let forward = F3(
+                rootForward.x / forwardLength,
+                rootForward.y / forwardLength, 0)
+            let lateral = F3(-forward.y, forward.x, 0)
+            let side: Float = sideSigns[offset] > 0 ? 1 : -1
+            let target = state.root.position
+            let launch = target + lateral * (launchDistance * side)
+            let predictedTarget = target
+                + state.root.linearVelocity * flightTime
+            let velocity = (predictedTarget - launch
+                - 0.5 * gravity * flightTime * flightTime) / flightTime
+            guard let projectile = refs[environment].projectile else {
+                continue
+            }
+            updates.append(.init(
+                body: projectile,
+                position: launch,
+                rotation: Quat(real: 1, imag: .zero),
+                linearVelocity: velocity,
+                angularVelocity: F3(
+                    side * 2.5, -side * 1.5, side * 3.5)))
+        }
+        solver.setBodyStates(updates)
+    }
+
+    /// Return selected boxes below the ground, clearing velocity and contact
+    /// warm starts so each launch is independent of earlier impacts.
+    public func hideBoxes(environmentIDs: [Int]) {
+        precondition(Set(environmentIDs).count == environmentIDs.count
+            && environmentIDs.allSatisfy(refs.indices.contains))
+        solver.setBodyStates(environmentIDs.compactMap { environment in
+            refs[environment].projectile.map { projectile in
+                Self.hiddenProjectileState(
+                    body: projectile,
+                    position: projectileHiddenPositions[environment])
+            }
+        })
+    }
+
+    public func hasProjectile(environment: Int) -> Bool {
+        precondition(refs.indices.contains(environment))
+        return refs[environment].projectile != nil
+    }
+
+    /// Physical box/articulation contacts from the last completed solve.
+    /// Shared-ground contacts and other replicas are excluded.
+    public func boxRobotContacts() -> [Bool] {
+        var contacts = [Bool](repeating: false, count: numEnvironments)
+        for (a, b) in solver.activeRigidContactPairs() {
+            if let environment = projectileOwners[a],
+               robotBodyOwners[b] == environment {
+                contacts[environment] = true
+            } else if let environment = projectileOwners[b],
+                      robotBodyOwners[a] == environment {
+                contacts[environment] = true
+            }
+        }
+        return contacts
     }
 
     public func groundContacts() -> [[Bool]] {
@@ -466,6 +594,15 @@ public final class Arachne15Env {
             linearVelocity: state.linearVelocity
                 + cross(state.angularVelocity, offset),
             angularVelocity: state.angularVelocity)
+    }
+
+    private static func hiddenProjectileState(
+        body: Int, position: F3
+    ) -> GPUSolver.BodyStateUpdate {
+        .init(
+            body: body, position: position,
+            rotation: Quat(real: 1, imag: .zero),
+            linearVelocity: .zero, angularVelocity: .zero)
     }
 }
 
@@ -631,8 +768,13 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     }
     private var resetRNG: SplitMix64
 
-    public init(configuration: Arachne15LocomotionTaskConfig,
-                taskID: String = "arachne15-velocity-v0") throws {
+    public init(
+        configuration: Arachne15LocomotionTaskConfig,
+        taskID: String = "arachne15-velocity-v0",
+        includeInteractiveRobustnessProbe: Bool = false,
+        projectileSize: Float = 0.05,
+        projectileMass: Float = 0.10
+    ) throws {
         guard (configuration.pointGoal && taskID == "arachne15-goal-v0")
                 || (!configuration.pointGoal
                     && taskID == "arachne15-velocity-v0") else {
@@ -674,7 +816,9 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 && configuration.goalSuccessBonus >= 0),
               configuration.commandProgressRewardWeight >= 0,
               configuration.velocityErrorPenaltyWeight >= 0,
-              configuration.yawErrorPenaltyWeight >= 0 else {
+              configuration.yawErrorPenaltyWeight >= 0,
+              projectileSize.isFinite, projectileSize > 0,
+              projectileMass.isFinite, projectileMass > 0 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "invalid Arachne locomotion configuration")
         }
@@ -685,7 +829,10 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
             domainRandomization: configuration.domainRandomization,
             includeGoalMarkers: configuration.pointGoal,
             goalMarkerRadius: configuration.goalRadius,
-            solverIterations: configuration.solverIterations)
+            solverIterations: configuration.solverIterations,
+            includeProjectiles: includeInteractiveRobustnessProbe,
+            projectileSize: projectileSize,
+            projectileMass: projectileMass)
         environment = env
         self.configuration = configuration
         let d = configuration.domainRandomization

@@ -219,6 +219,11 @@ public struct RLStepBatch: Sendable {
     /// episode reductions such as success-once; it need not coincide with a
     /// termination when a task uses fixed-horizon evaluation.
     public var successes: ContiguousArray<Bool>
+    /// Task-certified transition worth retaining for self-imitation. This is
+    /// deliberately separate from `successes`: curricula may preserve rare
+    /// useful behavior (for example, a stable physical lift) without inflating
+    /// final task success or changing Gymnasium termination semantics.
+    public var imitationMilestones: ContiguousArray<Bool>
     /// Terminal state before auto-reset. Only rows marked by
     /// `hasFinalObservation` are meaningful.
     public var finalObservations: ContiguousArray<Float>
@@ -232,6 +237,8 @@ public struct RLStepBatch: Sendable {
         terminated = ContiguousArray(repeating: false, count: spec.numEnvironments)
         truncated = ContiguousArray(repeating: false, count: spec.numEnvironments)
         successes = ContiguousArray(repeating: false, count: spec.numEnvironments)
+        imitationMilestones = ContiguousArray(
+            repeating: false, count: spec.numEnvironments)
         finalObservations = ContiguousArray(
             repeating: 0,
             count: spec.numEnvironments * spec.observation.elementCount)
@@ -245,6 +252,7 @@ public struct RLStepBatch: Sendable {
         for i in terminated.indices { terminated[i] = false }
         for i in truncated.indices { truncated[i] = false }
         for i in successes.indices { successes[i] = false }
+        for i in imitationMilestones.indices { imitationMilestones[i] = false }
         for i in hasFinalObservation.indices { hasFinalObservation[i] = false }
         metrics.removeAll(keepingCapacity: true)
     }
@@ -253,7 +261,8 @@ public struct RLStepBatch: Sendable {
         try observations.validate(for: spec)
         let n = spec.numEnvironments
         guard rewards.count == n, terminated.count == n, truncated.count == n,
-              successes.count == n, hasFinalObservation.count == n else {
+              successes.count == n, imitationMilestones.count == n,
+              hasFinalObservation.count == n else {
             throw RLEnvironmentError.invalidConfiguration(
                 "RLStepBatch signal storage does not match \(n) environments")
         }
@@ -390,6 +399,29 @@ public protocol PolicyReferenceRegularizationProviding: AnyObject {
         _ observations: ContiguousArray<Float>) -> ContiguousArray<Float>
 }
 
+/// Optional action-wise mask for initialization-policy retention. Row weights
+/// decide *when* retention applies; this mask decides *which actuator
+/// outputs* remain anchored. The returned tensor is row-major
+/// `[environment, action]`. This is useful for compositional control where a
+/// verified upper-body grasp must remain fixed while a lower-body locomotion
+/// branch adapts to the resulting load and center-of-mass shift.
+public protocol PolicyReferenceActionRegularizationProviding: AnyObject {
+    func policyReferenceActionRegularizationWeights(
+        _ observations: ContiguousArray<Float>,
+        actionDimension: Int
+    ) -> ContiguousArray<Float>
+}
+
+/// Optional task-owned actor update mask. The generic learner still trains
+/// the critic on every transition, but multiplies the PPO actor loss by one
+/// weight per environment. This is useful for staged contact tasks where a
+/// large prerequisite-state distribution would otherwise overwhelm the much
+/// smaller adaptation regime. It does not alter exploration or physics.
+public protocol PolicyActorTrainingWeightProviding: AnyObject {
+    func policyActorTrainingWeights(
+        _ observations: ContiguousArray<Float>) -> ContiguousArray<Float>
+}
+
 /// Optional hard routing signal for a two-expert actor. The task derives the
 /// gate from its raw policy observation, while PPO remains agnostic to what
 /// the modes mean. A value of one selects the specialized expert and zero
@@ -398,6 +430,11 @@ public protocol PolicyReferenceRegularizationProviding: AnyObject {
 public protocol PolicyExpertGateProviding: AnyObject {
     var usesPolicyExpertGate: Bool { get }
     var freezesBasePolicyExpert: Bool { get }
+    /// Optional action-space mask for compositional control. A value of one
+    /// routes that actuator through this expert and zero leaves it available
+    /// to the base or another disjoint expert. `nil` preserves whole-action
+    /// routing.
+    var policyExpertActionMask: ContiguousArray<Float>? { get }
     /// An explicit transfer can initialize the routed expert as an exact copy
     /// of the source checkpoint's base actor. This makes activating a new
     /// task-owned gate behavior-identical before specialist training begins.
@@ -422,7 +459,38 @@ public protocol PolicyStandExpertGateProviding: PolicyExpertGateProviding {
     /// Keep a verified low-speed/braking branch byte-stable while training
     /// only the independently routed stand branch.
     var freezesLowSpeedPolicyExpert: Bool { get }
+    /// An explicit transfer can clone the already learned routed expert into
+    /// the new third branch. The branch switch is then behavior-identical on
+    /// its first transition while subsequent PPO updates remain isolated.
+    var initializesPolicyStandExpertFromPolicyExpertOnTransfer: Bool { get }
+    /// Initialize the third branch from the verified base actor instead. This
+    /// is the useful starting point for a loaded-locomotion specialist whose
+    /// upper body is supplied by a separate frozen manipulation expert.
+    var initializesPolicyStandExpertFromBaseOnTransfer: Bool { get }
+    /// Optional action-space mask for compositional experts. A value of one
+    /// routes that action through the stand expert; zero keeps the base
+    /// expert's action even while the stand mode is active. `nil` preserves
+    /// whole-action routing. This lets tasks reuse a verified locomotion
+    /// controller for legs while independently learning an upper-body skill.
+    var policyStandExpertActionMask: ContiguousArray<Float>? { get }
     func policyStandExpertGates(
+        _ observations: ContiguousArray<Float>) -> ContiguousArray<Float>
+}
+
+/// Optional fourth routed actor for compositional skills that need to preserve
+/// three already verified behaviors while adapting a disjoint actuator group.
+/// The task owns both the scalar gate and action mask; PPO only composes the
+/// resulting convex action-wise mixture.
+public protocol PolicyAuxiliaryExpertGateProviding:
+    PolicyStandExpertGateProviding
+{
+    var usesPolicyAuxiliaryExpertGate: Bool { get }
+    /// Keep the existing third branch byte-stable while the new auxiliary
+    /// branch learns. This is independent of `freezesLowSpeedPolicyExpert`,
+    /// which freezes the first routed branch.
+    var freezesStandPolicyExpert: Bool { get }
+    var policyAuxiliaryExpertActionMask: ContiguousArray<Float>? { get }
+    func policyAuxiliaryExpertGates(
         _ observations: ContiguousArray<Float>) -> ContiguousArray<Float>
 }
 
@@ -431,8 +499,20 @@ public extension TrainingModeConfigurable {
 }
 
 public extension PolicyExpertGateProviding {
+    var policyExpertActionMask: ContiguousArray<Float>? { nil }
     var initializesPolicyExpertFromBaseOnTransfer: Bool { false }
     var initializesPolicyExpertFromMirroredBaseOnTransfer: Bool { false }
+}
+
+public extension PolicyStandExpertGateProviding {
+    var initializesPolicyStandExpertFromPolicyExpertOnTransfer: Bool { false }
+    var initializesPolicyStandExpertFromBaseOnTransfer: Bool { false }
+    var policyStandExpertActionMask: ContiguousArray<Float>? { nil }
+}
+
+public extension PolicyAuxiliaryExpertGateProviding {
+    var policyAuxiliaryExpertActionMask: ContiguousArray<Float>? { nil }
+    var freezesStandPolicyExpert: Bool { false }
 }
 
 /// Task-owned, algorithm-independent acceptance gate for deterministic policy
@@ -530,14 +610,22 @@ public struct RLTaskConfiguration: Sendable {
     /// enables this for throughput. Evaluation disables it so the evaluator
     /// can assign a fixed, reproducible episode quota to every environment.
     public var autoReset: Bool
+    /// Add scene-owned, policy-invisible bodies used only for interactive
+    /// robustness probes such as the Policy Replay "Throw Box" control.
+    /// This is deliberately not an experiment option or part of checkpoint
+    /// compatibility: training/evaluation batches leave it disabled.
+    public var includeInteractiveRobustnessProbes: Bool
     public var options: [String: Float]
 
     public init(numEnvironments: Int, seed: UInt64 = 1,
                 autoReset: Bool = true,
+                includeInteractiveRobustnessProbes: Bool = false,
                 options: [String: Float] = [:]) {
         self.numEnvironments = numEnvironments
         self.seed = seed
         self.autoReset = autoReset
+        self.includeInteractiveRobustnessProbes =
+            includeInteractiveRobustnessProbes
         self.options = options
     }
 

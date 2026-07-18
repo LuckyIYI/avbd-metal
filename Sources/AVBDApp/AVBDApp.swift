@@ -19,7 +19,9 @@ struct AVBDApp: App {
     var body: some SwiftUI.Scene {
         WindowGroup("AVBD Metal") {
             ContentView(model: model)
-                .frame(minWidth: 1120, minHeight: 680)
+                // Policy Replay reserves enough room for both an inspectable
+                // robot viewport and its non-clipped 520-point control panel.
+                .frame(minWidth: 1200, minHeight: 680)
         }
     }
 }

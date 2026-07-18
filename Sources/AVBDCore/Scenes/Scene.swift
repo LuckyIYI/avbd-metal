@@ -117,6 +117,11 @@ public struct SceneCollider {
     /// geometry; nonzero groups collide with shared geometry and themselves,
     /// but never with a different nonzero group.
     public var collisionGroup: UInt32
+    /// Whether this collider may contact group-zero shared geometry. This is
+    /// independent of replica isolation: a policy replay can expose extra
+    /// robot primitives to a same-replica projectile without also changing
+    /// the task's authored terrain-contact model.
+    public var collidesWithSharedGeometry: Bool
     /// Whether this analytic primitive participates in broad-phase and
     /// contact generation. Keeping this independent of `isRendered` lets
     /// imported robot models retain their visual proxy geometry while a task
@@ -139,6 +144,7 @@ public struct SceneCollider {
                 shape: BodyShape = .box,
                 convexHullVertices: [F3] = [],
                 collisionGroup: UInt32 = 0,
+                collidesWithSharedGeometry: Bool = true,
                 collisionEnabled: Bool = true,
                 usesWorldSpaceRoundAnchor: Bool = false,
                 isRendered: Bool = true) {
@@ -155,6 +161,7 @@ public struct SceneCollider {
         self.shape = shape
         self.convexHullVertices = convexHullVertices
         self.collisionGroup = collisionGroup
+        self.collidesWithSharedGeometry = collidesWithSharedGeometry
         self.collisionEnabled = collisionEnabled
         self.isRendered = isRendered
         self.usesWorldSpaceRoundAnchor = usesWorldSpaceRoundAnchor
@@ -531,6 +538,7 @@ public struct PhysicsScene {
                                      shape: BodyShape = .box,
                                      convexHullVertices: [F3] = [],
                                      collisionGroup: UInt32 = 0,
+                                     collidesWithSharedGeometry: Bool = true,
                                      collisionEnabled: Bool = true,
                                      isRendered: Bool = true) -> Int {
         precondition(bodies.indices.contains(body), "collider owner out of range")
@@ -541,6 +549,7 @@ public struct PhysicsScene {
             localPosition: localPosition, localRotation: localRotation,
             shape: shape, convexHullVertices: convexHullVertices,
             collisionGroup: collisionGroup,
+            collidesWithSharedGeometry: collidesWithSharedGeometry,
             collisionEnabled: collisionEnabled,
             usesWorldSpaceRoundAnchor: false,
             isRendered: isRendered))
@@ -559,6 +568,7 @@ public struct PhysicsScene {
         localPosition: F3 = .zero,
         localRotation: Quat = Quat(real: 1, imag: .zero),
         collisionGroup: UInt32 = 0,
+        collidesWithSharedGeometry: Bool = true,
         collisionEnabled: Bool = true,
         isRendered: Bool = false
     ) -> Int {
@@ -582,6 +592,7 @@ public struct PhysicsScene {
             localRotation: localRotation, shape: .box,
             convexHullVertices: centered,
             collisionGroup: collisionGroup,
+            collidesWithSharedGeometry: collidesWithSharedGeometry,
             collisionEnabled: collisionEnabled, isRendered: isRendered)
     }
 

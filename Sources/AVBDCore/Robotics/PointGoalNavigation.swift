@@ -23,23 +23,37 @@ public struct PointGoalNavigationParameters: Sendable, Equatable {
     public let boundarySpeed: Float
     public let yawGain: Float
     public let maximumYawRate: Float
+    /// Optional unicycle speed gate. Zero preserves the historical H1 command
+    /// law exactly. Positive values multiply forward speed by
+    /// `max(cos(relativeBearing), 0)^exponent`, allowing loaded or constrained
+    /// robots to turn toward a goal before translating into nearby geometry.
+    public let forwardAlignmentSpeedExponent: Float
+    /// Lower bound for the alignment multiplier. This keeps a controller whose
+    /// training distribution excludes pure in-place yaw on a slow forward arc.
+    public let minimumForwardAlignmentScale: Float
     public let mode: PointGoalCommandMode
 
     public init(
         goalRadius: Float, slowdownDistance: Float,
         cruiseSpeed: Float, boundarySpeed: Float = 0,
         yawGain: Float, maximumYawRate: Float,
+        forwardAlignmentSpeedExponent: Float = 0,
+        minimumForwardAlignmentScale: Float = 0,
         mode: PointGoalCommandMode
     ) {
         precondition(goalRadius > 0 && slowdownDistance > goalRadius)
         precondition(cruiseSpeed >= boundarySpeed && boundarySpeed >= 0)
         precondition(yawGain >= 0 && maximumYawRate >= 0)
+        precondition(forwardAlignmentSpeedExponent >= 0)
+        precondition((0...1).contains(minimumForwardAlignmentScale))
         self.goalRadius = goalRadius
         self.slowdownDistance = slowdownDistance
         self.cruiseSpeed = cruiseSpeed
         self.boundarySpeed = boundarySpeed
         self.yawGain = yawGain
         self.maximumYawRate = maximumYawRate
+        self.forwardAlignmentSpeedExponent = forwardAlignmentSpeedExponent
+        self.minimumForwardAlignmentScale = minimumForwardAlignmentScale
         self.mode = mode
     }
 }
@@ -63,7 +77,7 @@ public struct PointGoalNavigationCommand: Sendable, Equatable {
 /// deployment. It computes only a task-space command; joint actions remain the
 /// responsibility of the selected learned or classical controller.
 public enum PointGoalNavigator {
-    public static let revision = 1
+    public static let revision = 3
 
     public static func command(
         worldGoal: F3, bodyPosition: F3, bodyRotation: Quat,
@@ -117,7 +131,13 @@ public enum PointGoalNavigator {
                 ? bodyDelta / max(distance, 1e-6) : .zero
             velocity = direction * speed
         case .forwardOnlyYaw:
-            velocity = F3(speed, 0, 0)
+            let alignmentScale = parameters.forwardAlignmentSpeedExponent > 0
+                ? parameters.minimumForwardAlignmentScale
+                    + (1 - parameters.minimumForwardAlignmentScale)
+                        * pow(max(cos(bearing), 0),
+                              parameters.forwardAlignmentSpeedExponent)
+                : 1
+            velocity = F3(speed * alignmentScale, 0, 0)
         }
 
         return PointGoalNavigationCommand(

@@ -92,7 +92,7 @@ final class GTAOReferenceTests: XCTestCase {
         return GBuf(w: w, h: h, pos: pos, nrm: nrm)
     }
 
-    /// exact port of ssao_fragment (shader constants included)
+    /// Exact port of `gtao_fragment` (production shader constants included).
     func gtaoPixel(_ g: GBuf, _ px: Int, _ py: Int, eye: F3,
                    camRight: F3, camUpUV: F3, pxPerUnit: Float) -> Float {
         let (P4, Nr) = g.at(px, py)
@@ -111,7 +111,7 @@ final class GTAOReferenceTests: XCTestCase {
             .truncatingRemainder(dividingBy: 1))).truncatingRemainder(dividingBy: 1))
         let ang = abs(ign) * .pi
         let stepJit = abs((ign * 7).truncatingRemainder(dividingBy: 1))
-        let SLICES = 3, STEPS = 6
+        let SLICES = 3, STEPS = 4
         var occl: Float = 0
         for sl in 0..<SLICES {
             let phi = ang + Float(sl) * (.pi / Float(SLICES))

@@ -60,6 +60,42 @@ public enum BuiltInRLTasks {
             "postImpactAngularVelocityPenaltyWeight",
             "postImpactFallPenalty",
         ])
+    private static let humanoidBoxCarryOptionKeys: Set<String> = [
+        "maxEpisodeSteps", "solverIterations", "observationNoise",
+        "minimumTrainingStationDistance", "evaluationStationDistance",
+        "stationDistanceCurriculumControlSteps", "boxMass", "boxFriction",
+        "minimumTrainingLiftClearance", "liftClearance",
+        "liftClearanceCurriculumControlSteps",
+        "minimumTrainingCarryDistance", "carryDistance",
+        "carryDistanceCurriculumControlSteps",
+        "destinationBearingCurriculumControlSteps",
+        "minimumTrainingSuccessDwellSteps", "successDwellSteps",
+        "successDwellCurriculumControlSteps", "pregraspForwardOffset",
+        "pregraspLateralOffset", "approachCommandSpeed",
+        "carryCommandSpeed", "carryHolonomicCommand",
+        "navigationGoalObservationScale",
+        "manipulationHandoffSteps",
+        "carryHandoffSteps", "carryCommandRampSteps",
+        "manipulationArmActionScaleMultiplier",
+        "carryBaseLegActionFraction",
+        "freezeBasePolicyExpert",
+        "freezeManipulationPolicyExpert",
+        "freezeCarryPolicyExpert",
+        "manipulationGatedActor",
+        "initializeManipulationExpertFromBaseOnTransfer",
+        "initializeCarryExpertFromManipulationExpertOnTransfer",
+        "compositionalCarryController",
+        "upperBodyCarryController",
+        "carryLocomotionControlsTorso",
+        "initializeCarryExpertFromBaseOnTransfer",
+        "carryStartReplayProbability",
+        "advanceReplaySnapshotAtDestinationContact",
+        "carryArmReferenceWeight",
+        "carryHoldClearanceMultiplier",
+        "carryProgressRewardWeight",
+        "carryLocomotionRewardMultiplier",
+        "carryTrackingVariance",
+    ]
     private static let humanoidGoalOptionKeys: Set<String> = [
         "maxEpisodeSteps", "controlDecimation", "minimumCommandSpeed",
         "maximumCommandSpeed", "commandCurriculumControlSteps",
@@ -267,13 +303,20 @@ public enum BuiltInRLTasks {
         "goalDistanceCurriculumControlSteps", "goalDwellSteps",
         "projectileCurriculumControlSteps", "minimumProjectileLaunchStep",
         "maximumProjectileLaunchStep", "maximumActionLatencySteps",
+        "stationDistanceCurriculumControlSteps",
+        "carryDistanceCurriculumControlSteps",
+        "destinationBearingCurriculumControlSteps",
+        "minimumTrainingSuccessDwellSteps", "successDwellSteps",
+        "successDwellCurriculumControlSteps",
     ]
     private static let positiveIntegerOptionKeys: Set<String> = [
         "maxEpisodeSteps", "controlDecimation", "solverIterations",
         "commandResamplingSteps", "goalDwellSteps",
+        "minimumTrainingSuccessDwellSteps", "successDwellSteps",
     ]
     private static let booleanOptionKeys: Set<String> = [
         "commandGatedActor", "threeModeActor",
+        "manipulationGatedActor",
         "standExpertRequiresDoubleSupport", "standExpertUsesPlanarSpeed",
         "freezeBasePolicyExpert", "freezeLowSpeedPolicyExpert",
         "trainBasePolicyExpert", "pointGoal", "observationNoise",
@@ -281,6 +324,15 @@ public enum BuiltInRLTasks {
         "recoveryExpertGateDecay",
         "initializeRecoveryExpertFromBaseOnTransfer",
         "initializeRecoveryExpertFromMirroredBaseOnTransfer",
+        "initializeManipulationExpertFromBaseOnTransfer",
+        "freezeManipulationPolicyExpert",
+        "freezeCarryPolicyExpert",
+        "initializeCarryExpertFromManipulationExpertOnTransfer",
+        "compositionalCarryController", "upperBodyCarryController",
+        "initializeCarryExpertFromBaseOnTransfer",
+        "carryHolonomicCommand",
+        "carryLocomotionControlsTorso",
+        "advanceReplaySnapshotAtDestinationContact",
         "goalObservationUsesLateralVelocity",
         "goalObservationIncludesLateralVelocity", "precisionGatedActor",
         "continueAfterSuccess", "validationCollisionProfile",
@@ -466,7 +518,120 @@ public enum BuiltInRLTasks {
                         (cfg.options["observationNoise"] ?? 1) > 0,
                     solverIterations:
                         Int(cfg.options["solverIterations"] ?? 20),
-                    autoReset: cfg.autoReset))
+                    autoReset: cfg.autoReset),
+                includeInteractiveRobustnessProbe:
+                    cfg.includeInteractiveRobustnessProbes)
+        }
+        try! registry.register(
+            "humanoid-box-carry-v0",
+            optionSchema: optionSchema(humanoidBoxCarryOptionKeys)
+        ) { cfg in
+            guard (cfg.options["manipulationGatedActor"] ?? 1) == 1 else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "humanoid-box-carry-v0 requires manipulationGatedActor=1")
+            }
+            return try HumanoidBoxCarryTask(configuration: .init(
+                numEnvironments: cfg.numEnvironments,
+                seed: cfg.seed,
+                maxEpisodeSteps: Int(
+                    cfg.options["maxEpisodeSteps"] ?? 600),
+                solverIterations: Int(
+                    cfg.options["solverIterations"] ?? 20),
+                autoReset: cfg.autoReset,
+                observationNoise:
+                    (cfg.options["observationNoise"] ?? 1) > 0,
+                minimumTrainingStationDistance:
+                    cfg.options["minimumTrainingStationDistance"] ?? 0.55,
+                evaluationStationDistance:
+                    cfg.options["evaluationStationDistance"] ?? 1.40,
+                stationDistanceCurriculumControlSteps: Int(
+                    cfg.options["stationDistanceCurriculumControlSteps"]
+                        ?? 12_000),
+                boxMass: cfg.options["boxMass"] ?? 2,
+                boxFriction: cfg.options["boxFriction"] ?? 1.2,
+                minimumTrainingLiftClearance:
+                    cfg.options["minimumTrainingLiftClearance"] ?? 0.001,
+                liftClearance: cfg.options["liftClearance"] ?? 0.04,
+                liftClearanceCurriculumControlSteps: Int(
+                    cfg.options["liftClearanceCurriculumControlSteps"]
+                        ?? 30_000),
+                minimumTrainingCarryDistance:
+                    cfg.options["minimumTrainingCarryDistance"] ?? 0.05,
+                carryDistance: cfg.options["carryDistance"] ?? 0.75,
+                carryDistanceCurriculumControlSteps: Int(
+                    cfg.options["carryDistanceCurriculumControlSteps"]
+                        ?? 30_000),
+                destinationBearingCurriculumControlSteps: Int(
+                    cfg.options["destinationBearingCurriculumControlSteps"]
+                        ?? 0),
+                minimumTrainingSuccessDwellSteps: Int(
+                    cfg.options["minimumTrainingSuccessDwellSteps"] ?? 1),
+                successDwellSteps: Int(
+                    cfg.options["successDwellSteps"] ?? 10),
+                successDwellCurriculumControlSteps: Int(
+                    cfg.options["successDwellCurriculumControlSteps"]
+                        ?? 30_000),
+                pregraspForwardOffset:
+                    cfg.options["pregraspForwardOffset"]
+                        ?? HumanoidBoxCarryTask.pregraspOffset,
+                pregraspLateralOffset:
+                    cfg.options["pregraspLateralOffset"] ?? 0,
+                approachCommandSpeed:
+                    cfg.options["approachCommandSpeed"] ?? 0.40,
+                carryCommandSpeed:
+                    cfg.options["carryCommandSpeed"] ?? 0.30,
+                carryHolonomicCommand:
+                    (cfg.options["carryHolonomicCommand"] ?? 0) > 0,
+                navigationGoalObservationScale:
+                    cfg.options["navigationGoalObservationScale"] ?? 8,
+                manipulationHandoffSteps: Int(
+                    cfg.options["manipulationHandoffSteps"] ?? 24),
+                carryHandoffSteps: Int(
+                    cfg.options["carryHandoffSteps"] ?? 12),
+                carryCommandRampSteps: Int(
+                    cfg.options["carryCommandRampSteps"] ?? 12),
+                manipulationArmActionScaleMultiplier:
+                    cfg.options["manipulationArmActionScaleMultiplier"] ?? 2,
+                carryBaseLegActionFraction:
+                    cfg.options["carryBaseLegActionFraction"] ?? 0.25,
+                freezeBasePolicyExpert:
+                    (cfg.options["freezeBasePolicyExpert"] ?? 1) > 0,
+                freezeManipulationPolicyExpert:
+                    (cfg.options["freezeManipulationPolicyExpert"] ?? 1) > 0,
+                freezeCarryPolicyExpert:
+                    (cfg.options["freezeCarryPolicyExpert"] ?? 1) > 0,
+                initializeManipulationExpertFromBaseOnTransfer:
+                    (cfg.options[
+                        "initializeManipulationExpertFromBaseOnTransfer"]
+                        ?? 1) > 0,
+                initializeCarryExpertFromManipulationExpertOnTransfer:
+                    (cfg.options[
+                        "initializeCarryExpertFromManipulationExpertOnTransfer"]
+                        ?? 1) > 0,
+                compositionalCarryController:
+                    (cfg.options["compositionalCarryController"] ?? 0) > 0,
+                upperBodyCarryController:
+                    (cfg.options["upperBodyCarryController"] ?? 0) > 0,
+                carryLocomotionControlsTorso:
+                    (cfg.options["carryLocomotionControlsTorso"] ?? 0) > 0,
+                initializeCarryExpertFromBaseOnTransfer:
+                    (cfg.options[
+                        "initializeCarryExpertFromBaseOnTransfer"] ?? 0) > 0,
+                carryStartReplayProbability:
+                    cfg.options["carryStartReplayProbability"] ?? 0,
+                advanceReplaySnapshotAtDestinationContact:
+                    (cfg.options[
+                        "advanceReplaySnapshotAtDestinationContact"] ?? 0) > 0,
+                carryArmReferenceWeight:
+                    cfg.options["carryArmReferenceWeight"] ?? 1,
+                carryHoldClearanceMultiplier:
+                    cfg.options["carryHoldClearanceMultiplier"] ?? 1,
+                carryProgressRewardWeight:
+                    cfg.options["carryProgressRewardWeight"] ?? 25,
+                carryLocomotionRewardMultiplier:
+                    cfg.options["carryLocomotionRewardMultiplier"] ?? 1,
+                carryTrackingVariance:
+                    cfg.options["carryTrackingVariance"] ?? 0.25))
         }
         try! registry.register(
             "humanoid-isaac-goal-v0",
@@ -560,7 +725,9 @@ public enum BuiltInRLTasks {
                             "postImpactAngularVelocityPenaltyWeight"] ?? 0,
                     postImpactFallPenalty:
                         cfg.options["postImpactFallPenalty"] ?? 0),
-                taskID: "humanoid-isaac-goal-v0")
+                taskID: "humanoid-isaac-goal-v0",
+                includeInteractiveRobustnessProbe:
+                    cfg.includeInteractiveRobustnessProbes)
         }
         try! registry.register(
             "humanoid-goal-v0",
@@ -838,7 +1005,9 @@ public enum BuiltInRLTasks {
         ) { cfg in
             return try Arachne15LocomotionTask(
                 configuration: try arachne15Configuration(
-                    cfg, pointGoal: false))
+                    cfg, pointGoal: false),
+                includeInteractiveRobustnessProbe:
+                    cfg.includeInteractiveRobustnessProbes)
         }
         try! registry.register(
             "arachne15-goal-v0",
@@ -847,7 +1016,9 @@ public enum BuiltInRLTasks {
             return try Arachne15LocomotionTask(
                 configuration: try arachne15Configuration(
                     cfg, pointGoal: true),
-                taskID: "arachne15-goal-v0")
+                taskID: "arachne15-goal-v0",
+                includeInteractiveRobustnessProbe:
+                    cfg.includeInteractiveRobustnessProbes)
         }
         try! registry.register(
             "maniskill-pusht-v1",

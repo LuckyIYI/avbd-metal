@@ -11,8 +11,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     nonisolated let captureID = "policy"
     enum Robot: CaseIterable {
         case unitreeH1
+        case gearSonicG1
         case humanoidIsaac
         case humanoidIsaacGoal
+        case humanoidBoxCarry
         case arachne
         case arachneGoal
         case arachneClassical
@@ -20,8 +22,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         var selectionID: String {
             switch self {
             case .unitreeH1: return "unitree-h1-sim2sim-v0"
+            case .gearSonicG1: return "gear-sonic-g1-reference-v0"
             case .humanoidIsaac: return "humanoid-isaac-flat-v0"
             case .humanoidIsaacGoal: return "humanoid-isaac-goal-v0"
+            case .humanoidBoxCarry: return "humanoid-box-carry-v0"
             case .arachne: return "arachne15-velocity-v0"
             case .arachneGoal: return "arachne15-goal-v0"
             case .arachneClassical: return "arachne15-classical-goal-v0"
@@ -35,11 +39,20 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             PolicyReplayCatalog.entry(selectionID: selectionID)!
         }
 
-        var displayName: String { catalogEntry.displayName }
-        var taskID: String { catalogEntry.taskID }
+        var displayName: String {
+            self == .humanoidBoxCarry
+                ? "H1 Box Carry (Development)" : catalogEntry.displayName
+        }
+        var taskID: String {
+            self == .humanoidBoxCarry
+                ? "humanoid-box-carry-v0" : catalogEntry.taskID
+        }
+        var runtime: PolicyReplayRuntime {
+            self == .humanoidBoxCarry ? .nativeMLX : catalogEntry.runtime
+        }
 
         var usesClassicalController: Bool {
-            catalogEntry.runtime == .classicalController
+            runtime == .classicalController
         }
 
         static func fromSelectionID(_ id: String) -> Robot? {
@@ -49,8 +62,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         init?(taskID: String) {
             switch taskID {
             case "unitree-h1-sim2sim-v0": self = .unitreeH1
+            case "gear-sonic-g1-reference-v0": self = .gearSonicG1
             case "humanoid-isaac-flat-v0": self = .humanoidIsaac
             case "humanoid-isaac-goal-v0": self = .humanoidIsaacGoal
+            case "humanoid-box-carry-v0": self = .humanoidBoxCarry
             case "arachne15-velocity-v0": self = .arachne
             case "arachne15-goal-v0": self = .arachneGoal
             default: return nil
@@ -93,6 +108,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     @Published var goalBearingDegrees: Double = 0
     @Published var goalDistance: Double = 8
     @Published var boxSpeed: Double = 6
+    @Published private(set) var gearSonicReferenceNames: [String] = []
+    @Published private(set) var selectedGEARSonicReference = ""
     @Published var autoLoadLatest: Bool = {
         guard let value = ProcessInfo.processInfo.environment[
             "AVBD_REPLAY_AUTO_LOAD_LATEST"]?.lowercased() else { return true }
@@ -108,8 +125,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private(set) var cameraEpoch = 0
 
     private var isaacHumanoid: HumanoidIsaacVelocityTask?
+    private var humanoidBoxCarry: HumanoidBoxCarryTask?
     private var arachne: Arachne15LocomotionTask?
     private var unitreeH1: UnitreeH1Sim2SimSession?
+    private var gearSonicG1: GEARSonicG1Session?
     private var task: (any VectorizedRLTask)?
     private var observation: RLObservationBatch?
     private var result: RLStepBatch?
@@ -127,12 +146,23 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     /// states and pad the end of the video with a frozen terminal pose.
     private let frameLockedCapture = ProcessInfo.processInfo.environment[
         "AVBD_REPLAY_FRAME_LOCK"] != nil
+    /// Deterministic visual-regression hook. It invokes the exact same model
+    /// action as the UI button; normal interactive runs leave it unset.
+    private let scriptedBoxThrowStep = ProcessInfo.processInfo.environment[
+        "AVBD_REPLAY_AUTO_THROW_STEP"].flatMap(Int.init)
+    private var scriptedBoxThrowPerformed = false
     private var controlSteps = 0
     private var completed = 0
     private var successes = 0
     private var nextProjectileSide: Float = 1
     private var replaySeed: UInt64 = 21_001
     private var unitreeInitialPosition = F3.zero
+    private var gearSonicInitialPosition = F3.zero
+    private var gearSonicCourseCenter = F3(0, 0, 0.8)
+    private var gearSonicCourseDistance: Float = 4.5
+    private var gearSonicBundleDirectory: String?
+    private var gearSonicReferenceDirectory: String?
+    private var gearSonicReferenceDirectories: [String: String] = [:]
 
     var supportsGoalPlacement: Bool {
         isaacHumanoid?.usesPointGoal == true
@@ -145,9 +175,31 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     var isArachneTransforming: Bool {
         arachneRevealController != nil && !arachneFolded
     }
+    /// A learned actor is active, regardless of whether it came from native
+    /// training or an immutable external import.
     var usesCheckpoint: Bool { !robot.usesClassicalController }
+    var supportsLiveCheckpointLoading: Bool { robot.runtime == .nativeMLX }
+    var supportsGEARSonicReferenceSelection: Bool { robot == .gearSonicG1 }
+    var hasReplayScene: Bool { solver != nil }
     var controllerSectionTitle: String {
-        usesCheckpoint ? "Parallel training" : "Controller"
+        switch robot.runtime {
+        case .nativeMLX: return "Parallel training"
+        case .unitreeRecurrentMLX, .externalReferenceMLX:
+            return "Imported policy"
+        case .classicalController: return "Controller"
+        }
+    }
+    var replayControlExplanation: String {
+        switch robot.runtime {
+        case .nativeMLX:
+            return "Normal motion executes the learned Safetensors checkpoint used by `eval-rl`. Arachne transformation controls temporarily command a bounded commissioning trajectory through the same motors and physics; learned control resumes only after deployment settles."
+        case .unitreeRecurrentMLX:
+            return "This is a static, source-verified public recurrent policy imported to MLX. It is not connected to the native trainer or checkpoint hot-reload path."
+        case .externalReferenceMLX:
+            return "This is a static, source-verified GEAR-SONIC policy imported from ONNX to native MLX. The selected reference clip supplies commands; every rendered link still moves only through the policy, motors, and physical contacts."
+        case .classicalController:
+            return "This baseline contains no neural inference or checkpoint. Its motion is generated by the displayed CPG/IK controller through the exact same physical plant used by RL."
+        }
     }
     var goalControlExplanation: String {
         usesCheckpoint
@@ -157,14 +209,45 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     var goalDistanceRange: ClosedRange<Double> {
         arachne?.usesPointGoal == true ? 0.4...3.0 : 2...12
     }
+    var boxSpeedRange: ClosedRange<Double> {
+        switch robot {
+        case .arachne, .arachneGoal, .arachneClassical: return 0.5...4
+        default: return 2...10
+        }
+    }
+    var boxSpeedStep: Double {
+        switch robot {
+        case .arachne, .arachneGoal, .arachneClassical: return 0.25
+        default: return 0.5
+        }
+    }
     var supportsBoxThrows: Bool {
-        isaacHumanoid?.hasProjectile(environment: 0) == true
+        gearSonicG1 != nil
+            || unitreeH1 != nil
+            || isaacHumanoid?.hasProjectile(environment: 0) == true
+            || arachne?.environment.hasProjectile(environment: 0) == true
     }
     var impactModelSummary: String {
+        if let gearSonicG1 {
+            return String(
+                format: "%.1f kg box · all 29 G1 training colliders",
+                gearSonicG1.environment.configuration.projectileMass)
+        }
         if let isaacHumanoid, isaacHumanoid.hasProjectile(environment: 0) {
             return String(
                 format: "%.1f kg box · full imported H1 collision primitives",
                 isaacHumanoid.environment.projectileMass)
+        }
+        if let unitreeH1 {
+            return String(
+                format: "%.1f kg box · full source H1 collision plant",
+                unitreeH1.environment.projectileMass)
+        }
+        if let arachne,
+           arachne.environment.hasProjectile(environment: 0) {
+            return String(
+                format: "%.2f kg box · all 39 Arachne collision primitives",
+                arachne.environment.projectileMass)
         }
         return "no physical projectile in this checkpoint scene"
     }
@@ -172,10 +255,14 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         switch robot {
         case .unitreeH1:
             return "Unchanged public Unitree RL Gym H1 recurrent policy, imported from TorchScript to MLX and running on AVBD Metal physics."
+        case .gearSonicG1:
+            return "NVIDIA GEAR-SONIC's 29-DoF G1 reference-following policy, imported from ONNX to native batched MLX and replayed on its analytic training collision plant. Full walking and dance clips pass; high-dynamic clips remain development-qualified."
         case .humanoidIsaac:
             return "Replay the accepted H1 policy on the exact public Flat velocity task. Markers show the current command segment, not a point goal."
         case .humanoidIsaacGoal:
             return "Development H1 point-goal/8 kg impact policy on the current actuator contract (78.1% sealed-test goal success); PPO owns every joint action, but this policy is not acceptance-qualified yet."
+        case .humanoidBoxCarry:
+            return "Development H1 carry policy on the exact batched training scene. The current best checkpoint physically picks up the 2 kg box, carries it about 0.5 m to the receiving table, and remains stable through the 1,200-step horizon. Centering and release are not learned yet, so this replay is diagnostic rather than acceptance-qualified."
         case .arachne:
             return "Accepted Arachne-15 straight-walk benchmark at 0.15 m/s with the exact printable CAD visuals and corrected revision-6 foot collision model."
         case .arachneGoal:
@@ -186,9 +273,26 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     var solver: GPUSolver? {
+        if let gearSonicG1 { return gearSonicG1.environment.solver }
         if let unitreeH1 { return unitreeH1.environment.solver }
+        if let humanoidBoxCarry { return humanoidBoxCarry.environment.solver }
         if let isaacHumanoid { return isaacHumanoid.environment.solver }
         return arachne?.environment.solver
+    }
+
+    func selectGEARSonicReference(_ name: String) {
+        guard robot == .gearSonicG1,
+              name != selectedGEARSonicReference,
+              gearSonicReferenceDirectories[name] != nil else { return }
+        selectedGEARSonicReference = name
+        UserDefaults.standard.set(
+            name, forKey: "AVBDPolicyReplayGEARSonicReference")
+        rebuild()
+    }
+
+    func gearSonicReferenceDisplayName(_ name: String) -> String {
+        name.replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "  ", with: " ")
     }
 
     init() {
@@ -208,19 +312,39 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func rebuild() {
-        unitreeH1 = nil; isaacHumanoid = nil
+        unitreeH1 = nil; gearSonicG1 = nil; isaacHumanoid = nil
+        humanoidBoxCarry = nil
         arachne = nil
         arachneRevealController = nil
         arachneFolded = false
         arachneAutoUnfold = false
         task = nil; actionProvider = nil
+        gearSonicBundleDirectory = nil
+        gearSonicReferenceDirectory = nil
+        gearSonicReferenceDirectories = [:]
+        gearSonicReferenceNames = []
+        selectedGEARSonicReference = ""
         loadedCheckpointDirectory = nil; loadedUpdate = nil; newestUpdate = nil
         completed = 0; successes = 0; controlSteps = 0; accumulator = 0
         replaySeed = 21_001
+        scriptedBoxThrowPerformed = false
+        boxSpeed = switch robot {
+        case .arachne, .arachneGoal, .arachneClassical: 2.5
+        default: 6
+        }
         interactionStatus = ""
         episodeFinished = false
         running = true
         do {
+            if robot == .gearSonicG1 {
+                try installGEARSonicG1Replay()
+                updateCameraTargets()
+                applyCameraPreset()
+                cameraEpoch += 1
+                lastTime = CACurrentMediaTime()
+                refreshStats()
+                return
+            }
             if robot == .unitreeH1 {
                 try installUnitreeH1Replay()
                 updateCameraTargets()
@@ -233,6 +357,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let desiredTaskID = robot.taskID
             let checkpointRelativeDirectory: String
             if robot.usesClassicalController {
+                checkpointRelativeDirectory = desiredTaskID
+            } else if robot == .humanoidBoxCarry {
+                // Development-only local preview. It deliberately does not
+                // enter the curated replay catalog until an accepted policy
+                // and its machine-readable evidence are packaged.
                 checkpointRelativeDirectory = desiredTaskID
             } else {
                 guard let declared = PolicyReplayCatalog
@@ -271,8 +400,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 desiredTaskID,
                 configuration: RLTaskConfiguration(
                     numEnvironments: 1, seed: 21_001, autoReset: false,
+                    includeInteractiveRobustnessProbes: true,
                     options: replayOptions))
             isaacHumanoid = configuredTask as? HumanoidIsaacVelocityTask
+            humanoidBoxCarry = configuredTask as? HumanoidBoxCarryTask
             arachne = configuredTask as? Arachne15LocomotionTask
             task = configuredTask
             if robot.usesClassicalController {
@@ -362,6 +493,131 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             + String(session.policy.manifest.source.checkpointSHA256.prefix(12))
             + "…\n\(directory)"
         trainingStatus = "external pretrained policy · recurrent MLX inference"
+    }
+
+    private func installGEARSonicG1Replay() throws {
+        let environment = ProcessInfo.processInfo.environment
+        let overridePath = environment["AVBD_GEAR_SONIC_BUNDLE"]
+            ?? environment["AVBD_REPLAY_CHECKPOINT"]
+        let bundledPath = Bundle.main.resourceURL?
+            .appendingPathComponent(
+                "checkpoints/external/gear-sonic-g1").path
+        let candidates = [
+            overridePath, bundledPath,
+            "checkpoints/external/gear-sonic-g1",
+        ].compactMap { $0 }
+        guard let bundleDirectory = candidates.first(where: {
+            Self.isGEARSonicBundle(at: $0)
+        }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "imported GEAR-SONIC G1 bundle not found; run "
+                    + "Tools/import_gear_sonic_policy.py and "
+                    + "Tools/import_gear_sonic_g1_plant.py first")
+        }
+
+        var references: [String: String] = [:]
+        let referencesURL = URL(
+            fileURLWithPath: bundleDirectory, isDirectory: true)
+            .appendingPathComponent("references", isDirectory: true)
+        if let directories = try? FileManager.default.contentsOfDirectory(
+            at: referencesURL, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]) {
+            for directory in directories.sorted(by: {
+                $0.lastPathComponent < $1.lastPathComponent
+            }) where Self.isGEARSonicReference(at: directory.path) {
+                references[directory.lastPathComponent] = directory.path
+            }
+        }
+        if let exactReference = environment["AVBD_GEAR_SONIC_REFERENCE"],
+           Self.isGEARSonicReference(at: exactReference) {
+            let name = URL(
+                fileURLWithPath: exactReference,
+                isDirectory: true).lastPathComponent
+            references[name] = exactReference
+        }
+        gearSonicReferenceDirectories = references
+        gearSonicReferenceNames = references.keys.sorted()
+        guard !gearSonicReferenceNames.isEmpty else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "GEAR-SONIC bundle has no reference clips; install official "
+                    + "clip directories under " + bundleDirectory
+                    + "/references")
+        }
+
+        let requestedClip = environment["AVBD_GEAR_SONIC_CLIP"]
+        let persistedClip = UserDefaults.standard.string(
+            forKey: "AVBDPolicyReplayGEARSonicReference")
+        let preferredNames = [
+            requestedClip,
+            selectedGEARSonicReference.isEmpty
+                ? nil : selectedGEARSonicReference,
+            persistedClip,
+            "walking_quip_360_R_002__A428",
+            "dance_in_da_party_001__A464",
+            gearSonicReferenceNames.first,
+        ].compactMap { $0 }
+        guard let selected = preferredNames.first(where: {
+            references[$0] != nil
+        }), let referenceDirectory = references[selected] else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "GEAR-SONIC could not select an installed reference clip")
+        }
+
+        let session = try GEARSonicG1Session(
+            bundleDirectory: bundleDirectory,
+            referenceDirectory: referenceDirectory,
+            includeVisuals: true)
+        gearSonicG1 = session
+        gearSonicBundleDirectory = bundleDirectory
+        gearSonicReferenceDirectory = referenceDirectory
+        selectedGEARSonicReference = selected
+        UserDefaults.standard.set(
+            selected, forKey: "AVBDPolicyReplayGEARSonicReference")
+        let initialState = session.environment.states()[0]
+        gearSonicInitialPosition = initialState.root.position
+        let first = session.reference.bodyPositions[0]
+        let last = session.reference.bodyPositions[
+            session.reference.frameCount - 1]
+        let referenceDisplacement = F3(
+            Float(last[0] - first[0]), Float(last[1] - first[1]),
+            Float(last[2] - first[2]))
+        gearSonicCourseCenter = gearSonicInitialPosition
+            + 0.5 * referenceDisplacement + F3(0, 0, 0.12)
+        let planarDistance = simd_length(F3(
+            referenceDisplacement.x, referenceDisplacement.y, 0))
+        gearSonicCourseDistance = min(
+            max(4.5, 2 + 1.5 * planarDistance), 30)
+        controlSteps = 0
+        episodeFinished = false
+        running = true
+        let verification = session.policyVerification
+        policyStatus = "loaded GEAR-SONIC G1 · MLX/ONNX parity "
+            + (verification.passed ? "PASS" : "FAIL")
+            + String(format: " (token %.3g, action %.3g)\n",
+                     verification.maximumTokenError,
+                     verification.maximumActionError)
+            + String(session.policy.manifest.weightsSHA256.prefix(12))
+            + "… · " + bundleDirectory
+        trainingStatus = "static external policy · reference-conditioned "
+            + "native MLX inference\nclip " + selected + " · "
+            + String(session.reference.frameCount) + " frames at 50 Hz"
+    }
+
+    private static func isGEARSonicBundle(at directory: String) -> Bool {
+        ["manifest.json", "policy.safetensors", "plant.xml"].allSatisfy {
+            FileManager.default.fileExists(
+                atPath: URL(fileURLWithPath: directory, isDirectory: true)
+                    .appendingPathComponent($0).path)
+        }
+    }
+
+    private static func isGEARSonicReference(at directory: String) -> Bool {
+        ["joint_pos.csv", "joint_vel.csv", "body_pos.csv", "body_quat.csv"]
+            .allSatisfy {
+                FileManager.default.fileExists(
+                    atPath: URL(fileURLWithPath: directory, isDirectory: true)
+                        .appendingPathComponent($0).path)
+            }
     }
 
     /// Configure the simulator from the checkpoint's serialized task options
@@ -515,45 +771,49 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             interactionStatus = "this checkpoint scene has no projectile body"
             return
         }
-        let state = isaacHumanoid?.environment.states()[0]
-        guard let state else { return }
-        let forward: F3
-        if let isaacHumanoid, isaacHumanoid.usesPointGoal {
-            forward = isaacHumanoid.currentGoalDirection(environment: 0)
+        let launchedSide = nextProjectileSide
+        let mass: Float
+        if let gearSonicG1 {
+            gearSonicG1.environment.throwBoxes(
+                environmentIDs: [0], sideSigns: [launchedSide],
+                launchDistance: 1.2, speed: Float(boxSpeed))
+            mass = gearSonicG1.environment.configuration.projectileMass
+        } else if let unitreeH1 {
+            unitreeH1.environment.throwBoxes(
+                environmentIDs: [0], sideSigns: [launchedSide],
+                launchDistance: 1.2, speed: Float(boxSpeed))
+            mass = unitreeH1.environment.projectileMass
+        } else if let arachne,
+                  arachne.environment.hasProjectile(environment: 0) {
+            arachne.environment.throwBoxes(
+                environmentIDs: [0], sideSigns: [launchedSide],
+                launchDistance: 0.35, speed: Float(boxSpeed))
+            mass = arachne.environment.projectileMass
+        } else if let isaacHumanoid {
+            isaacHumanoid.throwRobustnessBoxes(
+                environmentIDs: [0], sideSigns: [launchedSide],
+                launchDistance: 1.2, speed: Float(boxSpeed))
+            mass = isaacHumanoid.environment.projectileMass
         } else {
-            forward = F3(1, 0, 0)
+            return
         }
-        let lateral = F3(-forward.y, forward.x, 0)
-        let target = state.torso.position
-        let launchDistance: Float = 1.2
-        let launch = target + lateral * (launchDistance * nextProjectileSide)
-            + forward * 0.15
-        let flightTime = launchDistance / Float(boxSpeed)
-        let gravityValue = isaacHumanoid?.environment.scene.settings.gravity
-            ?? -9.81
-        let gravity = F3(0, 0, gravityValue)
-        let predictedTarget = target + state.torso.linearVelocity * flightTime
-        let velocity = (predictedTarget - launch
-            - 0.5 * gravity * flightTime * flightTime) / flightTime
-        let angularVelocity = F3(
-            nextProjectileSide * 2.5, -nextProjectileSide * 1.5,
-            nextProjectileSide * 3.5)
-        isaacHumanoid?.environment.throwProjectiles(
-            environmentIDs: [0], positions: [launch],
-            velocities: [velocity], angularVelocities: [angularVelocity])
-        let side = nextProjectileSide > 0 ? "left" : "right"
-        let mass = isaacHumanoid?.environment.projectileMass ?? 0
+        let side = launchedSide > 0 ? "left" : "right"
         interactionStatus = String(
             format: "%.1f kg physical box thrown from robot's %@ at %.1f m/s",
             mass, side, boxSpeed)
         nextProjectileSide *= -1
+        // A throw while paused should visibly execute instead of leaving the
+        // box suspended until the separate Play control is pressed.
+        running = true
+        accumulator = 0
+        lastTime = CACurrentMediaTime()
     }
 
     /// Polling is intentionally snapshot based. The mutable run root is never
     /// opened while the trainer may be replacing its individual files.
     func pollForLatestCheckpoint(force: Bool = false) {
         refreshTrainingMetrics()
-        guard usesCheckpoint else { return }
+        guard supportsLiveCheckpointLoading else { return }
         guard let liveRunDirectory, let task else { return }
         guard let candidate = VectorPolicyCheckpointDiscovery
             .latestCompleteCheckpoint(
@@ -619,6 +879,29 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         arachneRevealController = nil
         arachneFolded = false
         arachneAutoUnfold = false
+        if robot == .gearSonicG1 {
+            guard let bundleDirectory = gearSonicBundleDirectory,
+                  let referenceDirectory = gearSonicReferenceDirectory else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "GEAR-SONIC bundle or reference directory is unavailable")
+            }
+            let session = try GEARSonicG1Session(
+                bundleDirectory: bundleDirectory,
+                referenceDirectory: referenceDirectory,
+                includeVisuals: true)
+            gearSonicG1 = session
+            gearSonicInitialPosition = session.environment.states()[0]
+                .root.position
+            completed = 0; successes = 0
+            controlSteps = 0; accumulator = 0
+            episodeFinished = false; running = true
+            updateCameraTargets()
+            applyCameraPreset()
+            cameraEpoch += 1
+            lastTime = CACurrentMediaTime()
+            refreshStats()
+            return
+        }
         if robot == .unitreeH1 {
             guard let loadedCheckpointDirectory else {
                 throw RLEnvironmentError.invalidConfiguration(
@@ -668,8 +951,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func refreshTrainingMetrics() {
-        if !usesCheckpoint {
+        if robot.usesClassicalController {
             trainingStatus = "deterministic classical controller · training not required"
+            return
+        }
+        guard supportsLiveCheckpointLoading else {
+            // Installation records the exact source/parity status. Timer-driven
+            // native trainer polling must not overwrite it with a generic label.
             return
         }
         guard let liveRunDirectory else {
@@ -700,6 +988,18 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func tickIfRunning() {
+        if !scriptedBoxThrowPerformed,
+           let scriptedBoxThrowStep,
+           scriptedBoxThrowStep >= 0,
+           controlSteps >= scriptedBoxThrowStep,
+           supportsBoxThrows {
+            scriptedBoxThrowPerformed = true
+            throwBox()
+        }
+        if gearSonicG1 != nil {
+            tickGEARSonicG1IfRunning()
+            return
+        }
         if unitreeH1 != nil {
             tickUnitreeH1IfRunning()
             return
@@ -776,6 +1076,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 }
                 let rootVelocityBeforeStep = isaacHumanoid?
                     .environment.states()[0].root.linearVelocity
+                    ?? arachne?.environment.states()[0].root.linearVelocity
                 guard let actionProvider else {
                     running = false
                     return
@@ -784,10 +1085,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     for: observation, task: task)
                 try task.step(actions: actions, into: &result)
                 try actionProvider.resetAfterStep(for: task, result: result)
-                if (result.metrics["state/projectile_robot_contact"]?[0] ?? 0) > 0,
-                   let before = rootVelocityBeforeStep {
+                let physicalBoxContact =
+                    isaacHumanoid?.environment.boxRobotContacts()[0] == true
+                    || arachne?.environment.boxRobotContacts()[0] == true
+                if physicalBoxContact, let before = rootVelocityBeforeStep {
                     let after = isaacHumanoid?
                         .environment.states()[0].root.linearVelocity
+                        ?? arachne?.environment.states()[0].root.linearVelocity
                         ?? before
                     interactionStatus = String(
                         format: "physical contact registered · root Δv %.3f m/s",
@@ -823,6 +1127,51 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         if controlSteps.isMultiple(of: 10) { refreshStats() }
     }
 
+    private func tickGEARSonicG1IfRunning() {
+        guard running, let session = gearSonicG1 else { return }
+        let now = CACurrentMediaTime()
+        let controlPeriod = Double(session.policy.manifest.control.periodSeconds)
+        let wallStep = controlPeriod / max(playbackRate, 0.1)
+        if frameLockedCapture {
+            accumulator = wallStep
+        } else {
+            accumulator += min(now - lastTime, 0.1)
+        }
+        lastTime = now
+        var ticks = 0
+        let maximumTicks = frameLockedCapture ? 1 : 3
+        while accumulator >= wallStep, ticks < maximumTicks {
+            do {
+                let rootVelocityBeforeStep = session.environment.states()[0]
+                    .root.linearVelocity
+                _ = try session.step()
+                if session.environment.boxRobotContacts()[0] {
+                    let after = session.environment.states()[0]
+                        .root.linearVelocity
+                    interactionStatus = String(
+                        format: "physical contact registered · root Δv %.3f m/s",
+                        simd_length(after - rootVelocityBeforeStep))
+                }
+                controlSteps = session.controlSteps
+                updateCameraTargets()
+                if session.completedReference {
+                    running = false
+                    episodeFinished = true
+                    completed = 1
+                    accumulator = 0
+                    refreshStats()
+                    break
+                }
+            } catch {
+                policyStatus = "step failed: " + error.localizedDescription
+                running = false
+            }
+            accumulator -= wallStep
+            ticks += 1
+        }
+        if controlSteps.isMultiple(of: 10) { refreshStats() }
+    }
+
     private func tickUnitreeH1IfRunning() {
         guard running, let session = unitreeH1 else { return }
         let now = CACurrentMediaTime()
@@ -837,7 +1186,15 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let maximumTicks = frameLockedCapture ? 1 : 3
         while accumulator >= wallStep, ticks < maximumTicks {
             do {
+                let rootVelocityBeforeStep = session.environment.state()
+                    .root.linearVelocity
                 _ = try session.step()
+                if session.environment.boxRobotContacts()[0] {
+                    let after = session.environment.state().root.linearVelocity
+                    interactionStatus = String(
+                        format: "physical contact registered · root Δv %.3f m/s",
+                        simd_length(after - rootVelocityBeforeStep))
+                }
                 controlSteps += 1
                 updateCameraTargets()
                 if controlSteps >= 500 {
@@ -866,8 +1223,15 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         // reset the 0.1-second catch-up allowance executes three control
         // transitions, making the button visibly skip frames.
         lastTime = CACurrentMediaTime()
-        let controlStep = robot == .unitreeH1
-            ? 0.02 : Double(task?.spec.controlStep ?? 1 / 30)
+        let controlStep: Double
+        if let gearSonicG1 {
+            controlStep = Double(
+                gearSonicG1.policy.manifest.control.periodSeconds)
+        } else if robot == .unitreeH1 {
+            controlStep = 0.02
+        } else {
+            controlStep = Double(task?.spec.controlStep ?? 1 / 30)
+        }
         accumulator = controlStep / max(playbackRate, 0.1)
         tickIfRunning()
         running = wasRunning
@@ -875,7 +1239,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func updateCameraTargets() {
-        if let unitreeH1 {
+        if let gearSonicG1 {
+            let state = gearSonicG1.environment.states()[0]
+            replayCameraTarget = state.root.position + F3(0.1, 0, 0.12)
+            courseCameraTarget = gearSonicCourseCenter
+        } else if let unitreeH1 {
             let state = unitreeH1.environment.state()
             replayCameraTarget = state.root.position + F3(0.15, 0, 0.15)
             courseCameraTarget = unitreeInitialPosition + F3(2, 0, 0.9)
@@ -886,6 +1254,15 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let projection = isaacHumanoid.currentCommandProjection(environment: 0)
             courseCameraTarget = 0.5 * (origin + projection)
                 + F3(0, 0, 0.9)
+        } else if let humanoidBoxCarry {
+            let state = humanoidBoxCarry.environment.states()[0]
+            let box = humanoidBoxCarry.environment.manipulationStates()[0]
+                .object.position
+            replayCameraTarget = 0.55 * state.root.position + 0.45 * box
+                + F3(0, 0, 0.10)
+            courseCameraTarget = 0.5 * (
+                box + humanoidBoxCarry.currentPlacementTarget(environment: 0))
+                + F3(0, 0, 0.20)
         } else if let arachne {
             let state = arachne.environment.states()[0]
             replayCameraTarget = state.root.position + F3(0.04, 0, 0.02)
@@ -919,18 +1296,76 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let selectedTarget = cameraMode == .follow
             ? replayCameraTarget : courseCameraTarget
         let isArachne = arachne != nil
+        let isBoxCarryCourse = cameraMode == .course
+            && humanoidBoxCarry != nil
         solver.settings.cameraDistance = cameraMode == .follow
-            ? (isArachne ? 0.65 : 3.2)
-            : (isArachne ? 1.5 : 15)
+            ? (isArachne ? 0.65 : (gearSonicG1 != nil ? 2.8 : 3.2))
+            : (isArachne ? 1.5
+                : (gearSonicG1 != nil ? gearSonicCourseDistance
+                    : (isBoxCarryCourse ? 4.2 : 15)))
         solver.settings.cameraTargetX = selectedTarget.x
         solver.settings.cameraTargetY = selectedTarget.y
         solver.settings.cameraTargetZ = selectedTarget.z
-        solver.settings.cameraAzimuth = -.pi / 2
-        solver.settings.cameraElevation = cameraMode == .follow ? 0.12 : 0.16
+        // The carry route turns from +X toward the H1's left (+Y). Looking
+        // exactly along Y makes the two tables overlap and falsely reads as a
+        // destination behind the source. An oblique course view exposes both
+        // axes while preserving the close side view used to judge contacts.
+        solver.settings.cameraAzimuth = isBoxCarryCourse
+            ? -3 * .pi / 4 : -.pi / 2
+        solver.settings.cameraElevation = isBoxCarryCourse
+            ? 0.22 : (cameraMode == .follow ? 0.12 : 0.16)
     }
 
     private func refreshStats() {
-        if let unitreeH1 {
+        if let gearSonicG1 {
+            let state = gearSonicG1.environment.states()[0]
+            let report = gearSonicG1.report()
+            let actual = state.root.position - gearSonicInitialPosition
+            let referenceIndex = max(0, min(
+                gearSonicG1.controlSteps - 1,
+                gearSonicG1.reference.frameCount - 1))
+            let initialReference = gearSonicG1.reference.bodyPositions[0]
+            let currentReference = gearSonicG1.reference.bodyPositions[
+                referenceIndex]
+            let reference = F3(
+                Float(currentReference[0] - initialReference[0]),
+                Float(currentReference[1] - initialReference[1]),
+                Float(currentReference[2] - initialReference[2]))
+            let upright = state.root.rotation.act(F3(0, 0, 1)).z
+            let totalTime = Float(gearSonicG1.reference.frameCount)
+                * gearSonicG1.policy.manifest.control.periodSeconds
+            let outcome: String
+            if let fall = report.firstFallStep {
+                outcome = "FALL RECORDED @ " + String(fall)
+            } else if gearSonicG1.completedReference {
+                outcome = "FULL CLIP COMPLETE"
+            } else {
+                outcome = "tracking"
+            }
+            statsText = String(
+                format: "clip %@\n"
+                    + "root Δ actual (%+.3f, %+.3f) / reference (%+.3f, %+.3f) m\n"
+                    + "joint error mean %.4f rad   max %.4f rad\n"
+                    + "14-link error mean %.4f m   max %.4f m\n"
+                    + "source eval height %.4f/%.2f m   rotation %.4f/%.2f rad   %@\n"
+                    + "height %.3f / min %.3f m   upright %.3f / min %.3f\n"
+                    + "frame %d/%d   time %.2f/%.2f s   %@",
+                gearSonicReferenceDisplayName(gearSonicG1.referenceName),
+                actual.x, actual.y, reference.x, reference.y,
+                report.meanJointTrackingErrorRadians,
+                report.maximumJointTrackingErrorRadians,
+                report.meanRootRelativeBodyTrackingErrorMeters,
+                report.maximumRootRelativeBodyTrackingErrorMeters,
+                report.maximumSourceCriterionHeightErrorMeters,
+                report.sourceHeightFailureThresholdMeters,
+                report.maximumRootOrientationErrorRadians,
+                report.sourceOrientationFailureThresholdRadians,
+                report.sourceCriteriaPassed ? "PASS" : "FAIL",
+                state.root.position.z, report.minimumRootHeightMeters,
+                upright, report.minimumUprightAlignment,
+                gearSonicG1.controlSteps, gearSonicG1.reference.frameCount,
+                gearSonicG1.elapsedTime, totalTime, outcome)
+        } else if let unitreeH1 {
             let state = unitreeH1.environment.state()
             let displacement = state.root.position - unitreeInitialPosition
             let duration = max(Float(controlSteps) * 0.02, 0.02)
@@ -986,6 +1421,52 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                     controlSteps, arachne.spec.maxEpisodeSteps,
                     completed, successes)
             }
+        } else if let humanoidBoxCarry {
+            let state = humanoidBoxCarry.environment.states()[0]
+            let box = humanoidBoxCarry.environment.manipulationStates()[0]
+                .object
+            let left = result?.metrics["state/left_hand_contact"]?[0] ?? 0
+            let right = result?.metrics["state/right_hand_contact"]?[0] ?? 0
+            let clearance = result?.metrics["state/box_clearance_m"]?[0] ?? 0
+            let carry = result?.metrics["state/carry_distance_m"]?[0] ?? 0
+            let pedestal = result?.metrics[
+                "state/box_pedestal_contact"]?[0] ?? 1
+            let destination = result?.metrics[
+                "state/box_destination_contact"]?[0] ?? 0
+            let placement = result?.metrics[
+                "state/placement_distance_m"]?[0] ?? .nan
+            let released = result?.metrics["state/released"]?[0] ?? 0
+            let stableUnsupported = result?.metrics[
+                "state/stable_unsupported_steps"]?[0] ?? 0
+            let handoff = result?.metrics[
+                "state/carry_handoff_progress"]?[0] ?? 0
+            let command = result?.metrics[
+                "state/carry_command_progress"]?[0] ?? 0
+            let outcome: String
+            if !episodeFinished {
+                outcome = "running"
+            } else if successes > 0 {
+                outcome = "SUCCESS"
+            } else if result?.truncated[0] == true {
+                outcome = destination > 0.5
+                    ? "DESTINATION REACHED · RELEASE INCOMPLETE"
+                    : "HORIZON · INCOMPLETE"
+            } else {
+                outcome = "TERMINATED / FAILURE"
+            }
+            statsText = String(
+                format: "box clearance %+.1f mm   carry %.3f m   goal error %.3f m\n"
+                    + "support %@   physical hands %.0f/%.0f   released %@\n"
+                    + "unsupported hold %.0f frames   handoff %.0f%%   walk command %.0f%%\n"
+                    + "root x %+.3f m   box x %+.3f m   box z %.3f m\n"
+                    + "frame %d/%d   %@",
+                clearance * 1_000, carry, placement,
+                destination > 0.5 ? "DESTINATION"
+                    : (pedestal > 0.5 ? "SOURCE" : "AIR"),
+                left, right, released > 0.5 ? "YES" : "NO",
+                stableUnsupported, handoff * 100, command * 100,
+                state.root.position.x, box.position.x, box.position.z,
+                controlSteps, humanoidBoxCarry.spec.maxEpisodeSteps, outcome)
         } else if let isaacHumanoid {
             let state = isaacHumanoid.environment.states()[0]
             let command = isaacHumanoid.currentCommand(environment: 0)
@@ -1040,7 +1521,28 @@ struct PolicyReplayLabView: View {
 
     var body: some View {
         HSplitView {
-            PolicyReplayMetalView(model: model).frame(minWidth: 650)
+            ZStack {
+                PolicyReplayMetalView(model: model)
+                if !model.hasReplayScene {
+                    Color(nsColor: .windowBackgroundColor)
+                    VStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 32))
+                            .foregroundStyle(.secondary)
+                        Text("Replay unavailable").font(.headline)
+                        Text(model.policyStatus.isEmpty
+                            ? "No physical replay scene is loaded."
+                            : model.policyStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 440)
+                    }
+                    .padding(24)
+                }
+            }
+            .frame(minWidth: 650)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("Policy Replay").font(.title2).bold()
@@ -1053,6 +1555,27 @@ struct PolicyReplayLabView: View {
                         }
                     }
                     .pickerStyle(.menu)
+                    if model.supportsGEARSonicReferenceSelection {
+                        Picker("Reference clip", selection: Binding(
+                            get: { model.selectedGEARSonicReference },
+                            set: { model.selectGEARSonicReference($0) }
+                        )) {
+                            if model.gearSonicReferenceNames.isEmpty {
+                                Text("No installed clips").tag("")
+                            } else {
+                                ForEach(model.gearSonicReferenceNames, id: \.self) {
+                                    Text(model.gearSonicReferenceDisplayName($0))
+                                        .tag($0)
+                                }
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .disabled(model.gearSonicReferenceNames.isEmpty)
+                        Text("Each entry is a complete official reference sequence. Replay runs to that clip's real final frame unless paused.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     HStack {
                         Button(model.episodeFinished ? "Replay" : (model.running ? "Pause" : "Play")) {
                             model.togglePlayback()
@@ -1062,14 +1585,16 @@ struct PolicyReplayLabView: View {
                             .disabled(model.episodeFinished
                                 || model.hasArachneTransformation)
                         Button("Reset") { model.resetEpisode() }
-                        Button("Load Latest") {
-                            model.pollForLatestCheckpoint(force: true)
+                        if model.supportsLiveCheckpointLoading {
+                            Button("Load Latest") {
+                                model.pollForLatestCheckpoint(force: true)
+                            }
                         }
-                        .disabled(!model.usesCheckpoint)
                     }
-                    Toggle("Auto-load complete checkpoints",
-                           isOn: $model.autoLoadLatest)
-                        .disabled(!model.usesCheckpoint)
+                    if model.supportsLiveCheckpointLoading {
+                        Toggle("Auto-load complete checkpoints",
+                               isOn: $model.autoLoadLatest)
+                    }
                     Picker("Camera", selection: $model.cameraMode) {
                         ForEach(PolicyReplayModel.CameraMode.allCases, id: \.self) {
                             Text($0.rawValue).tag($0)
@@ -1130,29 +1655,33 @@ struct PolicyReplayLabView: View {
                         Text(model.goalControlExplanation)
                             .font(.caption2).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        Divider()
-                        Text("Impact test").font(.headline)
-                        Text(model.impactModelSummary)
+                    }
+                    Divider()
+                    Text("Impact test").font(.headline)
+                    Text(model.impactModelSummary)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text("Speed").font(.caption)
+                            .frame(width: 50, alignment: .leading)
+                        Slider(value: $model.boxSpeed,
+                               in: model.boxSpeedRange,
+                               step: model.boxSpeedStep)
+                        Text(String(format: "%.1f", model.boxSpeed))
+                            .font(.caption.monospacedDigit()).frame(width: 42)
+                    }
+                    Button("Throw Physical Box") { model.throwBox() }
+                        .disabled(!model.supportsBoxThrows || model.episodeFinished)
+                    if !model.supportsBoxThrows {
+                        Text("This replay plant does not yet expose a reusable physical projectile.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if !model.interactionStatus.isEmpty {
+                        Text(model.interactionStatus)
                             .font(.caption2.monospaced())
                             .foregroundStyle(.secondary)
-                        HStack {
-                            Text("Speed").font(.caption).frame(width: 50, alignment: .leading)
-                            Slider(value: $model.boxSpeed, in: 2...10, step: 0.5)
-                            Text(String(format: "%.1f", model.boxSpeed))
-                                .font(.caption.monospacedDigit()).frame(width: 42)
-                        }
-                        Button("Throw Physical Box") { model.throwBox() }
-                            .disabled(!model.supportsBoxThrows || model.episodeFinished)
-                        if !model.supportsBoxThrows {
-                            Text("Load a goal checkpoint trained with projectiles to enable its colliding box body.")
-                                .font(.caption2).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if !model.interactionStatus.isEmpty {
-                            Text(model.interactionStatus)
-                                .font(.caption2.monospaced()).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Divider()
                     Text(model.controllerSectionTitle).font(.headline)
@@ -1169,9 +1698,7 @@ struct PolicyReplayLabView: View {
                     Text("Drag to orbit, right-drag to pan, and scroll to zoom. Follow Robot keeps footfalls large enough to inspect; Show Course keeps the route in view.")
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(model.usesCheckpoint
-                        ? "Normal motion executes the learned Safetensors checkpoint used by `eval-rl`. The Fold and Unfold & Walk controls temporarily command a bounded commissioning trajectory through the same motors and physics; learned control resumes only after deployment settles."
-                        : "This baseline contains no neural inference or checkpoint. Its motion is generated by the displayed CPG/IK controller through the exact same physical plant used by RL.")
+                    Text(model.replayControlExplanation)
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1179,6 +1706,7 @@ struct PolicyReplayLabView: View {
             }
             .frame(minWidth: 520, idealWidth: 600, maxWidth: 720)
         }
+        .frame(minWidth: 1200)
         .onReceive(checkpointTimer) { _ in
             model.pollForLatestCheckpoint()
         }
@@ -1209,14 +1737,16 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
         guard let renderer = context.coordinator.renderer else { return }
         if context.coordinator.cameraMode != model.cameraMode {
             context.coordinator.cameraMode = model.cameraMode
-            renderer.azimuth = -.pi / 2
-            renderer.elevation = model.cameraMode == .follow ? 0.12 : 0.16
+            renderer.azimuth = model.solver?.settings.cameraAzimuth ?? -.pi / 2
+            renderer.elevation = model.solver?.settings.cameraElevation
+                ?? (model.cameraMode == .follow ? 0.12 : 0.16)
             let isArachne = model.robot == .arachne
                 || model.robot == .arachneGoal
                 || model.robot == .arachneClassical
-            renderer.distance = model.cameraMode == .follow
-                ? (isArachne ? 0.65 : 3.2)
-                : (isArachne ? 1.5 : 15)
+            renderer.distance = model.solver?.settings.cameraDistance
+                ?? (model.cameraMode == .follow
+                    ? (isArachne ? 0.65 : 3.2)
+                    : (isArachne ? 1.5 : 15))
         }
         renderer.target = model.cameraMode == .follow
             ? model.replayCameraTarget : model.courseCameraTarget

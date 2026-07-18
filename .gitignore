@@ -1,5 +1,6 @@
 refs/
 .build/
+.swiftpm/
 .xcbuild/
 .xcbuild-ios/
 runs/

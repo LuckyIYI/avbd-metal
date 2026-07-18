@@ -94,6 +94,31 @@ public struct VectorPPOConfig: Codable, Sendable {
     /// a checkpointed exploration-to-consolidation curriculum without
     /// modifying task rewards or policy actions.
     public var maximumActionStd: Float?
+    /// Optional final exploration standard deviation for a checkpointed,
+    /// deterministic curriculum. When all three annealing fields are set, PPO
+    /// uses `initialActionStd` through `actionStdAnnealStartUpdate`, then
+    /// interpolates exponentially to this value at
+    /// `actionStdAnnealEndUpdate` and holds it there. The same effective value
+    /// is used by rollout sampling, likelihoods, KL, and reported metrics.
+    public var finalActionStd: Float?
+    public var actionStdAnnealStartUpdate: Int?
+    public var actionStdAnnealEndUpdate: Int?
+    /// Versioned rollout semantics for routed/frozen actors. Version 2 masks
+    /// exploration out of dimensions controlled exclusively by frozen
+    /// branches. Version 3 also scales each dimension's Gaussian by its
+    /// trainable routed contribution and uses that exact standard deviation
+    /// in sampling, likelihoods, entropy, and KL. Version 4 excludes exactly
+    /// frozen (Dirac) action dimensions from joint likelihoods, entropy, and
+    /// KL so a shared learned standard deviation cannot create enormous PPO
+    /// ratios through actuators whose policy mean and noise are both frozen.
+    /// Optional so historical
+    /// metadata decodes as version 1 and is rejected for exact resume rather
+    /// than silently changing trajectory.
+    public var routedExplorationMaskVersion: Int?
+    /// Versioned task-curriculum clock semantics. Version 2 advances every
+    /// `TrainingModeConfigurable` task after each completed rollout batch;
+    /// historical version 1 only initialized progress at process start.
+    public var trainingProgressUpdateVersion: Int?
     /// Optional policy/normalizer checkpoint used to initialize a fresh run.
     /// Unlike `resume`, this intentionally resets update counters, Adam
     /// moments, and the KL scheduler, and permits a task revision change when
@@ -106,6 +131,12 @@ public struct VectorPPOConfig: Codable, Sendable {
     /// useful for independently training approach, recovery, or precision
     /// specialists and composing them without task-specific trainer code.
     public var policyExpertInitializationCheckpoint: String?
+    /// Optional checkpoint supplying its already-routed policy-expert branch
+    /// as the destination routed branch. Unlike
+    /// `policyExpertInitializationCheckpoint`, this preserves a specialist
+    /// that was trained inside a multi-expert policy instead of copying that
+    /// checkpoint's base actor.
+    public var policyExpertBranchInitializationCheckpoint: String?
     /// Optional checkpoint supplying only the exact-stand actor branch during
     /// an explicit policy transfer. The source actor's first layer is
     /// reparameterized from its observation normalizer into the destination
@@ -132,6 +163,18 @@ public struct VectorPPOConfig: Codable, Sendable {
     /// Optional actor-mean regression on transitions from successful episodes
     /// in the current rollout. Failed and timed-out behavior has zero weight.
     public var successImitationCoefficient: Float?
+    /// Optional bounded replay of successful actor transitions across PPO
+    /// updates. Zero/nil preserves rollout-local self-imitation. Replay stores
+    /// only observations, sampled actions, and generic policy-routing gates.
+    public var successReplayCapacity: Int?
+    /// Number of replay rows sampled per PPO minibatch. Must be positive when
+    /// replay is enabled and no larger than `successReplayCapacity`.
+    public var successReplayBatchSize: Int?
+    /// Maximum recent causal window retained when a success or task-certified
+    /// imitation milestone occurs. Nil preserves full-episode behavior within
+    /// the current rollout; a positive bound prevents long settle/approach
+    /// prefixes from overwhelming the rare actions that produced the milestone.
+    public var successImitationHistorySteps: Int?
     /// Actor-mean regression toward the immutable policy present immediately
     /// after `initializationCheckpoint` transfer. Tasks may provide a
     /// per-transition mask to relax retention in an adaptation regime. Nil or
@@ -165,13 +208,22 @@ public struct VectorPPOConfig: Codable, Sendable {
                 initialActionStd: Float = 1.0,
                 minimumActionStd: Float? = nil,
                 maximumActionStd: Float? = nil,
+                finalActionStd: Float? = nil,
+                actionStdAnnealStartUpdate: Int? = nil,
+                actionStdAnnealEndUpdate: Int? = nil,
+                routedExplorationMaskVersion: Int? = 4,
+                trainingProgressUpdateVersion: Int? = 2,
                 initializationCheckpoint: String? = nil,
                 policyExpertInitializationCheckpoint: String? = nil,
+                policyExpertBranchInitializationCheckpoint: String? = nil,
                 standExpertInitializationCheckpoint: String? = nil,
                 initializationNormalizerPriorCount: Double? = nil,
                 useTaskSymmetryAugmentation: Bool? = true,
                 symmetryMirrorLossCoefficient: Float? = 0.01,
                 successImitationCoefficient: Float? = nil,
+                successReplayCapacity: Int? = nil,
+                successReplayBatchSize: Int? = nil,
+                successImitationHistorySteps: Int? = nil,
                 referencePolicyCoefficient: Float? = nil,
                 normalizeObservations: Bool = true,
                 updateObservationNormalizer: Bool? = true,
@@ -202,9 +254,16 @@ public struct VectorPPOConfig: Codable, Sendable {
         self.initialActionStd = initialActionStd
         self.minimumActionStd = minimumActionStd
         self.maximumActionStd = maximumActionStd
+        self.finalActionStd = finalActionStd
+        self.actionStdAnnealStartUpdate = actionStdAnnealStartUpdate
+        self.actionStdAnnealEndUpdate = actionStdAnnealEndUpdate
+        self.routedExplorationMaskVersion = routedExplorationMaskVersion
+        self.trainingProgressUpdateVersion = trainingProgressUpdateVersion
         self.initializationCheckpoint = initializationCheckpoint
         self.policyExpertInitializationCheckpoint =
             policyExpertInitializationCheckpoint
+        self.policyExpertBranchInitializationCheckpoint =
+            policyExpertBranchInitializationCheckpoint
         self.standExpertInitializationCheckpoint =
             standExpertInitializationCheckpoint
         self.initializationNormalizerPriorCount =
@@ -212,6 +271,9 @@ public struct VectorPPOConfig: Codable, Sendable {
         self.useTaskSymmetryAugmentation = useTaskSymmetryAugmentation
         self.symmetryMirrorLossCoefficient = symmetryMirrorLossCoefficient
         self.successImitationCoefficient = successImitationCoefficient
+        self.successReplayCapacity = successReplayCapacity
+        self.successReplayBatchSize = successReplayBatchSize
+        self.successImitationHistorySteps = successImitationHistorySteps
         self.referencePolicyCoefficient = referencePolicyCoefficient
         self.normalizeObservations = normalizeObservations
         self.updateObservationNormalizer = updateObservationNormalizer
@@ -226,6 +288,12 @@ public struct VectorPPOConfig: Codable, Sendable {
         guard minibatchSize > 0, minibatchSize <= batchSize else {
             throw RLEnvironmentError.invalidConfiguration(
                 "PPO minibatch must be in 1...rollout batch (\(batchSize))")
+        }
+        guard batchSize.isMultiple(of: minibatchSize) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO rollout batch must be divisible by minibatch size so "
+                    + "behavior and update inference use one stable Metal "
+                    + "matrix shape")
         }
         guard learningRate > 0, resolvedOptimizerEpsilon > 0,
               resolvedOptimizerEpsilon.isFinite, gamma > 0, gamma <= 1,
@@ -268,6 +336,36 @@ public struct VectorPPOConfig: Codable, Sendable {
                     "maximum PPO action standard deviation must be in (0, e]")
             }
         }
+        let annealingFieldsPresent = [
+            finalActionStd != nil,
+            actionStdAnnealStartUpdate != nil,
+            actionStdAnnealEndUpdate != nil,
+        ]
+        if annealingFieldsPresent.contains(true) {
+            guard annealingFieldsPresent.allSatisfy({ $0 }),
+                  let finalActionStd,
+                  let actionStdAnnealStartUpdate,
+                  let actionStdAnnealEndUpdate,
+                  finalActionStd > 0,
+                  finalActionStd <= exp(Float(1)),
+                  actionStdAnnealStartUpdate >= 0,
+                  actionStdAnnealEndUpdate > actionStdAnnealStartUpdate,
+                  minimumActionStd == nil,
+                  maximumActionStd == nil else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "action-std annealing requires a valid final std, a "
+                        + "non-negative start before its end, and no fixed "
+                        + "minimum/maximum std bounds")
+            }
+        }
+        guard (1...4).contains(resolvedRoutedExplorationMaskVersion) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "unsupported routed exploration-mask version")
+        }
+        guard (1...2).contains(resolvedTrainingProgressUpdateVersion) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "unsupported task training-progress update version")
+        }
         if let symmetryMirrorLossCoefficient {
             guard symmetryMirrorLossCoefficient >= 0,
                   symmetryMirrorLossCoefficient.isFinite else {
@@ -281,6 +379,32 @@ public struct VectorPPOConfig: Codable, Sendable {
                 throw RLEnvironmentError.invalidConfiguration(
                     "success-imitation coefficient must be finite and non-negative")
             }
+        }
+        let replayCapacity = successReplayCapacity ?? 0
+        let replayBatchSize = successReplayBatchSize ?? 0
+        guard replayCapacity >= 0, replayBatchSize >= 0,
+              (replayCapacity == 0 && replayBatchSize == 0)
+                || (replayCapacity > 0 && replayBatchSize > 0
+                    && replayBatchSize <= replayCapacity) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success replay requires 0/0 or a positive batch no larger "
+                    + "than its capacity")
+        }
+        if replayCapacity > 0
+            && (successImitationCoefficient ?? 0) <= 0 {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success replay requires a positive imitation coefficient")
+        }
+        if replayCapacity > 0, normalizeObservations,
+           updateObservationNormalizer != false {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success replay requires raw observations or a frozen "
+                    + "observation normalizer")
+        }
+        if let successImitationHistorySteps,
+           successImitationHistorySteps <= 0 {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success-imitation history must be positive when specified")
         }
         if let referencePolicyCoefficient {
             guard referencePolicyCoefficient >= 0,
@@ -301,10 +425,16 @@ public struct VectorPPOConfig: Codable, Sendable {
                 "initialization normalizer prior count must be finite and at least 2")
         }
         if (policyExpertInitializationCheckpoint != nil
+            || policyExpertBranchInitializationCheckpoint != nil
             || standExpertInitializationCheckpoint != nil),
            initializationCheckpoint == nil {
             throw RLEnvironmentError.invalidConfiguration(
                 "expert composition requires an initialization checkpoint")
+        }
+        if policyExpertInitializationCheckpoint != nil,
+           policyExpertBranchInitializationCheckpoint != nil {
+            throw RLEnvironmentError.invalidConfiguration(
+                "base-to-expert and routed-branch composition are mutually exclusive")
         }
     }
 
@@ -358,6 +488,18 @@ public struct VectorPPOConfig: Codable, Sendable {
                 checkpoint.minimumActionStd)
         require("maximumActionStd", maximumActionStd,
                 checkpoint.maximumActionStd)
+        require("finalActionStd", finalActionStd,
+                checkpoint.finalActionStd)
+        require("actionStdAnnealStartUpdate", actionStdAnnealStartUpdate,
+                checkpoint.actionStdAnnealStartUpdate)
+        require("actionStdAnnealEndUpdate", actionStdAnnealEndUpdate,
+                checkpoint.actionStdAnnealEndUpdate)
+        require("routedExplorationMaskVersion",
+                resolvedRoutedExplorationMaskVersion,
+                checkpoint.resolvedRoutedExplorationMaskVersion)
+        require("trainingProgressUpdateVersion",
+                resolvedTrainingProgressUpdateVersion,
+                checkpoint.resolvedTrainingProgressUpdateVersion)
         require("useTaskSymmetryAugmentation",
                 useTaskSymmetryAugmentation != false,
                 checkpoint.useTaskSymmetryAugmentation != false)
@@ -367,6 +509,12 @@ public struct VectorPPOConfig: Codable, Sendable {
         require("successImitationCoefficient",
                 successImitationCoefficient ?? 0,
                 checkpoint.successImitationCoefficient ?? 0)
+        require("successReplayCapacity", successReplayCapacity ?? 0,
+                checkpoint.successReplayCapacity ?? 0)
+        require("successReplayBatchSize", successReplayBatchSize ?? 0,
+                checkpoint.successReplayBatchSize ?? 0)
+        require("successImitationHistorySteps", successImitationHistorySteps,
+                checkpoint.successImitationHistorySteps)
         require("referencePolicyCoefficient",
                 referencePolicyCoefficient ?? 0,
                 checkpoint.referencePolicyCoefficient ?? 0)
@@ -382,6 +530,33 @@ public struct VectorPPOConfig: Codable, Sendable {
         return fields
     }
 
+    /// Log-space bounds for the exact distribution used by one update. A
+    /// fixed equal bound makes annealing independent of the learned log-std
+    /// parameter and therefore exactly reproducible across stop/resume.
+    func actionLogStandardDeviationBounds(
+        completedUpdate: Int
+    ) -> (minimum: Float, maximum: Float) {
+        if let finalActionStd,
+           let start = actionStdAnnealStartUpdate,
+           let end = actionStdAnnealEndUpdate {
+            let progress = min(max(
+                Float(completedUpdate - start) / Float(end - start), 0), 1)
+            let value = log(initialActionStd)
+                + progress * (log(finalActionStd) - log(initialActionStd))
+            return (value, value)
+        }
+        return (minimumActionStd.map(log) ?? -5,
+                maximumActionStd.map(log) ?? 1)
+    }
+
+    var resolvedRoutedExplorationMaskVersion: Int {
+        routedExplorationMaskVersion ?? 1
+    }
+
+    var resolvedTrainingProgressUpdateVersion: Int {
+        trainingProgressUpdateVersion ?? 1
+    }
+
     /// A resume command deliberately omits initialization checkpoints: those
     /// are transfer operations and cannot be performed again while restoring
     /// Adam. They are nevertheless immutable experiment provenance. Carry the
@@ -392,6 +567,8 @@ public struct VectorPPOConfig: Codable, Sendable {
         persisted.initializationCheckpoint = checkpoint.initializationCheckpoint
         persisted.policyExpertInitializationCheckpoint =
             checkpoint.policyExpertInitializationCheckpoint
+        persisted.policyExpertBranchInitializationCheckpoint =
+            checkpoint.policyExpertBranchInitializationCheckpoint
         persisted.standExpertInitializationCheckpoint =
             checkpoint.standExpertInitializationCheckpoint
         return persisted
@@ -573,6 +750,10 @@ public final class VectorActorCritic: Module {
     @ModuleInfo var standActor2: Linear
     @ModuleInfo var standActor3: Linear
     @ModuleInfo var standActorOutput: Linear
+    @ModuleInfo var auxiliaryActor1: Linear
+    @ModuleInfo var auxiliaryActor2: Linear
+    @ModuleInfo var auxiliaryActor3: Linear
+    @ModuleInfo var auxiliaryActorOutput: Linear
     @ModuleInfo var critic1: Linear
     @ModuleInfo var critic2: Linear
     @ModuleInfo var critic3: Linear
@@ -581,11 +762,11 @@ public final class VectorActorCritic: Module {
 
     public let actionDimension: Int
     public let activation: PPOActivation
-    // Version 5 adds an independent task-routed stand expert. Versions 3 and
-    // 4 remain inference/transfer compatible: the loader clones an existing
-    // actor into every missing branch, so expansion is behavior-identical.
-    public static let architectureVersion = 5
-    public static let compatibleArchitectureVersions: Set<Int> = [3, 4, 5]
+    // Version 6 adds a fourth, independently routed actor. Earlier versions
+    // remain inference/transfer compatible: the loader clones the verified
+    // base actor into the missing branch, so expansion is behavior-identical.
+    public static let architectureVersion = 6
+    public static let compatibleArchitectureVersions: Set<Int> = [3, 4, 5, 6]
 
     public init(observationDimension: Int, actionDimension: Int,
                 hiddenSize: Int = 512, hiddenDimensions: [Int]? = nil,
@@ -633,6 +814,10 @@ public final class VectorActorCritic: Module {
             standActor2 = Self.clonedLinear(initializedActor2)
             standActor3 = Self.clonedLinear(initializedActor3)
             standActorOutput = Self.clonedLinear(initializedActorOutput)
+            auxiliaryActor1 = Self.clonedLinear(initializedActor1)
+            auxiliaryActor2 = Self.clonedLinear(initializedActor2)
+            auxiliaryActor3 = Self.clonedLinear(initializedActor3)
+            auxiliaryActorOutput = Self.clonedLinear(initializedActorOutput)
             critic1 = Self.orthogonalLinear(
                 input: observationDimension, output: firstSize,
                 gain: sqrt(2), rng: &rng)
@@ -663,6 +848,12 @@ public final class VectorActorCritic: Module {
             standActorOutput = Linear(
                 weight: MLXArray.zeros([actionDimension, finalSize]),
                 bias: MLXArray.zeros([actionDimension]))
+            auxiliaryActor1 = Linear(observationDimension, firstSize)
+            auxiliaryActor2 = Linear(firstSize, middleSize)
+            auxiliaryActor3 = Linear(middleSize, finalSize)
+            auxiliaryActorOutput = Linear(
+                weight: MLXArray.zeros([actionDimension, finalSize]),
+                bias: MLXArray.zeros([actionDimension]))
             critic1 = Linear(observationDimension, firstSize)
             critic2 = Linear(firstSize, middleSize)
             critic3 = Linear(middleSize, finalSize)
@@ -675,9 +866,15 @@ public final class VectorActorCritic: Module {
 
     public func forward(_ observations: MLXArray,
                         expertGate: MLXArray? = nil,
+                        expertActionMask: MLXArray? = nil,
                         standExpertGate: MLXArray? = nil,
+                        standExpertActionMask: MLXArray? = nil,
+                        auxiliaryExpertGate: MLXArray? = nil,
+                        auxiliaryExpertActionMask: MLXArray? = nil,
                         freezeBaseActor: Bool = false,
-                        freezeExpertActor: Bool = false)
+                        freezeExpertActor: Bool = false,
+                        freezeStandActor: Bool = false,
+                        freezeAuxiliaryActor: Bool = false)
         -> (mean: MLXArray, value: MLXArray, logStandardDeviation: MLXArray) {
         var baseMean = actorOutput(activate(actor3(activate(
             actor2(activate(actor1(observations)))))))
@@ -685,13 +882,31 @@ public final class VectorActorCritic: Module {
         var expertMean = expertActorOutput(activate(expertActor3(
             activate(expertActor2(activate(expertActor1(observations)))))))
         if freezeExpertActor { expertMean = stopGradient(expertMean) }
-        let standMean = standActorOutput(activate(standActor3(
+        var standMean = standActorOutput(activate(standActor3(
             activate(standActor2(activate(standActor1(observations)))))))
+        if freezeStandActor { standMean = stopGradient(standMean) }
+        var auxiliaryMean = auxiliaryActorOutput(activate(auxiliaryActor3(
+            activate(auxiliaryActor2(activate(auxiliaryActor1(observations)))))))
+        if freezeAuxiliaryActor { auxiliaryMean = stopGradient(auxiliaryMean) }
         let expert = expertGate ?? MLXArray.zeros([observations.shape[0], 1])
         let stand = standExpertGate
             ?? MLXArray.zeros([observations.shape[0], 1])
-        let mean = (1 - expert - stand) * baseMean
-            + expert * expertMean + stand * standMean
+        let auxiliary = auxiliaryExpertGate
+            ?? MLXArray.zeros([observations.shape[0], 1])
+        // A task may route only selected action dimensions through the third
+        // expert. The remaining dimensions stay on the verified base actor,
+        // enabling compositional policies such as base locomotion plus learned
+        // upper-body manipulation. A nil mask preserves historical whole-row
+        // routing exactly.
+        let expertActionGate = expertActionMask.map { expert * $0 } ?? expert
+        let standActionGate = standExpertActionMask.map { stand * $0 } ?? stand
+        let auxiliaryActionGate = auxiliaryExpertActionMask.map {
+            auxiliary * $0
+        } ?? auxiliary
+        let mean = (1 - expertActionGate - standActionGate
+            - auxiliaryActionGate) * baseMean
+            + expertActionGate * expertMean + standActionGate * standMean
+            + auxiliaryActionGate * auxiliaryMean
         let criticHidden = activate(critic3(activate(
             critic2(activate(critic1(observations))))))
         let value = criticOutput(criticHidden).squeezed(axis: -1)
@@ -807,10 +1022,13 @@ public final class VectorActorCritic: Module {
         if version == 3 {
             try cloneActor(from: "", to: "expert")
         }
-        // A v4 expert was conventionally the exact-standing specialist, so
-        // preserve it in the new stand branch. A v3 policy has just cloned
-        // its base into that same expert and therefore remains identical too.
-        try cloneActor(from: "expert", to: "stand")
+        if version < 5 {
+            // A v4 expert was conventionally the exact-standing specialist,
+            // so preserve it in the new stand branch. A v3 policy has just
+            // cloned its base into that same expert and remains identical.
+            try cloneActor(from: "expert", to: "stand")
+        }
+        try cloneActor(from: "", to: "auxiliary")
         return expanded
     }
 
@@ -826,7 +1044,8 @@ public final class VectorActorCritic: Module {
         }
         var remapped = source
         for name in ["actor1.weight", "expertActor1.weight",
-                     "standActor1.weight", "critic1.weight"] {
+                     "standActor1.weight", "auxiliaryActor1.weight",
+                     "critic1.weight"] {
             guard let input = source[name], input.shape.count == 2 else {
                 throw RLEnvironmentError.invalidConfiguration(
                     "policy checkpoint is missing compatible \(name)")
@@ -884,6 +1103,62 @@ public final class VectorActorCritic: Module {
                     "expanded actor checkpoint is missing \(base)")
             }
             initialized[expert] = value
+        }
+        return initialized
+    }
+
+    /// Clone the first routed expert into the independent third branch. This
+    /// is useful when a task splits one learned behavior into a preserved
+    /// precondition skill and a newly trainable continuation skill.
+    public static func initializingStandExpertFromPolicyExpert(
+        _ source: [String: MLXArray]
+    ) throws -> [String: MLXArray] {
+        var initialized = source
+        for suffix in ["weight", "bias"] {
+            for layer in ["1", "2", "3"] {
+                let expert = "expertActor\(layer).\(suffix)"
+                let stand = "standActor\(layer).\(suffix)"
+                guard let value = source[expert] else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "expanded actor checkpoint is missing \(expert)")
+                }
+                initialized[stand] = value
+            }
+            let expert = "expertActorOutput.\(suffix)"
+            let stand = "standActorOutput.\(suffix)"
+            guard let value = source[expert] else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "expanded actor checkpoint is missing \(expert)")
+            }
+            initialized[stand] = value
+        }
+        return initialized
+    }
+
+    /// Clone the verified base actor into the third routed branch. The task can
+    /// then route only lower-body actions through this branch while a disjoint
+    /// frozen expert supplies upper-body manipulation.
+    public static func initializingStandExpertFromBase(
+        _ source: [String: MLXArray]
+    ) throws -> [String: MLXArray] {
+        var initialized = source
+        for suffix in ["weight", "bias"] {
+            for layer in ["1", "2", "3"] {
+                let base = "actor\(layer).\(suffix)"
+                let stand = "standActor\(layer).\(suffix)"
+                guard let value = source[base] else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "expanded actor checkpoint is missing \(base)")
+                }
+                initialized[stand] = value
+            }
+            let base = "actorOutput.\(suffix)"
+            let stand = "standActorOutput.\(suffix)"
+            guard let value = source[base] else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "expanded actor checkpoint is missing \(base)")
+            }
+            initialized[stand] = value
         }
         return initialized
     }
@@ -1172,6 +1447,90 @@ public final class VectorActorCritic: Module {
                     "policy-expert checkpoint is missing \(sourceName)")
             }
             composed["expertActorOutput.\(suffix)"] = value
+        }
+        return composed
+    }
+
+    /// Compose an already-trained routed expert into another policy. This is
+    /// deliberately separate from `initializingPolicyExpert`, whose contract
+    /// is to promote a source *base* actor into the routed slot. Keeping both
+    /// operations explicit prevents a multi-expert checkpoint from silently
+    /// losing the specialist the caller intended to preserve.
+    public static func initializingPolicyExpertFromExpert(
+        _ destination: [String: MLXArray],
+        from source: [String: MLXArray],
+        sourceNormalizer: RunningNormalizerSnapshot,
+        destinationNormalizer: RunningNormalizerSnapshot,
+        sourceNormalizesObservations: Bool = true,
+        destinationNormalizesObservations: Bool = true
+    ) throws -> [String: MLXArray] {
+        let dimension = sourceNormalizer.mean.count
+        guard dimension > 0,
+              sourceNormalizer.variance.count == dimension,
+              destinationNormalizer.mean.count == dimension,
+              destinationNormalizer.variance.count == dimension else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "routed-expert normalizers have incompatible dimensions")
+        }
+        let firstWeightName = "expertActor1.weight"
+        let firstBiasName = "expertActor1.bias"
+        guard let sourceWeightArray = source[firstWeightName],
+              let sourceBiasArray = source[firstBiasName],
+              sourceWeightArray.shape.count == 2,
+              sourceWeightArray.shape[1] == dimension,
+              sourceBiasArray.shape == [sourceWeightArray.shape[0]] else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "routed-expert checkpoint has an incompatible first layer")
+        }
+        let rows = sourceWeightArray.shape[0]
+        let sourceWeights = sourceWeightArray.asArray(Float.self)
+        var destinationWeights = sourceWeights
+        var destinationBias = sourceBiasArray.asArray(Float.self)
+        var scales = [Float](repeating: 0, count: dimension)
+        var offsets = [Float](repeating: 0, count: dimension)
+        for j in 0..<dimension {
+            let sourceVariance = max(sourceNormalizer.variance[j], 1e-8)
+            let destinationVariance = max(
+                destinationNormalizer.variance[j], 1e-8)
+            guard sourceVariance.isFinite, destinationVariance.isFinite,
+                  sourceNormalizer.mean[j].isFinite,
+                  destinationNormalizer.mean[j].isFinite else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "routed-expert normalizer contains non-finite statistics")
+            }
+            let sourceScale = sourceNormalizesObservations
+                ? sqrt(sourceVariance) : 1
+            let destinationScale = destinationNormalizesObservations
+                ? sqrt(destinationVariance) : 1
+            let sourceMean = sourceNormalizesObservations
+                ? sourceNormalizer.mean[j] : 0
+            let destinationMean = destinationNormalizesObservations
+                ? destinationNormalizer.mean[j] : 0
+            scales[j] = Float(destinationScale / sourceScale)
+            offsets[j] = Float((destinationMean - sourceMean) / sourceScale)
+        }
+        for row in 0..<rows {
+            var biasOffset: Float = 0
+            for j in 0..<dimension {
+                let index = row * dimension + j
+                biasOffset += sourceWeights[index] * offsets[j]
+                destinationWeights[index] = sourceWeights[index] * scales[j]
+            }
+            destinationBias[row] += biasOffset
+        }
+        var composed = destination
+        composed[firstWeightName] = MLXArray(destinationWeights)
+            .reshaped(sourceWeightArray.shape)
+        composed[firstBiasName] = MLXArray(destinationBias)
+        for layer in ["expertActor2", "expertActor3", "expertActorOutput"] {
+            for suffix in ["weight", "bias"] {
+                let name = "\(layer).\(suffix)"
+                guard let value = source[name] else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "routed-expert checkpoint is missing \(name)")
+                }
+                composed[name] = value
+            }
         }
         return composed
     }
@@ -1749,6 +2108,12 @@ public struct VectorPolicyMetadata: Codable, Sendable {
     public var simulationStep: Float
     public var controlDecimation: Int
     public var maxEpisodeSteps: Int
+    /// Row count used for policy inference during training. Some Metal
+    /// matrix-multiplication kernels select a different reduction path for a
+    /// one-row UI replay than for a batched rollout. Recording the validated
+    /// geometry lets deployment reproduce the checkpoint's numerical path.
+    /// Nil identifies checkpoints written before this contract existed.
+    public var inferenceBatchSize: Int? = nil
     public var ppo: VectorPPOConfig
     public var normalizer: RunningNormalizerSnapshot
 
@@ -2035,11 +2400,19 @@ public final class VectorPolicyRunner {
     public func actions(
         for observation: RLObservationBatch,
         expertGates: ContiguousArray<Float>? = nil,
-        standExpertGates: ContiguousArray<Float>? = nil
+        expertActionMask: ContiguousArray<Float>? = nil,
+        standExpertGates: ContiguousArray<Float>? = nil,
+        standExpertActionMask: ContiguousArray<Float>? = nil,
+        auxiliaryExpertGates: ContiguousArray<Float>? = nil,
+        auxiliaryExpertActionMask: ContiguousArray<Float>? = nil
     ) throws -> RLActionBatch {
         let values = try actions(
             for: observation.policy, expertGates: expertGates,
-            standExpertGates: standExpertGates)
+            expertActionMask: expertActionMask,
+            standExpertGates: standExpertGates,
+            standExpertActionMask: standExpertActionMask,
+            auxiliaryExpertGates: auxiliaryExpertGates,
+            auxiliaryExpertActionMask: auxiliaryExpertActionMask)
         return try RLActionBatch(
             numEnvironments: values.count / metadata.actionDimension,
             actionDimension: metadata.actionDimension, values: values)
@@ -2051,7 +2424,11 @@ public final class VectorPolicyRunner {
     public func actions(
         for policyObservations: ContiguousArray<Float>,
         expertGates: ContiguousArray<Float>? = nil,
-        standExpertGates: ContiguousArray<Float>? = nil
+        expertActionMask: ContiguousArray<Float>? = nil,
+        standExpertGates: ContiguousArray<Float>? = nil,
+        standExpertActionMask: ContiguousArray<Float>? = nil,
+        auxiliaryExpertGates: ContiguousArray<Float>? = nil,
+        auxiliaryExpertActionMask: ContiguousArray<Float>? = nil
     ) throws -> ContiguousArray<Float> {
         let n = policyObservations.count / metadata.observationDimension
         guard n > 0,
@@ -2064,33 +2441,146 @@ public final class VectorPolicyRunner {
             throw RLEnvironmentError.invalidConfiguration(
                 "observation value at flat index \(index) is not finite")
         }
-        let normalized = metadata.ppo.normalizeObservations
-            ? normalizer.normalize(policyObservations) : policyObservations
-        let input = MLXArray(Array(normalized)).reshaped(
-            [n, metadata.observationDimension])
         if let expertGates, expertGates.count != n {
             throw RLEnvironmentError.invalidConfiguration(
                 "policy expert gate count must match observation rows")
+        }
+        if let expertActionMask,
+           expertActionMask.count != metadata.actionDimension
+                || !expertActionMask.allSatisfy({ (0...1).contains($0) }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy expert action mask must match action dimensions")
         }
         if let standExpertGates, standExpertGates.count != n {
             throw RLEnvironmentError.invalidConfiguration(
                 "policy stand expert gate count must match observation rows")
         }
+        if let standExpertActionMask,
+           standExpertActionMask.count != metadata.actionDimension
+                || !standExpertActionMask.allSatisfy({ (0...1).contains($0) }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy stand expert action mask must match action dimensions")
+        }
+        if let auxiliaryExpertGates, auxiliaryExpertGates.count != n {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy auxiliary expert gate count must match observation rows")
+        }
+        if let auxiliaryExpertActionMask,
+           auxiliaryExpertActionMask.count != metadata.actionDimension
+                || !auxiliaryExpertActionMask.allSatisfy({
+                    (0...1).contains($0)
+                }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy auxiliary expert action mask must match action dimensions")
+        }
+        // A checkpoint records the Metal matrix row geometry validated during
+        // training. Padding smaller calls handles UI/single-environment replay;
+        // split larger calls into the same exact row geometry as well. Running
+        // an arbitrary larger matrix can select a different reduction kernel
+        // and, for contact-sensitive policies, change the physical trajectory.
+        if let recordedRows = metadata.inferenceBatchSize,
+           recordedRows > 0, n > recordedRows {
+            var combined = ContiguousArray<Float>()
+            combined.reserveCapacity(n * metadata.actionDimension)
+            for range in Self.inferenceBatchRanges(
+                rowCount: n, recordedBatchSize: recordedRows) {
+                let observationStart = range.lowerBound
+                    * metadata.observationDimension
+                let observationEnd = range.upperBound
+                    * metadata.observationDimension
+                let chunkObservations = ContiguousArray(
+                    policyObservations[observationStart..<observationEnd])
+                let chunkExpertGates = expertGates.map {
+                    ContiguousArray($0[range])
+                }
+                let chunkStandGates = standExpertGates.map {
+                    ContiguousArray($0[range])
+                }
+                let chunkAuxiliaryGates = auxiliaryExpertGates.map {
+                    ContiguousArray($0[range])
+                }
+                combined.append(contentsOf: try actions(
+                    for: chunkObservations,
+                    expertGates: chunkExpertGates,
+                    expertActionMask: expertActionMask,
+                    standExpertGates: chunkStandGates,
+                    standExpertActionMask: standExpertActionMask,
+                    auxiliaryExpertGates: chunkAuxiliaryGates,
+                    auxiliaryExpertActionMask: auxiliaryExpertActionMask))
+            }
+            return combined
+        }
+        let inferenceRows = max(n, metadata.inferenceBatchSize ?? n)
+        var inferenceObservations = policyObservations
+        if inferenceRows > n {
+            let lastRow = policyObservations.suffix(metadata.observationDimension)
+            inferenceObservations.reserveCapacity(
+                inferenceRows * metadata.observationDimension)
+            for _ in n..<inferenceRows {
+                inferenceObservations.append(contentsOf: lastRow)
+            }
+        }
+        let normalized = metadata.ppo.normalizeObservations
+            ? normalizer.normalize(inferenceObservations) : inferenceObservations
+        let input = MLXArray(Array(normalized)).reshaped(
+            [inferenceRows, metadata.observationDimension])
         let gate = expertGates.map {
-            MLXArray(Array($0)).reshaped([n, 1])
+            let values = Self.paddedGate($0, rows: inferenceRows)
+            return MLXArray(Array(values)).reshaped([inferenceRows, 1])
+        }
+        let expertMask = expertActionMask.map {
+            MLXArray(Array($0)).reshaped([1, metadata.actionDimension])
         }
         let standGate = standExpertGates.map {
-            MLXArray(Array($0)).reshaped([n, 1])
+            let values = Self.paddedGate($0, rows: inferenceRows)
+            return MLXArray(Array(values)).reshaped([inferenceRows, 1])
+        }
+        let standMask = standExpertActionMask.map {
+            MLXArray(Array($0)).reshaped([1, metadata.actionDimension])
+        }
+        let auxiliaryGate = auxiliaryExpertGates.map {
+            let values = Self.paddedGate($0, rows: inferenceRows)
+            return MLXArray(Array(values)).reshaped([inferenceRows, 1])
+        }
+        let auxiliaryMask = auxiliaryExpertActionMask.map {
+            MLXArray(Array($0)).reshaped([1, metadata.actionDimension])
         }
         let output = metadata.ppo.resolvedActionDistribution.environmentAction(
             policy.forward(
-                input, expertGate: gate, standExpertGate: standGate).mean)
+                input, expertGate: gate, expertActionMask: expertMask,
+                standExpertGate: standGate,
+                standExpertActionMask: standMask,
+                auxiliaryExpertGate: auxiliaryGate,
+                auxiliaryExpertActionMask: auxiliaryMask).mean)
         eval(output)
-        let values = ContiguousArray(output.asArray(Float.self))
+        let allValues = output.asArray(Float.self)
+        let values = ContiguousArray(
+            allValues.prefix(n * metadata.actionDimension))
         if let index = values.firstIndex(where: { !$0.isFinite }) {
             throw RLEnvironmentError.nonFiniteAction(index: index)
         }
         return values
+    }
+
+    static func inferenceBatchRanges(
+        rowCount: Int, recordedBatchSize: Int
+    ) -> [Range<Int>] {
+        precondition(rowCount > 0 && recordedBatchSize > 0)
+        var ranges = [Range<Int>]()
+        for start in stride(from: 0, to: rowCount, by: recordedBatchSize) {
+            ranges.append(start..<min(start + recordedBatchSize, rowCount))
+        }
+        return ranges
+    }
+
+    private static func paddedGate(
+        _ values: ContiguousArray<Float>, rows: Int
+    ) -> ContiguousArray<Float> {
+        guard values.count < rows, let last = values.last else { return values }
+        var padded = values
+        padded.reserveCapacity(rows)
+        padded.append(contentsOf: repeatElement(last, count: rows - values.count))
+        return padded
     }
 }
 
@@ -2110,12 +2600,28 @@ extension VectorPolicyRunner: RLActionProvider {
         let expertGates =
             (task as? any PolicyExpertGateProviding)?
                 .policyExpertGates(observation.policy)
+        let expertActionMask =
+            (task as? any PolicyExpertGateProviding)?
+                .policyExpertActionMask
         let standExpertGates =
             (task as? any PolicyStandExpertGateProviding)?
                 .policyStandExpertGates(observation.policy)
+        let standExpertActionMask =
+            (task as? any PolicyStandExpertGateProviding)?
+                .policyStandExpertActionMask
+        let auxiliaryExpertGates =
+            (task as? any PolicyAuxiliaryExpertGateProviding)?
+                .policyAuxiliaryExpertGates(observation.policy)
+        let auxiliaryExpertActionMask =
+            (task as? any PolicyAuxiliaryExpertGateProviding)?
+                .policyAuxiliaryExpertActionMask
         let batch = try actions(
             for: observation, expertGates: expertGates,
-            standExpertGates: standExpertGates)
+            expertActionMask: expertActionMask,
+            standExpertGates: standExpertGates,
+            standExpertActionMask: standExpertActionMask,
+            auxiliaryExpertGates: auxiliaryExpertGates,
+            auxiliaryExpertActionMask: auxiliaryExpertActionMask)
         try batch.validate(for: task.spec)
         return batch
     }
@@ -2126,6 +2632,7 @@ public final class VectorPPOTrainer {
     public var onUpdate: ((PPOUpdateMetrics) -> Void)?
 
     private static let logSqrt2Pi: Float = 0.9189385332
+    private static let successReplayFileName = "success-replay.safetensors"
     /// A mathematically equivalent PPO ratio can overflow before clipping
     /// when a minibatch contains an action that became very unlikely under
     /// the updated policy. Bounding the *log* ratio keeps both the loss and
@@ -2162,6 +2669,15 @@ public final class VectorPPOTrainer {
         for step in startStep...endStep {
             mask[step * numEnvironments + environment] = 1
         }
+    }
+
+    static func imitationSegmentStart(
+        episodeStart: Int, milestoneStep: Int, historySteps: Int?
+    ) -> Int {
+        precondition(episodeStart >= 0 && milestoneStep >= episodeStart)
+        guard let historySteps else { return episodeStart }
+        precondition(historySteps > 0)
+        return max(episodeStart, milestoneStep - historySteps + 1)
     }
 
     /// Recover the signed permutation represented by a task's row-wise
@@ -2212,16 +2728,153 @@ public final class VectorPPOTrainer {
     /// Critic training still uses every row; this mask keeps frozen actor
     /// branches out of policy normalization, loss denominators, and KL
     /// scheduling instead of silently diluting specialist updates.
+    static func hasValidActorComposition(
+        expertGates: [Float], standExpertGates: [Float],
+        actionDimension: Int,
+        expertActionMask: [Float]?, standExpertActionMask: [Float]?,
+        auxiliaryExpertGates: [Float]? = nil,
+        auxiliaryExpertActionMask: [Float]? = nil
+    ) -> Bool {
+        let auxiliaryGates = auxiliaryExpertGates
+            ?? [Float](repeating: 0, count: expertGates.count)
+        guard expertGates.count == standExpertGates.count,
+              expertGates.count == auxiliaryGates.count,
+              actionDimension > 0,
+              expertActionMask == nil
+                || expertActionMask?.count == actionDimension,
+              standExpertActionMask == nil
+                || standExpertActionMask?.count == actionDimension,
+              auxiliaryExpertActionMask == nil
+                || auxiliaryExpertActionMask?.count == actionDimension,
+              expertGates.allSatisfy({ $0.isFinite && (0...1).contains($0) }),
+              standExpertGates.allSatisfy({
+                  $0.isFinite && (0...1).contains($0)
+              }), auxiliaryGates.allSatisfy({
+                  $0.isFinite && (0...1).contains($0)
+              }) else { return false }
+        for row in expertGates.indices {
+            for action in 0..<actionDimension {
+                let expert = expertGates[row]
+                    * (expertActionMask?[action] ?? 1)
+                let stand = standExpertGates[row]
+                    * (standExpertActionMask?[action] ?? 1)
+                let auxiliary = auxiliaryGates[row]
+                    * (auxiliaryExpertActionMask?[action] ?? 1)
+                if expert + stand + auxiliary > 1 + 1e-6 { return false }
+            }
+        }
+        return true
+    }
+
     static func actorTrainingWeights(
         expertGates: [Float], standExpertGates: [Float],
-        freezesBaseActor: Bool, freezesExpertActor: Bool
+        actionDimension: Int = 1,
+        expertActionMask: [Float]? = nil,
+        standExpertActionMask: [Float]? = nil,
+        freezesBaseActor: Bool, freezesExpertActor: Bool,
+        auxiliaryExpertGates: [Float]? = nil,
+        auxiliaryExpertActionMask: [Float]? = nil,
+        freezesStandActor: Bool = false,
+        freezesAuxiliaryActor: Bool = false
     ) -> [Float] {
+        let auxiliaryGates = auxiliaryExpertGates
+            ?? [Float](repeating: 0, count: expertGates.count)
         precondition(expertGates.count == standExpertGates.count)
-        return zip(expertGates, standExpertGates).map { expert, stand in
-            let base = max(1 - expert - stand, 0)
-            return (freezesBaseActor ? 0 : base)
-                + (freezesExpertActor ? 0 : expert) + stand
+        precondition(expertGates.count == auxiliaryGates.count)
+        precondition(actionDimension > 0)
+        precondition(expertActionMask == nil
+            || expertActionMask?.count == actionDimension)
+        precondition(standExpertActionMask == nil
+            || standExpertActionMask?.count == actionDimension)
+        precondition(auxiliaryExpertActionMask == nil
+            || auxiliaryExpertActionMask?.count == actionDimension)
+        return expertGates.indices.map { row in
+            let expert = expertGates[row]
+            let stand = standExpertGates[row]
+            let auxiliary = auxiliaryGates[row]
+            var trainable: Float = 0
+            for action in 0..<actionDimension {
+                let expertContribution = expert
+                    * (expertActionMask?[action] ?? 1)
+                let standContribution = stand
+                    * (standExpertActionMask?[action] ?? 1)
+                let auxiliaryContribution = auxiliary
+                    * (auxiliaryExpertActionMask?[action] ?? 1)
+                let baseContribution = max(
+                    1 - expertContribution - standContribution
+                        - auxiliaryContribution, 0)
+                trainable += (freezesBaseActor ? 0 : baseContribution)
+                    + (freezesExpertActor ? 0 : expertContribution)
+                    + (freezesStandActor ? 0 : standContribution)
+                    + (freezesAuxiliaryActor ? 0 : auxiliaryContribution)
+            }
+            return min(max(trainable / Float(actionDimension), 0), 1)
         }
+    }
+
+    /// Per-action exploration scale for a routed actor composition. Frozen
+    /// experts must be frozen in the physical rollout as well as in the
+    /// gradient graph: injecting motor noise into their exclusive dimensions
+    /// changes the state distribution even though no branch can learn from
+    /// those rows. Partial actor blends receive proportional standard
+    /// deviation, matching their proportional influence on the composed mean.
+    static func actorExplorationActionScales(
+        expertGates: [Float], standExpertGates: [Float],
+        actionDimension: Int, expertActionMask: [Float]? = nil,
+        standExpertActionMask: [Float]?,
+        freezesBaseActor: Bool, freezesExpertActor: Bool,
+        auxiliaryExpertGates: [Float]? = nil,
+        auxiliaryExpertActionMask: [Float]? = nil,
+        freezesStandActor: Bool = false,
+        freezesAuxiliaryActor: Bool = false
+    ) -> [Float] {
+        let auxiliaryGates = auxiliaryExpertGates
+            ?? [Float](repeating: 0, count: expertGates.count)
+        precondition(expertGates.count == standExpertGates.count)
+        precondition(expertGates.count == auxiliaryGates.count)
+        precondition(actionDimension > 0)
+        precondition(expertActionMask == nil
+            || expertActionMask?.count == actionDimension)
+        precondition(standExpertActionMask == nil
+            || standExpertActionMask?.count == actionDimension)
+        precondition(auxiliaryExpertActionMask == nil
+            || auxiliaryExpertActionMask?.count == actionDimension)
+        var scales = [Float](
+            repeating: 0, count: expertGates.count * actionDimension)
+        for row in expertGates.indices {
+            let expert = expertGates[row]
+            let stand = standExpertGates[row]
+            let auxiliary = auxiliaryGates[row]
+            for action in 0..<actionDimension {
+                let standMask = standExpertActionMask?[action] ?? 1
+                let expertMask = expertActionMask?[action] ?? 1
+                let expertContribution = expert * expertMask
+                let standContribution = stand * standMask
+                let auxiliaryContribution = auxiliary
+                    * (auxiliaryExpertActionMask?[action] ?? 1)
+                let baseContribution = max(
+                    1 - expertContribution - standContribution
+                        - auxiliaryContribution, 0)
+                let trainableContribution =
+                    (freezesBaseActor ? 0 : baseContribution)
+                    + (freezesExpertActor ? 0 : expertContribution)
+                    + (freezesStandActor ? 0 : standContribution)
+                    + (freezesAuxiliaryActor ? 0 : auxiliaryContribution)
+                scales[row * actionDimension + action] = min(max(
+                    trainableContribution, 0), 1)
+            }
+        }
+        return scales
+    }
+
+    /// Exactly frozen routed dimensions are Dirac actions, not narrow
+    /// Gaussians. They must not participate in a joint PPO likelihood or a
+    /// shared log-standard-deviation update can dominate the importance ratio
+    /// despite having no effect on the environment action.
+    static func likelihoodActionMask(
+        explorationActionScales: [Float]
+    ) -> [Float] {
+        explorationActionScales.map { $0 > 0 ? 1 : 0 }
     }
 
     static func weightedNormalizedAdvantages(
@@ -2279,6 +2932,49 @@ public final class VectorPPOTrainer {
         }
     }
 
+    /// Serialize the ring in chronological order. Keeping the file independent
+    /// of the in-memory write cursor lets a transfer retain the newest rows
+    /// even when its replay capacity differs from the source run.
+    private static func successReplayCheckpointArrays(
+        observations: [Float], actions: [Float], expertGates: [Float],
+        standExpertGates: [Float], auxiliaryExpertGates: [Float],
+        count: Int, next: Int, capacity: Int,
+        observationDimension: Int, actionDimension: Int
+    ) -> [String: MLXArray]? {
+        guard count > 0, capacity > 0 else { return nil }
+        precondition(count <= capacity && (0..<capacity).contains(next))
+        let oldest = count == capacity ? next : 0
+        var orderedObservations = [Float]()
+        var orderedActions = [Float]()
+        var orderedExpertGates = [Float]()
+        var orderedStandExpertGates = [Float]()
+        var orderedAuxiliaryExpertGates = [Float]()
+        orderedObservations.reserveCapacity(count * observationDimension)
+        orderedActions.reserveCapacity(count * actionDimension)
+        orderedExpertGates.reserveCapacity(count)
+        orderedStandExpertGates.reserveCapacity(count)
+        orderedAuxiliaryExpertGates.reserveCapacity(count)
+        for offset in 0..<count {
+            let slot = (oldest + offset) % capacity
+            orderedObservations.append(contentsOf: observations[
+                (slot * observationDimension)..<((slot + 1) * observationDimension)])
+            orderedActions.append(contentsOf: actions[
+                (slot * actionDimension)..<((slot + 1) * actionDimension)])
+            orderedExpertGates.append(expertGates[slot])
+            orderedStandExpertGates.append(standExpertGates[slot])
+            orderedAuxiliaryExpertGates.append(auxiliaryExpertGates[slot])
+        }
+        return [
+            "observations": MLXArray(orderedObservations)
+                .reshaped([count, observationDimension]),
+            "actions": MLXArray(orderedActions)
+                .reshaped([count, actionDimension]),
+            "expertGates": MLXArray(orderedExpertGates),
+            "standExpertGates": MLXArray(orderedStandExpertGates),
+            "auxiliaryExpertGates": MLXArray(orderedAuxiliaryExpertGates),
+        ]
+    }
+
     public func train(task: any VectorizedRLTask, outputDirectory: String) throws {
         try train(task: task, outputDirectory: outputDirectory, resume: false)
     }
@@ -2287,6 +2983,7 @@ public final class VectorPPOTrainer {
                       resume: Bool) throws {
         if resume && (configuration.initializationCheckpoint != nil
             || configuration.policyExpertInitializationCheckpoint != nil
+            || configuration.policyExpertBranchInitializationCheckpoint != nil
             || configuration.standExpertInitializationCheckpoint != nil) {
             throw RLEnvironmentError.invalidConfiguration(
                 "PPO resume and checkpoint initialization are mutually exclusive")
@@ -2302,21 +2999,89 @@ public final class VectorPPOTrainer {
             ? taskPolicySymmetry : nil
         let policyExpertGate = task as? any PolicyExpertGateProviding
         let usesPolicyExpertGate = policyExpertGate?.usesPolicyExpertGate == true
+        let expertActionMask = usesPolicyExpertGate
+            ? policyExpertGate?.policyExpertActionMask : nil
+        if let expertActionMask {
+            guard expertActionMask.count == actionDim,
+                  expertActionMask.allSatisfy({ (0...1).contains($0) }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "task expert action mask must match action dimensions")
+            }
+        }
+        let expertActionMaskArray = expertActionMask.map {
+            MLXArray(Array($0)).reshaped([1, actionDim])
+        }
         let policyStandExpertGate = task as? any PolicyStandExpertGateProviding
         let usesPolicyStandExpertGate =
             policyStandExpertGate?.usesPolicyStandExpertGate == true
+        let standExpertActionMask = usesPolicyStandExpertGate
+            ? policyStandExpertGate?.policyStandExpertActionMask : nil
+        if let standExpertActionMask {
+            guard standExpertActionMask.count == actionDim,
+                  standExpertActionMask.allSatisfy({ (0...1).contains($0) }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                "task stand-expert action mask must match action dimensions")
+            }
+        }
+        let policyAuxiliaryExpertGate = task as?
+            any PolicyAuxiliaryExpertGateProviding
+        let usesPolicyAuxiliaryExpertGate =
+            policyAuxiliaryExpertGate?.usesPolicyAuxiliaryExpertGate == true
+        let auxiliaryExpertActionMask = usesPolicyAuxiliaryExpertGate
+            ? policyAuxiliaryExpertGate?.policyAuxiliaryExpertActionMask : nil
+        if let auxiliaryExpertActionMask {
+            guard auxiliaryExpertActionMask.count == spec.action.elementCount,
+                  auxiliaryExpertActionMask.allSatisfy({
+                      (0...1).contains($0)
+                  }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "task auxiliary-expert action mask must match action dimensions")
+            }
+        }
+        if let expertMask = expertActionMask,
+           let standMask = standExpertActionMask {
+            guard zip(expertMask, standMask).allSatisfy({
+                $0.0 + $0.1 <= 1 + 1e-6
+            }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "task expert action masks overlap")
+            }
+        }
+        let standExpertActionMaskArray = standExpertActionMask.map {
+            MLXArray(Array($0)).reshaped([1, actionDim])
+        }
+        if let standMask = standExpertActionMask,
+           let auxiliaryMask = auxiliaryExpertActionMask {
+            guard zip(standMask, auxiliaryMask).allSatisfy({
+                $0.0 + $0.1 <= 1 + 1e-6
+            }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "task stand and auxiliary expert action masks overlap")
+            }
+        }
+        let auxiliaryExpertActionMaskArray = auxiliaryExpertActionMask.map {
+            MLXArray(Array($0)).reshaped([1, actionDim])
+        }
         let freezesBasePolicyExpert = usesPolicyExpertGate
             && policyExpertGate?.freezesBasePolicyExpert == true
         let freezesLowSpeedPolicyExpert = usesPolicyStandExpertGate
             && policyStandExpertGate?.freezesLowSpeedPolicyExpert == true
+        let freezesStandPolicyExpert = usesPolicyAuxiliaryExpertGate
+            && policyAuxiliaryExpertGate?.freezesStandPolicyExpert == true
         let symmetryMirrorLossCoefficient =
             configuration.symmetryMirrorLossCoefficient ?? 0
         let successImitationCoefficient =
             configuration.successImitationCoefficient ?? 0
+        let successReplayCapacity = configuration.successReplayCapacity ?? 0
+        let successReplayBatchSize = configuration.successReplayBatchSize ?? 0
         let referencePolicyCoefficient =
             configuration.referencePolicyCoefficient ?? 0
         let referenceRegularizationProvider = task as?
             any PolicyReferenceRegularizationProviding
+        let referenceActionRegularizationProvider = task as?
+            any PolicyReferenceActionRegularizationProviding
+        let actorTrainingWeightProvider = task as?
+            any PolicyActorTrainingWeightProviding
         let actionDistribution = configuration.resolvedActionDistribution
         let usesSymmetryMirrorLoss = policySymmetry != nil
             && symmetryMirrorLossCoefficient > 0
@@ -2368,6 +3133,12 @@ public final class VectorPPOTrainer {
         var totalSteps = 0
         var restoredTrainingState: VectorPPOTrainingState?
         var persistedConfiguration = configuration
+        var replayInitializationDirectory: String?
+        // A transferred policy may be contact-sensitive to the Metal matrix
+        // row geometry used when its behavior was certified. Preserve that
+        // geometry during rollout instead of silently changing it to the new
+        // simulator batch size. PPO minibatches remain independently batched.
+        var policyInferenceBatchSize = n
         if resume {
             let metadataURL = URL(fileURLWithPath: "\(outputDirectory)/metadata.json")
             let metadata = try JSONDecoder().decode(
@@ -2398,6 +3169,11 @@ public final class VectorPPOTrainer {
             }
             persistedConfiguration = configuration
                 .preservingInitializationProvenance(from: metadata.ppo)
+            if let recordedRows = metadata.inferenceBatchSize,
+               recordedRows > 0 {
+                policyInferenceBatchSize = recordedRows
+            }
+            replayInitializationDirectory = outputDirectory
             let sourceWeights = try loadArrays(url: URL(
                 fileURLWithPath: "\(outputDirectory)/policy.safetensors"))
             let weights = try VectorActorCritic.compatibleWeights(
@@ -2425,6 +3201,20 @@ public final class VectorPPOTrainer {
                 fileURLWithPath: "\(checkpointDirectory)/metadata.json")
             let metadata = try JSONDecoder().decode(
                 VectorPolicyMetadata.self, from: Data(contentsOf: metadataURL))
+            if let recordedRows = metadata.inferenceBatchSize,
+               recordedRows > 0 {
+                policyInferenceBatchSize = recordedRows
+            }
+            // Successful-transition replay is valid only for the exact task
+            // contract that produced it. `--initialize-from` may deliberately
+            // transfer network weights across curricula or expert-routing
+            // changes, but reusing old replay rows would silently attach old
+            // rewards, gates, and success semantics to the new experiment.
+            if metadata.task == spec.id,
+               (metadata.taskRevision ?? 1) == spec.revision,
+               metadata.taskConfiguration == spec.configurationValues {
+                replayInitializationDirectory = checkpointDirectory
+            }
             // `--initialize-from` is an explicit transfer operation, unlike
             // exact resume. Permit a different task id when the complete
             // network interface and architecture match; this supports a
@@ -2531,7 +3321,15 @@ public final class VectorPPOTrainer {
                 let expertMetadata = try JSONDecoder().decode(
                     VectorPolicyMetadata.self,
                     from: Data(contentsOf: expertMetadataURL))
-                guard expertMetadata.observationDimension == obsDim,
+                let expertObservationSourceIndices =
+                    expertMetadata.observationDimension == obsDim
+                    ? nil
+                    : (task as? any ObservationSchemaTransferProviding)?
+                        .initializationObservationSourceIndices(
+                            sourceDimension:
+                                expertMetadata.observationDimension)
+                guard (expertMetadata.observationDimension == obsDim
+                        || expertObservationSourceIndices?.count == obsDim),
                       expertMetadata.actionDimension == actionDim,
                       VectorActorCritic.compatibleArchitectureVersions
                         .contains(expertMetadata.architectureVersion ?? 1),
@@ -2544,19 +3342,112 @@ public final class VectorPPOTrainer {
                 }
                 let expertSourceWeights = try loadArrays(url: URL(
                     fileURLWithPath: "\(expertCheckpoint)/policy.safetensors"))
-                let expertWeights = try VectorActorCritic.compatibleWeights(
+                var expertWeights = try VectorActorCritic.compatibleWeights(
                     expertSourceWeights,
                     architectureVersion: expertMetadata.architectureVersion)
+                var expertNormalizer = expertMetadata.normalizer
+                if let expertObservationSourceIndices {
+                    expertWeights = try VectorActorCritic
+                        .remappingObservationInputs(
+                            expertWeights,
+                            sourceIndices: expertObservationSourceIndices)
+                    expertNormalizer = try expertNormalizer
+                        .remappingObservationChannels(
+                            sourceIndices: expertObservationSourceIndices)
+                }
                 weights = try VectorActorCritic.initializingPolicyExpert(
                     weights, from: expertWeights,
-                    sourceNormalizer: expertMetadata.normalizer,
+                    sourceNormalizer: expertNormalizer,
                     destinationNormalizer: importedNormalizer,
                     sourceNormalizesObservations:
                         expertMetadata.ppo.normalizeObservations,
                     destinationNormalizesObservations:
                         configuration.normalizeObservations)
                 Swift.print("composed routed policy expert from \(expertCheckpoint) "
-                    + "with exact observation-normalizer reparameterization")
+                    + "with exact observation-normalizer reparameterization"
+                    + (expertObservationSourceIndices == nil ? ""
+                        : " and schema remapping"))
+            }
+            if let expertCheckpoint =
+                configuration.policyExpertBranchInitializationCheckpoint {
+                guard usesPolicyExpertGate else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "routed-expert branch composition requires a routed task")
+                }
+                let expertMetadataURL = URL(
+                    fileURLWithPath: "\(expertCheckpoint)/metadata.json")
+                let expertMetadata = try JSONDecoder().decode(
+                    VectorPolicyMetadata.self,
+                    from: Data(contentsOf: expertMetadataURL))
+                let expertObservationSourceIndices =
+                    expertMetadata.observationDimension == obsDim
+                    ? nil
+                    : (task as? any ObservationSchemaTransferProviding)?
+                        .initializationObservationSourceIndices(
+                            sourceDimension:
+                                expertMetadata.observationDimension)
+                guard (expertMetadata.observationDimension == obsDim
+                        || expertObservationSourceIndices?.count == obsDim),
+                      expertMetadata.actionDimension == actionDim,
+                      VectorActorCritic.compatibleArchitectureVersions
+                        .contains(expertMetadata.architectureVersion ?? 1),
+                      expertMetadata.ppo.resolvedHiddenDimensions
+                        == configuration.resolvedHiddenDimensions,
+                      expertMetadata.ppo.resolvedActionDistribution
+                        == configuration.resolvedActionDistribution else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "routed-expert checkpoint has an incompatible network interface")
+                }
+                let sourceArrays = try loadArrays(url: URL(
+                    fileURLWithPath: "\(expertCheckpoint)/policy.safetensors"))
+                var expertWeights = try VectorActorCritic.compatibleWeights(
+                    sourceArrays,
+                    architectureVersion: expertMetadata.architectureVersion)
+                var expertNormalizer = expertMetadata.normalizer
+                if let expertObservationSourceIndices {
+                    expertWeights = try VectorActorCritic
+                        .remappingObservationInputs(
+                            expertWeights,
+                            sourceIndices: expertObservationSourceIndices)
+                    expertNormalizer = try expertNormalizer
+                        .remappingObservationChannels(
+                            sourceIndices: expertObservationSourceIndices)
+                }
+                weights = try VectorActorCritic
+                    .initializingPolicyExpertFromExpert(
+                        weights, from: expertWeights,
+                        sourceNormalizer: expertNormalizer,
+                        destinationNormalizer: importedNormalizer,
+                        sourceNormalizesObservations:
+                            expertMetadata.ppo.normalizeObservations,
+                        destinationNormalizesObservations:
+                            configuration.normalizeObservations)
+                Swift.print("composed existing routed expert branch from "
+                    + "\(expertCheckpoint) with exact observation-normalizer "
+                    + "reparameterization"
+                    + (expertObservationSourceIndices == nil ? ""
+                        : " and schema remapping"))
+            }
+            let initializesStandFromPolicyExpert = usesPolicyStandExpertGate
+                && policyStandExpertGate?
+                    .initializesPolicyStandExpertFromPolicyExpertOnTransfer == true
+            let initializesStandFromBase = usesPolicyStandExpertGate
+                && policyStandExpertGate?
+                    .initializesPolicyStandExpertFromBaseOnTransfer == true
+            guard !initializesStandFromPolicyExpert || !initializesStandFromBase else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "stand expert cannot initialize from both base and policy expert")
+            }
+            if initializesStandFromPolicyExpert {
+                weights = try VectorActorCritic
+                    .initializingStandExpertFromPolicyExpert(weights)
+                Swift.print("initialized stand policy expert as an exact copy "
+                    + "of the transferred routed expert")
+            } else if initializesStandFromBase {
+                weights = try VectorActorCritic
+                    .initializingStandExpertFromBase(weights)
+                Swift.print("initialized stand policy expert as an exact copy "
+                    + "of the transferred base actor")
             }
             if let standCheckpoint =
                 configuration.standExpertInitializationCheckpoint {
@@ -2569,7 +3460,14 @@ public final class VectorPPOTrainer {
                 let standMetadata = try JSONDecoder().decode(
                     VectorPolicyMetadata.self,
                     from: Data(contentsOf: standMetadataURL))
-                guard standMetadata.observationDimension == obsDim,
+                let standObservationSourceIndices =
+                    standMetadata.observationDimension == obsDim
+                    ? nil
+                    : (task as? any ObservationSchemaTransferProviding)?
+                        .initializationObservationSourceIndices(
+                            sourceDimension: standMetadata.observationDimension)
+                guard (standMetadata.observationDimension == obsDim
+                        || standObservationSourceIndices?.count == obsDim),
                       standMetadata.actionDimension == actionDim,
                       VectorActorCritic.compatibleArchitectureVersions
                         .contains(standMetadata.architectureVersion ?? 1),
@@ -2582,15 +3480,27 @@ public final class VectorPPOTrainer {
                 }
                 let standSourceWeights = try loadArrays(url: URL(
                     fileURLWithPath: "\(standCheckpoint)/policy.safetensors"))
-                let standWeights = try VectorActorCritic.compatibleWeights(
+                var standWeights = try VectorActorCritic.compatibleWeights(
                     standSourceWeights,
                     architectureVersion: standMetadata.architectureVersion)
+                var standNormalizer = standMetadata.normalizer
+                if let standObservationSourceIndices {
+                    standWeights = try VectorActorCritic
+                        .remappingObservationInputs(
+                            standWeights,
+                            sourceIndices: standObservationSourceIndices)
+                    standNormalizer = try standNormalizer
+                        .remappingObservationChannels(
+                            sourceIndices: standObservationSourceIndices)
+                }
                 weights = try VectorActorCritic.initializingStandExpert(
                     weights, from: standWeights,
-                    sourceNormalizer: standMetadata.normalizer,
+                    sourceNormalizer: standNormalizer,
                     destinationNormalizer: importedNormalizer)
                 Swift.print("composed stand expert from \(standCheckpoint) "
-                    + "with exact observation-normalizer reparameterization")
+                    + "with exact observation-normalizer reparameterization"
+                    + (standObservationSourceIndices == nil ? ""
+                        : " and schema remapping"))
             }
             try policy.update(parameters: ModuleParameters.unflattened(weights),
                               verify: [.all])
@@ -2614,6 +3524,11 @@ public final class VectorPPOTrainer {
                 + "\(schemaDescription)\(actionTransformDescription); "
                 + "Adam, KL scheduler, "
                 + "and progress start fresh")
+        }
+        if policyInferenceBatchSize != n {
+            Swift.print("preserving transferred policy inference geometry at "
+                + "\(policyInferenceBatchSize) rows across \(n) simulator "
+                + "environments")
         }
         (task as? any TrainingModeConfigurable)?.setTrainingProgress(
             environmentSteps: totalSteps)
@@ -2679,13 +3594,222 @@ public final class VectorPPOTrainer {
         // episode reduction here so fixed-horizon tasks can distinguish
         // success-once from success-at-end without changing the generic API.
         var episodeSucceeded = [Bool](repeating: false, count: n)
+        var episodeSuccessImitationReached = [Bool](
+            repeating: false, count: n)
         var stepResult = RLStepBatch(spec: spec)
+        var successReplayObservations = [Float](
+            repeating: 0, count: successReplayCapacity * obsDim)
+        var successReplayActions = [Float](
+            repeating: 0, count: successReplayCapacity * actionDim)
+        var successReplayExpertGates = [Float](
+            repeating: 0, count: successReplayCapacity)
+        var successReplayStandExpertGates = [Float](
+            repeating: 0, count: successReplayCapacity)
+        var successReplayAuxiliaryExpertGates = [Float](
+            repeating: 0, count: successReplayCapacity)
+        var successReplayCount = 0
+        var successReplayNext = 0
+        if successReplayCapacity > 0, let replayInitializationDirectory {
+            let replayURL = URL(fileURLWithPath: replayInitializationDirectory)
+                .appendingPathComponent(Self.successReplayFileName)
+            if FileManager.default.fileExists(atPath: replayURL.path) {
+                let arrays = try loadArrays(url: replayURL)
+                guard let replayObservations = arrays["observations"],
+                      let replayActions = arrays["actions"],
+                      let replayExpertGates = arrays["expertGates"],
+                      let replayStandExpertGates = arrays["standExpertGates"],
+                      replayObservations.shape.count == 2,
+                      replayObservations.shape[1] == obsDim,
+                      replayActions.shape == [replayObservations.shape[0], actionDim],
+                      replayExpertGates.shape == [replayObservations.shape[0]],
+                      replayStandExpertGates.shape == [replayObservations.shape[0]] else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "success replay checkpoint has incompatible tensor shapes")
+                }
+                let sourceCount = replayObservations.shape[0]
+                let retainedCount = min(sourceCount, successReplayCapacity)
+                let sourceStart = sourceCount - retainedCount
+                let observationValues = replayObservations.asArray(Float.self)
+                let actionValues = replayActions.asArray(Float.self)
+                let expertValues = replayExpertGates.asArray(Float.self)
+                let standExpertValues = replayStandExpertGates.asArray(Float.self)
+                let auxiliaryExpertValues = arrays["auxiliaryExpertGates"]
+                    .map { $0.asArray(Float.self) }
+                    ?? [Float](repeating: 0, count: sourceCount)
+                guard auxiliaryExpertValues.count == sourceCount else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "success replay auxiliary gate has incompatible shape")
+                }
+                if retainedCount > 0 {
+                    successReplayObservations.replaceSubrange(
+                        0..<(retainedCount * obsDim), with: observationValues[
+                            (sourceStart * obsDim)..<(sourceCount * obsDim)])
+                    successReplayActions.replaceSubrange(
+                        0..<(retainedCount * actionDim), with: actionValues[
+                            (sourceStart * actionDim)..<(sourceCount * actionDim)])
+                    successReplayExpertGates.replaceSubrange(
+                        0..<retainedCount,
+                        with: expertValues[sourceStart..<sourceCount])
+                    successReplayStandExpertGates.replaceSubrange(
+                        0..<retainedCount,
+                        with: standExpertValues[sourceStart..<sourceCount])
+                    successReplayAuxiliaryExpertGates.replaceSubrange(
+                        0..<retainedCount,
+                        with: auxiliaryExpertValues[sourceStart..<sourceCount])
+                }
+                successReplayCount = retainedCount
+                successReplayNext = retainedCount % successReplayCapacity
+                Swift.print("restored \(retainedCount) successful transition "
+                    + "rows from \(replayURL.path)")
+            }
+        }
+        var actionLogStandardDeviationBounds = configuration
+            .actionLogStandardDeviationBounds(
+                completedUpdate: startingUpdate)
         let actionMirrorSources = MLXArray(
             (policySymmetry?.policyActionMirrorSourceIndices
                 ?? Array(0..<actionDim)).map(Int32.init))
         let actionMirrorSigns = MLXArray(
             policySymmetry?.policyActionMirrorSigns
                 ?? [Float](repeating: 1, count: actionDim))
+
+        /// Run the behavior policy with the exact row geometry recorded by the
+        /// source checkpoint. Smaller final chunks repeat their last row, just
+        /// like `VectorPolicyRunner`, and only real rows are returned.
+        func rolloutForward(
+            observations: ContiguousArray<Float>,
+            expertGates: ContiguousArray<Float>,
+            standExpertGates: ContiguousArray<Float>,
+            auxiliaryExpertGates: ContiguousArray<Float>
+        ) -> (mean: MLXArray, value: MLXArray,
+              logStandardDeviation: MLXArray) {
+            precondition(observations.count == n * obsDim)
+            precondition(expertGates.count == n)
+            precondition(standExpertGates.count == n)
+            precondition(auxiliaryExpertGates.count == n)
+            var means = [MLXArray]()
+            var values = [MLXArray]()
+            var logStandardDeviation: MLXArray?
+            for range in VectorPolicyRunner.inferenceBatchRanges(
+                rowCount: n,
+                recordedBatchSize: policyInferenceBatchSize) {
+                let actualRows = range.count
+                let observationStart = range.lowerBound * obsDim
+                let observationEnd = range.upperBound * obsDim
+                var chunkObservations = ContiguousArray(
+                    observations[observationStart..<observationEnd])
+                var chunkExpertGates = ContiguousArray(expertGates[range])
+                var chunkStandExpertGates = ContiguousArray(
+                    standExpertGates[range])
+                var chunkAuxiliaryExpertGates = ContiguousArray(
+                    auxiliaryExpertGates[range])
+                if actualRows < policyInferenceBatchSize {
+                    let lastObservation = ContiguousArray(
+                        chunkObservations.suffix(obsDim))
+                    for _ in actualRows..<policyInferenceBatchSize {
+                        chunkObservations.append(contentsOf: lastObservation)
+                    }
+                    chunkExpertGates.append(contentsOf: repeatElement(
+                        chunkExpertGates.last!,
+                        count: policyInferenceBatchSize - actualRows))
+                    chunkStandExpertGates.append(contentsOf: repeatElement(
+                        chunkStandExpertGates.last!,
+                        count: policyInferenceBatchSize - actualRows))
+                    chunkAuxiliaryExpertGates.append(contentsOf: repeatElement(
+                        chunkAuxiliaryExpertGates.last!,
+                        count: policyInferenceBatchSize - actualRows))
+                }
+                let chunkOut = policy.forward(
+                    MLXArray(Array(chunkObservations)).reshaped(
+                        [policyInferenceBatchSize, obsDim]),
+                    expertGate: MLXArray(Array(chunkExpertGates)).reshaped(
+                        [policyInferenceBatchSize, 1]),
+                    expertActionMask: expertActionMaskArray,
+                    standExpertGate: MLXArray(Array(chunkStandExpertGates))
+                        .reshaped([policyInferenceBatchSize, 1]),
+                    standExpertActionMask: standExpertActionMaskArray,
+                    auxiliaryExpertGate: MLXArray(
+                        Array(chunkAuxiliaryExpertGates))
+                        .reshaped([policyInferenceBatchSize, 1]),
+                    auxiliaryExpertActionMask:
+                        auxiliaryExpertActionMaskArray,
+                    freezeBaseActor: freezesBasePolicyExpert,
+                    freezeExpertActor: freezesLowSpeedPolicyExpert,
+                    freezeStandActor: freezesStandPolicyExpert)
+                if actualRows == policyInferenceBatchSize {
+                    means.append(chunkOut.mean)
+                    values.append(chunkOut.value)
+                } else {
+                    means.append(chunkOut.mean[0..<actualRows, 0...])
+                    values.append(chunkOut.value[0..<actualRows])
+                }
+                if logStandardDeviation == nil {
+                    logStandardDeviation = chunkOut.logStandardDeviation
+                }
+            }
+            return (
+                means.count == 1 ? means[0] : concatenated(means, axis: 0),
+                values.count == 1 ? values[0] : concatenated(values, axis: 0),
+                logStandardDeviation!)
+        }
+
+        func routedExplorationScales(
+            expertGates: MLXArray, standExpertGates: MLXArray,
+            auxiliaryExpertGates: MLXArray
+        ) -> MLXArray {
+            let expertContribution = expertActionMaskArray.map {
+                expertGates * $0
+            } ?? expertGates
+            let standContribution = standExpertActionMaskArray.map {
+                standExpertGates * $0
+            } ?? standExpertGates
+            let auxiliaryContribution = auxiliaryExpertActionMaskArray.map {
+                auxiliaryExpertGates * $0
+            } ?? auxiliaryExpertGates
+            let baseContribution = maximum(
+                1 - expertContribution - standContribution
+                    - auxiliaryContribution,
+                MLXArray(Float(0)))
+            var scales = auxiliaryContribution
+            if !freezesBasePolicyExpert { scales = scales + baseContribution }
+            if !freezesLowSpeedPolicyExpert {
+                scales = scales + expertContribution
+            }
+            if !freezesStandPolicyExpert {
+                scales = scales + standContribution
+            }
+            return clip(scales, min: 0, max: 1)
+        }
+
+        func routedEffectiveLogStandardDeviation(
+            base: MLXArray, expertGates: MLXArray,
+            standExpertGates: MLXArray,
+            auxiliaryExpertGates: MLXArray
+        ) -> MLXArray {
+            guard configuration.resolvedRoutedExplorationMaskVersion >= 3 else {
+                return base
+            }
+            return base + log(clip(routedExplorationScales(
+                expertGates: expertGates,
+                standExpertGates: standExpertGates,
+                auxiliaryExpertGates: auxiliaryExpertGates),
+                min: 1e-6, max: 1))
+        }
+
+        func routedLikelihoodActionMask(
+            expertGates: MLXArray, standExpertGates: MLXArray,
+            auxiliaryExpertGates: MLXArray
+        ) -> MLXArray {
+            guard configuration.resolvedRoutedExplorationMaskVersion >= 4 else {
+                return MLXArray.ones([expertGates.shape[0], actionDim])
+            }
+            let scales = routedExplorationScales(
+                expertGates: expertGates,
+                standExpertGates: standExpertGates,
+                auxiliaryExpertGates: auxiliaryExpertGates)
+            return which(
+                scales .> 0, MLXArray(Float(1)), MLXArray(Float(0)))
+        }
 
         let lossAndGradient = valueAndGrad(model: policy) {
             (model: VectorActorCritic, args: [MLXArray]) -> [MLXArray] in
@@ -2697,21 +3821,47 @@ public final class VectorPPOTrainer {
             let mirroredObservations = args[8]
             let expertGates = args[9]
             let standExpertGates = args[10]
-            let successImitationMask = args[11]
-            let referencePolicyWeights = args[12]
-            let actorTrainingWeights = args[13]
+            let auxiliaryExpertGates = args[11]
+            let successImitationMask = args[12]
+            let referencePolicyWeights = args[13]
+            let referencePolicyActionWeights = args[14]
+            let actorTrainingWeights = args[15]
+            let oldMeans = args[16]
+            let oldLogStandardDeviations = args[17]
+            let replayObservations = args[18]
+            let replayActions = args[19]
+            let replayExpertGates = args[20]
+            let replayStandExpertGates = args[21]
+            let replayAuxiliaryExpertGates = args[22]
+            let replayWeights = args[23]
             let out = model.forward(
                 observations, expertGate: expertGates,
+                expertActionMask: expertActionMaskArray,
                 standExpertGate: standExpertGates,
+                standExpertActionMask: standExpertActionMaskArray,
+                auxiliaryExpertGate: auxiliaryExpertGates,
+                auxiliaryExpertActionMask: auxiliaryExpertActionMaskArray,
                 freezeBaseActor: freezesBasePolicyExpert,
-                freezeExpertActor: freezesLowSpeedPolicyExpert)
-            let effectiveLogStandardDeviation = clip(
+                freezeExpertActor: freezesLowSpeedPolicyExpert,
+                freezeStandActor: freezesStandPolicyExpert)
+            let baseLogStandardDeviation = clip(
                 out.logStandardDeviation,
-                min: self.configuration.minimumActionStd.map(log) ?? -5,
-                max: self.configuration.maximumActionStd.map(log) ?? 1)
+                min: actionLogStandardDeviationBounds.minimum,
+                max: actionLogStandardDeviationBounds.maximum)
+            let effectiveLogStandardDeviation =
+                routedEffectiveLogStandardDeviation(
+                    base: baseLogStandardDeviation,
+                    expertGates: expertGates,
+                    standExpertGates: standExpertGates,
+                    auxiliaryExpertGates: auxiliaryExpertGates)
+            let likelihoodActionMask = routedLikelihoodActionMask(
+                expertGates: expertGates,
+                standExpertGates: standExpertGates,
+                auxiliaryExpertGates: auxiliaryExpertGates)
             let logProb = Self.gaussianLogProbability(
                 preTanhActions, mean: out.mean,
-                logStandardDeviation: effectiveLogStandardDeviation)
+                logStandardDeviation: effectiveLogStandardDeviation,
+                actionMask: likelihoodActionMask)
             let (ratio, logRatio) = Self.stableImportanceRatio(
                 newLogProbability: logProb,
                 oldLogProbability: oldLogProb)
@@ -2742,8 +3892,11 @@ public final class VectorPPOTrainer {
             case .gaussian:
                 // RSL-RL uses the analytic entropy of its unbounded diagonal
                 // Gaussian action distribution.
-                entropy = sum(effectiveLogStandardDeviation
-                    + Float(1.4189385332))
+                let entropyRows = sum((effectiveLogStandardDeviation
+                    + Float(1.4189385332)) * likelihoodActionMask,
+                    axis: -1)
+                entropy = sum(entropyRows * actorTrainingWeights)
+                    / actorTrainingDenominator
             case .squashedGaussian:
                 // Entropy must belong to the policy the environment actually
                 // receives. A reparameterized Monte-Carlo estimate includes
@@ -2753,31 +3906,58 @@ public final class VectorPPOTrainer {
                 let entropyActions = tanh(entropyPreTanh)
                 let entropyLogProbability = Self.gaussianLogProbability(
                     entropyPreTanh, mean: out.mean,
-                    logStandardDeviation: effectiveLogStandardDeviation)
+                    logStandardDeviation: effectiveLogStandardDeviation,
+                    actionMask: likelihoodActionMask)
                     - sum(log(clip(1 - entropyActions.square(),
-                                   min: 1e-6, max: 1)), axis: -1)
-                entropy = -mean(entropyLogProbability)
+                                   min: 1e-6, max: 1))
+                        * likelihoodActionMask, axis: -1)
+                entropy = -sum(entropyLogProbability * actorTrainingWeights)
+                    / actorTrainingDenominator
             }
-            // Symmetry-transformed actions were not sampled from the policy
-            // at their transformed observations. They are valid supervised
-            // PPO augmentation rows, but not Monte-Carlo samples for the
-            // behavior-policy KL estimator. Match RSL-RL's trust-region
-            // scheduling semantics by measuring KL only on original rollout
-            // rows; otherwise an asymmetric transferred policy reports a huge
-            // false KL on update one and collapses the adaptive learning rate.
+            // Use the exact diagonal-Gaussian KL employed by RSL-RL rather
+            // than a sampled importance-ratio estimate. The sampled estimator
+            // becomes extremely noisy when only a sparse routed expert is
+            // trainable; that previously stopped transfer updates even when
+            // the deterministic joint targets changed by only a few 1e-5.
+            // Symmetry-transformed rows remain excluded because they were not
+            // generated by the environment behavior policy.
             let trainableKLWeights = klWeights * actorTrainingWeights
             let klDenominator = clip(sum(trainableKLWeights), min: 1,
                                      max: Float.greatestFiniteMagnitude)
-            let approximateKL = sum(
+            let oldVariance = exp(2 * oldLogStandardDeviations)
+            let newVariance = exp(2 * effectiveLogStandardDeviation)
+            let gaussianKLRows = maximum(sum((
+                effectiveLogStandardDeviation - oldLogStandardDeviations
+                    + (oldVariance + (oldMeans - out.mean).square())
+                        / (2 * newVariance)
+                    - 0.5) * likelihoodActionMask,
+                axis: -1), MLXArray(Float(0)))
+            let exactKL = sum(gaussianKLRows * trainableKLWeights)
+                / klDenominator
+            let maximumExactKL = max(gaussianKLRows * trainableKLWeights)
+            let maximumBehaviorMeanReplayError = max(
+                abs(oldMeans - out.mean) * likelihoodActionMask
+                    * trainableKLWeights.reshaped([-1, 1]))
+            let maximumBehaviorLogStandardDeviationReplayError = max(abs(
+                oldLogStandardDeviations - effectiveLogStandardDeviation)
+                * likelihoodActionMask
+                * trainableKLWeights.reshaped([-1, 1]))
+            let sampleApproximateKL = sum(
                 ((ratio - 1) - logRatio) * trainableKLWeights)
                 / klDenominator
             var symmetryLoss = MLXArray(Float(0))
             if usesSymmetryMirrorLoss {
                 let mirroredMean = model.forward(
                     mirroredObservations, expertGate: expertGates,
+                    expertActionMask: expertActionMaskArray,
                     standExpertGate: standExpertGates,
+                    standExpertActionMask: standExpertActionMaskArray,
+                    auxiliaryExpertGate: auxiliaryExpertGates,
+                    auxiliaryExpertActionMask:
+                        auxiliaryExpertActionMaskArray,
                     freezeBaseActor: freezesBasePolicyExpert,
-                    freezeExpertActor: freezesLowSpeedPolicyExpert).mean
+                    freezeExpertActor: freezesLowSpeedPolicyExpert,
+                    freezeStandActor: freezesStandPolicyExpert).mean
                 // Compare the actual deterministic environment action. For a
                 // squashed policy this avoids over-penalizing saturated
                 // logits; for RSL's Gaussian policy it compares raw means.
@@ -2800,18 +3980,45 @@ public final class VectorPPOTrainer {
             let imitationDenominator = clip(
                 sum(trainableImitationMask), min: 1,
                 max: Float.greatestFiniteMagnitude)
-            let successImitationLoss = sum(
+            let rolloutSuccessImitationLoss = sum(
                 imitationActionError * trainableImitationMask)
                 / imitationDenominator
+            let replayOut = model.forward(
+                replayObservations,
+                expertGate: replayExpertGates,
+                expertActionMask: expertActionMaskArray,
+                standExpertGate: replayStandExpertGates,
+                standExpertActionMask: standExpertActionMaskArray,
+                auxiliaryExpertGate: replayAuxiliaryExpertGates,
+                auxiliaryExpertActionMask: auxiliaryExpertActionMaskArray,
+                freezeBaseActor: freezesBasePolicyExpert,
+                freezeExpertActor: freezesLowSpeedPolicyExpert,
+                freezeStandActor: freezesStandPolicyExpert)
+            let replayActionError = sum(
+                (actionDistribution.environmentAction(replayOut.mean)
+                    - actionDistribution.environmentAction(replayActions))
+                    .square(), axis: -1)
+            let replayDenominator = clip(sum(replayWeights), min: 1,
+                                         max: Float.greatestFiniteMagnitude)
+            let replaySuccessImitationLoss = sum(
+                replayActionError * replayWeights) / replayDenominator
+            let successImitationLoss = rolloutSuccessImitationLoss
+                + replaySuccessImitationLoss
             var referencePolicyLoss = MLXArray(Float(0))
             if let referencePolicy {
                 let referenceMean = stopGradient(referencePolicy.forward(
                     observations, expertGate: expertGates,
-                    standExpertGate: standExpertGates).mean)
+                    expertActionMask: expertActionMaskArray,
+                    standExpertGate: standExpertGates,
+                    standExpertActionMask: standExpertActionMaskArray,
+                    auxiliaryExpertGate: auxiliaryExpertGates,
+                    auxiliaryExpertActionMask:
+                        auxiliaryExpertActionMaskArray).mean)
                 let referenceActionError = sum(
                     (actionDistribution.environmentAction(out.mean)
                         - actionDistribution.environmentAction(referenceMean))
-                        .square(), axis: -1)
+                        .square() * referencePolicyActionWeights,
+                    axis: -1)
                 let trainableReferenceWeights = referencePolicyWeights
                     * actorTrainingWeights
                 let referenceDenominator = clip(
@@ -2827,8 +4034,11 @@ public final class VectorPPOTrainer {
                 + symmetryMirrorLossCoefficient * symmetryLoss
                 + successImitationCoefficient * successImitationLoss
                 + referencePolicyCoefficient * referencePolicyLoss
-            return [total, policyLoss, valueLoss, entropy, approximateKL,
-                    symmetryLoss, successImitationLoss, referencePolicyLoss]
+            return [total, policyLoss, valueLoss, entropy, exactKL,
+                    symmetryLoss, successImitationLoss, referencePolicyLoss,
+                    sampleApproximateKL, maximumExactKL,
+                    maximumBehaviorMeanReplayError,
+                    maximumBehaviorLogStandardDeviationReplayError]
         }
 
         if resume {
@@ -2843,6 +4053,8 @@ public final class VectorPPOTrainer {
 
         for localUpdate in 0..<configuration.updates {
             let update = startingUpdate + localUpdate
+            actionLogStandardDeviationBounds = configuration
+                .actionLogStandardDeviationBounds(completedUpdate: update)
             let startTime = Date()
             optimizer.learningRate = adaptiveLearningRate
 
@@ -2850,6 +4062,11 @@ public final class VectorPPOTrainer {
             var storedMirroredObservations = [Float]()
             storedMirroredObservations.reserveCapacity(batchSize * obsDim)
             var storedActions = [Float](); storedActions.reserveCapacity(batchSize * actionDim)
+            var storedBehaviorMeans = [Float]()
+            storedBehaviorMeans.reserveCapacity(batchSize * actionDim)
+            var storedBehaviorLogStandardDeviations = [Float]()
+            storedBehaviorLogStandardDeviations.reserveCapacity(
+                batchSize * actionDim)
             var storedLogProb = [Float](); storedLogProb.reserveCapacity(batchSize)
             var storedValues = [Float](); storedValues.reserveCapacity(batchSize)
             var storedRewards = [Float](); storedRewards.reserveCapacity(batchSize)
@@ -2859,11 +4076,16 @@ public final class VectorPPOTrainer {
                 repeating: 0, count: batchSize)
             var storedReferencePolicyWeights = [Float]()
             storedReferencePolicyWeights.reserveCapacity(batchSize)
+            var storedReferencePolicyActionWeights = [Float]()
+            storedReferencePolicyActionWeights.reserveCapacity(
+                batchSize * actionDim)
             var episodeStartSteps = [Int](repeating: 0, count: n)
             var storedExpertGates = [Float]();
             storedExpertGates.reserveCapacity(batchSize)
             var storedStandExpertGates = [Float]();
             storedStandExpertGates.reserveCapacity(batchSize)
+            var storedAuxiliaryExpertGates = [Float]();
+            storedAuxiliaryExpertGates.reserveCapacity(batchSize)
             var storedActorTrainingWeights = [Float]();
             storedActorTrainingWeights.reserveCapacity(batchSize)
             var completedEpisodes = 0, successfulEpisodes = 0
@@ -2935,6 +4157,29 @@ public final class VectorPPOTrainer {
                 }
                 storedReferencePolicyWeights.append(
                     contentsOf: rolloutReferencePolicyWeights)
+                let rolloutReferencePolicyActionWeights:
+                    ContiguousArray<Float>
+                if referencePolicyCoefficient > 0,
+                   let referenceActionRegularizationProvider {
+                    rolloutReferencePolicyActionWeights =
+                        referenceActionRegularizationProvider
+                            .policyReferenceActionRegularizationWeights(
+                                observation.policy,
+                                actionDimension: actionDim)
+                } else {
+                    rolloutReferencePolicyActionWeights = ContiguousArray(
+                        repeating: 1, count: n * actionDim)
+                }
+                guard rolloutReferencePolicyActionWeights.count
+                        == n * actionDim,
+                      rolloutReferencePolicyActionWeights.allSatisfy({
+                          $0.isFinite && (0...1).contains($0)
+                      }) else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "task returned invalid action-wise reference-policy weights")
+                }
+                storedReferencePolicyActionWeights.append(
+                    contentsOf: rolloutReferencePolicyActionWeights)
                 let rolloutExpertGates = usesPolicyExpertGate
                     ? policyExpertGate!.policyExpertGates(observation.policy)
                     : ContiguousArray(repeating: Float(0), count: n)
@@ -2942,37 +4187,111 @@ public final class VectorPPOTrainer {
                     ? policyStandExpertGate!.policyStandExpertGates(
                         observation.policy)
                     : ContiguousArray(repeating: Float(0), count: n)
-                guard rolloutExpertGates.count == n,
-                      rolloutStandExpertGates.count == n,
-                      rolloutExpertGates.allSatisfy({ (0...1).contains($0) }),
-                      rolloutStandExpertGates.allSatisfy({ (0...1).contains($0) }),
-                      zip(rolloutExpertGates, rolloutStandExpertGates)
-                        .allSatisfy({ $0.0 + $0.1 <= 1 }) else {
+                let rolloutAuxiliaryExpertGates = usesPolicyAuxiliaryExpertGate
+                    ? policyAuxiliaryExpertGate!.policyAuxiliaryExpertGates(
+                        observation.policy)
+                    : ContiguousArray(repeating: Float(0), count: n)
+                guard Self.hasValidActorComposition(
+                    expertGates: Array(rolloutExpertGates),
+                    standExpertGates: Array(rolloutStandExpertGates),
+                    actionDimension: actionDim,
+                    expertActionMask: expertActionMask.map { Array($0) },
+                    standExpertActionMask: standExpertActionMask.map {
+                        Array($0)
+                    }, auxiliaryExpertGates:
+                        Array(rolloutAuxiliaryExpertGates),
+                    auxiliaryExpertActionMask:
+                        auxiliaryExpertActionMask.map { Array($0) }) else {
                     throw RLEnvironmentError.invalidConfiguration(
                         "task returned invalid or overlapping policy expert gates")
                 }
                 storedExpertGates.append(contentsOf: rolloutExpertGates)
                 storedStandExpertGates.append(
                     contentsOf: rolloutStandExpertGates)
-                storedActorTrainingWeights.append(contentsOf:
-                    Self.actorTrainingWeights(
-                        expertGates: Array(rolloutExpertGates),
-                        standExpertGates: Array(rolloutStandExpertGates),
-                        freezesBaseActor: freezesBasePolicyExpert,
-                        freezesExpertActor: freezesLowSpeedPolicyExpert))
-                let obsArray = MLXArray(Array(normalized)).reshaped([n, obsDim])
+                storedAuxiliaryExpertGates.append(
+                    contentsOf: rolloutAuxiliaryExpertGates)
+                var rolloutActorTrainingWeights = Self.actorTrainingWeights(
+                    expertGates: Array(rolloutExpertGates),
+                    standExpertGates: Array(rolloutStandExpertGates),
+                    actionDimension: actionDim,
+                    expertActionMask: expertActionMask.map { Array($0) },
+                    standExpertActionMask: standExpertActionMask.map {
+                        Array($0)
+                    },
+                    freezesBaseActor: freezesBasePolicyExpert,
+                    freezesExpertActor: freezesLowSpeedPolicyExpert,
+                    auxiliaryExpertGates:
+                        Array(rolloutAuxiliaryExpertGates),
+                    auxiliaryExpertActionMask:
+                        auxiliaryExpertActionMask.map { Array($0) },
+                    freezesStandActor: freezesStandPolicyExpert)
+                if let actorTrainingWeightProvider {
+                    let taskWeights = actorTrainingWeightProvider
+                        .policyActorTrainingWeights(observation.policy)
+                    guard taskWeights.count == n,
+                          taskWeights.allSatisfy({
+                              $0.isFinite && (0...1).contains($0)
+                          }) else {
+                        throw RLEnvironmentError.invalidConfiguration(
+                            "task returned invalid actor-training weights")
+                    }
+                    for environment in 0..<n {
+                        rolloutActorTrainingWeights[environment] *=
+                            taskWeights[environment]
+                    }
+                }
+                storedActorTrainingWeights.append(
+                    contentsOf: rolloutActorTrainingWeights)
                 let rolloutGateArray = MLXArray(Array(rolloutExpertGates))
                     .reshaped([n, 1])
                 let rolloutStandGateArray = MLXArray(
                     Array(rolloutStandExpertGates)).reshaped([n, 1])
-                let out = policy.forward(
-                    obsArray, expertGate: rolloutGateArray,
-                    standExpertGate: rolloutStandGateArray,
-                    freezeBaseActor: freezesBasePolicyExpert)
-                let effectiveLogStandardDeviation = clip(
+                let rolloutAuxiliaryGateArray = MLXArray(
+                    Array(rolloutAuxiliaryExpertGates)).reshaped([n, 1])
+                var explorationActionScaleValues = configuration
+                    .resolvedRoutedExplorationMaskVersion >= 2
+                    ? Self.actorExplorationActionScales(
+                        expertGates: Array(rolloutExpertGates),
+                        standExpertGates: Array(rolloutStandExpertGates),
+                        actionDimension: actionDim,
+                        expertActionMask: expertActionMask.map { Array($0) },
+                        standExpertActionMask: standExpertActionMask.map {
+                            Array($0)
+                        },
+                        freezesBaseActor: freezesBasePolicyExpert,
+                        freezesExpertActor: freezesLowSpeedPolicyExpert,
+                        auxiliaryExpertGates:
+                            Array(rolloutAuxiliaryExpertGates),
+                        auxiliaryExpertActionMask:
+                            auxiliaryExpertActionMask.map { Array($0) },
+                        freezesStandActor: freezesStandPolicyExpert)
+                    : [Float](repeating: 1, count: n * actionDim)
+                if configuration.resolvedRoutedExplorationMaskVersion == 2 {
+                    explorationActionScaleValues =
+                        explorationActionScaleValues.map { $0 > 0 ? 1 : 0 }
+                }
+                let explorationActionScales = MLXArray(
+                    explorationActionScaleValues)
+                    .reshaped([n, actionDim])
+                let out = rolloutForward(
+                    observations: normalized,
+                    expertGates: rolloutExpertGates,
+                    standExpertGates: rolloutStandExpertGates,
+                    auxiliaryExpertGates: rolloutAuxiliaryExpertGates)
+                let baseLogStandardDeviation = clip(
                     out.logStandardDeviation,
-                    min: configuration.minimumActionStd.map(log) ?? -5,
-                    max: configuration.maximumActionStd.map(log) ?? 1)
+                    min: actionLogStandardDeviationBounds.minimum,
+                    max: actionLogStandardDeviationBounds.maximum)
+                let effectiveLogStandardDeviation =
+                    routedEffectiveLogStandardDeviation(
+                        base: baseLogStandardDeviation,
+                        expertGates: rolloutGateArray,
+                        standExpertGates: rolloutStandGateArray,
+                        auxiliaryExpertGates: rolloutAuxiliaryGateArray)
+                let likelihoodActionMask = routedLikelihoodActionMask(
+                    expertGates: rolloutGateArray,
+                    standExpertGates: rolloutStandGateArray,
+                    auxiliaryExpertGates: rolloutAuxiliaryGateArray)
                 // An explicit update/step key makes action sampling stable
                 // across process restarts without depending on global PRNG
                 // state consumed during model construction.
@@ -2982,12 +4301,14 @@ public final class VectorPPOTrainer {
                         &+ UInt64(rolloutStep) &* 0xD1B54A32D192ED03)
                 let preTanh = out.mean
                     + MLXRandom.normal([n, actionDim], key: randomKey)
-                        * exp(effectiveLogStandardDeviation)
+                        * exp(baseLogStandardDeviation)
+                        * explorationActionScales
                 let environmentActions = actionDistribution.environmentAction(
                     preTanh)
                 let logProb = Self.gaussianLogProbability(
                     preTanh, mean: out.mean,
-                    logStandardDeviation: effectiveLogStandardDeviation)
+                    logStandardDeviation: effectiveLogStandardDeviation,
+                    actionMask: likelihoodActionMask)
                 eval(preTanh, environmentActions, logProb, out.value)
                 let actionHost = environmentActions.asArray(Float.self)
                 let preTanhHost = preTanh.asArray(Float.self)
@@ -3005,7 +4326,6 @@ public final class VectorPPOTrainer {
                         + "value \(Self.hostSummary(valueHost))")
                 }
                 var trainingPreTanh = ContiguousArray(preTanhHost)
-                var trainingLogProb = ContiguousArray(logProbHost)
                 var trainingValues = ContiguousArray(valueHost)
                 if usesSymmetryDataAugmentation, let policySymmetry {
                     let mirroredPreTanh = policySymmetry.mirrorPolicyActions(
@@ -3018,36 +4338,22 @@ public final class VectorPPOTrainer {
                     // supplies the exact old likelihood/value for the
                     // augmented sample rather than assuming the still-learning
                     // network is already equivariant.
-                    let trainingInput = MLXArray(Array(trainingNormalized))
-                        .reshaped([n, obsDim])
-                    let trainingOut = policy.forward(
-                        trainingInput, expertGate: rolloutGateArray,
-                        standExpertGate: rolloutStandGateArray,
-                        freezeBaseActor: freezesBasePolicyExpert)
-                    let trainingLogStandardDeviation = clip(
-                        trainingOut.logStandardDeviation,
-                        min: configuration.minimumActionStd.map(log) ?? -5,
-                        max: configuration.maximumActionStd.map(log) ?? 1)
-                    let trainingPreTanhArray = MLXArray(Array(trainingPreTanh))
-                        .reshaped([n, actionDim])
-                    let oldTrainingLogProbability = Self.gaussianLogProbability(
-                        trainingPreTanhArray, mean: trainingOut.mean,
-                        logStandardDeviation: trainingLogStandardDeviation)
-                    eval(oldTrainingLogProbability, trainingOut.value)
-                    trainingLogProb = ContiguousArray(
-                        oldTrainingLogProbability.asArray(Float.self))
+                    let trainingOut = rolloutForward(
+                        observations: trainingNormalized,
+                        expertGates: rolloutExpertGates,
+                        standExpertGates: rolloutStandExpertGates,
+                        auxiliaryExpertGates: rolloutAuxiliaryExpertGates)
+                    eval(trainingOut.value)
                     trainingValues = ContiguousArray(
                         trainingOut.value.asArray(Float.self))
                 }
                 guard trainingPreTanh.allSatisfy(\.isFinite),
-                      trainingLogProb.allSatisfy(\.isFinite),
                       trainingValues.allSatisfy(\.isFinite) else {
                     throw RLEnvironmentError.invalidConfiguration(
                         "non-finite symmetry-augmented PPO sample before update "
                         + "\(update + 1)")
                 }
                 storedActions.append(contentsOf: trainingPreTanh)
-                storedLogProb.append(contentsOf: trainingLogProb)
                 storedValues.append(contentsOf: trainingValues)
                 if usesSymmetryDataAugmentation {
                     let mirroredParity = update & 1
@@ -3066,6 +4372,7 @@ public final class VectorPPOTrainer {
                     where name.hasPrefix("reward/")
                         || name.hasPrefix("penalty/")
                         || name.hasPrefix("gait/")
+                        || name.hasPrefix("curriculum/")
                         || name.hasPrefix("task/") {
                     taskMetricSums[name, default: 0] += values.reduce(0, +)
                     taskMetricCounts[name, default: 0] += values.count
@@ -3086,8 +4393,13 @@ public final class VectorPPOTrainer {
                     if configuration.normalizeObservations {
                         final = normalizer.normalize(final)
                     }
-                    let finalArray = MLXArray(Array(final)).reshaped([n, obsDim])
-                    let finalValues = policy.forward(finalArray).value
+                    let finalValues = rolloutForward(
+                        observations: final,
+                        expertGates: ContiguousArray(repeating: 0, count: n),
+                        standExpertGates: ContiguousArray(
+                            repeating: 0, count: n),
+                        auxiliaryExpertGates: ContiguousArray(
+                            repeating: 0, count: n)).value
                     eval(finalValues)
                     let host = finalValues.asArray(Float.self)
                     for e in 0..<n where stepResult.truncated[e] {
@@ -3107,11 +4419,25 @@ public final class VectorPPOTrainer {
                     storedDones.append(done)
                     if stepResult.successes[e] && !episodeSucceeded[e] {
                         episodeSucceeded[e] = true
+                    }
+                    let successImitationTrigger = stepResult.successes[e]
+                        && !episodeSuccessImitationReached[e]
+                    let imitationTrigger = successImitationTrigger
+                        || stepResult.imitationMilestones[e]
+                    if imitationTrigger {
+                        if successImitationTrigger {
+                            episodeSuccessImitationReached[e] = true
+                        }
                         if successImitationCoefficient > 0 {
+                            let causalStart = Self.imitationSegmentStart(
+                                episodeStart: episodeStartSteps[e],
+                                milestoneStep: rolloutStep,
+                                historySteps: configuration
+                                    .successImitationHistorySteps)
                             Self.markSuccessfulEpisodeSegment(
                                 mask: &storedSuccessImitationMask,
                                 environment: e, numEnvironments: n,
-                                startStep: episodeStartSteps[e],
+                                startStep: causalStart,
                                 endStep: rolloutStep)
                         }
                     }
@@ -3119,6 +4445,7 @@ public final class VectorPPOTrainer {
                         completedEpisodes += 1
                         if episodeSucceeded[e] { successfulEpisodes += 1 }
                         episodeSucceeded[e] = false
+                        episodeSuccessImitationReached[e] = false
                         episodeStartSteps[e] = rolloutStep + 1
                         if let episodeReturns = stepResult.metrics["episode/return"] {
                             completedReturnSum += episodeReturns[e]
@@ -3139,6 +4466,134 @@ public final class VectorPPOTrainer {
                 observation = stepResult.observations
             }
 
+            if successReplayCapacity > 0 {
+                for row in 0..<batchSize
+                    where storedSuccessImitationMask[row] > 0
+                        && storedActorTrainingWeights[row] > 0 {
+                    let slot = successReplayNext
+                    let observationSource = row * obsDim
+                    let observationDestination = slot * obsDim
+                    for index in 0..<obsDim {
+                        successReplayObservations[
+                            observationDestination + index] =
+                            storedObservations[observationSource + index]
+                    }
+                    let actionSource = row * actionDim
+                    let actionDestination = slot * actionDim
+                    for index in 0..<actionDim {
+                        successReplayActions[actionDestination + index] =
+                            storedActions[actionSource + index]
+                    }
+                    successReplayExpertGates[slot] = storedExpertGates[row]
+                    successReplayStandExpertGates[slot] =
+                        storedStandExpertGates[row]
+                    successReplayAuxiliaryExpertGates[slot] =
+                        storedAuxiliaryExpertGates[row]
+                    successReplayNext = (successReplayNext + 1)
+                        % successReplayCapacity
+                    successReplayCount = min(
+                        successReplayCount + 1, successReplayCapacity)
+                }
+            }
+
+            // MLX may select a different Metal matrix kernel for the small
+            // online environment batch than for a large PPO minibatch. On a
+            // deep transferred actor, the resulting floating-point reduction
+            // drift was enough to make an unchanged policy report a 0.05 KL.
+            // Re-evaluate the frozen behavior policy once in the exact update
+            // geometry so importance ratios, value clipping, and analytic KL
+            // all satisfy the required identity-at-update-start invariant.
+            // The actions remain the ones physically sampled and applied by
+            // the rollout; only their immutable reference likelihood/value is
+            // represented in the numerical geometry used by optimization.
+            var storedTrainingValues = [Float]()
+            storedTrainingValues.reserveCapacity(batchSize)
+            for start in stride(from: 0, to: batchSize,
+                                by: configuration.minibatchSize) {
+                let end = start + configuration.minibatchSize
+                let rows = end - start
+                let observationStart = start * obsDim
+                let observationEnd = end * obsDim
+                let actionStart = start * actionDim
+                let actionEnd = end * actionDim
+                let behaviorObservations = MLXArray(Array(
+                    storedObservations[observationStart..<observationEnd]))
+                    .reshaped([rows, obsDim])
+                let behaviorExpertGates = MLXArray(Array(
+                    storedExpertGates[start..<end])).reshaped([rows, 1])
+                let behaviorStandExpertGates = MLXArray(Array(
+                    storedStandExpertGates[start..<end])).reshaped([rows, 1])
+                let behaviorAuxiliaryExpertGates = MLXArray(Array(
+                    storedAuxiliaryExpertGates[start..<end]))
+                    .reshaped([rows, 1])
+                let behavior = policy.forward(
+                    behaviorObservations,
+                    expertGate: behaviorExpertGates,
+                    expertActionMask: expertActionMaskArray,
+                    standExpertGate: behaviorStandExpertGates,
+                    standExpertActionMask: standExpertActionMaskArray,
+                    auxiliaryExpertGate: behaviorAuxiliaryExpertGates,
+                    auxiliaryExpertActionMask:
+                        auxiliaryExpertActionMaskArray,
+                    freezeBaseActor: freezesBasePolicyExpert,
+                    freezeExpertActor: freezesLowSpeedPolicyExpert,
+                    freezeStandActor: freezesStandPolicyExpert)
+                let behaviorBaseLogStandardDeviation = clip(
+                    behavior.logStandardDeviation,
+                    min: actionLogStandardDeviationBounds.minimum,
+                    max: actionLogStandardDeviationBounds.maximum)
+                let behaviorLogStandardDeviation =
+                    routedEffectiveLogStandardDeviation(
+                        base: behaviorBaseLogStandardDeviation,
+                        expertGates: behaviorExpertGates,
+                        standExpertGates: behaviorStandExpertGates,
+                        auxiliaryExpertGates: behaviorAuxiliaryExpertGates)
+                let behaviorLikelihoodActionMask =
+                    routedLikelihoodActionMask(
+                        expertGates: behaviorExpertGates,
+                        standExpertGates: behaviorStandExpertGates,
+                        auxiliaryExpertGates: behaviorAuxiliaryExpertGates)
+                let behaviorActions = MLXArray(Array(
+                    storedActions[actionStart..<actionEnd]))
+                    .reshaped([rows, actionDim])
+                let behaviorLogProbability = Self.gaussianLogProbability(
+                    behaviorActions, mean: behavior.mean,
+                    logStandardDeviation: behaviorLogStandardDeviation,
+                    actionMask: behaviorLikelihoodActionMask)
+                eval(behavior.mean, behavior.value,
+                     behaviorLogStandardDeviation, behaviorLogProbability)
+                storedBehaviorMeans.append(contentsOf:
+                    behavior.mean.asArray(Float.self))
+                let behaviorLogStandardDeviationHost =
+                    behaviorLogStandardDeviation.asArray(Float.self)
+                if configuration.resolvedRoutedExplorationMaskVersion >= 3 {
+                    storedBehaviorLogStandardDeviations.append(
+                        contentsOf: behaviorLogStandardDeviationHost)
+                } else {
+                    for _ in 0..<rows {
+                        storedBehaviorLogStandardDeviations.append(
+                            contentsOf: behaviorLogStandardDeviationHost)
+                    }
+                }
+                storedLogProb.append(contentsOf:
+                    behaviorLogProbability.asArray(Float.self))
+                storedTrainingValues.append(contentsOf:
+                    behavior.value.asArray(Float.self))
+            }
+            guard storedBehaviorMeans.count == batchSize * actionDim,
+                  storedBehaviorLogStandardDeviations.count
+                    == batchSize * actionDim,
+                  storedLogProb.count == batchSize,
+                  storedTrainingValues.count == batchSize,
+                  storedBehaviorMeans.allSatisfy(\.isFinite),
+                  storedBehaviorLogStandardDeviations.allSatisfy(\.isFinite),
+                  storedLogProb.allSatisfy(\.isFinite),
+                  storedTrainingValues.allSatisfy(\.isFinite) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "non-finite or incomplete behavior-policy replay before "
+                        + "PPO update \(update + 1)")
+            }
+
             var lastRaw = observation.policy
             if usesSymmetryDataAugmentation, let policySymmetry {
                 let mirroredLast = policySymmetry.mirrorPolicyObservations(lastRaw)
@@ -3148,8 +4603,12 @@ public final class VectorPPOTrainer {
             }
             let lastNormalized = configuration.normalizeObservations
                 ? normalizer.normalize(lastRaw) : lastRaw
-            let lastObs = MLXArray(Array(lastNormalized)).reshaped([n, obsDim])
-            let lastValueArray = policy.forward(lastObs).value
+            let lastValueArray = rolloutForward(
+                observations: lastNormalized,
+                expertGates: ContiguousArray(repeating: 0, count: n),
+                standExpertGates: ContiguousArray(repeating: 0, count: n),
+                auxiliaryExpertGates: ContiguousArray(
+                    repeating: 0, count: n)).value
             eval(lastValueArray)
             let gae = GeneralizedAdvantageEstimator.compute(
                 rewards: storedRewards, values: storedValues, dones: storedDones,
@@ -3178,6 +4637,11 @@ public final class VectorPPOTrainer {
             var lastSymmetryLoss: Float = 0
             var lastSuccessImitationLoss: Float = 0
             var lastReferencePolicyLoss: Float = 0
+            var lastSampleApproximateKL: Float = 0
+            var lastMaximumExactKL: Float = 0
+            var lastMaximumBehaviorMeanReplayError: Float = 0
+            var lastMaximumBehaviorLogStandardDeviationReplayError: Float = 0
+            var firstMinibatchHostBehaviorMeanReplayError: Float = 0
             var klSum: Float = 0
             var klCount = 0
             var shuffleRNG = SplitMix64(
@@ -3204,12 +4668,22 @@ public final class VectorPPOTrainer {
                     mbExpertGates.reserveCapacity(m)
                     var mbStandExpertGates = [Float]();
                     mbStandExpertGates.reserveCapacity(m)
+                    var mbAuxiliaryExpertGates = [Float]();
+                    mbAuxiliaryExpertGates.reserveCapacity(m)
                     var mbSuccessImitationMask = [Float]()
                     mbSuccessImitationMask.reserveCapacity(m)
                     var mbReferencePolicyWeights = [Float]()
                     mbReferencePolicyWeights.reserveCapacity(m)
+                    var mbReferencePolicyActionWeights = [Float]()
+                    mbReferencePolicyActionWeights.reserveCapacity(
+                        m * actionDim)
                     var mbActorTrainingWeights = [Float]()
                     mbActorTrainingWeights.reserveCapacity(m)
+                    var mbBehaviorMeans = [Float]()
+                    mbBehaviorMeans.reserveCapacity(m * actionDim)
+                    var mbBehaviorLogStandardDeviations = [Float]()
+                    mbBehaviorLogStandardDeviations.reserveCapacity(
+                        m * actionDim)
                     for i in indices {
                         mbObs.append(contentsOf:
                             storedObservations[(i * obsDim)..<((i + 1) * obsDim)])
@@ -3221,17 +4695,78 @@ public final class VectorPPOTrainer {
                         mbLogProb.append(storedLogProb[i])
                         mbAdvantages.append(normalizedAdvantages[i])
                         mbReturns.append(gae.returns[i])
-                        mbValues.append(storedValues[i])
+                        mbValues.append(storedTrainingValues[i])
                         mbKLWeights.append(storedKLWeights[i])
                         mbExpertGates.append(storedExpertGates[i])
                         mbStandExpertGates.append(storedStandExpertGates[i])
+                        mbAuxiliaryExpertGates.append(
+                            storedAuxiliaryExpertGates[i])
                         mbSuccessImitationMask.append(
                             storedSuccessImitationMask[i])
                         mbReferencePolicyWeights.append(
                             storedReferencePolicyWeights[i])
+                        mbReferencePolicyActionWeights.append(contentsOf:
+                            storedReferencePolicyActionWeights[
+                                (i * actionDim)..<((i + 1) * actionDim)])
                         mbActorTrainingWeights.append(
                             storedActorTrainingWeights[i])
+                        mbBehaviorMeans.append(contentsOf:
+                            storedBehaviorMeans[
+                                (i * actionDim)..<((i + 1) * actionDim)])
+                        mbBehaviorLogStandardDeviations.append(contentsOf:
+                            storedBehaviorLogStandardDeviations[
+                                (i * actionDim)..<((i + 1) * actionDim)])
                     }
+                    let replayRows = min(
+                        successReplayBatchSize, successReplayCount)
+                    var mbReplayObservations = [Float]()
+                    var mbReplayActions = [Float]()
+                    var mbReplayExpertGates = [Float]()
+                    var mbReplayStandExpertGates = [Float]()
+                    var mbReplayAuxiliaryExpertGates = [Float]()
+                    var mbReplayWeights = [Float]()
+                    if replayRows > 0 {
+                        mbReplayObservations.reserveCapacity(replayRows * obsDim)
+                        mbReplayActions.reserveCapacity(replayRows * actionDim)
+                        mbReplayExpertGates.reserveCapacity(replayRows)
+                        mbReplayStandExpertGates.reserveCapacity(replayRows)
+                        mbReplayAuxiliaryExpertGates.reserveCapacity(replayRows)
+                        mbReplayWeights.reserveCapacity(replayRows)
+                        let replayStart = (update &* 131
+                            + epoch &* 17
+                            + start / configuration.minibatchSize)
+                            % successReplayCount
+                        for offset in 0..<replayRows {
+                            let slot = (replayStart + offset)
+                                % successReplayCount
+                            mbReplayObservations.append(contentsOf:
+                                successReplayObservations[
+                                    (slot * obsDim)..<((slot + 1) * obsDim)])
+                            mbReplayActions.append(contentsOf:
+                                successReplayActions[
+                                    (slot * actionDim)..<((slot + 1) * actionDim)])
+                            mbReplayExpertGates.append(
+                                successReplayExpertGates[slot])
+                            mbReplayStandExpertGates.append(
+                                successReplayStandExpertGates[slot])
+                            mbReplayAuxiliaryExpertGates.append(
+                                successReplayAuxiliaryExpertGates[slot])
+                            mbReplayWeights.append(1)
+                        }
+                    } else {
+                        // MLX tensors cannot use a zero row in every backend.
+                        // A single zero-weight row keeps the graph shape valid
+                        // and contributes exactly zero replay loss.
+                        mbReplayObservations = [Float](
+                            repeating: 0, count: obsDim)
+                        mbReplayActions = [Float](
+                            repeating: 0, count: actionDim)
+                        mbReplayExpertGates = [0]
+                        mbReplayStandExpertGates = [0]
+                        mbReplayAuxiliaryExpertGates = [0]
+                        mbReplayWeights = [0]
+                    }
+                    let effectiveReplayRows = max(replayRows, 1)
                     let entropyKey = MLXRandom.key(
                         configuration.seed
                             &+ UInt64(update) &* 0xD1B54A32D192ED03
@@ -3239,18 +4774,81 @@ public final class VectorPPOTrainer {
                             &+ UInt64(start))
                     let entropyNoise = MLXRandom.normal(
                         [m, actionDim], key: entropyKey)
+                    let mbObservationArray = MLXArray(mbObs)
+                        .reshaped([m, obsDim])
+                    let mbExpertGateArray = MLXArray(mbExpertGates)
+                        .reshaped([m, 1])
+                    let mbStandExpertGateArray = MLXArray(mbStandExpertGates)
+                        .reshaped([m, 1])
+                    let mbAuxiliaryExpertGateArray = MLXArray(
+                        mbAuxiliaryExpertGates).reshaped([m, 1])
+                    if epoch == 0 && start == 0 {
+                        let replayMean = policy.forward(
+                            mbObservationArray,
+                            expertGate: mbExpertGateArray,
+                            expertActionMask: expertActionMaskArray,
+                            standExpertGate: mbStandExpertGateArray,
+                            standExpertActionMask: standExpertActionMaskArray,
+                            auxiliaryExpertGate: mbAuxiliaryExpertGateArray,
+                            auxiliaryExpertActionMask:
+                                auxiliaryExpertActionMaskArray,
+                            freezeBaseActor: freezesBasePolicyExpert,
+                            freezeExpertActor:
+                                freezesLowSpeedPolicyExpert,
+                            freezeStandActor: freezesStandPolicyExpert).mean
+                        eval(replayMean)
+                        let replayHost = replayMean.asArray(Float.self)
+                        for row in 0..<m
+                            where mbActorTrainingWeights[row] > 0 {
+                            for action in 0..<actionDim {
+                                let index = row * actionDim + action
+                                let error = abs(replayHost[index]
+                                    - mbBehaviorMeans[index])
+                                if error
+                                    > firstMinibatchHostBehaviorMeanReplayError {
+                                    firstMinibatchHostBehaviorMeanReplayError =
+                                        error
+                                }
+                            }
+                        }
+                        if firstMinibatchHostBehaviorMeanReplayError > 1e-5 {
+                            throw RLEnvironmentError.invalidConfiguration(
+                                "behavior-policy replay changed before PPO "
+                                    + "update \(update + 1) (max actor mean "
+                                    + "error "
+                                    + "\(firstMinibatchHostBehaviorMeanReplayError)); "
+                                    + "Metal training geometry is inconsistent")
+                        }
+                    }
                     let (losses, gradients) = lossAndGradient(policy, [
-                        MLXArray(mbObs).reshaped([m, obsDim]),
+                        mbObservationArray,
                         MLXArray(mbActions).reshaped([m, actionDim]),
                         MLXArray(mbLogProb), MLXArray(mbAdvantages),
                         MLXArray(mbReturns), MLXArray(mbValues), entropyNoise,
                         MLXArray(mbKLWeights),
                         MLXArray(mbMirroredObs).reshaped([m, obsDim]),
-                        MLXArray(mbExpertGates).reshaped([m, 1]),
-                        MLXArray(mbStandExpertGates).reshaped([m, 1]),
+                        mbExpertGateArray,
+                        mbStandExpertGateArray,
+                        mbAuxiliaryExpertGateArray,
                         MLXArray(mbSuccessImitationMask),
                         MLXArray(mbReferencePolicyWeights),
+                        MLXArray(mbReferencePolicyActionWeights)
+                            .reshaped([m, actionDim]),
                         MLXArray(mbActorTrainingWeights),
+                        MLXArray(mbBehaviorMeans).reshaped([m, actionDim]),
+                        MLXArray(mbBehaviorLogStandardDeviations)
+                            .reshaped([m, actionDim]),
+                        MLXArray(mbReplayObservations)
+                            .reshaped([effectiveReplayRows, obsDim]),
+                        MLXArray(mbReplayActions)
+                            .reshaped([effectiveReplayRows, actionDim]),
+                        MLXArray(mbReplayExpertGates)
+                            .reshaped([effectiveReplayRows, 1]),
+                        MLXArray(mbReplayStandExpertGates)
+                            .reshaped([effectiveReplayRows, 1]),
+                        MLXArray(mbReplayAuxiliaryExpertGates)
+                            .reshaped([effectiveReplayRows, 1]),
+                        MLXArray(mbReplayWeights),
                     ])
                     let (clippedGradients, squaredGradientNorm) =
                         Self.clipGradientNorm(
@@ -3287,6 +4885,11 @@ public final class VectorPPOTrainer {
                     lastSymmetryLoss = scalarLosses[5]
                     lastSuccessImitationLoss = scalarLosses[6]
                     lastReferencePolicyLoss = scalarLosses[7]
+                    lastSampleApproximateKL = scalarLosses[8]
+                    lastMaximumExactKL = scalarLosses[9]
+                    lastMaximumBehaviorMeanReplayError = scalarLosses[10]
+                    lastMaximumBehaviorLogStandardDeviationReplayError =
+                        scalarLosses[11]
                     klSum += lastKL
                     klCount += 1
                     if Self.shouldStopForKL(
@@ -3315,6 +4918,10 @@ public final class VectorPPOTrainer {
             }
 
             totalSteps += batchSize
+            if configuration.resolvedTrainingProgressUpdateVersion >= 2 {
+                (task as? any TrainingModeConfigurable)?.setTrainingProgress(
+                    environmentSteps: totalSteps)
+            }
             let elapsed = max(Float(-startTime.timeIntervalSinceNow), 1e-6)
             let returnMean = gae.returns.reduce(0, +) / Float(batchSize)
             let returnVariance = gae.returns.reduce(Float(0)) {
@@ -3334,12 +4941,47 @@ public final class VectorPPOTrainer {
                 lastSuccessImitationLoss
             meanTaskMetrics["training/success_imitation_fraction"] =
                 storedSuccessImitationMask.reduce(0, +) / Float(batchSize)
+            meanTaskMetrics["training/success_replay_size"] =
+                Float(successReplayCount)
+            meanTaskMetrics["training/success_replay_fill_fraction"] =
+                successReplayCapacity > 0
+                    ? Float(successReplayCount) / Float(successReplayCapacity)
+                    : 0
             meanTaskMetrics["training/reference_policy_loss"] =
                 lastReferencePolicyLoss
             meanTaskMetrics["training/reference_policy_fraction"] =
                 storedReferencePolicyWeights.reduce(0, +) / Float(batchSize)
+            meanTaskMetrics["training/reference_policy_action_fraction"] =
+                storedReferencePolicyActionWeights.reduce(0, +)
+                    / Float(batchSize * actionDim)
             meanTaskMetrics["training/actor_training_fraction"] =
                 storedActorTrainingWeights.reduce(0, +) / Float(batchSize)
+            meanTaskMetrics["training/policy_inference_batch_size"] =
+                Float(policyInferenceBatchSize)
+            meanTaskMetrics["training/sample_approximate_kl"] =
+                lastSampleApproximateKL
+            meanTaskMetrics["training/maximum_exact_kl"] =
+                lastMaximumExactKL
+            meanTaskMetrics["training/behavior_mean_replay_max_abs"] =
+                lastMaximumBehaviorMeanReplayError
+            meanTaskMetrics[
+                "training/behavior_log_std_replay_max_abs"] =
+                lastMaximumBehaviorLogStandardDeviationReplayError
+            meanTaskMetrics[
+                "training/first_minibatch_host_mean_replay_max_abs"] =
+                firstMinibatchHostBehaviorMeanReplayError
+            var maximumTrainableObservationMagnitude: Float = 0
+            for row in 0..<batchSize
+                where storedActorTrainingWeights[row] > 0 {
+                let start = row * obsDim
+                let end = start + obsDim
+                for value in storedObservations[start..<end] {
+                    maximumTrainableObservationMagnitude = max(
+                        maximumTrainableObservationMagnitude, abs(value))
+                }
+            }
+            meanTaskMetrics["training/actor_observation_max_abs"] =
+                maximumTrainableObservationMagnitude
             let metrics = PPOUpdateMetrics(
                 update: update, environmentSteps: totalSteps,
                 policyLoss: lastPolicyLoss,
@@ -3359,8 +5001,8 @@ public final class VectorPPOTrainer {
                     ? completedDistanceSum / Float(completedEpisodes) : 0,
                 meanActionStandardDeviation: {
                     let value = mean(exp(clip(policy.logStandardDeviation,
-                        min: configuration.minimumActionStd.map(log) ?? -5,
-                        max: configuration.maximumActionStd.map(log) ?? 1)))
+                        min: actionLogStandardDeviationBounds.minimum,
+                        max: actionLogStandardDeviationBounds.maximum)))
                     eval(value)
                     return value.item(Float.self)
                 }(), taskMetrics: meanTaskMetrics)
@@ -3375,12 +5017,24 @@ public final class VectorPPOTrainer {
                     completedUpdates: update + 1, environmentSteps: totalSteps,
                     optimizerSteps: optimizer.step,
                     adaptiveLearningRate: adaptiveLearningRate)
+                let successReplayArrays = Self.successReplayCheckpointArrays(
+                    observations: successReplayObservations,
+                    actions: successReplayActions,
+                    expertGates: successReplayExpertGates,
+                    standExpertGates: successReplayStandExpertGates,
+                    auxiliaryExpertGates:
+                        successReplayAuxiliaryExpertGates,
+                    count: successReplayCount, next: successReplayNext,
+                    capacity: successReplayCapacity,
+                    observationDimension: obsDim, actionDimension: actionDim)
                 try Self.save(policy: policy, normalizer: normalizer,
                               optimizer: optimizer,
                               referencePolicy: referencePolicy,
+                              successReplayArrays: successReplayArrays,
                               taskSpec: spec,
                               configuration: persistedConfiguration,
                               trainingState: trainingState,
+                              inferenceBatchSize: policyInferenceBatchSize,
                               outputDirectory: outputDirectory)
                 // Preserve the policy trajectory for deterministic selection.
                 // A noisy on-policy update can regress after a good checkpoint;
@@ -3391,9 +5045,11 @@ public final class VectorPPOTrainer {
                 try Self.save(policy: policy, normalizer: normalizer,
                               optimizer: optimizer,
                               referencePolicy: referencePolicy,
+                              successReplayArrays: successReplayArrays,
                               taskSpec: spec,
                               configuration: persistedConfiguration,
                               trainingState: trainingState,
+                              inferenceBatchSize: policyInferenceBatchSize,
                               outputDirectory: snapshotDirectory)
             }
         }
@@ -3449,25 +5105,53 @@ public final class VectorPPOTrainer {
                 + "task \(spec.id) [\(spec.observation.elementCount), "
                 + "\(spec.action.elementCount)]")
         }
-        let policy = VectorActorCritic(
-            observationDimension: metadata.observationDimension,
-            actionDimension: metadata.actionDimension,
-            hiddenSize: metadata.ppo.hiddenSize,
-            hiddenDimensions: metadata.ppo.hiddenDimensions,
-            initialActionStd: metadata.ppo.initialActionStd,
-            activation: metadata.ppo.resolvedActivation)
-        let sourceWeights = try loadArrays(
-            url: URL(fileURLWithPath: "\(checkpointDirectory)/policy.safetensors"))
-        let weights = try VectorActorCritic.compatibleWeights(
-            sourceWeights, architectureVersion: metadata.architectureVersion)
-        try policy.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
-        eval(policy)
-        let normalizer = RunningObservationNormalizer(snapshot: metadata.normalizer)
+        // Evaluation, replay, and deployment must use the same saved inference
+        // row geometry. MLX can select a different matrix kernel for a one-row
+        // or small evaluation batch than for the training batch; the resulting
+        // last-bit reduction differences are enough to change a contact-
+        // critical trajectory. VectorPolicyRunner pads to `inferenceBatchSize`
+        // and returns only the requested rows, giving every frontend identical
+        // deterministic actions.
+        let runner = try VectorPolicyRunner(
+            checkpointDirectory: checkpointDirectory)
         let policyExpertGate = task as? any PolicyExpertGateProviding
         let usesPolicyExpertGate = policyExpertGate?.usesPolicyExpertGate == true
+        let expertActionMask = usesPolicyExpertGate
+            ? policyExpertGate?.policyExpertActionMask : nil
+        if let expertActionMask {
+            guard expertActionMask.count == spec.action.elementCount,
+                  expertActionMask.allSatisfy({ (0...1).contains($0) }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "task expert action mask must match action dimensions")
+            }
+        }
         let policyStandExpertGate = task as? any PolicyStandExpertGateProviding
         let usesPolicyStandExpertGate =
             policyStandExpertGate?.usesPolicyStandExpertGate == true
+        let standExpertActionMask = usesPolicyStandExpertGate
+            ? policyStandExpertGate?.policyStandExpertActionMask : nil
+        if let standExpertActionMask {
+            guard standExpertActionMask.count == spec.action.elementCount,
+                  standExpertActionMask.allSatisfy({ (0...1).contains($0) }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "task stand-expert action mask must match action dimensions")
+            }
+        }
+        let policyAuxiliaryExpertGate = task as?
+            any PolicyAuxiliaryExpertGateProviding
+        let usesPolicyAuxiliaryExpertGate =
+            policyAuxiliaryExpertGate?.usesPolicyAuxiliaryExpertGate == true
+        let auxiliaryExpertActionMask = usesPolicyAuxiliaryExpertGate
+            ? policyAuxiliaryExpertGate?.policyAuxiliaryExpertActionMask : nil
+        if let auxiliaryExpertActionMask {
+            guard auxiliaryExpertActionMask.count == spec.action.elementCount,
+                  auxiliaryExpertActionMask.allSatisfy({
+                      (0...1).contains($0)
+                  }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "task auxiliary-expert action mask must match action dimensions")
+            }
+        }
         var observation = try task.reset(seed: seed)
         var stepResult = RLStepBatch(spec: spec)
         var runningReturns = [Float](repeating: 0, count: spec.numEnvironments)
@@ -3490,27 +5174,22 @@ public final class VectorPPOTrainer {
         var controlSteps = 0
         while completedReturns.count < requestedEpisodes
                 && controlSteps < maximumControlSteps {
-            let normalized = metadata.ppo.normalizeObservations
-                ? normalizer.normalize(observation.policy)
-                : observation.policy
-            let input = MLXArray(Array(normalized)).reshaped(
-                [spec.numEnvironments, spec.observation.elementCount])
             let expertGate = usesPolicyExpertGate
-                ? MLXArray(Array(policyExpertGate!.policyExpertGates(
-                    observation.policy))).reshaped([spec.numEnvironments, 1])
-                : nil
+                ? policyExpertGate!.policyExpertGates(observation.policy) : nil
             let standExpertGate = usesPolicyStandExpertGate
-                ? MLXArray(Array(policyStandExpertGate!.policyStandExpertGates(
-                    observation.policy))).reshaped([spec.numEnvironments, 1])
-                : nil
-            let action = metadata.ppo.resolvedActionDistribution
-                .environmentAction(policy.forward(
-                    input, expertGate: expertGate,
-                    standExpertGate: standExpertGate,
-                    freezeBaseActor: usesPolicyExpertGate
-                        && policyExpertGate!.freezesBasePolicyExpert).mean)
-            eval(action)
-            var actionValues = ContiguousArray(action.asArray(Float.self))
+                ? policyStandExpertGate!.policyStandExpertGates(
+                    observation.policy) : nil
+            let auxiliaryExpertGate = usesPolicyAuxiliaryExpertGate
+                ? policyAuxiliaryExpertGate!.policyAuxiliaryExpertGates(
+                    observation.policy) : nil
+            var actionValues = try runner.actions(
+                for: observation.policy,
+                expertGates: expertGate,
+                expertActionMask: expertActionMask,
+                standExpertGates: standExpertGate,
+                standExpertActionMask: standExpertActionMask,
+                auxiliaryExpertGates: auxiliaryExpertGate,
+                auxiliaryExpertActionMask: auxiliaryExpertActionMask)
             for e in 0..<spec.numEnvironments where !active[e] {
                 let base = e * spec.action.elementCount
                 for j in 0..<spec.action.elementCount {
@@ -3659,11 +5338,13 @@ public final class VectorPPOTrainer {
     }
 
     public static func gaussianLogProbability(_ action: MLXArray, mean: MLXArray,
-                                              logStandardDeviation: MLXArray)
+                                              logStandardDeviation: MLXArray,
+                                              actionMask: MLXArray? = nil)
         -> MLXArray {
         let z = (action - mean) / exp(logStandardDeviation)
-        return sum(-0.5 * z.square() - logStandardDeviation - logSqrt2Pi,
-                   axis: -1)
+        var terms = -0.5 * z.square() - logStandardDeviation - logSqrt2Pi
+        if let actionMask { terms = terms * actionMask }
+        return sum(terms, axis: -1)
     }
 
     /// Numerically stable importance ratio used by PPO's clipped surrogate.
@@ -3701,6 +5382,42 @@ public final class VectorPPOTrainer {
                 logProbabilityDifference: difference)
             weightedSum += weight
                 * ((stable.ratio - 1) - stable.logRatio)
+            weightSum += weight
+        }
+        return weightSum > 0 ? weightedSum / weightSum : 0
+    }
+
+    /// Host mirror of the exact old-policy-to-new-policy diagonal Gaussian KL
+    /// used by the trust-region scheduler. Keeping the arithmetic testable
+    /// without a Metal test bundle guards both direction and row weighting.
+    static func weightedDiagonalGaussianKL(
+        oldMeans: [Float], oldLogStandardDeviations: [Float],
+        newMeans: [Float], newLogStandardDeviations: [Float],
+        actionDimension: Int, weights: [Float]
+    ) -> Float {
+        precondition(actionDimension > 0)
+        precondition(oldMeans.count == newMeans.count)
+        precondition(oldMeans.count == weights.count * actionDimension)
+        precondition(oldLogStandardDeviations.count == oldMeans.count)
+        precondition(newLogStandardDeviations.count == oldMeans.count)
+        var weightedSum: Float = 0
+        var weightSum: Float = 0
+        for row in weights.indices {
+            let weight = weights[row]
+            precondition(weight >= 0 && weight.isFinite)
+            var rowKL: Float = 0
+            for action in 0..<actionDimension {
+                let index = row * actionDimension + action
+                let oldLogStd = oldLogStandardDeviations[index]
+                let newLogStd = newLogStandardDeviations[index]
+                let delta = oldMeans[index] - newMeans[index]
+                let oldVariance = exp(2 * oldLogStd)
+                let newVariance = exp(2 * newLogStd)
+                rowKL += newLogStd - oldLogStd
+                    + (oldVariance + delta * delta) / (2 * newVariance)
+                    - 0.5
+            }
+            weightedSum += weight * max(rowKL, 0)
             weightSum += weight
         }
         return weightSum > 0 ? weightedSum / weightSum : 0
@@ -3796,8 +5513,10 @@ public final class VectorPPOTrainer {
                              normalizer: RunningObservationNormalizer,
                              optimizer: CheckpointableAdam,
                              referencePolicy: VectorActorCritic?,
+                             successReplayArrays: [String: MLXArray]?,
                              taskSpec: RLTaskSpec, configuration: VectorPPOConfig,
                              trainingState: VectorPPOTrainingState,
+                             inferenceBatchSize: Int,
                              outputDirectory: String) throws {
         try FileManager.default.createDirectory(atPath: outputDirectory,
                                                 withIntermediateDirectories: true)
@@ -3819,6 +5538,14 @@ public final class VectorPPOTrainer {
                 "\(outputDirectory)/reference-policy.safetensors"),
                 options: .atomic)
         }
+        let replayURL = URL(fileURLWithPath: outputDirectory)
+            .appendingPathComponent(successReplayFileName)
+        if let successReplayArrays {
+            let replayData = try MLX.saveToData(arrays: successReplayArrays)
+            try replayData.write(to: replayURL, options: .atomic)
+        } else if FileManager.default.fileExists(atPath: replayURL.path) {
+            try FileManager.default.removeItem(at: replayURL)
+        }
         let metadata = VectorPolicyMetadata(
             architectureVersion: VectorActorCritic.architectureVersion,
             task: taskSpec.id,
@@ -3829,6 +5556,7 @@ public final class VectorPPOTrainer {
             simulationStep: taskSpec.simulationStep,
             controlDecimation: taskSpec.controlDecimation,
             maxEpisodeSteps: taskSpec.maxEpisodeSteps,
+            inferenceBatchSize: inferenceBatchSize,
             ppo: configuration,
             normalizer: normalizer.snapshot)
         let data = try JSONEncoder().encode(metadata)

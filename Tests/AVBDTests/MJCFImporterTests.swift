@@ -11,11 +11,14 @@ final class MJCFImporterTests: XCTestCase {
             options.defaultMotorGain,
             MJCFMotorGain(stiffness: 0, damping: 0))
         XCTAssertTrue(options.motorGains.isEmpty)
+        XCTAssertTrue(options.motorEffortLimits.isEmpty)
+        XCTAssertTrue(options.jointArmatures.isEmpty)
         XCTAssertTrue(options.jointHomePositions.isEmpty)
         XCTAssertFalse(options.fixedBase)
         XCTAssertEqual(options.gravityScale, 1)
         XCTAssertEqual(options.collisionGroup, 0)
         XCTAssertTrue(options.selfCollisions)
+        XCTAssertTrue(options.collideConnectedBodies)
         XCTAssertEqual(options.inertiaFrame, .principal)
         XCTAssertEqual(options.dynamicsScale, .identity)
         XCTAssertTrue(options.includeVisuals)
@@ -325,6 +328,176 @@ final class MJCFImporterTests: XCTestCase {
         XCTAssertEqual(scene.joints[0].motorStiffness, 11, accuracy: 1e-6)
         XCTAssertEqual(scene.joints[0].motorDamping, 3.6, accuracy: 1e-6)
         XCTAssertEqual(scene.joints[0].armature, 0.13, accuracy: 1e-6)
+    }
+
+    func testTopLevelFreeJointUsesAlreadyFreeRootAndNestedFreeIsRejected() throws {
+        let xml = """
+        <mujoco model="free-root">
+          <worldbody>
+            <body name="root">
+              <inertial mass="2" diaginertia="1 1 1"/>
+              <joint name="root_free" type="free"/>
+              <body name="child" pos="0 0 1">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="hinge" type="hinge"/>
+              </body>
+            </body>
+          </worldbody>
+          <actuator><motor name="drive" joint="hinge"/></actuator>
+        </mujoco>
+        """
+        let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+        XCTAssertEqual(asset.jointNames, ["hinge"])
+        var scene = PhysicsScene(name: "free-root")
+        let imported = try asset.instantiate(
+            in: &scene,
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 1, damping: 0)))
+        XCTAssertEqual(scene.bodies.count, 2)
+        XCTAssertEqual(scene.joints.count, 1)
+        XCTAssertEqual(imported.actuatorJoints, [0])
+
+        let nestedFree = """
+        <mujoco model="nested-free">
+          <worldbody>
+            <body name="root">
+              <inertial mass="1" diaginertia="1 1 1"/>
+              <body name="child">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint type="free"/>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        XCTAssertThrowsError(try MJCFAsset.parse(data: Data(nestedFree.utf8))) {
+            XCTAssertTrue(String(describing: $0).contains(
+                "free joint on child must be on a top-level body"))
+        }
+    }
+
+    func testMotorEffortPrecedenceAndNamedPhysicalOverrides() throws {
+        let xml = """
+        <mujoco model="effort-precedence">
+          <worldbody>
+            <body name="root">
+              <inertial mass="1" diaginertia="1 1 1"/>
+              <body name="force_body">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="force_joint" armature="0.1"
+                       actuatorfrcrange="-9 9"/>
+              </body>
+              <body name="joint_body">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="joint_limit" armature="0.2"
+                       actuatorfrcrange="-6 8"/>
+              </body>
+              <body name="control_body">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="control_joint" armature="0.3"/>
+              </body>
+              <body name="legacy_body">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="legacy_joint" armature="0.4"/>
+              </body>
+            </body>
+          </worldbody>
+          <actuator>
+            <motor name="force_motor" joint="force_joint"
+                   forcerange="-7 7" ctrlrange="-3 3"/>
+            <motor name="joint_motor" joint="joint_limit" ctrlrange="-3 3"/>
+            <motor name="control_motor" joint="control_joint" ctrlrange="-5 4"/>
+            <motor name="legacy_motor" joint="legacy_joint"/>
+          </actuator>
+        </mujoco>
+        """
+        let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+        var sourceScene = PhysicsScene(name: "source-effort")
+        let source = try asset.instantiate(
+            in: &sourceScene,
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 1, damping: 0)))
+        XCTAssertEqual(sourceScene.joints[
+            try XCTUnwrap(source.jointsByName["force_joint"])
+        ].motorTorque, 7, accuracy: 1e-6)
+        XCTAssertEqual(sourceScene.joints[
+            try XCTUnwrap(source.jointsByName["joint_limit"])
+        ].motorTorque, 8, accuracy: 1e-6)
+        XCTAssertEqual(sourceScene.joints[
+            try XCTUnwrap(source.jointsByName["control_joint"])
+        ].motorTorque, 5, accuracy: 1e-6)
+        XCTAssertEqual(sourceScene.joints[
+            try XCTUnwrap(source.jointsByName["legacy_joint"])
+        ].motorTorque, 1, accuracy: 1e-6)
+
+        var overrideScene = PhysicsScene(name: "override-effort")
+        let overridden = try asset.instantiate(
+            in: &overrideScene,
+            options: MJCFInstantiationOptions(
+                defaultMotorGain: .init(stiffness: 1, damping: 0),
+                motorEffortLimits: [
+                    "force_motor": 11,
+                    "force_joint": 99,
+                    "joint_limit": 12,
+                ],
+                jointArmatures: [
+                    "force_motor": 1.1,
+                    "force_joint": 9.9,
+                    "joint_limit": 1.2,
+                ]))
+        let forceJoint = overrideScene.joints[
+            try XCTUnwrap(overridden.jointsByName["force_joint"])]
+        XCTAssertEqual(forceJoint.motorTorque, 11, accuracy: 1e-6)
+        XCTAssertEqual(forceJoint.armature, 1.1, accuracy: 1e-6)
+        let jointLimit = overrideScene.joints[
+            try XCTUnwrap(overridden.jointsByName["joint_limit"])]
+        XCTAssertEqual(jointLimit.motorTorque, 12, accuracy: 1e-6)
+        XCTAssertEqual(jointLimit.armature, 1.2, accuracy: 1e-6)
+    }
+
+    func testConnectedBodyCollisionFilteringIsExplicit() throws {
+        let xml = """
+        <mujoco model="connected-filter">
+          <worldbody>
+            <body name="root">
+              <inertial mass="1" diaginertia="1 1 1"/>
+              <body name="hinged">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <joint name="hinge"/>
+                <body name="nested_without_joint">
+                  <inertial mass="1" diaginertia="1 1 1"/>
+                </body>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+
+        var legacyScene = PhysicsScene(name: "connected-legacy")
+        _ = try asset.instantiate(
+            in: &legacyScene, options: MJCFInstantiationOptions())
+        XCTAssertTrue(legacyScene.collisionExclusions.isEmpty)
+
+        var filteredScene = PhysicsScene(name: "connected-filtered")
+        let imported = try asset.instantiate(
+            in: &filteredScene,
+            options: MJCFInstantiationOptions(
+                selfCollisions: true, collideConnectedBodies: false))
+        XCTAssertEqual(filteredScene.collisionExclusions.count, 2)
+        let pairs = Set(filteredScene.collisionExclusions.map {
+            Set([$0.bodyA, $0.bodyB])
+        })
+        XCTAssertEqual(pairs, Set([
+            Set([
+                try XCTUnwrap(imported.bodiesByName["root"]),
+                try XCTUnwrap(imported.bodiesByName["hinged"]),
+            ]),
+            Set([
+                try XCTUnwrap(imported.bodiesByName["hinged"]),
+                try XCTUnwrap(imported.bodiesByName["nested_without_joint"]),
+            ]),
+        ]))
     }
 
     func testDomainRandomizationIsSeededAndBounded() {

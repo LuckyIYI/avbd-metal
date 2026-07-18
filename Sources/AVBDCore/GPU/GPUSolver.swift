@@ -56,6 +56,7 @@ public final class GPUSolver {
     // contributes one identity-local collider; imported links may contribute
     // zero or many offset primitives.
     var colliderOwner, colliderShape, colliderShapeType, colliderGroup: MTLBuffer
+    var colliderSharedCollision: MTLBuffer
     var colliderLocalPosition, colliderLocalRotation: MTLBuffer
     var colliderFriction: MTLBuffer
     var colliderHullRange, convexHullVertices: MTLBuffer
@@ -240,6 +241,8 @@ public final class GPUSolver {
         colliderShape = try makeBuf(numColliders * 16, "colliderShape")
         colliderShapeType = try makeBuf(numColliders * 4, "colliderShapeType")
         colliderGroup = try makeBuf(numColliders * 4, "colliderGroup")
+        colliderSharedCollision = try makeBuf(
+            numColliders * 4, "colliderSharedCollision")
         colliderLocalPosition = try makeBuf(numColliders * 16, "colliderLocalPosition")
         colliderLocalRotation = try makeBuf(numColliders * 16, "colliderLocalRotation")
         colliderFriction = try makeBuf(
@@ -570,6 +573,8 @@ public final class GPUSolver {
                                                          capacity: numColliders)
         let cg = colliderGroup.contents().bindMemory(to: UInt32.self,
                                                      capacity: numColliders)
+        let csc = colliderSharedCollision.contents().bindMemory(
+            to: UInt32.self, capacity: numColliders)
         let cp = colliderLocalPosition.contents().bindMemory(to: SIMD4<Float>.self,
                                                              capacity: numColliders)
         let cq = colliderLocalRotation.contents().bindMemory(to: SIMD4<Float>.self,
@@ -601,6 +606,7 @@ public final class GPUSolver {
             let particle = scene.bodies[c.body].isParticle
             co[i] = UInt32(c.body)
             cg[i] = c.collisionGroup
+            csc[i] = c.collidesWithSharedGeometry ? 1 : 0
             cs[i] = SIMD4(c.size, particle ? -r : r)
             cp[i] = SIMD4(c.localPosition, c.friction)
             cq[i] = SIMD4(c.localRotation.imag, c.localRotation.real)
@@ -2350,6 +2356,8 @@ public final class GPUSolver {
                 e.setBuffer(self.colliderLocalPosition, offset: 0, index: 15)
                 e.setBuffer(self.posAng, offset: 0, index: 16)
                 e.setBuffer(self.colliderGroup, offset: 0, index: 17)
+                e.setBuffer(
+                    self.colliderSharedCollision, offset: 0, index: 18)
             }
             encodeScan(enc, input: pairCount, output: pairStart,
                        count: pairProducerCount)
@@ -2372,6 +2380,8 @@ public final class GPUSolver {
                 e.setBuffer(self.colliderLocalPosition, offset: 0, index: 15)
                 e.setBuffer(self.posAng, offset: 0, index: 16)
                 e.setBuffer(self.colliderGroup, offset: 0, index: 17)
+                e.setBuffer(
+                    self.colliderSharedCollision, offset: 0, index: 18)
             }
         }
         dispatch1D(enc, "bp_finalize_deterministic_pairs", 1) { e in
@@ -2712,7 +2722,14 @@ public final class GPUSolver {
         // Metal guarantees no forward progress between threadgroups, and the
         // arrive-and-spin barrier wedged the queue. Kept for further study.
         let multiOK = ProcessInfo.processInfo.environment["AVBD_MULTI"] != nil
-        let noPersist = ProcessInfo.processInfo.environment["AVBD_NO_PERSIST"] != nil
+        // The dispatched solver is the canonical path at every scene size.
+        // Switching to a different numerical kernel at the threadgroup-size
+        // boundary made otherwise identical vectorized RL replicas diverge.
+        // Keep the scalar persistent kernel as an explicit benchmark/debug
+        // mode only; production simulation and replay must share one path.
+        let persistentRequested = ProcessInfo.processInfo.environment[
+            "AVBD_PERSIST"] != nil
+            && ProcessInfo.processInfo.environment["AVBD_NO_PERSIST"] == nil
         if multiOK && numBodies <= 4096 {
             let tgW = min(256, multiPSO.maxTotalThreadsPerThreadgroup)
             var ntg = UInt32(min(8, max(1, (numBodies + tgW - 1) / tgW + 1)))
@@ -2745,7 +2762,8 @@ public final class GPUSolver {
             enc.setBuffer(counters, offset: 0, index: 28)
             enc.dispatchThreadgroups(MTLSize(width: Int(ntg), height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
-        } else if !noPersist && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
+        } else if persistentRequested
+                    && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
             // small scene: the whole solve loop in ONE dispatch — hundreds
             // of per-dispatch launch/barrier latencies become threadgroup
             // barriers (see kernel comment)

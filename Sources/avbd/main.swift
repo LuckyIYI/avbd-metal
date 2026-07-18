@@ -44,8 +44,12 @@ struct Options {
     var actionStd: Float = 1.0
     var minimumActionStd: Float? = nil
     var maximumActionStd: Float? = nil
+    var finalActionStd: Float? = nil
+    var actionStdAnnealStartUpdate: Int? = nil
+    var actionStdAnnealEndUpdate: Int? = nil
     var initializeFrom: String? = nil
     var policyExpertFrom: String? = nil
+    var policyExpertBranchFrom: String? = nil
     var standExpertFrom: String? = nil
     var initializationNormalizerPriorCount: Double? = nil
     var symmetryAugmentation = true
@@ -61,6 +65,9 @@ struct Options {
     var valueCoefficient: Float = 1
     var maxGradientNorm: Float = 1
     var successImitationCoefficient: Float = 0
+    var successReplayCapacity = 0
+    var successReplayBatchSize = 0
+    var successImitationHistorySteps: Int?
     var referencePolicyCoefficient: Float = 0
     var checkpointInterval = 50
     var activation: PPOActivation? = nil
@@ -181,10 +188,18 @@ func parseOptions(_ args: [String]) -> Options {
             o.minimumActionStd = Float(value(after: args[i]))
         case "--maximum-action-std":
             o.maximumActionStd = Float(value(after: args[i]))
+        case "--final-action-std":
+            o.finalActionStd = Float(value(after: args[i]))
+        case "--action-std-anneal-start":
+            o.actionStdAnnealStartUpdate = Int(value(after: args[i]))
+        case "--action-std-anneal-end":
+            o.actionStdAnnealEndUpdate = Int(value(after: args[i]))
         case "--initialize-from":
             o.initializeFrom = value(after: args[i])
         case "--policy-expert-from":
             o.policyExpertFrom = value(after: args[i])
+        case "--policy-expert-branch-from":
+            o.policyExpertBranchFrom = value(after: args[i])
         case "--stand-expert-from":
             o.standExpertFrom = value(after: args[i])
         case "--initialization-normalizer-prior-count":
@@ -221,6 +236,14 @@ func parseOptions(_ args: [String]) -> Options {
         case "--success-imitation-coef":
             o.successImitationCoefficient = Float(value(after: args[i]))
                 ?? o.successImitationCoefficient
+        case "--success-replay-capacity":
+            o.successReplayCapacity = Int(value(after: args[i]))
+                ?? o.successReplayCapacity
+        case "--success-replay-batch":
+            o.successReplayBatchSize = Int(value(after: args[i]))
+                ?? o.successReplayBatchSize
+        case "--success-imitation-history":
+            o.successImitationHistorySteps = Int(value(after: args[i]))
         case "--reference-policy-coef":
             o.referencePolicyCoefficient = Float(value(after: args[i]))
                 ?? o.referencePolicyCoefficient
@@ -305,12 +328,15 @@ guard let command = args.first else {
       export-policy-rl <task>  Create an immutable optimizer-free field bundle
       verify-policy-rl <task>  Verify immutable bundle identity and MLX inference
       trace-rl <task>  Trace one deterministic policy trajectory step by step
+      distill-h1-box-lift  Distill a verified physical lift trajectory into MLX
+      probe-h1-box-lift  Audit bounded H1 grasp-to-lift actuation in parallel
       eval-arm-expert  Evaluate the batched Push-T demonstration expert
       select-rl <reports...>  Select one checkpoint on validation-only reports
       verify-selection-rl <selection.json> <reports...>  Reject seed leakage or drift
       aggregate-rl <reports...>  Aggregate distinct-seed evaluation JSON files
       aggregate-checkpoint-rl <reports...>  Aggregate one checkpoint over reset seeds
       sim2sim-h1       Run Unitree's imported recurrent H1 policy unchanged
+      sim2sim-gear-sonic <reference-dir>  Replay NVIDIA GEAR-SONIC on G1
 
     Options: --frames N --iterations N --scale N --dt T --cpu --json --watch BODY --stats-every N
     """)
@@ -565,6 +591,119 @@ case "sim2sim-h1":
     }
     if !report.finite || !report.policyVerification.passed { exit(2) }
 
+case "sim2sim-gear-sonic":
+    guard args.count > 1, !args[1].hasPrefix("--") else {
+        fail("usage: avbd sim2sim-gear-sonic <reference-directory> "
+            + "[--checkpoint bundle --frames N --envs N --iterations N "
+            + "--stats-every N --trace --json --output report.json]")
+    }
+    let referenceDirectory = args[1]
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let bundleDirectory = o.checkpoint ?? "checkpoints/external/gear-sonic-g1"
+    // `Options.envs` defaults to the large training batch. A replay is a
+    // single visible trajectory unless the caller explicitly requests a
+    // throughput batch with `--envs`.
+    let replayEnvironmentCount = args.contains("--envs") ? max(o.envs, 1) : 1
+    let session = try GEARSonicG1Session(
+        bundleDirectory: bundleDirectory,
+        referenceDirectory: referenceDirectory,
+        environmentCount: replayEnvironmentCount,
+        solverIterations: o.iterations ?? 8)
+    let requestedSteps: Int? = args.contains("--frames") ? o.frames : nil
+    let report = try session.run(maximumControlSteps: requestedSteps) {
+        step, states in
+        let state = states[0]
+        if args.contains("--trace") {
+            func values(_ input: some Collection<Float>) -> String {
+                input.map { String(format: "%+.7f", $0) }
+                    .joined(separator: ",")
+            }
+            let root: [Float] = [
+                state.root.position.x, state.root.position.y,
+                state.root.position.z,
+            ]
+            print("trace \(step) frame \(session.referenceFrame) "
+                + "root [\(values(root))] "
+                + "q [\(values(state.jointAngles))] "
+                + "dq [\(values(state.jointVelocities))] "
+                + "action [\(values(session.lastRawAction.prefix(29)))]")
+        }
+        guard !o.json,
+              step == 1 || step % max(o.statsEvery, 1) == 0 else { return }
+        let upright = state.root.rotation.act(F3(0, 0, 1)).z
+        let displayedAction = session.lastRawAction.prefix(29)
+        let meanAbsoluteAction = displayedAction.isEmpty ? 0
+            : displayedAction.map(abs).reduce(0, +)
+                / Float(displayedAction.count)
+        print(String(format:
+            "step %4d/%4d  t %6.2f  root (%+.3f,%+.3f,%.3f)  "
+            + "upright %.3f  |action| %.3f",
+            step, session.reference.frameCount, session.elapsedTime,
+            state.root.position.x, state.root.position.y,
+            state.root.position.z, upright, meanAbsoluteAction))
+    }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let encoded = try encoder.encode(report)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try encoded.write(to: url, options: .atomic)
+    }
+    if o.json {
+        print(String(decoding: encoded, as: UTF8.self))
+    } else {
+        let actual = report.actualRootDisplacementMeters
+        let reference = report.referenceRootDisplacementMeters
+        print(String(format:
+            "GEAR-SONIC %@  %.2fs (%d/%d frames)  "
+            + "root delta (%+.3f,%+.3f,%+.3f)m  "
+            + "reference (%+.3f,%+.3f,%+.3f)m",
+            report.referenceName, report.simulatedSeconds,
+            report.controlSteps, report.referenceFrames,
+            actual[0], actual[1], actual[2],
+            reference[0], reference[1], reference[2]))
+        print(String(format:
+            "joint tracking mean %.4frad  max %.4frad  "
+            + "min height %.3fm  min upright %.3f  %@",
+            report.meanJointTrackingErrorRadians,
+            report.maximumJointTrackingErrorRadians,
+            report.minimumRootHeightMeters,
+            report.minimumUprightAlignment,
+            report.firstFallStep.map { "FELL at step \($0)" } ?? "STABLE"))
+        print(String(format:
+            "14-link root-relative error mean %.4fm  max %.4fm  "
+            + "max height error %.4fm  root rotation %.4frad",
+            report.meanRootRelativeBodyTrackingErrorMeters,
+            report.maximumRootRelativeBodyTrackingErrorMeters,
+            report.maximumTrackedBodyHeightErrorMeters,
+            report.maximumRootOrientationErrorRadians))
+        print(String(format:
+            "joint speed max %.3frad/s (%.3fx source limit)  %@",
+            report.maximumAbsoluteJointVelocityRadiansPerSecond,
+            report.maximumJointVelocityLimitRatio,
+            report.firstSourceCriterionFailureStep.map {
+                "SOURCE THRESHOLD EXCEEDED at step \($0)"
+            } ?? "SOURCE THRESHOLDS PASS"))
+        print(String(format:
+            "source eval height max %.4fm / %.2fm  orientation %.4frad / %.2frad  "
+                + "velocity clamp %@",
+            report.maximumSourceCriterionHeightErrorMeters,
+            report.sourceHeightFailureThresholdMeters,
+            report.maximumRootOrientationErrorRadians,
+            report.sourceOrientationFailureThresholdRadians,
+            report.jointVelocityLimitsEnforced ? "ENFORCED" : "AUDIT ONLY"))
+        print(String(format:
+            "ONNX->MLX max errors: token %.3g  action %.3g  %@",
+            report.policyMaximumTokenError,
+            report.policyMaximumActionError,
+            report.policyParityPassed ? "PASS" : "FAIL"))
+    }
+    if !report.finite || !report.policyParityPassed { exit(2) }
+    if report.completedReference && report.firstFallStep != nil { exit(3) }
+
 case "rl-smoke":
     guard args.count > 1 else { fail("usage: avbd rl-smoke <task> [--envs N --frames N]") }
     let o = parseOptions(Array(args.dropFirst(2)))
@@ -711,6 +850,10 @@ case "train-rl":
     tunedConfig.maxGradientNorm = o.maxGradientNorm
     tunedConfig.successImitationCoefficient =
         o.successImitationCoefficient
+    tunedConfig.successReplayCapacity = o.successReplayCapacity
+    tunedConfig.successReplayBatchSize = o.successReplayBatchSize
+    tunedConfig.successImitationHistorySteps =
+        o.successImitationHistorySteps
     tunedConfig.referencePolicyCoefficient =
         o.referencePolicyCoefficient
     tunedConfig.initialActionStd = o.actionStd
@@ -721,8 +864,13 @@ case "train-rl":
     tunedConfig.actionDistribution = o.actionDistribution
     tunedConfig.minimumActionStd = o.minimumActionStd
     tunedConfig.maximumActionStd = o.maximumActionStd
+    tunedConfig.finalActionStd = o.finalActionStd
+    tunedConfig.actionStdAnnealStartUpdate = o.actionStdAnnealStartUpdate
+    tunedConfig.actionStdAnnealEndUpdate = o.actionStdAnnealEndUpdate
     tunedConfig.initializationCheckpoint = o.initializeFrom
     tunedConfig.policyExpertInitializationCheckpoint = o.policyExpertFrom
+    tunedConfig.policyExpertBranchInitializationCheckpoint =
+        o.policyExpertBranchFrom
     tunedConfig.standExpertInitializationCheckpoint = o.standExpertFrom
     tunedConfig.initializationNormalizerPriorCount =
         o.initializationNormalizerPriorCount
@@ -746,11 +894,27 @@ case "eval-rl":
     }
     let o = parseOptions(Array(args.dropFirst(2)))
     let taskID = args[1]
+    let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
+    let checkpointMetadata = try JSONDecoder().decode(
+        VectorPolicyMetadata.self,
+        from: Data(contentsOf: URL(
+            fileURLWithPath: "\(checkpointDirectory)/metadata.json")))
+    var evaluationOptions = BuiltInRLTasks.registry.checkpointReplayOptions(
+        for: taskID,
+        semanticOptions: checkpointMetadata.taskConfiguration ?? [:],
+        maxEpisodeSteps: checkpointMetadata.maxEpisodeSteps,
+        controlDecimation: checkpointMetadata.controlDecimation)
+    // Explicit evaluation overrides are patches to the serialized task, not
+    // a replacement configuration. Replacing the dictionary silently reset
+    // every omitted physics/curriculum option to today's defaults, making a
+    // one-parameter ablation change several unrelated variables at once.
+    for (name, value) in o.taskOptions {
+        evaluationOptions[name] = value
+    }
     let task = try BuiltInRLTasks.registry.make(
         taskID, configuration: RLTaskConfiguration(
             numEnvironments: o.envs, seed: o.seed, autoReset: false,
-            options: o.taskOptions))
-    let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
+            options: evaluationOptions))
     let metrics = try VectorPPOTrainer.evaluate(
         task: task, checkpointDirectory: checkpointDirectory,
         episodes: o.episodes, seed: o.seed,
@@ -893,6 +1057,12 @@ case "trace-rl":
         taskID, configuration: RLTaskConfiguration(
             numEnvironments: 1, seed: o.seed, autoReset: false,
             options: replayOptions))
+    if args.contains("--training-mode"),
+       let trainingTask = task as? any TrainingModeConfigurable {
+        trainingTask.setTrainingMode(true)
+        trainingTask.setTrainingProgress(environmentSteps: Int(
+            o.taskOptions["trainingEnvironmentSteps"] ?? 0))
+    }
     guard metadata.compatibilityMismatches(with: task.spec).isEmpty else {
         fail("checkpoint/task mismatch for deterministic trace")
     }
@@ -904,11 +1074,26 @@ case "trace-rl":
     for step in 0..<min(o.frames, task.spec.maxEpisodeSteps) {
         let expertGates = (task as? any PolicyExpertGateProviding)?
             .policyExpertGates(observation.policy)
+        let expertActionMask = (task as? any PolicyExpertGateProviding)?
+            .policyExpertActionMask
         let standExpertGates = (task as? any PolicyStandExpertGateProviding)?
             .policyStandExpertGates(observation.policy)
+        let standExpertActionMask =
+            (task as? any PolicyStandExpertGateProviding)?
+                .policyStandExpertActionMask
+        let auxiliaryExpertGates =
+            (task as? any PolicyAuxiliaryExpertGateProviding)?
+                .policyAuxiliaryExpertGates(observation.policy)
+        let auxiliaryExpertActionMask =
+            (task as? any PolicyAuxiliaryExpertGateProviding)?
+                .policyAuxiliaryExpertActionMask
         let actions = try runner.actions(
             for: observation, expertGates: expertGates,
-            standExpertGates: standExpertGates)
+            expertActionMask: expertActionMask,
+            standExpertGates: standExpertGates,
+            standExpertActionMask: standExpertActionMask,
+            auxiliaryExpertGates: auxiliaryExpertGates,
+            auxiliaryExpertActionMask: auxiliaryExpertActionMask)
         try task.step(actions: actions, into: &result)
         if let pushT = task as? ManiSkillPushTTask {
             let state = pushT.environment.states()[0]
@@ -984,17 +1169,194 @@ case "trace-rl":
                 state.root.position.z, clearance, result.rewards[0],
                 result.terminated[0] || result.truncated[0]
                     ? "true" : "false"))
+        } else if let carry = task as? HumanoidBoxCarryTask {
+            let robot = carry.environment.states()[0]
+            let item = carry.environment.manipulationStates()[0]
+            let forward = robot.root.rotation.act(F3(1, 0, 0))
+            let rootYaw = atan2(forward.y, forward.x)
+            let command = F3(
+                observation.policy[9],
+                observation.policy[10],
+                observation.policy[11])
+            let left = result.metrics["state/left_hand_contact"]?[0] ?? 0
+            let right = result.metrics["state/right_hand_contact"]?[0] ?? 0
+            let reach = result.metrics["state/reach_distance_m"]?[0] ?? .nan
+            let distance = result.metrics["state/carry_distance_m"]?[0] ?? 0
+            let phase = result.metrics["state/task_phase"]?[0] ?? .nan
+            let clearance = result.metrics["state/box_clearance_m"]?[0] ?? .nan
+            let missed = result.metrics[
+                "state/missed_bilateral_contact_steps"]?[0] ?? 0
+            let ground = result.metrics["state/box_ground_contact"]?[0] ?? 0
+            let pedestal = result.metrics[
+                "state/box_pedestal_contact"]?[0] ?? 0
+            let destination = result.metrics[
+                "state/box_destination_contact"]?[0] ?? 0
+            let placement = result.metrics[
+                "state/placement_distance_m"]?[0] ?? .nan
+            let released = result.metrics["state/released"]?[0] ?? 0
+            let stableUnsupported = result.metrics[
+                "state/stable_unsupported_steps"]?[0] ?? 0
+            let handoff = result.metrics[
+                "state/carry_handoff_progress"]?[0] ?? 0
+            let manipulationHandoff = result.metrics[
+                "state/manipulation_handoff_progress"]?[0] ?? 0
+            let commandRamp = result.metrics[
+                "state/carry_command_progress"]?[0] ?? 0
+            if args.contains("--trace-actions") {
+                let formatted = actions.values.map {
+                    String(format: "%+.5f", $0)
+                }.joined(separator: ",")
+                print("actions [\(formatted)]")
+            }
+            print(String(format:
+                "%3d root (%+.3f,%+.3f,%.3f) yaw %+.3f "
+                    + "cmd (%+.3f,%+.3f,%+.3f) box (%+.3f,%+.3f,%.3f) "
+                    + "hands_z (%.3f,%.3f) contact %.0f/%.0f reach %.3f "
+                    + "carry %.3f phase %.0f clearance %.3f missed %.0f "
+                    + "support %.0f/%.0f/%.0f goal %.3f released %.0f hold %.0f "
+                    + "manip %.2f handoff %.2f command %.2f "
+                    + "reward %+.4f done %@",
+                step + 1, robot.root.position.x, robot.root.position.y,
+                robot.root.position.z, rootYaw,
+                command.x, command.y, command.z,
+                item.object.position.x, item.object.position.y,
+                item.object.position.z,
+                item.leftHand.position.z, item.rightHand.position.z,
+                left, right, reach, distance, phase, clearance, missed,
+                ground, pedestal, destination, placement, released,
+                stableUnsupported,
+                manipulationHandoff, handoff, commandRamp, result.rewards[0],
+                result.terminated[0] || result.truncated[0]
+                    ? "true" : "false"))
         } else {
             print(String(format: "%3d action_mean_abs %.5f reward %+.5f done %@",
                          step + 1,
                          actions.values.map(abs).reduce(0, +)
                             / Float(max(actions.values.count, 1)),
                          result.rewards[0],
-                         result.terminated[0] || result.truncated[0]
-                            ? "true" : "false"))
+                result.terminated[0] || result.truncated[0]
+                    ? "true" : "false"))
         }
         observation = result.observations
         if result.terminated[0] || result.truncated[0] { break }
+    }
+
+case "distill-h1-box-lift":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let checkpoint = o.checkpoint, o.runName != "ppo" else {
+        fail("usage: avbd distill-h1-box-lift --checkpoint DIR "
+            + "--run PROBE_REPORT_JSON --output DIR")
+    }
+    let output = o.output ?? "runs/humanoid-box-carry-v0/carry-distilled"
+    let report = try HumanoidBoxCarryDistillation.run(
+        checkpointDirectory: checkpoint,
+        probeReportPath: o.runName,
+        outputDirectory: output,
+        configuration: .init(
+            collectionEnvironments: o.envs,
+            contactDwellSteps: Int(
+                o.taskOptions["contactDwellSteps"] ?? 12),
+            probeSteps: o.frames,
+            epochs: o.updates,
+            learningRate: o.lr,
+            maximumGradientNorm: o.maxGradientNorm,
+            aggregationRounds: Int(
+                o.taskOptions["aggregationRounds"] ?? 1),
+            initialTeacherMix:
+                o.taskOptions["initialTeacherMix"] ?? 0.75,
+            finalTeacherMix:
+                o.taskOptions["finalTeacherMix"] ?? 0,
+            rolloutArmNoiseStandardDeviation:
+                o.taskOptions["rolloutArmNoiseStandardDeviation"] ?? 0.01,
+            stateAlignedTeacherQueries:
+                o.taskOptions["stateAlignedTeacherQueries"] == 1,
+            physicalStateWeighting:
+                o.taskOptions["physicalStateWeighting"] == 1,
+            armActionWeight:
+                o.taskOptions["armActionWeight"] ?? 1,
+            probeSeed: o.seed))
+    print(String(format:
+        "distilled %d -> %d rows/%d rounds, clearance %.4fm, carry %.3fm/%dfr, "
+            + "action MSE %.6g -> %.6g, snapshots %d",
+        report.teacherRows, report.aggregatedRows, report.aggregationRounds,
+        report.teacherMaximumClearanceMeters,
+        report.teacherMaximumCarryDistanceMeters,
+        report.teacherMaximumStableUnsupportedSteps,
+        report.initialMeanSquaredActionError,
+        report.finalMeanSquaredActionError, report.snapshots.count))
+
+case "probe-h1-box-lift":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let checkpoint = o.checkpoint else {
+        fail("usage: avbd probe-h1-box-lift --checkpoint DIR "
+            + "[--envs N --updates GENERATIONS --frames PROBE_STEPS --json]")
+    }
+    let initialProbeTrajectory: [Float]? = try {
+        guard o.runName != "ppo" else { return nil }
+        let prior = try JSONDecoder().decode(
+            HumanoidBoxCarryActuationProbeReport.self,
+            from: Data(contentsOf: URL(fileURLWithPath: o.runName)))
+        return prior.bestArmTarget
+    }()
+    let configuration = HumanoidBoxCarryActuationProbeConfiguration(
+        populationSize: o.envs,
+        generations: o.updates,
+        maximumWarmupSteps: Int(
+            o.taskOptions["maximumWarmupSteps"] ?? 600),
+        contactDwellSteps: Int(
+            o.taskOptions["contactDwellSteps"] ?? 8),
+        probeSteps: o.frames,
+        rampSteps: Int(o.taskOptions["rampSteps"] ?? 24),
+        trajectoryKnotCount: Int(
+            o.taskOptions["trajectoryKnotCount"] ?? 3),
+        sustainedCarryObjective:
+            o.taskOptions["sustainedCarryObjective"] == 1,
+        initialStandardDeviation:
+            o.taskOptions["initialStandardDeviation"] ?? 0.30,
+        initialArmTrajectory: initialProbeTrajectory,
+        eliteFraction: o.taskOptions["eliteFraction"] ?? 0.125,
+        seed: o.seed)
+    let report = try HumanoidBoxCarryActuationProbe.run(
+        checkpointDirectory: checkpoint, configuration: configuration)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(report)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+    if o.json {
+        print(String(decoding: data, as: UTF8.self))
+    } else {
+        for generation in report.generations {
+            print(String(format:
+                "probe %2d warmup %3d score %+.3f rise %+.4fm "
+                    + "clearance %+.4fm carry %.3fm goal +%.3fm/%.3fm "
+                    + "contact %.1f%% "
+                    + "stable %.1f%%/%dfr %@",
+                generation.generation, generation.warmupSteps,
+                generation.bestScore,
+                generation.maximumBoxCenterRiseMeters,
+                generation.maximumBoxClearanceMeters,
+                generation.maximumCarryDistanceMeters ?? 0,
+                generation.maximumDestinationProgressMeters ?? 0,
+                generation.minimumPlacementPlanarDistanceMeters ?? .nan,
+                generation.bilateralContactFraction * 100,
+                generation.unsupportedFraction * 100,
+                generation.maximumStableUnsupportedSteps ?? 0,
+                generation.physicallyLifted ? "LIFTED" : "planted"))
+        }
+        print("best bounded arm target ["
+            + report.bestArmTarget.map { String(format: "%+.5f", $0) }
+                .joined(separator: ",") + "]")
+        let passed = configuration.sustainedCarryObjective
+            ? report.succeeded == true : report.physicallyLifted
+        print(passed
+            ? "physical carry feasibility PASS"
+            : "physical carry feasibility FAIL")
     }
 
 case "eval-arm-expert":
