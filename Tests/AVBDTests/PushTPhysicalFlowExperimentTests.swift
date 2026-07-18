@@ -4,6 +4,18 @@ import simd
 @testable import AVBDLearn
 
 final class PushTPhysicalFlowExperimentTests: XCTestCase {
+    func testTaskGeneralBalancedObjectiveTargetsWorstConstraint() {
+        let evaluation = PhysicalFlowBalancedObjective.evaluate(
+            normalizedErrors: [0.5, 1, 2])
+        XCTAssertEqual(evaluation.maximumNormalizedError, 2)
+        XCTAssertEqual(
+            evaluation.meanSquaredNormalizedError, 1.75, accuracy: 1e-6)
+        XCTAssertEqual(evaluation.bottleneckLoss, 4.4375, accuracy: 1e-6)
+        XCTAssertFalse(evaluation.satisfiesEveryConstraint)
+        XCTAssertTrue(PhysicalFlowBalancedObjective.evaluate(
+            normalizedErrors: [0.999, 0.2]).satisfiesEveryConstraint)
+    }
+
     func testClampedCubicSplineInterpolatesEndpointsAndConvexHull() {
         let points = [
             SIMD2<Float>(-1, 0.5), SIMD2<Float>(-0.4, 1.2),
@@ -69,6 +81,11 @@ final class PushTPhysicalFlowExperimentTests: XCTestCase {
         XCTAssertLessThan(report.selectedReplayLoss, 1e-7)
         XCTAssertLessThan(report.selectedReplayMaximumStateError, 1e-5)
         XCTAssertTrue(report.optimizedSpline.loss.isFinite)
+        XCTAssertEqual(report.generationZeroSelectedProposal, .notApplicable)
+        XCTAssertNil(report.providedProposalProbeBestLoss)
+        XCTAssertNil(report.geometricProposalProbeBestLoss)
+        XCTAssertEqual(report.generationZeroProbeCandidates, 0)
+        XCTAssertEqual(report.generationZeroExploitationCandidates, 0)
         XCTAssertEqual(report.bestControlPointsXY.count, 8)
         XCTAssertEqual(
             report.teacherSample.schemaVersion,
@@ -101,9 +118,53 @@ final class PushTPhysicalFlowExperimentTests: XCTestCase {
         XCTAssertEqual(
             report.teacherSample.canonicalInternalControlPointsXY.count, 4)
         XCTAssertTrue(report.initialProposalSpline.loss.isFinite)
+        XCTAssertNotEqual(
+            report.generationZeroSelectedProposal, .notApplicable)
+        XCTAssertNotNil(report.providedProposalProbeBestLoss)
+        XCTAssertNotNil(report.geometricProposalProbeBestLoss)
+        XCTAssertEqual(report.generationZeroProbeCandidates, 8)
+        XCTAssertEqual(report.generationZeroExploitationCandidates, 0)
         XCTAssertLessThanOrEqual(
             report.optimizedSpline.loss,
             min(report.initialProposalSpline.loss,
                 report.geometricProposalSpline.loss) + 1e-6)
+    }
+
+    func testExactPhysicsProbeRejectsBadProviderAtMatchedCandidateBudget()
+        throws {
+        let configuration = PushTPhysicalFlowConfiguration(
+            populationSize: 16, simulationBatchSize: 8,
+            generations: 1, horizon: 8,
+            controlPointCount: 4, substeps: 2,
+            sourcePreparationSteps: 160,
+            objective: .balancedEndpointBottleneck,
+            initialStandardDeviation: 0.5, eliteFraction: 0.25,
+            seed: 83)
+        let report = try PushTPhysicalFlowExperiment.run(
+            configuration: configuration,
+            proposalProvider: { _ in [2.95, 2.95, 2.95, 2.95] })
+
+        XCTAssertEqual(report.generationZeroSelectedProposal, .geometric)
+        XCTAssertEqual(report.objective, .balancedEndpointBottleneck)
+        XCTAssertEqual(
+            report.optimizedSpline.loss,
+            report.optimizedSpline.balancedEndpointBottleneckLoss,
+            accuracy: 1e-6)
+        XCTAssertTrue(report.optimizedSpline.legacyWeightedLoss.isFinite)
+        XCTAssertTrue(
+            report.optimizedSpline.maximumNormalizedEndpointError.isFinite)
+        XCTAssertEqual(report.generationZeroProbeCandidates, 8)
+        XCTAssertEqual(report.generationZeroExploitationCandidates, 8)
+        XCTAssertGreaterThan(
+            report.providedProposalProbeBestLoss!,
+            report.geometricProposalProbeBestLoss!)
+        XCTAssertLessThanOrEqual(
+            report.optimizedSpline.loss,
+            report.geometricProposalProbeBestLoss! + 1e-6)
+        let expectedControlSteps = configuration.simulationBatchSize * (
+            report.sourcePreparationSteps + 3 * configuration.horizon)
+            + configuration.populationSize * configuration.horizon
+        XCTAssertEqual(
+            report.simulatedEnvironmentControlSteps, expectedControlSteps)
     }
 }

@@ -89,6 +89,92 @@ struct Options {
     var gaitMaximumPlacement: Float = 0.045
 }
 
+/// Reads the action trajectory from either a probe or physical-flow artifact
+/// without requiring every diagnostic field in that artifact to match the
+/// current report schema. Experiment results are durable inputs: adding a new
+/// metric must not invalidate a previously verified physical trajectory.
+func humanoidBoxTrajectory(from data: Data) -> [Float]? {
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any] else {
+        return nil
+    }
+    for key in ["bestTrajectory", "bestArmTarget"] {
+        guard let values = dictionary[key] as? [NSNumber] else { continue }
+        let trajectory = values.map(\.floatValue)
+        guard !trajectory.isEmpty,
+              trajectory.allSatisfy(\.isFinite) else { continue }
+        return trajectory
+    }
+    return nil
+}
+
+/// Resolves a physical-flow artifact into the complete simulator-executed
+/// lineage needed to reproduce its terminal state. Older single-stage flow
+/// reports are accepted and become a one-element lineage.
+func humanoidBoxFlowSourceStages(
+    from data: Data, useTargetGeneratingTrajectory: Bool = false
+) -> [HumanoidBoxPhysicalFlowStage]? {
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any],
+          let ownValues = dictionary[
+            useTargetGeneratingTrajectory
+                ? "targetGeneratingTrajectory" : "bestTrajectory"]
+            as? [NSNumber],
+          let ownSteps = dictionary["selectedTargetStep"] as? NSNumber,
+          ownSteps.intValue > 0 else {
+        return nil
+    }
+    if useTargetGeneratingTrajectory {
+        let explicitPass = dictionary["targetPlanningGatePassed"] as? Bool
+        let inferredPass = (dictionary["targetGatePassed"] as? Bool) == true
+            && ((dictionary["targetCloneSuccessFraction"]
+                as? NSNumber)?.floatValue ?? 0) >= 0.8
+            && ((dictionary["targetReplayMaximumNormalizedError"]
+                as? NSNumber)?.floatValue ?? .infinity) < 0.02
+        guard explicitPass == true || inferredPass,
+              ((dictionary["targetGenerationSteps"]
+                as? NSNumber)?.intValue ?? 0) > 0 else { return nil }
+    }
+    var stages = [HumanoidBoxPhysicalFlowStage]()
+    if let encodedStages = dictionary["sourceStages"]
+            as? [[String: Any]] {
+        for encoded in encodedStages {
+            guard let values = encoded["trajectory"] as? [NSNumber],
+                  let steps = encoded["controlSteps"] as? NSNumber,
+                  steps.intValue > 0 else { return nil }
+            let duration = (encoded["trajectoryDurationSteps"]
+                as? NSNumber)?.intValue
+            let trajectory = values.map(\.floatValue)
+            guard !trajectory.isEmpty,
+                  trajectory.allSatisfy(\.isFinite) else { return nil }
+            stages.append(.init(
+                trajectory: trajectory, controlSteps: steps.intValue,
+                trajectoryDurationSteps: duration))
+        }
+    }
+    let ownTrajectory = ownValues.map(\.floatValue)
+    guard !ownTrajectory.isEmpty,
+          ownTrajectory.allSatisfy(\.isFinite) else { return nil }
+    stages.append(.init(
+        trajectory: ownTrajectory, controlSteps: ownSteps.intValue,
+        trajectoryDurationSteps: useTargetGeneratingTrajectory
+            ? (dictionary["targetGenerationSteps"] as? NSNumber)?.intValue
+            : nil))
+    return stages
+}
+
+func humanoidBoxTargetGeneratingTrajectory(from data: Data) -> [Float]? {
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any],
+          let values = dictionary["targetGeneratingTrajectory"]
+            as? [NSNumber] else {
+        return nil
+    }
+    let trajectory = values.map(\.floatValue)
+    return !trajectory.isEmpty && trajectory.allSatisfy(\.isFinite)
+        ? trajectory : nil
+}
+
 func parseOptions(_ args: [String]) -> Options {
     var o = Options()
     var i = 0
@@ -310,7 +396,10 @@ func makeScene(_ name: String, _ o: Options) -> PhysicsScene {
 func makePushTPhysicalFlowConfiguration(
     _ o: Options, arguments: [String], defaultGenerations: Int = 6
 ) -> PushTPhysicalFlowConfiguration {
-    PushTPhysicalFlowConfiguration(
+    let endpointContact = o.algorithm.hasPrefix("endpoint-contact")
+    let fullCovariance = o.algorithm.contains("full-cem")
+    let balancedObjective = o.algorithm.hasSuffix("balanced")
+    return PushTPhysicalFlowConfiguration(
         populationSize: max(8, o.envs),
         simulationBatchSize: max(
             3, min(32, Int(o.taskOptions["simulationBatchSize"] ?? 32))),
@@ -327,11 +416,10 @@ func makePushTPhysicalFlowConfiguration(
             0, Int(o.taskOptions["terminalHoldSteps"] ?? 0)),
         targetGenerationMaximumStep:
             o.taskOptions["targetGenerationMaximumStep"] ?? 0.16,
-        proposal: o.algorithm == "endpoint-contact-cem"
-                || o.algorithm == "endpoint-contact-full-cem"
-            ? .endpointContact : .linearEndpoints,
-        covarianceMode: o.algorithm == "endpoint-contact-full-cem"
-            ? .full : .diagonal,
+        proposal: endpointContact ? .endpointContact : .linearEndpoints,
+        covarianceMode: fullCovariance ? .full : .diagonal,
+        objective: balancedObjective
+            ? .balancedEndpointBottleneck : .legacyWeightedState,
         initialStandardDeviation:
             o.taskOptions["initialStandardDeviation"] ?? 0.65,
         eliteFraction: o.taskOptions["eliteFraction"] ?? 0.1,
@@ -361,8 +449,10 @@ guard let command = args.first else {
       trace-rl <task>  Trace one deterministic policy trajectory step by step
       distill-h1-box-lift  Distill a verified physical lift trajectory into MLX
       probe-h1-box-lift  Audit bounded H1 grasp-to-lift actuation in parallel
+      experiment-h1-box-flow  Reconstruct a hidden physical H1+box future
       eval-arm-expert  Evaluate the batched Push-T demonstration expert
       experiment-pusht-flow  Reconstruct a real Push-T future with spline CEM
+      eval-pusht-flow  Evaluate geometric physical-flow search over many seeds
       collect-pusht-flow-teacher  Build physically verified inverse-flow rows
       train-pusht-flow-proposal  Train one structured MLX spline proposal net
       eval-pusht-flow-proposal  Evaluate learned proposals in exact physics
@@ -1321,6 +1411,192 @@ case "distill-h1-box-lift":
         report.initialMeanSquaredActionError,
         report.finalMeanSquaredActionError, report.snapshots.count))
 
+case "distill-h1-box-flow":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let checkpoint = o.checkpoint, o.runName != "ppo",
+          let output = o.output else {
+        fail("usage: avbd distill-h1-box-flow --checkpoint DIR "
+            + "--run FLOW_REPORT_JSON --output DIR [--updates EPOCHS]")
+    }
+    let report = try HumanoidBoxFlowDistillation.run(
+        checkpointDirectory: checkpoint,
+        flowReportPath: o.runName,
+        outputDirectory: output,
+        configuration: .init(
+            collectionEnvironments: o.envs,
+            contactDwellSteps: Int(
+                o.taskOptions["contactDwellSteps"] ?? 8),
+            epochs: args.contains("--updates") ? o.updates : 200,
+            learningRate: o.lr,
+            maximumGradientNorm: o.maxGradientNorm,
+            targetRowWeight:
+                o.taskOptions["targetRowWeight"] ?? 4,
+            robustReplayCount: Int(
+                o.taskOptions["robustReplayCount"] ?? 32),
+            seed: o.seed))
+    print(String(format:
+        "flow distillation %d rows action MSE %.6g -> %.6g, teacher %.3fm learner %.3fm robust %.0f%% %@",
+        report.teacherRows, report.initialActionMSE,
+        report.finalActionMSE, report.teacherCarryDistanceMeters,
+        report.learnerMaximumStableCarryDistanceMeters,
+        100 * report.learnerRobustFinalSuccessFraction,
+        report.distillationGatePassed ? "PASS" : "FAIL"))
+
+case "experiment-h1-box-flow":
+    guard args.count > 1, !args[1].hasPrefix("--") else {
+        fail("usage: avbd experiment-h1-box-flow <target-probe.json> "
+            + "[proposal-probe.json] --checkpoint DIR [options]")
+    }
+    let targetData = try Data(contentsOf: URL(fileURLWithPath: args[1]))
+    let targetTrajectory: [Float]
+    if let probe = try? JSONDecoder().decode(
+        HumanoidBoxCarryActuationProbeReport.self, from: targetData) {
+        targetTrajectory = probe.bestArmTarget
+    } else if let trajectory = humanoidBoxTargetGeneratingTrajectory(
+        from: targetData) {
+        targetTrajectory = trajectory
+    } else {
+        fail("target must be a box actuation-probe or discovered flow report")
+    }
+    let hasProposal = args.count > 2 && !args[2].hasPrefix("--")
+    let proposalTrajectory: [Float]?
+    if hasProposal {
+        let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+        if let trajectory = humanoidBoxTrajectory(from: data) {
+            proposalTrajectory = trajectory
+        } else {
+            fail("proposal must be a box actuation-probe or physical-flow report")
+        }
+    } else {
+        proposalTrajectory = nil
+    }
+    let o = parseOptions(Array(args.dropFirst(hasProposal ? 3 : 2)))
+    guard let checkpoint = o.checkpoint else {
+        fail("experiment-h1-box-flow requires --checkpoint DIR")
+    }
+    let legBlendKnotCount = Int(
+        o.taskOptions["legBlendKnotCount"] ?? 0)
+    let targetArmParameterCount = targetTrajectory.count.isMultiple(of: 4)
+        ? targetTrajectory.count
+        : targetTrajectory.count - legBlendKnotCount
+    guard targetArmParameterCount > 0,
+          targetArmParameterCount.isMultiple(of: 4) else {
+        fail("target probe trajectory has an invalid knot schema")
+    }
+    let knotCount = targetArmParameterCount / 4
+    let acceptedTrajectoryCounts = Set([
+        targetArmParameterCount,
+        targetArmParameterCount + legBlendKnotCount,
+    ])
+    if let proposalTrajectory,
+       !acceptedTrajectoryCounts.contains(proposalTrajectory.count) {
+        fail("proposal and target probe knot schemas differ")
+    }
+    let sourceStages: [HumanoidBoxPhysicalFlowStage]
+    if o.runName != "ppo" {
+        let data = try Data(contentsOf: URL(fileURLWithPath: o.runName))
+        let useTargetGeneratingSource =
+            o.taskOptions["useTargetGeneratingTrajectoryAsSource"] == 1
+        if let stages = humanoidBoxFlowSourceStages(
+            from: data,
+            useTargetGeneratingTrajectory:
+                useTargetGeneratingSource) {
+            sourceStages = stages
+        } else if useTargetGeneratingSource {
+            fail("--run target-generating source did not pass its planner gate")
+        } else if let trajectory = humanoidBoxTrajectory(from: data) {
+            // Probe artifacts predate explicit flow lineage. They remain
+            // usable when the caller supplies the replay duration.
+            sourceStages = [.init(
+                trajectory: trajectory,
+                controlSteps: Int(
+                    o.taskOptions["sourceTrajectorySteps"] ?? 16))]
+        } else {
+            fail("--run source must be a box physical-flow or probe report")
+        }
+        if sourceStages.contains(where: {
+            !acceptedTrajectoryCounts.contains($0.trajectory.count)
+        }) {
+            fail("source and target trajectory knot schemas differ")
+        }
+    } else {
+        sourceStages = []
+    }
+    let configuration = HumanoidBoxPhysicalFlowConfiguration(
+        populationSize: o.envs,
+        proposalProbeSize: Int(
+            o.taskOptions["proposalProbeSize"] ?? 32),
+        generations: args.contains("--updates") ? o.updates : 6,
+        maximumWarmupSteps: Int(
+            o.taskOptions["maximumWarmupSteps"] ?? 600),
+        contactDwellSteps: Int(
+            o.taskOptions["contactDwellSteps"] ?? 8),
+        targetGenerationSteps: args.contains("--frames") ? o.frames : 400,
+        targetDiscoveryPopulationSize: Int(
+            o.taskOptions["targetDiscoveryPopulationSize"] ?? 0),
+        targetDiscoveryGenerations: Int(
+            o.taskOptions["targetDiscoveryGenerations"] ?? 0),
+        targetDiscoveryInitialStandardDeviation:
+            o.taskOptions["targetDiscoveryInitialStandardDeviation"] ?? 0.25,
+        carryBaseLegActionFractionOverride:
+            o.taskOptions["carryBaseLegActionFractionOverride"],
+        legBlendKnotCount: legBlendKnotCount,
+        minimumTargetCarryDistanceMeters:
+            o.taskOptions["minimumTargetCarryDistanceMeters"] ?? 0,
+        trajectoryKnotCount: knotCount,
+        robustReplayCount: Int(
+            o.taskOptions["robustReplayCount"] ?? 32),
+        initialStandardDeviation:
+            o.taskOptions["initialStandardDeviation"] ?? 0.25,
+        eliteFraction: o.taskOptions["eliteFraction"] ?? 0.05,
+        seed: o.seed)
+    let report = try HumanoidBoxPhysicalFlowExperiment.run(
+        checkpointDirectory: checkpoint,
+        targetTrajectory: o.taskOptions["zeroTargetTrajectory"] == 1
+            ? [Float](repeating: 0,
+                count: targetArmParameterCount + legBlendKnotCount)
+            : targetTrajectory,
+        proposalTrajectory: proposalTrajectory,
+        sourceStages: sourceStages,
+        configuration: configuration)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(report)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+    if o.json {
+        print(String(decoding: data, as: UTF8.self))
+    } else {
+        print(String(format:
+            "H1 box flow source %dfr %.0f%% target step %d carry %.3fm clearance %.3fm upright %.3f/%.3f",
+            report.sourceTrajectorySteps,
+            100 * report.sourceReplaySuccessFraction,
+            report.selectedTargetStep, report.targetCarryDistanceMeters,
+            report.targetClearanceMeters,
+            report.targetRobotUprightAlignment,
+            report.targetBoxUprightAlignment))
+        for generation in report.generationHistory {
+            print(String(format:
+                "flow %2d loss %.4f max %.3f median %.4f std %.3f",
+                generation.generation, generation.bestLoss,
+                generation.bestMaximumNormalizedError,
+                generation.medianLoss,
+                generation.meanStandardDeviation))
+        }
+        print(String(format:
+            "optimized max %.3f robust %.0f%% replay %.3g plan %@ reconstruction %@",
+            report.optimized.maximumNormalizedError,
+            100 * report.robustReplaySuccessFraction,
+            report.selectedReplayMaximumNormalizedStateError,
+            report.targetPlanningGatePassed ? "PASS" : "FAIL",
+            report.goGatePassed ? "PASS" : "FAIL"))
+    }
+
 case "probe-h1-box-lift":
     let o = parseOptions(Array(args.dropFirst(1)))
     guard let checkpoint = o.checkpoint else {
@@ -1474,6 +1750,39 @@ case "experiment-pusht-flow":
     }
     print(String(decoding: reportData, as: UTF8.self))
 
+case "eval-pusht-flow":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    let seedStride = UInt64(max(
+        1, Int(o.taskOptions["seedStride"] ?? 104_729)))
+    var reports = [PushTPhysicalFlowReport]()
+    for index in 0..<max(1, o.episodes) {
+        var configuration = makePushTPhysicalFlowConfiguration(
+            o, arguments: args, defaultGenerations: 2)
+        configuration.seed = o.seed &+ UInt64(index) &* seedStride
+        let report = try PushTPhysicalFlowExperiment.run(
+            configuration: configuration)
+        reports.append(report)
+        print(String(format:
+            "geometric flow %3d/%3d seed %llu  objective %.5g  legacy %.5g  robust %.0f%%  go %d",
+            index + 1, max(1, o.episodes), configuration.seed,
+            report.optimizedSpline.loss,
+            report.optimizedSpline.legacyWeightedLoss,
+            100 * report.robustReplaySuccessFraction,
+            report.goGatePassed ? 1 : 0))
+    }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let reportData = try encoder.encode(reports)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try reportData.write(to: url, options: .atomic)
+    } else {
+        print(String(decoding: reportData, as: UTF8.self))
+    }
+
 case "collect-pusht-flow-teacher":
     let o = parseOptions(Array(args.dropFirst(1)))
     guard let output = o.output else {
@@ -1550,7 +1859,8 @@ case "eval-pusht-flow-proposal":
             index + 1, max(1, o.episodes), configuration.seed,
             report.initialProposalSpline.loss, report.optimizedSpline.loss,
             100 * report.robustReplaySuccessFraction,
-            report.goGatePassed ? 1 : 0))
+            report.goGatePassed ? 1 : 0)
+            + "  selected \(report.generationZeroSelectedProposal.rawValue)")
     }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -1594,7 +1904,8 @@ case "eval-pusht-flow-retrieval":
             proposal.lastNormalizedDistance ?? .infinity,
             report.initialProposalSpline.loss, report.optimizedSpline.loss,
             100 * report.robustReplaySuccessFraction,
-            report.goGatePassed ? 1 : 0))
+            report.goGatePassed ? 1 : 0)
+            + "  selected \(report.generationZeroSelectedProposal.rawValue)")
     }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

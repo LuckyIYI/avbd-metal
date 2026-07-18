@@ -148,6 +148,18 @@ public enum PushTCEMCovarianceMode: String, Codable, Sendable {
     case full
 }
 
+public enum PushTPhysicalFlowObjective: String, Codable, Sendable {
+    /// Historical weighted squared state error, retained for exact comparison
+    /// with the first physical-flow experiments.
+    case legacyWeightedState
+    /// Minimize the worst robust-gate-normalized endpoint component, with a
+    /// small mean-square term to keep all state components improving.
+    case balancedEndpointBottleneck
+}
+
+public typealias PushTPhysicalFlowProposalSelection =
+    PhysicalFlowProposalSelection
+
 public struct PushTPhysicalFlowConfiguration: Sendable {
     public var populationSize: Int
     /// Number of collision-isolated replicas advanced by one solver instance.
@@ -163,6 +175,7 @@ public struct PushTPhysicalFlowConfiguration: Sendable {
     public var targetGenerationMaximumStep: Float
     public var proposal: PushTPhysicalFlowProposal
     public var covarianceMode: PushTCEMCovarianceMode
+    public var objective: PushTPhysicalFlowObjective
     public var initialStandardDeviation: Float
     public var eliteFraction: Float
     public var seed: UInt64
@@ -180,6 +193,7 @@ public struct PushTPhysicalFlowConfiguration: Sendable {
         targetGenerationMaximumStep: Float = 0.16,
         proposal: PushTPhysicalFlowProposal = .linearEndpoints,
         covarianceMode: PushTCEMCovarianceMode = .diagonal,
+        objective: PushTPhysicalFlowObjective = .legacyWeightedState,
         initialStandardDeviation: Float = 0.65,
         eliteFraction: Float = 0.1,
         seed: UInt64 = 1
@@ -196,6 +210,7 @@ public struct PushTPhysicalFlowConfiguration: Sendable {
         self.targetGenerationMaximumStep = targetGenerationMaximumStep
         self.proposal = proposal
         self.covarianceMode = covarianceMode
+        self.objective = objective
         self.initialStandardDeviation = initialStandardDeviation
         self.eliteFraction = eliteFraction
         self.seed = seed
@@ -229,7 +244,11 @@ public struct PushTPhysicalFlowConfiguration: Sendable {
 }
 
 public struct PushTPhysicalFlowMetrics: Codable, Sendable {
+    /// Active candidate-ranking objective selected by the configuration.
     public var loss: Float
+    public var legacyWeightedLoss: Float
+    public var balancedEndpointBottleneckLoss: Float
+    public var maximumNormalizedEndpointError: Float
     public var blockPositionErrorMeters: Float
     public var blockYawErrorRadians: Float
     public var blockLinearVelocityErrorMPS: Float
@@ -237,6 +256,18 @@ public struct PushTPhysicalFlowMetrics: Codable, Sendable {
     public var tipPositionErrorMeters: Float
     public var tipLinearVelocityErrorMPS: Float
     public var commandedTargetErrorMeters: Float
+}
+
+/// One source of truth for both robust replay classification and the balanced
+/// search objective. Tests intentionally exercise these exact limits so metric
+/// tuning cannot silently redefine task success.
+public enum PushTPhysicalFlowEndpointGate {
+    public static let blockPositionMeters: Float = 0.05
+    public static let blockYawRadians: Float = 0.1
+    public static let blockLinearVelocityMPS: Float = 0.1
+    public static let blockAngularVelocityRadPS: Float = 0.25
+    public static let tipPositionMeters: Float = 0.1
+    public static let commandedTargetMeters: Float = 0.1
 }
 
 public struct PushTPhysicalFlowGeneration: Codable, Sendable {
@@ -327,6 +358,9 @@ public struct PushTPhysicalFlowReport: Codable, Sendable {
     public var targetGenerationMaximumStep: Float
     public var proposal: PushTPhysicalFlowProposal
     public var covarianceMode: PushTCEMCovarianceMode
+    public var objective: PushTPhysicalFlowObjective
+    public var initialStandardDeviation: Float
+    public var eliteFraction: Float
     public var sourceHadActiveContact: Bool
     public var targetBlockDisplacementMeters: Float
     public var targetBlockYawChangeRadians: Float
@@ -347,6 +381,12 @@ public struct PushTPhysicalFlowReport: Codable, Sendable {
     public var fittedReferenceSpline: PushTPhysicalFlowMetrics
     public var geometricProposalSpline: PushTPhysicalFlowMetrics
     public var initialProposalSpline: PushTPhysicalFlowMetrics
+    public var generationZeroSelectedProposal:
+        PushTPhysicalFlowProposalSelection
+    public var providedProposalProbeBestLoss: Float?
+    public var geometricProposalProbeBestLoss: Float?
+    public var generationZeroProbeCandidates: Int
+    public var generationZeroExploitationCandidates: Int
     public var randomShooting: PushTPhysicalFlowMetrics
     public var optimizedSpline: PushTPhysicalFlowMetrics
     public var optimizedToLinearLossRatio: Float
@@ -490,7 +530,9 @@ public enum PushTPhysicalFlowExperiment {
         let targetCloneDiagnostics = targetReplicas.enumerated().dropFirst()
             .map { environment, state in
                 (environment: environment,
-                 loss: metrics(from: state, to: target).loss,
+                 loss: metrics(
+                    from: state, to: target,
+                    objective: configuration.objective).loss,
                  maximumError: maximumStateError(state, target))
             }
         let targetCloneSpread = targetCloneDiagnostics.map(\.loss).max() ?? 0
@@ -525,9 +567,15 @@ public enum PushTPhysicalFlowExperiment {
         let calibrationStates = rollout(
             environment: environment, source: source,
             paths: calibrationPaths, configuration: configuration)
-        let referenceMetrics = metrics(from: calibrationStates[0], to: target)
-        let linearMetrics = metrics(from: calibrationStates[1], to: target)
-        let fittedMetrics = metrics(from: calibrationStates[2], to: target)
+        let referenceMetrics = metrics(
+            from: calibrationStates[0], to: target,
+            objective: configuration.objective)
+        let linearMetrics = metrics(
+            from: calibrationStates[1], to: target,
+            objective: configuration.objective)
+        let fittedMetrics = metrics(
+            from: calibrationStates[2], to: target,
+            objective: configuration.objective)
 
         var generator = PhysicalFlowRandomNumberGenerator(
             seed: configuration.seed &+ 0xA11CE)
@@ -571,43 +619,45 @@ public enum PushTPhysicalFlowExperiment {
         var randomShootingBest: Candidate?
         var initialProposalMetrics: PushTPhysicalFlowMetrics?
         var geometricProposalMetrics: PushTPhysicalFlowMetrics?
+        var generationZeroSelectedProposal:
+            PushTPhysicalFlowProposalSelection = .notApplicable
+        var providedProposalProbeBestLoss: Float?
+        var geometricProposalProbeBestLoss: Float?
+        var generationZeroProbeCandidates = 0
+        var generationZeroExploitationCandidates = 0
         var generationHistory = [PushTPhysicalFlowGeneration]()
+        var searchReplicaRollouts = 0
 
-        for generation in 0..<configuration.generations {
-            let samplingTransform = cholesky(searchCovariance)
-            var controls = [[SIMD2<Float>]]()
-            controls.reserveCapacity(population)
-            for candidateIndex in 0..<population {
-                let parameters: [Float]
-                if candidateIndex == 0 {
-                    parameters = searchMean
-                } else if generation == 0, hasLearnedProposal,
-                          candidateIndex == 1 {
-                    parameters = geometricParameters
-                } else if candidateIndex == 1, let overallBest {
-                    parameters = Array(overallBest.controlPoints
-                        .dropFirst().dropLast())
-                        .flatMap { [$0.x, $0.y] }
-                } else {
-                    let noise = searchMean.map { _ in generator.normal() }
-                    let samplingCenter = generation == 0
-                            && hasLearnedProposal
-                            && candidateIndex.isMultiple(of: 2)
-                        ? geometricParameters : searchMean
-                    parameters = searchMean.indices.map { row in
-                        let delta = (0...row).reduce(Float(0)) {
-                            $0 + samplingTransform[row][$1] * noise[$1]
-                        }
-                        return simd_clamp(
-                            samplingCenter[row] + delta, -3, 3)
-                    }
-                }
-                controls.append(
-                    [source.commandedTipTarget] + stride(
-                        from: 0, to: parameters.count, by: 2).map {
-                            SIMD2(parameters[$0], parameters[$0 + 1])
-                        } + [target.commandedTipTarget])
+        func parameters(from controlPoints: [SIMD2<Float>]) -> [Float] {
+            Array(controlPoints.dropFirst().dropLast()).flatMap {
+                [$0.x, $0.y]
             }
+        }
+
+        func controlPoints(from parameters: [Float]) -> [SIMD2<Float>] {
+            [source.commandedTipTarget] + stride(
+                from: 0, to: parameters.count, by: 2).map {
+                    SIMD2(parameters[$0], parameters[$0 + 1])
+                } + [target.commandedTipTarget]
+        }
+
+        func sampledParameters(
+            around center: [Float], transform: [[Float]],
+            generator: inout PhysicalFlowRandomNumberGenerator
+        ) -> [Float] {
+            let noise = center.map { _ in generator.normal() }
+            return center.indices.map { row in
+                let delta = (0...row).reduce(Float(0)) {
+                    $0 + transform[row][$1] * noise[$1]
+                }
+                return simd_clamp(center[row] + delta, -3, 3)
+            }
+        }
+
+        func evaluate(_ controls: [[SIMD2<Float>]]) -> [Candidate] {
+            precondition(!controls.isEmpty)
+            searchReplicaRollouts += ((controls.count + simulationBatch - 1)
+                / simulationBatch) * simulationBatch
             let paths = controls.map {
                 path(controlPoints: $0, horizon: configuration.horizon,
                      terminalHoldSteps: configuration.terminalHoldSteps)
@@ -615,11 +665,109 @@ public enum PushTPhysicalFlowExperiment {
             let terminals = rollout(
                 environment: environment, source: source,
                 paths: paths, configuration: configuration)
-            let candidates = (0..<population).map { index in
-                Candidate(environment: index % simulationBatch,
-                          controlPoints: controls[index],
-                          metrics: metrics(from: terminals[index], to: target),
-                          terminal: terminals[index])
+            return controls.indices.map { index in
+                Candidate(
+                    environment: index % simulationBatch,
+                    controlPoints: controls[index],
+                    metrics: metrics(
+                        from: terminals[index], to: target,
+                        objective: configuration.objective),
+                    terminal: terminals[index])
+            }
+        }
+
+        for generation in 0..<configuration.generations {
+            let samplingTransform = cholesky(searchCovariance)
+            let candidates: [Candidate]
+            if generation == 0, hasLearnedProposal {
+                // One resident physics batch is an equal, exact-simulation
+                // probe of the provided and geometric neighborhoods. The rest
+                // of the fixed population is then spent around the physically
+                // better probe result, rather than trusting either prior.
+                let maximumProbeCount = min(simulationBatch, population)
+                let probeCount = max(2, maximumProbeCount
+                    - maximumProbeCount % 2)
+                var probeControls = [[SIMD2<Float>]]()
+                var probeSources = [PushTPhysicalFlowProposalSelection]()
+                probeControls.reserveCapacity(probeCount)
+                probeSources.reserveCapacity(probeCount)
+                for candidateIndex in 0..<probeCount {
+                    let sourceKind: PushTPhysicalFlowProposalSelection =
+                        candidateIndex.isMultiple(of: 2)
+                            ? .provided : .geometric
+                    let center = sourceKind == .provided
+                        ? searchMean : geometricParameters
+                    let parameters: [Float]
+                    if candidateIndex == 0 || candidateIndex == 1 {
+                        parameters = center
+                    } else {
+                        parameters = sampledParameters(
+                            around: center, transform: samplingTransform,
+                            generator: &generator)
+                    }
+                    probeControls.append(controlPoints(from: parameters))
+                    probeSources.append(sourceKind)
+                }
+                let probeCandidates = evaluate(probeControls)
+                var bestProvided = probeCandidates[0]
+                var bestGeometric = probeCandidates[1]
+                for index in probeCandidates.indices {
+                    let candidate = probeCandidates[index]
+                    if probeSources[index] == .provided,
+                       candidate.metrics.loss < bestProvided.metrics.loss {
+                        bestProvided = candidate
+                    } else if probeSources[index] == .geometric,
+                              candidate.metrics.loss
+                                < bestGeometric.metrics.loss {
+                        bestGeometric = candidate
+                    }
+                }
+                providedProposalProbeBestLoss = bestProvided.metrics.loss
+                geometricProposalProbeBestLoss = bestGeometric.metrics.loss
+                let selectedProbe: Candidate
+                if bestProvided.metrics.loss <= bestGeometric.metrics.loss {
+                    generationZeroSelectedProposal = .provided
+                    selectedProbe = bestProvided
+                } else {
+                    generationZeroSelectedProposal = .geometric
+                    selectedProbe = bestGeometric
+                }
+                generationZeroProbeCandidates = probeCount
+
+                let exploitationCount = population - probeCount
+                generationZeroExploitationCandidates = exploitationCount
+                if exploitationCount > 0 {
+                    let selectedParameters = parameters(
+                        from: selectedProbe.controlPoints)
+                    let exploitationControls = (0..<exploitationCount).map {
+                        _ in controlPoints(from: sampledParameters(
+                            around: selectedParameters,
+                            transform: samplingTransform,
+                            generator: &generator))
+                    }
+                    candidates = probeCandidates
+                        + evaluate(exploitationControls)
+                } else {
+                    candidates = probeCandidates
+                }
+            } else {
+                var controls = [[SIMD2<Float>]]()
+                controls.reserveCapacity(population)
+                for candidateIndex in 0..<population {
+                    let candidateParameters: [Float]
+                    if candidateIndex == 0 {
+                        candidateParameters = searchMean
+                    } else if candidateIndex == 1, let overallBest {
+                        candidateParameters = parameters(
+                            from: overallBest.controlPoints)
+                    } else {
+                        candidateParameters = sampledParameters(
+                            around: searchMean, transform: samplingTransform,
+                            generator: &generator)
+                    }
+                    controls.append(controlPoints(from: candidateParameters))
+                }
+                candidates = evaluate(controls)
             }
             guard candidates.allSatisfy({ $0.metrics.loss.isFinite }) else {
                 throw RLEnvironmentError.invalidConfiguration(
@@ -725,20 +873,29 @@ public enum PushTPhysicalFlowExperiment {
             configuration: configuration)
         let selectedReplayState = replayStates[best.environment]
         let selectedReplay = metrics(
-            from: selectedReplayState, to: best.terminal)
+            from: selectedReplayState, to: best.terminal,
+            objective: configuration.objective)
         let selectedReplayMaximumError = maximumStateError(
             selectedReplayState, best.terminal)
         let robustReplayMetrics = replayStates.map {
-            metrics(from: $0, to: target)
+            metrics(
+                from: $0, to: target,
+                objective: configuration.objective)
         }
         let robustReplayLosses = robustReplayMetrics.map(\.loss).sorted()
         let robustReplaySuccesses = robustReplayMetrics.filter {
-            $0.blockPositionErrorMeters < 0.05
-                && $0.blockYawErrorRadians < 0.1
-                && $0.blockLinearVelocityErrorMPS < 0.1
-                && $0.blockAngularVelocityErrorRadPS < 0.25
-                && $0.tipPositionErrorMeters < 0.1
-                && $0.commandedTargetErrorMeters < 0.1
+            $0.blockPositionErrorMeters
+                < PushTPhysicalFlowEndpointGate.blockPositionMeters
+                && $0.blockYawErrorRadians
+                    < PushTPhysicalFlowEndpointGate.blockYawRadians
+                && $0.blockLinearVelocityErrorMPS
+                    < PushTPhysicalFlowEndpointGate.blockLinearVelocityMPS
+                && $0.blockAngularVelocityErrorRadPS
+                    < PushTPhysicalFlowEndpointGate.blockAngularVelocityRadPS
+                && $0.tipPositionErrorMeters
+                    < PushTPhysicalFlowEndpointGate.tipPositionMeters
+                && $0.commandedTargetErrorMeters
+                    < PushTPhysicalFlowEndpointGate.commandedTargetMeters
         }.count
         let robustReplaySuccessFraction = Float(robustReplaySuccesses)
             / Float(robustReplayMetrics.count)
@@ -765,15 +922,21 @@ public enum PushTPhysicalFlowExperiment {
         let infrastructureGatePassed = referenceMetrics.loss < 1e-7
             && selectedReplayMaximumError < 1e-4
         let poseGatePassed = targetDisplacement >= 0.05
-            && best.metrics.blockPositionErrorMeters < 0.05
-            && best.metrics.blockYawErrorRadians < 0.1
+            && best.metrics.blockPositionErrorMeters
+                < PushTPhysicalFlowEndpointGate.blockPositionMeters
+            && best.metrics.blockYawErrorRadians
+                < PushTPhysicalFlowEndpointGate.blockYawRadians
             && optimizedToLinear < 0.8
             && optimizedToRandom < 0.8
         let dynamicGatePassed = poseGatePassed
-            && best.metrics.blockLinearVelocityErrorMPS < 0.1
-            && best.metrics.blockAngularVelocityErrorRadPS < 0.25
-            && best.metrics.tipPositionErrorMeters < 0.1
-            && best.metrics.commandedTargetErrorMeters < 0.1
+            && best.metrics.blockLinearVelocityErrorMPS
+                < PushTPhysicalFlowEndpointGate.blockLinearVelocityMPS
+            && best.metrics.blockAngularVelocityErrorRadPS
+                < PushTPhysicalFlowEndpointGate.blockAngularVelocityRadPS
+            && best.metrics.tipPositionErrorMeters
+                < PushTPhysicalFlowEndpointGate.tipPositionMeters
+            && best.metrics.commandedTargetErrorMeters
+                < PushTPhysicalFlowEndpointGate.commandedTargetMeters
         let robustReplayGatePassed = robustReplaySuccessFraction >= 0.8
         let teacherSample = PushTPhysicalFlowTeacherSample(
             schemaVersion: PushTPhysicalFlowTeacherSample.schemaVersion,
@@ -785,12 +948,9 @@ public enum PushTPhysicalFlowExperiment {
             robustReplaySuccessFraction: robustReplaySuccessFraction,
             goGatePassed: infrastructureGatePassed && dynamicGatePassed
                 && robustReplayGatePassed)
-        let paddedPopulation = ((population + simulationBatch - 1)
-            / simulationBatch) * simulationBatch
         let simulatedEnvironmentControlSteps = simulationBatch * (
             sourcePreparationSteps + 3 * configuration.horizon)
-            + paddedPopulation * configuration.generations
-                * configuration.horizon
+            + searchReplicaRollouts * configuration.horizon
         return PushTPhysicalFlowReport(
             experiment: "pusht-state-to-state-physical-flow-v0",
             seed: configuration.seed,
@@ -807,6 +967,10 @@ public enum PushTPhysicalFlowExperiment {
                 configuration.targetGenerationMaximumStep,
             proposal: configuration.proposal,
             covarianceMode: configuration.covarianceMode,
+            objective: configuration.objective,
+            initialStandardDeviation:
+                configuration.initialStandardDeviation,
+            eliteFraction: configuration.eliteFraction,
             sourceHadActiveContact: sourceHasContact,
             targetBlockDisplacementMeters: targetDisplacement,
             targetBlockYawChangeRadians: targetYawChange,
@@ -827,6 +991,16 @@ public enum PushTPhysicalFlowExperiment {
             fittedReferenceSpline: fittedMetrics,
             geometricProposalSpline: geometricProposalMetrics!,
             initialProposalSpline: initialProposalMetrics!,
+            generationZeroSelectedProposal:
+                generationZeroSelectedProposal,
+            providedProposalProbeBestLoss:
+                providedProposalProbeBestLoss,
+            geometricProposalProbeBestLoss:
+                geometricProposalProbeBestLoss,
+            generationZeroProbeCandidates:
+                generationZeroProbeCandidates,
+            generationZeroExploitationCandidates:
+                generationZeroExploitationCandidates,
             randomShooting: random.metrics,
             optimizedSpline: best.metrics,
             optimizedToLinearLossRatio: optimizedToLinear,
@@ -1045,7 +1219,8 @@ public enum PushTPhysicalFlowExperiment {
     }
 
     private static func metrics(
-        from state: PushTPhysicalState, to target: PushTPhysicalState
+        from state: PushTPhysicalState, to target: PushTPhysicalState,
+        objective: PushTPhysicalFlowObjective
     ) -> PushTPhysicalFlowMetrics {
         let blockPosition = length(blockCenter(state) - blockCenter(target))
         let blockYawError = abs(wrappedAngle(blockYaw(state) - blockYaw(target)))
@@ -1066,15 +1241,40 @@ public enum PushTPhysicalFlowExperiment {
             state.tip.linearVelocity - target.tip.linearVelocity)
         let command = length(
             state.commandedTipTarget - target.commandedTipTarget)
-        let loss = 100 * blockPosition * blockPosition
+        let legacyLoss = 100 * blockPosition * blockPosition
             + 4 * blockYawError * blockYawError
             + 0.5 * blockLinearVelocity * blockLinearVelocity
             + 0.1 * blockAngularVelocity * blockAngularVelocity
             + 10 * tipPosition * tipPosition
             + 0.2 * tipLinearVelocity * tipLinearVelocity
             + 2 * command * command
+        let normalizedEndpointErrors = [
+            blockPosition
+                / PushTPhysicalFlowEndpointGate.blockPositionMeters,
+            blockYawError
+                / PushTPhysicalFlowEndpointGate.blockYawRadians,
+            blockLinearVelocity
+                / PushTPhysicalFlowEndpointGate.blockLinearVelocityMPS,
+            blockAngularVelocity
+                / PushTPhysicalFlowEndpointGate.blockAngularVelocityRadPS,
+            tipPosition
+                / PushTPhysicalFlowEndpointGate.tipPositionMeters,
+            command
+                / PushTPhysicalFlowEndpointGate.commandedTargetMeters,
+        ]
+        let balancedEndpoint = PhysicalFlowBalancedObjective.evaluate(
+            normalizedErrors: normalizedEndpointErrors)
+        let maximumNormalizedEndpointError =
+            balancedEndpoint.maximumNormalizedError
+        let balancedLoss = balancedEndpoint.bottleneckLoss
+        let loss = objective == .balancedEndpointBottleneck
+            ? balancedLoss : legacyLoss
         return PushTPhysicalFlowMetrics(
             loss: loss,
+            legacyWeightedLoss: legacyLoss,
+            balancedEndpointBottleneckLoss: balancedLoss,
+            maximumNormalizedEndpointError:
+                maximumNormalizedEndpointError,
             blockPositionErrorMeters: blockPosition,
             blockYawErrorRadians: blockYawError,
             blockLinearVelocityErrorMPS: blockLinearVelocity,
