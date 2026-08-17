@@ -3,6 +3,7 @@ refs/
 .swiftpm/
 .xcbuild/
 .xcbuild-ios/
+.xcbuild-test/
 runs/
 .DS_Store
 *.profraw
