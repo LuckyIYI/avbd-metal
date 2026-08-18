@@ -419,6 +419,17 @@ final class GPUSolverTests: XCTestCase {
         }
     }
 
+    func testMissingShaderResourcesFailWithTypedError() throws {
+        XCTAssertThrowsError(
+            try GPUSolver.validateShaderResourceURLs([])
+        ) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .shaderCompile(
+                    "no .metal resources were found in the AVBDCore bundle"))
+        }
+    }
+
     func testCollisionGroupsIsolateOverlappingSimulationReplicas() throws {
         var scene = PhysicsScene(name: "overlapping-collision-groups")
         scene.settings.dt = 1 / 120

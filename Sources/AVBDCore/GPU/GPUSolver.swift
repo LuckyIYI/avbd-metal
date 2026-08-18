@@ -554,8 +554,10 @@ public final class GPUSolver {
         let lib: MTLLibrary
         do {
             lib = try Self.makeLibrary(device: device)
+        } catch let error as AVBDError {
+            throw error
         } catch {
-            throw AVBDError.shaderCompile("\(error)")
+            throw AVBDError.shaderCompile(error.localizedDescription)
         }
         shaderLib = lib
         for name in lib.functionNames {
@@ -572,6 +574,13 @@ public final class GPUSolver {
         }
     }
 
+    static func validateShaderResourceURLs(_ urls: [URL]) throws {
+        guard !urls.isEmpty else {
+            throw AVBDError.shaderCompile(
+                "no .metal resources were found in the AVBDCore bundle")
+        }
+    }
+
     /// Concatenates the bundled .metal sources (filename order) and compiles.
     static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
         var urls = (Bundle.module.urls(forResourcesWithExtension: "metal", subdirectory: nil) ?? [])
@@ -580,7 +589,7 @@ public final class GPUSolver {
                                       subdirectory: "Shaders") ?? []
         }
         urls.sort { $0.lastPathComponent < $1.lastPathComponent }
-        precondition(!urls.isEmpty, "no .metal resources found in bundle")
+        try validateShaderResourceURLs(urls)
         var source = ""
         for url in urls {
             var text = try String(contentsOf: url, encoding: .utf8)
