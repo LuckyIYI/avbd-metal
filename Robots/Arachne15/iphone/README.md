@@ -85,8 +85,9 @@ iPhone, bridge firmware, and chosen radio link.
 
 The template at `hardware-calibration.template.json` is intentionally invalid:
 `commissioned=false`, no robot serial, no timestamp, zero current limits, and
-zero measured latency. Copy it into a dated calibration run; never edit it into
-a plausible-looking default.
+zero measured latency. Copy it into a dated run under the ignored
+`artifacts/calibration/` directory; never edit it into a plausible-looking
+default.
 
 ## Bridge requirements
 

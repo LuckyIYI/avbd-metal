@@ -18,8 +18,9 @@ being mistaken for a reliable robot controller.
 | Control latency | Seeded 0--40 ms task range | Timestamped iPhone→bridge→servo→encoder round trip |
 
 Raw measurements, scripts, firmware revision, temperature, battery voltage,
-and fixture photos belong together under a dated `calibration/` run. Never
-overwrite the nominal file without retaining the measurement provenance.
+and fixture photos belong together under a dated `artifacts/calibration/` run.
+That tree is intentionally ignored; never overwrite the nominal file without
+retaining the measurement provenance.
 
 ## Fidelity ladder
 
@@ -74,7 +75,8 @@ the aggregators refuse to mix reports from different contracts.
 .xcbuild/Build/Products/Release/avbd eval-rl arachne15-goal-v0 \
   --checkpoint runs/arachne15-goal-v0/accepted/checkpoints/update-NNNNNN \
   --envs 512 --episodes 512 --seed 31001 --allow-task-transfer \
-  --task-option validationCollisionProfile=1 --output validation-31001.json
+  --task-option validationCollisionProfile=1 \
+  --output runs/arachne15-goal-v0/qualification/validation-31001.json
 ```
 
 Supply every non-default task option used by the accepted checkpoint as well;
@@ -86,7 +88,7 @@ evaluated policy rather than copying a mutable run directory:
 ```sh
 .xcbuild/Build/Products/Release/avbd export-policy-rl arachne15-goal-v0 \
   --checkpoint runs/arachne15-goal-v0/accepted/checkpoints/update-NNNNNN \
-  --output field-bundles/arachne15-goal-v0-update-NNNNNN
+  --output artifacts/field-bundles/arachne15-goal-v0-update-NNNNNN
 ```
 
 The exporter refuses to overwrite a bundle. It copies only deterministic

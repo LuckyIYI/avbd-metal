@@ -129,8 +129,8 @@ noise testing.
 
 ## Build the CAD
 
-OpenSCAD `2026.06.12` is installed at `/Applications/OpenSCAD.app` and linked as
-`openscad`. From this directory:
+The CAD was verified with OpenSCAD `2026.06.12`. The build script expects the
+`openscad` executable on `PATH`. From this directory:
 
 ```sh
 ./scripts/build_cad.sh

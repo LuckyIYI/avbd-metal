@@ -55,7 +55,7 @@ app-ml:
 	-cp -R checkpoints AVBD.app/Contents/Resources/ 2>/dev/null
 	-cp .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib AVBD.app/Contents/Resources/ 2>/dev/null
 	-cp -R .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle AVBD.app/Contents/Resources/ 2>/dev/null
-	cp AVBD.app/Contents/Info.plist.tmp AVBD.app/Contents/Info.plist 2>/dev/null || printf '%s\n' \
+	printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	  '<plist version="1.0"><dict>' \

@@ -361,7 +361,11 @@ Adding sigma=0.001 noise through the inherited approach and source lift yields
 0/64 before carry begins. End-to-end approach, grasp, lift, transport,
 destination support, release, and survival remain the task-level objective.
 
-Reproduction:
+The lineage recipe below requires the named ignored `runs/` checkpoint and
+physical-flow report; those generated inputs are not part of a clean clone.
+Its output is also intentionally written under `runs/`.
+
+Reproduction with that archived run tree:
 
 ```sh
 .build/release/avbd distill-h1-box-flow \

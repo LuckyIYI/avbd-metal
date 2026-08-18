@@ -5,6 +5,12 @@ policy. Every native MLX checkpoint in this directory must reconstruct its
 serialized task exactly; `VectorPolicyCompatibilityTests` rejects missing,
 stale, extra, or deprecated task directories.
 
+Serialized `initializationCheckpoint` and `checkpointDirectory` values are
+immutable training provenance. They may name ignored `runs/` output or a
+retired source snapshot; Policy Replay does not follow them. Runtime loading
+uses the policy, metadata, and training state stored in each tracked checkpoint
+directory (plus the deployment manifest where present).
+
 Newly qualified checkpoints keep their sealed held-out report beside the
 weights as `evaluation.json`; Arachne Goal retains its larger multi-seed report
 set under the canonical robot qualification directory linked below.

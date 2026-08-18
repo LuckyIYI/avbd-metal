@@ -42,4 +42,7 @@ checkpoints/external/*
 !checkpoints/arachne15-goal-v0/policy.safetensors
 !checkpoints/arachne15-goal-v0/training-state.json
 !checkpoints/arachne15-goal-v0/deployment-manifest.json
+
+# Maintained repository documentation is tracked beside the relevant source;
+# scratch notes and generated media under the top-level docs tree stay local.
 docs/

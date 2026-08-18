@@ -12,7 +12,7 @@ research playground built on top of it.
 |---|---|
 | **AVBD** (Giles, Diaz, Yuksel, SIGGRAPH 2025) | Core solver: per-color 6×6 LDLᵀ block primal, bounded AL duals, penalty ramping, α-stabilization, γ warm-start |
 | **VBD** (Chen et al., SIGGRAPH 2024) | Block-descent structure the GPU loop follows; trust-region step caps |
-| **OGC** (Chen et al., SIGGRAPH 2025, `refs/ogc_paper.pdf`) | Contact model alignment (face blocks ⊥, radial boundaries) + the penetration-free machinery: 2-ring-excluded conservative bounds, Eq-28 warmstart truncation, counter-driven in-loop bound refresh (indirect dispatch, no CPU sync), divergent cloth-cloth log barrier |
+| **[OGC](https://graphics.cs.utah.edu/research/projects/ogc/)** (Chen et al., SIGGRAPH 2025) | Contact model alignment (face blocks ⊥, radial boundaries) + the penetration-free machinery: 2-ring-excluded conservative bounds, Eq-28 warmstart truncation, counter-driven in-loop bound refresh (indirect dispatch, no CPU sync), divergent cloth-cloth log barrier |
 | **Stable Neo-Hookean** (Smith et al. 2018) | Tet FEM material with per-vertex SPD Hessian |
 | **Bergou et al. 2006** | Quadratic bending; hinge K derived numerically from the intrinsic unfolded shape |
 | **IPC / Codimensional IPC** (Li et al.) | Lagged friction formulation; contact-radius framing |
@@ -44,6 +44,7 @@ spider, and earlier native humanoid research tasks. Policy Replay is narrower:
 it exposes only maintained examples with a packaged current-contract policy.
 
 ```bash
+make build
 .build/release/avbd list-rl
 .build/release/avbd rl-smoke pusht-state-v0 --envs 256 --frames 200
 .build/release/avbd rl-smoke arm-pusht-v0 --envs 128 --frames 200
@@ -76,8 +77,10 @@ signals, and pre-reset final observations. Checkpoints include Safetensors,
 observation statistics, trainer progress, the full PPO configuration, task
 timing, and JSONL training metrics. Deterministic evaluation applies task-owned
 publish gates and exits nonzero when a policy stands still, falls early, misses
-Push-T, or otherwise fails its contract. See
-[the RL architecture and research notes](docs/RL_ARCHITECTURE.md).
+Push-T, or otherwise fails its contract. The tracked extension points are
+[`VectorizedRLTask`](Sources/AVBDCore/Robotics/RLEnvironment.swift) and
+[`VectorRLAlgorithm`](Sources/AVBDLearn/VectorRLAlgorithm.swift); shipped
+checkpoint contracts are indexed in [the checkpoint catalog](checkpoints/README.md).
 
 The packaged H1 Flat actor has been transferred onto the corrected fixed-gain
 actuator contract (`taskRevision=1000010`) and passes its documented held-out
@@ -120,12 +123,11 @@ They are visual-only and are never observations, rewards, or success inputs.
 The H1 gate requires a full 20-second episode plus low linear and yaw tracking
 error; merely standing upright cannot pass.
 
-A frame-locked replay of packaged update 300 at seed 21001 is under
-`artifacts/replays/humanoid-isaac-flat-v0`. It contains 503 frames at 25 fps
-(20.12 seconds) and the matching deterministic one-episode report. That exact
-episode completed all 1,000 controls, traveled 12.78 m, and passed its tracking
-gate; `h1-flat-update300-seed21001-replay.json` records the linkage between
-video, seed, checkpoint fingerprint, and metrics.
+The packaged actor's tracked held-out evidence is
+[`checkpoints/humanoid-isaac-flat-v0/evaluation.json`](checkpoints/humanoid-isaac-flat-v0/evaluation.json).
+Replay videos and frame-locked single-episode reports are generated outputs
+under the ignored `artifacts/` directory; they are deliberately not required
+by a clean clone or treated as release evidence.
 
 ## Quick start
 

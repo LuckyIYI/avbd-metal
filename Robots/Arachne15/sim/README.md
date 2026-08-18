@@ -157,18 +157,20 @@ Run the reproducible batched evaluator:
 
 ```sh
 .build/release/avbd eval-arachne-classical --envs 32 --seed 21001 \
-  --output Robots/Arachne15/baselines/classical/seed-21001.json
+  --output runs/arachne15-classical/seed-21001.json
 ```
 
 The default controller uses a 16-tick cycle at 50 Hz, 16 mm swing clearance, a
 350 ms half-stride horizon, and a 45 mm planar placement bound. The CLI exposes
 `--gait-swing-steps`, `--gait-swing-height`,
 `--gait-placement-horizon`, and `--gait-maximum-placement` for explicit
-experiments. The tracked 2026-07-16 two-seed snapshot reached 56/64 randomized
-goals (87.5%; seed rates 81.25% and 93.75%), survived 64/64 episodes, and
-measured 0.28 mm mean foot-penetration RMSE. This is a useful baseline, not a
-deployment qualification: the immutable learned controller reaches about 95%
-on thousands of held-out episodes and remains the stronger candidate.
+experiments. Evaluation commands write ignored run output; the tracked
+2026-07-16 two-seed snapshot under `Robots/Arachne15/baselines/classical/`
+reached 56/64 randomized goals (87.5%; seed rates 81.25% and 93.75%), survived
+64/64 episodes, and measured 0.28 mm mean foot-penetration RMSE. This is a
+useful baseline, not a deployment qualification: the immutable learned
+controller reaches about 95% on thousands of held-out episodes and remains the
+stronger candidate.
 
 Tests cover exact FK↔IK round trips and require a deterministic front goal to
 be physically reached. The latter fails if joint targets animate without
