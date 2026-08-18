@@ -16,6 +16,17 @@ protocol RenderableModel {
     /// keep the user's camera.
     var cameraEpoch: Int { get }
     func tickIfRunning()
+    /// Stop the driving model and expose a renderer failure through that
+    /// model's existing status UI. Render failures are deliberately separate
+    /// from GPUSolver's terminal physics health.
+    func reportRenderFailure(_ message: String)
+}
+
+extension SimulationModel {
+    func reportRenderFailure(_ message: String) {
+        running = false
+        statsText = "render stopped: \(message)"
+    }
 }
 import AVBDCore
 import simd
@@ -751,6 +762,23 @@ let SPHV = 12 * 18 * 6
 let TORV = 24 * 12 * 6
 let CAPV = (2 * 6 + 1) * 16 * 6
 
+private enum RendererInitializationError: LocalizedError {
+    case commandQueue
+    case shaderFunction(String)
+    case depthState(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .commandQueue:
+            return "could not create the Metal render command queue"
+        case .shaderFunction(let name):
+            return "render shader function '\(name)' is missing"
+        case .depthState(let name):
+            return "could not create the \(name) depth state"
+        }
+    }
+}
+
 final class Renderer: NSObject, MTKViewDelegate {
     static let sampleCount = 4
     static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
@@ -782,7 +810,33 @@ final class Renderer: NSObject, MTKViewDelegate {
     var viewportSize = SIMD2<Float>(1, 1)
     private var framesDrawn = 0
     private var lastCameraEpoch: Int = -1
+    private var lastSolverIdentity: ObjectIdentifier?
     private var envCameraSet = false
+    private var runtimeFailure: String?
+
+    private func reportFailure(_ message: String) {
+        guard runtimeFailure == nil else { return }
+        runtimeFailure = message
+        // A failed render command can leave temporal targets partially
+        // written. Ignore their history if a later frame is retried.
+        prevVP = nil
+        let target = model
+        DispatchQueue.main.async {
+            target?.reportRenderFailure(message)
+        }
+    }
+
+    private func commandFailureDescription(_ command: MTLCommandBuffer) -> String? {
+        guard command.status != .completed || command.error != nil else {
+            return nil
+        }
+        let status = String(describing: command.status)
+        guard let error = command.error as NSError? else {
+            return "Metal command ended with status \(status)"
+        }
+        return "Metal command ended with status \(status): "
+            + "\(error.domain) \(error.code) — \(error.localizedDescription)"
+    }
 
     private var scriptedCaptureAllowed: Bool {
         let environment = ProcessInfo.processInfo.environment
@@ -793,7 +847,10 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     init(device: MTLDevice, model: AnyObject & RenderableModel) throws {
         self.device = device
-        self.queue = device.makeCommandQueue()!
+        guard let queue = device.makeCommandQueue() else {
+            throw RendererInitializationError.commandQueue
+        }
+        self.queue = queue
         self.model = model
         super.init()
         // scripted-capture camera overrides
@@ -808,8 +865,14 @@ final class Renderer: NSObject, MTKViewDelegate {
                   colorFormats: [MTLPixelFormat] = [Renderer.colorFormat],
                   depth: MTLPixelFormat = .depth32Float) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
-            d.vertexFunction = lib.makeFunction(name: v)!
-            d.fragmentFunction = lib.makeFunction(name: f)!
+            guard let vertex = lib.makeFunction(name: v) else {
+                throw RendererInitializationError.shaderFunction(v)
+            }
+            guard let fragment = lib.makeFunction(name: f) else {
+                throw RendererInitializationError.shaderFunction(f)
+            }
+            d.vertexFunction = vertex
+            d.fragmentFunction = fragment
             for (i, fmt) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = fmt
             }
@@ -820,7 +883,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         func depthPipe(_ vertex: String) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
             d.label = "Directional shadow: \(vertex)"
-            d.vertexFunction = lib.makeFunction(name: vertex)!
+            guard let function = lib.makeFunction(name: vertex) else {
+                throw RendererInitializationError.shaderFunction(vertex)
+            }
+            d.vertexFunction = function
             d.fragmentFunction = nil
             d.depthAttachmentPixelFormat = .depth32Float
             d.rasterSampleCount = 1
@@ -865,40 +931,47 @@ final class Renderer: NSObject, MTKViewDelegate {
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
-        depthState = device.makeDepthStencilState(descriptor: dd)
+        guard let depthState = device.makeDepthStencilState(descriptor: dd) else {
+            throw RendererInitializationError.depthState("geometry")
+        }
+        self.depthState = depthState
 
         let nd = MTLDepthStencilDescriptor()
         nd.depthCompareFunction = .always
         nd.isDepthWriteEnabled = false
-        noDepthState = device.makeDepthStencilState(descriptor: nd)
+        guard let noDepthState = device.makeDepthStencilState(descriptor: nd) else {
+            throw RendererInitializationError.depthState("background")
+        }
+        self.noDepthState = noDepthState
 
     }
 
-    private func ensureTargets(_ size: CGSize) {
+    @discardableResult
+    private func ensureTargets(_ size: CGSize) -> Bool {
         let w = max(Int(size.width), 4), h = max(Int(size.height), 4)
-        if targetSize == SIMD2(w, h), posTex != nil, shadowTex != nil { return }
-        targetSize = SIMD2(w, h)
-        func tex(_ fmt: MTLPixelFormat) -> MTLTexture {
+        if targetSize == SIMD2(w, h), posTex != nil, normTex != nil,
+           aoTexA != nil, aoTexB != nil, histTex != nil, prevPosTex != nil,
+           preDepthTex != nil, shadowTex != nil { return true }
+        func tex(_ fmt: MTLPixelFormat) -> MTLTexture? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt,
                                                              width: w, height: h,
                                                              mipmapped: false)
             d.usage = [.renderTarget, .shaderRead]
             d.storageMode = .private
-            return device.makeTexture(descriptor: d)!
+            return device.makeTexture(descriptor: d)
         }
-        posTex = tex(.rgba32Float)
-        normTex = tex(.rgba16Float)
-        aoTexA = tex(.r8Unorm)
-        aoTexB = tex(.r8Unorm)
-        histTex = tex(.r8Unorm)
-        prevPosTex = tex(.rgba32Float)
-        prevVP = nil                      // resize invalidates history
+        let newPos = tex(.rgba32Float)
+        let newNorm = tex(.rgba16Float)
+        let newAOA = tex(.r8Unorm)
+        let newAOB = tex(.r8Unorm)
+        let newHistory = tex(.r8Unorm)
+        let newPreviousPosition = tex(.rgba32Float)
         let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                                                           width: w, height: h,
                                                           mipmapped: false)
         dd.usage = .renderTarget
         dd.storageMode = .private
-        preDepthTex = device.makeTexture(descriptor: dd)
+        let newPreDepth = device.makeTexture(descriptor: dd)
 
         let sd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
@@ -907,8 +980,22 @@ final class Renderer: NSObject, MTKViewDelegate {
             mipmapped: false)
         sd.usage = [.renderTarget, .shaderRead]
         sd.storageMode = .private
-        shadowTex = device.makeTexture(descriptor: sd)
+        let newShadow = device.makeTexture(descriptor: sd)
+        guard let newPos, let newNorm, let newAOA, let newAOB,
+              let newHistory, let newPreviousPosition, let newPreDepth,
+              let newShadow else { return false }
+        posTex = newPos
+        normTex = newNorm
+        aoTexA = newAOA
+        aoTexB = newAOB
+        histTex = newHistory
+        prevPosTex = newPreviousPosition
+        preDepthTex = newPreDepth
+        shadowTex = newShadow
         shadowTex?.label = "Directional shadow map"
+        targetSize = SIMD2(w, h)
+        prevVP = nil                      // resize invalidates history
+        return true
     }
 
     // MARK: - Camera
@@ -948,14 +1035,31 @@ final class Renderer: NSObject, MTKViewDelegate {
     // MARK: - Frame
 
     func draw(in view: MTKView) {
+        guard runtimeFailure == nil else { return }
         guard let model,
               let solver = model.solver,
               let rpd = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable,
-              let cmd = queue.makeCommandBuffer() else { return }
+              let drawable = view.currentDrawable else { return }
+
+        guard let cmd = queue.makeCommandBuffer() else {
+            reportFailure("could not create a Metal command buffer")
+            return
+        }
+        cmd.label = "AVBD render frame"
 
         model.tickIfRunning()
-        ensureTargets(view.drawableSize)
+        // The model owns physics failure reporting. Never relabel a poisoned
+        // solver as a renderer failure or read its potentially invalid state.
+        guard solver.runtimeFailure == nil else { return }
+        let solverIdentity = ObjectIdentifier(solver)
+        if solverIdentity != lastSolverIdentity {
+            lastSolverIdentity = solverIdentity
+            prevVP = nil
+        }
+        guard ensureTargets(view.drawableSize) else {
+            reportFailure("could not allocate required Metal render targets")
+            return
+        }
 
         // Per-scene default framing (small cloth rigs drown at the rigid-rig
         // default distance). Applied only when the DEMO changes — resets and
@@ -989,10 +1093,23 @@ final class Renderer: NSObject, MTKViewDelegate {
                                           options: .storageModePrivate)
         }
         guard let instances, let posTex, let normTex, let aoTexA, let aoTexB,
-              let preDepthTex, let shadowTex else { return }
+              let histTex, let prevPosTex, let preDepthTex, let shadowTex else {
+            reportFailure("could not allocate required Metal render resources")
+            return
+        }
 
-        solver.encodeBuildInstances(cmd, instances: instances,
-                                    colorMode: model.colorByGraphColor ? 1 : 0)
+        do {
+            try solver.encodeBuildInstancesChecked(
+                cmd, instances: instances,
+                colorMode: model.colorByGraphColor ? 1 : 0)
+        } catch {
+            // synchronize() inside the checked API may be the first observer
+            // of a physics error. Its owning model will report it on the next
+            // tick; do not poison or misclassify it here.
+            guard solver.runtimeFailure == nil else { return }
+            reportFailure("instance-build encoder failed: \(error.localizedDescription)")
+            return
+        }
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
         let pxPerUnit = viewportSize.y * 0.5 / tan(25 * Float.pi / 180)
@@ -1037,15 +1154,19 @@ final class Renderer: NSObject, MTKViewDelegate {
                                          prevVP == nil ? 1.0 : 0.12, 0, 0),
                          shadowViewProj: shadowVP,
                          shadowParams: SIMD4(0.00008, 0.00030, 0, 0))
-        frameIdx &+= 1
-
         // ---- 1. directional shadow depth ----
         let shadowPass = MTLRenderPassDescriptor()
         shadowPass.depthAttachment.texture = shadowTex
         shadowPass.depthAttachment.loadAction = .clear
         shadowPass.depthAttachment.clearDepth = 1
         shadowPass.depthAttachment.storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: shadowPass) {
+        guard let shadowEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: shadowPass) else {
+            reportFailure("could not create the directional-shadow encoder")
+            return
+        }
+        do {
+            let enc = shadowEncoder
             enc.label = "Directional shadow casters"
             enc.setViewport(MTLViewport(originX: 0, originY: 0,
                                         width: Double(Renderer.shadowMapSize),
@@ -1106,7 +1227,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         pre.depthAttachment.loadAction = .clear
         pre.depthAttachment.clearDepth = 1
         pre.depthAttachment.storeAction = .dontCare
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: pre) {
+        guard let prepassEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: pre) else {
+            reportFailure("could not create the world-position prepass encoder")
+            return
+        }
+        do {
+            let enc = prepassEncoder
+            enc.label = "World-position and normal prepass"
             enc.setViewport(screenViewport)
             enc.setDepthStencilState(depthState)
             enc.setRenderPipelineState(floorPreP)
@@ -1157,7 +1285,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         aoPass.colorAttachments[0].texture = aoTexA
         aoPass.colorAttachments[0].loadAction = .dontCare
         aoPass.colorAttachments[0].storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: aoPass) {
+        guard let gtaoEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: aoPass) else {
+            reportFailure("could not create the GTAO encoder")
+            return
+        }
+        do {
+            let enc = gtaoEncoder
+            enc.label = "GTAO"
             enc.setViewport(screenViewport)
             enc.setRenderPipelineState(gtaoP)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1172,7 +1307,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         tPass.colorAttachments[0].texture = aoTexB
         tPass.colorAttachments[0].loadAction = .dontCare
         tPass.colorAttachments[0].storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: tPass) {
+        guard let temporalEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: tPass) else {
+            reportFailure("could not create the temporal-AO encoder")
+            return
+        }
+        do {
+            let enc = temporalEncoder
+            enc.label = "Temporal AO resolve"
             enc.setViewport(screenViewport)
             enc.setRenderPipelineState(temporalP)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1184,19 +1326,27 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.endEncoding()
         }
         // ---- 4b. save history (resolved AO + world positions) ----
-        if let blit = cmd.makeBlitCommandEncoder(),
-           let hist = histTex, let pp = prevPosTex {
-            blit.copy(from: aoTexB, to: hist)
-            blit.copy(from: posTex, to: pp)
-            blit.endEncoding()
+        guard let historyEncoder = cmd.makeBlitCommandEncoder() else {
+            reportFailure("could not create the temporal-history encoder")
+            return
         }
-        prevVP = vp
+        historyEncoder.label = "Temporal history copy"
+        historyEncoder.copy(from: aoTexB, to: histTex)
+        historyEncoder.copy(from: posTex, to: prevPosTex)
+        historyEncoder.endEncoding()
         // ---- 4c. one depth-aware spatial blur: B -> A ----
         let blurPass = MTLRenderPassDescriptor()
         blurPass.colorAttachments[0].texture = aoTexA
         blurPass.colorAttachments[0].loadAction = .dontCare
         blurPass.colorAttachments[0].storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: blurPass) {
+        guard let blurEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: blurPass) else {
+            reportFailure("could not create the AO-blur encoder")
+            return
+        }
+        do {
+            let enc = blurEncoder
+            enc.label = "Depth-aware AO blur"
             enc.setViewport(screenViewport)
             enc.setRenderPipelineState(blurP)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1207,7 +1357,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         // ---- 5. main pass ----
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
+            reportFailure("could not create the main render encoder")
+            return
+        }
+        enc.label = "Main PBR pass"
         enc.setViewport(screenViewport)
 
         enc.setDepthStencilState(noDepthState)
@@ -1275,13 +1429,19 @@ final class Renderer: NSObject, MTKViewDelegate {
         cmd.present(drawable)
         cmd.commit()
 
-        // Policy Replay advances the simulator at the start of the next draw.
-        // This renderer owns a different MTLCommandQueue from GPUSolver, so
-        // resource hazards are not serialized by queue order. Waiting here
-        // prevents the next physics write from racing this frame's instance
-        // build/read of the same solver state buffers. Headless evaluation
-        // has no renderer and therefore never encountered this race.
-        if model.captureID == "policy" { cmd.waitUntilCompleted() }
+        // Physics and rendering own different command queues but share pose
+        // buffers. Retire every visual frame before returning to the main run
+        // loop, where Play/Step/Reset/goal/impact actions may mutate those
+        // buffers. This is the conservative cross-queue correctness boundary;
+        // a future shared-event/read-lease API can recover overlap safely.
+        cmd.waitUntilCompleted()
+        if let failure = commandFailureDescription(cmd) {
+            reportFailure(failure)
+            return
+        }
+
+        prevVP = vp
+        frameIdx &+= 1
 
         framesDrawn += 1
         if framesDrawn == 30, ProcessInfo.processInfo.environment["AVBD_MARKER"] != nil {
@@ -1293,7 +1453,6 @@ final class Renderer: NSObject, MTKViewDelegate {
         if scriptedCaptureAllowed,
            let shotPath = ProcessInfo.processInfo.environment["AVBD_SHOT"],
            framesDrawn == (Int(ProcessInfo.processInfo.environment["AVBD_SHOT_FRAME"] ?? "") ?? 90) {
-            cmd.waitUntilCompleted()
             writePNG(texture: drawable.texture, to: shotPath)
             exit(0)
         }
@@ -1302,7 +1461,6 @@ final class Renderer: NSObject, MTKViewDelegate {
             let every = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_EVERY"] ?? "") ?? 3, 1)
             let maximum = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_FRAMES"] ?? "") ?? 600, 1)
             if framesDrawn.isMultiple(of: every) {
-                cmd.waitUntilCompleted()
                 let path = String(format: "%@/%05d.png", directory, framesDrawn / every)
                 writePNG(texture: drawable.texture, to: path)
             }

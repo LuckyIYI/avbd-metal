@@ -31,11 +31,11 @@ enum PolicyBridge {
         do {
             if FileManager.default.fileExists(atPath: "runs/pusht/model/bc.safetensors") {
                 let runner = try BCPolicyRunner(modelPath: "runs/pusht/model", latent: 192)
-                model.policyAction = { env in runner.action(env) }
+                model.policyAction = { env in try runner.actionChecked(env) }
                 model.policyStatus = "policy: BC visuomotor (pixels -> action)"
             } else if FileManager.default.fileExists(atPath: "runs/pusht/model/lewm.safetensors") {
                 let planner = try LeWMPlanner(modelPath: "runs/pusht/model")
-                model.policyAction = { env in planner.action(env) }
+                model.policyAction = { env in try planner.actionChecked(env) }
                 model.policyStatus = "policy: LeWM loaded (CEM latent MPC)"
             } else {
                 model.policyStatus = "policy: no model — train via the Training panel"

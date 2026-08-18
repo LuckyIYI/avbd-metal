@@ -33,6 +33,15 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case arachneGoal
         case arachneClassical
 
+        /// Only current catalog entries plus the explicit local box-carry
+        /// development surface belong in the picker. Historical learned
+        /// checkpoints remain addressable for a visible compatibility error,
+        /// but can never be selected accidentally.
+        static let allCases: [Robot] = [
+            .unitreeH1, .gearSonicG1, .humanoidIsaac,
+            .humanoidBoxCarry, .arachneClassical,
+        ]
+
         var selectionID: String {
             switch self {
             case .unitreeH1: return "unitree-h1-sim2sim-v0"
@@ -47,10 +56,16 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
 
         private var catalogEntry: PolicyReplayCatalogEntry {
-            // Every UI case is intentionally backed by the shared, tested
-            // catalog; adding a case without a packaged-policy declaration is
-            // a programmer error rather than a silent empty replay.
-            PolicyReplayCatalog.entry(selectionID: selectionID)!
+            // Hidden historical cases are used only to explain why an
+            // explicitly requested old checkpoint is incompatible. They must
+            // not be returned by allCases or normal selection lookup.
+            if let entry = PolicyReplayCatalog.entry(selectionID: selectionID)
+                ?? PolicyReplayCatalog.historicalEntry(
+                    selectionID: selectionID) {
+                return entry
+            }
+            preconditionFailure(
+                "replay robot has no catalog declaration: \(selectionID)")
         }
 
         var displayName: String {
@@ -401,6 +416,16 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         rebuild()
     }
 
+    func reportRenderFailure(_ message: String) {
+        running = false
+        accumulator = 0
+        let status = "render stopped: \(message)"
+        // statsText is near the top of the controls while policyStatus keeps
+        // the diagnosis visible in the controller section as well.
+        statsText = status
+        policyStatus = status
+    }
+
     func rebuild() {
         unitreeH1 = nil; gearSonicG1 = nil; isaacHumanoid = nil
         humanoidBoxCarry = nil
@@ -447,6 +472,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 return
             }
             let desiredTaskID = robot.taskID
+            let overridePath = explicitCheckpointPath
             let checkpointRelativeDirectory: String
             if robot.usesClassicalController {
                 checkpointRelativeDirectory = desiredTaskID
@@ -456,8 +482,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 // and its machine-readable evidence are packaged.
                 checkpointRelativeDirectory = desiredTaskID
             } else {
-                guard let declared = PolicyReplayCatalog
-                    .entry(selectionID: robot.selectionID)?
+                let declaredEntry = PolicyReplayCatalog.entry(
+                    selectionID: robot.selectionID)
+                    ?? (overridePath == nil ? nil
+                        : PolicyReplayCatalog.historicalEntry(
+                            selectionID: robot.selectionID))
+                guard let declared = declaredEntry?
                     .checkpointRelativeDirectory else {
                     throw RLEnvironmentError.invalidConfiguration(
                         "learned replay has no packaged checkpoint declaration")
@@ -468,7 +498,6 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let bundledPath = Bundle.main.resourceURL?
                 .appendingPathComponent(
                     "checkpoints/\(checkpointRelativeDirectory)").path
-            let overridePath = explicitCheckpointPath
             let configurationPaths = robot.usesClassicalController ? []
                 : PolicyReplayCheckpointResolution.candidates(
                     explicit: overridePath, fallbacks: [
@@ -588,7 +617,16 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             }
             refreshTrainingMetrics()
         } catch {
+            running = false
+            accumulator = 0
             policyStatus = "replay unavailable: \(error.localizedDescription)"
+            // State/camera/stat helpers use legacy synchronous readers. A
+            // terminal solver must be rebuilt before any of them are legal.
+            if solver?.runtimeFailure != nil {
+                cameraEpoch += 1
+                lastTime = CACurrentMediaTime()
+                return
+            }
         }
         updateCameraTargets()
         applyCameraPreset()
@@ -790,11 +828,16 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func startArachneFold(autoUnfold: Bool) {
-        guard let arachne else { return }
+        guard arachne != nil else { return }
         do {
             // Start from the authored neutral assembly so the reveal is
             // repeatable and never tries to fold an already-fallen robot.
             try restartEpisode()
+            // restartEpisode may have replaced a terminal solver and task.
+            guard let arachne = self.arachne else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "Arachne replay scene is unavailable after reset")
+            }
             arachne.environment.setCommissioningTorqueScale(
                 Arachne15RevealController.commissioningTorqueScale)
             let measured = arachne.environment.states()[0].jointAngles
@@ -810,7 +853,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             lastTime = CACurrentMediaTime()
             refreshStats()
         } catch {
-            arachne.environment.setCommissioningTorqueScale(1)
+            if self.arachne?.environment.solver.runtimeFailure == nil {
+                self.arachne?.environment.setCommissioningTorqueScale(1)
+            }
             policyStatus = "reveal failed: \(error.localizedDescription)"
             running = false
         }
@@ -832,6 +877,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
     func applyGoalAndReset() {
         do {
+            if solver?.runtimeFailure != nil {
+                rebuild()
+            }
             if let isaacHumanoid, isaacHumanoid.usesPointGoal {
                 try installSelectedGoal(in: isaacHumanoid)
             } else if let arachne, arachne.usesPointGoal {
@@ -851,6 +899,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
     func randomizeGoalAndReset() {
         do {
+            if solver?.runtimeFailure != nil {
+                rebuild()
+            }
             if let isaacHumanoid, isaacHumanoid.usesPointGoal {
                 isaacHumanoid.clearGoalOverride(environment: 0)
             } else if let arachne, arachne.usesPointGoal {
@@ -899,6 +950,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func throwBox() {
+        guard let solver, solver.runtimeFailure == nil else {
+            running = false
+            interactionStatus = "simulation is stopped after a Metal failure · Reset to rebuild"
+            return
+        }
         guard supportsBoxThrows else {
             interactionStatus = "this checkpoint scene has no projectile body"
             return
@@ -1005,6 +1061,19 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func restartEpisode() throws {
+        if let failure = solver?.runtimeFailure {
+            // GPUSolver failures are terminal. Rebuild the exact selected task
+            // and reload its controller rather than calling reset/setters on
+            // poisoned GPU state.
+            policyStatus = "rebuilding replay after: \(failure.localizedDescription)"
+            rebuild()
+            guard let replacement = solver,
+                  replacement.runtimeFailure == nil else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "replay rebuild failed after terminal Metal error")
+            }
+            return
+        }
         if arachneRevealController != nil {
             arachne?.environment.setCommissioningTorqueScale(1)
         }
@@ -1126,6 +1195,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     func tickIfRunning() {
+        guard running else { return }
+        guard let activeSolver = solver else { return }
+        if let failure = activeSolver.runtimeFailure {
+            running = false
+            policyStatus = "simulation stopped: \(failure.localizedDescription)"
+            return
+        }
         if !scriptedBoxThrowPerformed,
            let scriptedBoxThrowStep,
            scriptedBoxThrowStep >= 0,
@@ -1142,7 +1218,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             tickUnitreeH1IfRunning()
             return
         }
-        guard running, let task, var observation, var result else { return }
+        guard let task, var observation, var result else { return }
         let now = CACurrentMediaTime()
         let wallStep = Double(task.spec.controlStep) / max(playbackRate, 0.1)
         if frameLockedCapture {
@@ -1160,7 +1236,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             do {
                 if let reveal = arachneRevealController, let arachne {
                     if arachneFolded {
-                        arachne.environment.stepJointTargets(
+                        try arachne.environment.stepJointTargetsChecked(
                             ContiguousArray(
                                 Arachne15RevealController.compactJointTargets),
                             decimation: arachne.configuration.controlDecimation)
@@ -1172,7 +1248,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                         continue
                     }
                     let targets = reveal.nextJointTargets()
-                    arachne.environment.stepJointTargets(
+                    try arachne.environment.stepJointTargetsChecked(
                         targets,
                         decimation: arachne.configuration.controlDecimation)
                     controlSteps += 1
@@ -1262,13 +1338,17 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 }
             } catch {
                 if arachneRevealController != nil {
-                    arachne?.environment.setCommissioningTorqueScale(1)
+                    if arachne?.environment.solver.runtimeFailure == nil {
+                        arachne?.environment.setCommissioningTorqueScale(1)
+                    }
                     arachneRevealController = nil
                     arachneFolded = false
                     arachneAutoUnfold = false
                 }
                 policyStatus = "step failed: \(error.localizedDescription)"
                 running = false
+                accumulator = 0
+                return
             }
             accumulator -= wallStep
             ticks += 1
@@ -1316,6 +1396,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             } catch {
                 policyStatus = "step failed: " + error.localizedDescription
                 running = false
+                accumulator = 0
+                return
             }
             accumulator -= wallStep
             ticks += 1
@@ -1359,6 +1441,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             } catch {
                 policyStatus = "step failed: \(error.localizedDescription)"
                 running = false
+                accumulator = 0
+                return
             }
             accumulator -= wallStep
             ticks += 1
@@ -1385,6 +1469,15 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
         accumulator = controlStep / max(playbackRate, 0.1)
         tickIfRunning()
+        // A failed or terminal manual transition must remain stopped. In
+        // particular, never call the synchronous stats readers on a poisoned
+        // solver or restore the pre-step running state after an error.
+        guard running, !episodeFinished,
+              solver?.runtimeFailure == nil else {
+            running = false
+            accumulator = 0
+            return
+        }
         running = wasRunning
         refreshStats()
     }
@@ -1873,7 +1966,7 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
     @ObservedObject var model: PolicyReplayModel
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> PolicyOrbitMTKView {
-        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()!
+        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()
         let view = PolicyOrbitMTKView(frame: .zero, device: device)
         if ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil
             || ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] != nil {
@@ -1883,10 +1976,20 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = Renderer.sampleCount
         view.preferredFramesPerSecond = 30
-        let renderer = try! Renderer(device: device, model: model)
-        context.coordinator.renderer = renderer
-        view.renderer = renderer
-        view.delegate = renderer
+        guard let device else {
+            model.reportRenderFailure("no Metal device is available")
+            view.isPaused = true
+            return view
+        }
+        do {
+            let renderer = try Renderer(device: device, model: model)
+            context.coordinator.renderer = renderer
+            view.renderer = renderer
+            view.delegate = renderer
+        } catch {
+            model.reportRenderFailure(error.localizedDescription)
+            view.isPaused = true
+        }
         return view
     }
     func updateNSView(_ view: PolicyOrbitMTKView, context: Context) {

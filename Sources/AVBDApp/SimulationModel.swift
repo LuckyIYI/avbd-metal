@@ -143,13 +143,23 @@ final class SimulationModel: ObservableObject, RenderableModel {
 
         let dt = Double(solver.settings.dt)
         var steps = 0
-        while stepAccumulator >= dt && steps < 4 {
-            let t0 = CACurrentMediaTime()
-            solver.step()
-            let ms = (CACurrentMediaTime() - t0) * 1000
-            msEMA = msEMA == 0 ? ms : msEMA * 0.95 + ms * 0.05
-            stepAccumulator -= dt
-            steps += 1
+        do {
+            while stepAccumulator >= dt && steps < 4 {
+                let t0 = CACurrentMediaTime()
+                try solver.submitStep()
+                let ms = (CACurrentMediaTime() - t0) * 1000
+                msEMA = msEMA == 0 ? ms : msEMA * 0.95 + ms * 0.05
+                stepAccumulator -= dt
+                steps += 1
+            }
+            // Physics and rendering use separate Metal queues. Retiring the
+            // submitted steps here is the explicit cross-queue boundary and
+            // prevents rendering partially updated shared poses.
+            try solver.synchronize()
+        } catch {
+            running = false
+            statsText = "solver stopped: \(error.localizedDescription)"
+            return
         }
         if steps == 4 { stepAccumulator = 0 }  // avoid spiral of death
 
@@ -165,13 +175,22 @@ final class SimulationModel: ObservableObject, RenderableModel {
 
     func singleStep() {
         running = false
-        solver?.step()
+        guard let solver else { return }
+        do {
+            try solver.submitStep()
+            try solver.synchronize()
+        } catch {
+            statsText = "solver stopped: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Mouse dragging
 
     func beginDrag(origin: F3, dir: F3) {
-        guard let solver else { return }
+        guard let solver, solver.runtimeFailure == nil else {
+            dragBody = nil
+            return
+        }
         guard let (body, local) = solver.pick(origin: origin, dir: dir) else { return }
         dragBody = body
         dragLocal = local
@@ -179,7 +198,11 @@ final class SimulationModel: ObservableObject, RenderableModel {
     }
 
     func updateDrag(origin: F3, dir: F3) {
-        guard let solver, let body = dragBody else { return }
+        guard let solver, solver.runtimeFailure == nil,
+              let body = dragBody else {
+            dragBody = nil
+            return
+        }
         // target: keep the grabbed point at fixed distance along the ray
         let anchor = solver.bodyPosition(body) + solver.bodyRotation(body).act(dragLocal)
         let depth = dot(anchor - origin, dir)
@@ -190,9 +213,9 @@ final class SimulationModel: ObservableObject, RenderableModel {
     }
 
     func endDrag() {
-        guard let solver else { return }
+        defer { dragBody = nil }
+        guard let solver, solver.runtimeFailure == nil else { return }
         solver.setDrag(jointIndex: dragJoint, body: nil, worldTarget: .zero, localAnchor: .zero)
-        dragBody = nil
     }
 
     private func solverMass(_ body: Int) -> Float {

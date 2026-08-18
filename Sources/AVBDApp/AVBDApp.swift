@@ -182,7 +182,7 @@ struct MetalView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> InteractiveMTKView {
-        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()!
+        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()
         let view = InteractiveMTKView(frame: .zero, device: device)
         if ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil
             || ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] != nil {
@@ -192,9 +192,20 @@ struct MetalView: NSViewRepresentable {
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = Renderer.sampleCount
         view.preferredFramesPerSecond = 60
-        let renderer = try! Renderer(device: device, model: model)
-        context.coordinator.renderer = renderer
-        view.delegate = renderer
+        guard let device else {
+            model.reportRenderFailure("no Metal device is available")
+            view.isPaused = true
+            view.coordinator = context.coordinator
+            return view
+        }
+        do {
+            let renderer = try Renderer(device: device, model: model)
+            context.coordinator.renderer = renderer
+            view.delegate = renderer
+        } catch {
+            model.reportRenderFailure(error.localizedDescription)
+            view.isPaused = true
+        }
         view.coordinator = context.coordinator
         return view
     }

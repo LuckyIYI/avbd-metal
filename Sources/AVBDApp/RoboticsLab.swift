@@ -97,7 +97,7 @@ final class RoboticsModel: ObservableObject, RenderableModel {
     private var stepAccumulator: Double = 0
     private var frame = 0
     /// hook for the learned policy (installed by PolicyBridge when MLX works)
-    var policyAction: ((PushTEnv) -> SIMD2<Float>?)? = nil
+    var policyAction: ((PushTEnv) throws -> SIMD2<Float>?)? = nil
 
     init() {
         reset()
@@ -105,12 +105,24 @@ final class RoboticsModel: ObservableObject, RenderableModel {
     }
 
     func reset() {
-        // in-place: production-style episode reset, no scene rebuild
-        if let env {
+        // In-place reset is valid only while the solver is healthy. A Metal
+        // runtime failure is terminal for that GPUSolver, so Reset rebuilds
+        // the one-environment scene instead of invoking legacy setters on a
+        // poisoned solver.
+        if let env, env.solver.runtimeFailure == nil {
             env.reset(0, seed: UInt64.random(in: 1...999_999_999))
         } else {
-            env = try? PushTEnv(numEnvs: 1, seed: UInt64.random(in: 1...999_999),
-                                goalMarkers: true)
+            do {
+                env = try PushTEnv(
+                    numEnvs: 1,
+                    seed: UInt64.random(in: 1...999_999),
+                    goalMarkers: true)
+            } catch {
+                env = nil
+                running = false
+                statsText = "Push-T scene unavailable: \(error.localizedDescription)"
+                return
+            }
         }
         tipTarget = SIMD2(1.4, 0)
         episodes += 1
@@ -122,53 +134,73 @@ final class RoboticsModel: ObservableObject, RenderableModel {
 
     private var settleGrace = 0
 
+    func reportRenderFailure(_ message: String) {
+        running = false
+        stepAccumulator = 0
+        statsText = "render stopped: \(message)"
+    }
+
     func tickIfRunning() {
         guard running, let env, let solver else { return }
+        if let failure = solver.runtimeFailure {
+            running = false
+            stepAccumulator = 0
+            statsText = "Push-T simulation stopped: \(failure.localizedDescription)"
+            return
+        }
         let now = CACurrentMediaTime()
         let elapsed = min(now - lastStepTime, 0.1)
         lastStepTime = now
         stepAccumulator += elapsed
-        // one CONTROL tick = 4 physics substeps, all through env.step()'s
+        // one CONTROL tick = 4 physics substeps, all through stepChecked's
         // rate-limited actuator path — same cadence the training pipeline
         // uses; driving the actuator per-substep made the oracle whip
         let controlDt = Double(solver.settings.dt) * 4
         var ticks = 0
-        while stepAccumulator >= controlDt && ticks < 2 {
-            env.tipSpeedLimit = Float(speedLimit)
-            if settleGrace > 0 {
-                settleGrace -= 1
-                env.step(actions: [env.tipPos(0)], substeps: 4)
-            } else {
-                let action: SIMD2<Float>
-                switch mode {
-                case .manual:
-                    action = tipTarget
-                case .oracle:
-                    action = env.oracleAction(0)
-                case .policy:
-                    if let act = policyAction?(env) {
-                        action = act * 3
-                    } else {
-                        policyStatus = "policy unavailable: build with `make app-ml` and train a model first"
-                        action = env.tipPos(0)
+        do {
+            while stepAccumulator >= controlDt && ticks < 2 {
+                env.tipSpeedLimit = Float(speedLimit)
+                if settleGrace > 0 {
+                    settleGrace -= 1
+                    try env.stepChecked(
+                        actions: [env.tipPos(0)], substeps: 4)
+                } else {
+                    let action: SIMD2<Float>
+                    switch mode {
+                    case .manual:
+                        action = tipTarget
+                    case .oracle:
+                        action = env.oracleAction(0)
+                    case .policy:
+                        if let policyAction,
+                           let act = try policyAction(env) {
+                            action = act * 3
+                        } else {
+                            policyStatus = "policy unavailable: build with `make app-ml` and train a model first"
+                            action = env.tipPos(0)
+                        }
                     }
+                    try env.stepChecked(actions: [action], substeps: 4)
                 }
-                env.step(actions: [action], substeps: 4)
+                stepAccumulator -= controlDt
+                ticks += 1
             }
-            stepAccumulator -= controlDt
-            ticks += 1
-        }
-        if ticks == 2 { stepAccumulator = 0 }
+            if ticks == 2 { stepAccumulator = 0 }
 
-        frame += 1
-        if frame % 8 == 0 { refreshDebug() }
-        if env.success(0) && frame % 30 == 0 {
-            solves += 1
-            reset()
+            frame += 1
+            if frame % 8 == 0 { try refreshDebug() }
+            if env.success(0) && frame % 30 == 0 {
+                solves += 1
+                reset()
+            }
+        } catch {
+            running = false
+            stepAccumulator = 0
+            statsText = "Push-T simulation stopped: \(error.localizedDescription)"
         }
     }
 
-    private func refreshDebug() {
+    private func refreshDebug() throws {
         guard let env else { return }
         let (bp, byaw) = env.blockPose(0)
         let r = env.refs[0]
@@ -184,7 +216,7 @@ final class RoboticsModel: ObservableObject, RenderableModel {
 
         // what the model sees: the actual observation tensor as an image
         let res = env.obsRes
-        let obs = env.observations()
+        let obs = try env.observationsChecked()
         var pixels = [UInt8](repeating: 255, count: res * res * 4)
         for i in 0..<(res * res) {
             pixels[i * 4 + 0] = obs[i * 3 + 0]
@@ -316,7 +348,7 @@ struct RoboticsMetalView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
 
     func makeNSView(context: Context) -> LabMTKView {
-        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()!
+        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()
         let view = LabMTKView(frame: .zero, device: device)
         if ProcessInfo.processInfo.environment["AVBD_CAPTURE_VIEW"] == "robotics",
            ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil
@@ -327,21 +359,31 @@ struct RoboticsMetalView: NSViewRepresentable {
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = Renderer.sampleCount
         view.preferredFramesPerSecond = 60
-        let renderer = try! Renderer(device: device, model: model)
-        context.coordinator.renderer = renderer
-        view.delegate = renderer
         view.coordinator = context.coordinator
-        model.applyCamera = { [weak renderer, weak model] in
-            guard let r = renderer, let m = model else { return }
-            if m.topView {
-                r.elevation = 1.52
-                r.azimuth = -.pi / 2
-                r.distance = 9
-            } else {
-                r.elevation = 0.6
-                r.azimuth = -.pi / 3
-                r.distance = 10
+        guard let device else {
+            model.reportRenderFailure("no Metal device is available")
+            view.isPaused = true
+            return view
+        }
+        do {
+            let renderer = try Renderer(device: device, model: model)
+            context.coordinator.renderer = renderer
+            view.delegate = renderer
+            model.applyCamera = { [weak renderer, weak model] in
+                guard let r = renderer, let m = model else { return }
+                if m.topView {
+                    r.elevation = 1.52
+                    r.azimuth = -.pi / 2
+                    r.distance = 9
+                } else {
+                    r.elevation = 0.6
+                    r.azimuth = -.pi / 3
+                    r.distance = 10
+                }
             }
+        } catch {
+            model.reportRenderFailure(error.localizedDescription)
+            view.isPaused = true
         }
         return view
     }
