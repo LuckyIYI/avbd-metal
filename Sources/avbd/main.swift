@@ -80,6 +80,13 @@ struct Options {
     var checkpoint: String? = nil
     var output: String? = nil
     var allowTaskTransfer = false
+    var expectedCheckpointFingerprint: String? = nil
+    var sourceCommit: String? = nil
+    var inferenceBatchSize: Int? = nil
+    var evaluationSeeds: [UInt64]? = nil
+    var evaluationEnvironments: Int? = nil
+    var parentCheckpoint: String? = nil
+    var qualificationDirectory: String? = nil
     /// Task-owned numeric configuration. Keeping these values out of the PPO
     /// parser lets new scenes expose curricula and control settings without
     /// adding task-specific branches to this executable.
@@ -1063,6 +1070,25 @@ func parseOptions(_ args: [String]) -> Options {
         case "--checkpoint": o.checkpoint = value(after: args[i])
         case "--output": o.output = value(after: args[i])
         case "--allow-task-transfer": o.allowTaskTransfer = true
+        case "--expected-checkpoint-fingerprint":
+            o.expectedCheckpointFingerprint = value(after: args[i])
+        case "--source-commit": o.sourceCommit = value(after: args[i])
+        case "--inference-batch-size":
+            o.inferenceBatchSize = Int(value(after: args[i]))
+        case "--evaluation-seeds":
+            let rawSeeds = value(after: args[i]).split(
+                separator: ",", omittingEmptySubsequences: false)
+            let seeds = rawSeeds.compactMap { UInt64($0) }
+            guard rawSeeds.count == 4, seeds.count == 4 else {
+                fail("--evaluation-seeds expects four comma-separated UInt64 values")
+            }
+            o.evaluationSeeds = seeds
+        case "--evaluation-environments":
+            o.evaluationEnvironments = Int(value(after: args[i]))
+        case "--parent-checkpoint":
+            o.parentCheckpoint = value(after: args[i])
+        case "--qualification-directory":
+            o.qualificationDirectory = value(after: args[i])
         case "--task-option":
             let assignment = value(after: args[i])
             let pieces = assignment.split(separator: "=", maxSplits: 1,
@@ -1103,6 +1129,27 @@ func makeScene(_ name: String, _ o: Options) -> PhysicsScene {
     if let it = o.iterations { scene.settings.iterations = it }
     if let dt = o.dt { scene.settings.dt = dt }
     return scene
+}
+
+/// Reconstruct the exact serialized task options while resolving its current
+/// registered physics revision. Requalification may change that revision and
+/// nothing else.
+func makeCurrentCheckpointTask(
+    taskID: String, checkpointDirectory: String, seed: UInt64 = 1
+) throws -> any VectorizedRLTask {
+    let metadata = try JSONDecoder().decode(
+        VectorPolicyMetadata.self,
+        from: Data(contentsOf: URL(
+            fileURLWithPath: "\(checkpointDirectory)/metadata.json")))
+    let options = BuiltInRLTasks.registry.checkpointReplayOptions(
+        for: taskID,
+        semanticOptions: metadata.taskConfiguration ?? [:],
+        maxEpisodeSteps: metadata.maxEpisodeSteps,
+        controlDecimation: metadata.controlDecimation)
+    return try BuiltInRLTasks.registry.make(
+        taskID, configuration: RLTaskConfiguration(
+            numEnvironments: 1, seed: seed, autoReset: false,
+            options: options))
 }
 
 func makePushTPhysicalFlowConfiguration(
@@ -1156,6 +1203,9 @@ guard let command = args.first else {
       eval-arachne-classical  Evaluate non-neural ripple-gait point-goal control
       train-rl <task>  Train any registered task with MLX PPO
       eval-rl <task>   Evaluate a saved MLX policy deterministically
+      prepare-policy-requalification <task>  Create a zero-update revision candidate
+      publish-policy-requalification <task>  Seal a robustly evaluated candidate
+      verify-policy-requalification <task>  Verify sealed revision lineage/evidence
       export-policy-rl <task>  Create an immutable optimizer-free field bundle
       verify-policy-rl <task>  Verify immutable bundle identity and MLX inference
       trace-rl <task>  Trace one deterministic policy trajectory step by step
@@ -1785,6 +1835,116 @@ case "eval-rl":
         }
     }
     if metrics.acceptance?.passed == false { exit(2) }
+
+case "prepare-policy-requalification":
+    guard args.count > 1 else {
+        fail("usage: avbd prepare-policy-requalification <task> "
+            + "--checkpoint PARENT --output CANDIDATE "
+            + "--expected-checkpoint-fingerprint SHA256 "
+            + "--source-commit COMMIT --inference-batch-size N "
+            + "--evaluation-environments N --evaluation-seeds S1,S2,S3,S4")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let taskID = args[1]
+    guard let parent = o.checkpoint,
+          let output = o.output,
+          let expectedFingerprint = o.expectedCheckpointFingerprint,
+          let sourceCommit = o.sourceCommit,
+          let inferenceBatchSize = o.inferenceBatchSize,
+          let evaluationEnvironments = o.evaluationEnvironments,
+          let evaluationSeeds = o.evaluationSeeds else {
+        fail("prepare-policy-requalification requires every lineage and "
+            + "qualification-plan option shown in --help")
+    }
+    let targetTask = try makeCurrentCheckpointTask(
+        taskID: taskID, checkpointDirectory: parent,
+        seed: evaluationSeeds[0])
+    guard let criteriaProvider = targetTask as?
+            any RLEvaluationCriteriaProviding else {
+        fail("requalification preparation requires task-owned evaluation criteria")
+    }
+    let manifest = try VectorPolicyRequalification.prepare(
+        targetSpec: targetTask.spec,
+        parentCheckpointDirectory: parent,
+        outputDirectory: output,
+        expectedParentCheckpointFingerprint: expectedFingerprint,
+        inferenceBatchSize: inferenceBatchSize,
+        declaredSourceCommit: sourceCommit,
+        qualificationPlan: .init(
+            evaluationSeeds: evaluationSeeds,
+            evaluationEnvironments: evaluationEnvironments),
+        evaluationCriteria: criteriaProvider.evaluationCriteria)
+    print("prepared zero-update \(manifest.task) revision "
+        + "\(manifest.sourceTaskRevision) -> \(manifest.targetTaskRevision) "
+        + "candidate \(manifest.candidateCheckpointFingerprint) at \(output)")
+
+case "publish-policy-requalification":
+    guard args.count > 1 else {
+        fail("usage: avbd publish-policy-requalification <task> "
+            + "--checkpoint CANDIDATE --parent-checkpoint PARENT "
+            + "--qualification-directory DIR --output BUNDLE")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let taskID = args[1]
+    guard let candidate = o.checkpoint,
+          let parent = o.parentCheckpoint,
+          let qualificationDirectory = o.qualificationDirectory,
+          let output = o.output else {
+        fail("publish-policy-requalification requires candidate, parent, "
+            + "qualification directory, and output")
+    }
+    let manifestData = try Data(contentsOf: URL(
+        fileURLWithPath: candidate).appendingPathComponent(
+            VectorPolicyRequalification.manifestFileName))
+    let prepared = try JSONDecoder().decode(
+        VectorPolicyRequalificationManifest.self, from: manifestData)
+    let reportPaths = prepared.qualificationPlan.evaluationSeeds.map {
+        "\(qualificationDirectory)/eval-seed-\($0).json"
+    }
+    let targetTask = try makeCurrentCheckpointTask(
+        taskID: taskID, checkpointDirectory: candidate,
+        seed: prepared.qualificationPlan.evaluationSeeds[0])
+    guard let criteriaProvider = targetTask as?
+            any RLEvaluationCriteriaProviding else {
+        fail("requalification publication requires task-owned evaluation criteria")
+    }
+    let manifest = try VectorPolicyRequalification.publish(
+        targetSpec: targetTask.spec,
+        evaluationCriteria: criteriaProvider.evaluationCriteria,
+        candidateDirectory: candidate,
+        parentCheckpointDirectory: parent,
+        evaluationReportPaths: reportPaths,
+        aggregatePath: "\(qualificationDirectory)/aggregate.json",
+        outputDirectory: output)
+    print("published requalified \(manifest.task) revision "
+        + "\(manifest.targetTaskRevision) checkpoint "
+        + "\(manifest.candidateCheckpointFingerprint) at \(output)")
+
+case "verify-policy-requalification":
+    guard args.count > 1 else {
+        fail("usage: avbd verify-policy-requalification <task> "
+            + "--checkpoint BUNDLE --parent-checkpoint PARENT")
+    }
+    let o = parseOptions(Array(args.dropFirst(2)))
+    let taskID = args[1]
+    guard let bundle = o.checkpoint,
+          let parent = o.parentCheckpoint else {
+        fail("verify-policy-requalification requires bundle and parent checkpoint")
+    }
+    let targetTask = try makeCurrentCheckpointTask(
+        taskID: taskID, checkpointDirectory: bundle)
+    guard let criteriaProvider = targetTask as?
+            any RLEvaluationCriteriaProviding else {
+        fail("requalification verification requires task-owned evaluation criteria")
+    }
+    let manifest = try VectorPolicyRequalification.verify(
+        targetSpec: targetTask.spec,
+        evaluationCriteria: criteriaProvider.evaluationCriteria,
+        bundleDirectory: bundle,
+        parentCheckpointDirectory: parent)
+    print("verified requalified \(manifest.task) revision "
+        + "\(manifest.targetTaskRevision) checkpoint "
+        + manifest.candidateCheckpointFingerprint)
 
 case "export-policy-rl":
     guard args.count > 1 else {
