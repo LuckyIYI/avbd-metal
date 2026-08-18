@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,13 @@ import verify_policy_evidence as verifier  # noqa: E402
 
 
 class MultiSuiteEvidenceVerifierTests(unittest.TestCase):
+    @staticmethod
+    def git(root: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True, text=True, check=True)
+        return completed.stdout.strip()
+
     def context(self, bundle: Path) -> verifier.CheckpointContext:
         entry = verifier.CatalogEntry(
             selection_id="fixture", task_id="arachne15-velocity-v0",
@@ -155,6 +163,29 @@ class MultiSuiteEvidenceVerifierTests(unittest.TestCase):
                 verifier.VerificationError, "directory inventory differs"
             ):
                 verifier.verify_app_checkpoint_package(root, packaged)
+
+    def test_declared_source_commit_must_remain_in_head_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.git(root, "init", "--quiet")
+            self.git(root, "config", "user.name", "Evidence Test")
+            self.git(root, "config", "user.email", "evidence@example.invalid")
+            (root / "first.txt").write_text("sealed\n", encoding="utf-8")
+            self.git(root, "add", "first.txt")
+            self.git(root, "commit", "--quiet", "-m", "sealed source")
+            source_commit = self.git(root, "rev-parse", "HEAD")
+            verifier.verify_declared_source_commit(
+                root, source_commit, "fixture")
+
+            self.git(root, "checkout", "--quiet", "--orphan", "rewritten")
+            (root / "second.txt").write_text("replacement\n", encoding="utf-8")
+            self.git(root, "add", "-A")
+            self.git(root, "commit", "--quiet", "-m", "rewritten history")
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "not an ancestor of HEAD"
+            ):
+                verifier.verify_declared_source_commit(
+                    root, source_commit, "fixture")
 
 
 if __name__ == "__main__":

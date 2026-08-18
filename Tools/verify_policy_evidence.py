@@ -26,6 +26,7 @@ import json
 import math
 import re
 import struct
+import subprocess
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from typing import Any
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 EVALUATION_KEYS = {
     "task",
     "evaluationSeed",
@@ -124,6 +126,9 @@ H1_EVALUATION_CRITERIA = {
 }
 H1_HISTORICAL_V0_FINGERPRINT = (
     "d6b5d416e7f7d75fa2b9b9dd33f78ae387e3f2a8139aa6d25a69e5dbcae777ab"
+)
+H1_HISTORICAL_V1_DECLARED_SOURCE_COMMIT = (
+    "d3d07bf1bd0b78c62235794a7c81621ffe748ed7"
 )
 H1_HISTORICAL_V0_FILES = {
     "metadata.json":
@@ -356,6 +361,40 @@ class CheckpointContext:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise VerificationError(message)
+
+
+def verify_declared_source_commit(root: Path, commit: Any, label: str) -> None:
+    """Require sealed experiment provenance to remain in repository history.
+
+    Requalification manifests intentionally name the exact code commit used to
+    produce their evidence. Merely comparing that string to another constant
+    would let a squash or history rewrite orphan the claim while the release
+    gate still passed.
+    """
+    require(isinstance(commit, str)
+            and GIT_COMMIT_PATTERN.fullmatch(commit) is not None,
+            f"{label}: declared source commit is not a full Git object ID")
+    try:
+        present = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", f"{commit}^{{commit}}"],
+            capture_output=True, text=True, check=False)
+        require(present.returncode == 0,
+                f"{label}: declared source commit {commit} is unavailable; "
+                "preserve branch history (or fetch the missing history)")
+        ancestor = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor",
+             commit, "HEAD"],
+            capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise VerificationError(
+            f"{label}: cannot invoke Git to verify source provenance: {error}"
+        ) from error
+    require(ancestor.returncode in {0, 1},
+            f"{label}: Git could not verify source ancestry: "
+            f"{ancestor.stderr.strip() or ancestor.stdout.strip()}")
+    require(ancestor.returncode == 0,
+            f"{label}: declared source commit {commit} is not an ancestor of "
+            "HEAD; do not squash or rewrite sealed experiment history")
 
 
 def require_exact_keys(value: Any, keys: set[str], label: str) -> None:
@@ -1328,6 +1367,12 @@ def verify_pinned_historical_h1_lineage(root: Path) -> None:
             and manifest.get("candidateCheckpointFingerprint")
                 == H1_PARENT_FINGERPRINT,
             "historical H1 v0-to-v1 lineage changed")
+    require(manifest.get("declaredSourceCommit")
+            == H1_HISTORICAL_V1_DECLARED_SOURCE_COMMIT,
+            "historical H1 v0-to-v1 source commit changed")
+    verify_declared_source_commit(
+        root, manifest.get("declaredSourceCommit"),
+        "historical H1 v0-to-v1 lineage")
 
 
 def verify_h1_requalification(root: Path, context: CheckpointContext,
@@ -1406,6 +1451,7 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
     source_commit = manifest.get("declaredSourceCommit")
     require(source_commit == H1_DECLARED_SOURCE_COMMIT,
             f"{manifest_path}: declared source commit changed")
+    verify_declared_source_commit(root, source_commit, str(manifest_path))
     require(manifest.get("changedFields") == REQUALIFICATION_CHANGED_FIELDS,
             f"{manifest_path}: permitted zero-update transform changed")
     assert_json_equal(
@@ -1729,6 +1775,7 @@ def verify_schema2_requalification(
     source_commit = manifest.get("declaredSourceCommit")
     require(source_commit == profile["declaredSourceCommit"],
             f"{manifest_path}: declared source commit changed")
+    verify_declared_source_commit(root, source_commit, str(manifest_path))
     candidate_relative = manifest.get("candidateCheckpointDirectory")
     require(candidate_relative == profile["candidateDirectory"]
             and candidate_relative != manifest.get("parentCheckpointDirectory"),
