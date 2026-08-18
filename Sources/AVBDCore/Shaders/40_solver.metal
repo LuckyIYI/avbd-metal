@@ -1493,7 +1493,7 @@ kernel void primal_particles_split(
     float maxLin = 0.35f * fabs(shape[body].w);
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
-    if (!rigid) {                           // particles: OGC bound truncation
+    if (!rigid && P.numTris > 0u) {         // soft-surface particles only
         dxLin = ogcTruncate(dxLin, pl.xyz, ogcPrev[body].xyz,
                             boundsBits[body], -shape[body].w, ogcCounters);
     }

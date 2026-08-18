@@ -88,11 +88,9 @@ final class GPUSolverTests: XCTestCase {
         scene.settings.dt = 1 / 120
         scene.settings.rigidLinearDamping = 2
         scene.settings.rigidAngularDamping = 2
-        let particle = scene.addBody(
-            size: F3(repeating: 0.08), density: 1_000, friction: 0,
-            position: .zero, velocity: F3(1, 0, 0), shape: .sphere,
-            collisionEnabled: false)
-        scene.bodies[particle].isParticle = true
+        let particle = scene.addParticle(
+            radius: 0.04, mass: 0.01, friction: 0,
+            position: .zero, velocity: F3(1, 0, 0))
 
         let cpu = scene.makeCPUSolver()
         let gpu = try makeGPU(scene)
