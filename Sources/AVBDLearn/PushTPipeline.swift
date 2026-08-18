@@ -505,8 +505,19 @@ public enum PushTPipeline {
     }
 
     // ---------------- planning (latent MPC with CEM) ----------------
+    /// Source-compatible fixed-latent entry point. Explicit legacy latent
+    /// requests still flow through the metadata-validating implementation.
+    public static func solve(modelPath: String, episodes: Int,
+                             seed: UInt64 = 11, latent: Int = 128,
+                             debug: Bool = false,
+                             oracleNull: Bool = false) throws {
+        try solve(modelPath: modelPath, episodes: episodes, seed: seed,
+                  latent: Optional(latent), debug: debug,
+                  oracleNull: oracleNull)
+    }
+
     public static func solve(modelPath: String, episodes: Int, seed: UInt64 = 11,
-                             latent: Int? = nil, debug: Bool = false,
+                             latent: Int?, debug: Bool = false,
                              oracleNull: Bool = false) throws {
         let configuration = try worldModelConfiguration(
             modelPath: modelPath, requestedLatent: latent)

@@ -6,12 +6,12 @@ final class TaskFailureBoundaryTests: XCTestCase {
         _ operation: () throws -> Void,
         file: StaticString = #filePath,
         line: UInt = #line
-    ) throws -> GPUSolver.AVBDError {
-        var observed: GPUSolver.AVBDError?
+    ) throws -> GPUSolver.RuntimeFailure {
+        var observed: GPUSolver.RuntimeFailure?
         XCTAssertThrowsError(try operation(), file: file, line: line) { error in
-            observed = error as? GPUSolver.AVBDError
+            observed = error as? GPUSolver.RuntimeFailure
             if observed == nil {
-                XCTFail("expected GPUSolver.AVBDError, got \(error)",
+                XCTFail("expected GPUSolver.RuntimeFailure, got \(error)",
                         file: file, line: line)
             }
         }

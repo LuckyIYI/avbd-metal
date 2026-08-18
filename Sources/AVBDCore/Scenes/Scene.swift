@@ -58,6 +58,7 @@ public struct SceneBody {
 
     public var isDynamic: Bool { (mass ?? (density > 0 ? 1 : 0)) > 0 }
 
+    @_disfavoredOverload
     public init(size: F3, density: Float, friction: Float,
                 dynamicFriction: Float? = nil, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
@@ -89,6 +90,17 @@ public struct SceneBody {
         self.mass = mass
         self.diagonalInertia = diagonalInertia
         self.gravityScale = gravityScale
+    }
+
+    /// Source-compatible initializer for scenes authored before separate
+    /// dynamic friction and explicit inertial properties were introduced.
+    public init(size: F3, density: Float, friction: Float, position: F3,
+                rotation: Quat = Quat(real: 1, imag: .zero),
+                velocity: F3 = .zero, shape: BodyShape = .box) {
+        self.init(size: size, density: density, friction: friction,
+                  dynamicFriction: friction, position: position,
+                  rotation: rotation, velocity: velocity, shape: shape,
+                  mass: nil, diagonalInertia: nil, gravityScale: 1)
     }
 }
 
@@ -211,6 +223,9 @@ public struct SceneJoint {
     public var motorTarget: Float
     /// Absolute joint-effort limit. Zero disables the motor.
     public var motorTorque: Float
+    /// Legacy continuous drive rate. Compatibility-authored position motors
+    /// advance their wrapped target by this many radians per second.
+    public var motorRate: Float
     /// Fixed physical gains. Position modes use both `motorStiffness` (kp)
     /// and `motorDamping` (kd). Velocity mode requires zero stiffness and
     /// uses `motorDamping` as its velocity gain. Damping has units of torque
@@ -227,6 +242,7 @@ public struct SceneJoint {
     public var limitLo: Float
     public var limitHi: Float
 
+    @_disfavoredOverload
     public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
                 stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
                 fracture: Float = .infinity, fractureLinear: Bool = false,
@@ -266,12 +282,35 @@ public struct SceneJoint {
         self.hingeAxis = hingeAxis.map(normalize)
         self.motorTarget = motorTarget
         self.motorTorque = motorTorque
+        self.motorRate = 0
         self.motorStiffness = motorStiffness
         self.motorDamping = motorDamping
         self.motorMode = motorMode
         self.armature = armature
         self.limitLo = limitLo
         self.limitHi = limitHi
+    }
+
+    /// Source-compatible motor initializer. The original motor was a
+    /// bounded position servo with a fixed gain of 400; a nonzero rate
+    /// continuously advanced that servo's wrapped target.
+    public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
+                stiffnessLin: Float = .infinity, stiffnessAng: Float = 0,
+                fracture: Float = .infinity, fractureLinear: Bool = false,
+                hingeAxis: F3? = nil, motorTarget: Float = 0,
+                motorTorque: Float = 0, motorRate: Float = 0,
+                limitLo: Float = 1, limitHi: Float = -1) {
+        precondition(motorRate.isFinite, "motor rate must be finite")
+        self.init(bodyA: bodyA, bodyB: bodyB, rA: rA, rB: rB,
+                  stiffnessLin: stiffnessLin, stiffnessAng: stiffnessAng,
+                  fracture: fracture, fractureLinear: fractureLinear,
+                  hingeAxis: hingeAxis, motorTarget: motorTarget,
+                  motorTorque: motorTorque,
+                  motorStiffness: motorTorque > 0 ? 400 : 0,
+                  motorDamping: 0,
+                  motorMode: .implicitPositionPD,
+                  armature: 0, limitLo: limitLo, limitHi: limitHi)
+        self.motorRate = motorRate
     }
 }
 
@@ -511,6 +550,7 @@ public struct PhysicsScene {
     }
 
     @discardableResult
+    @_disfavoredOverload
     public mutating func addBody(size: F3, density: Float, friction: Float,
                                  dynamicFriction: Float? = nil, position: F3,
                                  rotation: Quat = Quat(real: 1, imag: .zero),
@@ -535,6 +575,20 @@ public struct PhysicsScene {
                 usesWorldSpaceRoundAnchor: shape != .box))
         }
         return body
+    }
+
+    /// Source-compatible body insertion using the original material model.
+    @discardableResult
+    public mutating func addBody(size: F3, density: Float, friction: Float,
+                                 position: F3,
+                                 rotation: Quat = Quat(real: 1, imag: .zero),
+                                 velocity: F3 = .zero,
+                                 shape: BodyShape = .box) -> Int {
+        addBody(size: size, density: density, friction: friction,
+                dynamicFriction: friction, position: position,
+                rotation: rotation, velocity: velocity, shape: shape,
+                mass: nil, diagonalInertia: nil, gravityScale: 1,
+                collisionGroup: 0, collisionEnabled: true)
     }
 
     /// Attach an additional collision primitive without changing body mass or

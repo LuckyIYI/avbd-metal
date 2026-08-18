@@ -35,6 +35,7 @@ public final class CPURigid {
     public var forces: [CPUForce] = []
     public let index: Int
 
+    @_disfavoredOverload
     public init(index: Int, size: F3, density: Float, friction: Float,
                 dynamicFriction: Float? = nil, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
@@ -90,6 +91,20 @@ public final class CPURigid {
         }
     }
 
+    /// Source-compatible initializer for the original single-friction body
+    /// model. New material and inertia fields retain their legacy defaults.
+    public convenience init(index: Int, size: F3, density: Float,
+                            friction: Float, position: F3,
+                            rotation: Quat = Quat(real: 1, imag: .zero),
+                            velocity: F3 = .zero,
+                            shape: BodyShape = .box) {
+        self.init(index: index, size: size, density: density,
+                  friction: friction, dynamicFriction: friction,
+                  position: position, rotation: rotation, velocity: velocity,
+                  shape: shape, mass: nil, diagonalInertia: nil,
+                  gravityScale: 1)
+    }
+
     public func constrainedTo(_ other: CPURigid) -> Bool {
         forces.contains { f in
             (f.bodyA === self && f.bodyB === other) || (f.bodyA === other && f.bodyB === self)
@@ -140,6 +155,7 @@ public final class CPUSolver {
     public init() {}
 
     @discardableResult
+    @_disfavoredOverload
     public func addBody(size: F3, density: Float, friction: Float,
                         dynamicFriction: Float? = nil, position: F3,
                         rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
@@ -155,6 +171,19 @@ public final class CPUSolver {
                          gravityScale: gravityScale)
         bodies.append(b)
         return b
+    }
+
+    /// Source-compatible body insertion using the original material model.
+    @discardableResult
+    public func addBody(size: F3, density: Float, friction: Float,
+                        position: F3,
+                        rotation: Quat = Quat(real: 1, imag: .zero),
+                        velocity: F3 = .zero,
+                        shape: BodyShape = .box) -> CPURigid {
+        addBody(size: size, density: density, friction: friction,
+                dynamicFriction: friction, position: position,
+                rotation: rotation, velocity: velocity, shape: shape,
+                mass: nil, diagonalInertia: nil, gravityScale: 1)
     }
 
     @discardableResult

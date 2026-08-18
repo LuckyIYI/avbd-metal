@@ -131,7 +131,7 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertThrowsError(try solver.submitStep()) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .commandBufferCreation(operation: "physics", frame: 1))
         }
         XCTAssertEqual(solver.frameIndex, 0)
@@ -139,9 +139,31 @@ final class GPUSolverTests: XCTestCase {
             solver.runtimeFailure,
             .commandBufferCreation(operation: "physics", frame: 1))
         XCTAssertThrowsError(try solver.submitStep()) { error in
-            XCTAssertEqual(error as? GPUSolver.AVBDError,
+            XCTAssertEqual(error as? GPUSolver.RuntimeFailure,
                            solver.runtimeFailure)
         }
+    }
+
+    func testLegacyRateMotorAdvancesWrappedServoTarget() throws {
+        var scene = PhysicsScene(name: "legacy-rate-motor")
+        scene.settings.dt = 0.25
+        scene.settings.gravity = 0
+        let body = scene.addBody(
+            size: F3(repeating: 0.2), density: 1, friction: 0,
+            position: .zero)
+        scene.addJoint(SceneJoint(
+            bodyA: -1, bodyB: body, rA: .zero, rB: .zero,
+            stiffnessLin: .infinity, stiffnessAng: .infinity,
+            hingeAxis: F3(0, 0, 1), motorTorque: 10,
+            motorRate: 2))
+        let solver = try makeGPU(scene)
+
+        XCTAssertEqual(solver.motorTargetForTesting(0), 0)
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertEqual(solver.motorTargetForTesting(0), 0.5,
+                       accuracy: 1e-6)
     }
 
     func testSynchronousSecondFrameFailureDrainsPriorSubmission() throws {
@@ -152,7 +174,7 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertThrowsError(try solver.submitStep()) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .commandBufferCreation(operation: "physics", frame: 2))
         }
 
@@ -168,7 +190,7 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertThrowsError(try solver.submitStep()) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .commandEncoderCreation(
                     operation: "physics", stage: "narrowphase", frame: 1))
         }
@@ -181,7 +203,7 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertThrowsError(try solver.maxConstraintErrorChecked()) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .commandBufferCreation(
                     operation: "constraint diagnostics", frame: 0))
         }
@@ -195,12 +217,12 @@ final class GPUSolverTests: XCTestCase {
         XCTAssertThrowsError(try task.step(
             actions: RLActionBatch(spec: task.spec), into: &result)) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .commandBufferCreation(operation: "physics", frame: 1))
         }
         XCTAssertThrowsError(try task.step(
             actions: RLActionBatch(spec: task.spec), into: &result)) { error in
-            XCTAssertEqual(error as? GPUSolver.AVBDError,
+            XCTAssertEqual(error as? GPUSolver.RuntimeFailure,
                            task.environment.solver.runtimeFailure)
         }
     }
@@ -209,7 +231,7 @@ final class GPUSolverTests: XCTestCase {
         let solver = try makeGPU(Demos.ground())
         try solver.submitStep()
         try solver.submitStep()
-        let injected = GPUSolver.AVBDError.commandExecution(
+        let injected = GPUSolver.RuntimeFailure.commandExecution(
             operation: "physics", frame: 1, status: -1,
             domain: "AVBDTests", code: 7, message: "synthetic GPU fault")
         solver.completionFailureForTesting = { operation, frame in
@@ -217,18 +239,18 @@ final class GPUSolverTests: XCTestCase {
         }
 
         XCTAssertThrowsError(try solver.synchronize()) { error in
-            XCTAssertEqual(error as? GPUSolver.AVBDError, injected)
+            XCTAssertEqual(error as? GPUSolver.RuntimeFailure, injected)
         }
         XCTAssertEqual(solver.inflightCountForTesting, 0)
         XCTAssertEqual(solver.runtimeFailure, injected)
         XCTAssertThrowsError(try solver.submitStep()) { error in
-            XCTAssertEqual(error as? GPUSolver.AVBDError, injected)
+            XCTAssertEqual(error as? GPUSolver.RuntimeFailure, injected)
         }
     }
 
     func testVectorizedTaskPropagatesAsynchronousExecutionFailure() throws {
         let task = try PushTTask(configuration: .init(numEnvironments: 1))
-        let injected = GPUSolver.AVBDError.commandExecution(
+        let injected = GPUSolver.RuntimeFailure.commandExecution(
             operation: "physics", frame: 1, status: -1,
             domain: "AVBDTests", code: 8, message: "synthetic GPU fault")
         task.environment.solver.completionFailureForTesting = {
@@ -239,7 +261,7 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertThrowsError(try task.step(
             actions: RLActionBatch(spec: task.spec), into: &result)) { error in
-            XCTAssertEqual(error as? GPUSolver.AVBDError, injected)
+            XCTAssertEqual(error as? GPUSolver.RuntimeFailure, injected)
         }
     }
 
@@ -303,7 +325,7 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertThrowsError(try solver.synchronize()) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .rigidPairCapacity(
                     frame: 1, required: 4_160, capacity: 4_096))
         }
@@ -327,7 +349,7 @@ final class GPUSolverTests: XCTestCase {
         try solver.submitStep()
 
         XCTAssertThrowsError(try solver.synchronize()) { error in
-            guard let failure = error as? GPUSolver.AVBDError,
+            guard let failure = error as? GPUSolver.RuntimeFailure,
                   case .unresolvedColoring(let frame, let conflicts)
                     = failure else {
                 return XCTFail("unexpected error: \(error)")
@@ -356,7 +378,7 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertThrowsError(try GPUSolver(scene: scene)) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .staticColorCapacity(body: 64, required: 65, capacity: 64))
         }
     }
@@ -372,7 +394,7 @@ final class GPUSolverTests: XCTestCase {
         XCTAssertThrowsError(try solver.encodeBuildInstancesChecked(
             command, instances: instances)) { error in
             XCTAssertEqual(
-                error as? GPUSolver.AVBDError,
+                error as? GPUSolver.RuntimeFailure,
                 .commandEncoderCreation(
                     operation: "render instances", stage: "build-instances",
                     frame: 0))

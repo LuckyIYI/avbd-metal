@@ -20,6 +20,16 @@ public final class CPUManifold: CPUForce {
     public var basis: (F3, F3, F3) = (.zero, .zero, .zero)
     public var staticFriction: Float = 0
     public var dynamicFriction: Float = 0
+    /// Compatibility alias for the original single Coulomb coefficient.
+    /// Reads the static coefficient; writes update both coefficients so
+    /// legacy callers retain their original single-material semantics.
+    public var friction: Float {
+        get { staticFriction }
+        set {
+            staticFriction = newValue
+            dynamicFriction = newValue
+        }
+    }
 
     init(solver: CPUSolver, bodyA: CPURigid, bodyB: CPURigid) {
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)

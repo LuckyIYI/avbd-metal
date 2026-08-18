@@ -108,6 +108,7 @@ public final class PushTEnv: RoboticsEnv {
     private var spawnPoses: [(F3, Quat)] = []
     private var commanded: [SIMD2<Float>] = []
 
+    @_disfavoredOverload
     public init(numEnvs: Int, seed: UInt64 = 1,
                 goalMarkers: Bool = false,
                 layout: PushTBatchLayout = .grid) throws {
@@ -179,6 +180,13 @@ public final class PushTEnv: RoboticsEnv {
             let p = spawnPoses[reference.tip].0 - reference.center
             return SIMD2(p.x, p.y)
         }
+    }
+
+    /// Source-compatible initializer retaining the original grid layout.
+    public convenience init(numEnvs: Int, seed: UInt64 = 1,
+                            goalMarkers: Bool = false) throws {
+        try self.init(numEnvs: numEnvs, seed: seed,
+                      goalMarkers: goalMarkers, layout: .grid)
     }
 
     static func buildOne(_ s: inout PhysicsScene, center c: F3,

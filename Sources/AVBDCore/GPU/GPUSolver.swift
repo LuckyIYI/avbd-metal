@@ -221,6 +221,8 @@ public final class GPUSolver {
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
+    /// Legacy position-servo targets advanced each step as `(joint, rad/s)`.
+    private var rateMotors: [(Int, Float)] = []
     public init(scene: PhysicsScene, device: MTLDevice? = nil,
                 maxPairsPerBody: Int = 16) throws {
         precondition(scene.settings.collisionMargin >= 0
@@ -465,6 +467,25 @@ public final class GPUSolver {
         case allocFailed(String)
         case shaderCompile(String)
         case kernelMissing(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .noDevice:
+                return "Metal device or command queue is unavailable"
+            case .allocFailed(let label):
+                return "Metal buffer allocation failed: \(label)"
+            case .shaderCompile(let message):
+                return "Metal shader compilation failed: \(message)"
+            case .kernelMissing(let name):
+                return "Metal kernel is unavailable: \(name)"
+            }
+        }
+    }
+
+    /// Terminal failures discovered while encoding or retiring solver work.
+    /// These are separate from the original construction-time `AVBDError`
+    /// surface so clients can continue to switch exhaustively over it.
+    public enum RuntimeFailure: Error, Equatable, LocalizedError {
         case commandBufferCreation(operation: String, frame: Int)
         case commandEncoderCreation(operation: String, stage: String,
                                     frame: Int)
@@ -477,14 +498,6 @@ public final class GPUSolver {
 
         public var errorDescription: String? {
             switch self {
-            case .noDevice:
-                return "Metal device or command queue is unavailable"
-            case .allocFailed(let label):
-                return "Metal buffer allocation failed: \(label)"
-            case .shaderCompile(let message):
-                return "Metal shader compilation failed: \(message)"
-            case .kernelMissing(let name):
-                return "Metal kernel is unavailable: \(name)"
             case .commandBufferCreation(let operation, let frame):
                 return "\(operation) frame \(frame): command-buffer creation failed"
             case .commandEncoderCreation(let operation, let stage, let frame):
@@ -890,6 +903,11 @@ public final class GPUSolver {
                         g.header.w |= Self.jointMotorModeExplicitTorquePD
                     case .velocity:
                         g.header.w |= Self.jointMotorModeVelocity
+                    }
+                    if j.motorRate != 0 {
+                        precondition(j.motorMode == .implicitPositionPD,
+                            "legacy motor rates require implicit position PD")
+                        rateMotors.append((i, j.motorRate))
                     }
                 }
                 if j.limitLo < j.limitHi && j.motorTorque == 0 {
@@ -1694,7 +1712,7 @@ public final class GPUSolver {
                 if c < 64 { used |= (1 << UInt64(c)) }
             }
             guard used != UInt64.max else {
-                throw AVBDError.staticColorCapacity(
+                throw RuntimeFailure.staticColorCapacity(
                     body: v, required: AVBD_MAX_COLORS + 1,
                     capacity: AVBD_MAX_COLORS)
             }
@@ -1881,12 +1899,12 @@ public final class GPUSolver {
     private var inflight: [StepSubmission] = []
     private let statsLock = NSLock()
     private let failureLock = NSLock()
-    private var latchedRuntimeFailure: AVBDError?
+    private var latchedRuntimeFailure: RuntimeFailure?
 
     /// A runtime failure is terminal because a failed Metal command may have
     /// partially modified solver state. Rebuild the solver; never clear and
     /// continue a training rollout.
-    public var runtimeFailure: AVBDError? {
+    public var runtimeFailure: RuntimeFailure? {
         failureLock.lock()
         defer { failureLock.unlock() }
         return latchedRuntimeFailure
@@ -1897,8 +1915,15 @@ public final class GPUSolver {
     // between submissions is safe even if an older command is still in flight.
     var commandBufferFactoryForTesting: (() -> MTLCommandBuffer?)?
     var deniedEncoderStageForTesting: String?
-    var completionFailureForTesting: ((String, Int) -> AVBDError?)?
+    var completionFailureForTesting: ((String, Int) -> RuntimeFailure?)?
     var inflightCountForTesting: Int { inflight.count }
+
+    func motorTargetForTesting(_ joint: Int) -> Float {
+        sync()
+        let values = joints.contents().bindMemory(
+            to: JointGPU.self, capacity: max(1, numJoints))
+        return values[joint].motor.x
+    }
 
     private func makeRuntimeCommandBuffer() -> MTLCommandBuffer? {
         if let factory = commandBufferFactoryForTesting { return factory() }
@@ -2423,7 +2448,7 @@ public final class GPUSolver {
     }
 
     @discardableResult
-    private func latch(_ failure: AVBDError) -> AVBDError {
+    private func latch(_ failure: RuntimeFailure) -> RuntimeFailure {
         failureLock.lock()
         defer { failureLock.unlock() }
         if latchedRuntimeFailure == nil { latchedRuntimeFailure = failure }
@@ -2507,11 +2532,11 @@ public final class GPUSolver {
     public func synchronize() throws {
         let pending = inflight
         inflight.removeAll(keepingCapacity: true)
-        var observedFailure: AVBDError?
+        var observedFailure: RuntimeFailure?
         for submission in pending {
             do {
                 try retire(submission)
-            } catch let failure as AVBDError {
+            } catch let failure as RuntimeFailure {
                 if observedFailure == nil { observedFailure = failure }
             }
         }
@@ -2644,7 +2669,7 @@ public final class GPUSolver {
             let oldest = inflight.removeFirst()
             do {
                 try retire(oldest)
-            } catch let failure as AVBDError {
+            } catch let failure as RuntimeFailure {
                 // A terminal error invalidates every queued frame. Drain the
                 // queue before returning so no GPU work outlives its solver
                 // resources, while preserving the earliest failure.
@@ -2690,26 +2715,26 @@ public final class GPUSolver {
     public func submitStep() throws {
         try requireHealthy()
         try throttleChecked()
-        if profiling || !spinners.isEmpty {
+        if profiling || !spinners.isEmpty || !rateMotors.isEmpty {
             // Profiling retires its own submission synchronously. Drain any
             // older asynchronous owner before selecting a parity readback
-            // slot; spinners likewise require a CPU-write boundary.
+            // slot; CPU-authored kinematic targets likewise require a fence.
             try synchronize()
         }
         do {
             try encodeAndSubmitStep()
-        } catch let failure as AVBDError {
+        } catch let failure as RuntimeFailure {
             // A synchronous failure in frame N must still retire every older
             // submitted frame before it reaches the caller. Otherwise the
             // throwing API would return while Metal continued mutating the
             // solver behind an already-failed rollout boundary.
             let pending = inflight
             inflight.removeAll(keepingCapacity: true)
-            var earlierFailure: AVBDError?
+            var earlierFailure: RuntimeFailure?
             for submission in pending {
                 do {
                     try retire(submission)
-                } catch let prior as AVBDError {
+                } catch let prior as RuntimeFailure {
                     if earlierFailure == nil { earlierFailure = prior }
                 }
             }
@@ -2724,13 +2749,13 @@ public final class GPUSolver {
 
         // ---- Command buffer 1: collision + warm start + adjacency + coloring
         guard let cmd1 = makeRuntimeCommandBuffer() else {
-            throw AVBDError.commandBufferCreation(
+            throw RuntimeFailure.commandBufferCreation(
                 operation: "physics", frame: submittedFrame)
         }
         cmd1.label = "AVBD physics frame \(submittedFrame)"
 
         guard let clearEncoder = cmd1.makeBlitCommandEncoder() else {
-            throw AVBDError.commandEncoderCreation(
+            throw RuntimeFailure.commandEncoderCreation(
                 operation: "physics", stage: "clear", frame: submittedFrame)
         }
         clearEncoder.label = "clear"
@@ -2767,7 +2792,7 @@ public final class GPUSolver {
             return e
         }
         guard var enc = makeEncoder("broadphase") else {
-            throw AVBDError.commandEncoderCreation(
+            throw RuntimeFailure.commandEncoderCreation(
                 operation: "physics", stage: "broadphase",
                 frame: submittedFrame)
         }
@@ -2777,7 +2802,7 @@ public final class GPUSolver {
         func stage(_ name: String) throws {
             enc.endEncoding()
             guard let next = makeEncoder(name) else {
-                throw AVBDError.commandEncoderCreation(
+                throw RuntimeFailure.commandEncoderCreation(
                     operation: "physics", stage: name,
                     frame: submittedFrame)
             }
@@ -3456,7 +3481,7 @@ public final class GPUSolver {
             // scratch copy for the gather (inertLin is dead after the solve
             // and rewritten by next frame's warmstart)
             guard let blit = cmd1.makeBlitCommandEncoder() else {
-                throw AVBDError.commandEncoderCreation(
+                throw RuntimeFailure.commandEncoderCreation(
                     operation: "physics", stage: "viscosity-copy",
                     frame: submittedFrame)
             }
@@ -3466,7 +3491,7 @@ public final class GPUSolver {
             blit.endEncoding()
             guard deniedEncoderStageForTesting != "velocity-smoothing",
                   let e2 = cmd1.makeComputeCommandEncoder() else {
-                throw AVBDError.commandEncoderCreation(
+                throw RuntimeFailure.commandEncoderCreation(
                     operation: "physics", stage: "velocity-smoothing",
                     frame: submittedFrame)
             }
@@ -3488,7 +3513,7 @@ public final class GPUSolver {
             e2.endEncoding()
         }
         guard let readbackEncoder = cmd1.makeBlitCommandEncoder() else {
-            throw AVBDError.commandEncoderCreation(
+            throw RuntimeFailure.commandEncoderCreation(
                 operation: "physics", stage: "readback",
                 frame: submittedFrame)
         }
@@ -3550,8 +3575,18 @@ public final class GPUSolver {
 
     }
 
-    /// Advance kinematic spinners (static bodies with prescribed rotation).
+    /// Advance compatibility rate motors and kinematic spinners.
     private func advanceSpinners() {
+        if !rateMotors.isEmpty {
+            let jp = joints.contents().bindMemory(
+                to: JointGPU.self, capacity: max(1, numJoints))
+            for (joint, rate) in rateMotors {
+                var target = jp[joint].motor.x + rate * settings.dt
+                target -= (2 * Float.pi)
+                    * (target / (2 * .pi)).rounded()
+                jp[joint].motor.x = target
+            }
+        }
         guard !spinners.isEmpty else { return }
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         for sp in spinners {
@@ -3752,7 +3787,7 @@ public final class GPUSolver {
         try synchronize()
         guard deniedEncoderStageForTesting != "render-instances",
               let enc = cmd.makeComputeCommandEncoder() else {
-            throw AVBDError.commandEncoderCreation(
+            throw RuntimeFailure.commandEncoderCreation(
                 operation: "render instances", stage: "build-instances",
                 frame: frameIndex)
         }
