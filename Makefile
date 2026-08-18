@@ -1,13 +1,36 @@
 # AVBD Metal build helpers
 
-.PHONY: build test app cli bench clean ml-tool app-ml ios-ml \
-	generate-arachne-assets verify-arachne-assets verify-arachne-policy
+.PHONY: build test verify-core verify-mlx-rl app cli bench clean ml-tool \
+	app-ml ios-ml generate-arachne-assets verify-arachne-assets \
+	verify-arachne-policy
 
 build:
 	swift build -c release
 
 test:
 	swift test
+
+# Local core merge gate: generated Arachne contracts plus the SwiftPM suite.
+verify-core: verify-arachne-assets
+	swift test
+
+# Xcode-package the MLX/RL tests, then run their bundle serially so the MLX
+# opt-in reaches XCTest (xcodebuild filters custom environment variables).
+verify-mlx-rl:
+	xcodebuild \
+	  -scheme avbd-metal-Package \
+	  -configuration Debug \
+	  -destination 'platform=macOS,arch=arm64' \
+	  -derivedDataPath .xcbuild-test \
+	  -clonedSourcePackagesDirPath .xcbuild-test/SourcePackages \
+	  -disableAutomaticPackageResolution \
+	  -onlyUsePackageVersionsFromResolvedFile \
+	  -parallel-testing-enabled NO \
+	  -only-testing:AVBDTests/RLFrameworkTests \
+	  build-for-testing
+	AVBD_MLX_INTEGRATION_TESTS=1 xcrun xctest \
+	  -XCTest RLFrameworkTests \
+	  .xcbuild-test/Build/Products/Debug/AVBDTests.xctest
 
 cli: build
 	@echo "binary: .build/release/avbd"
