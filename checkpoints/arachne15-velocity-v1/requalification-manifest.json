@@ -1,0 +1,319 @@
+{
+  "actionDimension" : 16,
+  "candidateCheckpointDirectory" : "runs\/arachne15-velocity-v1\/requalification-r2000006\/candidate",
+  "candidateCheckpointFingerprint" : "97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5",
+  "candidateMetadataSHA256" : "97e3d9325147fa620a8b709e2bbd51a33be34dacbb400ec21691fdfe050d52da",
+  "candidatePolicySHA256" : "a41b162b2bb922605e29a487a736f98b31416457807fc30a30c4e52014bf0638",
+  "candidateTrainingStateSHA256" : "15857f493c4a481825b008864879d53be5d398865a33c2249adfbbabe6d51e3e",
+  "changedFields" : [
+    "metadata.taskRevision",
+    "metadata.inferenceBatchSize",
+    "metadata.ppo.initializationCheckpoint",
+    "metadata.ppo.updates",
+    "training-state.completedUpdates",
+    "training-state.environmentSteps",
+    "training-state.optimizerSteps",
+    "training-state.adaptiveLearningRate"
+  ],
+  "controlDecimation" : 10,
+  "declaredSourceCommit" : "a941cfe37c0f285105a192cc48192c85909a2d59",
+  "evaluationCriteria" : {
+    "maximumTaskMetrics" : {
+      "episode\/foot_collider_penetration_over_1mm_fraction" : 0.025,
+      "episode\/foot_collider_penetration_rmse_m" : 0.0005,
+      "episode\/linear_velocity_rmse_mps" : 0.15,
+      "episode\/yaw_rate_rmse_rps" : 0.4
+    },
+    "minimumMeanEpisodeLengthFraction" : 0.9,
+    "minimumSuccessRate" : 0.9,
+    "minimumTaskMetrics" : {
+      "episode\/minimum_foot_collider_clearance_m" : -0.003,
+      "episode\/survived" : 0.95
+    }
+  },
+  "inferenceBatchSize" : 128,
+  "maxEpisodeSteps" : 500,
+  "observationDimension" : 60,
+  "parentCheckpointDirectory" : "checkpoints\/arachne15-velocity-v0",
+  "parentCheckpointFingerprint" : "aed643b062df4e0e07e70998212720909bc1b25229455489ba28d4319d202524",
+  "parentMetadataSHA256" : "1af26ab822bae72db6ed64d4f19dfe078b2cd333a010ee4488f4c22fbe8e307d",
+  "parentPolicySHA256" : "a41b162b2bb922605e29a487a736f98b31416457807fc30a30c4e52014bf0638",
+  "parentTrainingEnvironmentSteps" : 8192,
+  "parentTrainingStateSHA256" : "2dd66c4d70bd34a72050b3c938b74f7361066c1ac1a935bfe797c68add00131a",
+  "parentTrainingUpdates" : 1,
+  "qualification" : {
+    "additionalSuites" : [
+      {
+        "aggregate" : {
+          "file" : "qualification\/validation-collision\/aggregate.json",
+          "sha256" : "6ecf2f14837705ce85f6473341c6a3ba0cc09f2ed903a2b5bcdaf2c9d315fd99"
+        },
+        "id" : "validation-collision",
+        "reports" : [
+          {
+            "evaluationSeed" : 61501,
+            "file" : "qualification\/validation-collision\/eval-seed-61501.json",
+            "sha256" : "b24af2be1f97f7c2d3e9e4c57c80fb60ecd92e8ab5015d7c006385be85e5ac8d"
+          },
+          {
+            "evaluationSeed" : 61502,
+            "file" : "qualification\/validation-collision\/eval-seed-61502.json",
+            "sha256" : "72d802a719f69f257e325c51f3d2c4c9169e4c08ef96b8f76ec71efcdada67c9"
+          },
+          {
+            "evaluationSeed" : 61503,
+            "file" : "qualification\/validation-collision\/eval-seed-61503.json",
+            "sha256" : "f626f25b0963ac022c11ed3242c63155b7254b4be574ff335318932ce1b0ae25"
+          },
+          {
+            "evaluationSeed" : 61504,
+            "file" : "qualification\/validation-collision\/eval-seed-61504.json",
+            "sha256" : "a29ddc1347a6fcf8b7c6fcf570e004d1e0d815008bf4c06c5ea51d7b3692d82d"
+          }
+        ]
+      }
+    ],
+    "aggregate" : {
+      "file" : "qualification\/nominal\/aggregate.json",
+      "sha256" : "5a2383122b8c1ac45cf62b2a5010bf28de13e4d38f600d4c8766ed201754647c"
+    },
+    "reports" : [
+      {
+        "evaluationSeed" : 61001,
+        "file" : "qualification\/nominal\/eval-seed-61001.json",
+        "sha256" : "a425b6304acfd329a3764a8c3f83293f952cb00e4a03b2f5884e94cd18fa0943"
+      },
+      {
+        "evaluationSeed" : 61002,
+        "file" : "qualification\/nominal\/eval-seed-61002.json",
+        "sha256" : "6f15108cf351f02607fd8425fefc80864d026bed08d177396dff0d5330160865"
+      },
+      {
+        "evaluationSeed" : 61003,
+        "file" : "qualification\/nominal\/eval-seed-61003.json",
+        "sha256" : "36fee36f871e8f0422914c89411aa8ebec6bf6d4818420f771a56d359b2078fd"
+      },
+      {
+        "evaluationSeed" : 61004,
+        "file" : "qualification\/nominal\/eval-seed-61004.json",
+        "sha256" : "fc32a6c51028ba3fe938fee44a8c425725e608c98eedc538b7c2f4c211e21ac0"
+      }
+    ]
+  },
+  "qualificationMatrix" : {
+    "comparisons" : [
+      {
+        "baselineSuite" : "nominal",
+        "evaluatedSuite" : "validation-collision",
+        "maximumPooledSuccessRateDrop" : 0.05
+      }
+    ],
+    "suites" : [
+      {
+        "changedConfigurationFields" : [
+
+        ],
+        "episodesPerReport" : 512,
+        "evaluationCriteria" : {
+          "maximumTaskMetrics" : {
+            "episode\/foot_collider_penetration_over_1mm_fraction" : 0.025,
+            "episode\/foot_collider_penetration_rmse_m" : 0.0005,
+            "episode\/linear_velocity_rmse_mps" : 0.15,
+            "episode\/yaw_rate_rmse_rps" : 0.4
+          },
+          "minimumMeanEpisodeLengthFraction" : 0.9,
+          "minimumSuccessRate" : 0.9,
+          "minimumTaskMetrics" : {
+            "episode\/minimum_foot_collider_clearance_m" : -0.003,
+            "episode\/survived" : 0.95
+          }
+        },
+        "evaluationEnvironments" : 128,
+        "evaluationSeeds" : [
+          61001,
+          61002,
+          61003,
+          61004
+        ],
+        "evaluationTaskConfiguration" : {
+          "armatureScaleLower" : 1,
+          "armatureScaleUpper" : 1,
+          "commandProgressRewardWeight" : 20,
+          "commandResamplingSteps" : 500,
+          "frictionScaleLower" : 1,
+          "frictionScaleUpper" : 1,
+          "goalBoundaryCommandSpeed" : 0.02,
+          "goalCommandSpeed" : 0.15,
+          "goalDwellSteps" : 15,
+          "goalProgressRewardWeight" : 4,
+          "goalRadius" : 0.12,
+          "goalSlowdownDistance" : 0.5,
+          "goalStableRewardWeight" : 1,
+          "goalSuccessBonus" : 8,
+          "inertiaScaleLower" : 1,
+          "inertiaScaleUpper" : 1,
+          "initialRollPitchRange" : 0,
+          "initialYawRange" : 0,
+          "massScaleLower" : 1,
+          "massScaleUpper" : 1,
+          "maximumActionLatencySteps" : 0,
+          "maximumForwardVelocity" : 0.15,
+          "maximumGoalArrivalSpeed" : 0.08,
+          "maximumGoalDirectionAngle" : 3.1415925,
+          "maximumGoalDistance" : 2,
+          "maximumLateralVelocity" : 0,
+          "maximumYawRate" : 0,
+          "minimumForwardVelocity" : 0.15,
+          "minimumGoalDistance" : 0.6,
+          "motorDampingScaleLower" : 1,
+          "motorDampingScaleUpper" : 1,
+          "motorStiffnessScaleLower" : 1,
+          "motorStiffnessScaleUpper" : 1,
+          "motorTorqueScaleLower" : 1,
+          "motorTorqueScaleUpper" : 1,
+          "observationNoise" : 0,
+          "pointGoal" : 0,
+          "solverIterations" : 20,
+          "standingCommandProbability" : 0,
+          "validationCollisionProfile" : 0,
+          "velocityErrorPenaltyWeight" : 10,
+          "yawErrorPenaltyWeight" : 10
+        },
+        "id" : "nominal"
+      },
+      {
+        "changedConfigurationFields" : [
+          "validationCollisionProfile"
+        ],
+        "episodesPerReport" : 512,
+        "evaluationCriteria" : {
+          "maximumTaskMetrics" : {
+            "episode\/foot_collider_penetration_over_1mm_fraction" : 0.025,
+            "episode\/foot_collider_penetration_rmse_m" : 0.0005,
+            "episode\/linear_velocity_rmse_mps" : 0.15,
+            "episode\/yaw_rate_rmse_rps" : 0.4
+          },
+          "minimumMeanEpisodeLengthFraction" : 0.9,
+          "minimumSuccessRate" : 0.9,
+          "minimumTaskMetrics" : {
+            "episode\/minimum_foot_collider_clearance_m" : -0.003,
+            "episode\/survived" : 0.95
+          }
+        },
+        "evaluationEnvironments" : 128,
+        "evaluationSeeds" : [
+          61501,
+          61502,
+          61503,
+          61504
+        ],
+        "evaluationTaskConfiguration" : {
+          "armatureScaleLower" : 1,
+          "armatureScaleUpper" : 1,
+          "commandProgressRewardWeight" : 20,
+          "commandResamplingSteps" : 500,
+          "frictionScaleLower" : 1,
+          "frictionScaleUpper" : 1,
+          "goalBoundaryCommandSpeed" : 0.02,
+          "goalCommandSpeed" : 0.15,
+          "goalDwellSteps" : 15,
+          "goalProgressRewardWeight" : 4,
+          "goalRadius" : 0.12,
+          "goalSlowdownDistance" : 0.5,
+          "goalStableRewardWeight" : 1,
+          "goalSuccessBonus" : 8,
+          "inertiaScaleLower" : 1,
+          "inertiaScaleUpper" : 1,
+          "initialRollPitchRange" : 0,
+          "initialYawRange" : 0,
+          "massScaleLower" : 1,
+          "massScaleUpper" : 1,
+          "maximumActionLatencySteps" : 0,
+          "maximumForwardVelocity" : 0.15,
+          "maximumGoalArrivalSpeed" : 0.08,
+          "maximumGoalDirectionAngle" : 3.1415925,
+          "maximumGoalDistance" : 2,
+          "maximumLateralVelocity" : 0,
+          "maximumYawRate" : 0,
+          "minimumForwardVelocity" : 0.15,
+          "minimumGoalDistance" : 0.6,
+          "motorDampingScaleLower" : 1,
+          "motorDampingScaleUpper" : 1,
+          "motorStiffnessScaleLower" : 1,
+          "motorStiffnessScaleUpper" : 1,
+          "motorTorqueScaleLower" : 1,
+          "motorTorqueScaleUpper" : 1,
+          "observationNoise" : 0,
+          "pointGoal" : 0,
+          "solverIterations" : 20,
+          "standingCommandProbability" : 0,
+          "validationCollisionProfile" : 1,
+          "velocityErrorPenaltyWeight" : 10,
+          "yawErrorPenaltyWeight" : 10
+        },
+        "id" : "validation-collision"
+      }
+    ]
+  },
+  "qualificationPlan" : {
+    "episodesPerReport" : 512,
+    "evaluationEnvironments" : 128,
+    "evaluationSeeds" : [
+      61001,
+      61002,
+      61003,
+      61004
+    ]
+  },
+  "schemaVersion" : 2,
+  "simulationStepSeconds" : 0.002,
+  "sourceTaskRevision" : 6,
+  "targetTaskRevision" : 2000006,
+  "targetTrainingEnvironmentSteps" : 0,
+  "targetTrainingUpdates" : 0,
+  "task" : "arachne15-velocity-v0",
+  "taskConfiguration" : {
+    "armatureScaleLower" : 1,
+    "armatureScaleUpper" : 1,
+    "commandProgressRewardWeight" : 20,
+    "commandResamplingSteps" : 500,
+    "frictionScaleLower" : 1,
+    "frictionScaleUpper" : 1,
+    "goalBoundaryCommandSpeed" : 0.02,
+    "goalCommandSpeed" : 0.15,
+    "goalDwellSteps" : 15,
+    "goalProgressRewardWeight" : 4,
+    "goalRadius" : 0.12,
+    "goalSlowdownDistance" : 0.5,
+    "goalStableRewardWeight" : 1,
+    "goalSuccessBonus" : 8,
+    "inertiaScaleLower" : 1,
+    "inertiaScaleUpper" : 1,
+    "initialRollPitchRange" : 0,
+    "initialYawRange" : 0,
+    "massScaleLower" : 1,
+    "massScaleUpper" : 1,
+    "maximumActionLatencySteps" : 0,
+    "maximumForwardVelocity" : 0.15,
+    "maximumGoalArrivalSpeed" : 0.08,
+    "maximumGoalDirectionAngle" : 3.1415925,
+    "maximumGoalDistance" : 2,
+    "maximumLateralVelocity" : 0,
+    "maximumYawRate" : 0,
+    "minimumForwardVelocity" : 0.15,
+    "minimumGoalDistance" : 0.6,
+    "motorDampingScaleLower" : 1,
+    "motorDampingScaleUpper" : 1,
+    "motorStiffnessScaleLower" : 1,
+    "motorStiffnessScaleUpper" : 1,
+    "motorTorqueScaleLower" : 1,
+    "motorTorqueScaleUpper" : 1,
+    "observationNoise" : 0,
+    "pointGoal" : 0,
+    "solverIterations" : 20,
+    "standingCommandProbability" : 0,
+    "validationCollisionProfile" : 0,
+    "velocityErrorPenaltyWeight" : 10,
+    "yawErrorPenaltyWeight" : 10
+  }
+}

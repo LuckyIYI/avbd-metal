@@ -392,7 +392,9 @@ public final class Arachne15DeploymentController {
     ) throws {
         let runtime = try VectorPolicyDeploymentRuntime(
             bundleDirectory: bundleDirectory,
-            expectedTask: "arachne15-goal-v0", expectedTaskRevision: 6,
+            expectedTask: "arachne15-goal-v0",
+            expectedTaskRevision:
+                Arachne15LocomotionTask.currentTaskRevision,
             expectedCheckpointFingerprint:
                 calibration.policyCheckpointFingerprint)
         try self.init(inference: runtime, calibration: calibration,

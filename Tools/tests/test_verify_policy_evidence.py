@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import unittest
@@ -80,6 +81,80 @@ class MultiSuiteEvidenceVerifierTests(unittest.TestCase):
             ],
             0.0005,
         )
+
+    def test_published_arachne_profiles_pin_every_file_and_outcome(self) -> None:
+        root = TOOLS.parent
+        for task, profile in verifier.ARACHNE_QUALIFICATION_PROFILE.items():
+            with self.subTest(task=task):
+                candidate_files = verifier.arachne_candidate_files(profile)
+                self.assertEqual(len(candidate_files), 15)
+                candidate = root / "checkpoints" / profile[
+                    "checkpointRelativeDirectory"
+                ]
+                parent = root / profile["parentDirectory"]
+                verifier.verify_pinned_file_tree(
+                    candidate, candidate_files, f"{task} candidate"
+                )
+                verifier.verify_pinned_file_tree(
+                    parent, profile["parentFiles"], f"{task} parent"
+                )
+                self.assertEqual(
+                    verifier.checkpoint_fingerprint(candidate),
+                    profile["candidateFingerprint"],
+                )
+                self.assertEqual(
+                    verifier.checkpoint_fingerprint(parent),
+                    profile["parentFingerprint"],
+                )
+                for suite in profile["suites"].values():
+                    self.assertEqual(
+                        sum(suite["successes"]), suite["totalSuccesses"]
+                    )
+                    self.assertEqual(len(suite["seeds"]), 4)
+                    self.assertEqual(len(suite["reportSHA256"]), 4)
+
+    def test_pinned_tree_rejects_mutated_or_extra_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary) / "bundle"
+            bundle.mkdir()
+            payload = bundle / "payload.json"
+            payload.write_bytes(b"sealed")
+            expected = {
+                "payload.json": verifier.sha256_file(payload),
+            }
+            verifier.verify_pinned_file_tree(bundle, expected, "fixture")
+            payload.write_bytes(b"mutated")
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "SHA-256 changed"
+            ):
+                verifier.verify_pinned_file_tree(bundle, expected, "fixture")
+            payload.write_bytes(b"sealed")
+            (bundle / "extra.json").write_text("{}")
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "file inventory changed"
+            ):
+                verifier.verify_pinned_file_tree(bundle, expected, "fixture")
+
+    def test_release_app_inventory_is_exact(self) -> None:
+        root = TOOLS.parent
+        source = root / "checkpoints"
+        with tempfile.TemporaryDirectory() as temporary:
+            packaged = Path(temporary) / "checkpoints"
+            packaged.mkdir()
+            shutil.copy2(source / "README.md", packaged / "README.md")
+            for relative in (
+                "humanoid-isaac-flat-v2",
+                "external/unitree-h1",
+                "arachne15-velocity-v1",
+                "arachne15-goal-v1",
+            ):
+                shutil.copytree(source / relative, packaged / relative)
+            verifier.verify_app_checkpoint_package(root, packaged)
+            (packaged / "arachne15-velocity-v0").mkdir()
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "directory inventory differs"
+            ):
+                verifier.verify_app_checkpoint_package(root, packaged)
 
 
 if __name__ == "__main__":

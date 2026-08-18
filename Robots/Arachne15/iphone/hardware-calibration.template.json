@@ -7,7 +7,7 @@
   "maximumServoTemperatureCelsius" : 55,
   "measuredAtUTC" : "",
   "measuredMaximumRoundTripLatencySeconds" : 0,
-  "policyCheckpointFingerprint" : "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027",
+  "policyCheckpointFingerprint" : "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02",
   "robotSerial" : "",
   "schemaVersion" : 1,
   "servoDirectionSigns" : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],

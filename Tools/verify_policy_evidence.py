@@ -184,22 +184,148 @@ REQUALIFICATION_V2_MANIFEST_KEYS = (
 ARACHNE_EPOCH2_REVISION = 2_000_006
 ARACHNE_QUALIFICATION_PROFILE = {
     "arachne15-velocity-v0": {
-        "nominalSeeds": [61_001, 61_002, 61_003, 61_004],
-        "validationSeeds": [61_501, 61_502, 61_503, 61_504],
+        "selectionID": "arachne15-velocity-v1",
+        "checkpointRelativeDirectory": "arachne15-velocity-v1",
+        "evidenceRelativePath": (
+            "checkpoints/arachne15-velocity-v1/"
+            "requalification-manifest.json"
+        ),
         "parentDirectory": "checkpoints/arachne15-velocity-v0",
+        "candidateDirectory": (
+            "runs/arachne15-velocity-v1/"
+            "requalification-r2000006/candidate"
+        ),
+        "declaredSourceCommit": (
+            "a941cfe37c0f285105a192cc48192c85909a2d59"
+        ),
         "parentFingerprint":
             "aed643b062df4e0e07e70998212720909bc1b25229455489ba28d4319d202524",
+        "candidateFingerprint":
+            "97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5",
         "parentPolicySHA256":
             "a41b162b2bb922605e29a487a736f98b31416457807fc30a30c4e52014bf0638",
+        "parentFiles": {
+            "evaluation.json":
+                "25b3dc73a57ac73711515ca648a82f20b8ce32cd1c39d8bd7f6b6659510fac26",
+            "metadata.json":
+                "1af26ab822bae72db6ed64d4f19dfe078b2cd333a010ee4488f4c22fbe8e307d",
+            "policy.safetensors":
+                "a41b162b2bb922605e29a487a736f98b31416457807fc30a30c4e52014bf0638",
+            "training-state.json":
+                "2dd66c4d70bd34a72050b3c938b74f7361066c1ac1a935bfe797c68add00131a",
+        },
+        "candidateFiles": {
+            "deployment-manifest.json":
+                "7295cf74dc9576a8b2bce74eeae0beb2932af96c5ff0617b0b99b82796b5039c",
+            "metadata.json":
+                "97e3d9325147fa620a8b709e2bbd51a33be34dacbb400ec21691fdfe050d52da",
+            "policy.safetensors":
+                "a41b162b2bb922605e29a487a736f98b31416457807fc30a30c4e52014bf0638",
+            "requalification-manifest.json":
+                "ba2b8dbe2d34e2c27a3a074dcdea91decc1bc57e08855293a9fbd149a227f159",
+            "training-state.json":
+                "15857f493c4a481825b008864879d53be5d398865a33c2249adfbbabe6d51e3e",
+        },
+        "suites": {
+            "nominal": {
+                "seeds": [61_001, 61_002, 61_003, 61_004],
+                "successes": [512, 512, 512, 512],
+                "totalSuccesses": 2_048,
+                "aggregateSHA256":
+                    "5a2383122b8c1ac45cf62b2a5010bf28de13e4d38f600d4c8766ed201754647c",
+                "reportSHA256": [
+                    "a425b6304acfd329a3764a8c3f83293f952cb00e4a03b2f5884e94cd18fa0943",
+                    "6f15108cf351f02607fd8425fefc80864d026bed08d177396dff0d5330160865",
+                    "36fee36f871e8f0422914c89411aa8ebec6bf6d4818420f771a56d359b2078fd",
+                    "fc32a6c51028ba3fe938fee44a8c425725e608c98eedc538b7c2f4c211e21ac0",
+                ],
+            },
+            "validation-collision": {
+                "seeds": [61_501, 61_502, 61_503, 61_504],
+                "successes": [512, 512, 512, 512],
+                "totalSuccesses": 2_048,
+                "aggregateSHA256":
+                    "6ecf2f14837705ce85f6473341c6a3ba0cc09f2ed903a2b5bcdaf2c9d315fd99",
+                "reportSHA256": [
+                    "b24af2be1f97f7c2d3e9e4c57c80fb60ecd92e8ab5015d7c006385be85e5ac8d",
+                    "72d802a719f69f257e325c51f3d2c4c9169e4c08ef96b8f76ec71efcdada67c9",
+                    "f626f25b0963ac022c11ed3242c63155b7254b4be574ff335318932ce1b0ae25",
+                    "a29ddc1347a6fcf8b7c6fcf570e004d1e0d815008bf4c06c5ea51d7b3692d82d",
+                ],
+            },
+        },
     },
     "arachne15-goal-v0": {
-        "nominalSeeds": [62_001, 62_002, 62_003, 62_004],
-        "validationSeeds": [63_001, 63_002, 63_003, 63_004],
+        "selectionID": "arachne15-goal-v1",
+        "checkpointRelativeDirectory": "arachne15-goal-v1",
+        "evidenceRelativePath": (
+            "checkpoints/arachne15-goal-v1/"
+            "requalification-manifest.json"
+        ),
         "parentDirectory": "checkpoints/arachne15-goal-v0",
+        "candidateDirectory": (
+            "runs/arachne15-goal-v1/"
+            "requalification-r2000006/candidate"
+        ),
+        "declaredSourceCommit": (
+            "a941cfe37c0f285105a192cc48192c85909a2d59"
+        ),
         "parentFingerprint":
             "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027",
+        "candidateFingerprint":
+            "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02",
         "parentPolicySHA256":
             "9521c03cab6fc9e829cd2664fa0e086f69720d4aa46b1e5b893776a4df072c14",
+        "parentFiles": {
+            "deployment-manifest.json":
+                "47a8c7a20f7cc405717693f16f9830a27a78e308545abdb0c5870eaeb57295ff",
+            "metadata.json":
+                "01e3f6d3983d522f82e951450a94ff5a4d5c3a9a31584793d64510b9e254dd32",
+            "policy.safetensors":
+                "9521c03cab6fc9e829cd2664fa0e086f69720d4aa46b1e5b893776a4df072c14",
+            "training-state.json":
+                "8286ef59443b9b00c110064b938e897dec556582de1bd017871329e2e47dc087",
+        },
+        "candidateFiles": {
+            "deployment-manifest.json":
+                "e7d747a41b3f724940bbe42d92dc38de8798dafbc7d39909e4ad1cf10ae1e127",
+            "metadata.json":
+                "8cf417d48ec00849c78feedbd3f1881c87b54e3496bff07e4be1883a829cffff",
+            "policy.safetensors":
+                "9521c03cab6fc9e829cd2664fa0e086f69720d4aa46b1e5b893776a4df072c14",
+            "requalification-manifest.json":
+                "1546b0ddaaaec8995888522723c0ef3f2f4a48ed3d72abecad5539777e66a192",
+            "training-state.json":
+                "15857f493c4a481825b008864879d53be5d398865a33c2249adfbbabe6d51e3e",
+        },
+        "suites": {
+            "nominal": {
+                "seeds": [62_001, 62_002, 62_003, 62_004],
+                "successes": [487, 492, 485, 478],
+                "totalSuccesses": 1_942,
+                "aggregateSHA256":
+                    "3285ec8bb356ab3a0db4676a46bc792e849d9e07c8e4ba9339115c347f872f16",
+                "reportSHA256": [
+                    "85a9ecf8e164ead072ecad6f07427b7b9867d1942324376a7a66e01917f042a5",
+                    "6f39b8b26904dbfb1d74193385d597b633c1bc658684dd1cb7cf8881ebf87f12",
+                    "47c1aa017ce8efd71c31c80660d1f7ef9262a32b9489e31532ac384c4a69ee2b",
+                    "2e0296e20e93cbb114091f75b25abd69713f16314b5782f25c8cf8b0a17b606c",
+                ],
+            },
+            "validation-collision": {
+                "seeds": [63_001, 63_002, 63_003, 63_004],
+                "successes": [493, 481, 473, 488],
+                "totalSuccesses": 1_935,
+                "aggregateSHA256":
+                    "49cea9406763130f30d16964c531d8172d998442d8e3aa5b2f8982c93713c304",
+                "reportSHA256": [
+                    "cfa102e9161386309385bc580caf474d9797f59b994191d6432da9ae1952cb55",
+                    "028d179c4cf5f020f0c479dd8d3df0db5ec4c45ba446f883c6ebb159d113b56b",
+                    "3667c68d9c1cc46fb499f92ae2d73faded64f3425e3ebbf4b25f4ac221bc9af4",
+                    "19982933065541eaacc7be8d88ce66420fae3d9c964520d6f91d2313c515ce89",
+                ],
+            },
+        },
     },
 }
 
@@ -292,6 +418,70 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def arachne_candidate_files(profile: dict[str, Any]) -> dict[str, str]:
+    """Return the complete immutable file map for one Arachne v1 bundle."""
+    expected = dict(profile["candidateFiles"])
+    for suite_id, suite in profile["suites"].items():
+        seeds = suite["seeds"]
+        successes = suite["successes"]
+        report_hashes = suite["reportSHA256"]
+        require(len(seeds) == len(successes) == len(report_hashes) == 4,
+                f"Arachne {suite_id} pinned outcome vector is incomplete")
+        expected[f"qualification/{suite_id}/aggregate.json"] = (
+            suite["aggregateSHA256"]
+        )
+        for seed, digest in zip(seeds, report_hashes):
+            expected[f"qualification/{suite_id}/eval-seed-{seed}.json"] = digest
+    return expected
+
+
+def verify_pinned_file_tree(directory: Path, expected: dict[str, str],
+                            label: str) -> None:
+    """Bind an immutable release directory to exact paths and exact bytes."""
+    require(directory.is_dir(), f"{label}: directory is missing")
+    expected_files = {Path(relative) for relative in expected}
+    require(len(expected_files) == len(expected),
+            f"{label}: pinned file map contains duplicate paths")
+    expected_directories = {Path(".")}
+    for relative in expected_files:
+        require(not relative.is_absolute()
+                and all(part not in {"", ".", ".."}
+                        for part in relative.parts),
+                f"{label}: non-canonical pinned path {relative}")
+        parent = relative.parent
+        while parent != Path("."):
+            expected_directories.add(parent)
+            parent = parent.parent
+
+    actual_files: set[Path] = set()
+    actual_directories: set[Path] = {Path(".")}
+    for path in directory.rglob("*"):
+        require(not path.is_symlink(),
+                f"{label}: pinned tree contains a symlink: {path}")
+        relative = path.relative_to(directory)
+        if path.is_file():
+            actual_files.add(relative)
+        elif path.is_dir():
+            actual_directories.add(relative)
+        else:
+            raise VerificationError(
+                f"{label}: pinned tree contains a special file: {path}")
+    require(actual_files == expected_files,
+            f"{label}: file inventory changed (missing="
+            f"{sorted(expected_files - actual_files)}, "
+            f"extra={sorted(actual_files - expected_files)})")
+    require(actual_directories == expected_directories,
+            f"{label}: directory inventory changed (missing="
+            f"{sorted(expected_directories - actual_directories)}, "
+            f"extra={sorted(actual_directories - expected_directories)})")
+    for relative, expected_digest in expected.items():
+        require(SHA256_PATTERN.fullmatch(expected_digest) is not None,
+                f"{label}: invalid pinned SHA-256 for {relative}")
+        path = directory / relative
+        require(sha256_file(path) == expected_digest,
+                f"{label}: SHA-256 changed for {relative}")
 
 
 def checkpoint_fingerprint(directory: Path) -> str:
@@ -676,7 +866,9 @@ def verify_deployment_manifest(context: CheckpointContext,
         require(isinstance(ppo, dict),
                 f"{path}: checkpoint PPO metadata is missing")
         normalize = ppo.get("normalizeObservations")
-        distribution = ppo.get("actionDistribution")
+        # Match PPOConfiguration.resolvedActionDistribution: historical
+        # checkpoints decode a missing field as the squashed Gaussian policy.
+        distribution = ppo.get("actionDistribution", "squashed-gaussian")
         require(type(normalize) is bool,
                 f"{path}: observation normalization mode is missing")
         require(isinstance(distribution, str) and distribution,
@@ -1509,6 +1701,23 @@ def verify_schema2_requalification(
     profile = ARACHNE_QUALIFICATION_PROFILE.get(task)
     require(profile is not None,
             f"{context.entry.selection_id}: schema-v2 release profile is not pinned")
+    expected_checkpoint = repository_path(
+        root, f"checkpoints/{profile['checkpointRelativeDirectory']}",
+        f"{context.entry.selection_id} pinned checkpoint",
+    )
+    require(context.entry.selection_id == profile["selectionID"]
+            and context.entry.checkpoint_relative_directory
+                == profile["checkpointRelativeDirectory"]
+            and context.entry.evidence_relative_path
+                == profile["evidenceRelativePath"]
+            and context.directory == expected_checkpoint
+            and not (root / "checkpoints"
+                     / profile["checkpointRelativeDirectory"]).is_symlink(),
+            f"{context.entry.selection_id}: published catalog identity changed")
+    verify_pinned_file_tree(
+        context.directory, arachne_candidate_files(profile),
+        f"{context.entry.selection_id} candidate",
+    )
     metadata = context.metadata
     state = context.training_state
     require(metadata.get("taskRevision") == ARACHNE_EPOCH2_REVISION
@@ -1518,14 +1727,12 @@ def verify_schema2_requalification(
     require(manifest.get("changedFields") == REQUALIFICATION_CHANGED_FIELDS,
             f"{manifest_path}: permitted zero-update transform changed")
     source_commit = manifest.get("declaredSourceCommit")
-    require(isinstance(source_commit, str)
-            and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
-                             source_commit) is not None,
-            f"{manifest_path}: declared source commit is not a full lowercase ID")
+    require(source_commit == profile["declaredSourceCommit"],
+            f"{manifest_path}: declared source commit changed")
     candidate_relative = manifest.get("candidateCheckpointDirectory")
-    require(isinstance(candidate_relative, str) and candidate_relative
+    require(candidate_relative == profile["candidateDirectory"]
             and candidate_relative != manifest.get("parentCheckpointDirectory"),
-            f"{manifest_path}: candidate checkpoint path is invalid")
+            f"{manifest_path}: candidate checkpoint path changed")
     assert_json_equal(manifest.get("taskConfiguration"),
                       metadata.get("taskConfiguration"),
                       f"{manifest_path}.taskConfiguration")
@@ -1558,6 +1765,10 @@ def verify_schema2_requalification(
                              f"{context.entry.selection_id} parent checkpoint")
     require(parent.is_dir() and not (root / parent_relative).is_symlink(),
             f"{manifest_path}: parent checkpoint is missing or aliased")
+    verify_pinned_file_tree(
+        parent, profile["parentFiles"],
+        f"{context.entry.selection_id} epoch-1 parent",
+    )
     parent_metadata = load_json(parent / "metadata.json")
     parent_state = load_json(parent / "training-state.json")
     require(parent_metadata.get("task") == task
@@ -1596,7 +1807,8 @@ def verify_schema2_requalification(
             == manifest.get("parentCheckpointFingerprint")
             == profile["parentFingerprint"]
             and context.fingerprint
-            == manifest.get("candidateCheckpointFingerprint"),
+            == manifest.get("candidateCheckpointFingerprint")
+            == profile["candidateFingerprint"],
             f"{manifest_path}: checkpoint fingerprint lineage changed")
 
     expected_metadata = deepcopy(parent_metadata)
@@ -1626,7 +1838,10 @@ def verify_schema2_requalification(
     require(isinstance(comparisons, list) and len(comparisons) == 1,
             f"{manifest_path}: Arachne requires one cross-suite gate")
     suite_ids = ["nominal", "validation-collision"]
-    expected_seeds = [profile["nominalSeeds"], profile["validationSeeds"]]
+    require(list(profile["suites"]) == suite_ids,
+            f"{manifest_path}: pinned suite order changed")
+    expected_seeds = [profile["suites"][suite_id]["seeds"]
+                      for suite_id in suite_ids]
     nominal_configuration = metadata.get("taskConfiguration")
     require(isinstance(nominal_configuration, dict)
             and f32_bits(nominal_configuration.get(
@@ -1700,6 +1915,7 @@ def verify_schema2_requalification(
     aggregates: dict[str, dict[str, Any]] = {}
     for index, suite_id in enumerate(suite_ids):
         suite = suites[index]
+        pinned_suite = profile["suites"][suite_id]
         evidence = evidence_by_id[suite_id]
         require_exact_keys(evidence,
                            {"reports", "aggregate"}
@@ -1709,7 +1925,8 @@ def verify_schema2_requalification(
         require(isinstance(report_evidence, list)
                 and len(report_evidence) == 4,
                 f"{manifest_path}: suite {suite_id} needs four reports")
-        for item, seed in zip(report_evidence, expected_seeds[index]):
+        for report_index, (item, seed) in enumerate(zip(
+                report_evidence, expected_seeds[index])):
             require_exact_keys(item, {"evaluationSeed", "file", "sha256"},
                                f"{manifest_path}.{suite_id}.report")
             relative = f"qualification/{suite_id}/eval-seed-{seed}.json"
@@ -1721,10 +1938,15 @@ def verify_schema2_requalification(
             require(sha256_file(path) == require_sha256(
                 item.get("sha256"), f"{manifest_path}.{suite_id}.sha256"),
                 f"{path}: sealed report digest mismatch")
+            require(item.get("sha256")
+                    == pinned_suite["reportSHA256"][report_index],
+                    f"{path}: published report digest changed")
             report = load_json(path)
             require(report.get("evaluationSeed") == seed
                     and report.get("evaluationEnvironments") == 128
                     and report.get("episodes") == 512
+                    and report.get("successes")
+                        == pinned_suite["successes"][report_index]
                     and report.get("checkpointDirectory")
                         == manifest.get("candidateCheckpointDirectory")
                     and config_equal(report.get("evaluationTaskConfiguration"),
@@ -1739,6 +1961,9 @@ def verify_schema2_requalification(
         aggregate_relative = f"qualification/{suite_id}/aggregate.json"
         require(aggregate_evidence.get("file") == aggregate_relative,
                 f"{manifest_path}: aggregate path changed")
+        require(aggregate_evidence.get("sha256")
+                == pinned_suite["aggregateSHA256"],
+                f"{manifest_path}: published {suite_id} aggregate changed")
         aggregate_path = sealed_bundle_file(
             context.directory, aggregate_relative,
             f"{manifest_path}.{suite_id}.aggregate")
@@ -1752,6 +1977,9 @@ def verify_schema2_requalification(
                 and aggregate.get("requiredRuns") == 4
                 and aggregate.get("runs") == 4
                 and aggregate.get("requiredEpisodesPerRun") == 512
+                and aggregate.get("totalEpisodes") == 2_048
+                and aggregate.get("totalSuccesses")
+                    == pinned_suite["totalSuccesses"]
                 and aggregate.get("acceptedRuns") == 4
                 and aggregate.get("allRunsPassed") is True
                 and aggregate.get("robustAcrossEvaluationSeeds") is True
@@ -1887,6 +2115,11 @@ def verify_app_checkpoint_package(root: Path, checkpoint_root: Path) -> None:
         Path(H1_REQUALIFIED_SELECTION) / relative for relative in h1_files)
     expected_files.update(
         Path("external/unitree-h1") / relative for relative in unitree_files)
+    for profile in ARACHNE_QUALIFICATION_PROFILE.values():
+        expected_files.update(
+            Path(profile["checkpointRelativeDirectory"]) / relative
+            for relative in arachne_candidate_files(profile)
+        )
 
     actual_files: set[Path] = set()
     actual_directories: set[Path] = {Path(".")}

@@ -10,6 +10,9 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             RLPhysicsContract.deterministicColorSolveV1(11), 2_000_011)
         XCTAssertEqual(
             RLPhysicsContract.deterministicColorSolveV1(122), 2_000_122)
+        XCTAssertEqual(Arachne15LocomotionTask.localTaskRevision, 6)
+        XCTAssertEqual(
+            Arachne15LocomotionTask.currentTaskRevision, 2_000_006)
     }
 
     func testExplicitReplayCheckpointIsAnAuthoritativeSource() {
@@ -77,6 +80,8 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
         XCTAssertEqual(selectionIDs, [
             "humanoid-isaac-flat-v2",
             "unitree-h1-sim2sim-v0",
+            "arachne15-velocity-v1",
+            "arachne15-goal-v1",
             "gear-sonic-g1-reference-v0",
             "arachne15-classical-goal-v0",
         ])
@@ -90,6 +95,30 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             "checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json")
         XCTAssertEqual(acceptedH1.deploymentManifestRelativePath,
             "checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json")
+        let acceptedArachne = [
+            (
+                selection: "arachne15-velocity-v1",
+                task: "arachne15-velocity-v0"
+            ),
+            (
+                selection: "arachne15-goal-v1",
+                task: "arachne15-goal-v0"
+            ),
+        ]
+        for policy in acceptedArachne {
+            let entry = try XCTUnwrap(PolicyReplayCatalog.entry(
+                selectionID: policy.selection))
+            XCTAssertEqual(entry.taskID, policy.task)
+            XCTAssertEqual(entry.qualification, .accepted)
+            XCTAssertEqual(
+                entry.checkpointRelativeDirectory, policy.selection)
+            XCTAssertEqual(entry.evidenceRelativePath,
+                "checkpoints/\(policy.selection)/requalification-manifest.json")
+            XCTAssertEqual(entry.acceptanceAggregateRelativePath,
+                "checkpoints/\(policy.selection)/qualification/nominal/aggregate.json")
+            XCTAssertEqual(entry.deploymentManifestRelativePath,
+                "checkpoints/\(policy.selection)/deployment-manifest.json")
+        }
         XCTAssertFalse(selectionIDs.contains("humanoid-isaac-flat-v1"))
         XCTAssertEqual(
             PolicyReplayCatalog.historicalEntry(
@@ -401,5 +430,130 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
         XCTAssertEqual(aggregate.totalSuccesses, 2_028)
         XCTAssertEqual(aggregate.totalEpisodes, 2_048)
         XCTAssertTrue(aggregate.robustAcrossEvaluationSeeds)
+    }
+
+    func testAcceptedArachneV1VerifiesCurrentMultiSuiteRequalification()
+        throws
+    {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let policies: [(
+            selection: String, task: String, fingerprint: String,
+            policySHA256: String,
+            nominalSeeds: [UInt64], validationSeeds: [UInt64]
+        )] = [
+            (
+                "arachne15-velocity-v1", "arachne15-velocity-v0",
+                "97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5",
+                "a41b162b2bb922605e29a487a736f98b31416457807fc30a30c4e52014bf0638",
+                [61_001, 61_002, 61_003, 61_004],
+                [61_501, 61_502, 61_503, 61_504]
+            ),
+            (
+                "arachne15-goal-v1", "arachne15-goal-v0",
+                "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02",
+                "9521c03cab6fc9e829cd2664fa0e086f69720d4aa46b1e5b893776a4df072c14",
+                [62_001, 62_002, 62_003, 62_004],
+                [63_001, 63_002, 63_003, 63_004]
+            ),
+        ]
+
+        for policy in policies {
+            let parent = root.appendingPathComponent(
+                "checkpoints/\(policy.task)", isDirectory: true)
+            let bundle = root.appendingPathComponent(
+                "checkpoints/\(policy.selection)", isDirectory: true)
+            let metadata = try JSONDecoder().decode(
+                VectorPolicyMetadata.self,
+                from: Data(contentsOf: bundle.appendingPathComponent(
+                    "metadata.json")))
+            let nominalOptions = BuiltInRLTasks.registry
+                .checkpointReplayOptions(
+                    for: metadata.task,
+                    semanticOptions: try XCTUnwrap(
+                        metadata.taskConfiguration),
+                    maxEpisodeSteps: metadata.maxEpisodeSteps,
+                    controlDecimation: metadata.controlDecimation)
+            let nominalTask = try BuiltInRLTasks.registry.make(
+                metadata.task,
+                configuration: .init(
+                    numEnvironments: 1, seed: policy.nominalSeeds[0],
+                    autoReset: false, options: nominalOptions))
+            var validationOptions = nominalOptions
+            validationOptions["validationCollisionProfile"] = 1
+            let validationTask = try BuiltInRLTasks.registry.make(
+                metadata.task,
+                configuration: .init(
+                    numEnvironments: 1, seed: policy.validationSeeds[0],
+                    autoReset: false, options: validationOptions))
+            let nominalCriteria = try XCTUnwrap(
+                (nominalTask as? any RLEvaluationCriteriaProviding)?
+                    .evaluationCriteria)
+            let validationCriteria = try XCTUnwrap(
+                (validationTask as? any RLEvaluationCriteriaProviding)?
+                    .evaluationCriteria)
+            var nominalSuiteSpec = nominalTask.spec
+            nominalSuiteSpec.numEnvironments = 128
+            var validationSuiteSpec = validationTask.spec
+            validationSuiteSpec.numEnvironments = 128
+
+            let manifest = try VectorPolicyRequalification.verify(
+                targetSpec: nominalTask.spec,
+                evaluationCriteria: nominalCriteria,
+                bundleDirectory: bundle.path,
+                parentCheckpointDirectory: parent.path,
+                suiteContracts: [
+                    .init(
+                        id: "nominal", taskSpec: nominalSuiteSpec,
+                        evaluationCriteria: nominalCriteria),
+                    .init(
+                        id: "validation-collision",
+                        taskSpec: validationSuiteSpec,
+                        evaluationCriteria: validationCriteria),
+                ])
+
+            XCTAssertEqual(manifest.schemaVersion, 2)
+            XCTAssertEqual(manifest.task, policy.task)
+            XCTAssertEqual(manifest.sourceTaskRevision, 6)
+            XCTAssertEqual(
+                manifest.targetTaskRevision,
+                Arachne15LocomotionTask.currentTaskRevision)
+            XCTAssertEqual(
+                manifest.candidateCheckpointFingerprint,
+                policy.fingerprint)
+            XCTAssertEqual(
+                manifest.parentPolicySHA256,
+                manifest.candidatePolicySHA256)
+            XCTAssertEqual(
+                manifest.candidatePolicySHA256, policy.policySHA256)
+            XCTAssertEqual(manifest.targetTrainingUpdates, 0)
+            XCTAssertEqual(manifest.targetTrainingEnvironmentSteps, 0)
+            XCTAssertEqual(
+                manifest.qualificationMatrix?.suites.map(\.id),
+                ["nominal", "validation-collision"])
+            XCTAssertEqual(
+                manifest.qualificationMatrix?.suites[0].evaluationSeeds,
+                policy.nominalSeeds)
+            XCTAssertEqual(
+                manifest.qualificationMatrix?.suites[1].evaluationSeeds,
+                policy.validationSeeds)
+            XCTAssertEqual(
+                manifest.qualificationMatrix?.comparisons.first?
+                    .maximumPooledSuccessRateDrop,
+                0.05)
+            XCTAssertEqual(
+                manifest.qualification?.aggregate.file,
+                "qualification/nominal/aggregate.json")
+            XCTAssertEqual(
+                manifest.qualification?.additionalSuites?.first?.id,
+                "validation-collision")
+            XCTAssertEqual(
+                try Data(contentsOf: parent.appendingPathComponent(
+                    "policy.safetensors")),
+                try Data(contentsOf: bundle.appendingPathComponent(
+                    "policy.safetensors")))
+        }
     }
 }

@@ -548,6 +548,14 @@ final class RLFrameworkTests: XCTestCase {
             Arachne15HardwareCalibration.self,
             from: Data(contentsOf: templateURL))
         let fingerprint = template.policyCheckpointFingerprint
+        let acceptedGoal = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "arachne15-goal-v1"))
+        XCTAssertEqual(acceptedGoal.qualification, .accepted)
+        XCTAssertEqual(
+            fingerprint,
+            try VectorPPOTrainer.checkpointFingerprint(
+                directory: packageRoot.appendingPathComponent(
+                    "checkpoints/arachne15-goal-v1", isDirectory: true).path))
         XCTAssertThrowsError(try template.validate(
             expectedPolicyFingerprint: fingerprint))
         XCTAssertTrue(template.validationFailures(
@@ -4780,7 +4788,9 @@ final class RLFrameworkTests: XCTestCase {
         }
     }
 
-    func testTrackedArachneDeploymentRuntimeHasExactInferenceParity() throws {
+    func testAcceptedArachneV1DeploymentRuntimesHaveExactInferenceParity()
+        throws
+    {
         guard ProcessInfo.processInfo.environment[
             "AVBD_MLX_INTEGRATION_TESTS"] == "1" else {
             throw XCTSkip(
@@ -4790,37 +4800,87 @@ final class RLFrameworkTests: XCTestCase {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
-        let bundle = packageRoot.appendingPathComponent(
-            "checkpoints/arachne15-goal-v0", isDirectory: true)
-        let fingerprint =
-            "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027"
-        let runtime = try VectorPolicyDeploymentRuntime(
-            bundleDirectory: bundle.path,
-            expectedTask: "arachne15-goal-v0",
-            expectedTaskRevision: 6,
-            expectedCheckpointFingerprint: fingerprint)
-        XCTAssertEqual(runtime.observationDimension, 60)
-        XCTAssertEqual(runtime.actionDimension, 16)
-        XCTAssertEqual(runtime.controlPeriodSeconds, 0.02, accuracy: 1e-8)
-
+        let policies = [
+            (
+                selection: "arachne15-velocity-v1",
+                task: "arachne15-velocity-v0",
+                fingerprint:
+                    "97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5"
+            ),
+            (
+                selection: "arachne15-goal-v1",
+                task: "arachne15-goal-v0",
+                fingerprint:
+                    "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02"
+            ),
+        ]
         let observation = ContiguousArray((0..<60).map {
             Float(($0 % 9) - 4) * 0.01
         })
-        let deployedActions = try runtime.actions(for: observation)
-        let checkpointRunner = try VectorPolicyRunner(
-            checkpointDirectory: bundle.path)
-        let checkpointActions = try checkpointRunner.actions(for: observation)
-        XCTAssertEqual(deployedActions.count, 16)
-        for (deployed, checkpoint) in zip(deployedActions, checkpointActions) {
-            XCTAssertEqual(deployed, checkpoint, accuracy: 1e-7)
-            XCTAssertTrue(deployed.isFinite)
-            XCTAssertLessThanOrEqual(abs(deployed), 1.0001)
+
+        for policy in policies {
+            let bundle = packageRoot.appendingPathComponent(
+                "checkpoints/\(policy.selection)", isDirectory: true)
+            XCTAssertEqual(
+                try VectorPPOTrainer.checkpointFingerprint(
+                    directory: bundle.path),
+                policy.fingerprint)
+            let runtime = try VectorPolicyDeploymentRuntime(
+                bundleDirectory: bundle.path,
+                expectedTask: policy.task,
+                expectedTaskRevision:
+                    Arachne15LocomotionTask.currentTaskRevision,
+                expectedCheckpointFingerprint: policy.fingerprint)
+            XCTAssertEqual(runtime.observationDimension, 60)
+            XCTAssertEqual(runtime.actionDimension, 16)
+            XCTAssertEqual(
+                runtime.controlPeriodSeconds, 0.02, accuracy: 1e-8)
+
+            let deployedActions = try runtime.actions(for: observation)
+            let checkpointRunner = try VectorPolicyRunner(
+                checkpointDirectory: bundle.path)
+            let checkpointActions = try checkpointRunner.actions(
+                for: observation)
+            XCTAssertEqual(deployedActions.count, 16)
+            for (deployed, checkpoint) in zip(
+                deployedActions, checkpointActions
+            ) {
+                XCTAssertEqual(deployed, checkpoint, accuracy: 1e-7)
+                XCTAssertTrue(deployed.isFinite)
+                XCTAssertLessThanOrEqual(abs(deployed), 1.0001)
+            }
+            XCTAssertThrowsError(try runtime.actions(
+                for: ContiguousArray(repeating: 0, count: 59)))
+            var nonFinite = observation
+            nonFinite[17] = .nan
+            XCTAssertThrowsError(try runtime.actions(for: nonFinite))
         }
-        XCTAssertThrowsError(try runtime.actions(
-            for: ContiguousArray(repeating: 0, count: 59)))
-        var nonFinite = observation
-        nonFinite[17] = .nan
-        XCTAssertThrowsError(try runtime.actions(for: nonFinite))
+
+        // The field controller is intentionally pinned to Goal v1, while the
+        // straight-walk policy remains a replay and regression benchmark.
+        let goal = policies[1]
+        let calibration = Arachne15HardwareCalibration(
+            robotSerial: "AR15-MLX-TEST", commissioned: true,
+            measuredAtUTC: "2026-08-18T00:00:00Z",
+            policyCheckpointFingerprint: goal.fingerprint,
+            servoIDs: Array(1...16),
+            servoZeroRadians: [Float](repeating: 2.5, count: 16),
+            servoDirectionSigns: [Float](repeating: 1, count: 16),
+            jointLowerRadians: (0..<16).map {
+                $0.isMultiple(of: 2) ? -0.55 : -0.7
+            },
+            jointUpperRadians: (0..<16).map {
+                $0.isMultiple(of: 2) ? 0.55 : 0.7
+            },
+            currentLimitsMilliamps: [Int](repeating: 300, count: 16),
+            maximumServoTemperatureCelsius: 55,
+            measuredMaximumRoundTripLatencySeconds: 0.018)
+        let deployment = try Arachne15DeploymentController(
+            bundleDirectory: packageRoot.appendingPathComponent(
+                "checkpoints/\(goal.selection)").path,
+            calibration: calibration)
+        XCTAssertEqual(
+            deployment.inference.checkpointFingerprint, goal.fingerprint)
     }
 
     func testDeploymentRuntimeRejectsTamperedPolicy() throws {
@@ -4828,7 +4888,7 @@ final class RLFrameworkTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
         let source = packageRoot.appendingPathComponent(
-            "checkpoints/arachne15-goal-v0", isDirectory: true)
+            "checkpoints/arachne15-goal-v1", isDirectory: true)
         let copy = FileManager.default.temporaryDirectory.appendingPathComponent(
             "avbd-tampered-deployment-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: copy) }

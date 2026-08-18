@@ -38,7 +38,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         /// a packaged build can opt into the same list explicitly.
         static var allCases: [Robot] {
             var cases: [Robot] = [
-                .humanoidIsaac, .unitreeH1, .arachneClassical,
+                .humanoidIsaac, .unitreeH1, .arachne, .arachneGoal,
+                .arachneClassical,
             ]
             let environment = ProcessInfo.processInfo.environment
             let developmentEnabled = environment[
@@ -58,8 +59,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             case .humanoidIsaac: return "humanoid-isaac-flat-v2"
             case .humanoidIsaacGoal: return "humanoid-isaac-goal-v0"
             case .humanoidBoxCarry: return "humanoid-box-carry-v0"
-            case .arachne: return "arachne15-velocity-v0"
-            case .arachneGoal: return "arachne15-goal-v0"
+            case .arachne: return "arachne15-velocity-v1"
+            case .arachneGoal: return "arachne15-goal-v1"
             case .arachneClassical: return "arachne15-classical-goal-v0"
             }
         }
@@ -102,6 +103,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 || id == "humanoid-isaac-flat-v1" {
                 return .humanoidIsaac
             }
+            if id == "arachne15-velocity-v0" { return .arachne }
+            if id == "arachne15-goal-v0" { return .arachneGoal }
             return allCases.first { $0.selectionID == id }
         }
 
@@ -132,10 +135,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let requestedTask = environment["AVBD_REPLAY_TASK"] ?? persistedTask
         let selected = requestedTask.flatMap(Robot.fromSelectionID)
         if environment["AVBD_REPLAY_TASK"] == nil,
-           persistedTask.map(
-               ["humanoid-isaac-flat-v0", "humanoid-isaac-flat-v1"]
-                   .contains) == true,
-           let selected {
+           let persistedTask, let selected,
+           persistedTask != selected.selectionID {
             UserDefaults.standard.set(
                 selected.selectionID, forKey: selectionKey)
         } else if environment["AVBD_REPLAY_TASK"] == nil,
@@ -384,9 +385,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             }
             return "Development H1 carry policy on the exact batched training scene. Live metrics below describe what the selected checkpoint actually achieves; receiving-table placement and release are not learned yet."
         case .arachne:
-            return "Accepted Arachne-15 straight-walk benchmark at 0.15 m/s with the exact printable CAD visuals and corrected revision-6 foot collision model."
+            return "Accepted epoch-2 Arachne-15 straight-walk benchmark at 0.15 m/s. The unchanged policy passed sealed nominal and full-collision validation suites on the current deterministic-color solver."
         case .arachneGoal:
-            return "Arachne-15 samples a random world target, converts it to the reusable local velocity/yaw command, and must enter the visible target slowly enough to stop there."
+            return "Accepted epoch-2 Arachne-15 point-goal policy. It samples a world target, converts it to the reusable local velocity/yaw command, and must enter the visible target slowly enough to stop there; nominal and full-collision validation suites are sealed with the bundle."
         case .arachneClassical:
             return "Non-neural paired-ripple CPG and exact two-axis leg IK drive the same torque-limited motors, contacts, randomized plant, and arbitrary point-goal task as the learned policy."
         }

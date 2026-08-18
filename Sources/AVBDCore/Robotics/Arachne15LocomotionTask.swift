@@ -635,6 +635,14 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     RLEvaluationCriteriaProviding, PolicySymmetryProviding,
     ObservationNormalizerTransferProviding
 {
+    /// Local Arachne contract revision within the process-wide physics epoch.
+    /// Deployment code consumes `currentTaskRevision` instead of duplicating
+    /// the encoded value, so simulator and hardware compatibility cannot
+    /// drift independently.
+    public static let localTaskRevision = 6
+    public static let currentTaskRevision =
+        RLPhysicsContract.deterministicColorSolveV1(localTaskRevision)
+
     private static let minimumFootColliderClearance: Float = -0.003
     private static let maximumFootPenetrationRMSE: Float = 0.0005
     private static let maximumDeepFootPenetrationFraction: Float = 0.025
@@ -874,7 +882,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         let d = configuration.domainRandomization
         spec = RLTaskSpec(
             id: taskID,
-            revision: RLPhysicsContract.deterministicColorSolveV1(6),
+            revision: Self.currentTaskRevision,
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),

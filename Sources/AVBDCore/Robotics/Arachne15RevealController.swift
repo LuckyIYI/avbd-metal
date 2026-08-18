@@ -6,8 +6,9 @@ import simd
 /// motors, contact solver, gravity, and friction execute every transition.
 ///
 /// The compact pose deliberately uses mechanical reserve travel outside the
-/// learned policy's action envelope. Walking still sees the exact revision-6
-/// `[-0.35, 0.35]` hip and `[-0.45, 0.45]` knee contract.
+/// learned policy's action envelope. Walking still sees the exact local
+/// revision-6 `[-0.35, 0.35]` hip and `[-0.45, 0.45]` knee contract; the
+/// process-wide physics epoch remains encoded in the complete task revision.
 public final class Arachne15RevealController {
     public enum Phase: String, Sendable, Equatable {
         case folding

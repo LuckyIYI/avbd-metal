@@ -121,7 +121,12 @@ app-ml: verify-policy-evidence
 	  trap cleanup EXIT HUP INT TERM; \
 	  mkdir -p "$$staged_app/Contents/MacOS" \
 	    "$$staged_app/Contents/Resources/checkpoints/external/unitree-h1"; \
-	  mkdir -p "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification"; \
+	  mkdir -p \
+	    "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification" \
+	    "$$staged_app/Contents/Resources/checkpoints/arachne15-velocity-v1/qualification/nominal" \
+	    "$$staged_app/Contents/Resources/checkpoints/arachne15-velocity-v1/qualification/validation-collision" \
+	    "$$staged_app/Contents/Resources/checkpoints/arachne15-goal-v1/qualification/nominal" \
+	    "$$staged_app/Contents/Resources/checkpoints/arachne15-goal-v1/qualification/validation-collision"; \
 	  cp .xcbuild/Build/Products/Release/AVBDApp "$$staged_app/Contents/MacOS/AVBDApp"; \
 	  cp .xcbuild/Build/Products/Release/avbd "$$staged_app/Contents/MacOS/avbd"; \
 	  cp -R .xcbuild/Build/Products/Release/avbd-metal_AVBDCore.bundle \
@@ -143,6 +148,42 @@ app-ml: verify-policy-evidence
 	  checkpoints/humanoid-isaac-flat-v2/qualification/eval-seed-51003.json \
 	  checkpoints/humanoid-isaac-flat-v2/qualification/eval-seed-51004.json \
 	  "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification/"; \
+	  cp checkpoints/arachne15-velocity-v1/deployment-manifest.json \
+	  checkpoints/arachne15-velocity-v1/metadata.json \
+	  checkpoints/arachne15-velocity-v1/policy.safetensors \
+	  checkpoints/arachne15-velocity-v1/requalification-manifest.json \
+	  checkpoints/arachne15-velocity-v1/training-state.json \
+	  "$$staged_app/Contents/Resources/checkpoints/arachne15-velocity-v1/"; \
+	  cp checkpoints/arachne15-velocity-v1/qualification/nominal/aggregate.json \
+	  checkpoints/arachne15-velocity-v1/qualification/nominal/eval-seed-61001.json \
+	  checkpoints/arachne15-velocity-v1/qualification/nominal/eval-seed-61002.json \
+	  checkpoints/arachne15-velocity-v1/qualification/nominal/eval-seed-61003.json \
+	  checkpoints/arachne15-velocity-v1/qualification/nominal/eval-seed-61004.json \
+	  "$$staged_app/Contents/Resources/checkpoints/arachne15-velocity-v1/qualification/nominal/"; \
+	  cp checkpoints/arachne15-velocity-v1/qualification/validation-collision/aggregate.json \
+	  checkpoints/arachne15-velocity-v1/qualification/validation-collision/eval-seed-61501.json \
+	  checkpoints/arachne15-velocity-v1/qualification/validation-collision/eval-seed-61502.json \
+	  checkpoints/arachne15-velocity-v1/qualification/validation-collision/eval-seed-61503.json \
+	  checkpoints/arachne15-velocity-v1/qualification/validation-collision/eval-seed-61504.json \
+	  "$$staged_app/Contents/Resources/checkpoints/arachne15-velocity-v1/qualification/validation-collision/"; \
+	  cp checkpoints/arachne15-goal-v1/deployment-manifest.json \
+	  checkpoints/arachne15-goal-v1/metadata.json \
+	  checkpoints/arachne15-goal-v1/policy.safetensors \
+	  checkpoints/arachne15-goal-v1/requalification-manifest.json \
+	  checkpoints/arachne15-goal-v1/training-state.json \
+	  "$$staged_app/Contents/Resources/checkpoints/arachne15-goal-v1/"; \
+	  cp checkpoints/arachne15-goal-v1/qualification/nominal/aggregate.json \
+	  checkpoints/arachne15-goal-v1/qualification/nominal/eval-seed-62001.json \
+	  checkpoints/arachne15-goal-v1/qualification/nominal/eval-seed-62002.json \
+	  checkpoints/arachne15-goal-v1/qualification/nominal/eval-seed-62003.json \
+	  checkpoints/arachne15-goal-v1/qualification/nominal/eval-seed-62004.json \
+	  "$$staged_app/Contents/Resources/checkpoints/arachne15-goal-v1/qualification/nominal/"; \
+	  cp checkpoints/arachne15-goal-v1/qualification/validation-collision/aggregate.json \
+	  checkpoints/arachne15-goal-v1/qualification/validation-collision/eval-seed-63001.json \
+	  checkpoints/arachne15-goal-v1/qualification/validation-collision/eval-seed-63002.json \
+	  checkpoints/arachne15-goal-v1/qualification/validation-collision/eval-seed-63003.json \
+	  checkpoints/arachne15-goal-v1/qualification/validation-collision/eval-seed-63004.json \
+	  "$$staged_app/Contents/Resources/checkpoints/arachne15-goal-v1/qualification/validation-collision/"; \
 	  cp -R .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle \
 	    "$$staged_app/Contents/Resources/"; \
 	  test -f "$$staged_app/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"; \
@@ -170,6 +211,14 @@ app-ml: verify-policy-evidence
 	  "$$staged_app/Contents/MacOS/avbd" verify-policy-rl \
 	  humanoid-isaac-flat-v0 \
 	  --checkpoint "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2" \
+	  --frames 1 --json >/dev/null; \
+	  "$$staged_app/Contents/MacOS/avbd" verify-policy-rl \
+	  arachne15-velocity-v0 \
+	  --checkpoint "$$staged_app/Contents/Resources/checkpoints/arachne15-velocity-v1" \
+	  --frames 1 --json >/dev/null; \
+	  "$$staged_app/Contents/MacOS/avbd" verify-policy-rl \
+	  arachne15-goal-v0 \
+	  --checkpoint "$$staged_app/Contents/Resources/checkpoints/arachne15-goal-v1" \
 	  --frames 1 --json >/dev/null; \
 	  $(ATOMIC_APP_PUBLISH) "$$staged_app" AVBD.app; \
 	  echo "built AVBD.app (ML-enabled)"
@@ -211,8 +260,12 @@ verify-h1-provenance:
 # Validate the tracked bundle, exact inference parity, and Metal latency.
 verify-arachne-policy: ml-tool
 	.xcbuild/Build/Products/Release/avbd verify-policy-rl \
+	  arachne15-velocity-v0 \
+	  --checkpoint checkpoints/arachne15-velocity-v1 \
+	  --frames 500 --json
+	.xcbuild/Build/Products/Release/avbd verify-policy-rl \
 	  arachne15-goal-v0 \
-	  --checkpoint checkpoints/arachne15-goal-v0 \
+	  --checkpoint checkpoints/arachne15-goal-v1 \
 	  --frames 500 --json
 
 # Rebuild every accepted result from its raw, immutable evidence without MLX.

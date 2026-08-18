@@ -99,6 +99,32 @@ public enum PolicyReplayCatalog {
                 qualification: .externalParityVerified,
                 evidenceRelativePath: "checkpoints/external/unitree-h1/manifest.json"),
             .init(
+                selectionID: "arachne15-velocity-v1",
+                displayName: "Arachne Straight Walk (Qualified)",
+                taskID: "arachne15-velocity-v0",
+                runtime: .nativeMLX,
+                checkpointRelativeDirectory: "arachne15-velocity-v1",
+                qualification: .accepted,
+                evidenceRelativePath:
+                    "checkpoints/arachne15-velocity-v1/requalification-manifest.json",
+                acceptanceAggregateRelativePath:
+                    "checkpoints/arachne15-velocity-v1/qualification/nominal/aggregate.json",
+                deploymentManifestRelativePath:
+                    "checkpoints/arachne15-velocity-v1/deployment-manifest.json"),
+            .init(
+                selectionID: "arachne15-goal-v1",
+                displayName: "Arachne Goal (Qualified)",
+                taskID: "arachne15-goal-v0",
+                runtime: .nativeMLX,
+                checkpointRelativeDirectory: "arachne15-goal-v1",
+                qualification: .accepted,
+                evidenceRelativePath:
+                    "checkpoints/arachne15-goal-v1/requalification-manifest.json",
+                acceptanceAggregateRelativePath:
+                    "checkpoints/arachne15-goal-v1/qualification/nominal/aggregate.json",
+                deploymentManifestRelativePath:
+                    "checkpoints/arachne15-goal-v1/deployment-manifest.json"),
+            .init(
                 selectionID: "gear-sonic-g1-reference-v0",
                 displayName: "GEAR-SONIC G1",
                 taskID: "gear-sonic-g1-reference-v0",
