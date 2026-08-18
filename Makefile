@@ -2,7 +2,8 @@
 
 .PHONY: build test verify-core verify-mlx-rl app cli bench clean ml-tool \
 	app-ml ios-ml generate-arachne-assets verify-arachne-assets \
-	verify-arachne-policy verify-panda-provenance verify-h1-provenance
+	verify-arachne-policy verify-policy-evidence verify-panda-provenance \
+	verify-h1-provenance
 
 build:
 	swift build -c release
@@ -12,7 +13,8 @@ test:
 
 # Local core merge gate: every checked-in generated/provenance contract plus
 # the complete SwiftPM suite. None of these checks needs network access.
-verify-core: verify-arachne-assets verify-panda-provenance verify-h1-provenance
+verify-core: verify-arachne-assets verify-policy-evidence \
+	verify-panda-provenance verify-h1-provenance
 	swift test
 
 # Xcode-package the MLX/RL tests, then run their bundle serially so the MLX
@@ -163,3 +165,9 @@ verify-arachne-policy: ml-tool
 	  arachne15-goal-v0 \
 	  --checkpoint checkpoints/arachne15-goal-v0 \
 	  --frames 500 --json
+
+# Rebuild every accepted result from its raw, immutable evidence without MLX.
+# The verifier discovers accepted entries from PolicyReplayCatalog and fails
+# closed when a future evidence shape has not been added to the contract.
+verify-policy-evidence:
+	python3 Tools/verify_policy_evidence.py

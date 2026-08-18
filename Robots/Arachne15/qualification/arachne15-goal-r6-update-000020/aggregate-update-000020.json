@@ -306,6 +306,7 @@
       "thirdQuartile" : 0.29799414
     }
   },
+  "taskRevision" : 6,
   "totalEpisodes" : 2048,
   "totalSuccesses" : 1945,
   "trainingSeed" : 523
