@@ -156,4 +156,31 @@ final class RLCLIParsingTests: XCTestCase {
             negative.stderr,
             "error: --training-environment-steps must be non-negative\n")
     }
+
+    func testEvidenceCommandsRejectUnknownMissingAndDuplicateOptions() throws {
+        let typo = try runCLI(["select-rl", "--outpt", "selection.json"])
+        XCTAssertNotEqual(typo.status, 0)
+        XCTAssertEqual(typo.stderr, "error: unknown option '--outpt'\n")
+
+        let missing = try runCLI([
+            "aggregate-rl", "report.json", "--output",
+        ])
+        XCTAssertNotEqual(missing.status, 0)
+        XCTAssertEqual(missing.stderr, "error: missing value after --output\n")
+
+        let duplicate = try runCLI([
+            "aggregate-checkpoint-rl", "report.json",
+            "--output", "first.json", "--output", "second.json",
+        ])
+        XCTAssertNotEqual(duplicate.status, 0)
+        XCTAssertEqual(
+            duplicate.stderr,
+            "error: duplicate --output for aggregate-checkpoint-rl\n")
+
+        let verification = try runCLI([
+            "verify-selection-rl", "selection.json", "--json",
+        ])
+        XCTAssertNotEqual(verification.status, 0)
+        XCTAssertEqual(verification.stderr, "error: unknown option '--json'\n")
+    }
 }

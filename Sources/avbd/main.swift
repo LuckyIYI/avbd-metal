@@ -1247,6 +1247,43 @@ func parseRLOptions(
     parseOptions(args, strict: true, allowedOptions: allowedOptions)
 }
 
+private struct RLReportCommandInputs {
+    var reportPaths: [String]
+    var output: String?
+}
+
+/// Selection and aggregation commands intentionally accept positional report
+/// paths plus one optional output. Parse that small grammar directly so a
+/// misspelled option can never be reinterpreted as experiment evidence.
+private func parseRLReportCommandInputs(
+    _ args: [String], command: String
+) -> RLReportCommandInputs {
+    var reportPaths = [String]()
+    var output: String?
+    var index = 0
+    while index < args.count {
+        let argument = args[index]
+        if argument == "--output" {
+            guard output == nil else {
+                fail("duplicate --output for \(command)")
+            }
+            guard index + 1 < args.count,
+                  !args[index + 1].hasPrefix("--") else {
+                fail("missing value after --output")
+            }
+            output = args[index + 1]
+            index += 2
+        } else {
+            guard !argument.hasPrefix("--") else {
+                fail("unknown option '\(argument)'")
+            }
+            reportPaths.append(argument)
+            index += 1
+        }
+    }
+    return RLReportCommandInputs(reportPaths: reportPaths, output: output)
+}
+
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(("error: " + msg + "\n").data(using: .utf8)!)
     exit(1)
@@ -3968,23 +4005,13 @@ case "eval-pusht-flow-retrieval":
     }
 
 case "select-rl":
-    let raw = Array(args.dropFirst())
-    let o = parseOptions(raw)
-    var reportPaths = [String]()
-    var index = 0
-    while index < raw.count {
-        if raw[index] == "--output" {
-            index += 2
-        } else {
-            reportPaths.append(raw[index])
-            index += 1
-        }
-    }
-    guard !reportPaths.isEmpty else {
+    let inputs = parseRLReportCommandInputs(
+        Array(args.dropFirst()), command: "select-rl")
+    guard !inputs.reportPaths.isEmpty else {
         fail("usage: avbd select-rl <validation-report.json...> "
             + "[--output selection.json]")
     }
-    let reports = try reportPaths.map {
+    let reports = try inputs.reportPaths.map {
         try JSONDecoder().decode(
             PPOEvaluationMetrics.self,
             from: Data(contentsOf: URL(fileURLWithPath: $0)))
@@ -3993,7 +4020,7 @@ case "select-rl":
     let selectionEncoder = JSONEncoder()
     selectionEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let selectionData = try selectionEncoder.encode(selection)
-    if let output = o.output {
+    if let output = inputs.output {
         let url = URL(fileURLWithPath: output)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -4005,6 +4032,9 @@ case "verify-selection-rl":
     let raw = Array(args.dropFirst())
     guard raw.count >= 2 else {
         fail("usage: avbd verify-selection-rl <selection.json> <test-report.json...>")
+    }
+    if let option = raw.first(where: { $0.hasPrefix("--") }) {
+        fail("unknown option '\(option)'")
     }
     let selection = try JSONDecoder().decode(
         PPOCheckpointSelection.self,
@@ -4022,22 +4052,12 @@ case "verify-selection-rl":
         + "are absent from test reports")
 
 case "aggregate-rl":
-    let raw = Array(args.dropFirst())
-    let o = parseOptions(raw)
-    var reportPaths = [String]()
-    var index = 0
-    while index < raw.count {
-        if raw[index] == "--output" {
-            index += 2
-        } else {
-            reportPaths.append(raw[index])
-            index += 1
-        }
-    }
-    guard !reportPaths.isEmpty else {
+    let inputs = parseRLReportCommandInputs(
+        Array(args.dropFirst()), command: "aggregate-rl")
+    guard !inputs.reportPaths.isEmpty else {
         fail("usage: avbd aggregate-rl <report.json...> [--output summary.json]")
     }
-    let reports = try reportPaths.map {
+    let reports = try inputs.reportPaths.map {
         try JSONDecoder().decode(
             PPOEvaluationMetrics.self,
             from: Data(contentsOf: URL(fileURLWithPath: $0)))
@@ -4046,7 +4066,7 @@ case "aggregate-rl":
     let aggregateEncoder = JSONEncoder()
     aggregateEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let aggregateData = try aggregateEncoder.encode(aggregate)
-    if let output = o.output {
+    if let output = inputs.output {
         let url = URL(fileURLWithPath: output)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -4056,23 +4076,13 @@ case "aggregate-rl":
     if !aggregate.publishable { exit(2) }
 
 case "aggregate-checkpoint-rl":
-    let raw = Array(args.dropFirst())
-    let o = parseOptions(raw)
-    var reportPaths = [String]()
-    var index = 0
-    while index < raw.count {
-        if raw[index] == "--output" {
-            index += 2
-        } else {
-            reportPaths.append(raw[index])
-            index += 1
-        }
-    }
-    guard !reportPaths.isEmpty else {
+    let inputs = parseRLReportCommandInputs(
+        Array(args.dropFirst()), command: "aggregate-checkpoint-rl")
+    guard !inputs.reportPaths.isEmpty else {
         fail("usage: avbd aggregate-checkpoint-rl <report.json...> "
             + "[--output summary.json]")
     }
-    let reports = try reportPaths.map {
+    let reports = try inputs.reportPaths.map {
         try JSONDecoder().decode(
             PPOEvaluationMetrics.self,
             from: Data(contentsOf: URL(fileURLWithPath: $0)))
@@ -4081,7 +4091,7 @@ case "aggregate-checkpoint-rl":
     let aggregateEncoder = JSONEncoder()
     aggregateEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let aggregateData = try aggregateEncoder.encode(aggregate)
-    if let output = o.output {
+    if let output = inputs.output {
         let url = URL(fileURLWithPath: output)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
