@@ -635,6 +635,10 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
     RLEvaluationCriteriaProviding, PolicySymmetryProviding,
     ObservationNormalizerTransferProviding
 {
+    private static let minimumFootColliderClearance: Float = -0.003
+    private static let maximumFootPenetrationRMSE: Float = 0.0005
+    private static let maximumDeepFootPenetrationFraction: Float = 0.025
+
     public static let observationDimension =
         Arachne15PolicyContract.observationDimension
     public let spec: RLTaskSpec
@@ -654,7 +658,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                 // Keep a hard guard against gross tunnelling, then use the
                 // time-resolved metrics below to reject sustained contact
                 // exploitation without failing on one 2 ms impact sample.
-                "episode/minimum_foot_collider_clearance_m": -0.003,
+                "episode/minimum_foot_collider_clearance_m":
+                    Self.minimumFootColliderClearance,
             ]
             if configuration.maximumGoalDirectionAngle > .pi / 4 {
                 minimumTaskMetrics["episode/goal_left_success_rate"] = 0.85
@@ -673,18 +678,27 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                     "episode/minimum_goal_distance_m":
                         configuration.goalRadius,
                     "episode/yaw_rate_rmse_rps": 0.40,
-                    "episode/foot_collider_penetration_rmse_m": 0.0005,
+                    "episode/foot_collider_penetration_rmse_m":
+                        Self.maximumFootPenetrationRMSE,
                     "episode/foot_collider_penetration_over_1mm_fraction":
-                        0.025,
+                        Self.maximumDeepFootPenetrationFraction,
                 ])
         }
         return RLEvaluationCriteria(
-            minimumSuccessRate: 0.80,
+            minimumSuccessRate: 0.90,
             minimumMeanEpisodeLengthFraction: 0.90,
-            minimumTaskMetrics: ["episode/survived": 0.90],
+            minimumTaskMetrics: [
+                "episode/survived": 0.95,
+                "episode/minimum_foot_collider_clearance_m":
+                    Self.minimumFootColliderClearance,
+            ],
             maximumTaskMetrics: [
                 "episode/linear_velocity_rmse_mps": 0.15,
                 "episode/yaw_rate_rmse_rps": 0.40,
+                "episode/foot_collider_penetration_rmse_m":
+                    Self.maximumFootPenetrationRMSE,
+                "episode/foot_collider_penetration_over_1mm_fraction":
+                    Self.maximumDeepFootPenetrationFraction,
             ])
     }
 

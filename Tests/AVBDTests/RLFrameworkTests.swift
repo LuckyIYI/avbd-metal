@@ -246,6 +246,17 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(task.configuration.commandProgressRewardWeight, 20)
         XCTAssertEqual(task.configuration.velocityErrorPenaltyWeight, 5)
         XCTAssertEqual(task.configuration.yawErrorPenaltyWeight, 5)
+        XCTAssertEqual(task.evaluationCriteria.minimumSuccessRate, 0.90)
+        XCTAssertEqual(
+            task.evaluationCriteria.minimumMeanEpisodeLengthFraction, 0.90)
+        XCTAssertEqual(task.evaluationCriteria.minimumTaskMetrics[
+            "episode/survived"], 0.95)
+        XCTAssertEqual(task.evaluationCriteria.minimumTaskMetrics[
+            "episode/minimum_foot_collider_clearance_m"], -0.003)
+        XCTAssertEqual(task.evaluationCriteria.maximumTaskMetrics[
+            "episode/foot_collider_penetration_rmse_m"], 0.0005)
+        XCTAssertEqual(task.evaluationCriteria.maximumTaskMetrics[
+            "episode/foot_collider_penetration_over_1mm_fraction"], 0.025)
         XCTAssertEqual(task.spec.simulationStep, 0.002, accuracy: 1e-7)
         XCTAssertEqual(task.spec.controlStep, 0.02, accuracy: 1e-7)
         XCTAssertEqual(task.environment.scene.settings.iterations, 20)
@@ -293,6 +304,62 @@ final class RLFrameworkTests: XCTestCase {
             XCTAssertTrue(clearances.allSatisfy { $0 > -0.001 },
                           "the 8 mm Arachne feet must not settle through the floor")
         }
+    }
+
+    func testArachneVelocityAcceptanceRejectsPublishGateRegressions() throws {
+        let registered = try BuiltInRLTasks.registry.make(
+            "arachne15-velocity-v0",
+            configuration: RLTaskConfiguration(
+                numEnvironments: 1, seed: 93,
+                options: ["domainRandomization": 0]))
+        let task = try XCTUnwrap(registered as? Arachne15LocomotionTask)
+        let criteria = task.evaluationCriteria
+        let passingMetrics: [String: Float] = [
+            "episode/survived": 0.95,
+            "episode/minimum_foot_collider_clearance_m": -0.003,
+            "episode/linear_velocity_rmse_mps": 0.15,
+            "episode/yaw_rate_rmse_rps": 0.40,
+            "episode/foot_collider_penetration_rmse_m": 0.0005,
+            "episode/foot_collider_penetration_over_1mm_fraction": 0.025,
+        ]
+        XCTAssertTrue(criteria.failures(
+            successRate: 0.90, meanEpisodeLength: 900,
+            maxEpisodeSteps: 1_000, taskMetrics: passingMetrics).isEmpty)
+
+        func failures(
+            metric: String, value: Float
+        ) -> [String] {
+            var metrics = passingMetrics
+            metrics[metric] = value
+            return criteria.failures(
+                successRate: 0.90, meanEpisodeLength: 900,
+                maxEpisodeSteps: 1_000, taskMetrics: metrics)
+        }
+        XCTAssertTrue(criteria.failures(
+            successRate: 0.899, meanEpisodeLength: 900,
+            maxEpisodeSteps: 1_000, taskMetrics: passingMetrics
+        ).contains { $0.contains("success_rate") })
+        XCTAssertTrue(failures(
+            metric: "episode/survived", value: 0.949
+        ).contains { $0.contains("episode/survived") })
+        XCTAssertTrue(failures(
+            metric: "episode/minimum_foot_collider_clearance_m",
+            value: -0.0031
+        ).contains {
+            $0.contains("episode/minimum_foot_collider_clearance_m")
+        })
+        XCTAssertTrue(failures(
+            metric: "episode/foot_collider_penetration_rmse_m",
+            value: 0.00051
+        ).contains {
+            $0.contains("episode/foot_collider_penetration_rmse_m")
+        })
+        XCTAssertTrue(failures(
+            metric: "episode/foot_collider_penetration_over_1mm_fraction",
+            value: 0.026
+        ).contains {
+            $0.contains("episode/foot_collider_penetration_over_1mm_fraction")
+        })
     }
 
     func testArachneGoalSamplesDeterministicVisibleNonCollidingTargets() throws {
