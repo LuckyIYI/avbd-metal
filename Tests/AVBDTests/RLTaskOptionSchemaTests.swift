@@ -2,6 +2,32 @@ import XCTest
 @testable import AVBDCore
 
 final class RLTaskOptionSchemaTests: XCTestCase {
+    private let humanoidBoxCarryIntegerOptions: Set<String> = [
+        "maxEpisodeSteps", "solverIterations",
+        "stationDistanceCurriculumControlSteps",
+        "liftClearanceCurriculumControlSteps",
+        "carryDistanceCurriculumControlSteps",
+        "destinationBearingCurriculumControlSteps",
+        "minimumTrainingSuccessDwellSteps", "successDwellSteps",
+        "successDwellCurriculumControlSteps", "manipulationHandoffSteps",
+        "carryHandoffSteps", "carryCommandRampSteps",
+        "minimumLoadedAlternatingSteps",
+    ]
+
+    private let humanoidBoxCarryBooleanOptions: Set<String> = [
+        "observationNoise", "carryHolonomicCommand",
+        "freezeBasePolicyExpert", "freezeManipulationPolicyExpert",
+        "freezeCarryPolicyExpert", "manipulationGatedActor",
+        "initializeManipulationExpertFromBaseOnTransfer",
+        "initializeCarryExpertFromManipulationExpertOnTransfer",
+        "compositionalCarryController", "upperBodyCarryController",
+        "carryLocomotionControlsTorso",
+        "initializeCarryExpertFromBaseOnTransfer",
+        "initializeCarryLocomotionExpertFromBaseOnTransfer",
+        "advanceReplaySnapshotAtDestinationContact",
+        "coupledCarryCommandTracking",
+    ]
+
     func testBuiltInRegistryPublishesTypedTaskOptions() throws {
         let schema = try XCTUnwrap(
             BuiltInRLTasks.registry.optionSchema(for: "arachne15-goal-v0"))
@@ -47,6 +73,73 @@ final class RLTaskOptionSchemaTests: XCTestCase {
                 numEnvironments: 1,
                 options: ["pointGoal": 2]))) { error in
             XCTAssertTrue(String(describing: error).contains("must be 0 or 1"))
+        }
+    }
+
+    func testHumanoidBoxCarryPublishesEveryCoercedIntegerAndBooleanType() throws {
+        let schema = try XCTUnwrap(
+            BuiltInRLTasks.registry.optionSchema(
+                for: "humanoid-box-carry-v0"))
+        let integerOptions = Set(schema.definitions.compactMap {
+            $0.value.valueKind == .integer ? $0.key : nil
+        })
+        let booleanOptions = Set(schema.definitions.compactMap {
+            $0.value.valueKind == .boolean ? $0.key : nil
+        })
+
+        XCTAssertEqual(integerOptions, humanoidBoxCarryIntegerOptions)
+        XCTAssertEqual(booleanOptions, humanoidBoxCarryBooleanOptions)
+    }
+
+    func testHumanoidBoxCarryRejectsFractionalIntegerOptions() throws {
+        let schema = try XCTUnwrap(
+            BuiltInRLTasks.registry.optionSchema(
+                for: "humanoid-box-carry-v0"))
+
+        for name in humanoidBoxCarryIntegerOptions.sorted() {
+            XCTAssertThrowsError(try schema.validate(
+                .init(numEnvironments: 1, options: [name: 1.5]),
+                taskID: "humanoid-box-carry-v0"), name) { error in
+                let message = String(describing: error)
+                XCTAssertTrue(message.contains(name), message)
+                XCTAssertTrue(message.contains("must be an integer"), message)
+            }
+        }
+    }
+
+    func testHumanoidBoxCarryRejectsEveryNonCanonicalBooleanValue() throws {
+        let schema = try XCTUnwrap(
+            BuiltInRLTasks.registry.optionSchema(
+                for: "humanoid-box-carry-v0"))
+
+        for name in humanoidBoxCarryBooleanOptions.sorted() {
+            for value: Float in [-1, 0.5, 2] {
+                XCTAssertThrowsError(try schema.validate(
+                    .init(numEnvironments: 1, options: [name: value]),
+                    taskID: "humanoid-box-carry-v0"), "\(name)=\(value)") {
+                    error in
+                    let message = String(describing: error)
+                    XCTAssertTrue(message.contains(name), message)
+                    XCTAssertTrue(message.contains("must be 0 or 1"), message)
+                }
+            }
+        }
+    }
+
+    func testHumanoidBoxCarryAcceptsCanonicalIntegerAndBooleanValues() throws {
+        let schema = try XCTUnwrap(
+            BuiltInRLTasks.registry.optionSchema(
+                for: "humanoid-box-carry-v0"))
+        var options = Dictionary(uniqueKeysWithValues:
+            humanoidBoxCarryIntegerOptions.map { ($0, Float(1)) })
+
+        for booleanValue: Float in [0, 1] {
+            for name in humanoidBoxCarryBooleanOptions {
+                options[name] = booleanValue
+            }
+            XCTAssertNoThrow(try schema.validate(
+                .init(numEnvironments: 1, options: options),
+                taskID: "humanoid-box-carry-v0"))
         }
     }
 
