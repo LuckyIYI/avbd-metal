@@ -37,7 +37,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             switch self {
             case .unitreeH1: return "unitree-h1-sim2sim-v0"
             case .gearSonicG1: return "gear-sonic-g1-reference-v0"
-            case .humanoidIsaac: return "humanoid-isaac-flat-v1"
+            case .humanoidIsaac: return "humanoid-isaac-flat-v2"
             case .humanoidIsaacGoal: return "humanoid-isaac-goal-v0"
             case .humanoidBoxCarry: return "humanoid-box-carry-v0"
             case .arachne: return "arachne15-velocity-v0"
@@ -70,11 +70,14 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
 
         static func fromSelectionID(_ id: String) -> Robot? {
-            // Migrate the only retired picker identifier. This is intentionally
+            // Migrate retired picker identifiers. This is intentionally
             // a UI preference migration, not a checkpoint compatibility
-            // bypass: an explicit v0 checkpoint is still rejected by the
+            // bypass: an explicit old checkpoint is still rejected by the
             // current task-revision check during installation.
-            if id == "humanoid-isaac-flat-v0" { return .humanoidIsaac }
+            if id == "humanoid-isaac-flat-v0"
+                || id == "humanoid-isaac-flat-v1" {
+                return .humanoidIsaac
+            }
             return allCases.first { $0.selectionID == id }
         }
 
@@ -105,7 +108,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let requestedTask = environment["AVBD_REPLAY_TASK"] ?? persistedTask
         let selected = requestedTask.flatMap(Robot.fromSelectionID)
         if environment["AVBD_REPLAY_TASK"] == nil,
-           persistedTask == "humanoid-isaac-flat-v0",
+           persistedTask.map(
+               ["humanoid-isaac-flat-v0", "humanoid-isaac-flat-v1"]
+                   .contains) == true,
            let selected {
             UserDefaults.standard.set(
                 selected.selectionID, forKey: selectionKey)

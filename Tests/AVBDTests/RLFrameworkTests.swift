@@ -4633,7 +4633,7 @@ final class RLFrameworkTests: XCTestCase {
             outputDirectory: output.path))
     }
 
-    func testHistoricalH1V1PackagedMLXInferenceIsDeterministicButIncompatible()
+    func testAcceptedH1V2PackagedMLXInferenceAndControlMapping()
         throws {
         guard ProcessInfo.processInfo.environment[
             "AVBD_MLX_INTEGRATION_TESTS"] == "1" else {
@@ -4645,9 +4645,9 @@ final class RLFrameworkTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
         let bundle = packageRoot.appendingPathComponent(
-            "checkpoints/humanoid-isaac-flat-v1", isDirectory: true)
+            "checkpoints/humanoid-isaac-flat-v2", isDirectory: true)
         let expectedFingerprint =
-            "85571805cc7b688970cf5497beb5916be8fb3b1fcb7855207af6f55b208c7fd2"
+            "00bc782d1845ddde94282b46f0d7fa2732feeb4a8e52215a5abe62128bccc756"
         XCTAssertEqual(
             try VectorPPOTrainer.checkpointFingerprint(
                 directory: bundle.path),
@@ -4658,14 +4658,14 @@ final class RLFrameworkTests: XCTestCase {
             from: Data(contentsOf: bundle.appendingPathComponent(
                 "metadata.json")))
         XCTAssertEqual(metadata.task, "humanoid-isaac-flat-v0")
-        XCTAssertEqual(metadata.taskRevision, 1_000_011)
+        XCTAssertEqual(metadata.taskRevision, 2_000_011)
         XCTAssertEqual(metadata.inferenceBatchSize, 128)
         XCTAssertEqual(metadata.observationDimension, 69)
         XCTAssertEqual(metadata.actionDimension, 19)
         let deployment = try VectorPolicyDeploymentRuntime(
             bundleDirectory: bundle.path,
             expectedTask: "humanoid-isaac-flat-v0",
-            expectedTaskRevision: 1_000_011,
+            expectedTaskRevision: 2_000_011,
             expectedCheckpointFingerprint: expectedFingerprint)
         XCTAssertEqual(deployment.observationDimension, 69)
         XCTAssertEqual(deployment.actionDimension, 19)
@@ -4682,16 +4682,17 @@ final class RLFrameworkTests: XCTestCase {
                 options: options))
         XCTAssertEqual(task.spec.revision,
                        RLPhysicsContract.deterministicColorSolveV1(11))
-        XCTAssertTrue(metadata.compatibilityMismatches(with: task.spec)
-            .contains { $0.contains("revision") })
+        XCTAssertTrue(metadata.compatibilityMismatches(with: task.spec).isEmpty)
 
         let runner = try VectorPolicyRunner(
             checkpointDirectory: bundle.path)
         let observation = try task.reset(seed: 51_001)
-        XCTAssertThrowsError(try runner.actions(for: observation, task: task))
+        let mapped = try runner.actions(for: observation, task: task)
         let first = try runner.actions(for: observation.policy)
         let repeated = try runner.actions(for: observation.policy)
         XCTAssertEqual(first.count, 4 * 19)
+        XCTAssertEqual(mapped.values, first,
+                       "task-shaped control mapping must preserve MLX output")
         XCTAssertEqual(first, repeated,
                        "deployed inference must be deterministic")
         XCTAssertTrue(first.allSatisfy(\.isFinite))

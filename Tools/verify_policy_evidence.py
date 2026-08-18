@@ -56,39 +56,48 @@ UNITREE_H1_SOURCE_CHECKPOINT_SHA256 = (
     "44a0fbceb81f3877833ae9a398d039bea1759cb0d3c8188181013885f70589eb"
 )
 
-H1_REQUALIFIED_SELECTION = "humanoid-isaac-flat-v1"
+H1_REQUALIFIED_SELECTION = "humanoid-isaac-flat-v2"
 H1_TASK = "humanoid-isaac-flat-v0"
-H1_SOURCE_REVISION = 1_000_010
-H1_TARGET_REVISION = 1_000_011
-H1_PARENT_DIRECTORY = "checkpoints/humanoid-isaac-flat-v0"
+H1_SOURCE_REVISION = 1_000_011
+H1_TARGET_REVISION = 2_000_011
+H1_PARENT_DIRECTORY = "checkpoints/humanoid-isaac-flat-v1"
 H1_CANDIDATE_DIRECTORY = (
-    "runs/humanoid-isaac-flat-v1/requalification-r1000011/candidate"
+    "runs/humanoid-isaac-flat-v2/requalification-r2000011/candidate"
 )
-H1_DECLARED_SOURCE_COMMIT = "d3d07bf1bd0b78c62235794a7c81621ffe748ed7"
+H1_DECLARED_SOURCE_COMMIT = "c5cc074163bb33bdc84dd7fb5390afba0156937c"
 H1_PARENT_FINGERPRINT = (
-    "d6b5d416e7f7d75fa2b9b9dd33f78ae387e3f2a8139aa6d25a69e5dbcae777ab"
+    "85571805cc7b688970cf5497beb5916be8fb3b1fcb7855207af6f55b208c7fd2"
 )
 H1_CANDIDATE_FINGERPRINT = (
-    "85571805cc7b688970cf5497beb5916be8fb3b1fcb7855207af6f55b208c7fd2"
+    "00bc782d1845ddde94282b46f0d7fa2732feeb4a8e52215a5abe62128bccc756"
 )
 H1_POLICY_SHA256 = (
     "3e0a21600afd6ee2e50383ed33f69007f9855c3f8b85ec0b52c4f2acc2c285ae"
 )
+H1_METADATA_SHA256 = (
+    "16a24679f2f373bfc8b8285e15d2e9c40a9bb41cf5e1f42413d05ac5b63d2f85"
+)
+H1_TRAINING_STATE_SHA256 = (
+    "15857f493c4a481825b008864879d53be5d398865a33c2249adfbbabe6d51e3e"
+)
+H1_DEPLOYMENT_MANIFEST_SHA256 = (
+    "cb04233bd11bcc8dc3e0d2e1f0d6cc2e1ec27d4318344c7ea021d8b117be5d59"
+)
 H1_REQUALIFICATION_MANIFEST_SHA256 = (
-    "01628ae5d07d75a4538cbcf085b27314b2e72e4c5324f6bd4249d6297e03da03"
+    "c05d59a4592b7bdc896dca1c90db47a149b84352f593281f1b74b022e07031e9"
 )
 H1_AGGREGATE_SHA256 = (
-    "a3e54308ac978e68509ff1ea437a7f908be3b2c2a0df6699755e03a98d7e3f6d"
+    "b1b5975c59147878358fd90e224180172a3df890b2306f352ab37c84d43e2c8c"
 )
 H1_REPORT_RESULTS = {
     51_001: (506,
-             "2c48696385668a22417bfb2d811adb39c05e6a501ac3ef7bf74bef2d046d3815"),
+             "e3cf0b147de1b4b1c0d07db35944229b86fcb9d11cbaaee39c49dbe5b11dae02"),
     51_002: (507,
-             "e0c4c03dcbfa18b6258f87ed135bf70304e97bc4640a6d4858026513ea57aba9"),
+             "e326c95f2c39f72dd3273944f40b08ee6d7299d76550c18a9e3f62d2b4108142"),
     51_003: (505,
-             "7412147895ddb1a48eec036a7e9d79bdd2379139b4997e62a6abbddf5e9fb124"),
+             "9901a6f52259f0735fa4952d1c3155cf0bf7452d4829b16d767a51a1870a2293"),
     51_004: (510,
-             "015bbb14ec3c9d1c7462ed1cd584f8af84685a02f0818f43428df6d6559b9e60"),
+             "1c60000c8332805c43d897ad796df1333eda5abf9038e5a16e8f88cd79d16083"),
 }
 H1_TOTAL_SUCCESSES = 2_028
 H1_EVALUATION_SEEDS = [51_001, 51_002, 51_003, 51_004]
@@ -109,6 +118,38 @@ H1_EVALUATION_CRITERIA = {
         "episode/linear_velocity_rmse_mps": 0.35,
         "episode/yaw_rate_rmse_rps": 0.5,
     },
+}
+H1_HISTORICAL_V0_FINGERPRINT = (
+    "d6b5d416e7f7d75fa2b9b9dd33f78ae387e3f2a8139aa6d25a69e5dbcae777ab"
+)
+H1_HISTORICAL_V0_FILES = {
+    "metadata.json":
+        "30bceef674cf25d99bb8f1e0e3ce9867843ff926755ecfd27383915acde9a1ce",
+    "policy.safetensors": H1_POLICY_SHA256,
+    "training-state.json":
+        "56bb45619a02264a02199d0c0ac0d96ff7fb9b3c9c8c6c58fc55756881c262e3",
+    "evaluation.json":
+        "c9652feee9b199e92156158bd891c5672c0deb29e97e9b3a292ff0c6bbd520bc",
+}
+H1_HISTORICAL_V1_FILES = {
+    "metadata.json":
+        "b0058de2a89ef4e27520d2bc1c00a9822c01bf8d8ac5a03a1bce31596e4d7be4",
+    "policy.safetensors": H1_POLICY_SHA256,
+    "training-state.json": H1_TRAINING_STATE_SHA256,
+    "deployment-manifest.json":
+        "9ec98be0db3149238693327eebc6eeab3c55536f3b7ea34d68521031674608fa",
+    "requalification-manifest.json":
+        "01628ae5d07d75a4538cbcf085b27314b2e72e4c5324f6bd4249d6297e03da03",
+    "qualification/aggregate.json":
+        "a3e54308ac978e68509ff1ea437a7f908be3b2c2a0df6699755e03a98d7e3f6d",
+    "qualification/eval-seed-51001.json":
+        "2c48696385668a22417bfb2d811adb39c05e6a501ac3ef7bf74bef2d046d3815",
+    "qualification/eval-seed-51002.json":
+        "e0c4c03dcbfa18b6258f87ed135bf70304e97bc4640a6d4858026513ea57aba9",
+    "qualification/eval-seed-51003.json":
+        "7412147895ddb1a48eec036a7e9d79bdd2379139b4997e62a6abbddf5e9fb124",
+    "qualification/eval-seed-51004.json":
+        "015bbb14ec3c9d1c7462ed1cd584f8af84685a02f0818f43428df6d6559b9e60",
 }
 REQUALIFICATION_CHANGED_FIELDS = [
     "metadata.taskRevision",
@@ -694,7 +735,7 @@ def task_acceptance_failures(report: dict[str, Any],
 
     if task == H1_TASK and revision == H1_TARGET_REVISION:
         require(context.entry.selection_id == H1_REQUALIFIED_SELECTION,
-                "H1 revision 1000011 evidence must use the requalified selection")
+                "accepted H1 evidence must use the current requalified selection")
         require(config_equal(configuration, H1_TASK_CONFIGURATION),
                 "accepted H1 evidence changed the task configuration")
         if f32(report["successRate"]) < f32(0.80):
@@ -1018,6 +1059,55 @@ def verify_aggregate(path: Path, context: CheckpointContext) -> int:
     return len(reports)
 
 
+def verify_pinned_historical_h1_lineage(root: Path) -> None:
+    """Keep the immutable v0/v1 source chain bound while v2 is accepted."""
+    v0 = repository_path(
+        root, "checkpoints/humanoid-isaac-flat-v0", "historical H1 v0")
+    v1 = repository_path(
+        root, H1_PARENT_DIRECTORY, "historical H1 v1")
+    for directory, expected_files, label in (
+        (v0, H1_HISTORICAL_V0_FILES, "historical H1 v0"),
+        (v1, H1_HISTORICAL_V1_FILES, "historical H1 v1"),
+    ):
+        require(directory.is_dir(), f"{label}: checkpoint directory is missing")
+        paths = list(directory.rglob("*"))
+        require(all(not path.is_symlink() for path in paths),
+                f"{label}: bundle must not contain symlinks")
+        actual_files = {
+            path.relative_to(directory).as_posix()
+            for path in paths if path.is_file()
+        }
+        require(actual_files == set(expected_files),
+                f"{label}: bundle has missing or extra files")
+        for relative, expected_hash in expected_files.items():
+            require(sha256_file(directory / relative) == expected_hash,
+                    f"{label}: pinned bytes changed for {relative}")
+
+    require(checkpoint_fingerprint(v0) == H1_HISTORICAL_V0_FINGERPRINT,
+            "historical H1 v0 checkpoint fingerprint changed")
+    require(checkpoint_fingerprint(v1) == H1_PARENT_FINGERPRINT,
+            "historical H1 v1 checkpoint fingerprint changed")
+    v0_metadata = load_json(v0 / "metadata.json")
+    v1_metadata = load_json(v1 / "metadata.json")
+    require(v0_metadata.get("task") == H1_TASK
+            and v0_metadata.get("taskRevision") == 1_000_010,
+            "historical H1 v0 task identity changed")
+    require(v1_metadata.get("task") == H1_TASK
+            and v1_metadata.get("taskRevision") == H1_SOURCE_REVISION,
+            "historical H1 v1 task identity changed")
+
+    manifest = load_json(v1 / "requalification-manifest.json")
+    require(manifest.get("sourceTaskRevision") == 1_000_010
+            and manifest.get("targetTaskRevision") == H1_SOURCE_REVISION
+            and manifest.get("parentCheckpointDirectory")
+                == "checkpoints/humanoid-isaac-flat-v0"
+            and manifest.get("parentCheckpointFingerprint")
+                == H1_HISTORICAL_V0_FINGERPRINT
+            and manifest.get("candidateCheckpointFingerprint")
+                == H1_PARENT_FINGERPRINT,
+            "historical H1 v0-to-v1 lineage changed")
+
+
 def verify_h1_requalification(root: Path, context: CheckpointContext,
                               evidence_path: Path) -> Path:
     """Verify the sealed, zero-update H1 revision transfer.
@@ -1036,7 +1126,7 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
             == H1_REQUALIFIED_SELECTION,
             f"{context.entry.selection_id}: checkpoint directory changed")
     require(context.entry.evidence_relative_path
-            == ("checkpoints/humanoid-isaac-flat-v1/"
+            == (f"checkpoints/{H1_REQUALIFIED_SELECTION}/"
                 "requalification-manifest.json"),
             f"{context.entry.selection_id}: evidence path changed")
     require(context.metadata.get("taskRevision") == H1_TARGET_REVISION,
@@ -1052,8 +1142,23 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
     require({path.name for path in context.directory.iterdir()}
             == expected_top_level,
             f"{context.directory}: release bundle has missing or extra files")
+    verify_pinned_historical_h1_lineage(root)
     require(not manifest_path.is_symlink(),
             f"{manifest_path}: manifest must not be a symlink")
+    pinned_release_files = {
+        "metadata.json": H1_METADATA_SHA256,
+        "policy.safetensors": H1_POLICY_SHA256,
+        "training-state.json": H1_TRAINING_STATE_SHA256,
+        "deployment-manifest.json": H1_DEPLOYMENT_MANIFEST_SHA256,
+        "requalification-manifest.json":
+            H1_REQUALIFICATION_MANIFEST_SHA256,
+    }
+    for relative, expected_hash in pinned_release_files.items():
+        path = sealed_bundle_file(
+            context.directory, relative,
+            f"{context.entry.selection_id} pinned release file")
+        require(sha256_file(path) == expected_hash,
+                f"{path}: pinned release bytes changed")
     require(sha256_file(manifest_path) == H1_REQUALIFICATION_MANIFEST_SHA256,
             f"{manifest_path}: pinned release manifest bytes changed")
     require(evidence_path.resolve() == manifest_path.resolve(),

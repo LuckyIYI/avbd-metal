@@ -83,19 +83,21 @@ Push-T, or otherwise fails its contract. The tracked extension points are
 [`VectorRLAlgorithm`](Sources/AVBDLearn/VectorRLAlgorithm.swift); shipped
 checkpoint contracts are indexed in [the checkpoint catalog](checkpoints/README.md).
 
-The tracked **H1 Flat** actor is immutable epoch-1 evidence on the BSD-source
-collision hulls (`taskRevision=1000011`). The current simulator uses the
-epoch-2 deterministic-color contract, so this checkpoint is intentionally not
-selectable until a zero-update requalification publishes an epoch-2 bundle.
-The registry task ID remains `humanoid-isaac-flat-v0`; `v1` names the
-historical checkpoint selection rather than a different task.
+The tracked **H1 Flat v2** actor is an accepted native replay on the epoch-2
+deterministic-color solver contract (`taskRevision=2000011`). The registry task
+ID remains `humanoid-isaac-flat-v0`; `humanoid-isaac-flat-v2` is the Policy
+Replay selection and sealed bundle ID, not a different task. V2 is an exact
+zero-update requalification of the immutable epoch-1 v1 bundle: policy bytes
+are unchanged and no target training or optimizer steps were performed.
 Four manifest-locked, fixed-seed 512-episode evaluations passed 2028/2048
 episodes (99.02%); the worst run passed 98.63%, while worst-run linear and
 yaw-rate RMSE were
 0.089 m/s and 0.132 rad/s. The sealed bundle binds the unchanged policy, old
 and new task revisions, fixed seeds, raw reports, aggregate, and producing
-commit. Its current fingerprint is `85571805...c7fd2`. The revision-1000010
-bundle remains immutable older-hull evidence and is not selectable.
+commit. Its fingerprint is `00bc782d...c756`. V1 remains the immutable
+epoch-1 requalification source and is historical/nonselectable; the
+revision-1000010 v0 bundle remains immutable older-hull evidence and is also
+not selectable.
 
 The tracked **H1 Goal** replay is also epoch-1 historical evidence and requires
 requalification before replay on the current solver. Its recorded robustness
@@ -107,18 +109,18 @@ physical contact. It is intentionally not labeled an accepted result yet
 because unconditional final/minimum goal distances, 1.208/1.179 m, exceed the
 1.125/0.750 m gates. Its current fingerprint is `15710d3f...113f6`.
 
-The tracked **Arachne Straight Walk** actor is a deterministic
+The historical **Arachne Straight Walk** actor is a deterministic
 0.15 m/s regression benchmark on the corrected revision-6 foot collider. Its
 single seed-45010 report passed 512/512 episodes, with 0.068 m/s linear and
 0.284 rad/s yaw-rate RMSE and no control steps deeper than 1 mm below the
 floor. Both it and **Arachne Goal** are epoch-1 historical checkpoints pending
 epoch-2 requalification; Arachne Goal's multi-seed qualification reports remain
 shipped beside the robot assets as immutable prior-contract evidence.
-All three Arachne replay modes also expose separate **Fold** and
-**Unfold & Walk** actions. The physical motor/contact sequence reduces the
+The selectable **Arachne Classical** mode also exposes separate **Fold** and
+**Unfold & Walk** actions. Its physical motor/contact sequence reduces the
 articulated footprint by 41.0%, holds it there, then deploys and hands the
-measured state back to the selected controller. It is not a render animation
-and does not change the revision-6 policy contract.
+measured state back to the controller. It is not a render animation and does
+not make either historical native actor selectable.
 
 The earlier native humanoids and obsolete two-link Arm policy were removed from
 Policy Replay. The full Panda Push-T task remains trainable, but its best
@@ -134,12 +136,14 @@ The H1 gate requires a full 20-second episode plus low linear and yaw tracking
 error; merely standing upright cannot pass.
 
 The current Flat actor's tracked multi-seed evidence is
-[`checkpoints/humanoid-isaac-flat-v1/qualification/aggregate.json`](checkpoints/humanoid-isaac-flat-v1/qualification/aggregate.json);
+[`checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json`](checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json);
 its exact zero-update lineage is sealed by the adjacent
-[`requalification-manifest.json`](checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json).
-The revision-1000010
+[`requalification-manifest.json`](checkpoints/humanoid-isaac-flat-v2/requalification-manifest.json).
+The epoch-1
+[`v1 parent`](checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json)
+and revision-1000010
 [`historical evaluation`](checkpoints/humanoid-isaac-flat-v0/evaluation.json)
-is retained but is not evidence for the revised collision geometry.
+are retained as nonselectable lineage evidence.
 Replay videos and frame-locked single-episode reports are generated outputs
 under the ignored `artifacts/` directory; they are deliberately not required
 by a clean clone or treated as release evidence.

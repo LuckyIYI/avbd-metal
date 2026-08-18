@@ -75,10 +75,21 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
         let selectionIDs = PolicyReplayCatalog.entries.map(\.selectionID)
         XCTAssertEqual(Set(selectionIDs).count, selectionIDs.count)
         XCTAssertEqual(selectionIDs, [
+            "humanoid-isaac-flat-v2",
             "unitree-h1-sim2sim-v0",
             "gear-sonic-g1-reference-v0",
             "arachne15-classical-goal-v0",
         ])
+        let acceptedH1 = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "humanoid-isaac-flat-v2"))
+        XCTAssertEqual(acceptedH1.taskID, "humanoid-isaac-flat-v0")
+        XCTAssertEqual(acceptedH1.qualification, .accepted)
+        XCTAssertEqual(acceptedH1.evidenceRelativePath,
+            "checkpoints/humanoid-isaac-flat-v2/requalification-manifest.json")
+        XCTAssertEqual(acceptedH1.acceptanceAggregateRelativePath,
+            "checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json")
+        XCTAssertEqual(acceptedH1.deploymentManifestRelativePath,
+            "checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json")
         XCTAssertFalse(selectionIDs.contains("humanoid-isaac-flat-v1"))
         XCTAssertEqual(
             PolicyReplayCatalog.historicalEntry(
@@ -106,6 +117,32 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             PolicyReplayCatalog.historicalEntry(
                 selectionID: "humanoid-isaac-flat-v0")?.qualification,
             .requalificationRequired)
+        XCTAssertEqual(
+            PolicyReplayCatalog.historicalEntry(
+                selectionID: "humanoid-isaac-flat-v1")?.qualification,
+            .requalificationRequired)
+
+        let acceptedEvidenceURL = root.appendingPathComponent(
+            try XCTUnwrap(acceptedH1.evidenceRelativePath))
+        let acceptedManifest = try JSONDecoder().decode(
+            VectorPolicyRequalificationManifest.self,
+            from: Data(contentsOf: acceptedEvidenceURL))
+        XCTAssertEqual(acceptedManifest.task, acceptedH1.taskID)
+        XCTAssertEqual(acceptedManifest.targetTaskRevision, 2_000_011)
+        XCTAssertEqual(
+            acceptedManifest.candidateCheckpointFingerprint,
+            "00bc782d1845ddde94282b46f0d7fa2732feeb4a8e52215a5abe62128bccc756")
+        let acceptedAggregateURL = root.appendingPathComponent(
+            try XCTUnwrap(acceptedH1.acceptanceAggregateRelativePath))
+        let acceptedAggregate = try JSONDecoder().decode(
+            PPOCheckpointEvaluationAggregate.self,
+            from: Data(contentsOf: acceptedAggregateURL))
+        XCTAssertEqual(acceptedAggregate.taskRevision, 2_000_011)
+        XCTAssertEqual(acceptedAggregate.totalSuccesses, 2_028)
+        XCTAssertEqual(acceptedAggregate.totalEpisodes, 2_048)
+        XCTAssertEqual(
+            acceptedAggregate.checkpointFingerprint,
+            acceptedManifest.candidateCheckpointFingerprint)
         let allSelectionIDs = PolicyReplayCatalog.allDeclaredEntries.map(
             \.selectionID)
         XCTAssertEqual(Set(allSelectionIDs).count, allSelectionIDs.count)
@@ -294,5 +331,75 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                 "policy.safetensors")),
             try Data(contentsOf: bundle.appendingPathComponent(
                 "policy.safetensors")))
+    }
+
+    func testAcceptedIsaacFlatV2VerifiesCurrentZeroUpdateRequalification()
+        throws
+    {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let parent = root.appendingPathComponent(
+            "checkpoints/humanoid-isaac-flat-v1", isDirectory: true)
+        let bundle = root.appendingPathComponent(
+            "checkpoints/humanoid-isaac-flat-v2", isDirectory: true)
+        let metadata = try JSONDecoder().decode(
+            VectorPolicyMetadata.self,
+            from: Data(contentsOf: bundle.appendingPathComponent(
+                "metadata.json")))
+        let options = BuiltInRLTasks.registry.checkpointReplayOptions(
+            for: metadata.task,
+            semanticOptions: try XCTUnwrap(metadata.taskConfiguration),
+            maxEpisodeSteps: metadata.maxEpisodeSteps,
+            controlDecimation: metadata.controlDecimation)
+        let task = try BuiltInRLTasks.registry.make(
+            metadata.task,
+            configuration: .init(
+                numEnvironments: 1, seed: 51_001, autoReset: false,
+                options: options))
+        let criteria = try XCTUnwrap(
+            (task as? any RLEvaluationCriteriaProviding)?.evaluationCriteria)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.deterministicColorSolveV1(11))
+        XCTAssertTrue(metadata.compatibilityMismatches(with: task.spec).isEmpty)
+
+        let manifest = try VectorPolicyRequalification.verify(
+            targetSpec: task.spec,
+            evaluationCriteria: criteria,
+            bundleDirectory: bundle.path,
+            parentCheckpointDirectory: parent.path)
+
+        XCTAssertEqual(manifest.sourceTaskRevision,
+                       RLPhysicsContract.fixedGainActuatorV2(11))
+        XCTAssertEqual(manifest.targetTaskRevision,
+                       RLPhysicsContract.deterministicColorSolveV1(11))
+        XCTAssertEqual(manifest.parentPolicySHA256,
+                       manifest.candidatePolicySHA256)
+        XCTAssertEqual(manifest.targetTrainingUpdates, 0)
+        XCTAssertEqual(manifest.targetTrainingEnvironmentSteps, 0)
+        XCTAssertEqual(manifest.qualificationPlan.evaluationSeeds,
+                       [51_001, 51_002, 51_003, 51_004])
+        XCTAssertEqual(manifest.qualificationPlan.episodesPerReport, 512)
+        XCTAssertEqual(manifest.qualification?.reports.count, 4)
+        XCTAssertEqual(
+            try Data(contentsOf: parent.appendingPathComponent(
+                "policy.safetensors")),
+            try Data(contentsOf: bundle.appendingPathComponent(
+                "policy.safetensors")))
+
+        let aggregateFile = try XCTUnwrap(
+            manifest.qualification?.aggregate.file)
+        let aggregate = try JSONDecoder().decode(
+            PPOCheckpointEvaluationAggregate.self,
+            from: Data(contentsOf: bundle.appendingPathComponent(
+                aggregateFile)))
+        XCTAssertEqual(aggregate.taskRevision,
+                       RLPhysicsContract.deterministicColorSolveV1(11))
+        XCTAssertEqual(aggregate.checkpointFingerprint,
+                       manifest.candidateCheckpointFingerprint)
+        XCTAssertEqual(aggregate.totalSuccesses, 2_028)
+        XCTAssertEqual(aggregate.totalEpisodes, 2_048)
+        XCTAssertTrue(aggregate.robustAcrossEvaluationSeeds)
     }
 }

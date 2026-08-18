@@ -78,6 +78,19 @@ public enum PolicyReplayCatalog {
     public static let entries: [PolicyReplayCatalogEntry] = {
         let entries: [PolicyReplayCatalogEntry] = [
             .init(
+                selectionID: "humanoid-isaac-flat-v2",
+                displayName: "H1 Flat (Qualified)",
+                taskID: "humanoid-isaac-flat-v0",
+                runtime: .nativeMLX,
+                checkpointRelativeDirectory: "humanoid-isaac-flat-v2",
+                qualification: .accepted,
+                evidenceRelativePath:
+                    "checkpoints/humanoid-isaac-flat-v2/requalification-manifest.json",
+                acceptanceAggregateRelativePath:
+                    "checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json",
+                deploymentManifestRelativePath:
+                    "checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json"),
+            .init(
                 selectionID: "unitree-h1-sim2sim-v0",
                 displayName: "Unitree H1 Sim2Sim",
                 taskID: "unitree-h1-sim2sim-v0",

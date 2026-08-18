@@ -1,0 +1,53 @@
+{
+  "acceptance" : {
+    "failures" : [
+
+    ],
+    "passed" : true
+  },
+  "checkpointDirectory" : "runs\/humanoid-isaac-flat-v2\/requalification-r2000011\/candidate",
+  "checkpointFingerprint" : "00bc782d1845ddde94282b46f0d7fa2732feeb4a8e52215a5abe62128bccc756",
+  "checkpointTaskConfiguration" : {
+    "commandResamplingSteps" : 500,
+    "initialYawRange" : 3.1415925,
+    "observationNoise" : 1,
+    "solverIterations" : 20,
+    "standingCommandProbability" : 0.02
+  },
+  "episodes" : 512,
+  "evaluationEnvironments" : 128,
+  "evaluationSeed" : 51002,
+  "evaluationTaskConfiguration" : {
+    "commandResamplingSteps" : 500,
+    "initialYawRange" : 3.1415925,
+    "observationNoise" : 1,
+    "solverIterations" : 20,
+    "standingCommandProbability" : 0.02
+  },
+  "initializationCheckpoint" : "checkpoints\/humanoid-isaac-flat-v1",
+  "meanEpisodeLength" : 996.5488,
+  "meanReturn" : 37.461945,
+  "provenanceVersion" : 3,
+  "successRate" : 0.9902344,
+  "successes" : 507,
+  "task" : "humanoid-isaac-flat-v0",
+  "taskConfigurationTransferred" : false,
+  "taskMetrics" : {
+    "episode\/final_goal_distance_m" : 0,
+    "episode\/forward_path_m" : 9.122903,
+    "episode\/goal_arrival_speed_mps" : 0,
+    "episode\/goal_dwell_steps" : 0,
+    "episode\/goal_entered" : 0,
+    "episode\/goal_reached" : 0,
+    "episode\/linear_velocity_rmse_mps" : 0.08584574,
+    "episode\/mean_commanded_forward_velocity_mps" : 0.4824452,
+    "episode\/mean_local_forward_velocity_mps" : 0.4580537,
+    "episode\/minimum_goal_distance_m" : 0,
+    "episode\/survived" : 0.9902344,
+    "episode\/yaw_rate_rmse_rps" : 0.13014309
+  },
+  "taskRevision" : 2000011,
+  "trainingEnvironmentSteps" : 0,
+  "trainingSeed" : 41002,
+  "trainingUpdates" : 0
+}
