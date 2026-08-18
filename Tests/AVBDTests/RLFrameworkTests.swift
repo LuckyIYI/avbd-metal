@@ -4284,13 +4284,28 @@ final class RLFrameworkTests: XCTestCase {
                 .appendingPathComponent("policy.safetensors"))
             try Data([2]).write(to: directory
                 .appendingPathComponent("optimizer.safetensors"))
-            let metadata = "{\"task\":\"\(task)\",\"taskRevision\":\(revision)}"
-            try Data(metadata.utf8).write(to: directory
+            let metadata = VectorPolicyMetadata(
+                architectureVersion: VectorActorCritic.architectureVersion,
+                task: task, taskRevision: revision,
+                taskConfiguration: [:], observationDimension: 4,
+                actionDimension: 2, simulationStep: 0.002,
+                controlDecimation: 4, maxEpisodeSteps: 100,
+                inferenceBatchSize: 1, ppo: VectorPPOConfig(),
+                normalizer: RunningNormalizerSnapshot(
+                    count: Double(update * 1_000),
+                    mean: [Double](repeating: 0, count: 4),
+                    variance: [Double](repeating: 1, count: 4)))
+            try JSONEncoder().encode(metadata).write(to: directory
                 .appendingPathComponent("metadata.json"))
             if complete {
-                let state = "{\"completedUpdates\":\(completedUpdates ?? update),"
-                    + "\"environmentSteps\":\(update * 1000)}"
-                try Data(state.utf8).write(to: directory
+                let persistedUpdates = completedUpdates ?? update
+                let state = VectorPPOTrainingState(
+                    completedUpdates: persistedUpdates,
+                    environmentSteps: update * 1_000,
+                    optimizerSteps: persistedUpdates,
+                    adaptiveLearningRate: 3e-4,
+                    successReplayCount: 0)
+                try JSONEncoder().encode(state).write(to: directory
                     .appendingPathComponent("training-state.json"))
             }
         }

@@ -1,9 +1,15 @@
 import Foundation
 import CryptoKit
+import Darwin
 import MLX
 import MLXNN
 import MLXRandom
 import AVBDCore
+
+// Darwin's Swift module exposes the `struct flock` name but not the colliding
+// BSD `flock(2)` function. Bind that stable POSIX symbol explicitly.
+@_silgen_name("flock")
+private func avbdPOSIXFlock(_ descriptor: Int32, _ operation: Int32) -> Int32
 
 public enum PPOActionDistribution: String, Codable, Sendable {
     /// Diagonal Gaussian followed by tanh. This remains the default for
@@ -285,6 +291,14 @@ public struct VectorPPOConfig: Codable, Sendable {
         guard updates > 0, rolloutSteps > 0, updateEpochs > 0 else {
             throw RLEnvironmentError.invalidConfiguration("PPO loop counts must be positive")
         }
+        guard [
+            learningRate, gamma, gaeLambda, policyClip, valueClip,
+            valueCoefficient, entropyCoefficient, maxGradientNorm, targetKL,
+            initialActionStd,
+        ].allSatisfy(\.isFinite) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO floating-point configuration must be finite")
+        }
         guard minibatchSize > 0, minibatchSize <= batchSize else {
             throw RLEnvironmentError.invalidConfiguration(
                 "PPO minibatch must be in 1...rollout batch (\(batchSize))")
@@ -438,11 +452,14 @@ public struct VectorPPOConfig: Codable, Sendable {
         }
     }
 
-    /// A true resume restores Adam moments and the adaptive KL scheduler, so
-    /// every setting that determines their update trajectory must remain
-    /// identical. Extending the update count or changing snapshot frequency
-    /// is safe; changing optimization, sampling, normalization, symmetry, or
-    /// seed is an explicit transfer and must use `--initialize-from`.
+    /// A resume restores policy, normalizer, Adam, scheduler, and progress at
+    /// an update boundary, so every setting that determines later updates must
+    /// remain identical. Simulator/task state is intentionally not serialized:
+    /// environments restart from the configured seed, so this is not an exact
+    /// mid-trajectory continuation. Extending the update count or changing
+    /// snapshot frequency is safe; changing optimization, sampling,
+    /// normalization, symmetry, or seed is an explicit transfer and must use
+    /// `--initialize-from`.
     func resumeIncompatibilities(with checkpoint: Self) -> [String] {
         var fields = [String]()
         func require<T: Equatable>(_ name: String, _ current: T, _ saved: T) {
@@ -2414,6 +2431,32 @@ public struct VectorPolicyMetadata: Codable, Sendable {
     public var ppo: VectorPPOConfig
     public var normalizer: RunningNormalizerSnapshot
 
+    /// Structural validation used before a live snapshot is considered for
+    /// replay or exact resume. Decoding only task identity is insufficient: a
+    /// truncated newest metadata file would otherwise hide an older complete
+    /// generation and fail later after selection.
+    func validateReplayCheckpointStructure() throws {
+        guard let architectureVersion,
+              VectorActorCritic.compatibleArchitectureVersions.contains(
+                architectureVersion),
+              !task.isEmpty,
+              let taskRevision, taskRevision > 0,
+              observationDimension > 0,
+              actionDimension > 0,
+              simulationStep.isFinite, simulationStep > 0,
+              controlDecimation > 0,
+              maxEpisodeSteps > 0,
+              inferenceBatchSize.map({ $0 > 0 }) ?? true,
+              normalizer.count.isFinite, normalizer.count >= 0,
+              normalizer.mean.count == observationDimension,
+              normalizer.variance.count == observationDimension,
+              normalizer.mean.allSatisfy(\.isFinite),
+              normalizer.variance.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO checkpoint metadata structure is invalid")
+        }
+    }
+
     /// Exact in-place replay compatibility. Explicit transfer paths may relax
     /// selected fields, but a generic action provider must always fail closed.
     public func compatibilityMismatches(with spec: RLTaskSpec) -> [String] {
@@ -2468,28 +2511,191 @@ public struct VectorPolicyMetadata: Codable, Sendable {
 }
 
 public struct VectorPPOTrainingState: Codable, Sendable {
+    public static let currentResumableSnapshotVersion = 2
+
     public var completedUpdates: Int
     public var environmentSteps: Int
+    /// Explicit opt-in to the exact-resume contract. Nil is retained for
+    /// historical, evaluation-only, distillation, and requalification files.
+    public var resumableSnapshotVersion: Int?
+    /// Simulator rows advanced by each rollout step in this run.
+    public var rolloutEnvironmentCount: Int?
     /// Minibatch-level Adam step. Optional for pre-checkpoint-v2 runs.
     public var optimizerSteps: Int?
     /// Adaptive KL scheduler state. Optional for pre-checkpoint-v2 runs.
     public var adaptiveLearningRate: Float?
+    /// Number of chronological rows in success-replay.safetensors. Optional
+    /// so evaluation and requalification artifacts outside the resumable PPO
+    /// snapshot format retain source-compatible JSON.
+    public var successReplayCount: Int?
 
     public init(completedUpdates: Int, environmentSteps: Int,
+                resumableSnapshotVersion: Int? = nil,
+                rolloutEnvironmentCount: Int? = nil,
                 optimizerSteps: Int? = nil,
-                adaptiveLearningRate: Float? = nil) {
+                adaptiveLearningRate: Float? = nil,
+                successReplayCount: Int? = nil) {
         self.completedUpdates = completedUpdates
         self.environmentSteps = environmentSteps
+        self.resumableSnapshotVersion = resumableSnapshotVersion
+        self.rolloutEnvironmentCount = rolloutEnvironmentCount
         self.optimizerSteps = optimizerSteps
         self.adaptiveLearningRate = adaptiveLearningRate
+        self.successReplayCount = successReplayCount
+    }
+
+    enum OptimizerResumeState: Equatable {
+        /// A current checkpoint taken before the first optimizer update has
+        /// no moment tensors to restore.
+        case fresh(adaptiveLearningRate: Float)
+        /// A current checkpoint with an advanced Adam trajectory must carry
+        /// its named first- and second-moment tensors.
+        case checkpointed(steps: Int, adaptiveLearningRate: Float)
+    }
+
+    func validatedOptimizerResumeState(
+        configuration: VectorPPOConfig,
+        maximumOptimizerSteps: Int? = nil
+    ) throws -> OptimizerResumeState {
+        guard resumableSnapshotVersion
+                == Self.currentResumableSnapshotVersion,
+              completedUpdates >= 0, environmentSteps >= 0,
+              let optimizerSteps, let adaptiveLearningRate else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "exact PPO resume requires current optimizer counters and "
+                    + "adaptive learning-rate state")
+        }
+        guard adaptiveLearningRate.isFinite, adaptiveLearningRate > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO checkpoint adaptive learning rate is invalid")
+        }
+        let configuredLearningRate = configuration.learningRate
+        guard configuredLearningRate.isFinite, configuredLearningRate > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO checkpoint configuration learning rate is invalid")
+        }
+        switch configuration.resolvedKLSchedule {
+        case .adaptive:
+            guard configuration.targetKL > 0 else {
+                guard adaptiveLearningRate == configuredLearningRate else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "disabled adaptive PPO scheduler must retain its "
+                            + "configured learning rate")
+                }
+                break
+            }
+            let minimumLearningRate = configuredLearningRate / 100
+            guard minimumLearningRate.isFinite,
+                  adaptiveLearningRate >= minimumLearningRate,
+                  adaptiveLearningRate <= configuredLearningRate else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "adaptive PPO checkpoint learning rate is outside its "
+                        + "configured scheduler range")
+            }
+        case .earlyStop, .none:
+            guard adaptiveLearningRate == configuredLearningRate else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "fixed-rate PPO checkpoint learning rate differs from "
+                        + "its configuration")
+            }
+        }
+        if completedUpdates == 0 || environmentSteps == 0
+            || optimizerSteps == 0 {
+            guard completedUpdates == 0, environmentSteps == 0,
+                  optimizerSteps == 0,
+                  adaptiveLearningRate == configuredLearningRate else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "a fresh PPO checkpoint must have zero update, environment, "
+                        + "and optimizer counters and the configured learning "
+                        + "rate")
+            }
+            return .fresh(adaptiveLearningRate: adaptiveLearningRate)
+        }
+        guard optimizerSteps >= completedUpdates else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO optimizer steps cannot trail completed updates")
+        }
+        if let maximumOptimizerSteps,
+           optimizerSteps > maximumOptimizerSteps {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO optimizer steps exceed the rollout/update geometry")
+        }
+        return .checkpointed(
+            steps: optimizerSteps,
+            adaptiveLearningRate: adaptiveLearningRate)
+    }
+
+    func validatedRolloutEnvironmentCount(rolloutSteps: Int) throws -> Int {
+        guard resumableSnapshotVersion
+                == Self.currentResumableSnapshotVersion,
+              let rolloutEnvironmentCount, rolloutEnvironmentCount > 0,
+              rolloutSteps > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "exact PPO resume requires v2 rollout geometry")
+        }
+        let updateRows = completedUpdates.multipliedReportingOverflow(
+            by: rolloutEnvironmentCount)
+        guard !updateRows.overflow else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO checkpoint rollout progress overflows Int")
+        }
+        let expectedSteps = updateRows.partialValue
+            .multipliedReportingOverflow(by: rolloutSteps)
+        guard !expectedSteps.overflow,
+              environmentSteps == expectedSteps.partialValue else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO checkpoint environment steps do not match rollout geometry")
+        }
+        return rolloutEnvironmentCount
+    }
+
+    func maximumOptimizerSteps(
+        rolloutSteps: Int,
+        updateEpochs: Int,
+        minibatchSize: Int
+    ) throws -> Int {
+        let environments = try validatedRolloutEnvironmentCount(
+            rolloutSteps: rolloutSteps)
+        guard updateEpochs > 0, minibatchSize > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO optimizer geometry must be positive")
+        }
+        let batch = environments.multipliedReportingOverflow(by: rolloutSteps)
+        guard !batch.overflow else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO rollout batch overflows Int")
+        }
+        let minibatches = batch.partialValue / minibatchSize
+            + (batch.partialValue % minibatchSize == 0 ? 0 : 1)
+        let perUpdate = minibatches.multipliedReportingOverflow(by: updateEpochs)
+        guard !perUpdate.overflow else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO optimizer epoch geometry overflows Int")
+        }
+        let maximum = completedUpdates.multipliedReportingOverflow(
+            by: perUpdate.partialValue)
+        guard !maximum.overflow else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO optimizer step ceiling overflows Int")
+        }
+        return maximum.partialValue
+    }
+
+    func validatedSuccessReplayCount(capacity: Int) throws -> Int {
+        guard capacity >= 0, let successReplayCount,
+              (0...capacity).contains(successReplayCount) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "exact PPO resume requires a valid success replay row count")
+        }
+        return successReplayCount
     }
 }
 
 /// A checkpoint snapshot that is safe for another process to open. Training
-/// writes each snapshot into a new `checkpoints/update-NNNNNN` directory and
-/// writes `training-state.json` last. Discovering snapshots (rather than the
-/// mutable run root) prevents replay from observing a mixture of old metadata
-/// and newly replaced weights while an atomic per-file save is in progress.
+/// completes each generation in a hidden staging directory, writes
+/// `training-state.json` last, and atomically renames it to
+/// `checkpoints/update-NNNNNN`. Discovering immutable snapshots (rather than
+/// the mutable run root) prevents replay or resume from observing mixed files.
 public struct VectorPolicyCheckpointCandidate: Sendable, Equatable {
     public var directory: String
     public var completedUpdates: Int
@@ -2504,14 +2710,225 @@ public struct VectorPolicyCheckpointCandidate: Sendable, Equatable {
 }
 
 public enum VectorPolicyCheckpointDiscovery {
-    private struct Identity: Decodable {
-        var task: String
-        var taskRevision: Int?
+    private static func isNonemptyReadableFile(_ url: URL) -> Bool {
+        let manager = FileManager.default
+        guard manager.isReadableFile(atPath: url.path),
+              let values = try? url.resourceValues(forKeys: [
+                .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+              ]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true else { return false }
+        return (values.fileSize ?? 0) > 0
     }
 
-    private struct Progress: Decodable {
-        var completedUpdates: Int
-        var environmentSteps: Int
+    static func checkpointDirectoryName(completedUpdates: Int) throws -> String {
+        guard completedUpdates >= 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO checkpoint update must be non-negative")
+        }
+        let digits = String(completedUpdates)
+        return "update-"
+            + String(repeating: "0", count: max(6 - digits.count, 0))
+            + digits
+    }
+
+    /// Read only the bounded JSON header. Live checkpoint discovery should
+    /// not initialize an MLX device or map a potentially large replay payload
+    /// merely to verify tensor row counts.
+    private static func safetensorShapes(at url: URL) -> [String: [Int]]? {
+        guard isNonemptyReadableFile(url),
+              let fileSize = try? url.resourceValues(forKeys: [.fileSizeKey])
+                .fileSize,
+              fileSize >= 8,
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        guard let lengthData = try? handle.read(upToCount: 8),
+              lengthData.count == 8 else { return nil }
+        let headerLength = lengthData.enumerated().reduce(UInt64(0)) {
+            $0 | UInt64($1.element) << UInt64(8 * $1.offset)
+        }
+        let maximumHeaderBytes = UInt64(16 * 1_024 * 1_024)
+        guard headerLength > 0, headerLength <= maximumHeaderBytes,
+              headerLength <= UInt64(fileSize - 8),
+              headerLength <= UInt64(Int.max),
+              let header = try? handle.read(upToCount: Int(headerLength)),
+              header.count == Int(headerLength),
+              let object = try? JSONSerialization.jsonObject(with: header),
+              let root = object as? [String: Any] else { return nil }
+        let payloadBytes = fileSize - 8 - Int(headerLength)
+        var shapes = [String: [Int]]()
+        var spans = [(Int, Int)]()
+        for (name, rawDescriptor) in root where name != "__metadata__" {
+            guard let descriptor = rawDescriptor as? [String: Any],
+                  descriptor["dtype"] as? String == "F32",
+                  let rawShape = descriptor["shape"] as? [NSNumber],
+                  let rawOffsets = descriptor["data_offsets"] as? [NSNumber],
+                  rawOffsets.count == 2 else { return nil }
+            var shape = [Int]()
+            shape.reserveCapacity(rawShape.count)
+            for number in rawShape {
+                let dimension = number.intValue
+                guard dimension >= 0,
+                      number.doubleValue == Double(dimension) else { return nil }
+                shape.append(dimension)
+            }
+            let start = rawOffsets[0].intValue
+            let end = rawOffsets[1].intValue
+            guard start >= 0, end >= start, end <= payloadBytes,
+                  rawOffsets[0].doubleValue == Double(start),
+                  rawOffsets[1].doubleValue == Double(end) else { return nil }
+            var elementCount = 1
+            for dimension in shape {
+                let product = elementCount.multipliedReportingOverflow(
+                    by: dimension)
+                guard !product.overflow else { return nil }
+                elementCount = product.partialValue
+            }
+            let byteCount = elementCount.multipliedReportingOverflow(by: 4)
+            guard !byteCount.overflow,
+                  end - start == byteCount.partialValue else { return nil }
+            shapes[name] = shape
+            spans.append((start, end))
+        }
+        spans.sort { $0.0 < $1.0 }
+        guard spans.first?.0 == 0,
+              spans.last?.1 == payloadBytes else { return nil }
+        for index in 1..<spans.count
+            where spans[index].0 != spans[index - 1].1 {
+            return nil
+        }
+        return shapes
+    }
+
+    private static func successReplayMatches(
+        directory: URL,
+        expectedCount: Int,
+        capacity: Int,
+        observationDimension: Int,
+        actionDimension: Int
+    ) -> Bool {
+        guard capacity >= 0, (0...capacity).contains(expectedCount) else {
+            return false
+        }
+        let url = directory.appendingPathComponent(
+            VectorPPOTrainer.successReplayFileName)
+        if expectedCount == 0 {
+            return !FileManager.default.fileExists(atPath: url.path)
+        }
+        guard capacity > 0, isNonemptyReadableFile(url),
+              let shapes = safetensorShapes(at: url),
+              Set(shapes.keys) == Set([
+                "observations", "actions", "expertGates",
+                "standExpertGates", "auxiliaryExpertGates",
+              ]),
+              shapes["observations"] == [
+                expectedCount, observationDimension,
+              ],
+              shapes["actions"] == [expectedCount, actionDimension],
+              shapes["expertGates"] == [expectedCount],
+              shapes["standExpertGates"] == [expectedCount],
+              shapes["auxiliaryExpertGates"] == [expectedCount] else {
+            return false
+        }
+        return true
+    }
+
+    private static func replayCandidate(
+        at directory: URL,
+        numberedUpdate: Int,
+        task: String,
+        taskRevision: Int
+    ) -> VectorPolicyCheckpointCandidate? {
+        guard numberedUpdate >= 0,
+              isNonemptyReadableFile(directory
+                .appendingPathComponent("policy.safetensors")),
+              isNonemptyReadableFile(directory
+                .appendingPathComponent("metadata.json")),
+              isNonemptyReadableFile(directory
+                .appendingPathComponent("training-state.json")),
+              let metadata = try? JSONDecoder().decode(
+                VectorPolicyMetadata.self,
+                from: Data(contentsOf: directory
+                    .appendingPathComponent("metadata.json"))),
+              (try? metadata.validateReplayCheckpointStructure()) != nil,
+              (try? metadata.ppo.validate(
+                batchSize: metadata.ppo.minibatchSize)) != nil,
+              metadata.task == task,
+              (metadata.taskRevision ?? 1) == taskRevision,
+              let progress = try? JSONDecoder().decode(
+                VectorPPOTrainingState.self,
+                from: Data(contentsOf: directory
+                    .appendingPathComponent("training-state.json"))),
+              progress.completedUpdates == numberedUpdate,
+              progress.completedUpdates >= 0,
+              progress.environmentSteps >= 0 else { return nil }
+        return VectorPolicyCheckpointCandidate(
+            directory: directory.resolvingSymlinksInPath().path,
+            completedUpdates: progress.completedUpdates,
+            environmentSteps: progress.environmentSteps)
+    }
+
+    private static func resumableCandidate(
+        at directory: URL,
+        numberedUpdate: Int,
+        task: String,
+        taskRevision: Int,
+        requiredEnvironmentCount: Int?
+    ) -> VectorPolicyCheckpointCandidate? {
+        guard let candidate = replayCandidate(
+                at: directory, numberedUpdate: numberedUpdate,
+                task: task, taskRevision: taskRevision),
+              let metadata = try? JSONDecoder().decode(
+                VectorPolicyMetadata.self,
+                from: Data(contentsOf: directory
+                    .appendingPathComponent("metadata.json"))),
+              let taskConfiguration = metadata.taskConfiguration,
+              taskConfiguration.keys.allSatisfy({ !$0.isEmpty }),
+              taskConfiguration.values.allSatisfy(\.isFinite),
+              let inferenceBatchSize = metadata.inferenceBatchSize,
+              inferenceBatchSize > 0,
+              (try? metadata.ppo.validate(
+                batchSize: metadata.ppo.minibatchSize)) != nil,
+              let progress = try? JSONDecoder().decode(
+                VectorPPOTrainingState.self,
+                from: Data(contentsOf: directory
+                    .appendingPathComponent("training-state.json"))),
+              let rolloutEnvironmentCount = try? progress
+                .validatedRolloutEnvironmentCount(
+                    rolloutSteps: metadata.ppo.rolloutSteps),
+              requiredEnvironmentCount.map({
+                $0 == rolloutEnvironmentCount
+              }) ?? true,
+              let maximumOptimizerSteps = try? progress.maximumOptimizerSteps(
+                rolloutSteps: metadata.ppo.rolloutSteps,
+                updateEpochs: metadata.ppo.updateEpochs,
+                minibatchSize: metadata.ppo.minibatchSize),
+              let optimizerState = try? progress
+                .validatedOptimizerResumeState(
+                    configuration: metadata.ppo,
+                    maximumOptimizerSteps: maximumOptimizerSteps),
+              let replayCount = try? progress.validatedSuccessReplayCount(
+                capacity: metadata.ppo.successReplayCapacity ?? 0),
+              successReplayMatches(
+                directory: directory,
+                expectedCount: replayCount,
+                capacity: metadata.ppo.successReplayCapacity ?? 0,
+                observationDimension: metadata.observationDimension,
+                actionDimension: metadata.actionDimension) else { return nil }
+
+        if case .checkpointed = optimizerState,
+           !isNonemptyReadableFile(directory
+            .appendingPathComponent("optimizer.safetensors")) {
+            return nil
+        }
+        if (metadata.ppo.referencePolicyCoefficient ?? 0) > 0,
+           !isNonemptyReadableFile(directory
+            .appendingPathComponent("reference-policy.safetensors")) {
+            return nil
+        }
+        return candidate
     }
 
     /// Return the highest numbered complete, task-compatible immutable
@@ -2532,39 +2949,19 @@ public enum VectorPolicyCheckpointDiscovery {
         var latest: VectorPolicyCheckpointCandidate?
         for directory in children {
             let name = directory.lastPathComponent
+            let values = try? directory.resourceValues(forKeys: [
+                .isDirectoryKey, .isSymbolicLinkKey,
+            ])
             guard name.hasPrefix("update-"),
                   let numberedUpdate = Int(name.dropFirst("update-".count)),
-                  (try? directory.resourceValues(forKeys: [.isDirectoryKey])
-                    .isDirectory) == true else { continue }
+                  (try? checkpointDirectoryName(
+                    completedUpdates: numberedUpdate)) == name,
+                  values?.isDirectory == true,
+                  values?.isSymbolicLink != true else { continue }
 
-            let required = [
-                "policy.safetensors", "optimizer.safetensors",
-                "metadata.json", "training-state.json",
-            ]
-            guard required.allSatisfy({ fileName in
-                let path = directory.appendingPathComponent(fileName).path
-                guard manager.isReadableFile(atPath: path),
-                      let size = (try? manager.attributesOfItem(atPath: path)[.size])
-                        as? NSNumber else { return false }
-                return size.intValue > 0
-            }) else { continue }
-
-            guard let identity = try? JSONDecoder().decode(
-                    Identity.self,
-                    from: Data(contentsOf: directory
-                        .appendingPathComponent("metadata.json"))),
-                  identity.task == task,
-                  (identity.taskRevision ?? 1) == taskRevision,
-                  let progress = try? JSONDecoder().decode(
-                    Progress.self,
-                    from: Data(contentsOf: directory
-                        .appendingPathComponent("training-state.json"))),
-                  progress.completedUpdates == numberedUpdate else { continue }
-
-            let candidate = VectorPolicyCheckpointCandidate(
-                directory: directory.path,
-                completedUpdates: progress.completedUpdates,
-                environmentSteps: progress.environmentSteps)
+            guard let candidate = replayCandidate(
+                at: directory, numberedUpdate: numberedUpdate,
+                task: task, taskRevision: taskRevision) else { continue }
             if latest == nil
                 || candidate.completedUpdates > latest!.completedUpdates {
                 latest = candidate
@@ -2572,6 +2969,221 @@ public enum VectorPolicyCheckpointDiscovery {
         }
         return latest
     }
+
+    /// Resolve the only checkpoint source accepted by exact PPO resume. The
+    /// mutable run root remains a convenience mirror for tools that expect it,
+    /// but it has no generation marker and can contain files from two saves
+    /// after interruption. A policy-only root is therefore an explicit
+    /// transfer source, never an in-place resume source.
+    static func checkpointForResume(
+        inRunDirectory runDirectory: String,
+        task: String,
+        taskRevision: Int,
+        numEnvironments: Int
+    ) throws -> VectorPolicyCheckpointCandidate {
+        guard numEnvironments > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO resume environment count must be positive")
+        }
+        let manager = FileManager.default
+        let snapshots = URL(fileURLWithPath: runDirectory, isDirectory: true)
+            .appendingPathComponent("checkpoints", isDirectory: true)
+        let children = (try? manager.contentsOfDirectory(
+            at: snapshots,
+            includingPropertiesForKeys: [
+                .isDirectoryKey, .isSymbolicLinkKey,
+            ], options: [.skipsHiddenFiles])) ?? []
+        var newestGeneration: (directory: URL, update: Int)?
+        for entry in children {
+            let name = entry.lastPathComponent
+            guard name.hasPrefix("update-"),
+                  let update = Int(name.dropFirst("update-".count)),
+                  (try? checkpointDirectoryName(completedUpdates: update))
+                    == name else { continue }
+            if newestGeneration == nil || update > newestGeneration!.update {
+                newestGeneration = (entry, update)
+            }
+        }
+        guard let newestGeneration else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO resume requires a complete resumable-format-v2 immutable "
+                    + "checkpoint under checkpoints/update-NNNNNN; legacy "
+                    + "snapshots and the mutable run root are replay-only. "
+                    + "Use --initialize-from for policy transfer.")
+        }
+        let values = try? newestGeneration.directory.resourceValues(forKeys: [
+            .isDirectoryKey, .isSymbolicLinkKey,
+        ])
+        guard values?.isDirectory == true,
+              values?.isSymbolicLink != true,
+              let candidate = resumableCandidate(
+                at: newestGeneration.directory,
+                numberedUpdate: newestGeneration.update,
+                task: task, taskRevision: taskRevision,
+                requiredEnvironmentCount: numEnvironments) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "newest immutable PPO generation update-"
+                    + "\(newestGeneration.update) is not resumable format v2; "
+                    + "quarantine/remove it or use --initialize-from. Exact "
+                    + "resume will not fork behind a visible newer generation.")
+        }
+        return candidate
+    }
+
+    private static func synchronize(_ url: URL) throws {
+        let descriptor = Darwin.open(url.path, O_RDONLY)
+        guard descriptor >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain, code: Int(errno),
+                userInfo: [NSFilePathErrorKey: url.path])
+        }
+        let syncResult = Darwin.fsync(descriptor)
+        let syncError = errno
+        let closeResult = Darwin.close(descriptor)
+        if syncResult != 0 {
+            throw NSError(
+                domain: NSPOSIXErrorDomain, code: Int(syncError),
+                userInfo: [NSFilePathErrorKey: url.path])
+        }
+        if closeResult != 0 {
+            throw NSError(
+                domain: NSPOSIXErrorDomain, code: Int(errno),
+                userInfo: [NSFilePathErrorKey: url.path])
+        }
+    }
+
+    private static func synchronizeSnapshot(at directory: URL) throws {
+        let children = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [
+                .isRegularFileKey, .isSymbolicLinkKey,
+            ])
+        for child in children {
+            let values = try child.resourceValues(forKeys: [
+                .isRegularFileKey, .isSymbolicLinkKey,
+            ])
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "PPO checkpoint staging contains a non-regular file")
+            }
+            try synchronize(child)
+        }
+        try synchronize(directory)
+    }
+
+    /// Write a complete snapshot in a hidden sibling directory, validate its
+    /// commit marker and required state, then publish it with one same-volume
+    /// rename. Readers can observe either no final directory or the complete
+    /// immutable generation, never an intermediate set of files.
+    static func publishCompleteCheckpoint(
+        inRunDirectory runDirectory: String,
+        completedUpdates: Int,
+        task: String,
+        taskRevision: Int,
+        write: (URL) throws -> Void
+    ) throws -> VectorPolicyCheckpointCandidate {
+        let manager = FileManager.default
+        let run = URL(fileURLWithPath: runDirectory, isDirectory: true)
+        let snapshots = run
+            .appendingPathComponent("checkpoints", isDirectory: true)
+        try manager.createDirectory(
+            at: snapshots, withIntermediateDirectories: true)
+        try synchronize(run)
+        let name = try checkpointDirectoryName(
+            completedUpdates: completedUpdates)
+        let destination = snapshots.appendingPathComponent(
+            name, isDirectory: true)
+        guard !manager.fileExists(atPath: destination.path) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "refusing to replace immutable PPO checkpoint \(destination.path)")
+        }
+        let staging = snapshots.appendingPathComponent(
+            ".\(name)-\(UUID().uuidString).staging", isDirectory: true)
+        try manager.createDirectory(at: staging, withIntermediateDirectories: false)
+        do {
+            try write(staging)
+            guard let candidate = resumableCandidate(
+                at: staging, numberedUpdate: completedUpdates,
+                task: task, taskRevision: taskRevision,
+                requiredEnvironmentCount: nil) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "refusing to publish incomplete PPO checkpoint \(name)")
+            }
+            try synchronizeSnapshot(at: staging)
+            let renameResult = staging.path.withCString { source in
+                destination.path.withCString { target in
+                    Darwin.renameatx_np(
+                        AT_FDCWD, source, AT_FDCWD, target,
+                        UInt32(RENAME_EXCL))
+                }
+            }
+            guard renameResult == 0 else {
+                let renameError = errno
+                if renameError == EEXIST {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "refusing to replace immutable PPO checkpoint "
+                            + destination.path)
+                }
+                throw NSError(
+                    domain: NSPOSIXErrorDomain, code: Int(renameError),
+                    userInfo: [NSFilePathErrorKey: destination.path])
+            }
+            try synchronize(snapshots)
+            try synchronize(run)
+            return VectorPolicyCheckpointCandidate(
+                directory: destination.resolvingSymlinksInPath().path,
+                completedUpdates: candidate.completedUpdates,
+                environmentSteps: candidate.environmentSteps)
+        } catch {
+            try? manager.removeItem(at: staging)
+            throw error
+        }
+    }
+}
+
+/// Advisory single-writer lease for a PPO run directory. `flock` is attached
+/// to the open file description, so the kernel releases it on ordinary close
+/// and on process termination; the persistent lock file is never deleted and
+/// therefore cannot split contenders across different inodes.
+final class VectorPPORunLock {
+    static let fileName = ".ppo-trainer.lock"
+    private var descriptor: Int32?
+
+    init(runDirectory: String) throws {
+        let url = URL(fileURLWithPath: runDirectory, isDirectory: true)
+            .appendingPathComponent(Self.fileName)
+        let opened = Darwin.open(
+            url.path, O_CREAT | O_RDWR | O_CLOEXEC,
+            mode_t(S_IRUSR | S_IWUSR))
+        guard opened >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain, code: Int(errno),
+                userInfo: [NSFilePathErrorKey: url.path])
+        }
+        guard avbdPOSIXFlock(opened, LOCK_EX | LOCK_NB) == 0 else {
+            let lockError = errno
+            _ = Darwin.close(opened)
+            if lockError == EWOULDBLOCK || lockError == EAGAIN {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "another PPO trainer already owns run directory "
+                        + runDirectory)
+            }
+            throw NSError(
+                domain: NSPOSIXErrorDomain, code: Int(lockError),
+                userInfo: [NSFilePathErrorKey: url.path])
+        }
+        descriptor = opened
+    }
+
+    func unlock() {
+        guard let descriptor else { return }
+        _ = avbdPOSIXFlock(descriptor, LOCK_UN)
+        _ = Darwin.close(descriptor)
+        self.descriptor = nil
+    }
+
+    deinit { unlock() }
 }
 
 /// Adam with explicitly named, serializable moment buffers. MLX Swift's Adam
@@ -2636,22 +3248,59 @@ final class CheckpointableAdam {
         return arrays
     }
 
+    static func validateCheckpointKeys(
+        actual: Set<String>, expected: Set<String>
+    ) throws {
+        guard actual == expected else {
+            let missing = expected.subtracting(actual).sorted()
+            let unexpected = actual.subtracting(expected).sorted()
+            throw RLEnvironmentError.invalidConfiguration(
+                "optimizer checkpoint tensor keys mismatch; missing="
+                    + "\(missing), unexpected=\(unexpected)")
+        }
+    }
+
+    static func validateFirstMomentValues(_ values: [Float]) throws {
+        guard values.allSatisfy(\.isFinite) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "optimizer checkpoint first moments must be finite")
+        }
+    }
+
+    static func validateSecondMomentValues(_ values: [Float]) throws {
+        guard values.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "optimizer checkpoint second moments must be finite and "
+                    + "non-negative")
+        }
+    }
+
     func restore(arrays: [String: MLXArray], step: Int,
                  parameters: ModuleParameters) throws {
         guard step >= 0 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "optimizer checkpoint has a negative step")
         }
+        let parameterPairs = parameters.flattened()
+        let expectedKeys = Set(parameterPairs.flatMap { name, _ in
+            ["first.\(name)", "second.\(name)"]
+        })
+        try Self.validateCheckpointKeys(
+            actual: Set(arrays.keys), expected: expectedKeys)
         var restoredFirst = [String: MLXArray]()
         var restoredSecond = [String: MLXArray]()
-        for (name, parameter) in parameters.flattened() {
+        for (name, parameter) in parameterPairs {
             guard let first = arrays["first.\(name)"],
                   let second = arrays["second.\(name)"],
+                  first.dtype == .float32,
+                  second.dtype == .float32,
                   first.shape == parameter.shape,
                   second.shape == parameter.shape else {
                 throw RLEnvironmentError.invalidConfiguration(
                     "optimizer checkpoint is missing or mismatches parameter \(name)")
             }
+            try Self.validateFirstMomentValues(first.asArray(Float.self))
+            try Self.validateSecondMomentValues(second.asArray(Float.self))
             restoredFirst[name] = first
             restoredSecond[name] = second
         }
@@ -2929,7 +3578,54 @@ public final class VectorPPOTrainer {
     public var onUpdate: ((PPOUpdateMetrics) -> Void)?
 
     private static let logSqrt2Pi: Float = 0.9189385332
-    private static let successReplayFileName = "success-replay.safetensors"
+    static let successReplayFileName = "success-replay.safetensors"
+
+    /// Validate untrusted host values before they enter the in-memory replay
+    /// ring. Shape-only safetensors discovery cannot detect NaNs or invalid
+    /// routing gates without reading the payload.
+    static func validateSuccessReplayCheckpointValues(
+        observations: [Float],
+        actions: [Float],
+        expertGates: [Float],
+        standExpertGates: [Float],
+        auxiliaryExpertGates: [Float],
+        rowCount: Int,
+        observationDimension: Int,
+        actionDimension: Int
+    ) throws {
+        guard rowCount >= 0, observationDimension > 0,
+              actionDimension > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success replay checkpoint dimensions are invalid")
+        }
+        let observationCount = rowCount.multipliedReportingOverflow(
+            by: observationDimension)
+        let actionCount = rowCount.multipliedReportingOverflow(
+            by: actionDimension)
+        guard !observationCount.overflow, !actionCount.overflow,
+              observations.count == observationCount.partialValue,
+              actions.count == actionCount.partialValue,
+              expertGates.count == rowCount,
+              standExpertGates.count == rowCount,
+              auxiliaryExpertGates.count == rowCount else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success replay checkpoint payload sizes are invalid")
+        }
+        guard observations.allSatisfy(\.isFinite),
+              actions.allSatisfy(\.isFinite) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success replay observations and actions must be finite")
+        }
+        let validGate: (Float) -> Bool = {
+            $0.isFinite && (0...1).contains($0)
+        }
+        guard expertGates.allSatisfy(validGate),
+              standExpertGates.allSatisfy(validGate),
+              auxiliaryExpertGates.allSatisfy(validGate) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "success replay routing gates must be finite and in [0, 1]")
+        }
+    }
     /// A mathematically equivalent PPO ratio can overflow before clipping
     /// when a minibatch contains an action that became very unlikely under
     /// the updated policy. Bounding the *log* ratio keeps both the loss and
@@ -3278,6 +3974,10 @@ public final class VectorPPOTrainer {
 
     public func train(task: any VectorizedRLTask, outputDirectory: String,
                       resume: Bool) throws {
+        try FileManager.default.createDirectory(
+            atPath: outputDirectory, withIntermediateDirectories: true)
+        let runLock = try VectorPPORunLock(runDirectory: outputDirectory)
+        defer { runLock.unlock() }
         if resume && (configuration.initializationCheckpoint != nil
             || configuration.policyExpertInitializationCheckpoint != nil
             || configuration.policyExpertBranchInitializationCheckpoint != nil
@@ -3401,8 +4101,6 @@ public final class VectorPPOTrainer {
             throw RLEnvironmentError.invalidConfiguration(
                 "reference-policy regularization requires --initialize-from")
         }
-        try FileManager.default.createDirectory(atPath: outputDirectory,
-                                                withIntermediateDirectories: true)
         let metricsURL = URL(fileURLWithPath: "\(outputDirectory)/metrics.jsonl")
         MLXRandom.seed(configuration.seed)
         if usesSymmetryMirrorLoss {
@@ -3429,15 +4127,25 @@ public final class VectorPPOTrainer {
         var startingUpdate = 0
         var totalSteps = 0
         var restoredTrainingState: VectorPPOTrainingState?
+        var restoredSuccessReplayCount: Int?
         var persistedConfiguration = configuration
         var replayInitializationDirectory: String?
+        var resumeCheckpointDirectory: String?
         // A transferred policy may be contact-sensitive to the Metal matrix
         // row geometry used when its behavior was certified. Preserve that
         // geometry during rollout instead of silently changing it to the new
         // simulator batch size. PPO minibatches remain independently batched.
         var policyInferenceBatchSize = n
         if resume {
-            let metadataURL = URL(fileURLWithPath: "\(outputDirectory)/metadata.json")
+            let resumeCheckpoint = try VectorPolicyCheckpointDiscovery
+                .checkpointForResume(
+                    inRunDirectory: outputDirectory, task: spec.id,
+                    taskRevision: spec.revision,
+                    numEnvironments: n)
+            let checkpointDirectory = resumeCheckpoint.directory
+            resumeCheckpointDirectory = checkpointDirectory
+            let metadataURL = URL(
+                fileURLWithPath: "\(checkpointDirectory)/metadata.json")
             let metadata = try JSONDecoder().decode(
                 VectorPolicyMetadata.self, from: Data(contentsOf: metadataURL))
             guard let checkpointTaskConfiguration = metadata.taskConfiguration else {
@@ -3470,29 +4178,37 @@ public final class VectorPPOTrainer {
                recordedRows > 0 {
                 policyInferenceBatchSize = recordedRows
             }
-            replayInitializationDirectory = outputDirectory
+            replayInitializationDirectory = checkpointDirectory
             let sourceWeights = try loadArrays(url: URL(
-                fileURLWithPath: "\(outputDirectory)/policy.safetensors"))
+                fileURLWithPath: "\(checkpointDirectory)/policy.safetensors"))
             let weights = try VectorActorCritic.compatibleWeights(
                 sourceWeights, architectureVersion: metadata.architectureVersion)
             try policy.update(parameters: ModuleParameters.unflattened(weights),
                               verify: [.all])
             normalizer = RunningObservationNormalizer(snapshot: metadata.normalizer)
-            let stateURL = URL(fileURLWithPath: "\(outputDirectory)/training-state.json")
-            if FileManager.default.fileExists(atPath: stateURL.path) {
-                let state = try JSONDecoder().decode(
-                    VectorPPOTrainingState.self, from: Data(contentsOf: stateURL))
-                startingUpdate = state.completedUpdates
-                totalSteps = state.environmentSteps
-                restoredTrainingState = state
-            } else {
-                // Backward-compatible inference for checkpoints written before
-                // explicit trainer state existed. Observation count is exact
-                // for ordinary PPO rollouts; demonstration pretraining users
-                // should start a fresh run rather than rely on this fallback.
-                totalSteps = Int(normalizer.snapshot.count)
-                startingUpdate = totalSteps / batchSize
+            let stateURL = URL(
+                fileURLWithPath: "\(checkpointDirectory)/training-state.json")
+            let state = try JSONDecoder().decode(
+                VectorPPOTrainingState.self, from: Data(contentsOf: stateURL))
+            let restoredEnvironmentCount = try state
+                .validatedRolloutEnvironmentCount(
+                    rolloutSteps: configuration.rolloutSteps)
+            guard restoredEnvironmentCount == n else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "PPO resume environment count differs from its checkpoint")
             }
+            let maximumOptimizerSteps = try state.maximumOptimizerSteps(
+                rolloutSteps: configuration.rolloutSteps,
+                updateEpochs: configuration.updateEpochs,
+                minibatchSize: configuration.minibatchSize)
+            _ = try state.validatedOptimizerResumeState(
+                configuration: configuration,
+                maximumOptimizerSteps: maximumOptimizerSteps)
+            restoredSuccessReplayCount = try state
+                .validatedSuccessReplayCount(capacity: successReplayCapacity)
+            startingUpdate = state.completedUpdates
+            totalSteps = state.environmentSteps
+            restoredTrainingState = state
         } else if let checkpointDirectory = configuration.initializationCheckpoint {
             let metadataURL = URL(
                 fileURLWithPath: "\(checkpointDirectory)/metadata.json")
@@ -3858,8 +4574,12 @@ public final class VectorPPOTrainer {
                 activation: configuration.resolvedActivation)
             let weights: [String: MLXArray]
             if resume {
+                guard let resumeCheckpointDirectory else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "PPO resume checkpoint was not resolved")
+                }
                 let url = URL(fileURLWithPath:
-                    "\(outputDirectory)/reference-policy.safetensors")
+                    "\(resumeCheckpointDirectory)/reference-policy.safetensors")
                 guard FileManager.default.fileExists(atPath: url.path) else {
                     throw RLEnvironmentError.invalidConfiguration(
                         "resume checkpoint has reference-policy regularization "
@@ -3887,21 +4607,36 @@ public final class VectorPPOTrainer {
         var adaptiveLearningRate = restoredTrainingState?.adaptiveLearningRate
             ?? configuration.learningRate
         if resume {
+            guard let resumeCheckpointDirectory,
+                  let restoredTrainingState else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "PPO resume checkpoint state was not resolved")
+            }
             let optimizerURL = URL(
-                fileURLWithPath: "\(outputDirectory)/optimizer.safetensors")
-            if let optimizerSteps = restoredTrainingState?.optimizerSteps,
-               FileManager.default.fileExists(atPath: optimizerURL.path) {
+                fileURLWithPath:
+                    "\(resumeCheckpointDirectory)/optimizer.safetensors")
+            switch try restoredTrainingState.validatedOptimizerResumeState(
+                configuration: configuration) {
+            case .checkpointed(let optimizerSteps, _):
+                guard FileManager.default.fileExists(atPath: optimizerURL.path)
+                else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "current PPO checkpoint has \(optimizerSteps) optimizer "
+                            + "steps but no optimizer.safetensors")
+                }
                 let arrays = try loadArrays(url: optimizerURL)
                 try optimizer.restore(arrays: arrays, step: optimizerSteps,
                                       parameters: policy.parameters())
                 Swift.print("resumed policy, normalizer, Adam moments, and KL scheduler "
-                    + "from \(outputDirectory) at update \(startingUpdate), "
+                    + "from \(resumeCheckpointDirectory) at update \(startingUpdate), "
                     + "\(totalSteps) environment steps")
-            } else {
-                Swift.print("resumed legacy policy and observation statistics from "
-                    + "\(outputDirectory) at update \(startingUpdate), \(totalSteps) "
-                    + "environment steps; Adam moments restart")
+            case .fresh:
+                Swift.print("resumed current policy and scheduler before the first "
+                    + "Adam step from \(resumeCheckpointDirectory)")
             }
+            Swift.print("resume restarts simulator/task environments from seed "
+                + "\(configuration.seed); task state is not an exact trajectory "
+                + "checkpoint")
         }
         var observation = try task.reset(seed: configuration.seed)
         // A task's success signal describes the current transition. Keep the
@@ -3923,10 +4658,28 @@ public final class VectorPPOTrainer {
             repeating: 0, count: successReplayCapacity)
         var successReplayCount = 0
         var successReplayNext = 0
+        if resume, successReplayCapacity > 0,
+           replayInitializationDirectory == nil {
+            throw RLEnvironmentError.invalidConfiguration(
+                "PPO resume did not resolve its success replay checkpoint")
+        }
         if successReplayCapacity > 0, let replayInitializationDirectory {
             let replayURL = URL(fileURLWithPath: replayInitializationDirectory)
                 .appendingPathComponent(Self.successReplayFileName)
-            if FileManager.default.fileExists(atPath: replayURL.path) {
+            let replayExists = FileManager.default.fileExists(
+                atPath: replayURL.path)
+            if resume {
+                guard let restoredSuccessReplayCount else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "PPO resume checkpoint is missing success replay count")
+                }
+                guard (restoredSuccessReplayCount == 0) != replayExists else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "PPO resume success replay file presence does not match "
+                            + "its recorded row count")
+                }
+            }
+            if replayExists {
                 let arrays = try loadArrays(url: replayURL)
                 guard let replayObservations = arrays["observations"],
                       let replayActions = arrays["actions"],
@@ -3936,24 +4689,41 @@ public final class VectorPPOTrainer {
                       replayObservations.shape[1] == obsDim,
                       replayActions.shape == [replayObservations.shape[0], actionDim],
                       replayExpertGates.shape == [replayObservations.shape[0]],
-                      replayStandExpertGates.shape == [replayObservations.shape[0]] else {
+                      replayStandExpertGates.shape
+                        == [replayObservations.shape[0]] else {
                     throw RLEnvironmentError.invalidConfiguration(
                         "success replay checkpoint has incompatible tensor shapes")
                 }
                 let sourceCount = replayObservations.shape[0]
+                let replayAuxiliaryExpertGates = arrays["auxiliaryExpertGates"]
+                if resume,
+                   replayAuxiliaryExpertGates?.shape != [sourceCount] {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "PPO resume success replay is missing its auxiliary gates")
+                }
+                if resume, sourceCount != restoredSuccessReplayCount {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "PPO resume success replay tensor rows do not match "
+                            + "training-state.json")
+                }
                 let retainedCount = min(sourceCount, successReplayCapacity)
                 let sourceStart = sourceCount - retainedCount
                 let observationValues = replayObservations.asArray(Float.self)
                 let actionValues = replayActions.asArray(Float.self)
                 let expertValues = replayExpertGates.asArray(Float.self)
                 let standExpertValues = replayStandExpertGates.asArray(Float.self)
-                let auxiliaryExpertValues = arrays["auxiliaryExpertGates"]
+                let auxiliaryExpertValues = replayAuxiliaryExpertGates
                     .map { $0.asArray(Float.self) }
                     ?? [Float](repeating: 0, count: sourceCount)
-                guard auxiliaryExpertValues.count == sourceCount else {
-                    throw RLEnvironmentError.invalidConfiguration(
-                        "success replay auxiliary gate has incompatible shape")
-                }
+                try Self.validateSuccessReplayCheckpointValues(
+                    observations: observationValues,
+                    actions: actionValues,
+                    expertGates: expertValues,
+                    standExpertGates: standExpertValues,
+                    auxiliaryExpertGates: auxiliaryExpertValues,
+                    rowCount: sourceCount,
+                    observationDimension: obsDim,
+                    actionDimension: actionDim)
                 if retainedCount > 0 {
                     successReplayObservations.replaceSubrange(
                         0..<(retainedCount * obsDim), with: observationValues[
@@ -5337,8 +6107,12 @@ public final class VectorPPOTrainer {
                 || localUpdate == configuration.updates - 1 {
                 let trainingState = VectorPPOTrainingState(
                     completedUpdates: update + 1, environmentSteps: totalSteps,
+                    resumableSnapshotVersion: VectorPPOTrainingState
+                        .currentResumableSnapshotVersion,
+                    rolloutEnvironmentCount: n,
                     optimizerSteps: optimizer.step,
-                    adaptiveLearningRate: adaptiveLearningRate)
+                    adaptiveLearningRate: adaptiveLearningRate,
+                    successReplayCount: successReplayCount)
                 let successReplayArrays = Self.successReplayCheckpointArrays(
                     observations: successReplayObservations,
                     actions: successReplayActions,
@@ -5349,6 +6123,28 @@ public final class VectorPPOTrainer {
                     count: successReplayCount, next: successReplayNext,
                     capacity: successReplayCapacity,
                     observationDimension: obsDim, actionDimension: actionDim)
+                // Preserve the policy trajectory for deterministic selection.
+                // A noisy on-policy update can regress after a good checkpoint;
+                // overwriting the only weights makes that impossible to audit.
+                // Publish the immutable generation first. The mutable root is
+                // only a compatibility mirror and is never used for resume.
+                _ = try VectorPolicyCheckpointDiscovery
+                    .publishCompleteCheckpoint(
+                        inRunDirectory: outputDirectory,
+                        completedUpdates: update + 1,
+                        task: spec.id, taskRevision: spec.revision
+                    ) { staging in
+                        try Self.save(
+                            policy: policy, normalizer: normalizer,
+                            optimizer: optimizer,
+                            referencePolicy: referencePolicy,
+                            successReplayArrays: successReplayArrays,
+                            taskSpec: spec,
+                            configuration: persistedConfiguration,
+                            trainingState: trainingState,
+                            inferenceBatchSize: policyInferenceBatchSize,
+                            outputDirectory: staging.path)
+                    }
                 try Self.save(policy: policy, normalizer: normalizer,
                               optimizer: optimizer,
                               referencePolicy: referencePolicy,
@@ -5358,21 +6154,6 @@ public final class VectorPPOTrainer {
                               trainingState: trainingState,
                               inferenceBatchSize: policyInferenceBatchSize,
                               outputDirectory: outputDirectory)
-                // Preserve the policy trajectory for deterministic selection.
-                // A noisy on-policy update can regress after a good checkpoint;
-                // overwriting the only weights makes that impossible to audit.
-                let snapshotDirectory = String(
-                    format: "%@/checkpoints/update-%06d",
-                    outputDirectory, update + 1)
-                try Self.save(policy: policy, normalizer: normalizer,
-                              optimizer: optimizer,
-                              referencePolicy: referencePolicy,
-                              successReplayArrays: successReplayArrays,
-                              taskSpec: spec,
-                              configuration: persistedConfiguration,
-                              trainingState: trainingState,
-                              inferenceBatchSize: policyInferenceBatchSize,
-                              outputDirectory: snapshotDirectory)
             }
         }
     }
