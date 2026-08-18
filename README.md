@@ -104,10 +104,12 @@ physical contact. It is intentionally not labeled an accepted result yet
 because unconditional final/minimum goal distances, 1.208/1.179 m, exceed the
 1.125/0.750 m gates. Its current fingerprint is `15710d3f...113f6`.
 
-The packaged **Arachne Straight Walk** actor is an accepted deterministic
+The packaged **Arachne Straight Walk** actor is a development-only deterministic
 0.15 m/s regression benchmark on the corrected revision-6 foot collider. Its
-sealed seed-45010 test passed 512/512 episodes, with 0.068 m/s linear and 0.284
-rad/s yaw-rate RMSE and no control steps deeper than 1 mm below the floor.
+single seed-45010 report passed 512/512 episodes, with 0.068 m/s linear and
+0.284 rad/s yaw-rate RMSE and no control steps deeper than 1 mm below the
+floor. It is not labeled accepted until it has a robust multi-seed aggregate
+and an immutable deployment manifest matching the evaluated checkpoint.
 **Arachne Goal** remains the randomized, arbitrary-direction sim-to-real policy;
 its multi-seed qualification reports are shipped beside the robot assets.
 All three Arachne replay modes also expose separate **Fold** and

@@ -542,8 +542,16 @@ public struct RLEvaluationCriteria: Equatable, Sendable {
                 minimumMeanEpisodeLengthFraction: Float = 0,
                 minimumTaskMetrics: [String: Float] = [:],
                 maximumTaskMetrics: [String: Float] = [:]) {
-        precondition((0...1).contains(minimumSuccessRate))
-        precondition((0...1).contains(minimumMeanEpisodeLengthFraction))
+        precondition(minimumSuccessRate.isFinite
+            && (0...1).contains(minimumSuccessRate))
+        precondition(minimumMeanEpisodeLengthFraction.isFinite
+            && (0...1).contains(minimumMeanEpisodeLengthFraction))
+        precondition(minimumTaskMetrics.values.allSatisfy(\.isFinite))
+        precondition(maximumTaskMetrics.values.allSatisfy(\.isFinite))
+        precondition(Set(minimumTaskMetrics.keys).intersection(
+            maximumTaskMetrics.keys).allSatisfy {
+                minimumTaskMetrics[$0]! <= maximumTaskMetrics[$0]!
+            })
         self.minimumSuccessRate = minimumSuccessRate
         self.minimumMeanEpisodeLengthFraction = minimumMeanEpisodeLengthFraction
         self.minimumTaskMetrics = minimumTaskMetrics
@@ -554,31 +562,70 @@ public struct RLEvaluationCriteria: Equatable, Sendable {
                          maxEpisodeSteps: Int,
                          taskMetrics: [String: Float]) -> [String] {
         var failures = [String]()
-        if successRate < minimumSuccessRate {
+        let validMinimumSuccessRate = minimumSuccessRate.isFinite
+            && (0...1).contains(minimumSuccessRate)
+        if !validMinimumSuccessRate {
+            failures.append("invalid minimum_success_rate threshold")
+        }
+        if !successRate.isFinite || !(0...1).contains(successRate) {
+            failures.append("success_rate is not finite or outside [0, 1]")
+        } else if validMinimumSuccessRate && successRate < minimumSuccessRate {
             failures.append(String(format: "success_rate %.4f < %.4f",
                                    successRate, minimumSuccessRate))
         }
-        let minimumLength = minimumMeanEpisodeLengthFraction
-            * Float(maxEpisodeSteps)
-        if meanEpisodeLength < minimumLength {
+        let validMinimumLengthFraction =
+            minimumMeanEpisodeLengthFraction.isFinite
+            && (0...1).contains(minimumMeanEpisodeLengthFraction)
+        if !validMinimumLengthFraction {
+            failures.append(
+                "invalid minimum_mean_episode_length_fraction threshold")
+        }
+        if maxEpisodeSteps <= 0 {
+            failures.append("max_episode_steps must be positive")
+        }
+        let minimumLength = validMinimumLengthFraction && maxEpisodeSteps > 0
+            ? minimumMeanEpisodeLengthFraction * Float(maxEpisodeSteps) : 0
+        if !meanEpisodeLength.isFinite || meanEpisodeLength < 0 {
+            failures.append("mean_episode_length is not finite or is negative")
+        } else if maxEpisodeSteps > 0
+                    && meanEpisodeLength > Float(maxEpisodeSteps) {
+            failures.append("mean_episode_length exceeds max_episode_steps")
+        } else if validMinimumLengthFraction && maxEpisodeSteps > 0
+                    && meanEpisodeLength < minimumLength {
             failures.append(String(format: "mean_episode_length %.3f < %.3f",
                                    meanEpisodeLength, minimumLength))
         }
+        let nonFiniteMetricNames = Set(taskMetrics.compactMap {
+            $0.value.isFinite ? nil : $0.key
+        })
+        for name in nonFiniteMetricNames.sorted() {
+            failures.append("metric \(name) is not finite")
+        }
         for (name, minimum) in minimumTaskMetrics.sorted(by: { $0.key < $1.key }) {
+            guard minimum.isFinite else {
+                failures.append("invalid minimum threshold for metric \(name)")
+                continue
+            }
             guard let value = taskMetrics[name] else {
                 failures.append("missing metric \(name)")
                 continue
             }
+            guard value.isFinite else { continue }
             if value < minimum {
                 failures.append(String(format: "%@ %.5f < %.5f",
                                        name, value, minimum))
             }
         }
         for (name, maximum) in maximumTaskMetrics.sorted(by: { $0.key < $1.key }) {
+            guard maximum.isFinite else {
+                failures.append("invalid maximum threshold for metric \(name)")
+                continue
+            }
             guard let value = taskMetrics[name] else {
                 failures.append("missing metric \(name)")
                 continue
             }
+            guard value.isFinite else { continue }
             if value > maximum {
                 failures.append(String(format: "%@ %.5f > %.5f",
                                        name, value, maximum))

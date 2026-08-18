@@ -45,10 +45,11 @@ set under the canonical robot qualification directory linked below.
   acceptance gate. Fingerprint:
   `15710d3f81b9ff4b5d14ab1a53d89381efd8effed02b237422ee72e625c113f6`.
 - `arachne15-velocity-v0` is the corrected revision-6 straight-walk benchmark:
-  fixed 0.15 m/s command, deterministic plant, no steering. Its sealed
-  512-episode test at seed 45010 passed 512/512, with 0.068 m/s linear and
+  fixed 0.15 m/s command, deterministic plant, no steering. Its single
+  512-episode report at seed 45010 passed 512/512, with 0.068 m/s linear and
   0.284 rad/s yaw-rate RMSE and zero control steps deeper than 1 mm below the
-  floor. Fingerprint:
+  floor. It remains development-only until a robust multi-seed aggregate and
+  matching deployment manifest are present. Fingerprint:
   `aed643b062df4e0e07e70998212720909bc1b25229455489ba28d4319d202524`.
 - `arachne15-goal-v0` is the separately qualified sim-to-real point-goal actor.
   Its four-seed training-collider and four-seed validation-collider reports are

@@ -72,6 +72,10 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             PolicyReplayCatalog.entry(
                 selectionID: "humanoid-isaac-flat-v1")?.evidenceRelativePath,
             "checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json")
+        XCTAssertEqual(
+            PolicyReplayCatalog.entry(
+                selectionID: "arachne15-velocity-v0")?.qualification,
+            .development)
         XCTAssertTrue(PolicyReplayCatalog.entries.allSatisfy {
             $0.qualification != .requalificationRequired
         })
@@ -102,6 +106,35 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                         atPath: root.appendingPathComponent(evidence).path),
                     evidence)
             }
+        }
+
+        for entry in PolicyReplayCatalog.entries
+            where entry.qualification == .accepted {
+            let aggregatePath = try XCTUnwrap(
+                entry.acceptanceAggregateRelativePath)
+            let deploymentPath = try XCTUnwrap(
+                entry.deploymentManifestRelativePath)
+            let aggregateURL = root.appendingPathComponent(aggregatePath)
+            let deploymentURL = root.appendingPathComponent(deploymentPath)
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: aggregateURL.path), aggregatePath)
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: deploymentURL.path), deploymentPath)
+
+            let aggregate = try JSONDecoder().decode(
+                PPOCheckpointEvaluationAggregate.self,
+                from: Data(contentsOf: aggregateURL))
+            try aggregate.validateStructure()
+            let deployment = try JSONDecoder().decode(
+                VectorPolicyDeploymentManifest.self,
+                from: Data(contentsOf: deploymentURL))
+            XCTAssertEqual(aggregate.task, entry.taskID)
+            XCTAssertEqual(aggregate.task, deployment.task)
+            XCTAssertEqual(aggregate.taskRevision, deployment.taskRevision)
+            XCTAssertEqual(
+                aggregate.checkpointFingerprint,
+                deployment.checkpointFingerprint)
+            XCTAssertTrue(aggregate.robustAcrossEvaluationSeeds)
         }
         let policyDirectories = PolicyReplayCatalog.allDeclaredEntries
             .filter { $0.runtime == .nativeMLX }

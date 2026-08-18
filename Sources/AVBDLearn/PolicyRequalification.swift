@@ -630,6 +630,7 @@ public enum VectorPolicyRequalification {
         candidateFingerprint: String,
         plan: VectorPolicyRequalificationPlan
     ) throws {
+        try aggregate.validateStructure()
         let recomputed = try PPOCheckpointEvaluationAggregate.make(reports)
         guard try canonicalJSON(aggregate) == canonicalJSON(recomputed),
               aggregate.scope == "single_checkpoint_across_evaluation_seeds",
@@ -665,6 +666,7 @@ public enum VectorPolicyRequalification {
         candidateMetadata: VectorPolicyMetadata,
         plan: VectorPolicyRequalificationPlan
     ) throws {
+        try report.validateStructure()
         let failures = criteria.failures(
             successRate: report.successRate,
             meanEpisodeLength: report.meanEpisodeLength,

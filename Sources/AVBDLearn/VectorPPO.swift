@@ -1688,12 +1688,94 @@ public struct PPOEvaluationAcceptance: Codable, Sendable {
     public var failures: [String]
 }
 
+public extension PPOEvaluationMetrics {
+    /// Validate the self-contained facts in an evaluation report before it is
+    /// ranked, aggregated, or used as publication evidence. Acceptance is
+    /// optional because historical/development tasks may not define a gate;
+    /// absence is never interpreted as a pass by downstream selection.
+    func validateStructure() throws {
+        guard !task.isEmpty, !checkpointDirectory.isEmpty else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "evaluation task and checkpoint directory must be non-empty")
+        }
+        guard trainingUpdates >= 0, trainingEnvironmentSteps >= 0,
+              episodes > 0, successes >= 0, successes <= episodes else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "evaluation counts are invalid")
+        }
+        if let evaluationEnvironments {
+            guard evaluationEnvironments > 0 else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "evaluation replica count must be positive")
+            }
+        }
+        let derivedSuccessRate = Float(successes) / Float(episodes)
+        guard successRate.isFinite, (0...1).contains(successRate),
+              abs(successRate - derivedSuccessRate) <= 1e-6 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "evaluation success count and rate are inconsistent")
+        }
+        guard meanReturn.isFinite, meanEpisodeLength.isFinite,
+              meanEpisodeLength >= 0,
+              taskMetrics.values.allSatisfy(\.isFinite),
+              checkpointTaskConfiguration?.values.allSatisfy(\.isFinite)
+                ?? true,
+              evaluationTaskConfiguration?.values.allSatisfy(\.isFinite)
+                ?? true else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "evaluation outputs and task contracts must be finite")
+        }
+        if let acceptance {
+            guard acceptance.passed == acceptance.failures.isEmpty,
+                  acceptance.failures.allSatisfy({
+                      !$0.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .isEmpty
+                  }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "evaluation acceptance disagrees with its failures")
+            }
+        }
+    }
+}
+
+private func ppoCheckedSum(_ values: some Sequence<Int>,
+                           label: String) throws -> Int {
+    var total = 0
+    for value in values {
+        let result = total.addingReportingOverflow(value)
+        guard !result.overflow else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "\(label) overflows Int")
+        }
+        total = result.partialValue
+    }
+    return total
+}
+
 public struct PPOScalarSummary: Codable, Sendable, Equatable {
     public var median: Float
     public var firstQuartile: Float
     public var thirdQuartile: Float
     public var minimum: Float
     public var maximum: Float
+}
+
+private extension PPOScalarSummary {
+    func validateStructure(label: String, range: ClosedRange<Float>? = nil,
+                           minimumAllowed: Float? = nil) throws {
+        let values = [self.minimum, firstQuartile, median, thirdQuartile,
+                      maximum]
+        guard values.allSatisfy(\.isFinite),
+              self.minimum <= firstQuartile,
+              firstQuartile <= median,
+              median <= thirdQuartile,
+              thirdQuartile <= maximum,
+              minimumAllowed.map({ self.minimum >= $0 }) ?? true,
+              range.map({ values.allSatisfy($0.contains) }) ?? true else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "aggregate summary '\(label)' is invalid")
+        }
+    }
 }
 
 public struct PPOEvaluationAggregate: Codable, Sendable {
@@ -1733,6 +1815,7 @@ public struct PPOEvaluationAggregate: Codable, Sendable {
             throw RLEnvironmentError.invalidConfiguration(
                 "at least one evaluation report is required")
         }
+        try evaluations.forEach { try $0.validateStructure() }
         guard evaluations.allSatisfy({ $0.task == first.task }) else {
             throw RLEnvironmentError.invalidConfiguration(
                 "evaluation reports must all belong to the same task")
@@ -1781,14 +1864,16 @@ public struct PPOEvaluationAggregate: Codable, Sendable {
         let allRunsFromScratch = evaluations.allSatisfy {
             $0.initializationCheckpoint == nil
         }
-        return Self(
+        let totalEpisodes = try ppoCheckedSum(
+            evaluations.lazy.map(\.episodes), label: "total evaluation episodes")
+        let aggregate = Self(
             task: first.task,
             evaluationTaskConfiguration: first.evaluationTaskConfiguration,
             taskConfigurationTransferred: first.taskConfigurationTransferred,
             trainingSeeds: evaluations.map(\.trainingSeed).sorted(),
             evaluationSeeds: evaluations.map(\.evaluationSeed).sorted(),
             evaluationEnvironments: first.evaluationEnvironments,
-            totalEpisodes: evaluations.reduce(0) { $0 + $1.episodes },
+            totalEpisodes: totalEpisodes,
             requiredRuns: requiredRuns,
             requiredEpisodesPerRun: requiredEpisodesPerRun,
             acceptedRuns: accepted,
@@ -1811,6 +1896,61 @@ public struct PPOEvaluationAggregate: Codable, Sendable {
             meanReturn: summarize(evaluations.map(\.meanReturn)),
             meanEpisodeLength: summarize(evaluations.map(\.meanEpisodeLength)),
             taskMetrics: summarizedMetrics)
+        try aggregate.validateStructure()
+        return aggregate
+    }
+
+    /// Validate invariants that remain independently checkable after the
+    /// source reports have been reduced into an aggregate.
+    public func validateStructure() throws {
+        let runs = trainingSeeds.count
+        guard !task.isEmpty,
+              evaluationTaskConfiguration?.values.allSatisfy(\.isFinite)
+                ?? true,
+              evaluationEnvironments.map({ $0 > 0 }) ?? true,
+              initializationCheckpoints.allSatisfy({ !$0.isEmpty }),
+              checkpointFingerprints.allSatisfy({ !$0.isEmpty }),
+              runs > 0, requiredRuns > 0, requiredEpisodesPerRun > 0,
+              totalEpisodes > 0,
+              Set(trainingSeeds).count == runs,
+              evaluationSeeds.count == runs,
+              acceptedRuns >= 0, acceptedRuns <= runs,
+              allRunsPassed == (acceptedRuns == runs),
+              hasRequiredRunCount == (runs >= requiredRuns),
+              allRunsFromScratch == initializationCheckpoints.isEmpty else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "evaluation aggregate counts or gates are inconsistent")
+        }
+        let requiredEpisodeResult = runs.multipliedReportingOverflow(
+            by: requiredEpisodesPerRun)
+        guard !requiredEpisodeResult.overflow,
+              !allRunsHaveRequiredEpisodes
+                || totalEpisodes >= requiredEpisodeResult.partialValue else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "evaluation aggregate episode gate is inconsistent")
+        }
+        let expectedPublishable = hasRequiredRunCount
+            && allRunsHaveRequiredEpisodes && allRunsPassed
+            && provenanceComplete && allRunsFromScratch
+        guard publishable == expectedPublishable,
+              !provenanceComplete
+                || ((evaluationEnvironments ?? 0) > 0
+                    && checkpointFingerprints.count == runs) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "evaluation aggregate publication gate is inconsistent")
+        }
+        try successRate.validateStructure(
+            label: "successRate", range: 0...1)
+        try trainingUpdates.validateStructure(
+            label: "trainingUpdates", minimumAllowed: 0)
+        try trainingEnvironmentSteps.validateStructure(
+            label: "trainingEnvironmentSteps", minimumAllowed: 0)
+        try meanReturn.validateStructure(label: "meanReturn")
+        try meanEpisodeLength.validateStructure(
+            label: "meanEpisodeLength", minimumAllowed: 0)
+        for (name, summary) in taskMetrics {
+            try summary.validateStructure(label: "taskMetrics.\(name)")
+        }
     }
 
     static func summarize(_ values: [Float]) -> PPOScalarSummary {
@@ -1879,6 +2019,7 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
             throw RLEnvironmentError.invalidConfiguration(
                 "at least one evaluation report is required")
         }
+        try evaluations.forEach { try $0.validateStructure() }
         guard first.taskRevision != nil,
               evaluations.allSatisfy({ $0.taskRevision != nil }) else {
             throw RLEnvironmentError.invalidConfiguration(
@@ -1918,8 +2059,10 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
             summarizedMetrics[name] = PPOEvaluationAggregate.summarize(
                 evaluations.map { $0.taskMetrics[name]! })
         }
-        let totalEpisodes = evaluations.reduce(0) { $0 + $1.episodes }
-        let totalSuccesses = evaluations.reduce(0) { $0 + $1.successes }
+        let totalEpisodes = try ppoCheckedSum(
+            evaluations.lazy.map(\.episodes), label: "total evaluation episodes")
+        let totalSuccesses = try ppoCheckedSum(
+            evaluations.lazy.map(\.successes), label: "total evaluation successes")
         let accepted = evaluations.filter { $0.acceptance?.passed == true }.count
         let hasRequiredRuns = evaluations.count >= requiredRuns
         let hasRequiredEpisodes = evaluations.allSatisfy {
@@ -1936,7 +2079,7 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
                         && $0.evaluationTaskConfiguration != nil
                         && $0.taskConfigurationTransferred != nil))
         }
-        return Self(
+        let aggregate = Self(
             scope: "single_checkpoint_across_evaluation_seeds",
             task: first.task,
             taskRevision: first.taskRevision,
@@ -1968,6 +2111,66 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
             meanEpisodeLength: PPOEvaluationAggregate.summarize(
                 evaluations.map(\.meanEpisodeLength)),
             taskMetrics: summarizedMetrics)
+        try aggregate.validateStructure()
+        return aggregate
+    }
+
+    /// Validate the arithmetic and Boolean gates of a decoded checkpoint
+    /// aggregate without trusting fields such as `pooledSuccessRate` or
+    /// `robustAcrossEvaluationSeeds` merely because they were serialized.
+    public func validateStructure() throws {
+        guard scope == "single_checkpoint_across_evaluation_seeds",
+              !task.isEmpty, !checkpointDirectory.isEmpty,
+              evaluationTaskConfiguration?.values.allSatisfy(\.isFinite)
+                ?? true,
+              evaluationEnvironments.map({ $0 > 0 }) ?? true,
+              initializationCheckpoint.map({ !$0.isEmpty }) ?? true,
+              checkpointFingerprint.map({ !$0.isEmpty }) ?? true,
+              runs > 0, requiredRuns > 0, requiredEpisodesPerRun > 0,
+              evaluationSeeds.count == runs,
+              Set(evaluationSeeds).count == runs,
+              totalEpisodes > 0,
+              totalSuccesses >= 0, totalSuccesses <= totalEpisodes,
+              acceptedRuns >= 0, acceptedRuns <= runs,
+              allRunsPassed == (acceptedRuns == runs),
+              hasRequiredRunCount == (runs >= requiredRuns) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "checkpoint aggregate counts or gates are inconsistent")
+        }
+        let derivedRate = Float(totalSuccesses) / Float(totalEpisodes)
+        guard pooledSuccessRate.isFinite,
+              (0...1).contains(pooledSuccessRate),
+              abs(pooledSuccessRate - derivedRate) <= 1e-6 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "checkpoint aggregate success count and rate are inconsistent")
+        }
+        let requiredEpisodeResult = runs.multipliedReportingOverflow(
+            by: requiredEpisodesPerRun)
+        guard !requiredEpisodeResult.overflow,
+              !allRunsHaveRequiredEpisodes
+                || totalEpisodes >= requiredEpisodeResult.partialValue else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "checkpoint aggregate episode gate is inconsistent")
+        }
+        let expectedRobust = hasRequiredRunCount
+            && allRunsHaveRequiredEpisodes && allRunsPassed
+            && provenanceComplete
+        guard robustAcrossEvaluationSeeds == expectedRobust,
+              !provenanceComplete
+                || (taskRevision != nil
+                    && (evaluationEnvironments ?? 0) > 0
+                    && !(checkpointFingerprint ?? "").isEmpty) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "checkpoint aggregate robustness gate is inconsistent")
+        }
+        try successRate.validateStructure(
+            label: "successRate", range: 0...1)
+        try meanReturn.validateStructure(label: "meanReturn")
+        try meanEpisodeLength.validateStructure(
+            label: "meanEpisodeLength", minimumAllowed: 0)
+        for (name, summary) in taskMetrics {
+            try summary.validateStructure(label: "taskMetrics.\(name)")
+        }
     }
 }
 
@@ -2019,6 +2222,7 @@ public struct PPOCheckpointSelection: Codable, Sendable {
             throw RLEnvironmentError.invalidConfiguration(
                 "at least one checkpoint validation report is required")
         }
+        try evaluations.forEach { try $0.validateStructure() }
         guard (first.provenanceVersion ?? 0) >= 2,
               let taskRevision = first.taskRevision,
               let evaluationEnvironments = first.evaluationEnvironments,
@@ -2077,13 +2281,21 @@ public struct PPOCheckpointSelection: Codable, Sendable {
                 "every checkpoint must use the same distinct validation seeds and episode counts")
         }
 
-        let candidates = grouped.values.map { reports in
+        let candidates = try grouped.values.map { reports in
             let candidate = reports[0]
-            let totalEpisodes = reports.reduce(0) { $0 + $1.episodes }
-            let totalSuccesses = reports.reduce(0) { $0 + $1.successes }
-            let weightedReturn = reports.reduce(Float(0)) {
-                $0 + $1.meanReturn * Float($1.episodes)
-            } / Float(totalEpisodes)
+            let totalEpisodes = try ppoCheckedSum(
+                reports.lazy.map(\.episodes),
+                label: "checkpoint validation episodes")
+            let totalSuccesses = try ppoCheckedSum(
+                reports.lazy.map(\.successes),
+                label: "checkpoint validation successes")
+            let weightedReturn = Float(reports.reduce(Double(0)) {
+                $0 + Double($1.meanReturn) * Double($1.episodes)
+            } / Double(totalEpisodes))
+            guard weightedReturn.isFinite else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "checkpoint validation return is not finite")
+            }
             return PPOCheckpointValidationCandidate(
                 checkpointDirectory: candidate.checkpointDirectory,
                 checkpointFingerprint: candidate.checkpointFingerprint!,
@@ -2096,7 +2308,7 @@ public struct PPOCheckpointSelection: Codable, Sendable {
                 minimumSeedSuccessRate: reports.map(\.successRate).min()!,
                 meanReturn: weightedReturn,
                 acceptancePassed: reports.allSatisfy {
-                    $0.acceptance?.passed ?? true
+                    $0.acceptance?.passed == true
                 })
         }.sorted {
             if $0.trainingUpdates != $1.trainingUpdates {
@@ -2104,7 +2316,12 @@ public struct PPOCheckpointSelection: Codable, Sendable {
             }
             return $0.checkpointFingerprint < $1.checkpointFingerprint
         }
-        let selected = candidates.max {
+        let acceptedCandidates = candidates.filter(\.acceptancePassed)
+        guard !acceptedCandidates.isEmpty else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "no checkpoint candidate passed every validation acceptance gate")
+        }
+        let selected = acceptedCandidates.max {
             if $0.acceptancePassed != $1.acceptancePassed {
                 return !$0.acceptancePassed && $1.acceptancePassed
             }
@@ -2125,6 +2342,9 @@ public struct PPOCheckpointSelection: Codable, Sendable {
         }!
         let uniformEpisodesPerSeed = Set(expectedEpisodes.values).count == 1
             ? expectedEpisodes.values.first : nil
+        let validationEpisodesPerCandidate = try ppoCheckedSum(
+            expectedEpisodes.values,
+            label: "validation episodes per checkpoint candidate")
         return Self(
             schemaVersion: 3,
             task: first.task,
@@ -2136,7 +2356,7 @@ public struct PPOCheckpointSelection: Codable, Sendable {
             validationEnvironments: evaluationEnvironments,
             evaluationTaskConfiguration: first.evaluationTaskConfiguration,
             taskConfigurationTransferred: first.taskConfigurationTransferred,
-            validationEpisodesPerCandidate: expectedEpisodes.values.reduce(0, +),
+            validationEpisodesPerCandidate: validationEpisodesPerCandidate,
             validationEpisodesPerSeed: uniformEpisodesPerSeed,
             selectionRule: "all_validation_acceptance_pass,worst_seed_success_rate,pooled_success_rate,mean_return,earlier_update,fingerprint",
             candidates: candidates,
@@ -2146,6 +2366,7 @@ public struct PPOCheckpointSelection: Codable, Sendable {
     }
 
     public func validateTestReport(_ evaluation: PPOEvaluationMetrics) throws {
+        try evaluation.validateStructure()
         guard evaluation.task == task,
               evaluation.taskRevision == taskRevision,
               evaluation.trainingSeed == trainingSeed,
@@ -5374,7 +5595,7 @@ public final class VectorPPOTrainer {
         } else {
             acceptance = nil
         }
-        return PPOEvaluationMetrics(
+        let metrics = PPOEvaluationMetrics(
             provenanceVersion: 3,
             task: spec.id, taskRevision: spec.revision,
             checkpointTaskConfiguration: metadata.taskConfiguration,
@@ -5393,6 +5614,8 @@ public final class VectorPPOTrainer {
             meanEpisodeLength: meanEpisodeLength,
             taskMetrics: averagedTaskMetrics,
             acceptance: acceptance)
+        try metrics.validateStructure()
+        return metrics
     }
 
     /// Content identity for every file that changes deterministic evaluation

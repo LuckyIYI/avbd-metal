@@ -4383,7 +4383,8 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testEvaluationAggregateUsesDistinctSeedsAndSeedLevelQuartiles() throws {
-        let rates: [Float] = [0.80, 0.85, 0.90, 0.95, 1.00]
+        let successes = [384, 416, 448, 480, 512]
+        let rates = successes.map { Float($0) / 512 }
         var reports = [PPOEvaluationMetrics]()
         for index in 0..<5 {
             let report = PPOEvaluationMetrics(
@@ -4397,7 +4398,7 @@ final class RLFrameworkTests: XCTestCase {
                 trainingUpdates: 3_000,
                 trainingEnvironmentSteps: 100_000_000 + index,
                 episodes: 512,
-                successes: 410 + index * 10,
+                successes: successes[index],
                 successRate: rates[index],
                 meanReturn: Float(index), meanEpisodeLength: 600,
                 taskMetrics: ["episode/forward_distance_m": Float(index + 4)],
@@ -4413,9 +4414,11 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertTrue(aggregate.provenanceComplete)
         XCTAssertTrue(aggregate.allRunsFromScratch)
         XCTAssertTrue(aggregate.publishable)
-        XCTAssertEqual(aggregate.successRate.median, 0.90, accuracy: 1e-6)
-        XCTAssertEqual(aggregate.successRate.firstQuartile, 0.85, accuracy: 1e-6)
-        XCTAssertEqual(aggregate.successRate.thirdQuartile, 0.95, accuracy: 1e-6)
+        XCTAssertEqual(aggregate.successRate.median, 0.875, accuracy: 1e-6)
+        XCTAssertEqual(aggregate.successRate.firstQuartile, 0.8125,
+                       accuracy: 1e-6)
+        XCTAssertEqual(aggregate.successRate.thirdQuartile, 0.9375,
+                       accuracy: 1e-6)
         XCTAssertEqual(aggregate.trainingUpdates.median, 3_000, accuracy: 1e-6)
         XCTAssertGreaterThanOrEqual(
             aggregate.trainingEnvironmentSteps.minimum, 100_000_000)

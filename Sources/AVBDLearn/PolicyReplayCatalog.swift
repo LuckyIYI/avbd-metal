@@ -31,13 +31,21 @@ public struct PolicyReplayCatalogEntry: Sendable, Equatable {
     /// Repository-relative parity/evaluation evidence or deterministic,
     /// source-locked importer for a locally installed external artifact.
     public var evidenceRelativePath: String?
+    /// A decoded, internally consistent robustness aggregate is required for
+    /// every entry advertised as accepted.
+    public var acceptanceAggregateRelativePath: String?
+    /// Accepted native policies must also name the immutable deployment
+    /// manifest that binds their runtime bytes to the evaluated fingerprint.
+    public var deploymentManifestRelativePath: String?
 
     public init(
         selectionID: String, displayName: String, taskID: String,
         runtime: PolicyReplayRuntime,
         checkpointRelativeDirectory: String?,
         qualification: PolicyReplayQualification,
-        evidenceRelativePath: String?
+        evidenceRelativePath: String?,
+        acceptanceAggregateRelativePath: String? = nil,
+        deploymentManifestRelativePath: String? = nil
     ) {
         self.selectionID = selectionID
         self.displayName = displayName
@@ -46,6 +54,9 @@ public struct PolicyReplayCatalogEntry: Sendable, Equatable {
         self.checkpointRelativeDirectory = checkpointRelativeDirectory
         self.qualification = qualification
         self.evidenceRelativePath = evidenceRelativePath
+        self.acceptanceAggregateRelativePath =
+            acceptanceAggregateRelativePath
+        self.deploymentManifestRelativePath = deploymentManifestRelativePath
     }
 }
 
@@ -64,69 +75,89 @@ public enum PolicyReplayCheckpointResolution {
 /// Single source of truth for the polished replay surface. Experimental tasks
 /// remain trainable through the generic registry without appearing here.
 public enum PolicyReplayCatalog {
-    public static let entries: [PolicyReplayCatalogEntry] = [
-        .init(
-            selectionID: "unitree-h1-sim2sim-v0",
-            displayName: "Unitree H1 Sim2Sim",
-            taskID: "unitree-h1-sim2sim-v0",
-            runtime: .unitreeRecurrentMLX,
-            checkpointRelativeDirectory: "external/unitree-h1",
-            qualification: .externalParityVerified,
-            evidenceRelativePath: "checkpoints/external/unitree-h1/manifest.json"),
-        .init(
-            selectionID: "gear-sonic-g1-reference-v0",
-            displayName: "GEAR-SONIC G1",
-            taskID: "gear-sonic-g1-reference-v0",
-            runtime: .externalReferenceMLX,
-            checkpointRelativeDirectory: "external/gear-sonic-g1",
-            qualification: .development,
-            evidenceRelativePath: "Tools/import_gear_sonic_policy.py"),
-        .init(
-            selectionID: "humanoid-isaac-flat-v1",
-            displayName: "H1 Flat",
-            taskID: "humanoid-isaac-flat-v0",
-            runtime: .nativeMLX,
-            checkpointRelativeDirectory: "humanoid-isaac-flat-v1",
-            qualification: .accepted,
-            evidenceRelativePath:
-                "checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json"),
-        .init(
-            selectionID: "humanoid-isaac-goal-v0",
-            displayName: "H1 Goal",
-            taskID: "humanoid-isaac-goal-v0",
-            runtime: .nativeMLX,
-            checkpointRelativeDirectory: "humanoid-isaac-goal-v0",
-            qualification: .development,
-            evidenceRelativePath:
-                "checkpoints/humanoid-isaac-goal-v0/evaluation.json"),
-        .init(
-            selectionID: "arachne15-velocity-v0",
-            displayName: "Arachne Straight Walk",
-            taskID: "arachne15-velocity-v0",
-            runtime: .nativeMLX,
-            checkpointRelativeDirectory: "arachne15-velocity-v0",
-            qualification: .accepted,
-            evidenceRelativePath:
-                "checkpoints/arachne15-velocity-v0/evaluation.json"),
-        .init(
-            selectionID: "arachne15-goal-v0",
-            displayName: "Arachne Goal",
-            taskID: "arachne15-goal-v0",
-            runtime: .nativeMLX,
-            checkpointRelativeDirectory: "arachne15-goal-v0",
-            qualification: .accepted,
-            evidenceRelativePath: "Robots/Arachne15/qualification/"
-                + "arachne15-goal-r6-update-000020/"
-                + "aggregate-update-000020.json"),
-        .init(
-            selectionID: "arachne15-classical-goal-v0",
-            displayName: "Arachne Classical",
-            taskID: "arachne15-goal-v0",
-            runtime: .classicalController,
-            checkpointRelativeDirectory: nil,
-            qualification: .nonNeuralBaseline,
-            evidenceRelativePath: nil),
-    ]
+    public static let entries: [PolicyReplayCatalogEntry] = {
+        let entries: [PolicyReplayCatalogEntry] = [
+            .init(
+                selectionID: "unitree-h1-sim2sim-v0",
+                displayName: "Unitree H1 Sim2Sim",
+                taskID: "unitree-h1-sim2sim-v0",
+                runtime: .unitreeRecurrentMLX,
+                checkpointRelativeDirectory: "external/unitree-h1",
+                qualification: .externalParityVerified,
+                evidenceRelativePath: "checkpoints/external/unitree-h1/manifest.json"),
+            .init(
+                selectionID: "gear-sonic-g1-reference-v0",
+                displayName: "GEAR-SONIC G1",
+                taskID: "gear-sonic-g1-reference-v0",
+                runtime: .externalReferenceMLX,
+                checkpointRelativeDirectory: "external/gear-sonic-g1",
+                qualification: .development,
+                evidenceRelativePath: "Tools/import_gear_sonic_policy.py"),
+            .init(
+                selectionID: "humanoid-isaac-flat-v1",
+                displayName: "H1 Flat",
+                taskID: "humanoid-isaac-flat-v0",
+                runtime: .nativeMLX,
+                checkpointRelativeDirectory: "humanoid-isaac-flat-v1",
+                qualification: .accepted,
+                evidenceRelativePath:
+                    "checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json",
+                acceptanceAggregateRelativePath:
+                    "checkpoints/humanoid-isaac-flat-v1/qualification/aggregate.json",
+                deploymentManifestRelativePath:
+                    "checkpoints/humanoid-isaac-flat-v1/deployment-manifest.json"),
+            .init(
+                selectionID: "humanoid-isaac-goal-v0",
+                displayName: "H1 Goal",
+                taskID: "humanoid-isaac-goal-v0",
+                runtime: .nativeMLX,
+                checkpointRelativeDirectory: "humanoid-isaac-goal-v0",
+                qualification: .development,
+                evidenceRelativePath:
+                    "checkpoints/humanoid-isaac-goal-v0/evaluation.json"),
+            .init(
+                selectionID: "arachne15-velocity-v0",
+                displayName: "Arachne Straight Walk",
+                taskID: "arachne15-velocity-v0",
+                runtime: .nativeMLX,
+                checkpointRelativeDirectory: "arachne15-velocity-v0",
+                qualification: .development,
+                evidenceRelativePath:
+                    "checkpoints/arachne15-velocity-v0/evaluation.json"),
+            .init(
+                selectionID: "arachne15-goal-v0",
+                displayName: "Arachne Goal",
+                taskID: "arachne15-goal-v0",
+                runtime: .nativeMLX,
+                checkpointRelativeDirectory: "arachne15-goal-v0",
+                qualification: .accepted,
+                evidenceRelativePath: "Robots/Arachne15/qualification/"
+                    + "arachne15-goal-r6-update-000020/"
+                    + "aggregate-update-000020.json",
+                acceptanceAggregateRelativePath:
+                    "Robots/Arachne15/qualification/"
+                    + "arachne15-goal-r6-update-000020/"
+                    + "aggregate-update-000020.json",
+                deploymentManifestRelativePath:
+                    "checkpoints/arachne15-goal-v0/deployment-manifest.json"),
+            .init(
+                selectionID: "arachne15-classical-goal-v0",
+                displayName: "Arachne Classical",
+                taskID: "arachne15-goal-v0",
+                runtime: .classicalController,
+                checkpointRelativeDirectory: nil,
+                qualification: .nonNeuralBaseline,
+                evidenceRelativePath: nil),
+        ]
+        precondition(
+            entries.allSatisfy {
+                $0.qualification != .accepted
+                    || ($0.runtime == .nativeMLX
+                        && $0.acceptanceAggregateRelativePath != nil
+                        && $0.deploymentManifestRelativePath != nil)
+            }, "accepted replay entries require aggregate and deployment evidence")
+        return entries
+    }()
 
     /// Immutable tracked checkpoints retained for provenance and migration.
     /// These entries are deliberately excluded from `entries`, so they cannot
