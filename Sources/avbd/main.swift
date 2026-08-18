@@ -88,6 +88,7 @@ struct Options {
     var evaluationEnvironments: Int? = nil
     var parentCheckpoint: String? = nil
     var qualificationDirectory: String? = nil
+    var trainingEnvironmentSteps: Int? = nil
     /// Task-owned numeric configuration. Keeping these values out of the PPO
     /// parser lets new scenes expose curricula and control settings without
     /// adding task-specific branches to this executable.
@@ -893,15 +894,63 @@ func humanoidBoxFlowSelectedTargetStep(from data: Data) -> Int? {
     return step.intValue
 }
 
-func parseOptions(_ args: [String]) -> Options {
+func parseOptions(
+    _ args: [String], strict: Bool = false,
+    allowedOptions: Set<String>? = nil
+) -> Options {
     var o = Options()
     var i = 0
     func value(after flag: String) -> String {
         guard i + 1 < args.count else { fail("missing value after \(flag)") }
+        guard !strict || !args[i + 1].hasPrefix("--") else {
+            fail("missing value after \(flag)")
+        }
         i += 1
         return args[i]
     }
+    func integer(after flag: String) -> Int? {
+        let rawValue = value(after: flag)
+        guard let parsed = Int(rawValue) else {
+            if strict { fail("\(flag) expects an integer, got '\(rawValue)'") }
+            return nil
+        }
+        return parsed
+    }
+    func unsignedInteger(after flag: String) -> UInt64? {
+        let rawValue = value(after: flag)
+        guard let parsed = UInt64(rawValue) else {
+            if strict {
+                fail("\(flag) expects an unsigned integer, got '\(rawValue)'")
+            }
+            return nil
+        }
+        return parsed
+    }
+    func float(after flag: String) -> Float? {
+        let rawValue = value(after: flag)
+        guard let parsed = Float(rawValue), !strict || parsed.isFinite else {
+            if strict {
+                fail("\(flag) expects a finite number, got '\(rawValue)'")
+            }
+            return nil
+        }
+        return parsed
+    }
+    func double(after flag: String) -> Double? {
+        let rawValue = value(after: flag)
+        guard let parsed = Double(rawValue), !strict || parsed.isFinite else {
+            if strict {
+                fail("\(flag) expects a finite number, got '\(rawValue)'")
+            }
+            return nil
+        }
+        return parsed
+    }
     while i < args.count {
+        if strict, let allowedOptions,
+           !allowedOptions.contains(args[i]) {
+            fail("unknown option '\(args[i])'")
+        }
         switch args[i] {
         case "--preset":
             let name = value(after: args[i])
@@ -943,38 +992,40 @@ func parseOptions(_ args: [String]) -> Options {
             default:
                 fail("unknown training preset '\(name)'; available: maniskill-pusht-ppo")
             }
-        case "--frames": o.frames = Int(value(after: args[i])) ?? o.frames
-        case "--iterations": o.iterations = Int(value(after: args[i]))
-        case "--scale": o.scale = Int(value(after: args[i])) ?? o.scale
-        case "--dt": o.dt = Float(value(after: args[i]))
+        case "--frames": o.frames = integer(after: args[i]) ?? o.frames
+        case "--iterations": o.iterations = integer(after: args[i])
+        case "--scale": o.scale = integer(after: args[i]) ?? o.scale
+        case "--dt": o.dt = float(after: args[i])
         case "--cpu": o.useCPU = true
         case "--json": o.json = true
-        case "--watch": o.watch = Int(value(after: args[i]))
-        case "--res": o.res = Int(value(after: args[i]))
+        case "--watch": o.watch = integer(after: args[i])
+        case "--res": o.res = integer(after: args[i])
         case "--stats-every":
-            o.statsEvery = Int(value(after: args[i])) ?? o.statsEvery
-        case "--envs": o.envs = Int(value(after: args[i])) ?? o.envs
-        case "--batch": o.batch = Int(value(after: args[i])) ?? o.batch
-        case "--latent": o.latent = Int(value(after: args[i])) ?? o.latent
-        case "--lr": o.lr = Float(value(after: args[i])) ?? o.lr
+            o.statsEvery = integer(after: args[i]) ?? o.statsEvery
+        case "--envs": o.envs = integer(after: args[i]) ?? o.envs
+        case "--batch": o.batch = integer(after: args[i]) ?? o.batch
+        case "--latent": o.latent = integer(after: args[i]) ?? o.latent
+        case "--lr": o.lr = float(after: args[i]) ?? o.lr
         case "--adam-epsilon":
-            o.optimizerEpsilon = Float(value(after: args[i]))
-        case "--gamma": o.gamma = Float(value(after: args[i])) ?? o.gamma
+            o.optimizerEpsilon = float(after: args[i])
+        case "--gamma": o.gamma = float(after: args[i]) ?? o.gamma
         case "--gae-lambda":
-            o.gaeLambda = Float(value(after: args[i])) ?? o.gaeLambda
+            o.gaeLambda = float(after: args[i]) ?? o.gaeLambda
         case "--reward-scale":
-            o.rewardScale = Float(value(after: args[i])) ?? o.rewardScale
-        case "--lambda": o.lambda = Float(value(after: args[i])) ?? o.lambda
-        case "--episodes": o.episodes = Int(value(after: args[i])) ?? o.episodes
-        case "--updates": o.updates = Int(value(after: args[i])) ?? o.updates
-        case "--horizon": o.horizon = Int(value(after: args[i])) ?? o.horizon
-        case "--epochs": o.epochs = Int(value(after: args[i])) ?? o.epochs
-        case "--hidden": o.hidden = Int(value(after: args[i])) ?? o.hidden
+            o.rewardScale = float(after: args[i]) ?? o.rewardScale
+        case "--lambda": o.lambda = float(after: args[i]) ?? o.lambda
+        case "--episodes":
+            o.episodes = integer(after: args[i]) ?? o.episodes
+        case "--updates": o.updates = integer(after: args[i]) ?? o.updates
+        case "--horizon": o.horizon = integer(after: args[i]) ?? o.horizon
+        case "--epochs": o.epochs = integer(after: args[i]) ?? o.epochs
+        case "--hidden": o.hidden = integer(after: args[i]) ?? o.hidden
         case "--hidden-layers":
-            let widths = value(after: args[i]).split(separator: ",").compactMap {
-                Int($0)
-            }
-            guard widths.count == 3 else {
+            let flag = args[i]
+            let components = value(after: flag).split(
+                separator: ",", omittingEmptySubsequences: false)
+            let widths = components.compactMap { Int($0) }
+            guard components.count == 3, widths.count == 3 else {
                 fail("--hidden-layers expects three comma-separated integers")
             }
             o.hiddenLayers = widths
@@ -984,20 +1035,21 @@ func parseOptions(_ args: [String]) -> Options {
                 fail("--action-distribution must be gaussian or squashed-gaussian")
             }
             o.actionDistribution = distribution
-        case "--seed": o.seed = UInt64(value(after: args[i])) ?? o.seed
+        case "--seed":
+            o.seed = unsignedInteger(after: args[i]) ?? o.seed
         case "--algorithm": o.algorithm = value(after: args[i])
         case "--action-std":
-            o.actionStd = Float(value(after: args[i])) ?? o.actionStd
+            o.actionStd = float(after: args[i]) ?? o.actionStd
         case "--minimum-action-std":
-            o.minimumActionStd = Float(value(after: args[i]))
+            o.minimumActionStd = float(after: args[i])
         case "--maximum-action-std":
-            o.maximumActionStd = Float(value(after: args[i]))
+            o.maximumActionStd = float(after: args[i])
         case "--final-action-std":
-            o.finalActionStd = Float(value(after: args[i]))
+            o.finalActionStd = float(after: args[i])
         case "--action-std-anneal-start":
-            o.actionStdAnnealStartUpdate = Int(value(after: args[i]))
+            o.actionStdAnnealStartUpdate = integer(after: args[i])
         case "--action-std-anneal-end":
-            o.actionStdAnnealEndUpdate = Int(value(after: args[i]))
+            o.actionStdAnnealEndUpdate = integer(after: args[i])
         case "--initialize-from":
             o.initializeFrom = value(after: args[i])
         case "--policy-expert-from":
@@ -1010,18 +1062,18 @@ func parseOptions(_ args: [String]) -> Options {
             o.locomotionCheckpoint = value(after: args[i])
         case "--initialization-normalizer-prior-count":
             o.initializationNormalizerPriorCount =
-                Double(value(after: args[i]))
+                double(after: args[i])
         case "--no-symmetry-augmentation": o.symmetryAugmentation = false
         case "--symmetry-mirror-loss":
-            o.symmetryMirrorLossCoefficient = Float(value(after: args[i]))
+            o.symmetryMirrorLossCoefficient = float(after: args[i])
         case "--legacy-symmetry-data-augmentation":
             o.symmetryMirrorLossCoefficient = 0
         case "--freeze-observation-normalizer":
             o.updateObservationNormalizer = false
         case "--no-observation-normalization":
             o.normalizeObservations = false
-        case "--entropy": o.entropy = Float(value(after: args[i])) ?? o.entropy
-        case "--target-kl": o.targetKL = Float(value(after: args[i])) ?? o.targetKL
+        case "--entropy": o.entropy = float(after: args[i]) ?? o.entropy
+        case "--target-kl": o.targetKL = float(after: args[i]) ?? o.targetKL
         case "--kl-schedule":
             let name = value(after: args[i])
             guard let schedule = PPOKLSchedule(rawValue: name) else {
@@ -1029,32 +1081,32 @@ func parseOptions(_ args: [String]) -> Options {
             }
             o.klSchedule = schedule
         case "--policy-clip":
-            o.policyClip = Float(value(after: args[i])) ?? o.policyClip
+            o.policyClip = float(after: args[i]) ?? o.policyClip
         case "--value-clip":
-            o.valueClip = Float(value(after: args[i])) ?? o.valueClip
+            o.valueClip = float(after: args[i]) ?? o.valueClip
         case "--no-value-clip-loss": o.clipValueLoss = false
         case "--value-coef":
-            o.valueCoefficient = Float(value(after: args[i]))
+            o.valueCoefficient = float(after: args[i])
                 ?? o.valueCoefficient
         case "--max-grad-norm":
-            o.maxGradientNorm = Float(value(after: args[i]))
+            o.maxGradientNorm = float(after: args[i])
                 ?? o.maxGradientNorm
         case "--success-imitation-coef":
-            o.successImitationCoefficient = Float(value(after: args[i]))
+            o.successImitationCoefficient = float(after: args[i])
                 ?? o.successImitationCoefficient
         case "--success-replay-capacity":
-            o.successReplayCapacity = Int(value(after: args[i]))
+            o.successReplayCapacity = integer(after: args[i])
                 ?? o.successReplayCapacity
         case "--success-replay-batch":
-            o.successReplayBatchSize = Int(value(after: args[i]))
+            o.successReplayBatchSize = integer(after: args[i])
                 ?? o.successReplayBatchSize
         case "--success-imitation-history":
-            o.successImitationHistorySteps = Int(value(after: args[i]))
+            o.successImitationHistorySteps = integer(after: args[i])
         case "--reference-policy-coef":
-            o.referencePolicyCoefficient = Float(value(after: args[i]))
+            o.referencePolicyCoefficient = float(after: args[i])
                 ?? o.referencePolicyCoefficient
         case "--checkpoint-interval":
-            o.checkpointInterval = Int(value(after: args[i]))
+            o.checkpointInterval = integer(after: args[i])
                 ?? o.checkpointInterval
         case "--activation":
             let name = value(after: args[i])
@@ -1065,17 +1117,21 @@ func parseOptions(_ args: [String]) -> Options {
         case "--orthogonal-initialization":
             o.orthogonalInitialization = true
         case "--actor-output-gain":
-            o.actorOutputGain = Float(value(after: args[i]))
+            o.actorOutputGain = float(after: args[i])
         case "--resume": o.resume = true
         case "--run": o.runName = value(after: args[i])
         case "--checkpoint": o.checkpoint = value(after: args[i])
         case "--output": o.output = value(after: args[i])
         case "--allow-task-transfer": o.allowTaskTransfer = true
+        // Command-owned presence flags are consumed by their call sites, but
+        // must still be declared here so strict RL parsing can distinguish
+        // them from misspellings.
+        case "--trace", "--training-mode", "--trace-actions": break
         case "--expected-checkpoint-fingerprint":
             o.expectedCheckpointFingerprint = value(after: args[i])
         case "--source-commit": o.sourceCommit = value(after: args[i])
         case "--inference-batch-size":
-            o.inferenceBatchSize = Int(value(after: args[i]))
+            o.inferenceBatchSize = integer(after: args[i])
         case "--evaluation-seeds":
             let rawSeeds = value(after: args[i]).split(
                 separator: ",", omittingEmptySubsequences: false)
@@ -1094,37 +1150,101 @@ func parseOptions(_ args: [String]) -> Options {
             }
             o.validationCollisionSeeds = seeds
         case "--evaluation-environments":
-            o.evaluationEnvironments = Int(value(after: args[i]))
+            o.evaluationEnvironments = integer(after: args[i])
         case "--parent-checkpoint":
             o.parentCheckpoint = value(after: args[i])
         case "--qualification-directory":
             o.qualificationDirectory = value(after: args[i])
+        case "--training-environment-steps":
+            o.trainingEnvironmentSteps = integer(after: args[i])
         case "--task-option":
             let assignment = value(after: args[i])
             let pieces = assignment.split(separator: "=", maxSplits: 1,
                                           omittingEmptySubsequences: false)
             guard pieces.count == 2, !pieces[0].isEmpty,
-                  let numericValue = Float(pieces[1]) else {
+                  let numericValue = Float(pieces[1]),
+                  !strict || numericValue.isFinite else {
                 fail("--task-option expects key=value with a numeric value")
             }
             o.taskOptions[String(pieces[0])] = numericValue
         case "--gait-swing-steps":
-            o.gaitSwingSteps = Int(value(after: args[i]))
+            o.gaitSwingSteps = integer(after: args[i])
                 ?? o.gaitSwingSteps
         case "--gait-swing-height":
-            o.gaitSwingHeight = Float(value(after: args[i]))
+            o.gaitSwingHeight = float(after: args[i])
                 ?? o.gaitSwingHeight
         case "--gait-placement-horizon":
-            o.gaitPlacementHorizon = Float(value(after: args[i]))
+            o.gaitPlacementHorizon = float(after: args[i])
                 ?? o.gaitPlacementHorizon
         case "--gait-maximum-placement":
-            o.gaitMaximumPlacement = Float(value(after: args[i]))
+            o.gaitMaximumPlacement = float(after: args[i])
                 ?? o.gaitMaximumPlacement
-        default: break
+        default:
+            if strict { fail("unknown option '\(args[i])'") }
         }
         i += 1
     }
     return o
+}
+
+private let rlTaskCommonOptions: Set<String> = [
+    "--envs", "--seed", "--task-option",
+]
+private let rlSmokeOptions = rlTaskCommonOptions.union([
+    "--frames", "--action-std", "--trace",
+])
+private let rlTrainOptions = rlTaskCommonOptions.union([
+    "--preset", "--algorithm", "--updates", "--horizon", "--epochs",
+    "--batch", "--lr", "--adam-epsilon", "--gamma", "--gae-lambda",
+    "--reward-scale", "--hidden", "--hidden-layers",
+    "--action-distribution", "--action-std", "--minimum-action-std",
+    "--maximum-action-std", "--final-action-std",
+    "--action-std-anneal-start", "--action-std-anneal-end",
+    "--initialize-from", "--policy-expert-from",
+    "--policy-expert-branch-from", "--stand-expert-from",
+    "--initialization-normalizer-prior-count", "--no-symmetry-augmentation",
+    "--symmetry-mirror-loss", "--legacy-symmetry-data-augmentation",
+    "--freeze-observation-normalizer", "--no-observation-normalization",
+    "--entropy", "--target-kl", "--kl-schedule", "--policy-clip",
+    "--value-clip", "--no-value-clip-loss", "--value-coef",
+    "--max-grad-norm", "--success-imitation-coef",
+    "--success-replay-capacity", "--success-replay-batch",
+    "--success-imitation-history", "--reference-policy-coef",
+    "--checkpoint-interval", "--activation", "--orthogonal-initialization",
+    "--actor-output-gain", "--resume", "--run",
+])
+private let rlEvaluationOptions = rlTaskCommonOptions.union([
+    "--episodes", "--checkpoint", "--run", "--allow-task-transfer",
+    "--output", "--json",
+])
+private let rlPrepareRequalificationOptions: Set<String> = [
+    "--checkpoint", "--output", "--expected-checkpoint-fingerprint",
+    "--source-commit", "--inference-batch-size", "--evaluation-environments",
+    "--evaluation-seeds", "--validation-collision-seeds",
+]
+private let rlPublishRequalificationOptions: Set<String> = [
+    "--checkpoint", "--parent-checkpoint", "--qualification-directory",
+    "--output",
+]
+private let rlVerifyRequalificationOptions: Set<String> = [
+    "--checkpoint", "--parent-checkpoint",
+]
+private let rlExportPolicyOptions: Set<String> = ["--checkpoint", "--output"]
+private let rlVerifyPolicyOptions: Set<String> = [
+    "--checkpoint", "--frames", "--json",
+]
+private let rlTraceOptions: Set<String> = [
+    "--checkpoint", "--run", "--frames", "--seed", "--training-mode",
+    "--training-environment-steps", "--trace-actions",
+]
+
+/// Registered RL experiments must never continue with a silently misspelled,
+/// irrelevant, or malformed option. Each command supplies its own accepted
+/// surface so a valid flag for some other workflow cannot become a no-op.
+func parseRLOptions(
+    _ args: [String], allowedOptions: Set<String>
+) -> Options {
+    parseOptions(args, strict: true, allowedOptions: allowedOptions)
 }
 
 func fail(_ msg: String) -> Never {
@@ -1388,6 +1508,9 @@ case "list":
     for d in Demos.all { print(d) }
 
 case "list-rl":
+    guard args.count == 1 else {
+        fail("unknown option '\(args[1])'")
+    }
     print("tasks:")
     for id in BuiltInRLTasks.registry.taskIDs { print("  \(id)") }
     print("algorithms:")
@@ -1398,6 +1521,10 @@ case "describe-rl":
         fail("usage: avbd describe-rl <task> [--json]")
     }
     let taskID = args[1]
+    let describeOptions = Array(args.dropFirst(2))
+    guard describeOptions.isEmpty || describeOptions == ["--json"] else {
+        fail("unknown option '\(describeOptions.first!)'")
+    }
     guard BuiltInRLTasks.registry.taskIDs.contains(taskID) else {
         fail("unknown RL task '\(taskID)'; available: "
             + BuiltInRLTasks.registry.taskIDs.joined(separator: ", "))
@@ -1746,7 +1873,8 @@ case "sim2sim-gear-sonic":
 
 case "rl-smoke":
     guard args.count > 1 else { fail("usage: avbd rl-smoke <task> [--envs N --frames N]") }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)), allowedOptions: rlSmokeOptions)
     let task = try BuiltInRLTasks.registry.make(
         args[1], configuration: RLTaskConfiguration(
             numEnvironments: o.envs, seed: o.seed, options: o.taskOptions))
@@ -1862,7 +1990,8 @@ case "train-rl":
     guard args.count > 1 else {
         fail("usage: avbd train-rl <task> [--algorithm ppo --envs N --updates N]")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)), allowedOptions: rlTrainOptions)
     let taskID = args[1]
     if o.preset == "maniskill-pusht-ppo"
         && taskID != "maniskill-pusht-v1" {
@@ -1932,7 +2061,8 @@ case "eval-rl":
         fail("usage: avbd eval-rl <task> [--envs N --episodes N --seed N "
             + "--allow-task-transfer]")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)), allowedOptions: rlEvaluationOptions)
     let taskID = args[1]
     let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
     let checkpointMetadata = try JSONDecoder().decode(
@@ -1994,7 +2124,9 @@ case "prepare-policy-requalification":
             + "--evaluation-environments N --evaluation-seeds S1,S2,S3,S4 "
             + "[--validation-collision-seeds V1,V2,V3,V4]")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)),
+        allowedOptions: rlPrepareRequalificationOptions)
     let taskID = args[1]
     guard let parent = o.checkpoint,
           let output = o.output,
@@ -2061,7 +2193,9 @@ case "publish-policy-requalification":
             + "(schema v2 reads DIR/<suite-id>/eval-seed-*.json and "
             + "aggregate.json)")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)),
+        allowedOptions: rlPublishRequalificationOptions)
     let taskID = args[1]
     guard let candidate = o.checkpoint,
           let parent = o.parentCheckpoint,
@@ -2152,7 +2286,9 @@ case "verify-policy-requalification":
         fail("usage: avbd verify-policy-requalification <task> "
             + "--checkpoint BUNDLE --parent-checkpoint PARENT")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)),
+        allowedOptions: rlVerifyRequalificationOptions)
     let taskID = args[1]
     guard let bundle = o.checkpoint,
           let parent = o.parentCheckpoint else {
@@ -2199,7 +2335,8 @@ case "export-policy-rl":
     guard args.count > 1 else {
         fail("usage: avbd export-policy-rl <task> --checkpoint DIR --output DIR")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)), allowedOptions: rlExportPolicyOptions)
     guard let checkpoint = o.checkpoint, let output = o.output else {
         fail("export-policy-rl requires --checkpoint DIR and --output DIR")
     }
@@ -2220,7 +2357,8 @@ case "verify-policy-rl":
         fail("usage: avbd verify-policy-rl <task> --checkpoint BUNDLE "
             + "[--frames N --json]")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)), allowedOptions: rlVerifyPolicyOptions)
     guard let bundle = o.checkpoint else {
         fail("verify-policy-rl requires --checkpoint BUNDLE")
     }
@@ -2292,8 +2430,18 @@ case "trace-rl":
     guard args.count > 1 else {
         fail("usage: avbd trace-rl <task> [--checkpoint DIR --frames N]")
     }
-    let o = parseOptions(Array(args.dropFirst(2)))
+    let o = parseRLOptions(
+        Array(args.dropFirst(2)), allowedOptions: rlTraceOptions)
     let taskID = args[1]
+    let trainingModeRequested = args.contains("--training-mode")
+    if let trainingEnvironmentSteps = o.trainingEnvironmentSteps {
+        guard trainingModeRequested else {
+            fail("--training-environment-steps requires --training-mode")
+        }
+        guard trainingEnvironmentSteps >= 0 else {
+            fail("--training-environment-steps must be non-negative")
+        }
+    }
     let checkpointDirectory = o.checkpoint ?? "runs/\(taskID)/\(o.runName)"
     let runner = try VectorPolicyRunner(
         checkpointDirectory: checkpointDirectory)
@@ -2307,11 +2455,18 @@ case "trace-rl":
         taskID, configuration: RLTaskConfiguration(
             numEnvironments: 1, seed: o.seed, autoReset: false,
             options: replayOptions))
-    if args.contains("--training-mode"),
-       let trainingTask = task as? any TrainingModeConfigurable {
+    if trainingModeRequested {
+        guard let trainingTask = task as? any TrainingModeConfigurable else {
+            fail("--training-mode is not supported by task '\(taskID)'")
+        }
         trainingTask.setTrainingMode(true)
-        trainingTask.setTrainingProgress(environmentSteps: Int(
-            o.taskOptions["trainingEnvironmentSteps"] ?? 0))
+        trainingTask.setTrainingProgress(
+            environmentSteps: o.trainingEnvironmentSteps ?? 0)
+    }
+    if args.contains("--trace-actions"),
+       !(task is Arachne15LocomotionTask),
+       !(task is HumanoidBoxCarryTask) {
+        fail("--trace-actions is not supported by task '\(taskID)'")
     }
     guard metadata.compatibilityMismatches(with: task.spec).isEmpty else {
         fail("checkpoint/task mismatch for deterministic trace")
