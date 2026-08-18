@@ -406,6 +406,35 @@ final class GPUSolverTests: XCTestCase {
         XCTAssertLessThan(maxX, -0.55, "fast box center crossed wall support: \(maxX)")
     }
 
+    func testFastOpposingDynamicBoxesDoNotTunnelThroughEachOther() throws {
+        var scene = PhysicsScene(name: "fast-opposing-boxes")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 20
+        let left = scene.addBody(
+            size: F3(1, 1, 1), density: 1, friction: 0,
+            position: F3(-0.6, 0, 0), velocity: F3(42, 0, 0))
+        let right = scene.addBody(
+            size: F3(1, 1, 1), density: 1, friction: 0,
+            position: F3(0.6, 0, 0), velocity: F3(-42, 0, 0))
+        let solver = try makeGPU(scene)
+
+        var minimumOrder = Float.greatestFiniteMagnitude
+        for _ in 0..<20 {
+            solver.step()
+            minimumOrder = min(
+                minimumOrder,
+                solver.bodyPosition(right).x - solver.bodyPosition(left).x)
+        }
+        let finalOrder = solver.bodyPosition(right).x
+            - solver.bodyPosition(left).x
+        XCTAssertGreaterThan(
+            minimumOrder, 0,
+            "opposing dynamic boxes crossed through each other: \(minimumOrder)")
+        XCTAssertGreaterThan(
+            finalOrder, 0.99,
+            "opposing boxes did not resolve their overlap: \(finalOrder)")
+    }
+
     func testFastParticleDoesNotStartBelowFloor() throws {
         var scene = PhysicsScene(name: "fast-floor-particle")
         _ = scene.addBody(size: F3(200, 200, 2), density: 0, friction: 0.7,

@@ -145,7 +145,11 @@ extension TorusAndMachineTests {
             while d2 > .pi { d2 -= 2 * .pi }; while d2 < -.pi { d2 += 2 * .pi }
             t1 += d1; t2 += d2; a1 = n1; a2 = n2
         }
-        XCTAssertLessThan(t1, -0.5, "drive gear should turn (got \(t1))")
-        XCTAssertGreaterThan(t2, 0.25, "hand gear should counter-rotate (got \(t2))")
+        XCTAssertLessThan(t1, -0.2, "drive gear should turn (got \(t1))")
+        XCTAssertGreaterThan(t2, 0.4, "hand gear should counter-rotate (got \(t2))")
+        let pitchRatio: Float = 1.25 / 0.65
+        let measuredRatio = abs(t2 / t1)
+        XCTAssertEqual(measuredRatio, pitchRatio, accuracy: 0.35,
+                       "meshed gears should follow their pitch-radius ratio")
     }
 }
