@@ -845,12 +845,16 @@
     "sin_phase,cos_phase(period=0.8s)"
   ],
   "robot": "unitree-h1",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "source": {
     "checkpointSHA256": "44a0fbceb81f3877833ae9a398d039bea1759cb0d3c8188181013885f70589eb",
     "license": "BSD-3-Clause",
+    "licenseFile": "LICENSE",
+    "licenseSHA256": "98335465f43a20b5850e4651db6e74c4aa1e9fc8e8813d38f345178045c0da50",
     "project": "unitreerobotics/unitree_rl_gym",
     "revision": "276801e46c5d433564f24658bac64f254b7d2d4b",
-    "url": "https://github.com/unitreerobotics/unitree_rl_gym/blob/main/deploy/pre_train/h1/motion.pt"
-  }
+    "url": "https://github.com/unitreerobotics/unitree_rl_gym/blob/276801e46c5d433564f24658bac64f254b7d2d4b/deploy/pre_train/h1/motion.pt"
+  },
+  "weightsFile": "policy.safetensors",
+  "weightsSHA256": "cb51db3e4ccbecc0d9a863173640f8cb8b5a5fb821bc1db9024c7957297ff4ee"
 }

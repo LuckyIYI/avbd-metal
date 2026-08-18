@@ -919,6 +919,18 @@ final class RLFrameworkTests: XCTestCase {
         let session = try UnitreeH1Sim2SimSession(
             policyDirectory: policyDirectory,
             command: SIMD3<Float>(0.5, 0, 0))
+        XCTAssertEqual(session.policy.manifest.schemaVersion, 2)
+        XCTAssertEqual(
+            session.policy.manifest.source.url,
+            "https://github.com/unitreerobotics/unitree_rl_gym/blob/"
+                + "276801e46c5d433564f24658bac64f254b7d2d4b/"
+                + "deploy/pre_train/h1/motion.pt")
+        XCTAssertEqual(
+            session.policy.manifest.weightsSHA256,
+            "cb51db3e4ccbecc0d9a863173640f8cb8b5a5fb821bc1db9024c7957297ff4ee")
+        XCTAssertEqual(
+            session.policy.manifest.source.licenseSHA256,
+            "98335465f43a20b5850e4651db6e74c4aa1e9fc8e8813d38f345178045c0da50")
         let report = try session.run(controlSteps: 500)
 
         XCTAssertEqual(report.checkpointSHA256,
@@ -930,6 +942,53 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertGreaterThan(report.minimumPelvisHeightMeters, 0.96)
         XCTAssertGreaterThan(report.minimumUprightAlignment, 0.995)
         XCTAssertLessThan(abs(report.lateralDistanceMeters), 0.25)
+    }
+
+    func testExternalUnitreeH1PolicyRejectsTamperedBundleFiles() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = repository.appendingPathComponent(
+            "checkpoints/external/unitree-h1", isDirectory: true)
+        guard FileManager.default.fileExists(
+            atPath: source.appendingPathComponent("policy.safetensors").path),
+              FileManager.default.fileExists(
+                atPath: source.appendingPathComponent("manifest.json").path),
+              FileManager.default.fileExists(
+                atPath: source.appendingPathComponent("LICENSE").path) else {
+            throw XCTSkip("external Unitree H1 checkpoint is not installed")
+        }
+        try requirePackagedMLXMetalLibrary()
+
+        for tamperedName in ["policy.safetensors", "LICENSE"] {
+            let copy = FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "unitree-h1-tamper-\(UUID().uuidString)",
+                    isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: copy, withIntermediateDirectories: false)
+            defer { try? FileManager.default.removeItem(at: copy) }
+            for name in ["LICENSE", "manifest.json", "policy.safetensors"] {
+                try FileManager.default.copyItem(
+                    at: source.appendingPathComponent(name),
+                    to: copy.appendingPathComponent(name))
+            }
+            let tampered = copy.appendingPathComponent(tamperedName)
+            var bytes = try Data(contentsOf: tampered)
+            bytes[bytes.startIndex] ^= 0x01
+            try bytes.write(to: tampered, options: .atomic)
+
+            XCTAssertThrowsError(
+                try UnitreeH1RecurrentPolicy(directory: copy.path)
+            ) { error in
+                guard case RLEnvironmentError.invalidConfiguration(
+                    let message) = error else {
+                    return XCTFail("unexpected error: \(error)")
+                }
+                XCTAssertTrue(message.contains("SHA-256"), message)
+            }
+        }
     }
 
     func testRegisteredIsaacH1GoalTransfersFlatPolicyAndOwnsArrival()

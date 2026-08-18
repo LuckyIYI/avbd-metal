@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -21,9 +22,11 @@ from typing import Dict
 import torch
 
 
-SOURCE_URL = (
-    "https://github.com/unitreerobotics/unitree_rl_gym/"
-    "blob/main/deploy/pre_train/h1/motion.pt"
+SOURCE_PROJECT_URL = "https://github.com/unitreerobotics/unitree_rl_gym"
+SOURCE_FILE = "deploy/pre_train/h1/motion.pt"
+SOURCE_LICENSE = (
+    Path(__file__).resolve().parents[1]
+    / "Sources" / "AVBDCore" / "Assets" / "unitree_h1" / "LICENSE"
 )
 EXPECTED_SHAPES = {
     "memory.weight_ih_l0": [256, 41],
@@ -58,6 +61,10 @@ def source_revision(path: Path) -> str | None:
             except (OSError, subprocess.CalledProcessError):
                 return None
     return None
+
+
+def pinned_source_url(revision: str) -> str:
+    return f"{SOURCE_PROJECT_URL}/blob/{revision}/{SOURCE_FILE}"
 
 
 def write_safetensors(path: Path, tensors: Dict[str, torch.Tensor]) -> None:
@@ -130,12 +137,24 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--source-revision",
+        help=("40-character unitree_rl_gym commit; inferred when the "
+              "checkpoint is inside a Git checkout"),
+    )
     args = parser.parse_args()
 
     checkpoint = args.checkpoint.expanduser().resolve()
     output = args.output.expanduser().resolve()
     if not checkpoint.is_file():
         raise SystemExit(f"checkpoint does not exist: {checkpoint}")
+    revision = args.source_revision or source_revision(checkpoint)
+    if revision is None or len(revision) != 40 or any(
+        character not in "0123456789abcdefABCDEF" for character in revision
+    ):
+        raise SystemExit(
+            "Unitree import requires an exact 40-character source revision")
+    revision = revision.lower()
 
     policy = torch.jit.load(str(checkpoint), map_location="cpu")
     methods = set(policy._c._method_names())
@@ -157,19 +176,28 @@ def main() -> None:
 
     tensors = {name: state[name] for name in EXPECTED_SHAPES}
     output.mkdir(parents=True, exist_ok=True)
-    write_safetensors(output / "policy.safetensors", tensors)
+    weights_path = output / "policy.safetensors"
+    write_safetensors(weights_path, tensors)
+    if not SOURCE_LICENSE.is_file():
+        raise SystemExit(f"Unitree BSD license does not exist: {SOURCE_LICENSE}")
+    license_path = output / "LICENSE"
+    shutil.copyfile(SOURCE_LICENSE, license_path)
 
     manifest = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "format": "avbd-unitree-h1-lstm-v1",
         "robot": "unitree-h1",
         "source": {
             "project": "unitreerobotics/unitree_rl_gym",
-            "url": SOURCE_URL,
-            "revision": source_revision(checkpoint),
+            "url": pinned_source_url(revision),
+            "revision": revision,
             "checkpointSHA256": sha256(checkpoint),
             "license": "BSD-3-Clause",
+            "licenseFile": license_path.name,
+            "licenseSHA256": sha256(license_path),
         },
+        "weightsFile": weights_path.name,
+        "weightsSHA256": sha256(weights_path),
         "network": {
             "kind": "lstm-actor",
             "observationDimension": 41,

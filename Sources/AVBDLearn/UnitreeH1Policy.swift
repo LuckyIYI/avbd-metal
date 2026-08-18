@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MLX
 import MLXNN
@@ -7,9 +8,11 @@ public struct UnitreeH1PolicyManifest: Codable, Sendable {
     public struct Source: Codable, Sendable {
         public var project: String
         public var url: String
-        public var revision: String?
+        public var revision: String
         public var checkpointSHA256: String
         public var license: String
+        public var licenseFile: String
+        public var licenseSHA256: String
     }
 
     public struct Network: Codable, Sendable {
@@ -50,6 +53,8 @@ public struct UnitreeH1PolicyManifest: Codable, Sendable {
     public var format: String
     public var robot: String
     public var source: Source
+    public var weightsFile: String
+    public var weightsSHA256: String
     public var network: Network
     public var control: Control
     public var observationLayout: [String]
@@ -96,9 +101,13 @@ public final class UnitreeH1RecurrentPolicy {
         manifest = try JSONDecoder().decode(
             UnitreeH1PolicyManifest.self,
             from: Data(contentsOf: root.appendingPathComponent("manifest.json")))
-        guard manifest.schemaVersion == 1,
+        guard manifest.schemaVersion == 2,
               manifest.format == "avbd-unitree-h1-lstm-v1",
               manifest.robot == "unitree-h1",
+              manifest.source.project == "unitreerobotics/unitree_rl_gym",
+              manifest.source.license == "BSD-3-Clause",
+              manifest.source.licenseFile == "LICENSE",
+              manifest.weightsFile == "policy.safetensors",
               manifest.network.kind == "lstm-actor",
               manifest.network.observationDimension == 41,
               manifest.network.hiddenDimension == 64,
@@ -109,8 +118,15 @@ public final class UnitreeH1RecurrentPolicy {
             throw RLEnvironmentError.invalidConfiguration(
                 "unsupported Unitree H1 import manifest")
         }
-        let weights = try loadArrays(
-            url: root.appendingPathComponent("policy.safetensors"))
+        let weightsURL = root.appendingPathComponent(manifest.weightsFile)
+        try Self.verifySHA256(
+            url: weightsURL, expected: manifest.weightsSHA256,
+            label: "Unitree H1 converted policy")
+        try Self.verifySHA256(
+            url: root.appendingPathComponent(manifest.source.licenseFile),
+            expected: manifest.source.licenseSHA256,
+            label: "Unitree H1 license")
+        let weights = try loadArrays(url: weightsURL)
         func tensor(_ name: String, shape: [Int]) throws -> MLXArray {
             guard let value = weights[name], value.shape == shape else {
                 throw RLEnvironmentError.invalidConfiguration(
@@ -218,6 +234,23 @@ public final class UnitreeH1RecurrentPolicy {
     ) -> Float where C1.Element == Float, C2.Element == Float {
         guard lhs.count == rhs.count else { return .infinity }
         return zip(lhs, rhs).reduce(0) { max($0, abs($1.0 - $1.1)) }
+    }
+
+    private static func verifySHA256(
+        url: URL, expected: String, label: String
+    ) throws {
+        guard expected.count == 64,
+              expected.allSatisfy({ $0.isHexDigit }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "\(label) manifest SHA-256 is invalid")
+        }
+        let digest = SHA256.hash(data: try Data(contentsOf: url)).map {
+            String(format: "%02x", $0)
+        }.joined()
+        guard digest == expected.lowercased() else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "\(label) SHA-256 does not match its import manifest")
+        }
     }
 }
 

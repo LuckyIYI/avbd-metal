@@ -20,6 +20,7 @@ checkpoints/*
 !checkpoints/external/
 checkpoints/external/*
 !checkpoints/external/unitree-h1/
+!checkpoints/external/unitree-h1/LICENSE
 !checkpoints/external/unitree-h1/manifest.json
 !checkpoints/external/unitree-h1/policy.safetensors
 !checkpoints/humanoid-isaac-flat-v0/

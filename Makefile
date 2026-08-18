@@ -49,10 +49,38 @@ ml-tool:
 app-ml:
 	xcodebuild -scheme AVBDApp -configuration Release -destination 'platform=macOS' -derivedDataPath .xcbuild build -quiet
 	rm -rf AVBD.app
-	mkdir -p AVBD.app/Contents/MacOS AVBD.app/Contents/Resources
+	mkdir -p AVBD.app/Contents/MacOS AVBD.app/Contents/Resources/checkpoints/external/unitree-h1
+	mkdir -p AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v0
+	mkdir -p AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-goal-v0
+	mkdir -p AVBD.app/Contents/Resources/checkpoints/arachne15-velocity-v0
+	mkdir -p AVBD.app/Contents/Resources/checkpoints/arachne15-goal-v0
 	cp .xcbuild/Build/Products/Release/AVBDApp AVBD.app/Contents/MacOS/AVBDApp
 	cp -R .xcbuild/Build/Products/Release/avbd-metal_AVBDCore.bundle AVBD.app/Contents/Resources/
-	-cp -R checkpoints AVBD.app/Contents/Resources/ 2>/dev/null
+	cp checkpoints/README.md AVBD.app/Contents/Resources/checkpoints/
+	cp checkpoints/external/unitree-h1/LICENSE \
+	  checkpoints/external/unitree-h1/manifest.json \
+	  checkpoints/external/unitree-h1/policy.safetensors \
+	  AVBD.app/Contents/Resources/checkpoints/external/unitree-h1/
+	cp checkpoints/humanoid-isaac-flat-v0/evaluation.json \
+	  checkpoints/humanoid-isaac-flat-v0/metadata.json \
+	  checkpoints/humanoid-isaac-flat-v0/policy.safetensors \
+	  checkpoints/humanoid-isaac-flat-v0/training-state.json \
+	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v0/
+	cp checkpoints/humanoid-isaac-goal-v0/evaluation.json \
+	  checkpoints/humanoid-isaac-goal-v0/metadata.json \
+	  checkpoints/humanoid-isaac-goal-v0/policy.safetensors \
+	  checkpoints/humanoid-isaac-goal-v0/training-state.json \
+	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-goal-v0/
+	cp checkpoints/arachne15-velocity-v0/evaluation.json \
+	  checkpoints/arachne15-velocity-v0/metadata.json \
+	  checkpoints/arachne15-velocity-v0/policy.safetensors \
+	  checkpoints/arachne15-velocity-v0/training-state.json \
+	  AVBD.app/Contents/Resources/checkpoints/arachne15-velocity-v0/
+	cp checkpoints/arachne15-goal-v0/deployment-manifest.json \
+	  checkpoints/arachne15-goal-v0/metadata.json \
+	  checkpoints/arachne15-goal-v0/policy.safetensors \
+	  checkpoints/arachne15-goal-v0/training-state.json \
+	  AVBD.app/Contents/Resources/checkpoints/arachne15-goal-v0/
 	-cp .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib AVBD.app/Contents/Resources/ 2>/dev/null
 	-cp -R .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle AVBD.app/Contents/Resources/ 2>/dev/null
 	printf '%s\n' \
