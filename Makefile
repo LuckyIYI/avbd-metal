@@ -2,7 +2,7 @@
 
 .PHONY: build test verify-core verify-mlx-rl app cli bench clean ml-tool \
 	app-ml ios-ml generate-arachne-assets verify-arachne-assets \
-	verify-arachne-policy
+	verify-arachne-policy verify-panda-provenance verify-h1-provenance
 
 build:
 	swift build -c release
@@ -10,8 +10,9 @@ build:
 test:
 	swift test
 
-# Local core merge gate: generated Arachne contracts plus the SwiftPM suite.
-verify-core: verify-arachne-assets
+# Local core merge gate: every checked-in generated/provenance contract plus
+# the complete SwiftPM suite. None of these checks needs network access.
+verify-core: verify-arachne-assets verify-panda-provenance verify-h1-provenance
 	swift test
 
 # Xcode-package the MLX/RL tests, then run their bundle serially so the MLX
@@ -144,6 +145,17 @@ verify-arachne-assets:
 	python3 Robots/Arachne15/sim/generate_model.py --check
 	python3 Robots/Arachne15/sim/validate_model.py
 	python3 Robots/Arachne15/analysis/reveal_pose.py --check
+
+# Verify the cleanly sourced Panda plant, first-party pusher and explicitly
+# attributed ManiSkill Push-T task boundary.
+verify-panda-provenance:
+	python3 Tools/verify_panda_provenance.py
+
+# Verify the generated Unitree/Menagerie collision support sets and the exact
+# Isaac Lab configuration sources adapted by the H1 task.
+verify-h1-provenance:
+	python3 Tools/generate_unitree_h1_collision_hulls.py --verify
+	python3 Tools/verify_isaac_lab_h1_provenance.py
 
 # Validate the tracked bundle, exact inference parity, and Metal latency.
 verify-arachne-policy: ml-tool
