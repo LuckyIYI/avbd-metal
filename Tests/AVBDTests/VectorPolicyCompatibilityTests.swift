@@ -46,13 +46,18 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
         })
     }
 
-    func testTrackedReplayCatalogContainsOnlyExactCurrentPolicies() throws {
+    func testTrackedReplayCatalogMakesPhysicsCompatibilityExplicit() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let selectionIDs = PolicyReplayCatalog.entries.map(\.selectionID)
         XCTAssertEqual(Set(selectionIDs).count, selectionIDs.count)
+        XCTAssertEqual(
+            PolicyReplayCatalog.entries.filter {
+                $0.qualification == .requalificationRequired
+            }.map(\.selectionID),
+            ["humanoid-isaac-flat-v0"])
         for entry in PolicyReplayCatalog.entries {
             XCTAssertEqual(
                 entry.runtime == .classicalController,
@@ -97,7 +102,9 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                     "policy.safetensors").path))
         }
 
-        for directory in policyDirectories {
+        for entry in PolicyReplayCatalog.nativeLearnedEntries {
+            let directory = "checkpoints/"
+                + (try XCTUnwrap(entry.checkpointRelativeDirectory))
             let policyDirectory = root.appendingPathComponent(directory)
             let metadataPath = policyDirectory.appendingPathComponent(
                 "metadata.json")
@@ -121,9 +128,15 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                     numEnvironments: 1, seed: 1, autoReset: false,
                     options: options))
             let mismatches = metadata.compatibilityMismatches(with: task.spec)
-            XCTAssertTrue(
-                mismatches.isEmpty,
-                "\(directory): \(mismatches.joined(separator: "; "))")
+            if entry.qualification == .requalificationRequired {
+                XCTAssertFalse(mismatches.isEmpty, directory)
+                XCTAssertTrue(mismatches.contains { $0.contains("revision") },
+                              "\(directory): \(mismatches)")
+            } else {
+                XCTAssertTrue(
+                    mismatches.isEmpty,
+                    "\(directory): \(mismatches.joined(separator: "; "))")
+            }
         }
     }
 }

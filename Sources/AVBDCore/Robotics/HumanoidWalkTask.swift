@@ -1094,7 +1094,7 @@ public final class HumanoidWalkEnv {
                 switch controlProfile {
                 case .isaacLab:
                     // Nominal Flat replay retains Isaac Lab's H1_MINIMAL
-                    // collision preset through the cooked hulls below.  A
+                    // collision topology through the bounded hulls below. A
                     // projectile scene instead enables every authored source
                     // primitive: pelvis, legs, shoulders, arms, forearms and
                     // the terminal hand spheres.  The importer already added
@@ -1104,7 +1104,7 @@ public final class HumanoidWalkEnv {
                     if preserveMinimalTerrainContactProfile {
                         // A manual replay probe must not change the nominal
                         // H1_MINIMAL floor/contact trajectory before launch.
-                        // Keep the cooked ankle/torso hulls below and expose
+                        // Keep the bounded ankle/torso hulls below and expose
                         // every other authored primitive only to same-replica
                         // bodies such as the projectile, never shared terrain.
                         let coveredByMinimalHull = body == leftFoot
@@ -1127,17 +1127,18 @@ public final class HumanoidWalkEnv {
                 }
             }
             if controlProfile == .isaacLab {
-                // H1_MINIMAL_CFG authors one PhysX convex hull on each ankle
-                // and the torso. The decoded vertices are in link frames;
-                // MJCFInstantiation supplies the selected source-simulator
-                // link->COM-body transform used for joints and inertia.
+                // Match H1_MINIMAL_CFG's three-collider topology with bounded
+                // support sets generated directly from the pinned BSD-3-Clause
+                // Menagerie STLs. No simulator-cooked geometry is packaged.
+                // Vertices remain in source link frames;
+                // MJCFInstantiation supplies the link->COM-body transform.
                 let hulls: [(Int, MJCFLinkFrame, [F3])] = [
                     (leftFoot, imported.linkFramesInBody["left_ankle_link"]!,
-                     IsaacH1CollisionHulls.leftAnkle),
+                     UnitreeH1CollisionHulls.leftAnkle),
                     (rightFoot, imported.linkFramesInBody["right_ankle_link"]!,
-                     IsaacH1CollisionHulls.rightAnkle),
+                     UnitreeH1CollisionHulls.rightAnkle),
                     (torso, imported.linkFramesInBody["torso_link"]!,
-                     IsaacH1CollisionHulls.torso),
+                     UnitreeH1CollisionHulls.torso),
                 ]
                 for (body, frame, vertices) in hulls {
                     _ = built.addConvexCollider(
@@ -2219,7 +2220,7 @@ public final class HumanoidWalkTask: VectorizedRLTask, RLEvaluationCriteriaProvi
 
     public init(configuration: HumanoidWalkTaskConfig,
                 taskID: String = "humanoid-walk-v0",
-                taskRevision: Int = 35) throws {
+                taskRevision: Int = 36) throws {
         guard configuration.numEnvironments > 0,
               configuration.maxEpisodeSteps > 0,
               configuration.controlDecimation > 0 else {

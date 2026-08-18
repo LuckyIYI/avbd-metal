@@ -1,0 +1,149 @@
+{
+  "generator": {
+    "algorithm": "Seed six AABB extrema, then repeatedly add the source support vertex at the greatest per-axis-AABB-normalized support error",
+    "errorMeasurement": "Physical-metre support-function error over every antipodal probe direction; max and RMS compare the full STL vertex set with the generated subset",
+    "input": "local commit-pinned binary STL files; SHA-256 is mandatory",
+    "networkAccess": false,
+    "path": "Tools/generate_unitree_h1_collision_hulls.py",
+    "probeDirections": {
+      "antipodallySymmetric": true,
+      "axisLimit": 8,
+      "construction": "all primitive integer triples in [-8, 8]^3 except (0, 0, 0)",
+      "count": 4034
+    },
+    "runtime": "Python 3.9+ standard library only",
+    "sha256": "4befda178c1b653968f8c5779f7c164701fb923e45c34ff5d4ca7fea364de270",
+    "tieBreak": "lexicographically sorted source vertex, then probe order",
+    "version": 1,
+    "vertexLimit": 64,
+    "vertexLimitRationale": "AVBD's Metal convex support path has a reviewed hard cap of 64 vertices per collider"
+  },
+  "output": {
+    "meshes": [
+      {
+        "generatedAABB": {
+          "max": [
+            0.17499999701976776,
+            0.03999999910593033,
+            0.010918009094893932
+          ],
+          "min": [
+            -0.06499774008989334,
+            -0.03999999910593033,
+            -0.07000000774860382
+          ]
+        },
+        "generatedVertexCount": 64,
+        "generatedVerticesSHA256": "b0dc267d8505e910345683ad65e3e41f74a07f847053be01c8fd42581e66b2e7",
+        "name": "leftAnkle",
+        "sourceAABB": {
+          "max": [
+            0.17499999701976776,
+            0.03999999910593033,
+            0.010918009094893932
+          ],
+          "min": [
+            -0.06499774008989334,
+            -0.03999999910593033,
+            -0.07000000774860382
+          ]
+        },
+        "sourceByteCount": 216684,
+        "sourceFile": "left_ankle_link.stl",
+        "sourceSHA256": "f623223b59d0f8cd86a799f409f4e8680da3e48d9b60e9f4bf9dad5c5dc8ac25",
+        "sourceTriangleCount": 4332,
+        "sourceURL": "https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/71f066ad0be9cd271f7ed58c030243ef157af9f4/unitree_h1/assets/left_ankle_link.stl",
+        "sourceUniqueVertexCount": 2170,
+        "symmetricSupportErrorMaxMeters": 0.001250398278542987,
+        "symmetricSupportErrorRMSMeters": 0.0003126046839682576
+      },
+      {
+        "generatedAABB": {
+          "max": [
+            0.17499999701976776,
+            0.03999999910593033,
+            0.010918009094893932
+          ],
+          "min": [
+            -0.06499774008989334,
+            -0.03999999910593033,
+            -0.07000000774860382
+          ]
+        },
+        "generatedVertexCount": 64,
+        "generatedVerticesSHA256": "5c6ba9ff4b879350b82d72fdc9bee76ab731ab6d635b8ba962ed3aa8e744c38d",
+        "name": "rightAnkle",
+        "sourceAABB": {
+          "max": [
+            0.17499999701976776,
+            0.03999999910593033,
+            0.010918009094893932
+          ],
+          "min": [
+            -0.06499774008989334,
+            -0.03999999910593033,
+            -0.07000000774860382
+          ]
+        },
+        "sourceByteCount": 216284,
+        "sourceFile": "right_ankle_link.stl",
+        "sourceSHA256": "a72e7b10d3961b5c5bb7b0ca09f20cbc203619f5ded33ca030517c06298d2fd9",
+        "sourceTriangleCount": 4324,
+        "sourceURL": "https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/71f066ad0be9cd271f7ed58c030243ef157af9f4/unitree_h1/assets/right_ankle_link.stl",
+        "sourceUniqueVertexCount": 2166,
+        "symmetricSupportErrorMaxMeters": 0.0010526066585007168,
+        "symmetricSupportErrorRMSMeters": 0.0002778725792454522
+      },
+      {
+        "generatedAABB": {
+          "max": [
+            0.1248040720820427,
+            0.1720477193593979,
+            0.753950297832489
+          ],
+          "min": [
+            -0.0729999989271164,
+            -0.1720477193593979,
+            4.1722897359264266e-10
+          ]
+        },
+        "generatedVertexCount": 64,
+        "generatedVerticesSHA256": "c2a2258db9425a2789b583f772728109f32e5762020c4432cd4de49d4e3cadc5",
+        "name": "torso",
+        "sourceAABB": {
+          "max": [
+            0.1248040720820427,
+            0.1720477193593979,
+            0.753950297832489
+          ],
+          "min": [
+            -0.0729999989271164,
+            -0.1720477193593979,
+            4.1722897359264266e-10
+          ]
+        },
+        "sourceByteCount": 2339384,
+        "sourceFile": "torso_link.stl",
+        "sourceSHA256": "3ab785cbfbd851b0e9c59a46871aabc4718f3f8e726e21a2d14360d217ec7ba8",
+        "sourceTriangleCount": 46786,
+        "sourceURL": "https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/71f066ad0be9cd271f7ed58c030243ef157af9f4/unitree_h1/assets/torso_link.stl",
+        "sourceUniqueVertexCount": 23351,
+        "symmetricSupportErrorMaxMeters": 0.005258431328978519,
+        "symmetricSupportErrorRMSMeters": 0.0013205284604437572
+      }
+    ],
+    "mirroredAnkleSupportDifferenceMaxMeters": 0.0009254564096018818,
+    "mirroredAnkleSupportDifferenceRMSMeters": 0.0002260236890319034,
+    "swiftSource": "Sources/AVBDCore/Robotics/UnitreeH1CollisionHulls.swift",
+    "swiftSourceSHA256": "62c7cdf8d9f526e06804c02565e44d7372c988eb1334e727c35c20c0b6ade5f8"
+  },
+  "schemaVersion": 1,
+  "source": {
+    "bundledLicenseFile": "LICENSE",
+    "bundledLicenseSHA256": "98335465f43a20b5850e4651db6e74c4aa1e9fc8e8813d38f345178045c0da50",
+    "license": "BSD-3-Clause",
+    "project": "MuJoCo Menagerie / Unitree H1",
+    "repository": "https://github.com/google-deepmind/mujoco_menagerie",
+    "revision": "71f066ad0be9cd271f7ed58c030243ef157af9f4"
+  }
+}

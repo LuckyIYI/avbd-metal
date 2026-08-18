@@ -612,7 +612,7 @@ final class RLFrameworkTests: XCTestCase {
             configuration: RLTaskConfiguration(numEnvironments: 2, seed: 41))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(35))
+                       RLPhysicsContract.fixedGainActuatorV2(36))
         XCTAssertEqual(task.configuration.minimumCommandSpeed, 0.45)
         XCTAssertEqual(task.configuration.maximumCommandSpeed, 0.65)
         XCTAssertEqual(task.configuration.standingCommandProbability, 0)
@@ -795,7 +795,7 @@ final class RLFrameworkTests: XCTestCase {
         let task = try XCTUnwrap(
             registered as? HumanoidIsaacVelocityTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(10))
+                       RLPhysicsContract.fixedGainActuatorV2(11))
         XCTAssertEqual(task.spec.observation.shape, [69])
         XCTAssertEqual(task.spec.action.shape, [19])
         XCTAssertEqual(task.spec.simulationStep, 0.005, accuracy: 1e-7)
@@ -850,14 +850,14 @@ final class RLFrameworkTests: XCTestCase {
                     * task.spec.controlStep,
                 accuracy: 1e-4)
             let left = HumanoidIsaacVelocityTask.footHullGroundClearance(
-                state.leftFoot, vertices: IsaacH1CollisionHulls.leftAnkle)
+                state.leftFoot, vertices: UnitreeH1CollisionHulls.leftAnkle)
             let right = HumanoidIsaacVelocityTask.footHullGroundClearance(
-                state.rightFoot, vertices: IsaacH1CollisionHulls.rightAnkle)
+                state.rightFoot, vertices: UnitreeH1CollisionHulls.rightAnkle)
             XCTAssertTrue(left.isFinite && right.isFinite)
             XCTAssertGreaterThan(left, -0.02,
-                                 "left cooked foot hull starts too deep: \(left)")
+                                 "left generated foot hull starts too deep: \(left)")
             XCTAssertGreaterThan(right, -0.02,
-                                  "right cooked foot hull starts too deep: \(right)")
+                                  "right generated foot hull starts too deep: \(right)")
         }
 
         let enabledRobotColliders = task.environment.scene.colliders.filter {
@@ -865,7 +865,7 @@ final class RLFrameworkTests: XCTestCase {
         }
         XCTAssertEqual(enabledRobotColliders.count, 3 * task.spec.numEnvironments)
         XCTAssertTrue(enabledRobotColliders.allSatisfy {
-            $0.convexHullVertices.count == 34 && !$0.isRendered
+            $0.convexHullVertices.count == 64 && !$0.isRendered
         })
         XCTAssertTrue(enabledRobotColliders.allSatisfy {
             $0.friction == 0.8 && $0.dynamicFriction == 0.6
@@ -1008,7 +1008,7 @@ final class RLFrameworkTests: XCTestCase {
             registered as? HumanoidIsaacVelocityTask)
         XCTAssertEqual(task.spec.id, "humanoid-isaac-goal-v0")
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(2))
+                       RLPhysicsContract.fixedGainActuatorV2(3))
         XCTAssertTrue(task.usesPointGoal)
         XCTAssertEqual(task.spec.observation.shape, [71])
         XCTAssertEqual(task.spec.action.shape, [19])
@@ -1192,7 +1192,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(42))
+                       RLPhysicsContract.fixedGainActuatorV2(43))
         XCTAssertEqual(task.configuration.standingCommandProbability, 0.35)
         XCTAssertEqual(task.trainingStandingCommandProbability, 0.35)
         task.setTrainingMode(true)
@@ -1216,7 +1216,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(44))
+                       RLPhysicsContract.fixedGainActuatorV2(45))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
         XCTAssertTrue(task.initializesPolicyExpertFromBaseOnTransfer)
@@ -1296,7 +1296,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(11))
+                       RLPhysicsContract.fixedGainActuatorV2(12))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertFalse(task.freezesBasePolicyExpert)
         var observation = try task.reset(seed: 49)
@@ -1318,7 +1318,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(14))
+                       RLPhysicsContract.fixedGainActuatorV2(15))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
         XCTAssertEqual(task.spec.configurationValues["freezeBasePolicyExpert"], 1)
@@ -1359,7 +1359,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(444))
+                       RLPhysicsContract.fixedGainActuatorV2(445))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.usesPolicyStandExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
@@ -1793,7 +1793,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(18))
+                       RLPhysicsContract.fixedGainActuatorV2(19))
         XCTAssertEqual(task.spec.configurationValues["expertGateBlendWidth"], 0.2)
         var observation = try task.reset(seed: 53)
         let dimension = task.spec.observation.elementCount
@@ -1845,7 +1845,7 @@ final class RLFrameworkTests: XCTestCase {
             goalDirectionCurriculumControlSteps: 1_000,
             initialGoalDistanceScale: 0.25,
             goalDistanceCurriculumControlSteps: 1_000),
-            taskID: "humanoid-goal-v0", taskRevision: 4)
+            taskID: "humanoid-goal-v0", taskRevision: 5)
         task.setTrainingMode(true)
         _ = try task.reset(seed: 59)
         XCTAssertEqual(task.trainingGoalDirectionRange, .pi / 2,
@@ -1861,7 +1861,7 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertThrowsError(try HumanoidWalkTask(configuration: .init(
             numEnvironments: 1, maximumGoalDirectionAngle: .pi / 2,
             initialGoalDirectionAngle: .pi),
-            taskID: "humanoid-goal-v0", taskRevision: 4))
+            taskID: "humanoid-goal-v0", taskRevision: 5))
     }
 
     func testHumanoidGoalOverrideIsNormalizedAndAppliedThroughReset() throws {
@@ -2085,9 +2085,9 @@ final class RLFrameworkTests: XCTestCase {
         let environment = try HumanoidWalkEnv(numEnvironments: 2, seed: 46)
         for state in environment.states() {
             let left = HumanoidIsaacVelocityTask.footHullGroundClearance(
-                state.leftFoot, vertices: IsaacH1CollisionHulls.leftAnkle)
+                state.leftFoot, vertices: UnitreeH1CollisionHulls.leftAnkle)
             let right = HumanoidIsaacVelocityTask.footHullGroundClearance(
-                state.rightFoot, vertices: IsaacH1CollisionHulls.rightAnkle)
+                state.rightFoot, vertices: UnitreeH1CollisionHulls.rightAnkle)
             // Isaac authors the crouched pose at a 1.05 m root height; it
             // does not lower the free root until a foot just touches. Keep
             // that initial contact transient explicit instead of silently
@@ -2679,7 +2679,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(45))
+                       RLPhysicsContract.fixedGainActuatorV2(46))
         XCTAssertEqual(task.configuration.standStillFallPenalty, 20)
         XCTAssertEqual(task.spec.configurationValues["standStillFallPenalty"], 20)
     }
@@ -2695,7 +2695,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(2_435))
+                       RLPhysicsContract.fixedGainActuatorV2(2_436))
         XCTAssertEqual(task.spec.configurationValues[
             "velocityTrackingStandardDeviation"], 0.2)
         XCTAssertEqual(task.spec.configurationValues[
@@ -2786,7 +2786,7 @@ final class RLFrameworkTests: XCTestCase {
             initialYawRange: 0, maximumGoalDirectionAngle: 0,
             goalDwellSteps: 2, goalStableDwellRewardWeight: 10,
             autoReset: false),
-            taskID: "humanoid-goal-v0", taskRevision: 10)
+            taskID: "humanoid-goal-v0", taskRevision: 11)
         XCTAssertEqual(
             task.spec.configurationValues["goalStableDwellRewardWeight"], 10)
         _ = try task.reset(seed: 753)
@@ -4308,7 +4308,7 @@ final class RLFrameworkTests: XCTestCase {
     func testGoalTransferWidensNavigationAndZeroSpeedHistoryChannels() throws {
         let task = try HumanoidWalkTask(configuration: .init(
             numEnvironments: 1, maximumGoalDirectionAngle: .pi / 2),
-            taskID: "humanoid-goal-v0", taskRevision: 4)
+            taskID: "humanoid-goal-v0", taskRevision: 5)
         let floors = task.initializationObservationVarianceFloors
         XCTAssertEqual(floors.count, 36)
         XCTAssertEqual(floors[2], 0.25)
@@ -4324,7 +4324,7 @@ final class RLFrameworkTests: XCTestCase {
 
         let inheritedRangeTask = try HumanoidWalkTask(configuration: .init(
             numEnvironments: 1, maximumGoalDirectionAngle: .pi / 4),
-            taskID: "humanoid-goal-v0", taskRevision: 4)
+            taskID: "humanoid-goal-v0", taskRevision: 5)
         XCTAssertEqual(inheritedRangeTask
             .initializationObservationVarianceFloors.count, 36)
 
@@ -4339,7 +4339,7 @@ final class RLFrameworkTests: XCTestCase {
         let appendedTask = try HumanoidWalkTask(configuration: .init(
             numEnvironments: 1, maximumGoalDirectionAngle: .pi / 2,
             goalObservationIncludesLateralVelocity: true),
-            taskID: "humanoid-goal-v0", taskRevision: 4)
+            taskID: "humanoid-goal-v0", taskRevision: 5)
         let appendedFloors = appendedTask
             .initializationObservationVarianceFloors
         XCTAssertEqual(appendedFloors.count, 45)

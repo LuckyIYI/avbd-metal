@@ -99,7 +99,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             ?? UserDefaults.standard.string(
                 forKey: "AVBDPolicyReplaySelectedTask")
         return requestedTask.flatMap(Robot.fromSelectionID)
-            ?? .humanoidIsaac
+            ?? .unitreeH1
     }() {
         didSet {
             UserDefaults.standard.set(
@@ -315,7 +315,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case .gearSonicG1:
             return "NVIDIA GEAR-SONIC's 29-DoF G1 reference-following policy, imported from ONNX to native batched MLX and replayed on its analytic training collision plant. Full walking and dance clips pass; high-dynamic clips remain development-qualified."
         case .humanoidIsaac:
-            return "Replay the accepted H1 policy on the exact public Flat velocity task. Markers show the current command segment, not a point goal."
+            return "The packaged H1 Flat checkpoint predates the current BSD-source collision-hull physics revision. It is intentionally rejected until the unchanged weights are requalified and republished against this task; markers show the current command segment, not a point goal."
         case .humanoidIsaacGoal:
             return "Development H1 point-goal/8 kg impact policy on the current actuator contract (78.1% sealed-test goal success); PPO owns every joint action, but this policy is not acceptance-qualified yet."
         case .humanoidBoxCarry:

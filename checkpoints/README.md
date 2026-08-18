@@ -20,10 +20,12 @@ set under the canonical robot qualification directory linked below.
 - `external/unitree-h1` is the unchanged public Unitree RL Gym recurrent H1
   policy imported to MLX. Its source identity and recurrent parity contract are
   recorded in `manifest.json`.
-- `humanoid-isaac-flat-v0` is the accepted H1 Flat actor transferred onto the
-  corrected fixed-gain actuator contract (`taskRevision=1000010`). Its sealed
+- `humanoid-isaac-flat-v0` is immutable historical evidence for the H1 Flat
+  actor on the former revision-1000010 collision geometry. Its sealed
   512-episode test at seed 41010 passed 507/512 episodes (99.02%), with 0.089
-  m/s linear and 0.134 rad/s yaw-rate RMSE. Fingerprint:
+  m/s linear and 0.134 rad/s yaw-rate RMSE. The current BSD-source hull task is
+  revision 1000011, so runtime compatibility intentionally rejects this bundle
+  until the unchanged weights are requalified and republished. Fingerprint:
   `d6b5d416e7f7d75fa2b9b9dd33f78ae387e3f2a8139aa6d25a69e5dbcae777ab`.
 - `humanoid-isaac-goal-v0` is the current H1 point-goal/impact actor on the
   corrected actuator contract (`taskRevision=1000004`). Every episode includes

@@ -65,8 +65,8 @@ make ml-tool
   --envs 256 --episodes 512 --seed 10001 --json \
   --output runs/humanoid-isaac-flat-v0/my-h1-seed-1/eval.json
 
-# Replay the identical checkpoint/task path in Metal UI. H1 Flat Walk is the
-# default Policy Replay task and executes only its packaged Safetensors actor.
+# Open Policy Replay. The source-verified Unitree H1 Sim2Sim policy is the
+# clean default while the native Flat actor crosses its explicit revision gate.
 make app-ml
 AVBD_POLICY_REPLAY=1 open AVBD.app
 ```
@@ -82,12 +82,14 @@ Push-T, or otherwise fails its contract. The tracked extension points are
 [`VectorRLAlgorithm`](Sources/AVBDLearn/VectorRLAlgorithm.swift); shipped
 checkpoint contracts are indexed in [the checkpoint catalog](checkpoints/README.md).
 
-The packaged H1 Flat actor has been transferred onto the corrected fixed-gain
-actuator contract (`taskRevision=1000010`) and passes its documented held-out
-gate. A sealed 512-episode test at seed 41010 achieved 507/512 successes
-(99.02%), 0.089 m/s linear RMSE, and 0.134 rad/s yaw-rate RMSE. Its immutable
-fingerprint is `d6b5d416...e777ab`. This transfer descends from one training
-seed and is therefore not a multi-training-seed algorithm claim.
+The packaged H1 Flat actor is retained as immutable evidence for the corrected
+fixed-gain actuator contract and former collision geometry
+(`taskRevision=1000010`). Its sealed seed-41010 test achieved 507/512 successes
+(99.02%), 0.089 m/s linear RMSE, and 0.134 rad/s yaw-rate RMSE. The current
+BSD-source hull task is revision 1000011, so Policy Replay rejects that bundle
+until the unchanged weights are requalified and republished. Its historical
+fingerprint is `d6b5d416...e777ab`; the old result is not presented as evidence
+for the new physics contract.
 
 The packaged **H1 Goal** replay is also on the corrected actuator contract and
 is the current experimental robustness best:
@@ -123,7 +125,7 @@ They are visual-only and are never observations, rewards, or success inputs.
 The H1 gate requires a full 20-second episode plus low linear and yaw tracking
 error; merely standing upright cannot pass.
 
-The packaged actor's tracked held-out evidence is
+The historical Flat actor's tracked held-out evidence is
 [`checkpoints/humanoid-isaac-flat-v0/evaluation.json`](checkpoints/humanoid-isaac-flat-v0/evaluation.json).
 Replay videos and frame-locked single-episode reports are generated outputs
 under the ignored `artifacts/` directory; they are deliberately not required

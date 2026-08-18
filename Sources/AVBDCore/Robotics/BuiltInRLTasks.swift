@@ -467,7 +467,11 @@ public enum BuiltInRLTasks {
                     + ((cfg.options["velocityTrackingErrorPenaltyWeight"] ?? 0) > 0
                         ? 1_600 : 0)
                     + ((cfg.options["freezeLowSpeedPolicyExpert"] ?? 0) > 0
-                        ? 3_200 : 0))
+                        ? 3_200 : 0)
+                    // All straight-walk profiles use the bounded Menagerie
+                    // ankle/torso hulls, whose source-chain migration is a
+                    // load-bearing physics revision.
+                    + 1)
         }
         try! registry.register(
             "humanoid-velocity-v0",
@@ -917,7 +921,12 @@ public enum BuiltInRLTasks {
                         > 0 ? 102_400 : 0)
                     + ((cfg.options[
                         "goalObservationIncludesLateralVelocity"] ?? 0)
-                        > 0 ? 204_800 : 0))
+                        > 0 ? 204_800 : 0)
+                    // Goal profiles with physical projectiles use the full
+                    // primitive collision model and are unchanged. Only the
+                    // no-projectile hull topology crosses this boundary.
+                    + ((cfg.options["projectileProbability"] ?? 0.5) == 0
+                        ? 1 : 0))
         }
         try! registry.register(
             "arm-pusht-v0", optionSchema: optionSchema(armPushTOptionKeys)

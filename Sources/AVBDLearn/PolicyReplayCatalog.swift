@@ -14,6 +14,9 @@ public enum PolicyReplayQualification: String, Sendable, Codable {
     case externalParityVerified
     case accepted
     case development
+    /// The immutable packaged checkpoint predates the current task physics
+    /// revision and remains visible only as a migration/retraining boundary.
+    case requalificationRequired
     case nonNeuralBaseline
 }
 
@@ -68,11 +71,11 @@ public enum PolicyReplayCatalog {
             evidenceRelativePath: "Tools/import_gear_sonic_policy.py"),
         .init(
             selectionID: "humanoid-isaac-flat-v0",
-            displayName: "H1 Flat Walk",
+            displayName: "H1 Flat (Requalify)",
             taskID: "humanoid-isaac-flat-v0",
             runtime: .nativeMLX,
             checkpointRelativeDirectory: "humanoid-isaac-flat-v0",
-            qualification: .accepted,
+            qualification: .requalificationRequired,
             evidenceRelativePath:
                 "checkpoints/humanoid-isaac-flat-v0/evaluation.json"),
         .init(

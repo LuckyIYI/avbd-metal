@@ -436,10 +436,16 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
             }
         }
         let taskRevision: Int
+        // The bounded Menagerie support sets replace the former cooked hulls
+        // used only by profiles without training projectiles. That changes
+        // load-bearing ground contact, so those two revision families must
+        // reject legacy checkpoints until they are replay-qualified and
+        // republished. Projectile profiles use the full authored primitive
+        // model instead; their physics and revisions are unchanged.
         if !configuration.pointGoal {
-            taskRevision = 10
+            taskRevision = 11
         } else if configuration.projectileProbability == 0 {
-            taskRevision = 2
+            taskRevision = 3
         } else if configuration.recoveryExpertSide != 0 {
             taskRevision = 7
         } else if configuration.recoveryContextObservations {
@@ -832,9 +838,9 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
             feetInContact[e] = Float(contacts.feet[e].filter { $0 }.count)
             minimumFootClearance[e] = min(
                 Self.footHullGroundClearance(
-                    state.leftFoot, vertices: IsaacH1CollisionHulls.leftAnkle),
+                    state.leftFoot, vertices: UnitreeH1CollisionHulls.leftAnkle),
                 Self.footHullGroundClearance(
-                    state.rightFoot, vertices: IsaacH1CollisionHulls.rightAnkle))
+                    state.rightFoot, vertices: UnitreeH1CollisionHulls.rightAnkle))
             rootPlanarSpeed[e] = sqrt(
                 state.root.linearVelocity.x * state.root.linearVelocity.x
                     + state.root.linearVelocity.y * state.root.linearVelocity.y)
