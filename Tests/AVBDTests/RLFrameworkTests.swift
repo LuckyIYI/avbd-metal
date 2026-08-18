@@ -1393,6 +1393,7 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testStandExpertCompositionReparameterizesItsInputNormalizer() throws {
+        try requirePackagedMLXMetalLibrary()
         let sourceMean = [Double](repeating: 0, count: 2)
         let sourceVariance = [Double](repeating: 1, count: 2)
         let destinationMean = [Double](arrayLiteral: 2, -3)
@@ -1435,6 +1436,7 @@ final class RLFrameworkTests: XCTestCase {
 
     func testPolicyExpertCompositionUsesSourceBaseAndReparameterizesInput()
         throws {
+        try requirePackagedMLXMetalLibrary()
         let sourceMean = [Double](arrayLiteral: 0, 0)
         let sourceVariance = [Double](arrayLiteral: 1, 1)
         let destinationMean = [Double](arrayLiteral: 2, -3)
@@ -1473,6 +1475,7 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testPolicyExpertBranchCompositionPreservesTheTrainedBranch() throws {
+        try requirePackagedMLXMetalLibrary()
         let destination: [String: MLXArray] = [
             "expertActor1.weight": MLXArray.zeros([1, 2]),
             "expertActor1.bias": MLXArray.zeros([1]),
@@ -1517,6 +1520,7 @@ final class RLFrameworkTests: XCTestCase {
 
     func testObservationSchemaTransferPreservesOldPolicyAndAddsZeroColumns()
         throws {
+        try requirePackagedMLXMetalLibrary()
         let sourceValues: [Float] = [1, 2, 3, 4, 5, 6]
         var weights = [String: MLXArray]()
         for name in ["actor1.weight", "expertActor1.weight",
@@ -1540,6 +1544,7 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testVersion5CheckpointExpandsAuxiliaryActorFromBaseExactly() throws {
+        try requirePackagedMLXMetalLibrary()
         var weights = [String: MLXArray]()
         for suffix in ["weight", "bias"] {
             for layer in ["1", "2", "3"] {
@@ -1567,6 +1572,7 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testAuxiliaryExpertCanInitializeFromBaseExactly() throws {
+        try requirePackagedMLXMetalLibrary()
         var weights = [String: MLXArray]()
         for suffix in ["weight", "bias"] {
             for layer in ["1", "2", "3"] {
@@ -1599,6 +1605,7 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testAuxiliaryExpertCanProjectSubsystemObservationsOnTransfer() throws {
+        try requirePackagedMLXMetalLibrary()
         var weights = [String: MLXArray]()
         weights["actor1.weight"] = MLXArray([
             Float(1), 2, 3,
@@ -3372,6 +3379,7 @@ final class RLFrameworkTests: XCTestCase {
     }
 
     func testPPOMirroredExpertInitializationIsExactWithNormalization() throws {
+        try requirePackagedMLXMetalLibrary()
         let source: [String: MLXArray] = [
             "actor1.weight": MLXArray([Float](
                 [1, 2, 3, -2, 0.5, 4])).reshaped([2, 3]),
@@ -4725,5 +4733,14 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(frame.fault, .invalidObservation)
         XCTAssertTrue(frame.servoPositionRadians.isEmpty)
         XCTAssertFalse(deployment.supervisor.isArmed)
+    }
+
+    private func requirePackagedMLXMetalLibrary() throws {
+        let library = Bundle(for: Self.self).bundleURL
+            .appendingPathComponent("Contents/Resources/mlx-swift_Cmlx.bundle")
+            .appendingPathComponent("Contents/Resources/default.metallib")
+        guard FileManager.default.fileExists(atPath: library.path) else {
+            throw XCTSkip("requires an Xcode-packaged MLX default.metallib")
+        }
     }
 }
