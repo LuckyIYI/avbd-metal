@@ -10,6 +10,13 @@ runs/
 *.profraw
 node_modules/
 AVBD.app/
+*.gputrace
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
 
 # Generated training/evaluation output and replay media stay local. The source
 # tree contains the scripts and textual methodology needed to reproduce them.
