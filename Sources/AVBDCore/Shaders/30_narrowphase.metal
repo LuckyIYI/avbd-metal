@@ -330,6 +330,7 @@ struct TorusHit {
     float3 xT;          // point on torus surface
     float3 xO;          // point on other shape
     float3 n;           // other -> torus
+    float separation;   // signed surface gap (negative = penetration)
     uint feature;
 };
 
@@ -772,6 +773,7 @@ kernel void np_collide(
                 hits[0].xT = spine + n * T.r;
                 hits[0].xO = pO - n * rs;
                 hits[0].n = -n;          // other -> torus
+                hits[0].separation = dist - T.r - rs;
                 hits[0].feature = 0;
                 nHits = 1;
             }
@@ -875,6 +877,7 @@ kernel void np_collide(
                 hits[nHits].xT = q - n * T.r;
                 hits[nHits].xO = xO_ + ((isBox) ? float3(0) : n * otherR);
                 hits[nHits].n = n;
+                hits[nHits].separation = dist - T.r - otherR;
                 hits[nHits].feature = uint(best);
                 nHits++;
             }
@@ -888,10 +891,12 @@ kernel void np_collide(
 
         // deepest-contact normal defines the basis; nrm points B -> A
         int deep = 0;
-        float minD = FLT_MAX;
+        float minSeparation = FLT_MAX;
         for (int h = 0; h < nHits; h++) {
-            float d = distance(hits[h].xT, hits[h].xO);
-            if (d < minD) { minD = d; deep = h; }
+            if (hits[h].separation < minSeparation) {
+                minSeparation = hits[h].separation;
+                deep = h;
+            }
         }
         float3 nTorus = hits[deep].n;                  // other -> torus
         float3 nrmT = tIsA ? nTorus : -nTorus;         // B -> A
