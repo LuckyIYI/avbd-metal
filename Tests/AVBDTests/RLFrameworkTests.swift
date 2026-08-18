@@ -914,6 +914,7 @@ final class RLFrameworkTests: XCTestCase {
                 atPath: policyDirectory + "/manifest.json") else {
             throw XCTSkip("external Unitree H1 checkpoint is not installed")
         }
+        try requirePackagedMLXMetalLibrary()
 
         let session = try UnitreeH1Sim2SimSession(
             policyDirectory: policyDirectory,
@@ -4572,6 +4573,7 @@ final class RLFrameworkTests: XCTestCase {
             throw XCTSkip(
                 "requires an Xcode-packaged MLX default.metallib")
         }
+        try requirePackagedMLXMetalLibrary()
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
