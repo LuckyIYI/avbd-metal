@@ -1,3 +1,4 @@
+import Foundation
 import simd
 
 /// Whole-body Unitree H1 pickup-and-carry task.  Every success condition is
@@ -67,6 +68,11 @@ public struct HumanoidBoxCarryTaskConfig: Sendable {
     /// joint for balance; both arm groups remain protected by the carry actor.
     public var carryLocomotionControlsTorso: Bool
     public var initializeCarryExpertFromBaseOnTransfer: Bool
+    /// Replace the loaded lower-body branch with an exact copy of the
+    /// verified navigation actor when transferring a checkpoint. The branch
+    /// remains independently trainable, so PPO learns load compensation
+    /// without modifying the source walker or the load-bearing arms.
+    public var initializeCarryLocomotionExpertFromBaseOnTransfer: Bool
     /// Fraction of training-only episode resets restored from a previously
     /// observed, physically unsupported lift. This is reference-state
     /// initialization at an episode boundary, not an in-episode teleport.
@@ -97,6 +103,23 @@ public struct HumanoidBoxCarryTaskConfig: Sendable {
     /// The unloaded H1 task uses 0.25; a smaller loaded value prevents a
     /// stationary holder from receiving almost the same reward as walking.
     public var carryTrackingVariance: Float
+    /// Couple loaded linear and yaw tracking multiplicatively. The historical
+    /// additive objective pays almost half of its maximum when the robot
+    /// stands still under a zero-yaw command, even if it ignores the planar
+    /// velocity command completely. Coupling preserves the same maximum at
+    /// perfect tracking while requiring both command components to be good.
+    public var coupledCarryCommandTracking: Bool
+    /// Weight on telescoping pelvis progress toward the loaded navigation
+    /// stance. Object progress alone can be produced by reaching farther with
+    /// the arms while both feet remain planted; this term makes translation
+    /// of the load-bearing robot an explicit, independently measured goal.
+    public var carryRootProgressRewardWeight: Float
+    /// Event reward for an alternating physical foot exchange while the box
+    /// is unsupported and held by both hands.
+    public var carryAlternatingStepRewardWeight: Float
+    /// Minimum measured alternating foot exchanges required before transport
+    /// can satisfy the carry milestone. Zero preserves legacy checkpoints.
+    public var minimumLoadedAlternatingSteps: Int
 
     public init(
         numEnvironments: Int, seed: UInt64 = 1,
@@ -136,13 +159,18 @@ public struct HumanoidBoxCarryTaskConfig: Sendable {
         upperBodyCarryController: Bool = false,
         carryLocomotionControlsTorso: Bool = false,
         initializeCarryExpertFromBaseOnTransfer: Bool = false,
+        initializeCarryLocomotionExpertFromBaseOnTransfer: Bool = false,
         carryStartReplayProbability: Float = 0,
         advanceReplaySnapshotAtDestinationContact: Bool = false,
         carryArmReferenceWeight: Float = 1,
         carryHoldClearanceMultiplier: Float = 1,
         carryProgressRewardWeight: Float = 25,
         carryLocomotionRewardMultiplier: Float = 1,
-        carryTrackingVariance: Float = 0.25
+        carryTrackingVariance: Float = 0.25,
+        coupledCarryCommandTracking: Bool = false,
+        carryRootProgressRewardWeight: Float = 0,
+        carryAlternatingStepRewardWeight: Float = 0,
+        minimumLoadedAlternatingSteps: Int = 0
     ) {
         self.numEnvironments = numEnvironments
         self.seed = seed
@@ -195,6 +223,8 @@ public struct HumanoidBoxCarryTaskConfig: Sendable {
         self.carryLocomotionControlsTorso = carryLocomotionControlsTorso
         self.initializeCarryExpertFromBaseOnTransfer =
             initializeCarryExpertFromBaseOnTransfer
+        self.initializeCarryLocomotionExpertFromBaseOnTransfer =
+            initializeCarryLocomotionExpertFromBaseOnTransfer
         self.carryStartReplayProbability = carryStartReplayProbability
         self.advanceReplaySnapshotAtDestinationContact =
             advanceReplaySnapshotAtDestinationContact
@@ -204,6 +234,11 @@ public struct HumanoidBoxCarryTaskConfig: Sendable {
         self.carryLocomotionRewardMultiplier =
             carryLocomotionRewardMultiplier
         self.carryTrackingVariance = carryTrackingVariance
+        self.coupledCarryCommandTracking = coupledCarryCommandTracking
+        self.carryRootProgressRewardWeight = carryRootProgressRewardWeight
+        self.carryAlternatingStepRewardWeight =
+            carryAlternatingStepRewardWeight
+        self.minimumLoadedAlternatingSteps = minimumLoadedAlternatingSteps
     }
 }
 
@@ -250,15 +285,25 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
     public static let manipulationEntryDistance: Float = 0.05
     public static let manipulationEntrySpeed: Float = 0.10
     public static let manipulationEntryDwellSteps = 8
-    /// A contact manifold can be an upper-edge brush. A grasp milestone also
-    /// requires each terminal hand sphere to be near its opposing face target.
-    public static let loadBearingHandTargetDistance: Float = 0.10
+    /// The H1 forearm collider is a 25 mm-radius capsule whose terminal sphere
+    /// is the hand contact shape. A mechanically useful
+    /// two-hand grasp may contact anywhere inside the two opposing side faces;
+    /// requiring the sphere centers to coincide with the face centers rejects
+    /// valid upper/front grasps even when their box-local transforms are stable.
+    public static let handCollisionSphereRadius: Float = 0.025
+    public static let loadBearingOpposingFaceQuality: Float = 0.5
     public static let loadBearingBoxUprightAlignment: Float = 0.80
+    /// Checkpoint schema v0 encoded a centered-face proximity bit at policy
+    /// input 91. Preserve that input exactly so immutable trained policies and
+    /// residual-flow artifacts remain replayable. It is only an observation
+    /// hint: physical milestones, rewards, metrics, and certification use
+    /// `isOpposingFaceGrasp`.
+    private static let checkpointFaceHintDistance: Float = 0.10
     /// The default final evaluation requires a visually unmistakable four-
     /// centimeter air gap. Training may begin with a smaller, still physical
     /// unsupported gap and ramp to this value; evaluation never relaxes it.
     public static let liftClearance: Float = 0.04
-    private static let actionDimension = 19
+    public static let actionDimension = 19
     private static let trackingVariance: Float = 0.25
     /// Sustained clearance must outweigh simply squeezing the object against
     /// its support. Progress potentials alone telescope to zero and otherwise
@@ -266,6 +311,26 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
     private static let liftHoldRewardWeight: Float = 24
     private static let bilateralAcquisitionRewardWeight: Float = 8
     private static let unilateralContactPenaltyWeight: Float = 4
+    /// Contact manifolds persist inside the narrowphase margin. A foot counts
+    /// as load bearing only when it carries at least this share of the current
+    /// total foot normal load.
+    static let loadedFootMinimumNormalLoadShare: Float = 0.02
+    /// Reject zero-force sole shuffles as swing: a touchdown must follow a
+    /// measured sole clearance of at least 15 mm.
+    static let loadedSwingMinimumClearance: Float = 0.015
+
+    static func loadBearingFootContacts(
+        manifoldContacts: [Bool], normalLoads: [Float]
+    ) -> [Bool] {
+        precondition(manifoldContacts.count == 2 && normalLoads.count == 2)
+        let total = normalLoads[0] + normalLoads[1]
+        guard total > 1e-6 else { return [false, false] }
+        return (0..<2).map {
+            manifoldContacts[$0]
+                && normalLoads[$0] / total
+                    >= loadedFootMinimumNormalLoadShare
+        }
+    }
 
     static func isStablePlacement(
         lifted: Bool, destinationContact: Bool,
@@ -280,6 +345,92 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             && !leftHandContact && !rightHandContact
             && linearSpeed <= placementMaximumLinearSpeed
             && angularSpeed <= placementMaximumAngularSpeed
+    }
+
+    /// Whether opposing contact duals can supply enough Coulomb friction to
+    /// support the box against gravity. A collision-margin manifold with a
+    /// zero dual is contact geometry, not a load-bearing grasp.
+    static func frictionGraspSupportsWeight(
+        leftNormalLoad: Float, rightNormalLoad: Float,
+        boxMass: Float, friction: Float,
+        gravityMagnitude: Float = 9.81
+    ) -> Bool {
+        frictionGraspSupportFraction(
+            leftNormalLoad: leftNormalLoad,
+            rightNormalLoad: rightNormalLoad,
+            boxMass: boxMass,
+            friction: friction,
+            gravityMagnitude: gravityMagnitude) >= 1
+    }
+
+    static func frictionGraspSupportFraction(
+        leftNormalLoad: Float, rightNormalLoad: Float,
+        boxMass: Float, friction: Float,
+        gravityMagnitude: Float = 9.81
+    ) -> Float {
+        guard leftNormalLoad.isFinite, rightNormalLoad.isFinite,
+              boxMass.isFinite, friction.isFinite,
+              gravityMagnitude.isFinite,
+              leftNormalLoad >= 0, rightNormalLoad >= 0,
+              boxMass > 0, friction > 0, gravityMagnitude > 0 else {
+            return 0
+        }
+        guard leftNormalLoad > 0, rightNormalLoad > 0 else { return 0 }
+        return friction * (leftNormalLoad + rightNormalLoad)
+            / (boxMass * gravityMagnitude)
+    }
+
+    /// Continuous contact geometry for the two opposing local-Y box faces.
+    /// Bilateral collision remains a separate hard requirement at the call
+    /// site. Normal-plane error measures whether each sphere is seated on its
+    /// expected side; tangential error is charged only after the sphere center
+    /// leaves the finite face expanded by the contact margin.
+    static func opposingFaceGraspQuality(
+        localLeftHand: F3, localRightHand: F3
+    ) -> Float {
+        guard localLeftHand.y > 0, localRightHand.y < 0 else { return 0 }
+        let half = 0.5 * boxDimensions
+        let normalTarget = half.y + handCollisionSphereRadius
+        let normalError = max(
+            abs(localLeftHand.y - normalTarget),
+            abs(localRightHand.y + normalTarget))
+        let xBound = half.x + handCollisionSphereRadius
+        let zBound = half.z + handCollisionSphereRadius
+        func tangentialExcess(_ hand: F3) -> Float {
+            max(
+                max(abs(hand.x) - xBound, 0),
+                max(abs(hand.z) - zBound, 0))
+        }
+        let tangentialError = max(
+            tangentialExcess(localLeftHand),
+            tangentialExcess(localRightHand))
+        let worstError = max(normalError, tangentialError)
+        return exp(-400 * worstError * worstError)
+    }
+
+    static func isOpposingFaceGrasp(
+        localLeftHand: F3, localRightHand: F3,
+        bilateralContact: Bool, boxUprightAlignment: Float
+    ) -> Bool {
+        bilateralContact
+            && opposingFaceGraspQuality(
+                localLeftHand: localLeftHand,
+                localRightHand: localRightHand)
+                >= loadBearingOpposingFaceQuality
+            && boxUprightAlignment >= loadBearingBoxUprightAlignment
+    }
+
+    static func commandTrackingReward(
+        planarErrorSquared: Float, yawErrorSquared: Float,
+        variance: Float, coupled: Bool
+    ) -> Float {
+        precondition(
+            planarErrorSquared >= 0 && yawErrorSquared >= 0 && variance > 0)
+        let linear = exp(-planarErrorSquared / variance)
+        let yaw = exp(-yawErrorSquared / variance)
+        // The factor of two preserves the additive objective's maximum, so
+        // enabling coupling changes the loophole rather than reward scale.
+        return coupled ? 2 * linear * yaw : linear + yaw
     }
 
     public let spec: RLTaskSpec
@@ -317,12 +468,21 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
     private var previousBoxHeights: [Float]
     private var previousBoxClearances: [Float]
     private var previousPlacementDistances: [Float]
+    private var previousRootPositions: [F3]
     private var maximumBoxHeights: [Float]
     private var maximumBoxClearances: [Float]
     private var maximumCarryDistances: [Float]
+    private var maximumLoadedRootDisplacements: [Float]
     private var currentStableUnsupportedSteps: [Int]
     private var maximumStableUnsupportedSteps: [Int]
     private var liftOrigins: [F3]
+    private var liftRootOrigins: [F3]
+    private var loadedFootAirTimes: [[Float]]
+    private var loadedFootMaximumClearances: [[Float]]
+    private var previousLoadedFootContacts: [[Bool]]
+    private var lastLoadedTouchdownFeet: [Int]
+    private var loadedTouchdownCounts: [Int]
+    private var loadedAlternatingStepCounts: [Int]
     private var approached: [Bool]
     private var approachSettleCounts: [Int]
     private var manipulationHandoffCounts: [Int]
@@ -354,6 +514,79 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         var destinationContact: Bool
     }
     private var carryStartSnapshots: [CarryStartSnapshot?]
+
+    /// Exact same-instance fork used by simulator-backed trajectory search.
+    /// This is intentionally opaque: it captures both solver temporal state
+    /// and every task variable that affects the next observation, reward, or
+    /// termination. It is not a portable checkpoint and cannot be restored
+    /// into another task or environment layout.
+    public struct SpeculationSnapshot {
+        fileprivate var solver: GPUSolver.RigidSpeculationSnapshot
+        fileprivate var trainingMode: Bool
+        fileprivate var trainingControlSteps: Int
+        fileprivate var commands: [F3]
+        fileprivate var phases: [Int]
+        fileprivate var stationDistances: [Float]
+        fileprivate var stationCenters: [F3]
+        fileprivate var destinationPedestalCenters: [F3]
+        fileprivate var destinationBoxTargets: [F3]
+        fileprivate var previousActions: ContiguousArray<Float>
+        fileprivate var previousJointVelocities: [[Float]]
+        fileprivate var episodeLengths: [Int]
+        fileprivate var episodeReturns: [Float]
+        fileprivate var previousPregraspDistances: [Float]
+        fileprivate var previousReachDistances: [Float]
+        fileprivate var previousBoxHeights: [Float]
+        fileprivate var previousBoxClearances: [Float]
+        fileprivate var previousPlacementDistances: [Float]
+        fileprivate var previousRootPositions: [F3]
+        fileprivate var maximumBoxHeights: [Float]
+        fileprivate var maximumBoxClearances: [Float]
+        fileprivate var maximumCarryDistances: [Float]
+        fileprivate var maximumLoadedRootDisplacements: [Float]
+        fileprivate var currentStableUnsupportedSteps: [Int]
+        fileprivate var maximumStableUnsupportedSteps: [Int]
+        fileprivate var liftOrigins: [F3]
+        fileprivate var liftRootOrigins: [F3]
+        fileprivate var loadedFootAirTimes: [[Float]]
+        fileprivate var loadedFootMaximumClearances: [[Float]]
+        fileprivate var previousLoadedFootContacts: [[Bool]]
+        fileprivate var lastLoadedTouchdownFeet: [Int]
+        fileprivate var loadedTouchdownCounts: [Int]
+        fileprivate var loadedAlternatingStepCounts: [Int]
+        fileprivate var approached: [Bool]
+        fileprivate var approachSettleCounts: [Int]
+        fileprivate var manipulationHandoffCounts: [Int]
+        fileprivate var bilateralGrasped: [Bool]
+        fileprivate var lifted: [Bool]
+        fileprivate var dropped: [Bool]
+        fileprivate var carryHandoffCounts: [Int]
+        fileprivate var successDwellCounts: [Int]
+        fileprivate var carryMilestoneReached: [Bool]
+        fileprivate var placed: [Bool]
+        fileprivate var missedContactCounts: [Int]
+        fileprivate var latestLeftHandContacts: [Bool]
+        fileprivate var latestRightHandContacts: [Bool]
+        fileprivate var latestDestinationContacts: [Bool]
+        fileprivate var commandRNGs: [SplitMix64]
+        fileprivate var noiseRNGs: [SplitMix64]
+        fileprivate var resetRNG: SplitMix64
+    }
+
+    /// A cold-start physical/task boundary that can be restored into the same
+    /// task revision with a different environment count. Unlike
+    /// `SpeculationSnapshot`, solver buffers are not transplanted: authored
+    /// body state and task memory are projected into the destination layout,
+    /// then incident constraint warm starts are cleared by `setBodyStates`.
+    ///
+    /// The payload is intentionally opaque. Callers may retain it only while
+    /// the originating task/configuration remains alive; durable artifacts
+    /// continue to record the complete action lineage used to certify it.
+    public struct PortableSpeculationState {
+        fileprivate var sourceEnvironment: Int
+        fileprivate var task: SpeculationSnapshot
+        fileprivate var bodyStates: [GPUSolver.RigidBodyState]
+    }
 
     public init(configuration: HumanoidBoxCarryTaskConfig) throws {
         guard configuration.numEnvironments > 0,
@@ -404,9 +637,17 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
               configuration.carryLocomotionRewardMultiplier <= 50,
               configuration.carryTrackingVariance >= 0.005,
               configuration.carryTrackingVariance <= 1,
+              configuration.carryRootProgressRewardWeight >= 0,
+              configuration.carryRootProgressRewardWeight <= 1_000,
+              configuration.carryAlternatingStepRewardWeight >= 0,
+              configuration.carryAlternatingStepRewardWeight <= 100,
+              (0...100).contains(configuration.minimumLoadedAlternatingSteps),
               !configuration.compositionalCarryController
                 || !configuration.upperBodyCarryController,
               !configuration.carryLocomotionControlsTorso
+                || configuration.upperBodyCarryController,
+              !configuration
+                    .initializeCarryLocomotionExpertFromBaseOnTransfer
                 || configuration.upperBodyCarryController,
               !configuration.initializeCarryExpertFromBaseOnTransfer
                 || !configuration
@@ -523,6 +764,11 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                 if configuration.initializeCarryExpertFromBaseOnTransfer {
                     values["initializeCarryExpertFromBaseOnTransfer"] = 1
                 }
+                if configuration
+                        .initializeCarryLocomotionExpertFromBaseOnTransfer {
+                    values[
+                        "initializeCarryLocomotionExpertFromBaseOnTransfer"] = 1
+                }
                 if configuration.carryStartReplayProbability > 0 {
                     values["carryStartReplayProbability"] =
                         configuration.carryStartReplayProbability
@@ -557,6 +803,21 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                     values["carryTrackingVariance"] =
                         configuration.carryTrackingVariance
                 }
+                if configuration.coupledCarryCommandTracking {
+                    values["coupledCarryCommandTracking"] = 1
+                }
+                if configuration.carryRootProgressRewardWeight > 0 {
+                    values["carryRootProgressRewardWeight"] =
+                        configuration.carryRootProgressRewardWeight
+                }
+                if configuration.carryAlternatingStepRewardWeight > 0 {
+                    values["carryAlternatingStepRewardWeight"] =
+                        configuration.carryAlternatingStepRewardWeight
+                }
+                if configuration.minimumLoadedAlternatingSteps > 0 {
+                    values["minimumLoadedAlternatingSteps"] = Float(
+                        configuration.minimumLoadedAlternatingSteps)
+                }
                 return values
             }())
 
@@ -579,12 +840,24 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         previousBoxHeights = [Float](repeating: Self.boxRestingHeight, count: n)
         previousBoxClearances = [Float](repeating: 0, count: n)
         previousPlacementDistances = [Float](repeating: 0, count: n)
+        previousRootPositions = [F3](repeating: .zero, count: n)
         maximumBoxHeights = [Float](repeating: Self.boxRestingHeight, count: n)
         maximumBoxClearances = [Float](repeating: 0, count: n)
         maximumCarryDistances = [Float](repeating: 0, count: n)
+        maximumLoadedRootDisplacements = [Float](repeating: 0, count: n)
         currentStableUnsupportedSteps = [Int](repeating: 0, count: n)
         maximumStableUnsupportedSteps = [Int](repeating: 0, count: n)
         liftOrigins = [F3](repeating: .zero, count: n)
+        liftRootOrigins = [F3](repeating: .zero, count: n)
+        loadedFootAirTimes = [[Float]](
+            repeating: [Float](repeating: 0, count: 2), count: n)
+        loadedFootMaximumClearances = [[Float]](
+            repeating: [Float](repeating: 0, count: 2), count: n)
+        previousLoadedFootContacts = [[Bool]](
+            repeating: [Bool](repeating: false, count: 2), count: n)
+        lastLoadedTouchdownFeet = [Int](repeating: -1, count: n)
+        loadedTouchdownCounts = [Int](repeating: 0, count: n)
+        loadedAlternatingStepCounts = [Int](repeating: 0, count: n)
         approached = [Bool](repeating: false, count: n)
         approachSettleCounts = [Int](repeating: 0, count: n)
         manipulationHandoffCounts = [Int](repeating: 0, count: n)
@@ -622,6 +895,473 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
     public func setTrainingMode(_ enabled: Bool) {
         trainingMode = enabled
         if enabled { trainingControlSteps = 0 }
+    }
+
+    public func captureSpeculationSnapshot() -> SpeculationSnapshot {
+        SpeculationSnapshot(
+            solver: environment.solver.captureRigidSpeculationSnapshot(),
+            trainingMode: trainingMode,
+            trainingControlSteps: trainingControlSteps,
+            commands: commands, phases: phases,
+            stationDistances: stationDistances,
+            stationCenters: stationCenters,
+            destinationPedestalCenters: destinationPedestalCenters,
+            destinationBoxTargets: destinationBoxTargets,
+            previousActions: previousActions,
+            previousJointVelocities: previousJointVelocities,
+            episodeLengths: episodeLengths,
+            episodeReturns: episodeReturns,
+            previousPregraspDistances: previousPregraspDistances,
+            previousReachDistances: previousReachDistances,
+            previousBoxHeights: previousBoxHeights,
+            previousBoxClearances: previousBoxClearances,
+            previousPlacementDistances: previousPlacementDistances,
+            previousRootPositions: previousRootPositions,
+            maximumBoxHeights: maximumBoxHeights,
+            maximumBoxClearances: maximumBoxClearances,
+            maximumCarryDistances: maximumCarryDistances,
+            maximumLoadedRootDisplacements:
+                maximumLoadedRootDisplacements,
+            currentStableUnsupportedSteps: currentStableUnsupportedSteps,
+            maximumStableUnsupportedSteps: maximumStableUnsupportedSteps,
+            liftOrigins: liftOrigins,
+            liftRootOrigins: liftRootOrigins,
+            loadedFootAirTimes: loadedFootAirTimes,
+            loadedFootMaximumClearances: loadedFootMaximumClearances,
+            previousLoadedFootContacts: previousLoadedFootContacts,
+            lastLoadedTouchdownFeet: lastLoadedTouchdownFeet,
+            loadedTouchdownCounts: loadedTouchdownCounts,
+            loadedAlternatingStepCounts: loadedAlternatingStepCounts,
+            approached: approached,
+            approachSettleCounts: approachSettleCounts,
+            manipulationHandoffCounts: manipulationHandoffCounts,
+            bilateralGrasped: bilateralGrasped, lifted: lifted,
+            dropped: dropped, carryHandoffCounts: carryHandoffCounts,
+            successDwellCounts: successDwellCounts,
+            carryMilestoneReached: carryMilestoneReached, placed: placed,
+            missedContactCounts: missedContactCounts,
+            latestLeftHandContacts: latestHandContacts.left,
+            latestRightHandContacts: latestHandContacts.right,
+            latestDestinationContacts: latestDestinationContacts,
+            commandRNGs: commandRNGs, noiseRNGs: noiseRNGs,
+            resetRNG: resetRNG)
+    }
+
+    public func restoreSpeculationSnapshot(_ snapshot: SpeculationSnapshot) {
+        precondition(snapshot.commands.count == spec.numEnvironments
+            && snapshot.phases.count == spec.numEnvironments,
+            "speculation snapshot belongs to another task shape")
+        environment.solver.restoreRigidSpeculationSnapshot(snapshot.solver)
+        trainingMode = snapshot.trainingMode
+        trainingControlSteps = snapshot.trainingControlSteps
+        commands = snapshot.commands
+        phases = snapshot.phases
+        stationDistances = snapshot.stationDistances
+        stationCenters = snapshot.stationCenters
+        destinationPedestalCenters = snapshot.destinationPedestalCenters
+        destinationBoxTargets = snapshot.destinationBoxTargets
+        previousActions = snapshot.previousActions
+        previousJointVelocities = snapshot.previousJointVelocities
+        episodeLengths = snapshot.episodeLengths
+        episodeReturns = snapshot.episodeReturns
+        previousPregraspDistances = snapshot.previousPregraspDistances
+        previousReachDistances = snapshot.previousReachDistances
+        previousBoxHeights = snapshot.previousBoxHeights
+        previousBoxClearances = snapshot.previousBoxClearances
+        previousPlacementDistances = snapshot.previousPlacementDistances
+        previousRootPositions = snapshot.previousRootPositions
+        maximumBoxHeights = snapshot.maximumBoxHeights
+        maximumBoxClearances = snapshot.maximumBoxClearances
+        maximumCarryDistances = snapshot.maximumCarryDistances
+        maximumLoadedRootDisplacements =
+            snapshot.maximumLoadedRootDisplacements
+        currentStableUnsupportedSteps = snapshot.currentStableUnsupportedSteps
+        maximumStableUnsupportedSteps = snapshot.maximumStableUnsupportedSteps
+        liftOrigins = snapshot.liftOrigins
+        liftRootOrigins = snapshot.liftRootOrigins
+        loadedFootAirTimes = snapshot.loadedFootAirTimes
+        loadedFootMaximumClearances =
+            snapshot.loadedFootMaximumClearances
+        previousLoadedFootContacts = snapshot.previousLoadedFootContacts
+        lastLoadedTouchdownFeet = snapshot.lastLoadedTouchdownFeet
+        loadedTouchdownCounts = snapshot.loadedTouchdownCounts
+        loadedAlternatingStepCounts = snapshot.loadedAlternatingStepCounts
+        approached = snapshot.approached
+        approachSettleCounts = snapshot.approachSettleCounts
+        manipulationHandoffCounts = snapshot.manipulationHandoffCounts
+        bilateralGrasped = snapshot.bilateralGrasped
+        lifted = snapshot.lifted
+        dropped = snapshot.dropped
+        carryHandoffCounts = snapshot.carryHandoffCounts
+        successDwellCounts = snapshot.successDwellCounts
+        carryMilestoneReached = snapshot.carryMilestoneReached
+        placed = snapshot.placed
+        missedContactCounts = snapshot.missedContactCounts
+        latestHandContacts = (
+            snapshot.latestLeftHandContacts,
+            snapshot.latestRightHandContacts)
+        latestDestinationContacts = snapshot.latestDestinationContacts
+        commandRNGs = snapshot.commandRNGs
+        noiseRNGs = snapshot.noiseRNGs
+        resetRNG = snapshot.resetRNG
+    }
+
+    public func capturePortableSpeculationState(
+        sourceEnvironment source: Int = 0
+    ) -> PortableSpeculationState {
+        precondition((0..<spec.numEnvironments).contains(source))
+        let refs = environment.refs[source]
+        guard let box = refs.projectile else {
+            preconditionFailure("carry speculation requires a box body")
+        }
+        return PortableSpeculationState(
+            sourceEnvironment: source,
+            task: captureSpeculationSnapshot(),
+            bodyStates: environment.solver.bodyStates(refs.bodies + [box]))
+    }
+
+    /// Restore one certified row into every row of this task, preserving the
+    /// measured controller/task memory but deliberately starting physics from
+    /// a portable cold constraint state.
+    public func restorePortableSpeculationState(
+        _ portable: PortableSpeculationState
+    ) {
+        let source = portable.sourceEnvironment
+        let saved = portable.task
+        precondition(saved.commands.indices.contains(source))
+        let n = spec.numEnvironments
+
+        func repeated<T>(_ values: [T]) -> [T] {
+            [T](repeating: values[source], count: n)
+        }
+        func repeatedRows<T>(_ values: [[T]]) -> [[T]] {
+            [[T]](repeating: values[source], count: n)
+        }
+
+        // Keep the destination solver's own buffer shape, but replace every
+        // task-owned row with the certified source row.
+        var local = captureSpeculationSnapshot()
+        local.trainingMode = saved.trainingMode
+        local.trainingControlSteps = saved.trainingControlSteps
+        local.commands = repeated(saved.commands)
+        local.phases = repeated(saved.phases)
+        local.stationDistances = repeated(saved.stationDistances)
+        local.stationCenters = repeated(saved.stationCenters)
+        local.destinationPedestalCenters = repeated(
+            saved.destinationPedestalCenters)
+        local.destinationBoxTargets = repeated(saved.destinationBoxTargets)
+        let actionBase = source * Self.actionDimension
+        let sourceAction = Array(saved.previousActions[
+            actionBase..<(actionBase + Self.actionDimension)])
+        local.previousActions = ContiguousArray(
+            (0..<n).flatMap { _ in sourceAction })
+        local.previousJointVelocities = repeatedRows(
+            saved.previousJointVelocities)
+        local.episodeLengths = repeated(saved.episodeLengths)
+        local.episodeReturns = repeated(saved.episodeReturns)
+        local.previousPregraspDistances = repeated(
+            saved.previousPregraspDistances)
+        local.previousReachDistances = repeated(saved.previousReachDistances)
+        local.previousBoxHeights = repeated(saved.previousBoxHeights)
+        local.previousBoxClearances = repeated(saved.previousBoxClearances)
+        local.previousPlacementDistances = repeated(
+            saved.previousPlacementDistances)
+        local.previousRootPositions = repeated(saved.previousRootPositions)
+        local.maximumBoxHeights = repeated(saved.maximumBoxHeights)
+        local.maximumBoxClearances = repeated(saved.maximumBoxClearances)
+        local.maximumCarryDistances = repeated(saved.maximumCarryDistances)
+        local.maximumLoadedRootDisplacements = repeated(
+            saved.maximumLoadedRootDisplacements)
+        local.currentStableUnsupportedSteps = repeated(
+            saved.currentStableUnsupportedSteps)
+        local.maximumStableUnsupportedSteps = repeated(
+            saved.maximumStableUnsupportedSteps)
+        local.liftOrigins = repeated(saved.liftOrigins)
+        local.liftRootOrigins = repeated(saved.liftRootOrigins)
+        local.loadedFootAirTimes = repeatedRows(saved.loadedFootAirTimes)
+        local.loadedFootMaximumClearances = repeatedRows(
+            saved.loadedFootMaximumClearances)
+        local.previousLoadedFootContacts = repeatedRows(
+            saved.previousLoadedFootContacts)
+        local.lastLoadedTouchdownFeet = repeated(
+            saved.lastLoadedTouchdownFeet)
+        local.loadedTouchdownCounts = repeated(saved.loadedTouchdownCounts)
+        local.loadedAlternatingStepCounts = repeated(
+            saved.loadedAlternatingStepCounts)
+        local.approached = repeated(saved.approached)
+        local.approachSettleCounts = repeated(saved.approachSettleCounts)
+        local.manipulationHandoffCounts = repeated(
+            saved.manipulationHandoffCounts)
+        local.bilateralGrasped = repeated(saved.bilateralGrasped)
+        local.lifted = repeated(saved.lifted)
+        local.dropped = repeated(saved.dropped)
+        local.carryHandoffCounts = repeated(saved.carryHandoffCounts)
+        local.successDwellCounts = repeated(saved.successDwellCounts)
+        local.carryMilestoneReached = repeated(saved.carryMilestoneReached)
+        local.placed = repeated(saved.placed)
+        local.missedContactCounts = repeated(saved.missedContactCounts)
+        local.latestLeftHandContacts = repeated(
+            saved.latestLeftHandContacts)
+        local.latestRightHandContacts = repeated(
+            saved.latestRightHandContacts)
+        local.latestDestinationContacts = repeated(
+            saved.latestDestinationContacts)
+        local.commandRNGs = repeated(saved.commandRNGs)
+        local.noiseRNGs = repeated(saved.noiseRNGs)
+        local.resetRNG = saved.resetRNG
+        restoreSpeculationSnapshot(local)
+
+        let stationCenters = [F3](repeating: saved.stationCenters[source],
+                                  count: n)
+        let destinationCenters = [F3](
+            repeating: saved.destinationPedestalCenters[source], count: n)
+        let boxCenter = portable.bodyStates.last!.position
+        environment.placeCarryStations(
+            environmentIDs: Array(0..<n),
+            pedestalCenters: stationCenters,
+            boxCenters: [F3](repeating: boxCenter, count: n),
+            destinationPedestalCenters: destinationCenters)
+
+        var bodyUpdates = [GPUSolver.BodyStateUpdate]()
+        var motorTargets = [GPUSolver.MotorTargetUpdate]()
+        bodyUpdates.reserveCapacity(n * portable.bodyStates.count)
+        motorTargets.reserveCapacity(n * Self.actionDimension)
+        for environmentIndex in 0..<n {
+            let refs = environment.refs[environmentIndex]
+            guard let box = refs.projectile else {
+                preconditionFailure("carry speculation requires a box body")
+            }
+            let bodies = refs.bodies + [box]
+            precondition(bodies.count == portable.bodyStates.count)
+            for (body, state) in zip(bodies, portable.bodyStates) {
+                bodyUpdates.append(.init(
+                    body: body, position: state.position,
+                    rotation: state.rotation,
+                    linearVelocity: state.linearVelocity,
+                    angularVelocity: state.angularVelocity))
+            }
+            for jointIndex in 0..<Self.actionDimension {
+                var action = sourceAction[jointIndex]
+                if jointIndex >= 11 {
+                    action *= configuration
+                        .manipulationArmActionScaleMultiplier
+                }
+                let jointID = refs.motors[jointIndex]
+                let joint = environment.scene.joints[jointID]
+                let requested =
+                    HumanoidWalkEnv.defaultJointPositions[jointIndex]
+                    + action * HumanoidWalkEnv.actionScales[jointIndex]
+                motorTargets.append(.init(
+                    joint: jointID,
+                    angle: simd_clamp(
+                        requested, joint.limitLo, joint.limitHi)))
+            }
+            carryStartSnapshots[environmentIndex] = nil
+        }
+        environment.solver.setBodyStates(bodyUpdates)
+        environment.solver.setMotorTargets(motorTargets)
+    }
+
+    /// Make every batched speculative replica an exact cold-start copy of one
+    /// certified task row. Batched CEM must compare actions from the same
+    /// physical branch; replaying a long contact-rich prefix independently
+    /// in each replica permits tiny solver-order differences to become
+    /// different grasp and foot-contact states before search even begins.
+    ///
+    /// `setBodyStates` deliberately clears incident joint/contact warm starts
+    /// for every copied body, so all replicas share the same explicit
+    /// branching boundary instead of inheriting different hidden multipliers.
+    public func canonicalizeSpeculationReplicas(
+        sourceEnvironment source: Int = 0
+    ) {
+        precondition((0..<spec.numEnvironments).contains(source))
+        let sourceRefs = environment.refs[source]
+        guard let sourceProjectile = sourceRefs.projectile else {
+            preconditionFailure("carry speculation requires a box body")
+        }
+        let sourceBodyIDs = sourceRefs.bodies + [sourceProjectile]
+        let sourceBodyStates = environment.solver.bodyStates(sourceBodyIDs)
+        var bodyUpdates = [GPUSolver.BodyStateUpdate]()
+        bodyUpdates.reserveCapacity(
+            spec.numEnvironments * sourceBodyStates.count)
+        var motorTargets = [GPUSolver.MotorTargetUpdate]()
+        motorTargets.reserveCapacity(
+            spec.numEnvironments * Self.actionDimension)
+        // Include the source row itself. `setBodyStates` is also the declared
+        // cold-start boundary: it clears incident joint/contact warm starts.
+        // Returning early for a one-environment task previously made UI
+        // validation continue with warm multipliers while batched planning
+        // cold-started row zero, so a long contact lineage could not replay
+        // across the two required execution regimes.
+        for e in 0..<spec.numEnvironments {
+            let refs = environment.refs[e]
+            guard let projectile = refs.projectile else {
+                preconditionFailure("carry speculation requires a box body")
+            }
+            let bodyIDs = refs.bodies + [projectile]
+            precondition(bodyIDs.count == sourceBodyStates.count)
+            for (body, state) in zip(bodyIDs, sourceBodyStates) {
+                bodyUpdates.append(.init(
+                    body: body, position: state.position,
+                    rotation: state.rotation,
+                    linearVelocity: state.linearVelocity,
+                    angularVelocity: state.angularVelocity))
+            }
+            for j in 0..<Self.actionDimension {
+                let jointID = refs.motors[j]
+                var action = previousActions[
+                    source * Self.actionDimension + j]
+                if j >= 11 {
+                    action *= configuration
+                        .manipulationArmActionScaleMultiplier
+                }
+                let requested = HumanoidWalkEnv.defaultJointPositions[j]
+                    + action * HumanoidWalkEnv.actionScales[j]
+                let joint = environment.scene.joints[jointID]
+                motorTargets.append(.init(
+                    joint: jointID,
+                    angle: simd_clamp(
+                        requested, joint.limitLo, joint.limitHi)))
+            }
+        }
+        environment.solver.setBodyStates(bodyUpdates)
+        environment.solver.setMotorTargets(motorTargets)
+
+        for e in 0..<spec.numEnvironments where e != source {
+            commands[e] = commands[source]
+            phases[e] = phases[source]
+            stationDistances[e] = stationDistances[source]
+            stationCenters[e] = stationCenters[source]
+            destinationPedestalCenters[e] =
+                destinationPedestalCenters[source]
+            destinationBoxTargets[e] = destinationBoxTargets[source]
+            previousJointVelocities[e] = previousJointVelocities[source]
+            episodeLengths[e] = episodeLengths[source]
+            episodeReturns[e] = episodeReturns[source]
+            previousPregraspDistances[e] =
+                previousPregraspDistances[source]
+            previousReachDistances[e] = previousReachDistances[source]
+            previousBoxHeights[e] = previousBoxHeights[source]
+            previousBoxClearances[e] = previousBoxClearances[source]
+            previousPlacementDistances[e] =
+                previousPlacementDistances[source]
+            previousRootPositions[e] = previousRootPositions[source]
+            maximumBoxHeights[e] = maximumBoxHeights[source]
+            maximumBoxClearances[e] = maximumBoxClearances[source]
+            maximumCarryDistances[e] = maximumCarryDistances[source]
+            maximumLoadedRootDisplacements[e] =
+                maximumLoadedRootDisplacements[source]
+            currentStableUnsupportedSteps[e] =
+                currentStableUnsupportedSteps[source]
+            maximumStableUnsupportedSteps[e] =
+                maximumStableUnsupportedSteps[source]
+            liftOrigins[e] = liftOrigins[source]
+            liftRootOrigins[e] = liftRootOrigins[source]
+            loadedFootAirTimes[e] = loadedFootAirTimes[source]
+            loadedFootMaximumClearances[e] =
+                loadedFootMaximumClearances[source]
+            previousLoadedFootContacts[e] =
+                previousLoadedFootContacts[source]
+            lastLoadedTouchdownFeet[e] =
+                lastLoadedTouchdownFeet[source]
+            loadedTouchdownCounts[e] = loadedTouchdownCounts[source]
+            loadedAlternatingStepCounts[e] =
+                loadedAlternatingStepCounts[source]
+            approached[e] = approached[source]
+            approachSettleCounts[e] = approachSettleCounts[source]
+            manipulationHandoffCounts[e] =
+                manipulationHandoffCounts[source]
+            bilateralGrasped[e] = bilateralGrasped[source]
+            lifted[e] = lifted[source]
+            dropped[e] = dropped[source]
+            carryHandoffCounts[e] = carryHandoffCounts[source]
+            successDwellCounts[e] = successDwellCounts[source]
+            carryMilestoneReached[e] = carryMilestoneReached[source]
+            placed[e] = placed[source]
+            missedContactCounts[e] = missedContactCounts[source]
+            latestHandContacts.left[e] = latestHandContacts.left[source]
+            latestHandContacts.right[e] = latestHandContacts.right[source]
+            latestDestinationContacts[e] =
+                latestDestinationContacts[source]
+            commandRNGs[e] = commandRNGs[source]
+            noiseRNGs[e] = noiseRNGs[source]
+            carryStartSnapshots[e] = carryStartSnapshots[source]
+            for j in 0..<Self.actionDimension {
+                previousActions[e * Self.actionDimension + j] =
+                    previousActions[source * Self.actionDimension + j]
+            }
+        }
+    }
+
+    /// Canonicalize simulator/task state and the host-visible observation
+    /// consumed by the next policy or flow action.
+    public func canonicalizeSpeculationReplicas(
+        observation: inout RLObservationBatch,
+        sourceEnvironment source: Int = 0
+    ) {
+        precondition((0..<spec.numEnvironments).contains(source))
+        canonicalizeSpeculationReplicas(sourceEnvironment: source)
+        guard spec.numEnvironments > 1 else { return }
+
+        broadcastSpeculationSourceRow(
+            &observation.policy, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &observation.privileged, sourceEnvironment: source)
+    }
+
+    /// Canonicalize both simulator/task state and every retained host-visible
+    /// batch. Use this overload when the caller retains the previous step
+    /// result across a speculative branch boundary.
+    public func canonicalizeSpeculationReplicas(
+        observation: inout RLObservationBatch,
+        result: inout RLStepBatch,
+        sourceEnvironment source: Int = 0
+    ) {
+        canonicalizeSpeculationReplicas(
+            observation: &observation, sourceEnvironment: source)
+
+        broadcastSpeculationSourceRow(
+            &result.observations.policy, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.observations.privileged, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.rewards, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.terminated, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.truncated, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.successes, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.imitationMilestones, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.finalObservations, sourceEnvironment: source)
+        broadcastSpeculationSourceRow(
+            &result.hasFinalObservation, sourceEnvironment: source)
+        for key in result.metrics.keys {
+            var values = result.metrics[key]!
+            broadcastSpeculationSourceRow(
+                &values, sourceEnvironment: source)
+            result.metrics[key] = values
+        }
+    }
+
+    private func broadcastSpeculationSourceRow<T>(
+        _ values: inout ContiguousArray<T>,
+        sourceEnvironment source: Int
+    ) {
+        guard !values.isEmpty else { return }
+        precondition(values.count.isMultiple(of: spec.numEnvironments))
+        let width = values.count / spec.numEnvironments
+        let sourceBase = source * width
+        let row = Array(values[sourceBase..<(sourceBase + width)])
+        for environment in 0..<spec.numEnvironments
+            where environment != source {
+            let base = environment * width
+            for component in 0..<width {
+                values[base + component] = row[component]
+            }
+        }
     }
 
     public func setTrainingProgress(environmentSteps: Int) {
@@ -743,7 +1483,16 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         var states = environment.states()
         var manipulation = environment.manipulationStates()
         let groundContacts = environment.groundContacts()
+        let groundContactNormalLoads =
+            environment.groundContactNormalLoads()
+        let loadBearingFootContacts = (0..<n).map {
+            Self.loadBearingFootContacts(
+                manifoldContacts: groundContacts.feet[$0],
+                normalLoads: groundContactNormalLoads[$0])
+        }
         let handContacts = environment.boxHandContacts()
+        let handContactNormalLoads =
+            environment.boxHandContactNormalLoads()
         let supportContacts = environment.boxCarrySupportContacts()
         let previousDestinationContacts = latestDestinationContacts
         latestHandContacts = handContacts
@@ -756,6 +1505,10 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         var rewardLift = ContiguousArray(repeating: Float(0), count: n)
         var rewardRetention = ContiguousArray(repeating: Float(0), count: n)
         var rewardCarry = ContiguousArray(repeating: Float(0), count: n)
+        var rewardCarryRootProgress = ContiguousArray(
+            repeating: Float(0), count: n)
+        var rewardLoadedAlternatingStep = ContiguousArray(
+            repeating: Float(0), count: n)
         var rewardPlacement = ContiguousArray(repeating: Float(0), count: n)
         var penaltyBoxDescent = ContiguousArray(repeating: Float(0), count: n)
         var penaltyUnilateralContact = ContiguousArray(
@@ -766,11 +1519,53 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         var stateBoxHeight = ContiguousArray(repeating: Float(0), count: n)
         var stateBoxClearance = ContiguousArray(repeating: Float(0), count: n)
         var stateCarryDistance = ContiguousArray(repeating: Float(0), count: n)
+        var stateLoadedRootDisplacement = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateRootDestinationDistance = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateLoadedTouchdowns = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateLoadedAlternatingSteps = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateLeftLoadedFootAirTime = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateRightLoadedFootAirTime = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateMaximumLoadedFootAirTime = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateLeftFootNormalLoad = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateRightFootNormalLoad = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateFootUnloadingFraction = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateLeftFootGroundClearance = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateRightFootGroundClearance = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateMaximumLoadedSwingClearance = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateLeftLoadBearingFootContact = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateRightLoadBearingFootContact = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateLeftFootContact = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateRightFootContact = ContiguousArray(
+            repeating: Float(0), count: n)
         var stateLiftFraction = ContiguousArray(repeating: Float(0), count: n)
         var stateLeftContact = ContiguousArray(repeating: Float(0), count: n)
         var stateRightContact = ContiguousArray(repeating: Float(0), count: n)
+        var stateLeftHandNormalLoad = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateRightHandNormalLoad = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateGraspFrictionSupportFraction = ContiguousArray(
+            repeating: Float(0), count: n)
         var stateGraspQuality = ContiguousArray(repeating: Float(0), count: n)
         var stateLoadBearingGrasp = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateFrictionLoadBearingGrasp = ContiguousArray(
             repeating: Float(0), count: n)
         var statePhase = ContiguousArray(repeating: Float(0), count: n)
         var stateBoxGroundContact = ContiguousArray(
@@ -792,6 +1587,18 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             repeating: Float(0), count: n)
         var stateStableUnsupportedSteps = ContiguousArray(
             repeating: Float(0), count: n)
+        var stateMaximumActuatorTorqueRatio = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateMaximumArmActuatorTorqueRatio = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateSaturatedActuatorCount = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateSaturatedArmActuatorCount = ContiguousArray(
+            repeating: Float(0), count: n)
+        var stateMinimumJointLimitMargin = ContiguousArray(
+            repeating: Float.infinity, count: n)
+        var stateMaximumRequestedTargetClamp = ContiguousArray(
+            repeating: Float(0), count: n)
         var taskImitationMilestone = ContiguousArray(
             repeating: Float(0), count: n)
         var referenceStateReset = ContiguousArray(
@@ -808,6 +1615,12 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         var episodeFinalCarryDistanceMetric = ContiguousArray(
             repeating: Float(0), count: n)
         var episodeMaximumCarryDistanceMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeMaximumLoadedRootDisplacementMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeLoadedTouchdownsMetric = ContiguousArray(
+            repeating: Float(0), count: n)
+        var episodeLoadedAlternatingStepsMetric = ContiguousArray(
             repeating: Float(0), count: n)
         var episodeMaximumBoxHeightMetric = ContiguousArray(
             repeating: Float(0), count: n)
@@ -829,6 +1642,10 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         for e in 0..<n {
             let state = states[e]
             let item = manipulation[e]
+            let footGroundClearances = [
+                HumanoidWalkEnv.footGroundClearance(state.leftFoot),
+                HumanoidWalkEnv.footGroundClearance(state.rightFoot),
+            ]
             let pregrasp = pregraspPosition(environment: e)
             let pregraspDelta = pregrasp - state.root.position
             let pregraspDistance = sqrt(
@@ -839,15 +1656,36 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             let rightDistance = length(item.rightHand.position - rightTarget)
             let reachDistance = leftDistance + rightDistance
             let bilateral = handContacts.left[e] && handContacts.right[e]
+            // Face-center proximity is a smooth reaching objective, not a
+            // physical grasp predicate. Once collision occurs, the finite-face
+            // geometry below decides whether the hold is load bearing.
             let leftHoldScore = exp(-40 * leftDistance * leftDistance)
             let rightHoldScore = exp(-40 * rightDistance * rightDistance)
-            let twoHandHoldScore = min(leftHoldScore, rightHoldScore)
             let worldBoxUp = item.object.rotation.act(F3(0, 0, 1))
+            let inverseBox = item.object.rotation.conjugate
+            let localLeftHand = inverseBox.act(
+                item.leftHand.position - item.object.position)
+            let localRightHand = inverseBox.act(
+                item.rightHand.position - item.object.position)
+            let twoHandHoldScore = Self.opposingFaceGraspQuality(
+                localLeftHand: localLeftHand,
+                localRightHand: localRightHand)
             let levelGripScore = max(worldBoxUp.z, 0)
-            let loadBearingGrasp = bilateral
-                && leftDistance <= Self.loadBearingHandTargetDistance
-                && rightDistance <= Self.loadBearingHandTargetDistance
-                && worldBoxUp.z >= Self.loadBearingBoxUprightAlignment
+            let geometricOpposingGrasp = Self.isOpposingFaceGrasp(
+                localLeftHand: localLeftHand,
+                localRightHand: localRightHand,
+                bilateralContact: bilateral,
+                boxUprightAlignment: worldBoxUp.z)
+            let frictionLoadBearingGrasp = geometricOpposingGrasp
+                && Self.frictionGraspSupportsWeight(
+                    leftNormalLoad: handContactNormalLoads.left[e],
+                    rightNormalLoad: handContactNormalLoads.right[e],
+                    boxMass: configuration.boxMass,
+                    friction: configuration.boxFriction)
+            // Revision-40 checkpoints observed this historical geometric phase
+            // signal. Keep it stable for exact checkpoint replay; new physical
+            // certification consumes frictionLoadBearingGrasp separately.
+            let loadBearingGrasp = geometricOpposingGrasp
             // Use the oriented cuboid's actual lowest corner.  Subtracting
             // only half the local Z size overestimates clearance whenever the
             // box pitches or rolls—the exact regime produced by a two-arm
@@ -884,10 +1722,20 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             let newlyAcquiredBilateralGrasp = loadBearingGrasp
                 && !bilateralGrasped[e]
             if loadBearingGrasp { bilateralGrasped[e] = true }
-            if !lifted[e], bilateralGrasped[e]
-                    && physicallyClearOfPedestal {
+            let newlyLifted = !lifted[e] && bilateralGrasped[e]
+                && physicallyClearOfPedestal
+            if newlyLifted {
                 lifted[e] = true
                 liftOrigins[e] = item.object.position
+                liftRootOrigins[e] = state.root.position
+                maximumLoadedRootDisplacements[e] = 0
+                loadedFootAirTimes[e] = [0, 0]
+                loadedFootMaximumClearances[e] = [0, 0]
+                previousLoadedFootContacts[e] =
+                    loadBearingFootContacts[e]
+                lastLoadedTouchdownFeet[e] = -1
+                loadedTouchdownCounts[e] = 0
+                loadedAlternatingStepCounts[e] = 0
             }
             // A physical lift used to switch every arm action from the
             // manipulation expert to an independently learned carry expert
@@ -913,6 +1761,12 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                     + carryDelta.y * carryDelta.y) : 0
             maximumCarryDistances[e] = max(
                 maximumCarryDistances[e], carryDistance)
+            let loadedRootDelta = state.root.position - liftRootOrigins[e]
+            let loadedRootDisplacement = lifted[e]
+                ? hypot(loadedRootDelta.x, loadedRootDelta.y) : 0
+            maximumLoadedRootDisplacements[e] = max(
+                maximumLoadedRootDisplacements[e],
+                loadedRootDisplacement)
             // A height-only test incorrectly extends the pedestal's top plane
             // across the entire world.  Once carried beyond the finite
             // pedestal, a box can dip below that plane while remaining held
@@ -976,6 +1830,58 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                 newCarryStartIDs.append(e)
             }
 
+            // Count only alternating solver-contact touchdowns after a real
+            // swing and while the load remains physically unsupported. A
+            // planted shuffle, hop, simultaneous landing, or arm-only box
+            // sweep cannot satisfy this locomotion evidence.
+            var loadedTouchdownMask = 0
+            if lifted[e] && !newlyLifted {
+                for foot in 0..<2 {
+                    let inContact = loadBearingFootContacts[e][foot]
+                    if inContact {
+                        if !previousLoadedFootContacts[e][foot]
+                            && loadedFootAirTimes[e][foot] > 0.10
+                            && loadedFootMaximumClearances[e][foot]
+                                >= Self.loadedSwingMinimumClearance {
+                            loadedTouchdownMask |= 1 << foot
+                        }
+                        loadedFootAirTimes[e][foot] = 0
+                        loadedFootMaximumClearances[e][foot] = 0
+                    } else {
+                        loadedFootAirTimes[e][foot] += dt
+                        loadedFootMaximumClearances[e][foot] = max(
+                            loadedFootMaximumClearances[e][foot],
+                            footGroundClearances[foot])
+                    }
+                    previousLoadedFootContacts[e][foot] = inContact
+                }
+            }
+            if stableUnsupported
+                && (loadedTouchdownMask == 1 || loadedTouchdownMask == 2) {
+                let foot = loadedTouchdownMask == 1 ? 0 : 1
+                let other = 1 - foot
+                let footPositions = [
+                    state.leftFoot.position, state.rightFoot.position,
+                ]
+                let goal = destinationPregraspPosition(environment: e)
+                let travelHeading = goal - state.root.position
+                if HumanoidLocomotionObjective.isLeadingTouchdown(
+                    touchdownFootPosition: footPositions[foot],
+                    otherFootPosition: footPositions[other],
+                    heading: travelHeading) {
+                    loadedTouchdownCounts[e] += 1
+                    if lastLoadedTouchdownFeet[e] >= 0
+                        && lastLoadedTouchdownFeet[e] != foot {
+                        loadedAlternatingStepCounts[e] += 1
+                        rewardLoadedAlternatingStep[e] =
+                            configuration.carryAlternatingStepRewardWeight
+                    }
+                    lastLoadedTouchdownFeet[e] = foot
+                }
+            } else if loadedTouchdownMask == 3 {
+                lastLoadedTouchdownFeet[e] = -1
+            }
+
             if placed[e] { phases[e] = 3 }
             else if bilateralGrasped[e] { phases[e] = 2 }
             else if approached[e] { phases[e] = 1 }
@@ -999,6 +1905,36 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                 + localAngular.y * localAngular.y
             var accelerationCost: Float = 0
             for j in 0..<Self.actionDimension {
+                let joint = environment.scene.joints[
+                    environment.refs[e].motors[j]]
+                let requestedTarget = HumanoidWalkEnv.defaultJointPositions[j]
+                    + appliedActions[e * Self.actionDimension + j]
+                        * HumanoidWalkEnv.actionScales[j]
+                let appliedTarget = simd_clamp(
+                    requestedTarget, joint.limitLo, joint.limitHi)
+                let rawTorque = joint.motorStiffness
+                    * (state.jointAngles[j] - appliedTarget)
+                    + joint.motorDamping * state.jointVelocities[j]
+                let torqueRatio = abs(rawTorque)
+                    / max(joint.motorTorque, Float.leastNormalMagnitude)
+                stateMaximumActuatorTorqueRatio[e] = max(
+                    stateMaximumActuatorTorqueRatio[e], torqueRatio)
+                if j >= 11 {
+                    stateMaximumArmActuatorTorqueRatio[e] = max(
+                        stateMaximumArmActuatorTorqueRatio[e], torqueRatio)
+                }
+                if torqueRatio >= 1 {
+                    stateSaturatedActuatorCount[e] += 1
+                    if j >= 11 { stateSaturatedArmActuatorCount[e] += 1 }
+                }
+                stateMinimumJointLimitMargin[e] = min(
+                    stateMinimumJointLimitMargin[e],
+                    min(
+                        state.jointAngles[j] - joint.limitLo,
+                        joint.limitHi - state.jointAngles[j]))
+                stateMaximumRequestedTargetClamp[e] = max(
+                    stateMaximumRequestedTargetClamp[e],
+                    abs(requestedTarget - appliedTarget))
                 let acceleration = (state.jointVelocities[j]
                     - previousJointVelocities[e][j]) / dt
                 accelerationCost += acceleration * acceleration
@@ -1007,9 +1943,14 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                 || state.torso.position.z < 0.55 || up.z < 0.35
             let trackingVariance = lifted[e]
                 ? configuration.carryTrackingVariance : Self.trackingVariance
+            let commandTrackingReward = Self.commandTrackingReward(
+                planarErrorSquared: trackingError,
+                yawErrorSquared: yawError * yawError,
+                variance: trackingVariance,
+                coupled: lifted[e]
+                    && configuration.coupledCarryCommandTracking)
             let locomotionRate =
-                exp(-trackingError / trackingVariance)
-                + exp(-(yawError * yawError) / trackingVariance)
+                commandTrackingReward
                 - orientationCost - 0.05 * angularCost
                 - 0.005 * actionRate[e]
                 - 1.25e-7 * accelerationCost
@@ -1082,6 +2023,13 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             rewardCarry[e] = lifted[e] && bilateral
                 ? configuration.carryProgressRewardWeight
                     * destinationProgress + 1.5 * dt : 0
+            let rootGoal = destinationPregraspPosition(environment: e)
+            let rootGoalProgress = planarDistance(
+                previousRootPositions[e], rootGoal)
+                - planarDistance(state.root.position, rootGoal)
+            rewardCarryRootProgress[e] = stableUnsupported && !newlyLifted
+                ? configuration.carryRootProgressRewardWeight
+                    * rootGoalProgress : 0
             rewardPlacement[e] = lifted[e]
                 ? (destinationSupported ? 5 * dt : 0)
                     + (stablePlacement ? 8 * dt : 0)
@@ -1100,6 +2048,8 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
 
             let stableCarry = lifted[e] && bilateral && !dropped[e]
                 && carryDistance >= carryTarget
+                && loadedAlternatingStepCounts[e]
+                    >= configuration.minimumLoadedAlternatingSteps
             if stableCarry { carryMilestoneReached[e] = true }
             successDwellCounts[e] = stablePlacement
                 ? successDwellCounts[e] + 1 : 0
@@ -1110,7 +2060,9 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             let boxFellBeforeLift = !lifted[e] && boxBottom < 0.10
             let reward = rewardLocomotion[e] + rewardApproach[e]
                 + rewardReach[e] + rewardContact[e] + rewardLift[e]
-                + rewardRetention[e] + rewardCarry[e] + rewardPlacement[e]
+                + rewardRetention[e] + rewardCarry[e]
+                + rewardCarryRootProgress[e]
+                + rewardLoadedAlternatingStep[e] + rewardPlacement[e]
                 + (newlyPlaced ? 24 : 0)
                 - penaltyBoxDescent[e]
                 - penaltyUnilateralContact[e]
@@ -1125,11 +2077,55 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             stateBoxHeight[e] = item.object.position.z
             stateBoxClearance[e] = boxClearance
             stateCarryDistance[e] = carryDistance
+            stateLoadedRootDisplacement[e] = loadedRootDisplacement
+            stateRootDestinationDistance[e] = planarDistance(
+                state.root.position,
+                destinationPregraspPosition(environment: e))
+            stateLoadedTouchdowns[e] = Float(loadedTouchdownCounts[e])
+            stateLoadedAlternatingSteps[e] = Float(
+                loadedAlternatingStepCounts[e])
+            stateLeftLoadedFootAirTime[e] = loadedFootAirTimes[e][0]
+            stateRightLoadedFootAirTime[e] = loadedFootAirTimes[e][1]
+            stateMaximumLoadedFootAirTime[e] = max(
+                loadedFootAirTimes[e][0], loadedFootAirTimes[e][1])
+            let leftFootNormalLoad = groundContactNormalLoads[e][0]
+            let rightFootNormalLoad = groundContactNormalLoads[e][1]
+            let totalFootNormalLoad = leftFootNormalLoad
+                + rightFootNormalLoad
+            stateLeftFootNormalLoad[e] = leftFootNormalLoad
+            stateRightFootNormalLoad[e] = rightFootNormalLoad
+            stateFootUnloadingFraction[e] = totalFootNormalLoad > 1e-6
+                ? 1 - min(leftFootNormalLoad, rightFootNormalLoad)
+                    / totalFootNormalLoad
+                : 0
+            stateLeftFootGroundClearance[e] = footGroundClearances[0]
+            stateRightFootGroundClearance[e] = footGroundClearances[1]
+            stateMaximumLoadedSwingClearance[e] = max(
+                loadedFootMaximumClearances[e][0],
+                loadedFootMaximumClearances[e][1])
+            stateLeftLoadBearingFootContact[e] =
+                loadBearingFootContacts[e][0] ? 1 : 0
+            stateRightLoadBearingFootContact[e] =
+                loadBearingFootContacts[e][1] ? 1 : 0
+            stateLeftFootContact[e] = groundContacts.feet[e][0] ? 1 : 0
+            stateRightFootContact[e] = groundContacts.feet[e][1] ? 1 : 0
             stateLiftFraction[e] = liftFraction
             stateLeftContact[e] = handContacts.left[e] ? 1 : 0
             stateRightContact[e] = handContacts.right[e] ? 1 : 0
+            stateLeftHandNormalLoad[e] =
+                handContactNormalLoads.left[e]
+            stateRightHandNormalLoad[e] =
+                handContactNormalLoads.right[e]
+            stateGraspFrictionSupportFraction[e] =
+                Self.frictionGraspSupportFraction(
+                    leftNormalLoad: handContactNormalLoads.left[e],
+                    rightNormalLoad: handContactNormalLoads.right[e],
+                    boxMass: configuration.boxMass,
+                    friction: configuration.boxFriction)
             stateGraspQuality[e] = twoHandHoldScore
             stateLoadBearingGrasp[e] = loadBearingGrasp ? 1 : 0
+            stateFrictionLoadBearingGrasp[e] =
+                frictionLoadBearingGrasp ? 1 : 0
             statePhase[e] = Float(phases[e])
             stateBoxGroundContact[e] = supportContacts.ground[e] ? 1 : 0
             stateBoxPedestalContact[e] = supportContacts.source[e] ? 1 : 0
@@ -1149,6 +2145,7 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             previousBoxHeights[e] = item.object.position.z
             previousBoxClearances[e] = boxClearance
             previousPlacementDistances[e] = carryGoalDistance
+            previousRootPositions[e] = state.root.position
 
             let timedOut = episodeLengths[e] >= configuration.maxEpisodeSteps
             let failed = fallen || dropped[e] || boxFellBeforeLift
@@ -1168,6 +2165,12 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                 episodeSurvivedMetric[e] = fallen ? 0 : 1
                 episodeFinalCarryDistanceMetric[e] = carryDistance
                 episodeMaximumCarryDistanceMetric[e] = maximumCarryDistances[e]
+                episodeMaximumLoadedRootDisplacementMetric[e] =
+                    maximumLoadedRootDisplacements[e]
+                episodeLoadedTouchdownsMetric[e] = Float(
+                    loadedTouchdownCounts[e])
+                episodeLoadedAlternatingStepsMetric[e] = Float(
+                    loadedAlternatingStepCounts[e])
                 episodeMaximumBoxHeightMetric[e] = maximumBoxHeights[e]
                 episodeMaximumBoxClearanceMetric[e] =
                     maximumBoxClearances[e]
@@ -1225,6 +2228,10 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         result.metrics["reward/lift"] = rewardLift
         result.metrics["reward/grip_retention"] = rewardRetention
         result.metrics["reward/carry"] = rewardCarry
+        result.metrics["reward/carry_root_progress"] =
+            rewardCarryRootProgress
+        result.metrics["reward/loaded_alternating_step"] =
+            rewardLoadedAlternatingStep
         result.metrics["reward/placement"] = rewardPlacement
         result.metrics["penalty/box_descent"] = penaltyBoxDescent
         result.metrics["penalty/unilateral_contact"] =
@@ -1234,11 +2241,50 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         result.metrics["state/box_height_m"] = stateBoxHeight
         result.metrics["state/box_clearance_m"] = stateBoxClearance
         result.metrics["state/carry_distance_m"] = stateCarryDistance
+        result.metrics["state/loaded_root_displacement_m"] =
+            stateLoadedRootDisplacement
+        result.metrics["state/root_destination_distance_m"] =
+            stateRootDestinationDistance
+        result.metrics["state/loaded_touchdowns"] = stateLoadedTouchdowns
+        result.metrics["state/loaded_alternating_steps"] =
+            stateLoadedAlternatingSteps
+        result.metrics["state/left_loaded_foot_air_time_s"] =
+            stateLeftLoadedFootAirTime
+        result.metrics["state/right_loaded_foot_air_time_s"] =
+            stateRightLoadedFootAirTime
+        result.metrics["state/maximum_loaded_foot_air_time_s"] =
+            stateMaximumLoadedFootAirTime
+        result.metrics["state/left_foot_normal_load"] =
+            stateLeftFootNormalLoad
+        result.metrics["state/right_foot_normal_load"] =
+            stateRightFootNormalLoad
+        result.metrics["state/foot_unloading_fraction"] =
+            stateFootUnloadingFraction
+        result.metrics["state/left_foot_ground_clearance_m"] =
+            stateLeftFootGroundClearance
+        result.metrics["state/right_foot_ground_clearance_m"] =
+            stateRightFootGroundClearance
+        result.metrics["state/maximum_loaded_swing_clearance_m"] =
+            stateMaximumLoadedSwingClearance
+        result.metrics["state/left_load_bearing_foot_contact"] =
+            stateLeftLoadBearingFootContact
+        result.metrics["state/right_load_bearing_foot_contact"] =
+            stateRightLoadBearingFootContact
+        result.metrics["state/left_foot_contact"] = stateLeftFootContact
+        result.metrics["state/right_foot_contact"] = stateRightFootContact
         result.metrics["state/lift_fraction"] = stateLiftFraction
         result.metrics["state/left_hand_contact"] = stateLeftContact
         result.metrics["state/right_hand_contact"] = stateRightContact
+        result.metrics["state/left_hand_normal_load"] =
+            stateLeftHandNormalLoad
+        result.metrics["state/right_hand_normal_load"] =
+            stateRightHandNormalLoad
+        result.metrics["state/grasp_friction_support_fraction"] =
+            stateGraspFrictionSupportFraction
         result.metrics["state/grasp_quality"] = stateGraspQuality
         result.metrics["state/load_bearing_grasp"] = stateLoadBearingGrasp
+        result.metrics["state/friction_load_bearing_grasp"] =
+            stateFrictionLoadBearingGrasp
         result.metrics["state/task_phase"] = statePhase
         result.metrics["state/box_ground_contact"] = stateBoxGroundContact
         result.metrics["state/box_pedestal_contact"] = stateBoxPedestalContact
@@ -1254,6 +2300,18 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         result.metrics["state/carry_command_progress"] = stateCarryCommandRamp
         result.metrics["state/stable_unsupported_steps"] =
             stateStableUnsupportedSteps
+        result.metrics["state/maximum_actuator_torque_ratio"] =
+            stateMaximumActuatorTorqueRatio
+        result.metrics["state/maximum_arm_actuator_torque_ratio"] =
+            stateMaximumArmActuatorTorqueRatio
+        result.metrics["state/saturated_actuator_count"] =
+            stateSaturatedActuatorCount
+        result.metrics["state/saturated_arm_actuator_count"] =
+            stateSaturatedArmActuatorCount
+        result.metrics["state/minimum_joint_limit_margin_rad"] =
+            stateMinimumJointLimitMargin
+        result.metrics["state/maximum_requested_target_clamp_rad"] =
+            stateMaximumRequestedTargetClamp
         result.metrics["task/imitation_milestone"] = taskImitationMilestone
         result.metrics["task/reference_state_reset"] = referenceStateReset
         result.metrics["curriculum/carry_target_m"] = ContiguousArray(
@@ -1277,6 +2335,12 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             episodeFinalCarryDistanceMetric
         result.metrics["episode/maximum_carry_distance_m"] =
             episodeMaximumCarryDistanceMetric
+        result.metrics["episode/maximum_loaded_root_displacement_m"] =
+            episodeMaximumLoadedRootDisplacementMetric
+        result.metrics["episode/loaded_touchdowns"] =
+            episodeLoadedTouchdownsMetric
+        result.metrics["episode/loaded_alternating_steps"] =
+            episodeLoadedAlternatingStepsMetric
         result.metrics["episode/maximum_box_height_m"] =
             episodeMaximumBoxHeightMetric
         result.metrics["episode/maximum_box_clearance_m"] =
@@ -1422,12 +2486,24 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             previousPlacementDistances[e] = length(
                 carryNavigationTarget(environment: e)
                     - item.object.position)
+            previousRootPositions[e] = states[e].root.position
             maximumBoxHeights[e] = item.object.position.z
             maximumBoxClearances[e] = previousBoxClearances[e]
             maximumCarryDistances[e] = 0
+            maximumLoadedRootDisplacements[e] = 0
             currentStableUnsupportedSteps[e] = 0
             maximumStableUnsupportedSteps[e] = 0
             liftOrigins[e] = item.object.position
+            liftRootOrigins[e] = states[e].root.position
+            loadedFootAirTimes[e] = [0, 0]
+            loadedFootMaximumClearances[e] = [0, 0]
+            previousLoadedFootContacts[e] = [
+                HumanoidWalkTask.footInContact(states[e].leftFoot),
+                HumanoidWalkTask.footInContact(states[e].rightFoot),
+            ]
+            lastLoadedTouchdownFeet[e] = -1
+            loadedTouchdownCounts[e] = 0
+            loadedAlternatingStepCounts[e] = 0
             approached[e] = true
             approachSettleCounts[e] = Self.manipulationEntryDwellSteps
             manipulationHandoffCounts[e] =
@@ -1514,12 +2590,24 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             previousPlacementDistances[e] = length(
                 carryNavigationTarget(environment: e)
                     - manipulation[e].object.position)
+            previousRootPositions[e] = states[e].root.position
             maximumBoxHeights[e] = manipulation[e].object.position.z
             maximumBoxClearances[e] = previousBoxClearances[e]
             maximumCarryDistances[e] = 0
+            maximumLoadedRootDisplacements[e] = 0
             currentStableUnsupportedSteps[e] = 0
             maximumStableUnsupportedSteps[e] = 0
             liftOrigins[e] = manipulation[e].object.position
+            liftRootOrigins[e] = states[e].root.position
+            loadedFootAirTimes[e] = [0, 0]
+            loadedFootMaximumClearances[e] = [0, 0]
+            previousLoadedFootContacts[e] = [
+                HumanoidWalkTask.footInContact(states[e].leftFoot),
+                HumanoidWalkTask.footInContact(states[e].rightFoot),
+            ]
+            lastLoadedTouchdownFeet[e] = -1
+            loadedTouchdownCounts[e] = 0
+            loadedAlternatingStepCounts[e] = 0
             approached[e] = pregraspDistance
                 <= Self.manipulationEntryDistance
                 && sqrt(
@@ -1654,7 +2742,8 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
     private func handTargets(
         _ box: GPUSolver.RigidBodyState
     ) -> (F3, F3) {
-        let faceOffset = 0.5 * Self.boxDimensions.y + 0.025
+        let faceOffset = 0.5 * Self.boxDimensions.y
+            + Self.handCollisionSphereRadius
         let left = box.position + box.rotation.act(F3(0, faceOffset, 0))
         let right = box.position + box.rotation.act(F3(0, -faceOffset, 0))
         return (left, right)
@@ -1735,18 +2824,18 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
             // Continuous and fully observed expert-composition gate. The
             // physical lift bit above remains a separate measured input.
             output[base + 90] = carryHandoffProgress(environment: e)
-            let (leftTarget, rightTarget) = handTargets(item.object)
             let worldBoxUp = item.object.rotation.act(F3(0, 0, 1))
-            let loadBearingGrasp = contacts.left[e] && contacts.right[e]
-                && length(item.leftHand.position - leftTarget)
-                    <= Self.loadBearingHandTargetDistance
-                && length(item.rightHand.position - rightTarget)
-                    <= Self.loadBearingHandTargetDistance
+            let (leftFaceTarget, rightFaceTarget) = handTargets(item.object)
+            let checkpointFaceHint = contacts.left[e] && contacts.right[e]
+                && length(item.leftHand.position - leftFaceTarget)
+                    <= Self.checkpointFaceHintDistance
+                && length(item.rightHand.position - rightFaceTarget)
+                    <= Self.checkpointFaceHintDistance
                 && worldBoxUp.z >= Self.loadBearingBoxUprightAlignment
-            // Current (not cumulative) load-bearing grip lets a specialist
-            // distinguish useful two-sided force transfer from merely having
-            // touched the box earlier in the episode.
-            output[base + 91] = loadBearingGrasp ? 1 : 0
+            // Do not use this compatibility channel as physical evidence.
+            // Current load-bearing state is emitted in the metrics and is
+            // fully derivable from local hands 75...80 plus contacts 84...85.
+            output[base + 91] = checkpointFaceHint ? 1 : 0
             // Expose signed progress toward the current physical curriculum
             // target. The source policy receives a zero-weight appended input,
             // so transfer remains behavior-identical before fine-tuning.
@@ -1934,6 +3023,24 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
 
     public var usesPolicyAuxiliaryExpertGate: Bool {
         configuration.upperBodyCarryController
+    }
+
+    public var initializesPolicyAuxiliaryExpertFromBaseOnTransfer: Bool {
+        configuration.initializeCarryLocomotionExpertFromBaseOnTransfer
+    }
+
+    public var policyAuxiliaryExpertZeroedObservationIndicesOnTransfer: [Int] {
+        // The imported walker was trained around nominal arm coordinates. At
+        // the physical lift boundary, the pickup branch instead leaves large
+        // arm angles, velocities, and previous actions. Feeding that unrelated
+        // upper-body state into a leg-only actor destroys the gait prior even
+        // though its arm outputs are masked. Begin from the source policy's
+        // nominal zero influence for those eight joints; PPO may learn useful
+        // load coupling into the still-trainable columns afterward.
+        let arms = 11..<Self.actionDimension
+        return arms.map { 12 + $0 }
+            + arms.map { 31 + $0 }
+            + arms.map { 50 + $0 }
     }
 
     public var freezesStandPolicyExpert: Bool {

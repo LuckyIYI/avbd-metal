@@ -1311,6 +1311,17 @@ public final class HumanoidWalkEnv {
         return lowestCenter - h1FootCapsuleRadius
     }
 
+    /// Lowest authored H1 foot collision-capsule clearance above z=0 for an
+    /// already link-frame-transformed foot state.
+    public static func footGroundClearance(
+        _ foot: GPUSolver.RigidBodyState
+    ) -> Float {
+        let lowestCenter = h1FootCapsuleEndpoints.reduce(Float.infinity) {
+            min($0, (foot.position + foot.rotation.act($1)).z)
+        }
+        return lowestCenter - h1FootCapsuleRadius
+    }
+
     /// Physical ground contacts from the solver's last manifold build. The
     /// task uses these for gait rewards and torso-contact termination; the
     /// geometric foot-clearance calculation remains diagnostics only.
@@ -1335,6 +1346,29 @@ public final class HumanoidWalkEnv {
             }
         }
         return (feet, torso)
+    }
+
+    /// Per-foot normal support load from the solver's converged contact duals.
+    /// This distinguishes a merely persistent margin manifold from a foot
+    /// actually bearing the robot/load weight and is intentionally exposed as
+    /// task diagnostics rather than a policy observation.
+    public func groundContactNormalLoads() -> [[Float]] {
+        var loads = [[Float]](
+            repeating: [0, 0], count: numEnvironments)
+        for contact in solver.activeRigidContactNormalLoads() {
+            let other: Int
+            if contact.bodyA == groundBody {
+                other = contact.bodyB
+            } else if contact.bodyB == groundBody {
+                other = contact.bodyA
+            } else {
+                continue
+            }
+            guard let slot = groundContactSlots[other],
+                  slot % 3 < 2 else { continue }
+            loads[slot / 3][slot % 3] += contact.normalLoad
+        }
+        return loads
     }
 
     /// Whether each environment's physical projectile touched any body in
@@ -1377,6 +1411,38 @@ public final class HumanoidWalkEnv {
             guard let slot else { continue }
             if slot.isMultiple(of: 2) { left[slot / 2] = true }
             else { right[slot / 2] = true }
+        }
+        return (left, right)
+    }
+
+    /// Converged normal load at each hand/object manifold. Contact presence
+    /// alone does not prove a friction grasp can support the box: a manifold
+    /// inside the collision margin may carry essentially zero force.
+    public func boxHandContactNormalLoads() -> (
+        left: [Float], right: [Float]
+    ) {
+        var left = [Float](repeating: 0, count: numEnvironments)
+        var right = [Float](repeating: 0, count: numEnvironments)
+        guard !projectileOwners.isEmpty else { return (left, right) }
+        for contact in solver.activeRigidContactNormalLoads() {
+            let slot: Int?
+            if let environment = projectileOwners[contact.bodyA],
+               let candidate = handContactSlots[contact.bodyB],
+               candidate / 2 == environment {
+                slot = candidate
+            } else if let environment = projectileOwners[contact.bodyB],
+                      let candidate = handContactSlots[contact.bodyA],
+                      candidate / 2 == environment {
+                slot = candidate
+            } else {
+                slot = nil
+            }
+            guard let slot else { continue }
+            if slot.isMultiple(of: 2) {
+                left[slot / 2] += contact.normalLoad
+            } else {
+                right[slot / 2] += contact.normalLoad
+            }
         }
         return (left, right)
     }

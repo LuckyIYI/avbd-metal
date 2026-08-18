@@ -88,6 +88,7 @@ public enum BuiltInRLTasks {
         "upperBodyCarryController",
         "carryLocomotionControlsTorso",
         "initializeCarryExpertFromBaseOnTransfer",
+        "initializeCarryLocomotionExpertFromBaseOnTransfer",
         "carryStartReplayProbability",
         "advanceReplaySnapshotAtDestinationContact",
         "carryArmReferenceWeight",
@@ -95,6 +96,10 @@ public enum BuiltInRLTasks {
         "carryProgressRewardWeight",
         "carryLocomotionRewardMultiplier",
         "carryTrackingVariance",
+        "coupledCarryCommandTracking",
+        "carryRootProgressRewardWeight",
+        "carryAlternatingStepRewardWeight",
+        "minimumLoadedAlternatingSteps",
     ]
     private static let humanoidGoalOptionKeys: Set<String> = [
         "maxEpisodeSteps", "controlDecimation", "minimumCommandSpeed",
@@ -617,6 +622,10 @@ public enum BuiltInRLTasks {
                 initializeCarryExpertFromBaseOnTransfer:
                     (cfg.options[
                         "initializeCarryExpertFromBaseOnTransfer"] ?? 0) > 0,
+                initializeCarryLocomotionExpertFromBaseOnTransfer:
+                    (cfg.options[
+                        "initializeCarryLocomotionExpertFromBaseOnTransfer"]
+                        ?? 0) > 0,
                 carryStartReplayProbability:
                     cfg.options["carryStartReplayProbability"] ?? 0,
                 advanceReplaySnapshotAtDestinationContact:
@@ -631,7 +640,15 @@ public enum BuiltInRLTasks {
                 carryLocomotionRewardMultiplier:
                     cfg.options["carryLocomotionRewardMultiplier"] ?? 1,
                 carryTrackingVariance:
-                    cfg.options["carryTrackingVariance"] ?? 0.25))
+                    cfg.options["carryTrackingVariance"] ?? 0.25,
+                coupledCarryCommandTracking:
+                    (cfg.options["coupledCarryCommandTracking"] ?? 0) > 0,
+                carryRootProgressRewardWeight:
+                    cfg.options["carryRootProgressRewardWeight"] ?? 0,
+                carryAlternatingStepRewardWeight:
+                    cfg.options["carryAlternatingStepRewardWeight"] ?? 0,
+                minimumLoadedAlternatingSteps: Int(
+                    cfg.options["minimumLoadedAlternatingSteps"] ?? 0)))
         }
         try! registry.register(
             "humanoid-isaac-goal-v0",

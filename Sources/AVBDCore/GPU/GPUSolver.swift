@@ -2223,6 +2223,108 @@ public final class GPUSolver {
         inflight.removeAll()
     }
 
+    /// Opaque rigid-scene checkpoint for batched speculative control. Unlike
+    /// `setBodyStates`, this preserves the temporal solver state that makes a
+    /// fork dynamically equivalent to continuing the original rollout:
+    /// adaptive velocity history, joint/contact multipliers, persistence-map
+    /// identity, and incremental coloring. It deliberately excludes authored
+    /// scene data and soft-body state; callers must use it only with the same
+    /// solver instance and a rigid scene.
+    struct RigidSpeculationSnapshot {
+        fileprivate var posLin: Data
+        fileprivate var posAng: Data
+        fileprivate var initLin: Data
+        fileprivate var initAng: Data
+        fileprivate var inertLin: Data
+        fileprivate var inertAng: Data
+        fileprivate var velLin: Data
+        fileprivate var velAng: Data
+        fileprivate var prevVelLin: Data
+        fileprivate var joints: Data
+        fileprivate var springs: Data
+        fileprivate var manifolds: Data
+        fileprivate var prevManifolds: Data
+        fileprivate var mapKeyA: Data
+        fileprivate var mapKeyB: Data
+        fileprivate var mapVal: Data
+        fileprivate var colorsA: Data
+        fileprivate var colorsB: Data
+        fileprivate var counters: Data
+        fileprivate var frameIndex: Int
+        fileprivate var lastColorCounts: [Int]
+        fileprivate var lastNumPairs: Int
+        fileprivate var lastNumSoft: Int
+        fileprivate var lastMaxColorUsed: Int
+    }
+
+    func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
+        precondition(numTris == 0 && numTets == 0,
+            "rigid speculation snapshots do not include soft-body state")
+        sync()
+        func copy(_ buffer: MTLBuffer) -> Data {
+            Data(bytes: buffer.contents(), count: buffer.length)
+        }
+        statsLock.lock()
+        let statistics = (
+            lastColorCounts, lastNumPairs, lastNumSoft, lastMaxColorUsed)
+        statsLock.unlock()
+        return RigidSpeculationSnapshot(
+            posLin: copy(posLin), posAng: copy(posAng),
+            initLin: copy(initLin), initAng: copy(initAng),
+            inertLin: copy(inertLin), inertAng: copy(inertAng),
+            velLin: copy(velLin), velAng: copy(velAng),
+            prevVelLin: copy(prevVelLin), joints: copy(joints),
+            springs: copy(springs), manifolds: copy(manifolds),
+            prevManifolds: copy(prevManifolds), mapKeyA: copy(mapKeyA),
+            mapKeyB: copy(mapKeyB), mapVal: copy(mapVal),
+            colorsA: copy(colorsA), colorsB: copy(colorsB),
+            counters: copy(counters), frameIndex: frameIndex,
+            lastColorCounts: statistics.0, lastNumPairs: statistics.1,
+            lastNumSoft: statistics.2, lastMaxColorUsed: statistics.3)
+    }
+
+    func restoreRigidSpeculationSnapshot(
+        _ snapshot: RigidSpeculationSnapshot
+    ) {
+        precondition(numTris == 0 && numTets == 0,
+            "rigid speculation snapshots do not include soft-body state")
+        sync()
+        func restore(_ data: Data, to buffer: MTLBuffer) {
+            precondition(data.count == buffer.length,
+                "speculation snapshot buffer size mismatch")
+            data.withUnsafeBytes { bytes in
+                guard let source = bytes.baseAddress else { return }
+                memcpy(buffer.contents(), source, data.count)
+            }
+        }
+        restore(snapshot.posLin, to: posLin)
+        restore(snapshot.posAng, to: posAng)
+        restore(snapshot.initLin, to: initLin)
+        restore(snapshot.initAng, to: initAng)
+        restore(snapshot.inertLin, to: inertLin)
+        restore(snapshot.inertAng, to: inertAng)
+        restore(snapshot.velLin, to: velLin)
+        restore(snapshot.velAng, to: velAng)
+        restore(snapshot.prevVelLin, to: prevVelLin)
+        restore(snapshot.joints, to: joints)
+        restore(snapshot.springs, to: springs)
+        restore(snapshot.manifolds, to: manifolds)
+        restore(snapshot.prevManifolds, to: prevManifolds)
+        restore(snapshot.mapKeyA, to: mapKeyA)
+        restore(snapshot.mapKeyB, to: mapKeyB)
+        restore(snapshot.mapVal, to: mapVal)
+        restore(snapshot.colorsA, to: colorsA)
+        restore(snapshot.colorsB, to: colorsB)
+        restore(snapshot.counters, to: counters)
+        frameIndex = snapshot.frameIndex
+        statsLock.lock()
+        lastColorCounts = snapshot.lastColorCounts
+        lastNumPairs = snapshot.lastNumPairs
+        lastNumSoft = snapshot.lastNumSoft
+        lastMaxColorUsed = snapshot.lastMaxColorUsed
+        statsLock.unlock()
+    }
+
     /// Cap the pipeline depth: deeper queues make the async color-bound
     /// readback stale enough to skip colors (observed physics regressions).
     private func throttle() {
@@ -3355,6 +3457,82 @@ public final class GPUSolver {
             result.append((Int(m[i].header.x), Int(m[i].header.y)))
         }
         return result
+    }
+
+    /// Solver normal-load magnitude for every active rigid manifold from the
+    /// last completed step. A narrowphase manifold can remain active inside
+    /// the contact margin while carrying essentially no support force; the
+    /// accumulated `-lambda.x` separates that state from a load-bearing
+    /// contact without using geometric height heuristics.
+    public func activeRigidContactNormalLoads()
+        -> [(bodyA: Int, bodyB: Int, normalLoad: Float)] {
+        sync()
+        let manifolds = prevManifolds.contents().bindMemory(
+            to: ManifoldGPU.self, capacity: maxPairs)
+        var result = [(bodyA: Int, bodyB: Int, normalLoad: Float)]()
+        result.reserveCapacity(lastNumPairs)
+        for index in 0..<lastNumPairs
+            where manifolds[index].header.z > 0 {
+            var contacts = manifolds[index].contacts
+            let contactCount = min(
+                Int(manifolds[index].header.z), AVBD_MAX_CONTACTS)
+            let normalLoad = withUnsafeBytes(of: &contacts) { bytes in
+                let values = bytes.bindMemory(to: ContactGPU.self)
+                return (0..<contactCount).reduce(Float(0)) {
+                    $0 + max(-values[$1].lambda.x, 0)
+                }
+            }
+            result.append((
+                bodyA: Int(manifolds[index].header.x),
+                bodyB: Int(manifolds[index].header.y),
+                normalLoad: normalLoad))
+        }
+        return result
+    }
+
+    /// Deepest active rigid-contact violation from the last completed step.
+    /// Intended for convergence diagnostics in dense cable/contact rigs.
+    public func debugWorstRigidContactPenetration()
+        -> (bodyA: Int, bodyB: Int, depth: Float)? {
+        sync()
+        let manifolds = prevManifolds.contents().bindMemory(
+            to: ManifoldGPU.self, capacity: maxPairs)
+        let positions = posLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        let rotations = posAng.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        var worst: (bodyA: Int, bodyB: Int, depth: Float)?
+        for index in 0..<lastNumPairs where manifolds[index].header.z > 0 {
+            let manifold = manifolds[index]
+            let a = Int(manifold.header.x), b = Int(manifold.header.y)
+            let qA = Quat(real: rotations[a].w,
+                          imag: F3(rotations[a].x, rotations[a].y, rotations[a].z))
+            let qB = Quat(real: rotations[b].w,
+                          imag: F3(rotations[b].x, rotations[b].y, rotations[b].z))
+            let pA = F3(positions[a].x, positions[a].y, positions[a].z)
+            let pB = F3(positions[b].x, positions[b].y, positions[b].z)
+            let roundA = (manifold.header.w & 2) != 0
+            let roundB = (manifold.header.w & 4) != 0
+            let normal = F3(manifold.basisN.x, manifold.basisN.y,
+                            manifold.basisN.z)
+            var contacts = manifold.contacts
+            let count = min(Int(manifold.header.z), AVBD_MAX_CONTACTS)
+            withUnsafeBytes(of: &contacts) { bytes in
+                let values = bytes.bindMemory(to: ContactGPU.self)
+                for contact in values.prefix(count) {
+                    let rA = F3(contact.rA.x, contact.rA.y, contact.rA.z)
+                    let rB = F3(contact.rB.x, contact.rB.y, contact.rB.z)
+                    let xA = pA + (roundA ? rA : qA.act(rA))
+                    let xB = pB + (roundB ? rB : qB.act(rB))
+                    let depth = max(0, -(dot(normal, xA - xB)
+                                         + settings.collisionMargin))
+                    if depth > (worst?.depth ?? 0) {
+                        worst = (a, b, depth)
+                    }
+                }
+            }
+        }
+        return worst
     }
 
     /// Max threadgroup width of the persistent solver kernel (scenes at or
