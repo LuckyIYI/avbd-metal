@@ -51,6 +51,7 @@ struct Options {
     var policyExpertFrom: String? = nil
     var policyExpertBranchFrom: String? = nil
     var standExpertFrom: String? = nil
+    var locomotionCheckpoint: String? = nil
     var initializationNormalizerPriorCount: Double? = nil
     var symmetryAugmentation = true
     var symmetryMirrorLossCoefficient: Float? = 0.01
@@ -108,6 +109,94 @@ func humanoidBoxTrajectory(from data: Data) -> [Float]? {
     return nil
 }
 
+private struct HumanoidBoxFlowQualification {
+    let finitePrefixPassed: Bool
+    let recoveryPathSafe: Bool
+    let reusableFrontierPassed: Bool
+
+    init(_ dictionary: [String: Any]) {
+        finitePrefixPassed = (dictionary[
+            "targetFinitePrefixGatePassed"] as? Bool)
+            ?? (dictionary["targetPlanningGatePassed"] as? Bool)
+            ?? ((dictionary["targetGatePassed"] as? Bool) == true
+                && ((dictionary["targetCloneSuccessFraction"]
+                    as? NSNumber)?.floatValue ?? 0) >= 0.8
+                && ((dictionary["targetReplayMaximumNormalizedError"]
+                    as? NSNumber)?.floatValue ?? .infinity) < 0.02)
+        recoveryPathSafe = (dictionary[
+            "targetPredictedRecoveryPathSafe"] as? Bool)
+            // Open-loop legacy reports had no continuation boundary and no
+            // recovery field. Preserve that historical interpretation only
+            // when the artifact also has no receding-horizon schema.
+            ?? (dictionary["recedingHorizonSteps"] == nil)
+        reusableFrontierPassed = (dictionary[
+            "targetReusableFrontierGatePassed"] as? Bool)
+            ?? (finitePrefixPassed && recoveryPathSafe)
+    }
+}
+
+private func humanoidBoxDeclaredTrajectoryElementCount(
+    _ dictionary: [String: Any]
+) -> Int? {
+    for key in [
+        "targetGeneratingTrajectory", "bestTrajectory", "bestArmTarget",
+    ] {
+        if let values = dictionary[key] as? [NSNumber], !values.isEmpty {
+            return values.count
+        }
+    }
+    return nil
+}
+
+/// Reads an optional committed-action trace without silently dropping malformed
+/// samples. `present == true && actions == nil` means the field existed but was
+/// not an exact 1...N sequence of full-body controls.
+private func humanoidBoxCommittedActions(
+    _ value: Any?, expectedCount: Int
+) -> (present: Bool, actions: [[Float]]?) {
+    guard let value else { return (false, nil) }
+    guard expectedCount > 0,
+          let trace = value as? [[String: Any]],
+          trace.count == expectedCount
+            || trace.count == expectedCount + 1 else {
+        return (true, nil)
+    }
+    var samples = [(step: Int, action: [Float])]()
+    samples.reserveCapacity(expectedCount)
+    var sawBoundarySample = false
+    for sample in trace {
+        guard let step = (sample["step"] as? NSNumber)?.intValue else {
+            return (true, nil)
+        }
+        if step == 0 {
+            guard !sawBoundarySample,
+                  sample["appliedNormalizedActions"] == nil else {
+                return (true, nil)
+            }
+            sawBoundarySample = true
+            continue
+        }
+        guard let encodedAction = sample[
+            "appliedNormalizedActions"] as? [NSNumber] else {
+            return (true, nil)
+        }
+        let action = encodedAction.map(\.floatValue)
+        guard action.count == HumanoidBoxCarryTask.actionDimension,
+              action.allSatisfy(\.isFinite) else {
+            return (true, nil)
+        }
+        samples.append((step, action))
+    }
+    samples.sort { $0.step < $1.step }
+    guard samples.count == expectedCount,
+          samples.enumerated().allSatisfy({ index, sample in
+        sample.step == index + 1
+    }) else {
+        return (true, nil)
+    }
+    return (true, samples.map(\.action))
+}
+
 /// Resolves a physical-flow artifact into the complete simulator-executed
 /// lineage needed to reproduce its terminal state. Older single-stage flow
 /// reports are accepted and become a one-element lineage.
@@ -120,27 +209,250 @@ func humanoidBoxFlowSourceStages(
         return nil
     }
     if includeOwnStage && useTargetGeneratingTrajectory {
-        let explicitPass = dictionary["targetPlanningGatePassed"] as? Bool
-        let inferredPass = (dictionary["targetGatePassed"] as? Bool) == true
-            && ((dictionary["targetCloneSuccessFraction"]
-                as? NSNumber)?.floatValue ?? 0) >= 0.8
-            && ((dictionary["targetReplayMaximumNormalizedError"]
-                as? NSNumber)?.floatValue ?? .infinity) < 0.02
-        guard explicitPass == true || inferredPass,
+        let qualification = HumanoidBoxFlowQualification(dictionary)
+        guard qualification.reusableFrontierPassed,
               ((dictionary["targetGenerationSteps"]
                 as? NSNumber)?.intValue ?? 0) > 0 else { return nil }
     }
+    if includeOwnStage && !useTargetGeneratingTrajectory,
+       let passed = dictionary["goGatePassed"] as? Bool, !passed {
+        return nil
+    }
     var stages = [HumanoidBoxPhysicalFlowStage]()
+    let flattenedSourceActions = (dictionary[
+        "sourceAppliedActions"] as? [[NSNumber]])?.map {
+            $0.map(\.floatValue)
+        }
+    var flattenedSourceActionOffset = 0
+    if flattenedSourceActions != nil,
+       dictionary["sourceStages"] as? [[String: Any]] == nil {
+        return nil
+    }
     if let encodedStages = dictionary["sourceStages"]
             as? [[String: Any]] {
+        let expectedSourceActionCount = encodedStages.reduce(0) {
+            $0 + (($1["controlSteps"] as? NSNumber)?.intValue ?? 0)
+        }
+        guard flattenedSourceActions.map({ actions in
+            actions.count == expectedSourceActionCount
+                && actions.allSatisfy {
+                    $0.count == HumanoidBoxCarryTask.actionDimension
+                        && $0.allSatisfy(\.isFinite)
+                }
+        }) ?? true else { return nil }
         for encoded in encodedStages {
             guard let steps = encoded["controlSteps"] as? NSNumber,
                   steps.intValue > 0 else { return nil }
+            let minimumCarry = (encoded["minimumCarryDistanceMeters"]
+                as? NSNumber)?.floatValue
+            let minimumDestinationProgress = (encoded[
+                "minimumDestinationProgressMeters"]
+                as? NSNumber)?.floatValue
+            let minimumRootDestinationProgress = (encoded[
+                "minimumRootDestinationProgressMeters"]
+                as? NSNumber)?.floatValue
+            let minimumAlternatingSteps = (encoded[
+                "minimumAlternatingSteps"]
+                as? NSNumber)?.intValue
+            let minimumSwingFootLift = (encoded[
+                "minimumSwingFootLiftMeters"] as? NSNumber)?.floatValue
+            let minimumTouchdowns = (encoded["minimumTouchdowns"]
+                as? NSNumber)?.intValue
+            let minimumFootAirTime = (encoded[
+                "minimumFootAirTimeSeconds"] as? NSNumber)?.floatValue
+            let minimumFootUnloading = (encoded[
+                "minimumFootUnloadingFraction"] as? NSNumber)?.floatValue
+            let minimumTerminalFootUnloading = (encoded[
+                "minimumTerminalFootUnloadingFraction"]
+                as? NSNumber)?.floatValue
+            let minimumClearance = (encoded["minimumClearanceMeters"]
+                as? NSNumber)?.floatValue
+            let maximumPathDownwardBoxVelocity = (encoded[
+                "maximumPathDownwardBoxVelocityMPS"]
+                as? NSNumber)?.floatValue
+            let minimumGraspQuality = (encoded["minimumGraspQuality"]
+                as? NSNumber)?.floatValue
+            let graspAnchorFeedbackBlend = (encoded[
+                "graspAnchorFeedbackBlend"] as? NSNumber)?.floatValue
+            let graspAnchorFeedbackVelocityHorizon = (encoded[
+                "graspAnchorFeedbackVelocityHorizonSeconds"]
+                as? NSNumber)?.floatValue
+            let graspAnchorFeedbackMaximumActionCorrection = (encoded[
+                "graspAnchorFeedbackMaximumActionCorrection"]
+                as? NSNumber)?.floatValue
+            let graspAnchorFeedbackInwardPreload = (encoded[
+                "graspAnchorFeedbackInwardPreloadMeters"]
+                as? NSNumber)?.floatValue
+            let leftGraspAnchor = (encoded[
+                "leftGraspAnchorBoxLocalMeters"] as? [NSNumber])?
+                .map(\.floatValue)
+            let rightGraspAnchor = (encoded[
+                "rightGraspAnchorBoxLocalMeters"] as? [NSNumber])?
+                .map(\.floatValue)
+            let graspAnchorBoxHeight = (encoded[
+                "graspAnchorBoxHeightMeters"] as? NSNumber)?.floatValue
+            let certificationDwell = (encoded["certificationDwellSteps"]
+                as? NSNumber)?.intValue
             let policyOnly = encoded["policyOnly"] as? Bool == true
+            let canonicalizeReplicasBeforeExecution = encoded[
+                "canonicalizeReplicasBeforeExecution"] as? Bool == true
+            let continueFromPreviousTrajectoryTerminal = encoded[
+                "continueFromPreviousTrajectoryTerminal"] as? Bool == true
+            let forwardOnlyBaseCommand = encoded[
+                "forwardOnlyBaseCommand"] as? Bool == true
+            let holonomicBaseCommand = encoded[
+                "holonomicBaseCommand"] as? Bool == true
+            let locomotionCheckpointDirectory = encoded[
+                "locomotionCheckpointDirectory"] as? String
+            let locomotionCommandSpeed = (encoded[
+                "locomotionCommandSpeed"] as? NSNumber)?.floatValue
+            let encodedAppliedNormalizedActions = (encoded[
+                "appliedNormalizedActions"] as? [[NSNumber]])?.map {
+                    $0.map(\.floatValue)
+                }
+            guard encodedAppliedNormalizedActions.map({ actions in
+                actions.count == steps.intValue
+                    && actions.allSatisfy {
+                        $0.count == HumanoidBoxCarryTask.actionDimension
+                            && $0.allSatisfy(\.isFinite)
+                    }
+            }) ?? true else { return nil }
+            let inheritedAppliedNormalizedActions:
+                [[Float]]?
+            let flattenedSourceActionEnd =
+                flattenedSourceActionOffset + steps.intValue
+            if let flattenedSourceActions,
+               flattenedSourceActionEnd
+                    <= flattenedSourceActions.count {
+                inheritedAppliedNormalizedActions = Array(
+                    flattenedSourceActions[
+                        flattenedSourceActionOffset..<flattenedSourceActionEnd])
+            } else {
+                inheritedAppliedNormalizedActions = nil
+            }
+            flattenedSourceActionOffset += steps.intValue
+            let appliedNormalizedActions =
+                encodedAppliedNormalizedActions
+                    ?? inheritedAppliedNormalizedActions
+            if let encodedAppliedNormalizedActions,
+               let inheritedAppliedNormalizedActions,
+               encodedAppliedNormalizedActions
+                    != inheritedAppliedNormalizedActions {
+                return nil
+            }
             if policyOnly {
                 stages.append(.init(
                     trajectory: [], controlSteps: steps.intValue,
-                    policyOnly: true))
+                    policyOnly: true,
+                    appliedNormalizedActions:
+                        appliedNormalizedActions,
+                    canonicalizeReplicasBeforeExecution:
+                        canonicalizeReplicasBeforeExecution,
+                    continueFromPreviousTrajectoryTerminal:
+                        continueFromPreviousTrajectoryTerminal,
+                    graspAnchorFeedbackBlend:
+                        graspAnchorFeedbackBlend,
+                    graspAnchorFeedbackVelocityHorizonSeconds:
+                        graspAnchorFeedbackVelocityHorizon,
+                    graspAnchorFeedbackMaximumActionCorrection:
+                        graspAnchorFeedbackMaximumActionCorrection,
+                    graspAnchorFeedbackInwardPreloadMeters:
+                        graspAnchorFeedbackInwardPreload,
+                    leftGraspAnchorBoxLocalMeters: leftGraspAnchor,
+                    rightGraspAnchorBoxLocalMeters: rightGraspAnchor,
+                    graspAnchorBoxHeightMeters: graspAnchorBoxHeight,
+                    minimumCarryDistanceMeters: minimumCarry,
+                    minimumDestinationProgressMeters:
+                        minimumDestinationProgress,
+                    minimumRootDestinationProgressMeters:
+                        minimumRootDestinationProgress,
+                    minimumTouchdowns:
+                        minimumTouchdowns,
+                    minimumAlternatingSteps:
+                        minimumAlternatingSteps,
+                    minimumSwingFootLiftMeters:
+                        minimumSwingFootLift,
+                    minimumFootAirTimeSeconds:
+                        minimumFootAirTime,
+                    minimumFootUnloadingFraction:
+                        minimumFootUnloading,
+                    minimumTerminalFootUnloadingFraction:
+                        minimumTerminalFootUnloading,
+                    minimumClearanceMeters: minimumClearance,
+                    maximumPathDownwardBoxVelocityMPS:
+                        maximumPathDownwardBoxVelocity,
+                    minimumGraspQuality: minimumGraspQuality,
+                    certificationDwellSteps: certificationDwell))
+                continue
+            }
+            if let encodedSequence = encoded[
+                    "trajectorySequence"] as? [[NSNumber]] {
+                let denominator = (encoded[
+                    "trajectorySequenceStepDenominator"]
+                        as? NSNumber)?.intValue
+                let sequence = encodedSequence.map { $0.map(\.floatValue) }
+                let phaseSteps = (encoded[
+                    "trajectorySequencePhaseSteps"] as? [NSNumber])?
+                    .map(\.intValue)
+                guard sequence.count == steps.intValue,
+                      (denominator ?? 0) > 0,
+                      (phaseSteps.map {
+                          $0.count == steps.intValue
+                            && $0.allSatisfy {
+                                $0 >= 0 && $0 < denominator!
+                            }
+                      } ?? true),
+                      sequence.allSatisfy({ !$0.isEmpty
+                        && $0.allSatisfy(\.isFinite) }) else { return nil }
+                stages.append(.init(
+                    trajectory: [], controlSteps: steps.intValue,
+                    trajectorySequence: sequence,
+                    trajectorySequencePhaseSteps: phaseSteps,
+                    trajectorySequenceStepDenominator: denominator,
+                    forwardOnlyBaseCommand: forwardOnlyBaseCommand,
+                    holonomicBaseCommand: holonomicBaseCommand,
+                    locomotionCheckpointDirectory:
+                        locomotionCheckpointDirectory,
+                    locomotionCommandSpeed: locomotionCommandSpeed,
+                    appliedNormalizedActions:
+                        appliedNormalizedActions,
+                    canonicalizeReplicasBeforeExecution:
+                        canonicalizeReplicasBeforeExecution,
+                    continueFromPreviousTrajectoryTerminal:
+                        continueFromPreviousTrajectoryTerminal,
+                    graspAnchorFeedbackBlend:
+                        graspAnchorFeedbackBlend,
+                    graspAnchorFeedbackVelocityHorizonSeconds:
+                        graspAnchorFeedbackVelocityHorizon,
+                    graspAnchorFeedbackMaximumActionCorrection:
+                        graspAnchorFeedbackMaximumActionCorrection,
+                    graspAnchorFeedbackInwardPreloadMeters:
+                        graspAnchorFeedbackInwardPreload,
+                    leftGraspAnchorBoxLocalMeters: leftGraspAnchor,
+                    rightGraspAnchorBoxLocalMeters: rightGraspAnchor,
+                    graspAnchorBoxHeightMeters: graspAnchorBoxHeight,
+                    minimumCarryDistanceMeters: minimumCarry,
+                    minimumDestinationProgressMeters:
+                        minimumDestinationProgress,
+                    minimumRootDestinationProgressMeters:
+                        minimumRootDestinationProgress,
+                    minimumTouchdowns:
+                        minimumTouchdowns,
+                    minimumAlternatingSteps:
+                        minimumAlternatingSteps,
+                    minimumSwingFootLiftMeters:
+                        minimumSwingFootLift,
+                    minimumFootAirTimeSeconds:
+                        minimumFootAirTime,
+                    minimumFootUnloadingFraction:
+                        minimumFootUnloading,
+                    minimumTerminalFootUnloadingFraction:
+                        minimumTerminalFootUnloading,
+                    minimumClearanceMeters: minimumClearance,
+                    maximumPathDownwardBoxVelocityMPS:
+                        maximumPathDownwardBoxVelocity,
+                    minimumGraspQuality: minimumGraspQuality,
+                    certificationDwellSteps: certificationDwell))
                 continue
             }
             guard let values = encoded["trajectory"] as? [NSNumber] else {
@@ -153,10 +465,214 @@ func humanoidBoxFlowSourceStages(
                   trajectory.allSatisfy(\.isFinite) else { return nil }
             stages.append(.init(
                 trajectory: trajectory, controlSteps: steps.intValue,
-                trajectoryDurationSteps: duration))
+                trajectoryDurationSteps: duration,
+                forwardOnlyBaseCommand: forwardOnlyBaseCommand,
+                holonomicBaseCommand: holonomicBaseCommand,
+                locomotionCheckpointDirectory:
+                    locomotionCheckpointDirectory,
+                locomotionCommandSpeed: locomotionCommandSpeed,
+                appliedNormalizedActions:
+                    appliedNormalizedActions,
+                canonicalizeReplicasBeforeExecution:
+                    canonicalizeReplicasBeforeExecution,
+                continueFromPreviousTrajectoryTerminal:
+                    continueFromPreviousTrajectoryTerminal,
+                graspAnchorFeedbackBlend:
+                    graspAnchorFeedbackBlend,
+                graspAnchorFeedbackVelocityHorizonSeconds:
+                    graspAnchorFeedbackVelocityHorizon,
+                graspAnchorFeedbackMaximumActionCorrection:
+                    graspAnchorFeedbackMaximumActionCorrection,
+                graspAnchorFeedbackInwardPreloadMeters:
+                    graspAnchorFeedbackInwardPreload,
+                leftGraspAnchorBoxLocalMeters: leftGraspAnchor,
+                rightGraspAnchorBoxLocalMeters: rightGraspAnchor,
+                graspAnchorBoxHeightMeters: graspAnchorBoxHeight,
+                minimumCarryDistanceMeters: minimumCarry,
+                minimumDestinationProgressMeters:
+                    minimumDestinationProgress,
+                minimumRootDestinationProgressMeters:
+                    minimumRootDestinationProgress,
+                minimumTouchdowns:
+                    minimumTouchdowns,
+                minimumAlternatingSteps:
+                    minimumAlternatingSteps,
+                minimumSwingFootLiftMeters:
+                    minimumSwingFootLift,
+                minimumFootAirTimeSeconds:
+                    minimumFootAirTime,
+                minimumFootUnloadingFraction:
+                    minimumFootUnloading,
+                minimumTerminalFootUnloadingFraction:
+                    minimumTerminalFootUnloading,
+                minimumClearanceMeters: minimumClearance,
+                maximumPathDownwardBoxVelocityMPS:
+                    maximumPathDownwardBoxVelocity,
+                minimumGraspQuality: minimumGraspQuality,
+                certificationDwellSteps: certificationDwell))
         }
     }
     if includeOwnStage {
+        let declaredCanonicalBoundary = dictionary[
+            "derivedStageSourceCanonicalized"] as? Bool
+        let inferredCanonicalBoundary: Bool
+        if useTargetGeneratingTrajectory {
+            inferredCanonicalBoundary = dictionary[
+                "targetGeneratingTrajectorySequencePhaseSteps"] != nil
+        } else {
+            inferredCanonicalBoundary = dictionary[
+                "reconstructionValidationCandidateCount"] != nil
+        }
+        let canonicalizeOwnStage = declaredCanonicalBoundary
+            ?? inferredCanonicalBoundary
+        let continueOwnStage = dictionary[
+            "derivedStageContinuesFromSourceTerminal"] as? Bool == true
+        let requiredGraspQuality = ((dictionary[
+            "minimumTargetGraspQuality"]
+            ?? dictionary["requiredGraspQuality"])
+            as? NSNumber)?.floatValue ?? 0
+        let requiredExecutionSteps = (dictionary["targetExecutionSteps"]
+            as? NSNumber)?.intValue ?? 0
+        let measuredGraspDwell = (dictionary[
+            "maximumGraspQualityThresholdDwellSteps"]
+            as? NSNumber)?.intValue ?? 0
+        let qualification = HumanoidBoxFlowQualification(dictionary)
+        let ownStageIsBalanceOnly =
+            (dictionary["physicalBalanceGatePassed"] as? Bool) == true
+            && (requiredGraspQuality <= 0
+                || (requiredExecutionSteps > 0
+                    && measuredGraspDwell >= requiredExecutionSteps))
+            && !qualification.reusableFrontierPassed
+        if useTargetGeneratingTrajectory,
+           let encodedSequence = dictionary[
+                "targetGeneratingTrajectorySequence"] as? [[NSNumber]],
+           let denominator = (dictionary["recedingHorizonSteps"]
+                ?? dictionary["targetGenerationSteps"]) as? NSNumber {
+            let sequence = encodedSequence.map { $0.map(\.floatValue) }
+            let phaseSteps = (dictionary[
+                "targetGeneratingTrajectorySequencePhaseSteps"]
+                as? [NSNumber])?.map(\.intValue)
+            let committedActions = humanoidBoxCommittedActions(
+                dictionary["targetCommittedTrace"]
+                    ?? dictionary["committedTrace"],
+                expectedCount: sequence.count)
+            guard !sequence.isEmpty, denominator.intValue > 0,
+                  !committedActions.present
+                    || committedActions.actions != nil,
+                  (phaseSteps.map {
+                      $0.count == sequence.count
+                        && $0.allSatisfy {
+                            $0 >= 0 && $0 < denominator.intValue
+                        }
+                  } ?? true),
+                  sequence.allSatisfy({ !$0.isEmpty
+                    && $0.allSatisfy(\.isFinite) }) else { return nil }
+            stages.append(.init(
+                trajectory: [], controlSteps: sequence.count,
+                trajectorySequence: sequence,
+                trajectorySequencePhaseSteps: phaseSteps,
+                trajectorySequenceStepDenominator: denominator.intValue,
+                forwardOnlyBaseCommand: dictionary[
+                    "recedingForwardOnlyBaseCommand"] as? Bool == true,
+                holonomicBaseCommand: dictionary[
+                    "recedingHolonomicBaseCommand"] as? Bool == true,
+                locomotionCheckpointDirectory: dictionary[
+                    "recedingLocomotionCheckpointDirectory"] as? String,
+                locomotionCommandSpeed: (dictionary[
+                    "recedingLocomotionCommandSpeed"]
+                    as? NSNumber)?.floatValue,
+                appliedNormalizedActions:
+                    committedActions.actions,
+                canonicalizeReplicasBeforeExecution:
+                    canonicalizeOwnStage,
+                continueFromPreviousTrajectoryTerminal:
+                    continueOwnStage,
+                graspAnchorFeedbackBlend: (dictionary[
+                    "graspAnchorFeedbackBlend"] as? NSNumber)?.floatValue,
+                graspAnchorFeedbackVelocityHorizonSeconds: (dictionary[
+                    "graspAnchorFeedbackVelocityHorizonSeconds"]
+                    as? NSNumber)?.floatValue,
+                graspAnchorFeedbackMaximumActionCorrection: (dictionary[
+                    "graspAnchorFeedbackMaximumActionCorrection"]
+                    as? NSNumber)?.floatValue,
+                graspAnchorFeedbackInwardPreloadMeters: (dictionary[
+                    "graspAnchorFeedbackInwardPreloadMeters"]
+                    as? NSNumber)?.floatValue,
+                leftGraspAnchorBoxLocalMeters: (dictionary[
+                    "leftGraspAnchorBoxLocalMeters"] as? [NSNumber])?
+                    .map(\.floatValue),
+                rightGraspAnchorBoxLocalMeters: (dictionary[
+                    "rightGraspAnchorBoxLocalMeters"] as? [NSNumber])?
+                    .map(\.floatValue),
+                graspAnchorBoxHeightMeters: (dictionary[
+                    "graspAnchorBoxHeightMeters"]
+                    as? NSNumber)?.floatValue,
+                minimumCarryDistanceMeters: ((dictionary[
+                    "minimumTargetCarryDistanceMeters"]
+                    ?? dictionary["requiredCarryDistanceMeters"])
+                    as? NSNumber)?.floatValue,
+                minimumDestinationProgressMeters: ownStageIsBalanceOnly
+                    ? nil : ((dictionary[
+                        "minimumTargetDestinationProgressMeters"]
+                        ?? dictionary["requiredDestinationProgressMeters"])
+                        as? NSNumber)?.floatValue,
+                minimumRootDestinationProgressMeters: ownStageIsBalanceOnly
+                    ? nil : ((dictionary[
+                        "minimumTargetRootDestinationProgressMeters"]
+                        ?? dictionary[
+                            "requiredRootDestinationProgressMeters"])
+                        as? NSNumber)?.floatValue,
+                minimumTouchdowns: ownStageIsBalanceOnly
+                    ? nil : ((dictionary["minimumTargetTouchdowns"]
+                        ?? dictionary["requiredTouchdowns"])
+                        as? NSNumber)?.intValue,
+                minimumAlternatingSteps: ownStageIsBalanceOnly
+                    ? nil : ((dictionary[
+                        "minimumTargetAlternatingSteps"]
+                        ?? dictionary["requiredAlternatingSteps"])
+                        as? NSNumber)?.intValue,
+                minimumSwingFootLiftMeters: ownStageIsBalanceOnly
+                    ? nil : ((dictionary[
+                        "minimumTargetSwingFootLiftMeters"]
+                        ?? dictionary["requiredSwingFootLiftMeters"])
+                        as? NSNumber)?.floatValue,
+                minimumFootAirTimeSeconds: ownStageIsBalanceOnly
+                    ? nil : ((dictionary[
+                        "minimumTargetFootAirTimeSeconds"]
+                        ?? dictionary["requiredFootAirTimeSeconds"])
+                        as? NSNumber)?.floatValue,
+                minimumFootUnloadingFraction: ownStageIsBalanceOnly
+                    ? nil : ((dictionary[
+                        "minimumTargetFootUnloadingFraction"]
+                        ?? dictionary[
+                            "requiredFootUnloadingFraction"])
+                        as? NSNumber)?.floatValue,
+                minimumTerminalFootUnloadingFraction:
+                    ownStageIsBalanceOnly
+                    ? nil : ((dictionary[
+                        "minimumTargetTerminalFootUnloadingFraction"]
+                        ?? dictionary[
+                            "requiredTerminalFootUnloadingFraction"])
+                        as? NSNumber)?.floatValue,
+                minimumClearanceMeters: ((dictionary[
+                    "minimumTargetClearanceMeters"]
+                    ?? dictionary["requiredClearanceMeters"])
+                    as? NSNumber)?.floatValue,
+                maximumPathDownwardBoxVelocityMPS: ((dictionary[
+                    "maximumTargetPathDownwardBoxVelocityMPS"]
+                    ?? dictionary[
+                        "maximumPathDownwardBoxVelocityMPS"])
+                    as? NSNumber)?.floatValue,
+                minimumGraspQuality: ((dictionary[
+                    "minimumTargetGraspQuality"]
+                    ?? dictionary["requiredGraspQuality"])
+                    as? NSNumber)?.floatValue,
+                certificationDwellSteps: ((dictionary[
+                    "targetFeasibilityDwellSteps"]
+                    ?? dictionary["requiredFeasibilityDwellSteps"])
+                    as? NSNumber)?.intValue))
+            return stages
+        }
         guard let ownValues = dictionary[
                 useTargetGeneratingTrajectory
                     ? "targetGeneratingTrajectory" : "bestTrajectory"]
@@ -164,27 +680,209 @@ func humanoidBoxFlowSourceStages(
               let ownSteps = dictionary["selectedTargetStep"] as? NSNumber,
               ownSteps.intValue > 0 else { return nil }
         let ownTrajectory = ownValues.map(\.floatValue)
+        let committedActions = humanoidBoxCommittedActions(
+            dictionary["targetCommittedTrace"]
+                ?? dictionary["committedTrace"],
+            expectedCount: ownSteps.intValue)
         guard !ownTrajectory.isEmpty,
-              ownTrajectory.allSatisfy(\.isFinite) else { return nil }
+              ownTrajectory.allSatisfy(\.isFinite),
+              !committedActions.present
+                || committedActions.actions != nil else { return nil }
         stages.append(.init(
             trajectory: ownTrajectory, controlSteps: ownSteps.intValue,
             trajectoryDurationSteps: useTargetGeneratingTrajectory
                 ? (dictionary["targetGenerationSteps"] as? NSNumber)?.intValue
-                : nil))
+                : (dictionary["candidateTrajectoryDurationSteps"]
+                    as? NSNumber)?.intValue,
+            appliedNormalizedActions: committedActions.actions,
+            canonicalizeReplicasBeforeExecution:
+                canonicalizeOwnStage,
+            continueFromPreviousTrajectoryTerminal:
+                continueOwnStage,
+            graspAnchorFeedbackBlend: (dictionary[
+                "graspAnchorFeedbackBlend"] as? NSNumber)?.floatValue,
+            graspAnchorFeedbackVelocityHorizonSeconds: (dictionary[
+                "graspAnchorFeedbackVelocityHorizonSeconds"]
+                as? NSNumber)?.floatValue,
+            graspAnchorFeedbackMaximumActionCorrection: (dictionary[
+                "graspAnchorFeedbackMaximumActionCorrection"]
+                as? NSNumber)?.floatValue,
+            graspAnchorFeedbackInwardPreloadMeters: (dictionary[
+                "graspAnchorFeedbackInwardPreloadMeters"]
+                as? NSNumber)?.floatValue,
+            leftGraspAnchorBoxLocalMeters: (dictionary[
+                "leftGraspAnchorBoxLocalMeters"] as? [NSNumber])?
+                .map(\.floatValue),
+            rightGraspAnchorBoxLocalMeters: (dictionary[
+                "rightGraspAnchorBoxLocalMeters"] as? [NSNumber])?
+                .map(\.floatValue),
+            graspAnchorBoxHeightMeters: (dictionary[
+                "graspAnchorBoxHeightMeters"] as? NSNumber)?.floatValue,
+            minimumCarryDistanceMeters: (dictionary[
+                "minimumTargetCarryDistanceMeters"]
+                as? NSNumber)?.floatValue,
+            minimumDestinationProgressMeters: ownStageIsBalanceOnly
+                ? nil : (dictionary[
+                    "minimumTargetDestinationProgressMeters"]
+                    as? NSNumber)?.floatValue,
+            minimumRootDestinationProgressMeters: ownStageIsBalanceOnly
+                ? nil : (dictionary[
+                    "minimumTargetRootDestinationProgressMeters"]
+                    as? NSNumber)?.floatValue,
+            minimumTouchdowns: ownStageIsBalanceOnly
+                ? nil : (dictionary["minimumTargetTouchdowns"]
+                    as? NSNumber)?.intValue,
+            minimumAlternatingSteps: ownStageIsBalanceOnly
+                ? nil : (dictionary["minimumTargetAlternatingSteps"]
+                    as? NSNumber)?.intValue,
+            minimumSwingFootLiftMeters: ownStageIsBalanceOnly
+                ? nil : (dictionary["minimumTargetSwingFootLiftMeters"]
+                    as? NSNumber)?.floatValue,
+            minimumFootAirTimeSeconds: ownStageIsBalanceOnly
+                ? nil : (dictionary[
+                    "minimumTargetFootAirTimeSeconds"]
+                    as? NSNumber)?.floatValue,
+            minimumFootUnloadingFraction: ownStageIsBalanceOnly
+                ? nil : (dictionary[
+                    "minimumTargetFootUnloadingFraction"]
+                    as? NSNumber)?.floatValue,
+            minimumTerminalFootUnloadingFraction: ownStageIsBalanceOnly
+                ? nil : (dictionary[
+                    "minimumTargetTerminalFootUnloadingFraction"]
+                    as? NSNumber)?.floatValue,
+            minimumClearanceMeters: (dictionary[
+                "minimumTargetClearanceMeters"]
+                as? NSNumber)?.floatValue,
+            maximumPathDownwardBoxVelocityMPS: (dictionary[
+                "maximumTargetPathDownwardBoxVelocityMPS"]
+                as? NSNumber)?.floatValue,
+            minimumGraspQuality: (dictionary[
+                "minimumTargetGraspQuality"]
+                as? NSNumber)?.floatValue,
+            certificationDwellSteps: (dictionary[
+                "targetFeasibilityDwellSteps"]
+                as? NSNumber)?.intValue))
     }
     return stages.isEmpty ? nil : stages
 }
 
 func humanoidBoxTargetGeneratingTrajectory(from data: Data) -> [Float]? {
+    humanoidBoxNamedTrajectory(
+        from: data, key: "targetGeneratingTrajectory")
+}
+
+/// Reads a named finite trajectory from a durable physical-flow artifact.
+/// Failure reports intentionally retain several distinct search archives; a
+/// continuation must select the archive it means to repair instead of relying
+/// on whichever diagnostic happened to be appended last.
+func humanoidBoxNamedTrajectory(
+    from data: Data, key: String
+) -> [Float]? {
     guard let object = try? JSONSerialization.jsonObject(with: data),
           let dictionary = object as? [String: Any],
-          let values = dictionary["targetGeneratingTrajectory"]
-            as? [NSNumber] else {
+          let values = dictionary[key] as? [NSNumber],
+          let declaredCount = humanoidBoxDeclaredTrajectoryElementCount(
+            dictionary),
+          values.count == declaredCount else {
         return nil
     }
     let trajectory = values.map(\.floatValue)
     return !trajectory.isEmpty && trajectory.allSatisfy(\.isFinite)
         ? trajectory : nil
+}
+
+func humanoidBoxTargetGeneratingAction(
+    from data: Data, index: Int
+) -> [Float]? {
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any],
+          let encoded = dictionary[
+            "targetGeneratingTrajectorySequence"] as? [[NSNumber]],
+          encoded.indices.contains(index),
+          let declaredCount = humanoidBoxDeclaredTrajectoryElementCount(
+            dictionary),
+          encoded[index].count == declaredCount else {
+        return nil
+    }
+    let values = encoded[index].map(\.floatValue)
+    return !values.isEmpty && values.allSatisfy(\.isFinite)
+        ? values : nil
+}
+
+func humanoidBoxLastTargetGeneratingAction(from data: Data) -> [Float]? {
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any],
+          let encoded = dictionary[
+            "targetGeneratingTrajectorySequence"] as? [[NSNumber]],
+          !encoded.isEmpty else {
+        return nil
+    }
+    return humanoidBoxTargetGeneratingAction(
+        from: data, index: encoded.count - 1)
+}
+
+private struct HumanoidBoxFlowTrajectorySchema {
+    let blendKnots: Int
+    let residualKnots: Int
+    let torsoResidualKnots: Int
+    let residualMaximum: Float
+    let torsoResidualMaximum: Float
+    let armAsymmetryKnots: Int
+    let armAsymmetryMaximum: Float
+
+    /// The structured action heads are explicitly declared by the artifact.
+    /// Subtracting exactly those heads leaves the four arm splines; divisibility
+    /// is validation of that schema, not a guess based on the total length.
+    func armParameterCount(totalParameterCount: Int) -> Int? {
+        let count = totalParameterCount
+            - blendKnots
+            - 10 * residualKnots
+            - torsoResidualKnots
+            - 4 * armAsymmetryKnots
+        return count > 0 && count.isMultiple(of: 4) ? count : nil
+    }
+}
+
+private func humanoidBoxFlowTrajectorySchema(
+    from data: Data
+) -> HumanoidBoxFlowTrajectorySchema? {
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any] else { return nil }
+    let blend = (dictionary["legBlendKnotCount"] as? NSNumber)?.intValue
+        ?? 0
+    let residual = (dictionary["legResidualKnotCount"] as? NSNumber)?.intValue
+        ?? 0
+    let torso = (dictionary["torsoResidualKnotCount"] as? NSNumber)?.intValue
+        ?? 0
+    let residualMaximum = (dictionary[
+        "maximumLegResidualAction"] as? NSNumber)?.floatValue ?? 0.25
+    let torsoResidualMaximum = (dictionary[
+        "maximumTorsoResidualAction"] as? NSNumber)?.floatValue ?? 0.25
+    let armAsymmetry = (dictionary[
+        "armAsymmetryKnotCount"] as? NSNumber)?.intValue ?? 0
+    let armAsymmetryMaximum = (dictionary[
+        "maximumArmAsymmetryAction"] as? NSNumber)?.floatValue ?? 0.25
+    guard blend >= 0, residual >= 0, torso >= 0, armAsymmetry >= 0,
+          residualMaximum.isFinite, residualMaximum > 0,
+          torsoResidualMaximum.isFinite, torsoResidualMaximum > 0,
+          armAsymmetryMaximum.isFinite, armAsymmetryMaximum > 0 else {
+        return nil
+    }
+    return HumanoidBoxFlowTrajectorySchema(
+        blendKnots: blend, residualKnots: residual,
+        torsoResidualKnots: torso,
+        residualMaximum: residualMaximum,
+        torsoResidualMaximum: torsoResidualMaximum,
+        armAsymmetryKnots: armAsymmetry,
+        armAsymmetryMaximum: armAsymmetryMaximum)
+}
+
+func humanoidBoxFlowSelectedTargetStep(from data: Data) -> Int? {
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any],
+          let step = dictionary["selectedTargetStep"] as? NSNumber,
+          step.intValue > 0 else { return nil }
+    return step.intValue
 }
 
 func parseOptions(_ args: [String]) -> Options {
@@ -300,6 +998,8 @@ func parseOptions(_ args: [String]) -> Options {
             o.policyExpertBranchFrom = value(after: args[i])
         case "--stand-expert-from":
             o.standExpertFrom = value(after: args[i])
+        case "--locomotion-checkpoint":
+            o.locomotionCheckpoint = value(after: args[i])
         case "--initialization-normalizer-prior-count":
             o.initializationNormalizerPriorCount =
                 Double(value(after: args[i]))
@@ -460,6 +1160,9 @@ guard let command = args.first else {
       verify-policy-rl <task>  Verify immutable bundle identity and MLX inference
       trace-rl <task>  Trace one deterministic policy trajectory step by step
       distill-h1-box-lift  Distill a verified physical lift trajectory into MLX
+      train-h1-box-action-chunk  Fit a zero-preserving frontier action chunk
+      eval-h1-box-action-chunk  Replay immutable chunk weights in exact physics
+      interpolate-h1-box-flow  Physically select a policy residual scale
       probe-h1-box-lift  Audit bounded H1 grasp-to-lift actuation in parallel
       experiment-h1-box-flow  Reconstruct a hidden physical H1+box future
       eval-arm-expert  Evaluate the batched Push-T demonstration expert
@@ -1334,6 +2037,12 @@ case "trace-rl":
             let released = result.metrics["state/released"]?[0] ?? 0
             let stableUnsupported = result.metrics[
                 "state/stable_unsupported_steps"]?[0] ?? 0
+            let loadedRoot = result.metrics[
+                "state/loaded_root_displacement_m"]?[0] ?? 0
+            let loadedSteps = result.metrics[
+                "state/loaded_alternating_steps"]?[0] ?? 0
+            let leftFoot = result.metrics["state/left_foot_contact"]?[0] ?? 0
+            let rightFoot = result.metrics["state/right_foot_contact"]?[0] ?? 0
             let handoff = result.metrics[
                 "state/carry_handoff_progress"]?[0] ?? 0
             let manipulationHandoff = result.metrics[
@@ -1350,7 +2059,8 @@ case "trace-rl":
                 "%3d root (%+.3f,%+.3f,%.3f) yaw %+.3f "
                     + "cmd (%+.3f,%+.3f,%+.3f) box (%+.3f,%+.3f,%.3f) "
                     + "hands_z (%.3f,%.3f) contact %.0f/%.0f reach %.3f "
-                    + "carry %.3f phase %.0f clearance %.3f missed %.0f "
+                    + "carry %.3f root_carry %.3f steps %.0f feet %.0f/%.0f "
+                    + "phase %.0f clearance %.3f missed %.0f "
                     + "support %.0f/%.0f/%.0f goal %.3f released %.0f hold %.0f "
                     + "manip %.2f handoff %.2f command %.2f "
                     + "reward %+.4f done %@",
@@ -1360,7 +2070,9 @@ case "trace-rl":
                 item.object.position.x, item.object.position.y,
                 item.object.position.z,
                 item.leftHand.position.z, item.rightHand.position.z,
-                left, right, reach, distance, phase, clearance, missed,
+                left, right, reach, distance, loadedRoot, loadedSteps,
+                leftFoot, rightFoot,
+                phase, clearance, missed,
                 ground, pedestal, destination, placement, released,
                 stableUnsupported,
                 manipulationHandoff, handoff, commandRamp, result.rewards[0],
@@ -1463,6 +2175,8 @@ case "distill-h1-box-flow":
                 o.taskOptions["validationNoiseIncludesSource"] == 1,
             robustReplayCount: Int(
                 o.taskOptions["robustReplayCount"] ?? 32),
+            trainOutputHeadsOnly:
+                o.taskOptions["trainOutputHeadsOnly"] != 0,
             seed: o.seed))
     print(String(format:
         "flow distillation %d -> %d rows/%d rounds action MSE %.6g -> %.6g, teacher %.3fm learner %.3fm deterministic %.0f%% robust %.0f%% best@%d %@",
@@ -1474,6 +2188,145 @@ case "distill-h1-box-flow":
         100 * report.learnerRobustFinalSuccessFraction,
         report.bestEpoch,
         report.distillationGatePassed ? "PASS" : "FAIL"))
+
+case "interpolate-h1-box-flow":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let base = o.checkpoint,
+          let candidate = o.initializeFrom,
+          o.runName != "ppo", let output = o.output else {
+        fail("usage: avbd interpolate-h1-box-flow --checkpoint BASE_DIR "
+            + "--initialize-from CANDIDATE_DIR --run FLOW_REPORT_JSON "
+            + "--output DIR")
+    }
+    let report = try HumanoidBoxFlowDistillation.evaluateResidualScales(
+        baseCheckpointDirectory: base,
+        candidateCheckpointDirectory: candidate,
+        flowReportPath: o.runName,
+        outputDirectory: output,
+        configuration: .init(
+            collectionEnvironments: o.envs,
+            validationActionNoiseStandardDeviation:
+                o.taskOptions[
+                    "validationActionNoiseStandardDeviation"] ?? 0.001,
+            validationNoiseIncludesSource:
+                o.taskOptions["validationNoiseIncludesSource"] == 1,
+            robustReplayCount: Int(
+                o.taskOptions["robustReplayCount"] ?? 32),
+            seed: o.seed))
+    print(String(format:
+        "flow residual scale %.6f carry %.3fm deterministic %.0f%% robust %.0f%% %@",
+        report.selectedScale,
+        report.selectedMaximumStableCarryDistanceMeters,
+        100 * report.selectedDeterministicSuccessFraction,
+        100 * report.selectedRobustSuccessFraction,
+        report.gatePassed ? "PASS" : "FAIL"))
+
+case "train-h1-box-action-chunk":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let checkpoint = o.checkpoint, o.runName != "ppo",
+          let output = o.output else {
+        fail("usage: avbd train-h1-box-action-chunk --checkpoint DIR "
+            + "--run FLOW_REPORT_JSON --output DIR [--updates EPOCHS "
+            + "--horizon ACTIONS]")
+    }
+    let report = try HumanoidBoxFlowDistillation.trainActionChunk(
+        checkpointDirectory: checkpoint,
+        flowReportPath: o.runName,
+        outputDirectory: output,
+        configuration: .init(
+            horizon: o.horizon,
+            hiddenDimension: o.hidden,
+            epochs: args.contains("--updates") ? o.updates : 2_000,
+            learningRate: o.lr,
+            maximumGradientNorm: o.maxGradientNorm,
+            maximumResidualAction:
+                o.taskOptions["maximumResidualAction"] ?? 2,
+            contactDwellSteps: Int(
+                o.taskOptions["contactDwellSteps"] ?? 8),
+            trainingReplayCount: Int(
+                o.taskOptions["trainingReplayCount"] ?? 1),
+            trainingActionNoiseStandardDeviation:
+                o.taskOptions[
+                    "trainingActionNoiseStandardDeviation"] ?? 0,
+            exactReplayRowWeight:
+                o.taskOptions["exactReplayRowWeight"] ?? 1,
+            exactFineTuneEpochs: Int(
+                o.taskOptions["exactFineTuneEpochs"] ?? 0),
+            exactFineTuneLearningRate:
+                o.taskOptions["exactFineTuneLearningRate"] ?? 1e-5,
+            exactActionBiasWeight:
+                o.taskOptions["exactActionBiasWeight"] ?? 0,
+            robustReplayCount: Int(
+                o.taskOptions["robustReplayCount"] ?? 32),
+            validationActionNoiseStandardDeviation:
+                o.taskOptions[
+                    "validationActionNoiseStandardDeviation"] ?? 0.001,
+            seed: o.seed))
+    print(String(format:
+        "flow action chunk h%d/%d rows residual MSE %.6g -> tube %.6g -> exact %.6g, max %.6g bias %.6g, zero %.3fm/%.0f%% teacher %.3fm/%.0f%% teacher-robust %.3fm/%.0f%% learned %.3fm/%.0f%% robust %.3fm/%.0f%% %@",
+        report.horizon, report.trainingRows,
+        report.initialMeanSquaredResidualError,
+        report.tubeMeanSquaredResidualError,
+        report.finalMeanSquaredResidualError,
+        report.maximumExactFirstActionResidualError,
+        report.maximumAbsoluteExactActionBias,
+        report.zeroResidualMaximumStableCarryDistanceMeters,
+        100 * report.zeroResidualFinalSuccessFraction,
+        report.teacherMaximumStableCarryDistanceMeters,
+        100 * report.teacherFinalSuccessFraction,
+        report.teacherRobustMaximumStableCarryDistanceMeters,
+        100 * report.teacherRobustFinalSuccessFraction,
+        report.learnedMaximumStableCarryDistanceMeters,
+        100 * report.learnedFinalSuccessFraction,
+        report.learnedRobustMaximumStableCarryDistanceMeters,
+        100 * report.learnedRobustFinalSuccessFraction,
+        report.gatePassed ? "PASS" : "FAIL"))
+
+case "eval-h1-box-action-chunk":
+    let o = parseOptions(Array(args.dropFirst(1)))
+    guard let checkpoint = o.checkpoint,
+          let actionChunk = o.initializeFrom,
+          o.runName != "ppo" else {
+        fail("usage: avbd eval-h1-box-action-chunk --checkpoint SOURCE_DIR "
+            + "--initialize-from ACTION_CHUNK_DIR --run FLOW_REPORT_JSON "
+            + "[--envs REPLAYS --seed SEED --output REPORT_JSON]")
+    }
+    let report = try HumanoidBoxFlowDistillation.evaluateActionChunk(
+        checkpointDirectory: checkpoint,
+        flowReportPath: o.runName,
+        actionChunkCheckpointDirectory: actionChunk,
+        replayCount: o.envs,
+        actionNoiseStandardDeviation:
+            o.taskOptions[
+                "validationActionNoiseStandardDeviation"] ?? 0.001,
+        seed: o.seed)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(report)
+    if let output = o.output {
+        let url = URL(fileURLWithPath: output)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+    if o.json {
+        print(String(decoding: data, as: UTF8.self))
+    } else {
+        print(String(format:
+            "flow action chunk eval seed %llu h%d noise %.4f teacher %.3fm destination %+0.3fm/%.0f%% learned %.3fm destination %+0.3fm/%.0f%% %@ fingerprint %@",
+            report.evaluationSeed, report.targetControlSteps,
+            report.actionNoiseStandardDeviation,
+            report.teacherMaximumStableCarryDistanceMeters,
+            report.teacherMaximumStableDestinationProgressMeters ?? 0,
+            100 * report.teacherSuccessFraction,
+            report.learnedMaximumStableCarryDistanceMeters,
+            report.learnedMaximumStableDestinationProgressMeters ?? 0,
+            100 * report.learnedSuccessFraction,
+            report.gatePassed ? "PASS" : "FAIL",
+            String(report.actionChunkFingerprint.prefix(12))))
+    }
+    if !report.gatePassed { exit(2) }
 
 case "eval-h1-box-flow":
     let o = parseOptions(Array(args.dropFirst(1)))
@@ -1529,8 +2382,62 @@ case "experiment-h1-box-flow":
             + "[proposal-probe.json] --checkpoint DIR [options]")
     }
     let targetData = try Data(contentsOf: URL(fileURLWithPath: args[1]))
-    let targetTrajectory: [Float]
-    if let probe = try? JSONDecoder().decode(
+    let hasProposal = args.count > 2 && !args[2].hasPrefix("--")
+    let o = parseOptions(Array(args.dropFirst(hasProposal ? 3 : 2)))
+    let requestedArchiveSelectors = [
+        "useLastTargetGeneratingActionAsTargetSeed",
+        "useBestStableSwingAsTargetSeed",
+        "useBestSwingFrontierAsTargetSeed",
+        "useBestFeasibilityFrontierAsTargetSeed",
+        "useBestTrajectoryAsTargetSeed",
+    ].filter { o.taskOptions[$0] == 1 }
+    guard requestedArchiveSelectors.count <= 1 else {
+        fail("select exactly one target-seed archive")
+    }
+    var targetTrajectory: [Float]
+    if let requestedIndex = o.taskOptions[
+            "targetGeneratingActionIndex"].map({ Int($0) }) {
+        guard let trajectory = humanoidBoxTargetGeneratingAction(
+            from: targetData, index: requestedIndex) else {
+            fail("target-generating action index is absent or invalid")
+        }
+        targetTrajectory = trajectory
+    } else if requestedArchiveSelectors.first
+                == "useLastTargetGeneratingActionAsTargetSeed" {
+        guard let trajectory = humanoidBoxLastTargetGeneratingAction(
+            from: targetData) else {
+            fail("last target-generating action is absent or invalid")
+        }
+        targetTrajectory = trajectory
+    } else if requestedArchiveSelectors.first
+                == "useBestStableSwingAsTargetSeed" {
+        guard let trajectory = humanoidBoxNamedTrajectory(
+            from: targetData, key: "bestStableSwingParameters") else {
+            fail("best stable-swing archive is absent or invalid")
+        }
+        targetTrajectory = trajectory
+    } else if requestedArchiveSelectors.first
+                == "useBestSwingFrontierAsTargetSeed" {
+        guard let trajectory = humanoidBoxNamedTrajectory(
+            from: targetData, key: "bestSwingFrontierParameters") else {
+            fail("best swing-frontier archive is absent or invalid")
+        }
+        targetTrajectory = trajectory
+    } else if requestedArchiveSelectors.first
+                == "useBestFeasibilityFrontierAsTargetSeed" {
+        guard let trajectory = humanoidBoxNamedTrajectory(
+            from: targetData,
+            key: "bestFeasibilityFrontierParameters") else {
+            fail("best feasibility-frontier archive is absent or invalid")
+        }
+        targetTrajectory = trajectory
+    } else if requestedArchiveSelectors.first
+                == "useBestTrajectoryAsTargetSeed" {
+        guard let trajectory = humanoidBoxTrajectory(from: targetData) else {
+            fail("best trajectory archive is absent or invalid")
+        }
+        targetTrajectory = trajectory
+    } else if let probe = try? JSONDecoder().decode(
         HumanoidBoxCarryActuationProbeReport.self, from: targetData) {
         targetTrajectory = probe.bestArmTarget
     } else if let trajectory = humanoidBoxTargetGeneratingTrajectory(
@@ -1539,19 +2446,62 @@ case "experiment-h1-box-flow":
     } else {
         fail("target must be a box actuation-probe or discovered flow report")
     }
-    let hasProposal = args.count > 2 && !args[2].hasPrefix("--")
-    let proposalTrajectory: [Float]?
+    let targetSourceSchema = humanoidBoxFlowTrajectorySchema(from: targetData)
+    guard let targetArmParameterCountFromArtifact = targetSourceSchema?
+            .armParameterCount(totalParameterCount: targetTrajectory.count) else {
+        fail("target artifact has an invalid explicit trajectory schema")
+    }
+    var archivedTargetTrajectorySequence: [[Float]]?
+    var archivedTargetTrajectorySequencePhaseSteps: [Int]?
+    var archivedTargetPredictedRecoveryPathSafe: Bool?
+    if o.taskOptions["useArchivedTargetGeneratingSequence"] == 1 {
+        guard let object = try JSONSerialization.jsonObject(
+                with: targetData) as? [String: Any],
+              let encodedSequence = object[
+                "targetGeneratingTrajectorySequence"] as? [[NSNumber]],
+              !encodedSequence.isEmpty else {
+            fail("archived target sequence is absent or invalid")
+        }
+        archivedTargetTrajectorySequence = encodedSequence.map {
+            $0.map(\.floatValue)
+        }
+        archivedTargetTrajectorySequencePhaseSteps = (object[
+            "targetGeneratingTrajectorySequencePhaseSteps"]
+            as? [NSNumber])?.map(\.intValue)
+        let archivedDenominator = ((object["recedingHorizonSteps"]
+            ?? object["targetGenerationSteps"])
+            as? NSNumber)?.intValue
+        guard archivedTargetTrajectorySequence?.allSatisfy({
+                  $0.count == targetTrajectory.count
+                    && $0.allSatisfy(\.isFinite)
+              }) == true,
+              (archivedTargetTrajectorySequencePhaseSteps.map { phaseSteps in
+                  phaseSteps.count == archivedTargetTrajectorySequence?.count
+                    && archivedDenominator.map { denominator in
+                        denominator > 0 && phaseSteps.allSatisfy {
+                            $0 >= 0 && $0 < denominator
+                        }
+                    } == true
+              } ?? true) else {
+            fail("archived target sequence does not match its declared schema")
+        }
+        archivedTargetPredictedRecoveryPathSafe = object[
+            "targetPredictedRecoveryPathSafe"] as? Bool
+    }
+    let proposalData: Data?
+    var proposalTrajectory: [Float]?
     if hasProposal {
         let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+        proposalData = data
         if let trajectory = humanoidBoxTrajectory(from: data) {
             proposalTrajectory = trajectory
         } else {
             fail("proposal must be a box actuation-probe or physical-flow report")
         }
     } else {
+        proposalData = nil
         proposalTrajectory = nil
     }
-    let o = parseOptions(Array(args.dropFirst(hasProposal ? 3 : 2)))
     guard let checkpoint = o.checkpoint else {
         fail("experiment-h1-box-flow requires --checkpoint DIR")
     }
@@ -1559,38 +2509,150 @@ case "experiment-h1-box-flow":
         o.taskOptions["legBlendKnotCount"] ?? 0)
     let legResidualKnotCount = Int(
         o.taskOptions["legResidualKnotCount"] ?? 0)
+    let torsoResidualKnotCount = Int(
+        o.taskOptions["torsoResidualKnotCount"] ?? 0)
+    let maximumLegResidualAction =
+        o.taskOptions["maximumLegResidualAction"] ?? 0.25
+    let maximumTorsoResidualAction =
+        o.taskOptions["maximumTorsoResidualAction"] ?? 0.25
+    let armAsymmetryKnotCount = Int(
+        o.taskOptions["armAsymmetryKnotCount"] ?? 0)
+    let maximumArmAsymmetryAction =
+        o.taskOptions["maximumArmAsymmetryAction"] ?? 0.25
+    let targetDiscoveryPopulationSize = Int(
+        o.taskOptions["targetDiscoveryPopulationSize"] ?? 0)
+    if let sourceSchema = targetSourceSchema,
+       sourceSchema.blendKnots == legBlendKnotCount,
+       (sourceSchema.residualKnots != legResidualKnotCount
+        || sourceSchema.torsoResidualKnots != torsoResidualKnotCount
+        || sourceSchema.residualMaximum != maximumLegResidualAction
+        || sourceSchema.torsoResidualMaximum
+            != maximumTorsoResidualAction
+        || sourceSchema.armAsymmetryKnots != armAsymmetryKnotCount
+        || sourceSchema.armAsymmetryMaximum
+            != maximumArmAsymmetryAction) {
+        guard let armCount = sourceSchema.armParameterCount(
+            totalParameterCount: targetTrajectory.count) else {
+            fail("target flow trajectory has an invalid source schema")
+        }
+        targetTrajectory = HumanoidBoxPhysicalFlowExperiment
+            .resampledLegResidualTrajectory(
+                targetTrajectory,
+                armParameterCount: armCount,
+                blendKnotCount: sourceSchema.blendKnots,
+                sourceResidualKnotCount: sourceSchema.residualKnots,
+                targetResidualKnotCount: legResidualKnotCount,
+                sourceResidualMaximumAction:
+                    sourceSchema.residualMaximum,
+                targetResidualMaximumAction:
+                    maximumLegResidualAction,
+                sourceTorsoResidualKnotCount:
+                    sourceSchema.torsoResidualKnots,
+                targetTorsoResidualKnotCount:
+                    torsoResidualKnotCount,
+                sourceTorsoResidualMaximumAction:
+                    sourceSchema.torsoResidualMaximum,
+                targetTorsoResidualMaximumAction:
+                    maximumTorsoResidualAction,
+                sourceArmAsymmetryKnotCount:
+                    sourceSchema.armAsymmetryKnots,
+                targetArmAsymmetryKnotCount:
+                    armAsymmetryKnotCount,
+                sourceArmAsymmetryMaximumAction:
+                    sourceSchema.armAsymmetryMaximum,
+                targetArmAsymmetryMaximumAction:
+                    maximumArmAsymmetryAction)
+    }
+    if let proposalData,
+       let sourceSchema = humanoidBoxFlowTrajectorySchema(from: proposalData),
+       sourceSchema.blendKnots == legBlendKnotCount,
+       (sourceSchema.residualKnots != legResidualKnotCount
+        || sourceSchema.torsoResidualKnots != torsoResidualKnotCount
+        || sourceSchema.residualMaximum != maximumLegResidualAction
+        || sourceSchema.torsoResidualMaximum
+            != maximumTorsoResidualAction
+        || sourceSchema.armAsymmetryKnots != armAsymmetryKnotCount
+        || sourceSchema.armAsymmetryMaximum
+            != maximumArmAsymmetryAction),
+       let trajectory = proposalTrajectory {
+        guard let armCount = sourceSchema.armParameterCount(
+            totalParameterCount: trajectory.count) else {
+            fail("proposal flow trajectory has an invalid source schema")
+        }
+        proposalTrajectory = HumanoidBoxPhysicalFlowExperiment
+            .resampledLegResidualTrajectory(
+                trajectory,
+                armParameterCount: armCount,
+                blendKnotCount: sourceSchema.blendKnots,
+                sourceResidualKnotCount: sourceSchema.residualKnots,
+                targetResidualKnotCount: legResidualKnotCount,
+                sourceResidualMaximumAction:
+                    sourceSchema.residualMaximum,
+                targetResidualMaximumAction:
+                    maximumLegResidualAction,
+                sourceTorsoResidualKnotCount:
+                    sourceSchema.torsoResidualKnots,
+                targetTorsoResidualKnotCount:
+                    torsoResidualKnotCount,
+                sourceTorsoResidualMaximumAction:
+                    sourceSchema.torsoResidualMaximum,
+                targetTorsoResidualMaximumAction:
+                    maximumTorsoResidualAction,
+                sourceArmAsymmetryKnotCount:
+                    sourceSchema.armAsymmetryKnots,
+                targetArmAsymmetryKnotCount:
+                    armAsymmetryKnotCount,
+                sourceArmAsymmetryMaximumAction:
+                    sourceSchema.armAsymmetryMaximum,
+                targetArmAsymmetryMaximumAction:
+                    maximumArmAsymmetryAction)
+    }
     let legResidualParameterCount = 10 * legResidualKnotCount
-    let targetArmParameterCount: Int
-    if targetTrajectory.count.isMultiple(of: 4) {
-        targetArmParameterCount = targetTrajectory.count
-    } else if targetTrajectory.count
-                > legBlendKnotCount + legResidualParameterCount,
-              (targetTrajectory.count - legBlendKnotCount
-                - legResidualParameterCount).isMultiple(of: 4) {
-        targetArmParameterCount = targetTrajectory.count
-            - legBlendKnotCount - legResidualParameterCount
-    } else {
-        targetArmParameterCount = targetTrajectory.count
-            - legBlendKnotCount
-    }
-    guard targetArmParameterCount > 0,
-          targetArmParameterCount.isMultiple(of: 4) else {
-        fail("target probe trajectory has an invalid knot schema")
-    }
+    let torsoResidualParameterCount = torsoResidualKnotCount
+    let armAsymmetryParameterCount = 4 * armAsymmetryKnotCount
+    // The artifact declares every structured action head. Derive the arm
+    // count from that schema before any resampling instead of guessing from
+    // divisibility: structured trajectories can also have a total length
+    // divisible by four.
+    let targetArmParameterCount = targetArmParameterCountFromArtifact
     let knotCount = targetArmParameterCount / 4
     let acceptedTrajectoryCounts = Set([
         targetArmParameterCount,
         targetArmParameterCount + legBlendKnotCount,
         targetArmParameterCount + legBlendKnotCount
             + legResidualParameterCount,
+        targetArmParameterCount + legBlendKnotCount
+            + legResidualParameterCount + torsoResidualParameterCount,
+        targetArmParameterCount + legBlendKnotCount
+            + legResidualParameterCount + torsoResidualParameterCount
+            + armAsymmetryParameterCount,
     ])
     if let proposalTrajectory,
        !acceptedTrajectoryCounts.contains(proposalTrajectory.count) {
         fail("proposal and target probe knot schemas differ")
     }
     var sourceStages: [HumanoidBoxPhysicalFlowStage]
+    var archivedSourceWarmupActions: [[Float]]?
     if o.runName != "ppo" {
         let data = try Data(contentsOf: URL(fileURLWithPath: o.runName))
+        if let object = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any] {
+            archivedSourceWarmupActions = (object[
+                "sourceWarmupAppliedActions"] as? [[NSNumber]])?.map {
+                    $0.map(\.floatValue)
+                }
+            guard archivedSourceWarmupActions.map({ actions in
+                !actions.isEmpty && actions.allSatisfy {
+                    $0.count == HumanoidBoxCarryTask.actionDimension
+                        && $0.allSatisfy(\.isFinite)
+                }
+            }) ?? true else {
+                fail("source warm-up controls are incomplete or invalid")
+            }
+        } else {
+            archivedSourceWarmupActions = nil
+        }
+        let encodedSchema = humanoidBoxFlowTrajectorySchema(from: data)
         let useTargetGeneratingSource =
             o.taskOptions["useTargetGeneratingTrajectoryAsSource"] == 1
         let sourceStagesOnly =
@@ -1602,7 +2664,8 @@ case "experiment-h1-box-flow":
             includeOwnStage: !sourceStagesOnly) {
             sourceStages = stages
         } else if useTargetGeneratingSource {
-            fail("--run target-generating source did not pass its planner gate")
+            fail("--run target-generating source is not a reusable "
+                + "recovery-safe frontier")
         } else if let trajectory = humanoidBoxTrajectory(from: data) {
             // Probe artifacts predate explicit flow lineage. They remain
             // usable when the caller supplies the replay duration.
@@ -1613,14 +2676,148 @@ case "experiment-h1-box-flow":
         } else {
             fail("--run source must be a box physical-flow or probe report")
         }
+        if let requestedSteps = o.taskOptions[
+                "sourceOwnStageExecutionSteps"].map({ Int($0) }) {
+            guard !sourceStagesOnly,
+                  let ownStage = sourceStages.last,
+                  let prefix = ownStage.prefix(
+                    controlSteps: requestedSteps) else {
+                fail("sourceOwnStageExecutionSteps must select a positive "
+                    + "prefix of the appended source stage")
+            }
+            sourceStages[sourceStages.count - 1] = prefix
+        }
+        if let encodedSchema,
+           encodedSchema.blendKnots == legBlendKnotCount,
+           (encodedSchema.residualKnots != legResidualKnotCount
+            || encodedSchema.torsoResidualKnots
+                != torsoResidualKnotCount
+            || encodedSchema.residualMaximum
+                != maximumLegResidualAction
+            || encodedSchema.torsoResidualMaximum
+                != maximumTorsoResidualAction
+            || encodedSchema.armAsymmetryKnots
+                != armAsymmetryKnotCount
+            || encodedSchema.armAsymmetryMaximum
+                != maximumArmAsymmetryAction) {
+            sourceStages = sourceStages.map { stage in
+                guard stage.policyOnly != true else { return stage }
+                let reference = stage.trajectorySequence?.first
+                    ?? stage.trajectory
+                guard let armCount = encodedSchema.armParameterCount(
+                    totalParameterCount: reference.count) else {
+                    fail("source flow trajectory has an invalid source schema")
+                }
+                func converted(_ trajectory: [Float]) -> [Float] {
+                    HumanoidBoxPhysicalFlowExperiment
+                        .resampledLegResidualTrajectory(
+                            trajectory,
+                            armParameterCount: armCount,
+                            blendKnotCount: encodedSchema.blendKnots,
+                            sourceResidualKnotCount:
+                                encodedSchema.residualKnots,
+                            targetResidualKnotCount: legResidualKnotCount,
+                            sourceResidualMaximumAction:
+                                encodedSchema.residualMaximum,
+                            targetResidualMaximumAction:
+                                maximumLegResidualAction,
+                            sourceTorsoResidualKnotCount:
+                                encodedSchema.torsoResidualKnots,
+                            targetTorsoResidualKnotCount:
+                                torsoResidualKnotCount,
+                            sourceTorsoResidualMaximumAction:
+                                encodedSchema.torsoResidualMaximum,
+                            targetTorsoResidualMaximumAction:
+                                maximumTorsoResidualAction,
+                            sourceArmAsymmetryKnotCount:
+                                encodedSchema.armAsymmetryKnots,
+                            targetArmAsymmetryKnotCount:
+                                armAsymmetryKnotCount,
+                            sourceArmAsymmetryMaximumAction:
+                                encodedSchema.armAsymmetryMaximum,
+                            targetArmAsymmetryMaximumAction:
+                                maximumArmAsymmetryAction)
+                }
+                return HumanoidBoxPhysicalFlowStage(
+                    trajectory: stage.trajectorySequence == nil
+                        ? converted(stage.trajectory) : [],
+                    controlSteps: stage.controlSteps,
+                    trajectoryDurationSteps:
+                        stage.trajectoryDurationSteps,
+                    trajectorySequence:
+                        stage.trajectorySequence?.map(converted),
+                    trajectorySequencePhaseSteps:
+                        stage.trajectorySequencePhaseSteps,
+                    trajectorySequenceStepDenominator:
+                        stage.trajectorySequenceStepDenominator,
+                    forwardOnlyBaseCommand:
+                        stage.forwardOnlyBaseCommand == true,
+                    holonomicBaseCommand:
+                        stage.holonomicBaseCommand == true,
+                    locomotionCheckpointDirectory:
+                        stage.locomotionCheckpointDirectory,
+                    locomotionCommandSpeed:
+                        stage.locomotionCommandSpeed,
+                    policyOnly: stage.policyOnly ?? false,
+                    appliedNormalizedActions:
+                        stage.appliedNormalizedActions,
+                    canonicalizeReplicasBeforeExecution:
+                        stage.canonicalizeReplicasBeforeExecution == true,
+                    continueFromPreviousTrajectoryTerminal:
+                        stage.continueFromPreviousTrajectoryTerminal == true,
+                    graspAnchorFeedbackBlend:
+                        stage.graspAnchorFeedbackBlend,
+                    graspAnchorFeedbackVelocityHorizonSeconds:
+                        stage.graspAnchorFeedbackVelocityHorizonSeconds,
+                    graspAnchorFeedbackMaximumActionCorrection:
+                        stage.graspAnchorFeedbackMaximumActionCorrection,
+                    graspAnchorFeedbackInwardPreloadMeters:
+                        stage.graspAnchorFeedbackInwardPreloadMeters,
+                    leftGraspAnchorBoxLocalMeters:
+                        stage.leftGraspAnchorBoxLocalMeters,
+                    rightGraspAnchorBoxLocalMeters:
+                        stage.rightGraspAnchorBoxLocalMeters,
+                    graspAnchorBoxHeightMeters:
+                        stage.graspAnchorBoxHeightMeters,
+                    minimumCarryDistanceMeters:
+                        stage.minimumCarryDistanceMeters,
+                    minimumDestinationProgressMeters:
+                        stage.minimumDestinationProgressMeters,
+                    minimumRootDestinationProgressMeters:
+                        stage.minimumRootDestinationProgressMeters,
+                    minimumTouchdowns:
+                        stage.minimumTouchdowns,
+                    minimumAlternatingSteps:
+                        stage.minimumAlternatingSteps,
+                    minimumSwingFootLiftMeters:
+                        stage.minimumSwingFootLiftMeters,
+                    minimumFootAirTimeSeconds:
+                        stage.minimumFootAirTimeSeconds,
+                    minimumFootUnloadingFraction:
+                        stage.minimumFootUnloadingFraction,
+                    minimumTerminalFootUnloadingFraction:
+                        stage.minimumTerminalFootUnloadingFraction,
+                    minimumClearanceMeters:
+                        stage.minimumClearanceMeters,
+                    maximumPathDownwardBoxVelocityMPS:
+                        stage.maximumPathDownwardBoxVelocityMPS,
+                    minimumGraspQuality:
+                        stage.minimumGraspQuality,
+                    certificationDwellSteps:
+                        stage.certificationDwellSteps)
+            }
+        }
         if sourceStages.contains(where: {
             $0.policyOnly != true
-                && !acceptedTrajectoryCounts.contains($0.trajectory.count)
+                && !($0.trajectorySequence?.allSatisfy {
+                    acceptedTrajectoryCounts.contains($0.count)
+                } ?? acceptedTrajectoryCounts.contains($0.trajectory.count))
         }) {
             fail("source and target trajectory knot schemas differ")
         }
     } else {
         sourceStages = []
+        archivedSourceWarmupActions = nil
     }
     if let policySourceSteps = o.taskOptions["policySourceSteps"],
        policySourceSteps > 0 {
@@ -1641,43 +2838,201 @@ case "experiment-h1-box-flow":
         targetExecutionSteps: o.taskOptions["targetExecutionSteps"].map {
             Int($0)
         },
-        targetDiscoveryPopulationSize: Int(
-            o.taskOptions["targetDiscoveryPopulationSize"] ?? 0),
+        targetSelectionStep: o.taskOptions["targetSelectionStep"].map {
+            Int($0)
+        } ?? (targetDiscoveryPopulationSize == 0
+            ? humanoidBoxFlowSelectedTargetStep(from: targetData) : nil),
+        candidateTrajectoryDurationSteps:
+            o.taskOptions["candidateTrajectoryDurationSteps"].map {
+                Int($0)
+            },
+        targetDiscoveryPopulationSize: targetDiscoveryPopulationSize,
         targetDiscoveryGenerations: Int(
             o.taskOptions["targetDiscoveryGenerations"] ?? 0),
         targetDiscoveryInitialStandardDeviation:
             o.taskOptions["targetDiscoveryInitialStandardDeviation"] ?? 0.25,
+        targetDiscoveryArmOnly:
+            o.taskOptions["targetDiscoveryArmOnly"] == 1,
+        targetDiscoveryLowerBodyOnly:
+            o.taskOptions["targetDiscoveryLowerBodyOnly"] == 1,
+        targetDiscoveryTiedArmKnots:
+            o.taskOptions["targetDiscoveryTiedArmKnots"] == 1,
+        targetDiscoveryBlockCoordinateSearch:
+            o.taskOptions["targetDiscoveryBlockCoordinateSearch"] == 1,
+        recedingHorizonSteps: Int(
+            o.taskOptions["recedingHorizonSteps"] ?? 0),
+        recedingInitialPhaseStep: Int(
+            o.taskOptions["recedingInitialPhaseStep"] ?? 0),
+        recedingControlHorizonSteps: Int(
+            o.taskOptions["recedingControlHorizonSteps"] ?? 1),
+        recedingSafetyLookaheadSteps:
+            o.taskOptions["recedingSafetyLookaheadSteps"].map(Int.init),
+        recedingTerminalHoldSteps: Int(
+            o.taskOptions["recedingTerminalHoldSteps"] ?? 0),
+        recedingValidationCandidateCount: Int(
+            o.taskOptions["recedingValidationCandidateCount"] ?? 4),
+        recedingValidationReplicaCount:
+            o.taskOptions["recedingValidationReplicaCount"].map(Int.init),
+        recedingValidationMinimumSuccessFraction:
+            o.taskOptions[
+                "recedingValidationMinimumSuccessFraction"] ?? 0.8,
+        reconstructionValidationCandidateCount: Int(
+            o.taskOptions[
+                "reconstructionValidationCandidateCount"] ?? 4),
+        reconstructionValidationMinimumSuccessFraction:
+            o.taskOptions[
+                "reconstructionValidationMinimumSuccessFraction"] ?? 0.8,
+        reconstructionOneEnvironmentSearch:
+            o.taskOptions["reconstructionOneEnvironmentSearch"] == 1,
+        continueTrajectoryFromSourceTerminal:
+            o.taskOptions["continueTrajectoryFromSourceTerminal"] == 1,
+        preserveProvidedContinuationSeedUpperBody:
+            o.taskOptions[
+                "preserveProvidedContinuationSeedUpperBody"] == 1,
+        recedingShiftInitialSeed:
+            o.taskOptions["recedingShiftInitialSeed"] == 1,
+        recedingLocomotionBlendProposal:
+            o.taskOptions["recedingLocomotionBlendProposal"],
+        recedingLocomotionZeroResidualProposal:
+            o.taskOptions["recedingLocomotionZeroResidualProposal"] == 1,
+        recedingLocomotionCheckpointDirectory:
+            o.locomotionCheckpoint,
+        recedingLocomotionCommandSpeed:
+            o.taskOptions["recedingLocomotionCommandSpeed"],
+        recedingForwardOnlyBaseCommand:
+            o.taskOptions["recedingForwardOnlyBaseCommand"] == 1,
+        recedingHolonomicBaseCommand:
+            o.taskOptions["recedingHolonomicBaseCommand"] == 1,
         carryBaseLegActionFractionOverride:
             o.taskOptions["carryBaseLegActionFractionOverride"],
         legBlendKnotCount: legBlendKnotCount,
         legResidualKnotCount: legResidualKnotCount,
-        maximumLegResidualAction:
-            o.taskOptions["maximumLegResidualAction"] ?? 0.25,
+        maximumLegResidualAction: maximumLegResidualAction,
+        torsoResidualKnotCount: torsoResidualKnotCount,
+        maximumTorsoResidualAction: maximumTorsoResidualAction,
+        armAsymmetryKnotCount: armAsymmetryKnotCount,
+        maximumArmAsymmetryAction: maximumArmAsymmetryAction,
+        graspAnchorFeedbackBlend:
+            o.taskOptions["graspAnchorFeedbackBlend"] ?? 0,
+        graspAnchorFeedbackVelocityHorizonSeconds:
+            o.taskOptions[
+                "graspAnchorFeedbackVelocityHorizonSeconds"] ?? 0.04,
+        graspAnchorFeedbackMaximumActionCorrection:
+            o.taskOptions[
+                "graspAnchorFeedbackMaximumActionCorrection"] ?? 0.7,
+        graspAnchorFeedbackInwardPreloadMeters:
+            o.taskOptions[
+                "graspAnchorFeedbackInwardPreloadMeters"] ?? 0,
         minimumTargetCarryDistanceMeters:
             o.taskOptions["minimumTargetCarryDistanceMeters"] ?? 0,
+        maximumTargetPathCarryRegressionMeters:
+            o.taskOptions["maximumTargetPathCarryRegressionMeters"] ?? 0,
         targetDiscoveryObjectiveCarryDistanceMeters:
             o.taskOptions[
                 "targetDiscoveryObjectiveCarryDistanceMeters"],
+        minimumTargetDestinationProgressMeters:
+            o.taskOptions["minimumTargetDestinationProgressMeters"] ?? 0,
+        targetDiscoveryObjectiveDestinationProgressMeters:
+            o.taskOptions[
+                "targetDiscoveryObjectiveDestinationProgressMeters"],
+        minimumTargetRootDestinationProgressMeters:
+            o.taskOptions[
+                "minimumTargetRootDestinationProgressMeters"] ?? 0,
+        targetDiscoveryObjectiveRootDestinationProgressMeters:
+            o.taskOptions[
+                "targetDiscoveryObjectiveRootDestinationProgressMeters"],
+        minimumTargetTouchdowns: Int(
+            o.taskOptions["minimumTargetTouchdowns"] ?? 0),
+        minimumTargetAlternatingSteps: Int(
+            o.taskOptions["minimumTargetAlternatingSteps"] ?? 0),
+        minimumTargetSwingFootLiftMeters:
+            o.taskOptions["minimumTargetSwingFootLiftMeters"] ?? 0,
+        targetDiscoveryObjectiveSwingFootLiftMeters:
+            o.taskOptions[
+                "targetDiscoveryObjectiveSwingFootLiftMeters"],
+        minimumTargetFootAirTimeSeconds:
+            o.taskOptions["minimumTargetFootAirTimeSeconds"] ?? 0,
+        targetDiscoveryObjectiveFootAirTimeSeconds:
+            o.taskOptions[
+                "targetDiscoveryObjectiveFootAirTimeSeconds"],
+        minimumTargetFootUnloadingFraction:
+            o.taskOptions["minimumTargetFootUnloadingFraction"] ?? 0,
+        targetDiscoveryObjectiveFootUnloadingFraction:
+            o.taskOptions[
+                "targetDiscoveryObjectiveFootUnloadingFraction"],
+        minimumTargetTerminalFootUnloadingFraction:
+            o.taskOptions[
+                "minimumTargetTerminalFootUnloadingFraction"],
+        minimumTargetClearanceMeters:
+            o.taskOptions["minimumTargetClearanceMeters"] ?? 0.01,
+        targetDiscoveryObjectiveClearanceMeters:
+            o.taskOptions[
+                "targetDiscoveryObjectiveClearanceMeters"],
+        maximumTargetPathDownwardBoxVelocityMPS:
+            o.taskOptions[
+                "maximumTargetPathDownwardBoxVelocityMPS"],
+        minimumTargetTerminalClearanceMeters:
+            o.taskOptions["minimumTargetTerminalClearanceMeters"],
+        maximumTargetTerminalDownwardBoxVelocityMPS:
+            o.taskOptions[
+                "maximumTargetTerminalDownwardBoxVelocityMPS"],
+        minimumTargetGraspQuality:
+            o.taskOptions["minimumTargetGraspQuality"] ?? 0,
+        targetDiscoveryObjectiveGraspQuality:
+            o.taskOptions["targetDiscoveryObjectiveGraspQuality"],
+        targetFeasibilityDwellSteps: Int(
+            o.taskOptions["targetFeasibilityDwellSteps"] ?? 1),
         requireStableCarryPath:
             o.taskOptions["requireStableCarryPath"] == 1,
         trajectoryKnotCount: knotCount,
         robustReplayCount: Int(
             o.taskOptions["robustReplayCount"] ?? 32),
+        robustActionNoiseStandardDeviation:
+            o.taskOptions["robustActionNoiseStandardDeviation"] ?? 0,
+        optimizationActionNoiseStandardDeviation:
+            o.taskOptions["optimizationActionNoiseStandardDeviation"] ?? 0,
+        optimizationActionNoiseReplicaCount: Int(
+            o.taskOptions["optimizationActionNoiseReplicaCount"] ?? 1),
         initialStandardDeviation:
             o.taskOptions["initialStandardDeviation"] ?? 0.25,
         eliteFraction: o.taskOptions["eliteFraction"] ?? 0.05,
-        seed: o.seed)
-    let report = try HumanoidBoxPhysicalFlowExperiment.run(
-        checkpointDirectory: checkpoint,
-        targetTrajectory: o.taskOptions["zeroTargetTrajectory"] == 1
-            ? [Float](repeating: 0,
-                count: targetArmParameterCount + legBlendKnotCount)
-            : targetTrajectory,
-        proposalTrajectory: proposalTrajectory,
-        sourceStages: sourceStages,
-        configuration: configuration)
+        seed: o.seed,
+        optimizerSeed: o.taskOptions["optimizerSeed"].map {
+            UInt64($0)
+        })
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let report: HumanoidBoxPhysicalFlowReport
+    do {
+        report = try HumanoidBoxPhysicalFlowExperiment.run(
+            checkpointDirectory: checkpoint,
+            targetTrajectory: o.taskOptions["zeroTargetTrajectory"] == 1
+                ? [Float](repeating: 0,
+                    count: targetArmParameterCount + legBlendKnotCount)
+                : targetTrajectory,
+            proposalTrajectory: proposalTrajectory,
+            archivedTargetTrajectorySequence:
+                archivedTargetTrajectorySequence,
+            archivedTargetTrajectorySequencePhaseSteps:
+                archivedTargetTrajectorySequencePhaseSteps,
+            archivedTargetPredictedRecoveryPathSafe:
+                archivedTargetPredictedRecoveryPathSafe,
+            archivedSourceWarmupActions:
+                archivedSourceWarmupActions,
+            sourceStages: sourceStages,
+            configuration: configuration)
+    } catch let failure as HumanoidBoxPhysicalFlowTargetFailure {
+        let failureData = try encoder.encode(failure)
+        if let output = o.output {
+            let url = URL(fileURLWithPath: output)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try failureData.write(to: url, options: .atomic)
+        }
+        if o.json { print(String(decoding: failureData, as: UTF8.self)) }
+        fail(failure.description)
+    }
     let data = try encoder.encode(report)
     if let output = o.output {
         let url = URL(fileURLWithPath: output)
@@ -1689,11 +3044,19 @@ case "experiment-h1-box-flow":
     if o.json {
         print(String(decoding: data, as: UTF8.self))
     } else {
+        let finitePrefixPassed = report.targetFinitePrefixGatePassed
+            ?? report.targetPlanningGatePassed
+        let reusableFrontierPassed = report
+            .targetReusableFrontierGatePassed
+            ?? (finitePrefixPassed
+                && (report.targetPredictedRecoveryPathSafe
+                    ?? (report.recedingHorizonSteps == nil)))
         print(String(format:
-            "H1 box flow source %dfr %.0f%% target step %d carry %.3fm clearance %.3fm upright %.3f/%.3f",
+            "H1 box flow source %dfr %.0f%% target step %d carry %.3fm destination %+0.3fm clearance %.3fm upright %.3f/%.3f",
             report.sourceTrajectorySteps,
             100 * report.sourceReplaySuccessFraction,
             report.selectedTargetStep, report.targetCarryDistanceMeters,
+            report.targetDestinationProgressMeters ?? 0,
             report.targetClearanceMeters,
             report.targetRobotUprightAlignment,
             report.targetBoxUprightAlignment))
@@ -1706,11 +3069,13 @@ case "experiment-h1-box-flow":
                 generation.meanStandardDeviation))
         }
         print(String(format:
-            "optimized max %.3f robust %.0f%% replay %.3g plan %@ reconstruction %@",
+            "optimized max %.3f robust %.0f%% replay %.3g finite-prefix %@ reusable-frontier %@ reconstruction %@ overall %@",
             report.optimized.maximumNormalizedError,
             100 * report.robustReplaySuccessFraction,
             report.selectedReplayMaximumNormalizedStateError,
-            report.targetPlanningGatePassed ? "PASS" : "FAIL",
+            finitePrefixPassed ? "PASS" : "FAIL",
+            reusableFrontierPassed ? "PASS" : "FAIL",
+            report.reconstructionGatePassed ? "PASS" : "FAIL",
             report.goGatePassed ? "PASS" : "FAIL"))
     }
 

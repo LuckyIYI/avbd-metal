@@ -9,6 +9,20 @@ import AVBDLearn
 @MainActor
 final class PolicyReplayModel: ObservableObject, RenderableModel {
     nonisolated let captureID = "policy"
+    private enum FlowFrontierQualification {
+        case measuredFinitePrefix
+        case reusableRecoverySafeFrontier
+
+        var endpointLabel: String {
+            switch self {
+            case .measuredFinitePrefix:
+                return "MEASURED FINITE-PREFIX ENDPOINT · NOT REUSABLE"
+            case .reusableRecoverySafeFrontier:
+                return "REUSABLE RECOVERY-SAFE FRONTIER"
+            }
+        }
+    }
+
     enum Robot: CaseIterable {
         case unitreeH1
         case gearSonicG1
@@ -100,7 +114,8 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
     }
     @Published var running = true
-    @Published var playbackRate: Double = 1
+    @Published var playbackRate: Double = ProcessInfo.processInfo.environment[
+        "AVBD_REPLAY_RATE"].flatMap(Double.init) ?? 1
     @Published var statsText = ""
     @Published var policyStatus = ""
     @Published var trainingStatus = "waiting for trainer metrics"
@@ -133,6 +148,11 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var observation: RLObservationBatch?
     private var result: RLStepBatch?
     private var actionProvider: (any RLActionProvider)?
+    private var flowReplayController:
+        HumanoidBoxFlowDistillation.ReplayController?
+    private var flowFrontierQualification:
+        FlowFrontierQualification?
+    private var flowReplayUsesLearnedActionChunk = false
     private var arachneRevealController: Arachne15RevealController?
     private var arachneAutoUnfold = false
     private var loadedCheckpointDirectory: String?
@@ -164,6 +184,33 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var gearSonicReferenceDirectory: String?
     private var gearSonicReferenceDirectories: [String: String] = [:]
 
+    private static func flowFrontierQualification(
+        reportPath: String
+    ) throws -> FlowFrontierQualification {
+        let data = try Data(contentsOf: URL(fileURLWithPath: reportPath))
+        guard let dictionary = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any] else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "flow replay report is not a JSON object")
+        }
+        let finitePrefixPassed = (dictionary[
+            "targetFinitePrefixGatePassed"] as? Bool)
+            ?? (dictionary["targetPlanningGatePassed"] as? Bool)
+            ?? ((dictionary["targetGatePassed"] as? Bool) == true
+                && ((dictionary["targetCloneSuccessFraction"]
+                    as? NSNumber)?.floatValue ?? 0) >= 0.8
+                && ((dictionary["targetReplayMaximumNormalizedError"]
+                    as? NSNumber)?.floatValue ?? .infinity) < 0.02)
+        let recoveryPathSafe = (dictionary[
+            "targetPredictedRecoveryPathSafe"] as? Bool)
+            ?? (dictionary["recedingHorizonSteps"] == nil)
+        let reusableFrontierPassed = (dictionary[
+            "targetReusableFrontierGatePassed"] as? Bool)
+            ?? (finitePrefixPassed && recoveryPathSafe)
+        return reusableFrontierPassed
+            ? .reusableRecoverySafeFrontier : .measuredFinitePrefix
+    }
+
     var supportsGoalPlacement: Bool {
         isaacHumanoid?.usesPointGoal == true
             || arachne?.usesPointGoal == true
@@ -192,6 +239,16 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     var replayControlExplanation: String {
         switch robot.runtime {
         case .nativeMLX:
+            if flowReplayController != nil {
+                let controller = flowReplayUsesLearnedActionChunk
+                    ? "learned MLX action chunk"
+                    : "exact simulator-feedback teacher"
+                if flowFrontierQualification
+                        == .reusableRecoverySafeFrontier {
+                    return "This experiment replays its exact measured physical source lineage, then executes the \(controller). The app pauses at the recovery-tested frontier; this boundary is qualified for a subsequent controller."
+                }
+                return "This experiment replays its exact measured physical source lineage, then executes the \(controller) for its finite evaluated horizon. The app pauses at that endpoint; recovery was not established, so it is not a reusable continuation boundary."
+            }
             return "Normal motion executes the learned Safetensors checkpoint used by `eval-rl`. Arachne transformation controls temporarily command a bounded commissioning trajectory through the same motors and physics; learned control resumes only after deployment settles."
         case .unitreeRecurrentMLX:
             return "This is a static, source-verified public recurrent policy imported to MLX. It is not connected to the native trainer or checkpoint hot-reload path."
@@ -262,7 +319,19 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case .humanoidIsaacGoal:
             return "Development H1 point-goal/8 kg impact policy on the current actuator contract (78.1% sealed-test goal success); PPO owns every joint action, but this policy is not acceptance-qualified yet."
         case .humanoidBoxCarry:
-            return "Development H1 carry policy on the exact batched training scene. The current best checkpoint physically picks up the 2 kg box, carries it about 0.5 m to the receiving table, and remains stable through the 1,200-step horizon. Centering and release are not learned yet, so this replay is diagnostic rather than acceptance-qualified."
+            if flowFrontierQualification == .measuredFinitePrefix {
+                return "Measured finite-prefix H1 box experiment on the exact batched training scene. It replays the recorded physical controls only through the evaluated horizon. The endpoint is not recovery-qualified, so this is diagnostic evidence—not a solved transport skill or reusable frontier."
+            }
+            if flowReplayController?.isBalanceOnly == true {
+                let controller = flowReplayUsesLearnedActionChunk
+                    ? "the immutable MLX action chunk"
+                    : "the exact simulator-feedback teacher"
+                return "Recovery-safe loaded-balance frontier on the exact batched training scene: the H1 physically grasps the 2 kg box, replays the measured source lineage, then \(controller) owns the balance controls. This is not receiving-table transport or release."
+            }
+            if flowReplayController != nil {
+                return "Reusable recovery-safe destination-progress frontier on the exact batched training scene: the H1 physically grasps the 2 kg box, replays the measured source lineage, then advances the held load toward the receiving table. Live goal error is the evidence; placement and release are not learned yet."
+            }
+            return "Development H1 carry policy on the exact batched training scene. Live metrics below describe what the selected checkpoint actually achieves; receiving-table placement and release are not learned yet."
         case .arachne:
             return "Accepted Arachne-15 straight-walk benchmark at 0.15 m/s with the exact printable CAD visuals and corrected revision-6 foot collision model."
         case .arachneGoal:
@@ -318,7 +387,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         arachneRevealController = nil
         arachneFolded = false
         arachneAutoUnfold = false
-        task = nil; actionProvider = nil
+        task = nil; actionProvider = nil; flowReplayController = nil
+        flowFrontierQualification = nil
+        flowReplayUsesLearnedActionChunk = false
         gearSonicBundleDirectory = nil
         gearSonicReferenceDirectory = nil
         gearSonicReferenceDirectories = [:]
@@ -442,6 +513,32 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 } catch {
                     loadFailures.append("\(path): \(error)")
                 }
+            }
+            if robot == .humanoidBoxCarry,
+               let flowReport = ProcessInfo.processInfo.environment[
+                    "AVBD_REPLAY_FLOW_REPORT"],
+               let sourceCheckpoint = loadedCheckpointDirectory {
+                let actionChunk = ProcessInfo.processInfo.environment[
+                    "AVBD_REPLAY_ACTION_CHUNK"]
+                let controller = try HumanoidBoxFlowDistillation
+                    .ReplayController(
+                        checkpointDirectory: sourceCheckpoint,
+                        flowReportPath: flowReport,
+                        actionChunkCheckpointDirectory: actionChunk)
+                flowReplayController = controller
+                flowFrontierQualification = try Self
+                    .flowFrontierQualification(reportPath: flowReport)
+                flowReplayUsesLearnedActionChunk = actionChunk != nil
+                let controllerName = actionChunk == nil
+                    ? "exact simulator-feedback teacher"
+                    : "learned MLX action chunk"
+                let qualificationName = flowFrontierQualification
+                        == .reusableRecoverySafeFrontier
+                    ? "reusable recovery-safe frontier"
+                    : "measured finite prefix (not reusable)"
+                actionProvider = controller
+                policyStatus = "loaded \(controllerName)\n\(flowReport)"
+                trainingStatus = "\(qualificationName) · replay pauses at the measured endpoint"
             }
             if actionProvider == nil {
                 running = false
@@ -1100,6 +1197,19 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 observation = result.observations
                 controlSteps += 1
                 updateCameraTargets()
+                if flowReplayController?.isComplete == true {
+                    running = false
+                    episodeFinished = true
+                    accumulator = 0
+                    interactionStatus = switch flowFrontierQualification {
+                    case .reusableRecoverySafeFrontier:
+                        "recovery-safe reusable frontier reached · Reset or Replay to inspect again"
+                    case .measuredFinitePrefix, .none:
+                        "finite measured endpoint reached · continuation is not recovery-qualified"
+                    }
+                    refreshStats()
+                    break
+                }
                 if result.terminated[0] || result.truncated[0] {
                     completed += 1
                     if result.successes[0] { successes += 1 }
@@ -1443,7 +1553,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let command = result?.metrics[
                 "state/carry_command_progress"]?[0] ?? 0
             let outcome: String
-            if !episodeFinished {
+            if flowReplayController?.isComplete == true {
+                outcome = flowFrontierQualification?.endpointLabel
+                    ?? "MEASURED EXPERIMENT ENDPOINT"
+            } else if !episodeFinished {
                 outcome = "running"
             } else if successes > 0 {
                 outcome = "SUCCESS"
@@ -1458,14 +1571,16 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 format: "box clearance %+.1f mm   carry %.3f m   goal error %.3f m\n"
                     + "support %@   physical hands %.0f/%.0f   released %@\n"
                     + "unsupported hold %.0f frames   handoff %.0f%%   walk command %.0f%%\n"
-                    + "root x %+.3f m   box x %+.3f m   box z %.3f m\n"
-                    + "frame %d/%d   %@",
+                    + "root xy (%+.3f, %+.3f) m   box xy (%+.3f, %+.3f) m   z %.3f m\n"
+                    + "phase %@\nframe %d/%d   %@",
                 clearance * 1_000, carry, placement,
                 destination > 0.5 ? "DESTINATION"
                     : (pedestal > 0.5 ? "SOURCE" : "AIR"),
                 left, right, released > 0.5 ? "YES" : "NO",
                 stableUnsupported, handoff * 100, command * 100,
-                state.root.position.x, box.position.x, box.position.z,
+                state.root.position.x, state.root.position.y,
+                box.position.x, box.position.y, box.position.z,
+                flowReplayController?.phaseDescription ?? "policy",
                 controlSteps, humanoidBoxCarry.spec.maxEpisodeSteps, outcome)
         } else if let isaacHumanoid {
             let state = isaacHumanoid.environment.states()[0]
@@ -1603,7 +1718,7 @@ struct PolicyReplayLabView: View {
                     .pickerStyle(.segmented)
                     HStack {
                         Text("Playback").font(.caption)
-                        Slider(value: $model.playbackRate, in: 0.25...1)
+                        Slider(value: $model.playbackRate, in: 0.1...1)
                         Text(String(format: "%.2fx", model.playbackRate))
                             .font(.caption.monospacedDigit()).frame(width: 42)
                     }
