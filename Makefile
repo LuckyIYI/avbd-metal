@@ -1,6 +1,11 @@
 # AVBD Metal build helpers
 
-.PHONY: build test verify-core verify-mlx-rl app cli bench clean ml-tool \
+# macOS renamex_np with RENAME_SWAP (0x2) replaces an existing bundle in one
+# namespace operation; os.rename does the same when no bundle exists yet.
+# Staging below .build keeps both paths on one volume.
+ATOMIC_APP_PUBLISH := python3 -c 'import ctypes, os, sys; src, dst = sys.argv[1:3]; f = ctypes.CDLL(None, use_errno=True).renamex_np; f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]; f.restype = ctypes.c_int; rc = f(os.fsencode(src), os.fsencode(dst), 0x2) if os.path.lexists(dst) else (os.rename(src, dst) or 0); err = ctypes.get_errno(); sys.exit("atomic app publish failed: " + os.strerror(err)) if rc else None'
+
+.PHONY: build test verify-core verify-mlx-rl verify-release app cli bench clean clean-all ml-tool \
 	app-ml ios-ml generate-arachne-assets verify-arachne-assets \
 	verify-arachne-policy verify-policy-evidence verify-panda-provenance \
 	verify-h1-provenance
@@ -35,16 +40,24 @@ verify-mlx-rl:
 	  -XCTest RLFrameworkTests \
 	  .xcbuild-test/Build/Products/Debug/AVBDTests.xctest
 
+# Full arm64 Mac release gate: hermetic source/provenance checks, the complete
+# simulator suite, packaged MLX integration, and the exact distributable app.
+verify-release: verify-core verify-mlx-rl app-ml
+
 cli: build
 	@echo "binary: .build/release/avbd"
 
 # Wrap the release executable + resource bundle into a double-clickable .app
 app: build
-	rm -rf AVBD.app
-	mkdir -p AVBD.app/Contents/MacOS AVBD.app/Contents/Resources
-	cp .build/release/AVBDApp AVBD.app/Contents/MacOS/AVBDApp
-	cp -R .build/release/avbd-metal_AVBDCore.bundle AVBD.app/Contents/Resources/
-	printf '%s\n' \
+	@set -eu; \
+	  staging_root="$$(mktemp -d .build/avbd-app-stage.XXXXXX)"; \
+	  staged_app="$$staging_root/AVBD.app"; \
+	  cleanup() { rm -rf "$$staging_root"; }; \
+	  trap cleanup EXIT HUP INT TERM; \
+	  mkdir -p "$$staged_app/Contents/MacOS" "$$staged_app/Contents/Resources"; \
+	  cp .build/release/AVBDApp "$$staged_app/Contents/MacOS/AVBDApp"; \
+	  cp -R .build/release/avbd-metal_AVBDCore.bundle "$$staged_app/Contents/Resources/"; \
+	  printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	  '<plist version="1.0"><dict>' \
@@ -56,9 +69,14 @@ app: build
 	  '  <key>CFBundleShortVersionString</key><string>1.0</string>' \
 	  '  <key>NSHighResolutionCapable</key><true/>' \
 	  '  <key>LSMinimumSystemVersion</key><string>14.0</string>' \
-	  '</dict></plist>' > AVBD.app/Contents/Info.plist
-	codesign --force --sign - AVBD.app 2>/dev/null || true
-	@echo "built AVBD.app"
+	  '</dict></plist>' > "$$staged_app/Contents/Info.plist"; \
+	  test -x "$$staged_app/Contents/MacOS/AVBDApp"; \
+	  test -d "$$staged_app/Contents/Resources/avbd-metal_AVBDCore.bundle"; \
+	  plutil -lint "$$staged_app/Contents/Info.plist" >/dev/null; \
+	  codesign --force --deep --sign - "$$staged_app"; \
+	  codesign --verify --deep --strict "$$staged_app"; \
+	  $(ATOMIC_APP_PUBLISH) "$$staged_app" AVBD.app; \
+	  echo "built AVBD.app"
 
 bench: build
 	.build/release/avbd bench boxpile --frames 100 --scale 3
@@ -66,59 +84,71 @@ bench: build
 clean:
 	rm -rf .build AVBD.app
 
+# Deliberately expensive cleanup for every ignored Xcode build cache. Normal
+# `clean` keeps these caches so rebuilding the MLX app does not start cold.
+clean-all: clean
+	rm -rf .xcbuild .xcbuild-app .xcbuild-ios .xcbuild-test
+
 # ML tool: MLX requires xcodebuild (SwiftPM cannot compile its Metal shaders)
 ml-tool:
-	xcodebuild -scheme avbd -configuration Release -destination 'platform=macOS' -derivedDataPath .xcbuild build -quiet
+	xcodebuild -scheme avbd -configuration Release -destination 'platform=macOS' \
+	  -derivedDataPath .xcbuild \
+	  -clonedSourcePackagesDirPath .xcbuild/SourcePackages \
+	  -disableAutomaticPackageResolution \
+	  -onlyUsePackageVersionsFromResolvedFile build -quiet
 	@echo "binary: .xcbuild/Build/Products/Release/avbd"
 
 # App with working MLX policy mode (xcodebuild; SwiftPM cannot build MLX shaders).
 # Accepted policy evidence is verified before any checkpoint enters the bundle.
+# Historical/development actors remain repository-only; release packaging
+# contains only catalog entries with accepted or external-parity evidence.
 app-ml: verify-policy-evidence
-	xcodebuild -scheme AVBDApp -configuration Release -destination 'platform=macOS' -derivedDataPath .xcbuild build -quiet
-	rm -rf AVBD.app
-	mkdir -p AVBD.app/Contents/MacOS AVBD.app/Contents/Resources/checkpoints/external/unitree-h1
-	mkdir -p AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification
-	mkdir -p AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-goal-v0
-	mkdir -p AVBD.app/Contents/Resources/checkpoints/arachne15-velocity-v0
-	mkdir -p AVBD.app/Contents/Resources/checkpoints/arachne15-goal-v0
-	cp .xcbuild/Build/Products/Release/AVBDApp AVBD.app/Contents/MacOS/AVBDApp
-	cp -R .xcbuild/Build/Products/Release/avbd-metal_AVBDCore.bundle AVBD.app/Contents/Resources/
-	cp checkpoints/README.md AVBD.app/Contents/Resources/checkpoints/
-	cp checkpoints/external/unitree-h1/LICENSE \
+	xcodebuild -scheme avbd -configuration Release -destination 'platform=macOS' \
+	  -derivedDataPath .xcbuild \
+	  -clonedSourcePackagesDirPath .xcbuild/SourcePackages \
+	  -disableAutomaticPackageResolution \
+	  -onlyUsePackageVersionsFromResolvedFile build -quiet
+	xcodebuild -scheme AVBDApp -configuration Release -destination 'platform=macOS' \
+	  -derivedDataPath .xcbuild \
+	  -clonedSourcePackagesDirPath .xcbuild/SourcePackages \
+	  -disableAutomaticPackageResolution \
+	  -onlyUsePackageVersionsFromResolvedFile build -quiet
+	@set -eu; \
+	  mkdir -p .build; \
+	  staging_root="$$(mktemp -d .build/avbd-app-stage.XXXXXX)"; \
+	  staged_app="$$staging_root/AVBD.app"; \
+	  cleanup() { rm -rf "$$staging_root"; }; \
+	  trap cleanup EXIT HUP INT TERM; \
+	  mkdir -p "$$staged_app/Contents/MacOS" \
+	    "$$staged_app/Contents/Resources/checkpoints/external/unitree-h1"; \
+	  mkdir -p "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification"; \
+	  cp .xcbuild/Build/Products/Release/AVBDApp "$$staged_app/Contents/MacOS/AVBDApp"; \
+	  cp .xcbuild/Build/Products/Release/avbd "$$staged_app/Contents/MacOS/avbd"; \
+	  cp -R .xcbuild/Build/Products/Release/avbd-metal_AVBDCore.bundle \
+	    "$$staged_app/Contents/Resources/"; \
+	  cp checkpoints/README.md "$$staged_app/Contents/Resources/checkpoints/"; \
+	  cp checkpoints/external/unitree-h1/LICENSE \
 	  checkpoints/external/unitree-h1/manifest.json \
 	  checkpoints/external/unitree-h1/policy.safetensors \
-	  AVBD.app/Contents/Resources/checkpoints/external/unitree-h1/
-	# v0/v1 remain repository-only lineage; ship the accepted epoch-2 v2 bundle.
-	cp checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json \
+	  "$$staged_app/Contents/Resources/checkpoints/external/unitree-h1/"; \
+	  cp checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json \
 	  checkpoints/humanoid-isaac-flat-v2/metadata.json \
 	  checkpoints/humanoid-isaac-flat-v2/policy.safetensors \
 	  checkpoints/humanoid-isaac-flat-v2/requalification-manifest.json \
 	  checkpoints/humanoid-isaac-flat-v2/training-state.json \
-	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/
-	cp checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json \
+	  "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/"; \
+	  cp checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json \
 	  checkpoints/humanoid-isaac-flat-v2/qualification/eval-seed-51001.json \
 	  checkpoints/humanoid-isaac-flat-v2/qualification/eval-seed-51002.json \
 	  checkpoints/humanoid-isaac-flat-v2/qualification/eval-seed-51003.json \
 	  checkpoints/humanoid-isaac-flat-v2/qualification/eval-seed-51004.json \
-	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification/
-	cp checkpoints/humanoid-isaac-goal-v0/evaluation.json \
-	  checkpoints/humanoid-isaac-goal-v0/metadata.json \
-	  checkpoints/humanoid-isaac-goal-v0/policy.safetensors \
-	  checkpoints/humanoid-isaac-goal-v0/training-state.json \
-	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-goal-v0/
-	cp checkpoints/arachne15-velocity-v0/evaluation.json \
-	  checkpoints/arachne15-velocity-v0/metadata.json \
-	  checkpoints/arachne15-velocity-v0/policy.safetensors \
-	  checkpoints/arachne15-velocity-v0/training-state.json \
-	  AVBD.app/Contents/Resources/checkpoints/arachne15-velocity-v0/
-	cp checkpoints/arachne15-goal-v0/deployment-manifest.json \
-	  checkpoints/arachne15-goal-v0/metadata.json \
-	  checkpoints/arachne15-goal-v0/policy.safetensors \
-	  checkpoints/arachne15-goal-v0/training-state.json \
-	  AVBD.app/Contents/Resources/checkpoints/arachne15-goal-v0/
-	-cp .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib AVBD.app/Contents/Resources/ 2>/dev/null
-	-cp -R .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle AVBD.app/Contents/Resources/ 2>/dev/null
-	printf '%s\n' \
+	  "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification/"; \
+	  cp -R .xcbuild/Build/Products/Release/mlx-swift_Cmlx.bundle \
+	    "$$staged_app/Contents/Resources/"; \
+	  test -f "$$staged_app/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"; \
+	  python3 Tools/verify_policy_evidence.py \
+	    --app-checkpoints "$$staged_app/Contents/Resources/checkpoints"; \
+	  printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	  '<plist version="1.0"><dict>' \
@@ -130,9 +160,19 @@ app-ml: verify-policy-evidence
 	  '  <key>CFBundleShortVersionString</key><string>1.0</string>' \
 	  '  <key>NSHighResolutionCapable</key><true/>' \
 	  '  <key>LSMinimumSystemVersion</key><string>14.0</string>' \
-	  '</dict></plist>' > AVBD.app/Contents/Info.plist
-	codesign --force --sign - AVBD.app 2>/dev/null || true
-	@echo "built AVBD.app (ML-enabled)"
+	  '</dict></plist>' > "$$staged_app/Contents/Info.plist"; \
+	  test -x "$$staged_app/Contents/MacOS/AVBDApp"; \
+	  test -x "$$staged_app/Contents/MacOS/avbd"; \
+	  plutil -lint "$$staged_app/Contents/Info.plist" >/dev/null; \
+	  codesign --force --deep --sign - "$$staged_app"; \
+	  codesign --verify --deep --strict "$$staged_app"; \
+	  "$$staged_app/Contents/MacOS/avbd" list-rl >/dev/null; \
+	  "$$staged_app/Contents/MacOS/avbd" verify-policy-rl \
+	  humanoid-isaac-flat-v0 \
+	  --checkpoint "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2" \
+	  --frames 1 --json >/dev/null; \
+	  $(ATOMIC_APP_PUBLISH) "$$staged_app" AVBD.app; \
+	  echo "built AVBD.app (ML-enabled)"
 
 # Compile the reusable MLX runtime for a physical iOS device. Xcode must have
 # the matching iOS platform installed; no signing is required for this library.

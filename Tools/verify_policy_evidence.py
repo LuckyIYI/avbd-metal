@@ -10,7 +10,9 @@ immutable boundary around an already evaluated policy instead:
 * evaluation reports must match checkpoint task/revision/configuration/lineage;
 * checkpoint robustness aggregates are rebuilt from their raw reports with the
   same Float32 quantile and pooling semantics as ``VectorPPO.swift``; and
-* deployment-manifest hashes are checked when a checkpoint exposes them.
+* deployment-manifest hashes are checked when a checkpoint exposes them; and
+* an optional built-app check rejects missing, historical, development, or
+  otherwise unallowlisted checkpoint payloads.
 
 An accepted evidence shape that this verifier does not understand fails closed,
 so extending the release catalog requires extending this contract as well.
@@ -18,6 +20,7 @@ so extending the release catalog requires extending this contract as well.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -1444,15 +1447,92 @@ def verify(root: Path) -> tuple[int, int, int, int]:
             report_count)
 
 
+def verify_app_checkpoint_package(root: Path, checkpoint_root: Path) -> None:
+    """Require the distributable app to contain only selectable evidence.
+
+    Historical and development checkpoints remain useful in a repository
+    checkout, but shipping them would make the runtime package broader than
+    the fail-closed replay catalog.  This exact inventory also catches a
+    missing evidence file or an accidental recursive copy of ignored runs.
+    """
+    require(not checkpoint_root.is_symlink(),
+            f"app checkpoint root must not be a symlink: {checkpoint_root}")
+    checkpoint_root = checkpoint_root.resolve()
+    require(checkpoint_root.is_dir(),
+            f"app checkpoint root does not exist: {checkpoint_root}")
+    h1_files = {
+        "deployment-manifest.json",
+        "metadata.json",
+        "policy.safetensors",
+        "requalification-manifest.json",
+        "training-state.json",
+        "qualification/aggregate.json",
+        "qualification/eval-seed-51001.json",
+        "qualification/eval-seed-51002.json",
+        "qualification/eval-seed-51003.json",
+        "qualification/eval-seed-51004.json",
+    }
+    unitree_files = {"LICENSE", "manifest.json", "policy.safetensors"}
+    expected_files = {Path("README.md")}
+    expected_files.update(
+        Path(H1_REQUALIFIED_SELECTION) / relative for relative in h1_files)
+    expected_files.update(
+        Path("external/unitree-h1") / relative for relative in unitree_files)
+
+    actual_files: set[Path] = set()
+    actual_directories: set[Path] = {Path(".")}
+    for path in checkpoint_root.rglob("*"):
+        require(not path.is_symlink(),
+                f"app checkpoint package must not contain symlinks: {path}")
+        relative = path.relative_to(checkpoint_root)
+        if path.is_dir():
+            actual_directories.add(relative)
+        elif path.is_file():
+            actual_files.add(relative)
+        else:
+            raise VerificationError(
+                f"app checkpoint package has unsupported entry: {path}")
+
+    expected_directories = {Path(".")}
+    for relative in expected_files:
+        parent = relative.parent
+        while parent != Path("."):
+            expected_directories.add(parent)
+            parent = parent.parent
+    require(actual_files == expected_files,
+            "app checkpoint file inventory differs from the accepted/external "
+            f"allowlist (missing={sorted(expected_files - actual_files)}, "
+            f"extra={sorted(actual_files - expected_files)})")
+    require(actual_directories == expected_directories,
+            "app checkpoint directory inventory differs from the accepted/"
+            f"external allowlist (missing="
+            f"{sorted(expected_directories - actual_directories)}, extra="
+            f"{sorted(actual_directories - expected_directories)})")
+
+    source_root = root / "checkpoints"
+    for relative in sorted(expected_files):
+        packaged = checkpoint_root / relative
+        source = source_root / relative
+        require(source.is_file(),
+                f"package allowlist source is missing: {source}")
+        require(sha256_file(packaged) == sha256_file(source),
+                f"packaged checkpoint bytes differ from tracked source: "
+                f"{relative}")
+
+
 def main() -> int:
-    root = DEFAULT_ROOT
-    if len(sys.argv) == 3 and sys.argv[1] == "--root":
-        root = Path(sys.argv[2])
-    elif len(sys.argv) != 1:
-        print(f"usage: {Path(sys.argv[0]).name} [--root repository]", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(
+        description="verify accepted replay evidence and app packaging")
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
+                        help="repository root")
+    parser.add_argument("--app-checkpoints", type=Path,
+                        help="built app's checkpoints resource directory")
+    arguments = parser.parse_args()
+    root = arguments.root
     try:
         accepted, external_parity, aggregates, reports = verify(root)
+        if arguments.app_checkpoints is not None:
+            verify_app_checkpoint_package(root, arguments.app_checkpoints)
     except (VerificationError, KeyError, OverflowError, struct.error,
             TypeError, ValueError) as error:
         print(f"policy evidence verification failed: {error}", file=sys.stderr)
@@ -1463,6 +1543,8 @@ def main() -> int:
         f"{external_parity} external parity entries, "
         f"{aggregates} robustness aggregates, "
         f"{reports} evaluation reports"
+        + (", exact app package" if arguments.app_checkpoints is not None
+           else "")
     )
     return 0
 

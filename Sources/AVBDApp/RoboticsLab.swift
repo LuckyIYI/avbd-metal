@@ -7,7 +7,7 @@ import simd
 /// Lab can launch massively parallel sim + training runs with live logs.
 @MainActor
 final class TrainingRunner: ObservableObject {
-    @Published var log = "ready — pipeline runs use the xcodebuild CLI (make ml-tool)"
+    @Published var log = "ready — packaged runs use the bundled MLX trainer"
     @Published var running = false
     @Published var envs: Double = 128
     @Published var steps: Double = 900
@@ -18,13 +18,48 @@ final class TrainingRunner: ObservableObject {
     @Published var episodes: Double = 10
     private var proc: Process?
 
-    var binary: String {
-        let x = ".xcbuild/Build/Products/Release/avbd"
-        return FileManager.default.fileExists(atPath: x) ? x : ".build/release/avbd"
+    static var workspaceURL: URL {
+        let environment = ProcessInfo.processInfo.environment
+        if let override = environment["AVBD_WORKSPACE"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        if Bundle.main.bundleURL.pathExtension == "app",
+           let applicationSupport = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask).first {
+            return applicationSupport.appendingPathComponent(
+                "AVBD", isDirectory: true)
+        }
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath,
+                   isDirectory: true)
+    }
+
+    var binaryURL: URL? {
+        let bundled = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/avbd")
+        let development = [
+            URL(fileURLWithPath: ".xcbuild/Build/Products/Release/avbd"),
+            URL(fileURLWithPath: ".build/release/avbd"),
+        ]
+        return ([bundled] + development).first {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }
     }
 
     func launch(_ phase: String) {
         guard !running else { return }
+        if phase == "train-wm" || phase == "solve-pusht" {
+            do {
+                try PolicyBridge.requireMLXRuntime()
+            } catch {
+                log = "trainer unavailable: \(error.localizedDescription)"
+                return
+            }
+        }
+        guard let binaryURL else {
+            log = "trainer unavailable — build the ML-enabled app with `make app-ml`"
+            return
+        }
         var args: [String] = [phase]
         switch phase {
         case "collect":
@@ -33,21 +68,32 @@ final class TrainingRunner: ObservableObject {
             args += ["--frames", "\(Int(iters))", "--batch", "\(Int(batch))",
                      "--latent", "\(Int(latent))", "--lr", "\(lr)"]
         case "solve-pusht", "oracle-pusht":
-            args += ["--episodes", "\(Int(episodes))", "--latent", "\(Int(latent))"]
+            // Solve reads the architecture contract written by train-wm;
+            // oracle-pusht is non-neural and ignores latent dimensions.
+            args += ["--episodes", "\(Int(episodes))"]
         default: break
         }
+        let workspace = Self.workspaceURL
+        do {
+            try FileManager.default.createDirectory(
+                at: workspace, withIntermediateDirectories: true)
+        } catch {
+            log = "workspace unavailable: \(error.localizedDescription)"
+            return
+        }
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: binary)
+        p.executableURL = binaryURL
         p.arguments = args
-        p.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        p.currentDirectoryURL = workspace
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
         pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let str = String(data: h.availableData, encoding: .utf8) ?? ""
             guard !str.isEmpty else { return }
-            Task { @MainActor in
-                self?.log = String((self!.log + str).suffix(2400))
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.log = String((self.log + str).suffix(2400))
             }
         }
         p.terminationHandler = { [weak self] proc in
@@ -57,6 +103,7 @@ final class TrainingRunner: ObservableObject {
             }
         }
         log = "$ avbd \(args.joined(separator: " "))\n"
+            + "workspace: \(workspace.path)\n"
         do { try p.run(); running = true; proc = p }
         catch { log += "launch failed: \(error.localizedDescription)" }
     }
@@ -271,9 +318,14 @@ struct RoboticsLabView: View {
                 }
 
                 if model.mode == .policy {
-                    Text(model.policyStatus)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(model.policyStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Reload trained policy") {
+                            PolicyBridge.install(into: model)
+                        }
+                    }
                 }
 
                 GroupBox("Model input (64\u{00D7}64)") {

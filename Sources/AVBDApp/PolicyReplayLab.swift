@@ -33,14 +33,23 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case arachneGoal
         case arachneClassical
 
-        /// Only current catalog entries plus the explicit local box-carry
-        /// development surface belong in the picker. Historical learned
-        /// checkpoints remain addressable for a visible compatibility error,
-        /// but can never be selected accidentally.
-        static let allCases: [Robot] = [
-            .unitreeH1, .gearSonicG1, .humanoidIsaac,
-            .humanoidBoxCarry, .arachneClassical,
-        ]
+        /// A distributable app advertises only policies it actually ships.
+        /// Unwrapped source builds keep local experiment surfaces convenient;
+        /// a packaged build can opt into the same list explicitly.
+        static var allCases: [Robot] {
+            var cases: [Robot] = [
+                .humanoidIsaac, .unitreeH1, .arachneClassical,
+            ]
+            let environment = ProcessInfo.processInfo.environment
+            let developmentEnabled = environment[
+                "AVBD_ENABLE_DEVELOPMENT_REPLAYS"] == "1"
+                || Bundle.main.bundleURL.pathExtension != "app"
+            if developmentEnabled {
+                cases.insert(.gearSonicG1, at: 2)
+                cases.insert(.humanoidBoxCarry, at: 3)
+            }
+            return cases
+        }
 
         var selectionID: String {
             switch self {
@@ -129,6 +138,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
            let selected {
             UserDefaults.standard.set(
                 selected.selectionID, forKey: selectionKey)
+        } else if environment["AVBD_REPLAY_TASK"] == nil,
+                  persistedTask != nil, selected == nil {
+            // A development replay selected from an unwrapped source build
+            // must not remain a broken default after launching a release app.
+            UserDefaults.standard.set(
+                Robot.humanoidIsaac.selectionID, forKey: selectionKey)
         }
         return selected ?? .humanoidIsaac
     }() {
@@ -453,6 +468,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         episodeFinished = false
         running = true
         do {
+            // Every learned replay below eventually constructs an MLX actor.
+            // MLX aborts the process when its compiled Metal library is
+            // absent, so reject the replay visibly before touching MLX. The
+            // classical Arachne baseline is the only non-MLX replay mode.
+            if !robot.usesClassicalController {
+                try PolicyBridge.requireMLXRuntime()
+            }
             if robot == .gearSonicG1 {
                 try installGEARSonicG1Replay()
                 updateCameraTargets()

@@ -72,6 +72,11 @@ make app-ml
 AVBD_POLICY_REPLAY=1 open AVBD.app
 ```
 
+The packaged Robotics Lab launches its bundled `avbd` helper and writes local
+training runs under `~/Library/Application Support/AVBD`. Set
+`AVBD_WORKSPACE=/absolute/path` before launch to use a different workspace;
+source-tree builds continue to use the repository working directory.
+
 Every task returns contiguous `[environment, feature]` tensors, normalized
 bounded actions, decomposed reward metrics, distinct termination/time-limit
 signals, and pre-reset final observations. Checkpoints include Safetensors,
@@ -153,6 +158,7 @@ by a clean clone or treated as release evidence.
 ```bash
 swift test                                    # full battery
 swift test --filter RLFrameworkTests          # vector RL contract + GAE
+make verify-release                           # full arm64 Mac release gate
 make app && open AVBD.app                     # interactive app
 .build/release/avbd run bed --frames 300
 .build/release/avbd profile clothfold --scale 16 --frames 80
