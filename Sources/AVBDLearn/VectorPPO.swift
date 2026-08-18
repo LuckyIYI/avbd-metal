@@ -1839,6 +1839,10 @@ public struct PPOEvaluationAggregate: Codable, Sendable {
 public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
     public var scope: String
     public var task: String
+    /// Optional only so aggregate reports written before this field existed
+    /// remain decodable. Newly produced, provenance-complete aggregates always
+    /// persist the exact task physics revision.
+    public var taskRevision: Int?
     public var evaluationTaskConfiguration: [String: Float]?
     public var taskConfigurationTransferred: Bool?
     public var checkpointDirectory: String
@@ -1875,8 +1879,14 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
             throw RLEnvironmentError.invalidConfiguration(
                 "at least one evaluation report is required")
         }
+        guard first.taskRevision != nil,
+              evaluations.allSatisfy({ $0.taskRevision != nil }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "checkpoint robustness reports require an explicit task revision")
+        }
         guard evaluations.allSatisfy({
             $0.task == first.task
+                && $0.taskRevision == first.taskRevision
                 && $0.checkpointDirectory == first.checkpointDirectory
                 && $0.checkpointFingerprint == first.checkpointFingerprint
                 && $0.initializationCheckpoint == first.initializationCheckpoint
@@ -1929,6 +1939,7 @@ public struct PPOCheckpointEvaluationAggregate: Codable, Sendable {
         return Self(
             scope: "single_checkpoint_across_evaluation_seeds",
             task: first.task,
+            taskRevision: first.taskRevision,
             evaluationTaskConfiguration: first.evaluationTaskConfiguration,
             taskConfigurationTransferred: first.taskConfigurationTransferred,
             checkpointDirectory: first.checkpointDirectory,
