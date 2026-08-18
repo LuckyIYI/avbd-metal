@@ -874,7 +874,9 @@ public final class VectorActorCritic: Module {
                         freezeBaseActor: Bool = false,
                         freezeExpertActor: Bool = false,
                         freezeStandActor: Bool = false,
-                        freezeAuxiliaryActor: Bool = false)
+                        freezeAuxiliaryActor: Bool = false,
+                        freezeStandActorBackbone: Bool = false,
+                        freezeAuxiliaryActorBackbone: Bool = false)
         -> (mean: MLXArray, value: MLXArray, logStandardDeviation: MLXArray) {
         var baseMean = actorOutput(activate(actor3(activate(
             actor2(activate(actor1(observations)))))))
@@ -882,11 +884,19 @@ public final class VectorActorCritic: Module {
         var expertMean = expertActorOutput(activate(expertActor3(
             activate(expertActor2(activate(expertActor1(observations)))))))
         if freezeExpertActor { expertMean = stopGradient(expertMean) }
-        var standMean = standActorOutput(activate(standActor3(
-            activate(standActor2(activate(standActor1(observations)))))))
+        var standHidden = activate(standActor3(
+            activate(standActor2(activate(standActor1(observations))))))
+        if freezeStandActorBackbone {
+            standHidden = stopGradient(standHidden)
+        }
+        var standMean = standActorOutput(standHidden)
         if freezeStandActor { standMean = stopGradient(standMean) }
-        var auxiliaryMean = auxiliaryActorOutput(activate(auxiliaryActor3(
-            activate(auxiliaryActor2(activate(auxiliaryActor1(observations)))))))
+        var auxiliaryHidden = activate(auxiliaryActor3(
+            activate(auxiliaryActor2(activate(auxiliaryActor1(observations))))))
+        if freezeAuxiliaryActorBackbone {
+            auxiliaryHidden = stopGradient(auxiliaryHidden)
+        }
+        var auxiliaryMean = auxiliaryActorOutput(auxiliaryHidden)
         if freezeAuxiliaryActor { auxiliaryMean = stopGradient(auxiliaryMean) }
         let expert = expertGate ?? MLXArray.zeros([observations.shape[0], 1])
         let stand = standExpertGate
@@ -1159,6 +1169,61 @@ public final class VectorActorCritic: Module {
                     "expanded actor checkpoint is missing \(base)")
             }
             initialized[stand] = value
+        }
+        return initialized
+    }
+
+    /// Clone the verified base actor into the fourth routed branch, optionally
+    /// projecting task-declared first-layer inputs out of the initialization.
+    /// Unlike a fixed action blend, the result remains a complete trainable
+    /// state-feedback policy while the source actor stays frozen.
+    public static func initializingAuxiliaryExpertFromBase(
+        _ source: [String: MLXArray],
+        zeroedObservationIndices: [Int] = []
+    ) throws -> [String: MLXArray] {
+        var initialized = source
+        for suffix in ["weight", "bias"] {
+            for layer in ["1", "2", "3"] {
+                let base = "actor\(layer).\(suffix)"
+                let auxiliary = "auxiliaryActor\(layer).\(suffix)"
+                guard let value = source[base] else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "expanded actor checkpoint is missing \(base)")
+                }
+                initialized[auxiliary] = value
+            }
+            let base = "actorOutput.\(suffix)"
+            let auxiliary = "auxiliaryActorOutput.\(suffix)"
+            guard let value = source[base] else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "expanded actor checkpoint is missing \(base)")
+            }
+            initialized[auxiliary] = value
+        }
+        if !zeroedObservationIndices.isEmpty {
+            guard Set(zeroedObservationIndices).count
+                    == zeroedObservationIndices.count,
+                  let firstLayer = initialized["auxiliaryActor1.weight"],
+                  firstLayer.shape.count == 2 else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "auxiliary observation projection is invalid")
+            }
+            let rows = firstLayer.shape[0]
+            let columns = firstLayer.shape[1]
+            guard zeroedObservationIndices.allSatisfy({
+                (0..<columns).contains($0)
+            }) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "auxiliary observation projection exceeds actor input")
+            }
+            var values = firstLayer.asArray(Float.self)
+            for row in 0..<rows {
+                for column in zeroedObservationIndices {
+                    values[row * columns + column] = 0
+                }
+            }
+            initialized["auxiliaryActor1.weight"] = MLXArray(values)
+                .reshaped([rows, columns])
         }
         return initialized
     }
@@ -3448,6 +3513,23 @@ public final class VectorPPOTrainer {
                     .initializingStandExpertFromBase(weights)
                 Swift.print("initialized stand policy expert as an exact copy "
                     + "of the transferred base actor")
+            }
+            if usesPolicyAuxiliaryExpertGate,
+               policyAuxiliaryExpertGate?
+                    .initializesPolicyAuxiliaryExpertFromBaseOnTransfer == true {
+                let projectedInputs = policyAuxiliaryExpertGate?
+                    .policyAuxiliaryExpertZeroedObservationIndicesOnTransfer
+                    ?? []
+                weights = try VectorActorCritic
+                    .initializingAuxiliaryExpertFromBase(
+                        weights,
+                        zeroedObservationIndices: projectedInputs)
+                Swift.print("initialized auxiliary policy expert from the "
+                    + "transferred base actor"
+                    + (projectedInputs.isEmpty
+                        ? " as an exact copy"
+                        : " with \(projectedInputs.count) task-declared "
+                            + "observation inputs projected out"))
             }
             if let standCheckpoint =
                 configuration.standExpertInitializationCheckpoint {

@@ -198,6 +198,7 @@ final class RLFrameworkTests: XCTestCase {
         XCTAssertEqual(BuiltInRLTasks.registry.taskIDs,
                        ["arachne15-goal-v0", "arachne15-velocity-v0",
                         "arm-pusht-v0",
+                        "humanoid-box-carry-v0",
                         "humanoid-goal-v0",
                         "humanoid-isaac-flat-v0", "humanoid-isaac-goal-v0",
                         "humanoid-velocity-v0", "humanoid-walk-v0",
@@ -1257,7 +1258,7 @@ final class RLFrameworkTests: XCTestCase {
                 ]))
         let task = try XCTUnwrap(registered as? HumanoidWalkTask)
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(15))
+                       RLPhysicsContract.fixedGainActuatorV2(14))
         XCTAssertTrue(task.usesPolicyExpertGate)
         XCTAssertTrue(task.freezesBasePolicyExpert)
         XCTAssertEqual(task.spec.configurationValues["freezeBasePolicyExpert"], 1)
@@ -1563,6 +1564,65 @@ final class RLFrameworkTests: XCTestCase {
                     .asArray(Float.self),
                 weights["actorOutput.\(suffix)"]?.asArray(Float.self))
         }
+    }
+
+    func testAuxiliaryExpertCanInitializeFromBaseExactly() throws {
+        var weights = [String: MLXArray]()
+        for suffix in ["weight", "bias"] {
+            for layer in ["1", "2", "3"] {
+                weights["actor\(layer).\(suffix)"] = MLXArray([
+                    Float(layer)! + (suffix == "bias" ? 10 : 0),
+                ])
+                weights["auxiliaryActor\(layer).\(suffix)"] =
+                    MLXArray([Float(-1)])
+            }
+            weights["actorOutput.\(suffix)"] = MLXArray([
+                suffix == "bias" ? Float(19) : Float(9),
+            ])
+            weights["auxiliaryActorOutput.\(suffix)"] =
+                MLXArray([Float(-1)])
+        }
+        let initialized = try VectorActorCritic
+            .initializingAuxiliaryExpertFromBase(weights)
+        for suffix in ["weight", "bias"] {
+            for layer in ["1", "2", "3"] {
+                XCTAssertEqual(
+                    initialized["auxiliaryActor\(layer).\(suffix)"]?
+                        .asArray(Float.self),
+                    weights["actor\(layer).\(suffix)"]?.asArray(Float.self))
+            }
+            XCTAssertEqual(
+                initialized["auxiliaryActorOutput.\(suffix)"]?
+                    .asArray(Float.self),
+                weights["actorOutput.\(suffix)"]?.asArray(Float.self))
+        }
+    }
+
+    func testAuxiliaryExpertCanProjectSubsystemObservationsOnTransfer() throws {
+        var weights = [String: MLXArray]()
+        weights["actor1.weight"] = MLXArray([
+            Float(1), 2, 3,
+            4, 5, 6,
+        ]).reshaped([2, 3])
+        weights["actor1.bias"] = MLXArray([Float(7), 8])
+        for layer in ["2", "3"] {
+            weights["actor\(layer).weight"] = MLXArray([Float(layer)!])
+            weights["actor\(layer).bias"] = MLXArray([Float(layer)! + 10])
+        }
+        weights["actorOutput.weight"] = MLXArray([Float(9)])
+        weights["actorOutput.bias"] = MLXArray([Float(19)])
+
+        let initialized = try VectorActorCritic
+            .initializingAuxiliaryExpertFromBase(
+                weights, zeroedObservationIndices: [1])
+        XCTAssertEqual(
+            initialized["auxiliaryActor1.weight"]?.asArray(Float.self),
+            [1, 0, 3, 4, 0, 6])
+        XCTAssertEqual(
+            initialized["auxiliaryActor1.bias"]?.asArray(Float.self), [7, 8])
+        XCTAssertThrowsError(try VectorActorCritic
+            .initializingAuxiliaryExpertFromBase(
+                weights, zeroedObservationIndices: [3]))
     }
 
     func testFourthActorCanTrainLoadedLegsWithoutUpdatingPreservedSkills() {
@@ -4508,8 +4568,7 @@ final class RLFrameworkTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
         let bundle = packageRoot.appendingPathComponent(
-            "Robots/Arachne15/policies/"
-                + "arachne15-goal-r6-update-000020", isDirectory: true)
+            "checkpoints/arachne15-goal-v0", isDirectory: true)
         let fingerprint =
             "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027"
         let runtime = try VectorPolicyDeploymentRuntime(
@@ -4546,8 +4605,7 @@ final class RLFrameworkTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
         let source = packageRoot.appendingPathComponent(
-            "Robots/Arachne15/policies/"
-                + "arachne15-goal-r6-update-000020", isDirectory: true)
+            "checkpoints/arachne15-goal-v0", isDirectory: true)
         let copy = FileManager.default.temporaryDirectory.appendingPathComponent(
             "avbd-tampered-deployment-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: copy) }

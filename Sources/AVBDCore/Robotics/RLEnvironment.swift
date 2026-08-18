@@ -485,6 +485,17 @@ public protocol PolicyAuxiliaryExpertGateProviding:
     PolicyStandExpertGateProviding
 {
     var usesPolicyAuxiliaryExpertGate: Bool { get }
+    /// Initialize the fourth branch from the verified base actor. This gives
+    /// a trainable residual skill (for example loaded legs) the source
+    /// policy's real behavior rather than an unrelated stationary branch.
+    var initializesPolicyAuxiliaryExpertFromBaseOnTransfer: Bool { get }
+    /// Observation columns whose first-layer influence must start at zero in
+    /// the transferred auxiliary branch. This is useful when an action-wise
+    /// expert owns only a subsystem: the source whole-body policy may depend
+    /// strongly on state from actuators now controlled by another branch.
+    /// The projected columns remain ordinary trainable parameters after
+    /// initialization, so the specialist can relearn useful coupling.
+    var policyAuxiliaryExpertZeroedObservationIndicesOnTransfer: [Int] { get }
     /// Keep the existing third branch byte-stable while the new auxiliary
     /// branch learns. This is independent of `freezesLowSpeedPolicyExpert`,
     /// which freezes the first routed branch.
@@ -511,6 +522,8 @@ public extension PolicyStandExpertGateProviding {
 }
 
 public extension PolicyAuxiliaryExpertGateProviding {
+    var initializesPolicyAuxiliaryExpertFromBaseOnTransfer: Bool { false }
+    var policyAuxiliaryExpertZeroedObservationIndicesOnTransfer: [Int] { [] }
     var policyAuxiliaryExpertActionMask: ContiguousArray<Float>? { nil }
     var freezesStandPolicyExpert: Bool { false }
 }
