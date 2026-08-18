@@ -8,7 +8,7 @@ fingerprint.
 
 ## Frozen candidate
 
-- Bundle: `../policies/arachne15-goal-r6-update-000020`
+- Bundle: `../../../checkpoints/arachne15-goal-v0`
 - Task: `arachne15-goal-v0`, revision 6
 - Checkpoint fingerprint:
   `30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027`

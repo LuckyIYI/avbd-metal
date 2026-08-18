@@ -98,7 +98,7 @@ Hardware logs must include that manifest fingerprint on every trial.
 
 ### Current immutable candidate (2026-07-16)
 
-`Robots/Arachne15/policies/arachne15-goal-r6-update-000020` is frozen at
+`checkpoints/arachne15-goal-v0` is frozen at
 checkpoint fingerprint
 `30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027`.
 Four held-out seeds on the exact training collision profile achieved
@@ -117,8 +117,10 @@ exploitation while retaining a hard anti-tunnelling bound.
 These are fixed-policy evaluation seeds, not independent training seeds. The
 candidate is eligible for suspended and tethered hardware experiments; it is
 not the five-training-seed publication artifact required by the gate above.
-See the bundle's `qualification/` directory for raw reports and
-`Robots/Arachne15/iphone/README.md` for the on-device and safety contract.
+See
+`Robots/Arachne15/qualification/arachne15-goal-r6-update-000020/` for raw
+reports and `Robots/Arachne15/iphone/README.md` for the on-device and safety
+contract.
 
 The point-goal task additionally exports `episode/goal_reached`, goal-entry,
 arrival-speed and dwell metrics,

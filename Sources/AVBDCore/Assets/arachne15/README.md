@@ -1,7 +1,9 @@
 # Arachne-15 simulation assets
 
-These files are generated from `Robots/Arachne15/sim/generate_model.py`.
-Do not edit the XML or bundled STL copies by hand. Run:
+The XML files are generated from `Robots/Arachne15/sim/generate_model.py`.
+The packaged STL files are installed from the parametric CAD by
+`Robots/Arachne15/scripts/build_cad.sh`. Do not edit either snapshot by hand.
+To regenerate and validate MJCF without rebuilding CAD, run:
 
 ```sh
 Robots/Arachne15/scripts/build_sim.sh

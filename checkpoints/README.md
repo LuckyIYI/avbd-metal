@@ -7,7 +7,7 @@ stale, extra, or deprecated task directories.
 
 Newly qualified checkpoints keep their sealed held-out report beside the
 weights as `evaluation.json`; Arachne Goal retains its larger multi-seed report
-set under the canonical robot policy directory linked below.
+set under the canonical robot qualification directory linked below.
 
 ## Shipped learned policies
 
@@ -35,7 +35,7 @@ set under the canonical robot policy directory linked below.
 - `arachne15-goal-v0` is the separately qualified sim-to-real point-goal actor.
   Its four-seed training-collider and four-seed validation-collider reports are
   retained under
-  `Robots/Arachne15/policies/arachne15-goal-r6-update-000020/qualification`.
+  `Robots/Arachne15/qualification/arachne15-goal-r6-update-000020`.
   Fingerprint:
   `30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027`.
 

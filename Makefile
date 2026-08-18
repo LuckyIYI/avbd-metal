@@ -80,13 +80,15 @@ ios-ml:
 	  -disableAutomaticPackageResolution \
 	  -onlyUsePackageVersionsFromResolvedFile build -quiet
 
-# Rewrite the tracked MJCF/bundled mesh copies from their canonical sources,
-# then validate both the robot-tree and SwiftPM-resource versions.
+# Rewrite the tracked MJCF files from their generator, then validate both the
+# robot-tree and SwiftPM-resource versions against packaged visual meshes.
+# Rebuilding CAD explicitly installs refreshed visual meshes first.
 generate-arachne-assets:
 	Robots/Arachne15/scripts/build_sim.sh
 
-# Read-only CI guard: fail when generated MJCF or bundled meshes are stale,
-# missing, or violate the structural/mass/articulation contract.
+# Read-only CI guard: fail when generated MJCF is stale, a required packaged
+# mesh is missing, or the structural/mass/articulation contract is violated.
+# It does not depend on ignored Robots/*/build output, so it works in a clone.
 verify-arachne-assets:
 	python3 Robots/Arachne15/sim/generate_model.py --check
 	python3 Robots/Arachne15/sim/validate_model.py
@@ -96,5 +98,5 @@ verify-arachne-assets:
 verify-arachne-policy: ml-tool
 	.xcbuild/Build/Products/Release/avbd verify-policy-rl \
 	  arachne15-goal-v0 \
-	  --checkpoint Robots/Arachne15/policies/arachne15-goal-r6-update-000020 \
+	  --checkpoint checkpoints/arachne15-goal-v0 \
 	  --frames 500 --json

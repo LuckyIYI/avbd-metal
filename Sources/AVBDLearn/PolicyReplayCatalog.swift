@@ -100,8 +100,8 @@ public enum PolicyReplayCatalog {
             runtime: .nativeMLX,
             checkpointRelativeDirectory: "arachne15-goal-v0",
             qualification: .accepted,
-            evidenceRelativePath: "Robots/Arachne15/policies/"
-                + "arachne15-goal-r6-update-000020/qualification/"
+            evidenceRelativePath: "Robots/Arachne15/qualification/"
+                + "arachne15-goal-r6-update-000020/"
                 + "aggregate-update-000020.json"),
         .init(
             selectionID: "arachne15-classical-goal-v0",

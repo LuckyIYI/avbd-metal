@@ -3,13 +3,8 @@
 A source-controlled concept for an eight-legged robot whose centrally mounted
 iPhone 15 Pro performs high-level perception and control. This revision is
 designed to be physically plausible on a flat floor and honest about what has
-not yet been proven.
-
-![Arachne-15 assembly](build/arachne15-assembly.png)
-
-![Camera-facing front elevation](build/arachne15-front.png)
-
-![Structural top view](build/arachne15-top.png)
+not yet been proven. Generated CAD renders are local build outputs; run
+`./scripts/build_cad.sh` to inspect the assembly, elevations, and compact pose.
 
 ## Geometry
 
@@ -70,8 +65,6 @@ which learned control must earn its complexity; see
 the analytical hardware gates above.
 
 ## Arachne Reveal
-
-![Arachne Reveal compact guard pose](build/arachne15-folded.png)
 
 The existing 16 actuators can also produce a physical compact/deploy sequence;
 no extra hinge or visual-only animation is required. The compact guard target
@@ -144,8 +137,10 @@ OpenSCAD `2026.06.12` is installed at `/Applications/OpenSCAD.app` and linked as
 ```
 
 That exports one STL per printable part, deployed and folded assembly PNGs,
-load/reveal reports, and mesh bounds/volume metrics under `build/`. Individual
-parts can also be exported directly:
+load/reveal reports, and mesh bounds/volume metrics under the ignored `build/`
+directory. It also installs the six simulation visual meshes into the tracked
+AVBDCore resource snapshot and validates the generated MJCF. Individual parts
+can also be exported directly:
 
 ```sh
 openscad --export-format binstl -D 'PART="chassis"' \

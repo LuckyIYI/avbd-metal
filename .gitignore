@@ -13,6 +13,8 @@ AVBD.app/
 # Generated training/evaluation output and replay media stay local. The source
 # tree contains the scripts and textual methodology needed to reproduce them.
 artifacts/
+Robots/*/build/
+Robots/Arachne15/policies/
 checkpoints/*
 !checkpoints/README.md
 !checkpoints/external/
@@ -39,4 +41,5 @@ checkpoints/external/*
 !checkpoints/arachne15-goal-v0/metadata.json
 !checkpoints/arachne15-goal-v0/policy.safetensors
 !checkpoints/arachne15-goal-v0/training-state.json
+!checkpoints/arachne15-goal-v0/deployment-manifest.json
 docs/

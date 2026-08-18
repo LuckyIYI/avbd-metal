@@ -36,5 +36,8 @@ openscad --render --imgsize 1600,1200 --viewall \
 python3 "$ROOT/analysis/load_case.py"
 python3 "$ROOT/analysis/reveal_pose.py"
 python3 "$ROOT/analysis/mesh_metrics.py" "$STL"/*.stl
+python3 "$ROOT/sim/generate_model.py" --install-visual-meshes "$STL"
+python3 "$ROOT/sim/generate_model.py" --check
+python3 "$ROOT/sim/validate_model.py"
 
 echo "CAD outputs: $OUT"

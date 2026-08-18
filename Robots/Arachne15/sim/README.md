@@ -3,8 +3,9 @@
 The simulation source of truth is the same measured architecture as the CAD,
 but visual and collision geometry deliberately have different jobs:
 
-- Generated printable STLs are scaled from millimetres to metres and used only
-  for rendering.
+- Packaged snapshots of generated printable STLs are scaled from millimetres
+  to metres and used only for rendering. Ignored `build/` outputs are never a
+  runtime dependency.
 - Collision is an authored union of boxes and capsules per rigid
   link. No dynamic link collides as a raw triangle mesh.
 - Each TPU foot uses an oriented 17.5 × 14 × 8 mm box contact matching its
@@ -16,17 +17,21 @@ but visual and collision geometry deliberately have different jobs:
 - The policy interface is stable: one floating base, eight hip-yaw joints,
   eight knee-pitch joints, and sixteen motors in deterministic XML order.
 
-Regenerate the tracked MJCF and bundled mesh copies after changing the CAD or
-generator, then validate them with:
+After changing CAD, rebuild it to install fresh packaged visual meshes. After
+changing only the model generator, regenerate the MJCF directly:
+
+```sh
+Robots/Arachne15/scripts/build_cad.sh
+```
 
 ```sh
 make generate-arachne-assets
 ```
 
-CI and pre-commit checks should instead run `make verify-arachne-assets`. That
-target is read-only: it fails if either generated MJCF profile or any bundled
-mesh is missing/stale, then structurally validates both source and bundled
-models.
+CI and pre-commit checks should run `make verify-arachne-assets`. That target is
+read-only and works in a clean clone: it fails if either generated MJCF profile
+or any packaged mesh is missing, then structurally validates both source and
+bundled models.
 
 This produces and validates two MJCF files:
 
