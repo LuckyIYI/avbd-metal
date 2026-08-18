@@ -35,9 +35,10 @@ verify-mlx-rl:
 	  -onlyUsePackageVersionsFromResolvedFile \
 	  -parallel-testing-enabled NO \
 	  -only-testing:AVBDTests/RLFrameworkTests \
+	  -only-testing:AVBDTests/VectorPolicyRunnerValidationTests \
 	  build-for-testing
 	AVBD_MLX_INTEGRATION_TESTS=1 xcrun xctest \
-	  -XCTest RLFrameworkTests \
+	  -XCTest RLFrameworkTests,VectorPolicyRunnerValidationTests \
 	  .xcbuild-test/Build/Products/Debug/AVBDTests.xctest
 
 # Full arm64 Mac release gate: hermetic source/provenance checks, the complete
