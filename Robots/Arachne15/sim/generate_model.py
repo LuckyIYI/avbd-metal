@@ -17,8 +17,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = ROOT.parents[2]
-BUNDLED_ASSET_ROOT = REPOSITORY_ROOT / "Sources/AVBDCore/Assets/arachne15"
-SOURCE_MESH_DIRECTORY = "../../../Sources/AVBDCore/Assets/arachne15/meshes"
+BUNDLED_ASSET_ROOT = REPOSITORY_ROOT / "Sources/Robotics/Assets/arachne15"
+SOURCE_MESH_DIRECTORY = "../../../Sources/Robotics/Assets/arachne15/meshes"
 BUNDLED_MESH_DIRECTORY = "meshes"
 VISUAL_MESH_FILES = (
     "chassis.stl", "phone_guide.stl", "battery_cradle.stl",
@@ -344,7 +344,7 @@ def main() -> None:
     parser.add_argument(
         "--install-visual-meshes", type=Path, metavar="DIRECTORY",
         help=("copy the six simulation visual meshes from a completed CAD "
-              "build into the tracked AVBDCore resource snapshot"),
+              "build into the tracked Robotics resource snapshot"),
     )
     args = parser.parse_args()
     if args.check and args.install_visual_meshes is not None:

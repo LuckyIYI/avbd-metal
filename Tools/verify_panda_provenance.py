@@ -22,10 +22,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PANDA_MANIFEST = (
-    ROOT / "Sources/AVBDCore/Assets/panda_pusher/PROVENANCE.json"
+    ROOT / "Sources/Robotics/Assets/panda_pusher/PROVENANCE.json"
 )
 MANISKILL_MANIFEST = (
-    ROOT / "Sources/AVBDCore/Assets/maniskill_pusht/PROVENANCE.json"
+    ROOT / "Sources/Robotics/Assets/maniskill_pusht/PROVENANCE.json"
 )
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")

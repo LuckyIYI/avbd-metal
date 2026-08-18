@@ -1,6 +1,8 @@
 import XCTest
 import simd
-@testable import AVBDCore
+@testable import SimCore
+@testable import Robotics
+@testable import RL
 
 final class PointGoalNavigationTests: XCTestCase {
     func testRevisionAndBodyFrameGeometry() {

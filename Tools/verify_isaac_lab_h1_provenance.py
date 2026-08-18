@@ -19,7 +19,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSET_DIRECTORY = ROOT / "Sources/AVBDCore/Assets/isaac_lab_h1"
+ASSET_DIRECTORY = ROOT / "Sources/Robotics/Assets/isaac_lab_h1"
 MANIFEST_PATH = ASSET_DIRECTORY / "PROVENANCE.json"
 
 EXPECTED_REPOSITORY = "https://github.com/isaac-sim/IsaacLab"
@@ -36,8 +36,8 @@ EXPECTED_UPSTREAM_FILES = {
     "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/h1/agents/rsl_rl_ppo_cfg.py",
 }
 EXPECTED_IMPLEMENTATION_FILES = {
-    "Sources/AVBDCore/Robotics/HumanoidWalkTask.swift",
-    "Sources/AVBDCore/Robotics/HumanoidIsaacVelocityTask.swift",
+    "Sources/RL/HumanoidWalkTask.swift",
+    "Sources/RL/HumanoidIsaacVelocityTask.swift",
 }
 EXPECTED_CONTRACTS = {
     "h1-control-profile",
@@ -242,8 +242,8 @@ def verify_redistribution(manifest: dict[str, Any],
         verify_file(ROOT / path, expected_hash, f"redistributed file {path}")
         redistributed[path] = expected_hash
 
-    license_path = "Sources/AVBDCore/Assets/isaac_lab_h1/LICENSE"
-    notice_path = "Sources/AVBDCore/Assets/isaac_lab_h1/NOTICE"
+    license_path = "Sources/Robotics/Assets/isaac_lab_h1/LICENSE"
+    notice_path = "Sources/Robotics/Assets/isaac_lab_h1/NOTICE"
     require(set(redistributed) == {license_path, notice_path},
             "redistributed Isaac Lab attribution file set changed")
     require(redistributed[license_path] == upstream_hashes["LICENSE"],

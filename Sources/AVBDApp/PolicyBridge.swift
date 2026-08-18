@@ -1,8 +1,10 @@
 import Foundation
 import simd
-import AVBDCore
-import AVBDLearn
-import MLX
+import SimCore
+import PhysicsAVBD
+import Robotics
+import RL
+import MLXRL
 
 // Bridges the trained LeWM + CEM planner into the Robotics Lab. MLX only
 // works in xcodebuild-produced binaries (`make app-ml`); under plain SwiftPM

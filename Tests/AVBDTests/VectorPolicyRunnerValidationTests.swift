@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import AVBDLearn
+@testable import MLXRL
 
 final class VectorPolicyRunnerValidationTests: XCTestCase {
     private func metadata(

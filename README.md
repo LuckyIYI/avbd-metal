@@ -29,10 +29,24 @@ crossing protection with boundary release, runtime shader concatenation
 
 | Target | Purpose |
 |---|---|
-| `AVBDCore` | Solver library: CPU reference + GPU implementation + scenes |
+| `SimCore` | Backend-neutral math, scene descriptions, geometry, mesh import, and deterministic utilities |
+| `PhysicsAVBD` | Concrete AVBD CPU/Metal solver, tuned demo scenes, and shader resources; depends only on `SimCore` |
+| `Robotics` | Robot models, MJCF import, calibration, and hardware-facing contracts; depends only on `SimCore` |
+| `RL` | Vector task contracts, task registry, rewards, and the current AVBD-backed environments |
+| `MLXRL` | MLX learning, checkpoint/evidence formats, policy runtime, and research pipelines |
+| `AVBDCore` | Source-compatibility umbrella that re-exports `SimCore`, `PhysicsAVBD`, `Robotics`, and `RL` |
+| `AVBDLearn` | Source-compatibility umbrella that re-exports `MLXRL` |
 | `avbd` | CLI: `run`, `bench`, `parity`, `profile` (per-kernel GPU timings), `clothgate` (gap/stretch/KE gates), `rodexp` |
 | `AVBDApp` | macOS app: viewer, demos, Robotics Lab |
-| `AVBDTests` | Full battery (16 suites) |
+| `AVBDTests` | Cross-layer and MLX integration tests; lower layers also have dependency-limited test targets |
+
+The production dependency graph is intentionally small: `SimCore` is the
+foundation; `PhysicsAVBD` and `Robotics` are independent siblings; `RL`
+composes them; and `MLXRL` is the only layer that depends on MLX. Policy
+metadata and runtime stay together with learning until they have an independent
+consumer or release cadence. The legacy umbrellas preserve existing source
+imports, but moving public declarations to their owning modules is an
+intentional binary-module boundary for precompiled clients.
 
 ## Robot learning
 
@@ -84,8 +98,8 @@ observation statistics, trainer progress, the full PPO configuration, task
 timing, and JSONL training metrics. Deterministic evaluation applies task-owned
 publish gates and exits nonzero when a policy stands still, falls early, misses
 Push-T, or otherwise fails its contract. The tracked extension points are
-[`VectorizedRLTask`](Sources/AVBDCore/Robotics/RLEnvironment.swift) and
-[`VectorRLAlgorithm`](Sources/AVBDLearn/VectorRLAlgorithm.swift); shipped
+[`VectorizedRLTask`](Sources/RL/RLEnvironment.swift) and
+[`VectorRLAlgorithm`](Sources/MLXRL/VectorRLAlgorithm.swift); shipped
 checkpoint contracts are indexed in [the checkpoint catalog](checkpoints/README.md).
 
 The tracked **H1 Flat v2** actor is an accepted native replay on the epoch-2

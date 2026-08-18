@@ -4,11 +4,13 @@
 # namespace operation; os.rename does the same when no bundle exists yet.
 # Staging below .build keeps both paths on one volume.
 ATOMIC_APP_PUBLISH := python3 -c 'import ctypes, os, sys; src, dst = sys.argv[1:3]; f = ctypes.CDLL(None, use_errno=True).renamex_np; f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]; f.restype = ctypes.c_int; rc = f(os.fsencode(src), os.fsencode(dst), 0x2) if os.path.lexists(dst) else (os.rename(src, dst) or 0); err = ctypes.get_errno(); sys.exit("atomic app publish failed: " + os.strerror(err)) if rc else None'
+PHYSICS_RESOURCE_BUNDLE := avbd-metal_PhysicsAVBD.bundle
+ROBOTICS_RESOURCE_BUNDLE := avbd-metal_Robotics.bundle
 
 .PHONY: build test verify-core verify-mlx-rl verify-release app cli bench clean clean-all ml-tool \
 	app-ml ios-ml generate-arachne-assets verify-arachne-assets \
 	verify-arachne-policy verify-policy-evidence verify-panda-provenance \
-	verify-h1-provenance
+	verify-h1-provenance verify-architecture
 
 build:
 	swift build -c release
@@ -18,9 +20,14 @@ test:
 
 # Local core merge gate: every checked-in generated/provenance contract plus
 # the complete SwiftPM suite. None of these checks needs network access.
-verify-core: verify-arachne-assets verify-policy-evidence \
+verify-core: verify-architecture verify-arachne-assets verify-policy-evidence \
 	verify-panda-provenance verify-h1-provenance
 	swift test
+
+verify-architecture:
+	python3 Tools/verify_architecture.py
+	PYTHONPYCACHEPREFIX=/tmp/avbd-architecture-pycache \
+	  python3 -m unittest Tools.tests.test_verify_architecture
 
 # Xcode-package the MLX/RL tests, then run their bundle serially so the MLX
 # opt-in reaches XCTest (xcodebuild filters custom environment variables).
@@ -48,7 +55,7 @@ verify-release: verify-core verify-mlx-rl app-ml
 cli: build
 	@echo "binary: .build/release/avbd"
 
-# Wrap the release executable + resource bundle into a double-clickable .app
+# Wrap the release executable + owned resource bundles into a double-clickable .app
 app: build
 	@set -eu; \
 	  staging_root="$$(mktemp -d .build/avbd-app-stage.XXXXXX)"; \
@@ -57,7 +64,9 @@ app: build
 	  trap cleanup EXIT HUP INT TERM; \
 	  mkdir -p "$$staged_app/Contents/MacOS" "$$staged_app/Contents/Resources"; \
 	  cp .build/release/AVBDApp "$$staged_app/Contents/MacOS/AVBDApp"; \
-	  cp -R .build/release/avbd-metal_AVBDCore.bundle "$$staged_app/Contents/Resources/"; \
+	  cp -R .build/release/$(PHYSICS_RESOURCE_BUNDLE) \
+	    .build/release/$(ROBOTICS_RESOURCE_BUNDLE) \
+	    "$$staged_app/Contents/Resources/"; \
 	  printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -72,7 +81,8 @@ app: build
 	  '  <key>LSMinimumSystemVersion</key><string>14.0</string>' \
 	  '</dict></plist>' > "$$staged_app/Contents/Info.plist"; \
 	  test -x "$$staged_app/Contents/MacOS/AVBDApp"; \
-	  test -d "$$staged_app/Contents/Resources/avbd-metal_AVBDCore.bundle"; \
+	  test -d "$$staged_app/Contents/Resources/$(PHYSICS_RESOURCE_BUNDLE)"; \
+	  test -d "$$staged_app/Contents/Resources/$(ROBOTICS_RESOURCE_BUNDLE)"; \
 	  plutil -lint "$$staged_app/Contents/Info.plist" >/dev/null; \
 	  codesign --force --deep --sign - "$$staged_app"; \
 	  codesign --verify --deep --strict "$$staged_app"; \
@@ -130,7 +140,8 @@ app-ml: verify-policy-evidence
 	    "$$staged_app/Contents/Resources/checkpoints/arachne15-goal-v1/qualification/validation-collision"; \
 	  cp .xcbuild/Build/Products/Release/AVBDApp "$$staged_app/Contents/MacOS/AVBDApp"; \
 	  cp .xcbuild/Build/Products/Release/avbd "$$staged_app/Contents/MacOS/avbd"; \
-	  cp -R .xcbuild/Build/Products/Release/avbd-metal_AVBDCore.bundle \
+	  cp -R .xcbuild/Build/Products/Release/$(PHYSICS_RESOURCE_BUNDLE) \
+	    .xcbuild/Build/Products/Release/$(ROBOTICS_RESOURCE_BUNDLE) \
 	    "$$staged_app/Contents/Resources/"; \
 	  cp checkpoints/README.md "$$staged_app/Contents/Resources/checkpoints/"; \
 	  cp checkpoints/external/unitree-h1/LICENSE \
@@ -205,6 +216,8 @@ app-ml: verify-policy-evidence
 	  '</dict></plist>' > "$$staged_app/Contents/Info.plist"; \
 	  test -x "$$staged_app/Contents/MacOS/AVBDApp"; \
 	  test -x "$$staged_app/Contents/MacOS/avbd"; \
+	  test -d "$$staged_app/Contents/Resources/$(PHYSICS_RESOURCE_BUNDLE)"; \
+	  test -d "$$staged_app/Contents/Resources/$(ROBOTICS_RESOURCE_BUNDLE)"; \
 	  plutil -lint "$$staged_app/Contents/Info.plist" >/dev/null; \
 	  codesign --force --deep --sign - "$$staged_app"; \
 	  codesign --verify --deep --strict "$$staged_app"; \

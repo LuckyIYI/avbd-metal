@@ -1,6 +1,10 @@
 import SwiftUI
 import MetalKit
-import AVBDCore
+import SimCore
+import PhysicsAVBD
+import Robotics
+import RL
+import MLXRL
 import simd
 
 /// Spawns and supervises the ML pipeline CLI (collect/train/solve) so the

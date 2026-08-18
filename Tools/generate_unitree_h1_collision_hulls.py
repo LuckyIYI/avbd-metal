@@ -270,15 +270,16 @@ def swift_source(hulls: dict[str, list[Point]]) -> bytes:
         "// Inputs and reduction metrics: Assets/unitree_h1/COLLISION_HULLS_PROVENANCE.json",
         "",
         "import simd",
+        "import SimCore",
         "",
         "/// Bounded support-map approximations generated directly from the pinned",
         "/// BSD-3-Clause Unitree H1 meshes in MuJoCo Menagerie. Every entry is an",
         "/// exact source-mesh vertex; deterministic farthest-error refinement fills",
         "/// the Metal narrow phase's 64-vertex budget. Coordinates are link-local.",
-        "enum UnitreeH1CollisionHulls {",
+        "package enum UnitreeH1CollisionHulls {",
     ]
     for spec in MESHES:
-        lines.append(f"    static let {spec.swift_name}: [F3] = [")
+        lines.append(f"    package static let {spec.swift_name}: [F3] = [")
         for point in hulls[spec.swift_name]:
             components = ", ".join(float_literal(value) for value in point)
             lines.append(f"        F3({components}),")
@@ -508,13 +509,13 @@ def main() -> int:
         "--swift-output",
         type=Path,
         default=repository_root
-        / "Sources/AVBDCore/Robotics/UnitreeH1CollisionHulls.swift",
+        / "Sources/Robotics/UnitreeH1CollisionHulls.swift",
     )
     parser.add_argument(
         "--manifest-output",
         type=Path,
         default=repository_root
-        / "Sources/AVBDCore/Assets/unitree_h1/COLLISION_HULLS_PROVENANCE.json",
+        / "Sources/Robotics/Assets/unitree_h1/COLLISION_HULLS_PROVENANCE.json",
     )
     parser.add_argument(
         "--check",
@@ -568,7 +569,7 @@ def main() -> int:
     swift_data = swift_source(hulls)
     manifest_data = manifest(
         Path(__file__).resolve(),
-        repository_root / "Sources/AVBDCore/Assets/unitree_h1/LICENSE",
+        repository_root / "Sources/Robotics/Assets/unitree_h1/LICENSE",
         swift_path.relative_to(repository_root),
         swift_data,
         records,

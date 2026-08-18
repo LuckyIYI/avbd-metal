@@ -28,7 +28,11 @@ extension SimulationModel {
         statsText = "render stopped: \(message)"
     }
 }
-import AVBDCore
+import SimCore
+import PhysicsAVBD
+import Robotics
+import RL
+import MLXRL
 import simd
 
 // Renderer: PBR (GGX metallic-roughness) + ACES, sRGB-correct framebuffer,

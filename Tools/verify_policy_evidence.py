@@ -670,7 +670,7 @@ def swift_string(expression: str, label: str) -> str | None:
 
 
 def catalog_entries(root: Path) -> tuple[list[CatalogEntry], list[CatalogEntry]]:
-    path = root / "Sources/AVBDLearn/PolicyReplayCatalog.swift"
+    path = root / "Sources/MLXRL/PolicyReplayCatalog.swift"
     try:
         source = path.read_text(encoding="utf-8")
     except OSError as error:

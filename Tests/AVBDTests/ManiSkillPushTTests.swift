@@ -1,7 +1,10 @@
 import XCTest
 import simd
 import CryptoKit
-@testable import AVBDCore
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
 
 final class ManiSkillPushTTests: XCTestCase {
     func testBundledPandaPusherMatchesPinnedMenagerieJointContract() throws {

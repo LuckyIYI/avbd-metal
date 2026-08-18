@@ -141,7 +141,7 @@ The CAD was verified with OpenSCAD `2026.06.12`. The build script expects the
 That exports one STL per printable part, deployed and folded assembly PNGs,
 load/reveal reports, and mesh bounds/volume metrics under the ignored `build/`
 directory. It also installs the six simulation visual meshes into the tracked
-AVBDCore resource snapshot and validates the generated MJCF. Individual parts
+Robotics resource snapshot and validates the generated MJCF. Individual parts
 can also be exported directly:
 
 ```sh

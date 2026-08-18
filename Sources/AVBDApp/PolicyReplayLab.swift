@@ -1,8 +1,11 @@
 import SwiftUI
 import Combine
 import MetalKit
-import AVBDCore
-import AVBDLearn
+import SimCore
+import PhysicsAVBD
+import Robotics
+import RL
+import MLXRL
 
 /// Visual, real-time replay for the exact VectorizedRLTask/checkpoint pair used
 /// by headless evaluation. There is no separate hand-authored display scene.

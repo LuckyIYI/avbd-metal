@@ -1,5 +1,5 @@
 import XCTest
-@testable import AVBDLearn
+@testable import MLXRL
 
 final class HumanoidBoxCarryActuationProbeTests: XCTestCase {
     func testProbeUsesMeanAndAntitheticBoundedCandidates() {

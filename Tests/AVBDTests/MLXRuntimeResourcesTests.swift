@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import AVBDLearn
+@testable import MLXRL
 
 final class MLXRuntimeResourcesTests: XCTestCase {
     private var temporaryRoots: [URL] = []

@@ -1,5 +1,8 @@
 import XCTest
-@testable import AVBDCore
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
 
 final class RLTaskOptionSchemaTests: XCTestCase {
     private let humanoidBoxCarryIntegerOptions: Set<String> = [

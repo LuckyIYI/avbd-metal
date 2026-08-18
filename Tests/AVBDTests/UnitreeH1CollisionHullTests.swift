@@ -1,7 +1,10 @@
 import Foundation
 import simd
 import XCTest
-@testable import AVBDCore
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
 
 final class UnitreeH1CollisionHullTests: XCTestCase {
     func testTaskRevisionBoundaryFollowsGeneratedHullTopology() throws {

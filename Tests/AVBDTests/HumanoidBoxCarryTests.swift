@@ -1,6 +1,9 @@
 import XCTest
 import simd
-@testable import AVBDCore
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
 
 final class HumanoidBoxCarryTests: XCTestCase {
     func testEnvironmentZeroPhysicsIsInvariantToBatchSize() throws {

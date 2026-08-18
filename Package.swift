@@ -5,6 +5,11 @@ let package = Package(
     name: "avbd-metal",
     platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
+        .library(name: "SimCore", targets: ["SimCore"]),
+        .library(name: "PhysicsAVBD", targets: ["PhysicsAVBD"]),
+        .library(name: "Robotics", targets: ["Robotics"]),
+        .library(name: "RL", targets: ["RL"]),
+        .library(name: "MLXRL", targets: ["MLXRL"]),
         .library(name: "AVBDCore", targets: ["AVBDCore"]),
         .library(name: "AVBDLearn", targets: ["AVBDLearn"]),
         .executable(name: "avbd", targets: ["avbd"]),
@@ -14,14 +19,25 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.21.0"),
     ],
     targets: [
+        .target(name: "SimCore"),
         .target(
-            name: "AVBDCore",
-            resources: [.copy("Shaders"), .copy("Assets")]
+            name: "PhysicsAVBD",
+            dependencies: ["SimCore"],
+            resources: [.copy("Shaders")]
         ),
         .target(
-            name: "AVBDLearn",
+            name: "Robotics",
+            dependencies: ["SimCore"],
+            resources: [.copy("Assets")]
+        ),
+        .target(
+            name: "RL",
+            dependencies: ["SimCore", "PhysicsAVBD", "Robotics"]
+        ),
+        .target(
+            name: "MLXRL",
             dependencies: [
-                "AVBDCore",
+                "SimCore", "PhysicsAVBD", "Robotics", "RL",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
@@ -29,16 +45,45 @@ let package = Package(
                 .product(name: "MLXLinalg", package: "mlx-swift"),
             ]
         ),
+        .target(
+            name: "AVBDCore",
+            dependencies: [
+                "SimCore", "PhysicsAVBD", "Robotics", "RL",
+            ]
+        ),
+        .target(
+            name: "AVBDLearn",
+            dependencies: ["MLXRL"]
+        ),
         .executableTarget(
             name: "avbd",
-            dependencies: ["AVBDCore", "AVBDLearn"]
+            dependencies: [
+                "SimCore", "PhysicsAVBD", "Robotics", "RL", "MLXRL",
+            ]
         ),
         .executableTarget(
             name: "AVBDApp",
-            dependencies: ["AVBDCore", "AVBDLearn"]
+            dependencies: [
+                "SimCore", "PhysicsAVBD", "Robotics", "RL", "MLXRL",
+            ]
         ),
         .testTarget(
             name: "AVBDTests",
+            dependencies: [
+                "SimCore", "PhysicsAVBD", "Robotics", "RL", "MLXRL",
+                .product(name: "MLX", package: "mlx-swift"),
+            ]
+        ),
+        .testTarget(
+            name: "SimCoreTests",
+            dependencies: ["SimCore"]
+        ),
+        .testTarget(
+            name: "PhysicsAVBDTests",
+            dependencies: ["SimCore", "PhysicsAVBD"]
+        ),
+        .testTarget(
+            name: "LegacyCompatibilityTests",
             dependencies: ["AVBDCore", "AVBDLearn"]
         ),
     ]

@@ -44,7 +44,7 @@ Both profiles contain 17 bodies, 16 joints, 16 actuators, the same mass and
 inertia tensors, and the same visual mesh instances. Only non-task-critical
 base collision detail changes. Feet and leg collision geometry are identical.
 The generator also installs byte-identical XML and mesh resources under
-`Sources/AVBDCore/Assets/arachne15`, so SwiftPM, the CLI, tests, and the app all
+`Sources/Robotics/Assets/arachne15`, so SwiftPM, the CLI, tests, and the app all
 consume the same checked asset rather than depending on a developer CAD path.
 
 ## AVBD/MLX task

@@ -1,8 +1,17 @@
 import XCTest
 import simd
-@testable import AVBDCore
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
 
 final class RoboticsTests: XCTestCase {
+    func testRobotContractErrorsPreserveUserFacingDiagnostics() {
+        let error = RobotContractError.invalidValueCount(
+            label: "joint positions", expected: 19, actual: 18)
+        XCTAssertEqual(error.localizedDescription, error.description)
+    }
+
     func testHumanoidManipulationStateReadsPhysicalHandTipsAndBox() throws {
         let env = try HumanoidWalkEnv(
             numEnvironments: 1, seed: 40, includeProjectile: true,

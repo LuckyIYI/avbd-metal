@@ -1,7 +1,10 @@
 import XCTest
 import simd
-@testable import AVBDCore
-@testable import AVBDLearn
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
+@testable import MLXRL
 
 final class PushTPhysicalFlowExperimentTests: XCTestCase {
     func testTaskGeneralBalancedObjectiveTargetsWorstConstraint() {

@@ -1,8 +1,11 @@
 import Dispatch
 import Foundation
 import XCTest
-@testable import AVBDCore
-@testable import AVBDLearn
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
+@testable import MLXRL
 
 final class VectorRLAlgorithmLifecycleTests: XCTestCase {
     private struct StubConfiguration: Codable, Equatable, Sendable {

@@ -26,7 +26,7 @@ SOURCE_PROJECT_URL = "https://github.com/unitreerobotics/unitree_rl_gym"
 SOURCE_FILE = "deploy/pre_train/h1/motion.pt"
 SOURCE_LICENSE = (
     Path(__file__).resolve().parents[1]
-    / "Sources" / "AVBDCore" / "Assets" / "unitree_h1" / "LICENSE"
+    / "Sources" / "Robotics" / "Assets" / "unitree_h1" / "LICENSE"
 )
 EXPECTED_SHAPES = {
     "memory.weight_ih_l0": [256, 41],

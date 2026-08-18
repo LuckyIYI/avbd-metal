@@ -2,8 +2,11 @@ import XCTest
 import Foundation
 import simd
 import MLX
-@testable import AVBDCore
-@testable import AVBDLearn
+@testable import SimCore
+@testable import PhysicsAVBD
+@testable import Robotics
+@testable import RL
+@testable import MLXRL
 
 private final class TestVectorPolicyInference: VectorPolicyInferencing {
     let observationDimension: Int
