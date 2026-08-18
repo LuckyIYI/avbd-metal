@@ -6,16 +6,22 @@ to walk. The code deliberately refuses to arm until an immutable qualified
 policy and a commissioned per-robot calibration agree on the same checkpoint
 fingerprint.
 
-## Frozen candidate
+## Qualified field candidate
 
-- Bundle: `../../../checkpoints/arachne15-goal-v0`
-- Task: `arachne15-goal-v0`, revision 6
+- Bundle: `../../../checkpoints/arachne15-goal-v1`
+- Task: `arachne15-goal-v0`, revision 2000006
 - Checkpoint fingerprint:
-  `30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027`
+  `923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02`
 - Policy SHA-256:
   `9521c03cab6fc9e829cd2664fa0e086f69720d4aa46b1e5b893776a4df072c14`
 - Deterministic control period: 20 ms / 50 Hz
 - Tensor contract: 60 float observations to 16 normalized joint offsets
+
+Goal v1 is an exact zero-update epoch-2 requalification of the historical v0
+bundle, so the policy SHA-256 is unchanged while its metadata-bound checkpoint
+fingerprint is deliberately different. Its schema-v2 manifest seals separate
+four-seed nominal and full-collision validation suites plus the predeclared
+cross-suite degradation gate.
 
 `VectorPolicyDeploymentRuntime` verifies the manifest schema, task/revision,
 policy digest, complete checkpoint fingerprint, tensor dimensions, timing,
@@ -59,7 +65,7 @@ from locomotion qualification.
 ## Minimal app integration
 
 Embed `AVBDCore` and `AVBDLearn` from this Swift package in an iOS 17 app and
-copy the frozen policy bundle plus a commissioned calibration into app
+copy the qualified policy bundle plus a commissioned calibration into app
 resources:
 
 ```swift
@@ -122,6 +128,7 @@ retain all raw telemetry with the policy and calibration fingerprints:
 6. tethered neutral stand, then low-body straight crawl;
 7. tethered random goals, then held-out floor/friction/payload trials.
 
-The current policy passes its simulation qualification but has only one final
-randomized training seed. It is a strong tethered-test candidate, not yet the
-five-training-seed publication artifact required by `../sim/SIM_TO_REAL.md`.
+The current policy passes its epoch-2 simulation qualification but inherits
+weights from one final randomized training seed. It is a strong tethered-test
+candidate, not yet the five-training-seed publication artifact required by
+`../sim/SIM_TO_REAL.md`.

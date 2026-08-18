@@ -65,9 +65,10 @@ need no spider-specific learner code. The policy contract is:
   observations, and a task-owned held-out evaluation gate.
 
 Large batches omit detailed CAD render buffers while retaining identical
-inertia and collisions. One-to-four-environment replay includes them, and the
-Policy Replay task selector exposes **Arachne-15** even before a checkpoint is
-available. Run the actual task boundary with:
+inertia and collisions. One-to-four-environment replay includes them. Policy
+Replay ships the accepted epoch-2 **Arachne Straight Walk v1** and **Arachne
+Goal v1** bundles while retaining their v0 task IDs. Run the actual task
+boundary with:
 
 ```sh
 .build/release/avbd rl-smoke arachne15-velocity-v0 \
@@ -136,8 +137,10 @@ the selected learned or classical controller receives the measured physical
 observation.
 
 The compact targets are outside the learned action envelope but inside the
-authored MJCF reserve limits. Therefore this feature does not alter task revision 6,
-the deployed collision model, or the checkpoint tensor contract. The exact
+authored MJCF reserve limits. Therefore this feature does not alter local task
+revision 6, the deployed collision model, or the checkpoint tensor contract.
+Current learned replay uses the epoch-2 encoded revision `2000006`; historical
+revision-6 bundles remain incompatible until requalified. The exact
 pre-check is part of `make verify-arachne-assets`; focused Swift tests require
 the compact pose to be reached by motor/contact dynamics, remain upright, stay
 near its start point, return to the loaded neutral stance, and survive the

@@ -86,7 +86,9 @@ body. The brief commissioning maneuver uses 0.372 N·m per joint—40% of
 the selected servo's 5 V stall torque—and restores the 0.186 N·m walking
 budget before handing the measured state back to the learned or classical
 controller. The deployed geometry and learned action contract are unchanged,
-so existing revision-6 policies do not require retraining.
+so this maneuver does not advance Arachne's local revision 6. The process-wide
+epoch-2 solver boundary is separate: historical revision-6 bundles require
+the sealed zero-update requalification before current replay or deployment.
 
 Run the exact geometry gate with:
 

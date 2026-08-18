@@ -114,13 +114,19 @@ physical contact. It is intentionally not labeled an accepted result yet
 because unconditional final/minimum goal distances, 1.208/1.179 m, exceed the
 1.125/0.750 m gates. Its current fingerprint is `15710d3f...113f6`.
 
-The historical **Arachne Straight Walk** actor is a deterministic
-0.15 m/s regression benchmark on the corrected revision-6 foot collider. Its
-single seed-45010 report passed 512/512 episodes, with 0.068 m/s linear and
-0.284 rad/s yaw-rate RMSE and no control steps deeper than 1 mm below the
-floor. Both it and **Arachne Goal** are epoch-1 historical checkpoints pending
-epoch-2 requalification; Arachne Goal's multi-seed qualification reports remain
-shipped beside the robot assets as immutable prior-contract evidence.
+The selectable **Arachne Straight Walk v1** and **Arachne Goal v1** actors are
+exact zero-update requalifications on the epoch-2 deterministic-color solver
+(`taskRevision=2000006`). Their task IDs remain `arachne15-velocity-v0` and
+`arachne15-goal-v0`; v1 names the immutable replay bundles, not new tasks.
+Each bundle seals four fixed-seed nominal reports and four full-collision
+validation reports, with both suites required to pass independently and a
+predeclared five-point maximum pooled-success degradation guard. Straight Walk
+v1 passed 2,048/2,048 episodes in each suite. Goal v1 passed
+1,942/2,048 nominal episodes (94.824%) and 1,935/2,048 validation episodes
+(94.482%), a 0.342 percentage-point drop, with 100% survival in both suites.
+The v0 parents and the older Arachne Goal report directory remain immutable,
+nonselectable epoch-1 evidence. Goal v1 is also the exact policy/revision
+boundary consumed by the fail-closed hardware deployment controller.
 The selectable **Arachne Classical** mode also exposes separate **Fold** and
 **Unfold & Walk** actions. Its physical motor/contact sequence reduces the
 articulated footprint by 41.0%, holds it there, then deploys and hands the
@@ -149,6 +155,11 @@ The epoch-1
 and revision-1000010
 [`historical evaluation`](checkpoints/humanoid-isaac-flat-v0/evaluation.json)
 are retained as nonselectable lineage evidence.
+The Arachne v1 lineage and both named evaluation suites are sealed by the
+velocity
+[`requalification manifest`](checkpoints/arachne15-velocity-v1/requalification-manifest.json)
+and goal
+[`requalification manifest`](checkpoints/arachne15-goal-v1/requalification-manifest.json).
 Replay videos and frame-locked single-episode reports are generated outputs
 under the ignored `artifacts/` directory; they are deliberately not required
 by a clean clone or treated as release evidence.

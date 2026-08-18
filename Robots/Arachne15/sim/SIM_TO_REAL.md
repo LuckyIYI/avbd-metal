@@ -98,7 +98,36 @@ task/revision, exact task configuration, tensor dimensions, normalization and
 action-distribution contract, 50 Hz control rate, and training provenance.
 Hardware logs must include that manifest fingerprint on every trial.
 
-### Current immutable candidate (2026-07-16)
+### Current epoch-2 qualified bundles (2026-08-18)
+
+`checkpoints/arachne15-goal-v1` is the hardware deployment candidate for task
+`arachne15-goal-v0` at encoded task revision `2000006`. Its checkpoint
+fingerprint is
+`923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02`.
+The policy SHA-256 remains
+`9521c03cab6fc9e829cd2664fa0e086f69720d4aa46b1e5b893776a4df072c14`:
+the epoch transfer changed only the permitted metadata and zeroed training
+state, never the learned weights.
+
+`checkpoints/arachne15-velocity-v1` is the corresponding straight-walk replay
+and regression bundle for task `arachne15-velocity-v0`; its fingerprint is
+`97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5`.
+Both schema-v2 manifests seal four nominal and four validation-collision
+fixed-seed reports under named qualification directories. Each distribution
+must pass independently, and validation pooled success may not fall more than
+five percentage points below nominal. Straight Walk passed 2,048/2,048
+episodes in both distributions. Goal passed 1,942/2,048 nominal episodes
+(94.824%) and 1,935/2,048 validation episodes (94.482%), a 0.342
+percentage-point drop; survival was 100% in both distributions. The sealed
+aggregates and per-seed reports remain the authoritative measurements.
+
+These are fixed-policy evaluation matrices, not five independent training
+seeds. Goal v1 is eligible for the suspended and tethered hardware ladder, but
+it is not the five-training-seed publication artifact required by the gate
+above. The deployment controller and calibration template intentionally pin
+its exact revision and metadata-bound checkpoint fingerprint.
+
+### Historical epoch-1 candidate (2026-07-16)
 
 `checkpoints/arachne15-goal-v0` is frozen at
 checkpoint fingerprint
@@ -116,10 +145,9 @@ measured about 0.36 mm RMS and 1.3--1.5% over 1 mm across the reported seeds.
 This distinguishes normal short contact impacts from sustained floor
 exploitation while retaining a hard anti-tunnelling bound.
 
-These are fixed-policy evaluation seeds, not independent training seeds. The
-candidate is eligible for suspended and tethered hardware experiments; it is
-not the five-training-seed publication artifact required by the gate above.
-See
+These are fixed-policy evaluation seeds, not independent training seeds. This
+bundle is retained as prior-contract evidence and is no longer accepted by the
+current deployment controller. See
 `Robots/Arachne15/qualification/arachne15-goal-r6-update-000020/` for raw
 reports and `Robots/Arachne15/iphone/README.md` for the on-device and safety
 contract.
@@ -138,8 +166,8 @@ perception failures inside locomotion success.
 The paired-ripple CPG/IK controller is deliberately evaluated on the same
 `arachne15-goal-v0` plant and success definition as the policy. Its tracked
 64-episode snapshot is under `baselines/classical/`; it achieved 87.5% goal
-success and 100% survival across two seeds, below the frozen learned policy's
-roughly 95% success. Keep it as a transparent fallback for suspended and
+success and 100% survival across two seeds, below the historical learned v0
+policy's roughly 95% success. Keep it as a transparent fallback for suspended and
 tethered actuator/contact commissioning. Do not treat its deterministic gait
 logic as evidence that the hardware model is calibrated, and do not replace
 the minimum publish gates with this small baseline sample.
@@ -163,5 +191,5 @@ make ml-tool
 That command is a nominal discovery baseline, not a claimed tuned recipe.
 After it passes the nominal gate, transfer the checkpoint into the default
 measured-randomization task and compare against training from scratch. Use
-Policy Replay with `AVBD_REPLAY_TASK=arachne15-velocity-v0` and a live run
+Policy Replay with `AVBD_REPLAY_TASK=arachne15-velocity-v1` and a live run
 directory to inspect each complete checkpoint without changing the task.

@@ -13,9 +13,9 @@ directory (plus the deployment manifest where present).
 
 Single-report qualifications keep their sealed held-out report beside the
 weights as `evaluation.json`. Multi-seed native qualifications keep an
-aggregate and raw fixed-seed reports under `qualification/`; Arachne Goal
-retains its prior-contract report set under the canonical robot directory
-linked below.
+aggregate and raw fixed-seed reports under `qualification/`. Schema-v2
+Arachne bundles separate the nominal and validation-collision distributions
+into named subdirectories and seal both in one requalification manifest.
 
 ## Selectable replay evidence
 
@@ -33,6 +33,20 @@ linked below.
 - `external/unitree-h1` is the unchanged public Unitree RL Gym recurrent H1
   policy imported to MLX. Its source identity and recurrent parity contract are
   recorded in `manifest.json`.
+- `arachne15-velocity-v1` is the accepted 0.15 m/s straight-walk replay on the
+  epoch-2 deterministic-color solver (`taskRevision=2000006`). The task ID
+  remains `arachne15-velocity-v0`; v1 is the immutable selection and bundle
+  ID. Its policy bytes are unchanged from the historical v0 parent. Four
+  fixed-seed nominal reports and four full-collision validation reports are
+  sealed independently, with a predeclared five-point maximum pooled-success
+  degradation gate. Fingerprint:
+  `97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5`.
+- `arachne15-goal-v1` is the accepted epoch-2 point-goal replay and the policy
+  pinned by the hardware deployment controller. The task ID remains
+  `arachne15-goal-v0`. Its policy bytes are unchanged from the historical v0
+  parent, and the same independent nominal/full-collision matrix and
+  cross-suite degradation guard are sealed with the bundle. Fingerprint:
+  `923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02`.
 
 The imported GEAR-SONIC entry remains a visible development reference, and
 `Arachne Classical` remains a visible non-neural CPG/IK baseline with no
@@ -80,8 +94,8 @@ own parity gates.
   Those reports do not qualify the epoch-2 solver. Fingerprint:
   `30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027`.
 
-Both native Arachne learned policies remain historical and cannot be selected
-through Policy Replay.
+Both v0 Arachne bundles remain historical and cannot be selected through
+Policy Replay; their accepted epoch-2 v1 descendants above are selectable.
 
 ## Removed replay examples
 
