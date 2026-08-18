@@ -1,10 +1,12 @@
 import XCTest
 import simd
+import CryptoKit
 @testable import AVBDCore
 
 final class ManiSkillPushTTests: XCTestCase {
-    func testBundledPandaStickMatchesPublishedJointContract() throws {
-        let asset = try MJCFAsset.bundledPandaStick()
+    func testBundledPandaPusherMatchesPinnedMenagerieJointContract() throws {
+        let asset = try MJCFAsset.bundledPandaPusher()
+        XCTAssertEqual(asset.name, "avbd_panda_pusher")
         XCTAssertEqual(asset.bodyNames,
                        (0...7).map { "link\($0)" })
         XCTAssertEqual(asset.jointNames,
@@ -13,10 +15,73 @@ final class ManiSkillPushTTests: XCTestCase {
                        (1...7).map { "actuator\($0)" })
     }
 
+    func testPackagedPandaAndManiSkillProvenanceIsHashBound() throws {
+        func url(_ resource: String, _ fileExtension: String?,
+                 _ subdirectory: String) throws -> URL {
+            try MJCFAsset.bundledResourceURL(
+                resource: resource, withExtension: fileExtension,
+                subdirectory: subdirectory)
+        }
+        func digest(_ url: URL) throws -> String {
+            SHA256.hash(data: try Data(contentsOf: url)).map {
+                String(format: "%02x", $0)
+            }.joined()
+        }
+        func json(_ url: URL) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: url)) as? [String: Any])
+        }
+
+        let pandaDirectory = "Assets/panda_pusher"
+        let pandaManifest = try json(url(
+            "PROVENANCE", "json", pandaDirectory))
+        let pandaAsset = try XCTUnwrap(
+            pandaManifest["asset"] as? [String: Any])
+        XCTAssertEqual(
+            try digest(url("panda_pusher", "xml", pandaDirectory)),
+            pandaAsset["sha256"] as? String)
+        let pandaLicense = try XCTUnwrap(
+            pandaManifest["redistributedLicense"] as? [String: Any])
+        XCTAssertEqual(
+            try digest(url("LICENSE", nil, pandaDirectory)),
+            pandaLicense["sha256"] as? String)
+        let pandaUpstream = try XCTUnwrap(
+            pandaManifest["upstream"] as? [String: Any])
+        XCTAssertEqual(pandaUpstream["revision"] as? String,
+                       "da76818e269b82289eba39808e2fb91d679d6994")
+        XCTAssertEqual(pandaUpstream["license"] as? String, "Apache-2.0")
+
+        let taskDirectory = "Assets/maniskill_pusht"
+        let taskManifest = try json(url(
+            "PROVENANCE", "json", taskDirectory))
+        let redistributed = try XCTUnwrap(
+            taskManifest["redistributedFiles"] as? [[String: Any]])
+        let expected = Dictionary(uniqueKeysWithValues: try redistributed.map {
+            entry -> (String, String) in
+            let path = try XCTUnwrap(entry["path"] as? String)
+            return (URL(fileURLWithPath: path).lastPathComponent,
+                    try XCTUnwrap(entry["sha256"] as? String))
+        })
+        XCTAssertEqual(try digest(url("LICENSE", nil, taskDirectory)),
+                       expected["LICENSE"])
+        XCTAssertEqual(try digest(url("NOTICE", nil, taskDirectory)),
+                       expected["NOTICE"])
+        let taskUpstream = try XCTUnwrap(
+            taskManifest["upstream"] as? [String: Any])
+        XCTAssertEqual(taskUpstream["revision"] as? String,
+                       "62ff3a5896b4d5b4cf0ac4c8d79afe600c9404a3")
+        XCTAssertEqual(taskUpstream["license"] as? String, "Apache-2.0")
+
+        XCTAssertThrowsError(try url(
+            "panda_stick", "xml", "Assets/panda_stick"))
+    }
+
     func testPublishedInitialPoseResolvesToPublishedTCP() throws {
         let task = try ManiSkillPushTTask(configuration: .init(
             numEnvironments: 1, seed: 9351,
             autoReset: false, robotInitialJointNoise: 0))
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.fixedGainActuatorV2(9))
         var observations = RLObservationBatch(spec: task.spec)
         try task.reset(environments: nil, seed: 9351,
                        into: &observations)
@@ -245,7 +310,7 @@ final class ManiSkillPushTTests: XCTestCase {
         })
     }
 
-    func testStickCapsulePreservesOfficialCylinderEnvelopeAndTCP() throws {
+    func testAVBDPusherMatchesFirstPartyDesignAndTCP() throws {
         let task = try ManiSkillPushTTask(configuration: .init(
             numEnvironments: 1, seed: 9351,
             autoReset: false, robotInitialJointNoise: 0))
@@ -254,15 +319,15 @@ final class ManiSkillPushTTests: XCTestCase {
         let stick = try XCTUnwrap(env.scene.colliders.first {
             $0.body == ref.link7
                 && $0.shape == .capsule
-                && abs($0.size.y - 0.008) < 1e-7
+                && abs($0.size.y - 0.009) < 1e-7
         })
-        XCTAssertEqual(stick.size.x, 0.084, accuracy: 1e-7)
-        XCTAssertEqual(stick.size.y, 0.008, accuracy: 1e-7)
-        XCTAssertEqual(stick.size.x + 2 * stick.size.y, 0.100,
+        XCTAssertEqual(stick.size.x, 0.092, accuracy: 1e-7)
+        XCTAssertEqual(stick.size.y, 0.009, accuracy: 1e-7)
+        XCTAssertEqual(stick.size.x + 2 * stick.size.y, 0.110,
                        accuracy: 1e-7)
 
         // Express the collider center in link7's authored frame. Its positive
-        // Z cap must terminate at the published TCP, 257 mm from link7.
+        // Z cap must terminate at AVBD's TCP, 255 mm from link7.
         let centerInLink = ref.link7Frame.rotation.conjugate.act(
             stick.localPosition - ref.link7Frame.position)
         let axisInLink = ref.link7Frame.rotation.conjugate.act(
@@ -273,6 +338,32 @@ final class ManiSkillPushTTests: XCTestCase {
         let tcp = PandaStickPushTEnv.tcpInLink7
         XCTAssertLessThan(
             min(length(positiveTip - tcp), length(negativeTip - tcp)), 1e-6)
+    }
+
+    func testReducedPlantPreservesMenagerieEffortAndFrictionSemantics() throws {
+        let task = try ManiSkillPushTTask(configuration: .init(
+            numEnvironments: 1, seed: 9351,
+            autoReset: false, robotInitialJointNoise: 0))
+        let env = task.environment
+        let ref = env.refs[0]
+        let effortLimits = ref.motors.map {
+            env.scene.joints[$0].motorTorque
+        }
+        XCTAssertEqual(effortLimits, [87, 87, 87, 87, 12, 12, 12])
+
+        let robotBodies = Set(ref.robotBodies)
+        let robotColliders = env.scene.colliders.filter {
+            robotBodies.contains($0.body)
+        }
+        let pusher = try XCTUnwrap(robotColliders.first {
+            $0.shape == .capsule && abs($0.size.y - 0.009) < 1e-7
+        })
+        XCTAssertEqual(pusher.friction, 0.3, accuracy: 1e-7)
+        for proxy in robotColliders where !(
+            proxy.shape == .capsule && abs(proxy.size.y - 0.009) < 1e-7
+        ) {
+            XCTAssertEqual(proxy.friction, 1, accuracy: 1e-7)
+        }
     }
 
     func testCentimeterScaleContactMarginPreservesTThickness() throws {

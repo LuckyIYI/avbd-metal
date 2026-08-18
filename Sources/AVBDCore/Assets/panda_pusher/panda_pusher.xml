@@ -1,13 +1,19 @@
-<mujoco model="panda_stick">
+<mujoco model="avbd_panda_pusher">
   <!--
-    Derived from MuJoCo Menagerie's Apache-2.0 Franka Emika Panda and
-    ManiSkill's PandaStick URDF. Source mesh collisions are replaced by
-    conservative primitive proxies for AVBD's batched Metal contact path.
+    MODIFIED FILE: AVBD's reduced Panda plant is derived solely from MuJoCo
+    Menagerie's Apache-2.0 Franka Emika Panda at repository revision
+    da76818e269b82289eba39808e2fb91d679d6994. This asset's exact source and
+    transformations are recorded in the adjacent PROVENANCE.json.
+
+    AVBD diagonalizes Menagerie's full inertia tensors, omits the gripper, and
+    replaces collision meshes with first-party analytic proxies for batched
+    Metal contact. The pusher is an independently authored AVBD tool; it is
+    not copied from ManiSkill's PandaStick asset.
   -->
   <default>
     <default class="panda">
       <joint armature="0.1" damping="1" axis="0 0 1" range="-2.8973 2.8973"/>
-      <geom friction="0.3 0.3 0"/>
+      <geom friction="1 0.005 0.0001"/>
     </default>
   </default>
 
@@ -16,9 +22,11 @@
       <inertial mass="0.629769" pos="-0.041018 -0.00014 0.049974"
         quat="0.997866762 -0.009703265 0.064553490 0.000787011"
         diaginertia="0.003130511 0.003879839 0.004304650"/>
-      <!-- AABB of ManiSkill's link0.stl collision mesh. The previous
-           capsule extended 7.5 cm through the table and 21.5 cm above the
-           source mesh, creating a permanent fixed-base contact. -->
+      <!-- Menagerie's pinned link0.stl AABB is:
+           min=(-0.154079,-0.094614,-0.000032),
+           max=( 0.071567, 0.094670, 0.140003). XY and upper Z are rounded
+           outward; its 32 micrometre lower numerical tail is clamped to the
+           mounting plane so a fixed base cannot fight the ground contact. -->
       <geom type="box" size="0.113 0.095 0.0701" pos="-0.0413 0 0.0701"/>
       <body name="link1" pos="0 0 0.333">
         <inertial mass="4.970684" pos="0.003875 0.002081 -0.04762"
@@ -62,13 +70,13 @@
                       diaginertia="0.004518030 0.010105477 0.012734493"/>
                     <joint name="joint7"/>
                     <geom type="capsule" size="0.045 0.06" pos="0 0 0.07"/>
-                    <!-- ManiSkill uses a radius-8 mm, length-100 mm cylinder.
-                         AVBD's capsule includes its spherical caps, so its
-                         axial segment is 100 - 2*8 = 84 mm. This preserves
-                         the source collision envelope and puts the physical
-                         tip exactly at the published TCP. -->
-                    <geom name="stick" type="capsule" size="0.008 0.042"
-                      pos="0 0 0.207" friction="0.3 0.3 0"/>
+                    <!-- AVBD-authored pusher: 18 mm diameter, 110 mm total
+                         capsule length, centered at link7 Z=0.200 m and
+                         spanning Z=0.145...0.255 m.
+                         The proximal overlap makes the primitive a rigidly
+                         mounted tool; the distal cap defines the task TCP. -->
+                    <geom name="avbd_pusher" type="capsule" size="0.009 0.046"
+                      pos="0 0 0.200" friction="0.3 0.3 0"/>
                   </body>
                 </body>
               </body>
@@ -80,12 +88,16 @@
   </worldbody>
 
   <actuator>
-    <motor name="actuator1" joint="joint1" ctrlrange="-100 100"/>
-    <motor name="actuator2" joint="joint2" ctrlrange="-100 100"/>
-    <motor name="actuator3" joint="joint3" ctrlrange="-100 100"/>
-    <motor name="actuator4" joint="joint4" ctrlrange="-100 100"/>
-    <motor name="actuator5" joint="joint5" ctrlrange="-100 100"/>
-    <motor name="actuator6" joint="joint6" ctrlrange="-100 100"/>
-    <motor name="actuator7" joint="joint7" ctrlrange="-100 100"/>
+    <motor name="actuator1" joint="joint1" forcerange="-87 87"/>
+    <motor name="actuator2" joint="joint2" forcerange="-87 87"/>
+    <motor name="actuator3" joint="joint3" forcerange="-87 87"/>
+    <motor name="actuator4" joint="joint4" forcerange="-87 87"/>
+    <motor name="actuator5" joint="joint5" forcerange="-12 12"/>
+    <motor name="actuator6" joint="joint6" forcerange="-12 12"/>
+    <motor name="actuator7" joint="joint7" forcerange="-12 12"/>
   </actuator>
+
+  <contact>
+    <exclude body1="link0" body2="link1"/>
+  </contact>
 </mujoco>

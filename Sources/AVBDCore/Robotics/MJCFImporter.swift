@@ -203,6 +203,23 @@ public struct MJCFAsset {
     fileprivate var actuators: [Actuator]
     fileprivate var exclusions: [(String, String)]
 
+    /// Resolve any copied AVBDCore resource. Kept internal so package tests
+    /// can prove that attribution payloads ship beside the assets they govern
+    /// without exposing bundle layout as public API.
+    static func bundledResourceURL(
+        resource: String, withExtension fileExtension: String?,
+        subdirectory: String
+    ) throws -> URL {
+        guard let url = Bundle.module.url(
+            forResource: resource, withExtension: fileExtension,
+            subdirectory: subdirectory) else {
+            let suffix = fileExtension.map { ".\($0)" } ?? ""
+            throw MJCFImportError.missing(
+                "bundled \(subdirectory)/\(resource)\(suffix)")
+        }
+        return url
+    }
+
     public static func parse(url: URL) throws -> MJCFAsset {
         try parse(data: Data(contentsOf: url), baseURL: url.deletingLastPathComponent())
     }
@@ -247,20 +264,27 @@ public struct MJCFAsset {
         return try parse(url: url)
     }
 
-    /// Collision/dynamics model for ManiSkill's seven-axis PandaStick.
-    /// Kinematics, inertias, limits, armature, and tool dimensions are copied
-    /// from the Apache-2.0 Panda model and ManiSkill PandaStick URDF. The
-    /// original mesh collisions are represented by explicit primitive proxies
-    /// because AVBD intentionally keeps batched contact on its Metal primitive
-    /// path.
-    public static func bundledPandaStick() throws -> MJCFAsset {
+    /// AVBD's seven-axis Panda plant with an independently authored pusher.
+    /// Robot frames, inertias, limits, passive joint parameters, and effort
+    /// limits derive solely from the commit-pinned Apache-2.0 MuJoCo Menagerie
+    /// model. AVBD-authored primitive proxies replace its collision meshes for
+    /// the batched Metal contact path; `PROVENANCE.json` records exact hashes
+    /// and every intentional transformation.
+    public static func bundledPandaPusher() throws -> MJCFAsset {
         guard let url = Bundle.module.url(
-            forResource: "panda_stick", withExtension: "xml",
-            subdirectory: "Assets/panda_stick") else {
+            forResource: "panda_pusher", withExtension: "xml",
+            subdirectory: "Assets/panda_pusher") else {
             throw MJCFImportError.missing(
-                "bundled Assets/panda_stick/panda_stick.xml")
+                "bundled Assets/panda_pusher/panda_pusher.xml")
         }
         return try parse(url: url)
+    }
+
+    /// Compatibility spelling retained for callers that identify the
+    /// ManiSkill benchmark rather than the independently sourced robot asset.
+    @available(*, deprecated, renamed: "bundledPandaPusher()")
+    public static func bundledPandaStick() throws -> MJCFAsset {
+        try bundledPandaPusher()
     }
 
     public static func parse(data: Data) throws -> MJCFAsset {

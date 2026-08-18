@@ -53,7 +53,10 @@ public struct PandaStickTCPPose {
     }
 }
 
-/// Batched seven-axis PandaStick and exact ManiSkill PushT-v1 scene layout.
+/// Batched seven-axis Panda with AVBD's pusher, executing the ManiSkill
+/// PushT-v1 scene/reward contract. The robot asset has separate Menagerie-only
+/// provenance; this benchmark task intentionally retains ManiSkill-derived
+/// reset, workpiece, controller, observation, reward, and success constants.
 public final class PandaStickPushTEnv {
     public struct EnvRefs {
         public var center: F3
@@ -76,7 +79,8 @@ public final class PandaStickPushTEnv {
         (-2.8973, 2.8973),
     ]
     public static let basePosition = F3(-0.615, 0, 0)
-    public static let tcpInLink7 = F3(0, 0, 0.257)
+    /// Distal cap of AVBD's independently authored pusher in link7 space.
+    public static let tcpInLink7 = F3(0, 0, 0.255)
     public static let goalPosition = SIMD2<Float>(-0.156, -0.1)
     public static let goalYaw: Float = 5 * .pi / 3
     public static let successCoverage: Float = 0.90
@@ -145,7 +149,7 @@ public final class PandaStickPushTEnv {
     public init(numEnvironments: Int, seed: UInt64 = 1) throws {
         precondition(numEnvironments > 0)
         self.numEnvironments = numEnvironments
-        model = try MJCFAsset.bundledPandaStick()
+        model = try MJCFAsset.bundledPandaPusher()
         var built = PhysicsScene(name: "maniskill-pusht-v1")
         // ManiSkill SimConfig defaults: 100 Hz simulation, 20 Hz control,
         // 15 position iterations, and 0.3/0.3 default surface friction.
@@ -322,8 +326,8 @@ public final class PandaStickPushTEnv {
 
     /// Damped-least-squares Cartesian IK used by deterministic diagnostics and
     /// demonstration generation. Learned policies never call this routine.
-    /// The optional orientation target is valuable for PandaStick because a
-    /// position-only solution can tilt the 10 cm tool into the table or T.
+    /// The optional orientation target is valuable for the pusher because a
+    /// position-only solution can tilt the 11 cm tool into the table or T.
     public func inverseKinematics(
         targetPosition: F3, targetRotation: Quat? = nil,
         initialJointPositions: [Float] = defaultJointPositions,
@@ -754,7 +758,13 @@ public final class ManiSkillPushTTask: VectorizedRLTask,
             numEnvironments: configuration.numEnvironments,
             seed: configuration.seed)
         spec = RLTaskSpec(
-            // Revision 8 preserves the official 100 mm cylindrical stick's
+            // Revision 9 replaces the noncommercial PandaStick asset with the
+            // pinned Menagerie Panda, Menagerie's effort/sliding-friction
+            // semantics,
+            // and AVBD's independently authored 110 mm pusher. The explicit
+            // revision boundary rejects revision-8 checkpoints rather than
+            // silently replaying them against a different physical plant.
+            // Revision 8 preserved the former 100 mm cylindrical stick's
             // total collision envelope when representing it as a capsule.
             // Revision 7 uses a millimeter-scale contact margin for the thin
             // T/stick instead of the engine's meter-scale 1 cm legacy slop.
@@ -766,7 +776,7 @@ public final class ManiSkillPushTTask: VectorizedRLTask,
             // Revision 3 represented the two T boxes as separately integrated
             // bodies connected by an AVBD weld and used continuous overlap.
             id: "maniskill-pusht-v1",
-            revision: RLPhysicsContract.fixedGainActuatorV2(8),
+            revision: RLPhysicsContract.fixedGainActuatorV2(9),
             numEnvironments: configuration.numEnvironments,
             // ManiSkill state observation: qpos, qvel, TCP pose, goal
             // position, and object pose = 7 + 7 + 7 + 3 + 7 = 31.

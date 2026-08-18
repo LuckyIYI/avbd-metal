@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "adaptedFile": {
+    "path": "Sources/AVBDCore/Robotics/ManiSkillPushTTask.swift",
+    "sha256": "2132086b676e97da131a0c38c5f16a9a1dd1af1a4088417211fb68a6918f3164"
+  },
+  "upstream": {
+    "project": "ManiSkill",
+    "repository": "https://github.com/haosulab/ManiSkill",
+    "revision": "62ff3a5896b4d5b4cf0ac4c8d79afe600c9404a3",
+    "license": "Apache-2.0",
+    "noticeFile": null,
+    "files": [
+      {
+        "path": "mani_skill/envs/tasks/tabletop/push_t.py",
+        "sha256": "da3aa9dfd69802f17cfad244250da0ead7ff8df4c008c97c5f3f27c5be4fc040"
+      },
+      {
+        "path": "LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  "redistributedFiles": [
+    {
+      "path": "Sources/AVBDCore/Assets/maniskill_pusht/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "Sources/AVBDCore/Assets/maniskill_pusht/NOTICE",
+      "sha256": "35aa49d961c39b3f426d7fa637d4e9f6ae9719678096bd9a63969c8b436c1267"
+    }
+  ],
+  "assetBoundary": {
+    "redistributesManiSkillAssets": false,
+    "statement": "Only benchmark code/configuration is adapted. The robot plant and pusher are separately sourced and documented in Assets/panda_pusher."
+  }
+}
