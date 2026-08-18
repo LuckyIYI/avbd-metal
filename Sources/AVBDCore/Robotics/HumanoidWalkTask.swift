@@ -1884,7 +1884,23 @@ public final class HumanoidWalkEnv {
     public func step(normalizedActions: ContiguousArray<Float>, decimation: Int,
                      clampActions: Bool = true,
                      clampTargetsToLimits: Bool = true) {
+        do {
+            try stepChecked(
+                normalizedActions: normalizedActions, decimation: decimation,
+                clampActions: clampActions,
+                clampTargetsToLimits: clampTargetsToLimits)
+        } catch {
+            fatalError("Humanoid simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepChecked(
+        normalizedActions: ContiguousArray<Float>, decimation: Int,
+        clampActions: Bool = true,
+        clampTargetsToLimits: Bool = true
+    ) throws {
         precondition(normalizedActions.count == numEnvironments * Self.jointRanges.count)
+        try solver.synchronize()
         var commands = [GPUSolver.MotorTargetUpdate]()
         commands.reserveCapacity(normalizedActions.count)
         for e in 0..<numEnvironments {
@@ -1908,7 +1924,8 @@ public final class HumanoidWalkEnv {
             }
         }
         solver.setMotorTargets(commands)
-        for _ in 0..<decimation { solver.step() }
+        for _ in 0..<decimation { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     /// Step absolute source-joint position targets. Imported policies use
@@ -1916,9 +1933,24 @@ public final class HumanoidWalkEnv {
     /// native task's normalized 0.5-radian action convention.
     public func step(jointPositionTargets: ContiguousArray<Float>,
                      decimation: Int, clampTargetsToLimits: Bool = true) {
+        do {
+            try stepChecked(
+                jointPositionTargets: jointPositionTargets,
+                decimation: decimation,
+                clampTargetsToLimits: clampTargetsToLimits)
+        } catch {
+            fatalError("Humanoid simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepChecked(
+        jointPositionTargets: ContiguousArray<Float>, decimation: Int,
+        clampTargetsToLimits: Bool = true
+    ) throws {
         precondition(jointPositionTargets.count
             == numEnvironments * Self.jointRanges.count)
         precondition(decimation > 0)
+        try solver.synchronize()
         var commands = [GPUSolver.MotorTargetUpdate]()
         commands.reserveCapacity(jointPositionTargets.count)
         for environment in 0..<numEnvironments {
@@ -1934,7 +1966,8 @@ public final class HumanoidWalkEnv {
             }
         }
         solver.setMotorTargets(commands)
-        for _ in 0..<decimation { solver.step() }
+        for _ in 0..<decimation { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     public func reset(_ environmentIDs: [Int], seeds: [UInt64],
@@ -2511,7 +2544,7 @@ public final class HumanoidWalkTask: VectorizedRLTask, RLEvaluationCriteriaProvi
         }
         spec = RLTaskSpec(
             id: taskID,
-            revision: RLPhysicsContract.fixedGainActuatorV2(taskRevision),
+            revision: RLPhysicsContract.deterministicColorSolveV1(taskRevision),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy",
@@ -3072,6 +3105,7 @@ public final class HumanoidWalkTask: VectorizedRLTask, RLEvaluationCriteriaProvi
                       into observations: inout RLObservationBatch) throws {
         try observations.validate(for: spec)
         let envIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = envIDs.map { seed &+ UInt64($0) &* 0x9E3779B97F4A7C15 }
         environment.reset(
             envIDs, seeds: seeds,
@@ -3087,6 +3121,7 @@ public final class HumanoidWalkTask: VectorizedRLTask, RLEvaluationCriteriaProvi
     public func step(actions: RLActionBatch, into result: inout RLStepBatch) throws {
         try result.validate(for: spec)
         try actions.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
         let n = spec.numEnvironments
         var applied = actions.values
@@ -3104,8 +3139,9 @@ public final class HumanoidWalkTask: VectorizedRLTask, RLEvaluationCriteriaProvi
             }
         }
         launchScheduledProjectiles()
-        environment.step(normalizedActions: applied,
-                         decimation: configuration.controlDecimation)
+        try environment.stepChecked(
+            normalizedActions: applied,
+            decimation: configuration.controlDecimation)
         if trainingMode { trainingControlSteps += 1 }
         var states = environment.states()
         let physicalGroundContacts = environment.groundContacts()

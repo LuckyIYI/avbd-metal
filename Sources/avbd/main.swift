@@ -3353,7 +3353,8 @@ case "eval-arm-expert":
         }
         // Match ArmPushTTask's maintained 20 Hz controller over the 120 Hz
         // physics step so this diagnostic has the same five-second horizon.
-        env.step(normalizedActions: appliedActions, decimation: 6)
+        try env.stepChecked(
+            normalizedActions: appliedActions, decimation: 6)
         let next = env.states()
         for e in 0..<o.envs {
             let coverage = env.coverage(e, state: next[e])
@@ -3712,9 +3713,9 @@ case "run":
         let solver = try GPUSolver(scene: scene)
         let t0 = Date()
         for f in 0..<o.frames {
-            solver.step()
+            try solver.submitStep()
             if !o.json && (f + 1) % o.statsEvery == 0 {
-                let err = solver.maxConstraintError()
+                let err = try solver.maxConstraintErrorChecked()
                 var extra = ""
                 if let w = o.watch {
                     let p = solver.bodyPosition(w)
@@ -3725,8 +3726,8 @@ case "run":
                              f + 1, err, solver.lastNumPairs, colors, extra))
             }
         }
+        let err = try solver.maxConstraintErrorChecked()
         let ms = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
-        let err = solver.maxConstraintError()
         if o.json {
             print("{\"backend\":\"gpu\",\"demo\":\"\(scene.name)\",\"bodies\":\(scene.bodies.count),\"frames\":\(o.frames),\"msPerFrame\":\(ms),\"maxConstraintError\":\(err),\"pairs\":\(solver.lastNumPairs)}")
         } else {
@@ -3758,8 +3759,9 @@ case "rodexp":
         var cur: Float = 0
         var worstStretch: Float = 0
         for f in 0..<frames {
-            solver.step()
+            try solver.submitStep()
             if f % 10 == 0 {
+                try solver.synchronize()
                 var ke: Float = 0
                 for b in 0..<scene.bodies.count where scene.bodies[b].isParticle {
                     ke += 0.5 * solver.bodyMass(b) * length_squared(solver.bodyVelocity(b))
@@ -3775,6 +3777,10 @@ case "rodexp":
                 }
             }
         }
+        // Retire the final asynchronous frames even when the sampling cadence
+        // does not land on the last frame. A Metal/capacity/coloring failure in
+        // that tail must fail the experiment instead of producing a report.
+        try solver.synchronize()
         let envelope = windowMax.map { String(format: "%.3f", $0) }.joined(separator: " ")
         let growing = windowMax.count >= 3
             && windowMax.last! > 1.5 * windowMax[1]
@@ -3790,13 +3796,13 @@ case "profile":
     let scene = makeScene(args[1], o)
     let solver = try GPUSolver(scene: scene)
     print("bodies \(scene.bodies.count)  tris \(scene.tris.count)+\(solver.tetBoundaryTris.count)b  springs \(scene.springs.count)  joints \(scene.joints.count)  colors \(solver.staticUsedColors)  persistent-capacity \(solver.persistentCapacity)")
-    for _ in 0..<30 { solver.step() }      // warm up
-    solver.sync()
+    for _ in 0..<30 { try solver.submitStep() } // warm up
+    try solver.synchronize()
     solver.profiling = true
     solver.resetProfile()
     let t0 = Date()
-    for _ in 0..<o.frames { solver.step() }
-    solver.sync()
+    for _ in 0..<o.frames { try solver.submitStep() }
+    try solver.synchronize()
     let wallMS = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
     let total = solver.profileNS.values.reduce(0, +)
     print(String(format: "wall %.3f ms/frame  (gpu-stage sum %.3f ms)",
@@ -3819,8 +3825,9 @@ case "clothgate":
     var worstStretch: Float = 0
     var ke: Float = 0
     for f in 0..<o.frames {
-        solver.step()
+        try solver.submitStep()
         if (f + 1) % o.statsEvery == 0 || f == o.frames - 1 {
+            try solver.synchronize()
             let (gap, stretch) = solver.debugClothMetrics()
             // KE over particles (cloth energy envelope) + fastest node
             ke = 0
@@ -3958,7 +3965,7 @@ case "bench":
     let scene = makeScene(args[1], o)
     let solver = try GPUSolver(scene: scene)
     // warmup
-    for _ in 0..<10 { solver.step() }
+    for _ in 0..<10 { try solver.submitStep() }
     if args.contains("--capture") {
         let mgr = MTLCaptureManager.shared()
         let cd = MTLCaptureDescriptor()
@@ -3966,7 +3973,8 @@ case "bench":
         cd.destination = .gpuTraceDocument
         cd.outputURL = URL(fileURLWithPath: "avbd-\(scene.name).gputrace")
         try mgr.startCapture(with: cd)
-        for _ in 0..<3 { solver.step() }
+        for _ in 0..<3 { try solver.submitStep() }
+        try solver.synchronize()
         mgr.stopCapture()
         print("wrote avbd-\(scene.name).gputrace (open in Xcode)")
     }
@@ -3977,11 +3985,11 @@ case "bench":
     let syncEach = args.contains("--syncstep")
     for _ in 0..<o.frames {
         let e0 = Date()
-        solver.step()
-        if syncEach { solver.sync() }
+        try solver.submitStep()
+        if syncEach { try solver.synchronize() }
         encodeS += Date().timeIntervalSince(e0)
     }
-    solver.sync()
+    try solver.synchronize()
     let ms = Date().timeIntervalSince(t0) * 1000 / Double(o.frames)
     print(String(format: "  cpu encode: %.3f ms/frame", encodeS * 1000 / Double(o.frames)))
     print(String(format: "%@: %d bodies, %d iterations, %.3f ms/frame (%.1f FPS)",
@@ -4009,7 +4017,8 @@ case "parity":
     var maxDiff: Float = 0
     for f in 0..<o.frames {
         cpu.step()
-        gpu.step()
+        try gpu.submitStep()
+        try gpu.synchronize()
         var diff: Float = 0
         for i in 0..<scene.bodies.count {
             diff = max(diff, length(cpu.bodies[i].positionLin - gpu.bodyPosition(i)))

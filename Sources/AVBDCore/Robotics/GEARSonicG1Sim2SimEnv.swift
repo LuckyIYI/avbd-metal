@@ -280,6 +280,7 @@ public final class GEARSonicG1Sim2SimEnv {
             throw RLEnvironmentError.invalidConfiguration(
                 "GEAR-SONIC control decimation must be positive")
         }
+        try solver.synchronize()
         var updates: [GPUSolver.MotorTargetUpdate] = []
         updates.reserveCapacity(targets.count)
         for environment in refs.indices {
@@ -291,7 +292,8 @@ public final class GEARSonicG1Sim2SimEnv {
             }
         }
         solver.setMotorTargets(updates)
-        for _ in 0..<steps { solver.step() }
+        for _ in 0..<steps { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     /// Reset complete replicas from absolute source coordinates in one GPU
@@ -303,6 +305,7 @@ public final class GEARSonicG1Sim2SimEnv {
             throw RLEnvironmentError.invalidConfiguration(
                 "GEAR-SONIC reset requires one state per environment")
         }
+        try solver.synchronize()
         var bodyUpdates: [GPUSolver.BodyStateUpdate] = []
         var motorUpdates: [GPUSolver.MotorTargetUpdate] = []
         bodyUpdates.reserveCapacity(configuration.environmentCount * 31)

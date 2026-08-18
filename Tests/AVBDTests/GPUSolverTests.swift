@@ -125,10 +125,298 @@ final class GPUSolverTests: XCTestCase {
         }
     }
 
+    func testCheckedSubmissionFailureIsStickyAndDoesNotAdvanceFrame() throws {
+        let solver = try makeGPU(Demos.ground())
+        solver.commandBufferFactoryForTesting = { nil }
+
+        XCTAssertThrowsError(try solver.submitStep()) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .commandBufferCreation(operation: "physics", frame: 1))
+        }
+        XCTAssertEqual(solver.frameIndex, 0)
+        XCTAssertEqual(
+            solver.runtimeFailure,
+            .commandBufferCreation(operation: "physics", frame: 1))
+        XCTAssertThrowsError(try solver.submitStep()) { error in
+            XCTAssertEqual(error as? GPUSolver.AVBDError,
+                           solver.runtimeFailure)
+        }
+    }
+
+    func testSynchronousSecondFrameFailureDrainsPriorSubmission() throws {
+        let solver = try makeGPU(Demos.ground())
+        try solver.submitStep()
+        XCTAssertEqual(solver.inflightCountForTesting, 1)
+        solver.commandBufferFactoryForTesting = { nil }
+
+        XCTAssertThrowsError(try solver.submitStep()) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .commandBufferCreation(operation: "physics", frame: 2))
+        }
+
+        XCTAssertEqual(solver.inflightCountForTesting, 0)
+        XCTAssertGreaterThan(solver.lastPairCandidates, 0,
+                             "the older submitted frame was not retired")
+        XCTAssertEqual(solver.frameIndex, 1)
+    }
+
+    func testCheckedEncoderFailureNamesStageAndDoesNotCommitFrame() throws {
+        let solver = try makeGPU(Demos.ground())
+        solver.deniedEncoderStageForTesting = "narrowphase"
+
+        XCTAssertThrowsError(try solver.submitStep()) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .commandEncoderCreation(
+                    operation: "physics", stage: "narrowphase", frame: 1))
+        }
+        XCTAssertEqual(solver.frameIndex, 0)
+    }
+
+    func testCheckedDiagnosticsCannotReportFalsePerfectOnMetalFailure() throws {
+        let solver = try makeGPU(Demos.ground())
+        solver.commandBufferFactoryForTesting = { nil }
+
+        XCTAssertThrowsError(try solver.maxConstraintErrorChecked()) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .commandBufferCreation(
+                    operation: "constraint diagnostics", frame: 0))
+        }
+    }
+
+    func testVectorizedTaskPropagatesSolverFailure() throws {
+        let task = try PushTTask(configuration: .init(numEnvironments: 1))
+        task.environment.solver.commandBufferFactoryForTesting = { nil }
+        var result = RLStepBatch(spec: task.spec)
+
+        XCTAssertThrowsError(try task.step(
+            actions: RLActionBatch(spec: task.spec), into: &result)) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .commandBufferCreation(operation: "physics", frame: 1))
+        }
+        XCTAssertThrowsError(try task.step(
+            actions: RLActionBatch(spec: task.spec), into: &result)) { error in
+            XCTAssertEqual(error as? GPUSolver.AVBDError,
+                           task.environment.solver.runtimeFailure)
+        }
+    }
+
+    func testAsynchronousExecutionFailureIsStickyAndDrainsAllFrames() throws {
+        let solver = try makeGPU(Demos.ground())
+        try solver.submitStep()
+        try solver.submitStep()
+        let injected = GPUSolver.AVBDError.commandExecution(
+            operation: "physics", frame: 1, status: -1,
+            domain: "AVBDTests", code: 7, message: "synthetic GPU fault")
+        solver.completionFailureForTesting = { operation, frame in
+            operation == "physics" && frame == 1 ? injected : nil
+        }
+
+        XCTAssertThrowsError(try solver.synchronize()) { error in
+            XCTAssertEqual(error as? GPUSolver.AVBDError, injected)
+        }
+        XCTAssertEqual(solver.inflightCountForTesting, 0)
+        XCTAssertEqual(solver.runtimeFailure, injected)
+        XCTAssertThrowsError(try solver.submitStep()) { error in
+            XCTAssertEqual(error as? GPUSolver.AVBDError, injected)
+        }
+    }
+
+    func testVectorizedTaskPropagatesAsynchronousExecutionFailure() throws {
+        let task = try PushTTask(configuration: .init(numEnvironments: 1))
+        let injected = GPUSolver.AVBDError.commandExecution(
+            operation: "physics", frame: 1, status: -1,
+            domain: "AVBDTests", code: 8, message: "synthetic GPU fault")
+        task.environment.solver.completionFailureForTesting = {
+            operation, frame in
+            operation == "physics" && frame == 1 ? injected : nil
+        }
+        var result = RLStepBatch(spec: task.spec)
+
+        XCTAssertThrowsError(try task.step(
+            actions: RLActionBatch(spec: task.spec), into: &result)) { error in
+            XCTAssertEqual(error as? GPUSolver.AVBDError, injected)
+        }
+    }
+
+    func testProfilingToggleRetiresPriorReadbackOwner() throws {
+        let solver = try makeGPU(Demos.ground())
+        try solver.submitStep()
+        solver.profiling = true
+
+        try solver.submitStep()
+        XCTAssertEqual(solver.profileFrames, 1)
+        XCTAssertGreaterThan(solver.lastPairCandidates, 0)
+        XCTAssertEqual(solver.inflightCountForTesting, 0)
+
+        solver.profiling = false
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertEqual(solver.frameIndex, 3)
+    }
+
+    private func rigidCapacityScene(sharedStatics: Int) -> PhysicsScene {
+        var scene = PhysicsScene(name: "rigid-capacity-\(sharedStatics)")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 1
+        let size = F3(repeating: 0.1)
+        for _ in 0..<sharedStatics {
+            _ = scene.addBody(
+                size: size, density: 0, friction: 0, position: .zero,
+                shape: .sphere)
+        }
+        // Nonzero groups isolate dynamic bodies from each other while shared
+        // group-zero statics collide with every replica. Demand is therefore
+        // exactly 64 * sharedStatics with no high-chromatic dynamic clique.
+        for group in 1...64 {
+            _ = scene.addBody(
+                size: size, density: 1, friction: 0, position: .zero,
+                shape: .sphere, collisionGroup: UInt32(group))
+        }
+        return scene
+    }
+
+    func testExactRigidPairCapacityIsValid() throws {
+        let solver = try GPUSolver(
+            scene: rigidCapacityScene(sharedStatics: 64),
+            maxPairsPerBody: 0)
+        XCTAssertEqual(solver.maxPairs, 4_096)
+
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertEqual(solver.lastPairCandidates, 4_096)
+        XCTAssertEqual(solver.lastNumPairs, 4_096)
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
+    func testRigidPairOverflowPoisonsInsteadOfDroppingContacts() throws {
+        let solver = try GPUSolver(
+            scene: rigidCapacityScene(sharedStatics: 65),
+            maxPairsPerBody: 0)
+        try solver.submitStep()
+
+        XCTAssertThrowsError(try solver.synchronize()) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .rigidPairCapacity(
+                    frame: 1, required: 4_160, capacity: 4_096))
+        }
+        XCTAssertEqual(solver.lastPairCandidates, 4_160)
+        XCTAssertEqual(solver.lastNumPairs, 4_096)
+        XCTAssertEqual(solver.runtimeFailure,
+                       .rigidPairCapacity(
+                           frame: 1, required: 4_160, capacity: 4_096))
+    }
+
+    func testUnresolvedDynamicColoringPoisonsTheSolve() throws {
+        var scene = PhysicsScene(name: "color-capacity")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 1
+        for _ in 0..<65 {
+            _ = scene.addBody(
+                size: F3(repeating: 0.1), density: 1, friction: 0,
+                position: .zero, shape: .sphere)
+        }
+        let solver = try makeGPU(scene)
+        try solver.submitStep()
+
+        XCTAssertThrowsError(try solver.synchronize()) { error in
+            guard let failure = error as? GPUSolver.AVBDError,
+                  case .unresolvedColoring(let frame, let conflicts)
+                    = failure else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(frame, 1)
+            XCTAssertGreaterThan(conflicts, 0)
+        }
+    }
+
+    func testStaticColorPaletteExhaustionFailsDuringInitialization() throws {
+        var scene = PhysicsScene(name: "static-color-capacity")
+        scene.settings.gravity = 0
+        let particles = (0..<65).map { index in
+            scene.addParticle(
+                radius: 0.01, mass: 0.01, friction: 0,
+                position: F3(Float(index), 0, 1))
+        }
+        scene.addTri(SceneTri(ids: (particles[0], particles[1], particles[2])))
+        for a in particles.indices {
+            for b in (a + 1)..<particles.count {
+                scene.addJoint(SceneJoint(
+                    bodyA: particles[a], bodyB: particles[b],
+                    rA: .zero, rB: .zero, stiffnessLin: 1))
+            }
+        }
+
+        XCTAssertThrowsError(try GPUSolver(scene: scene)) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .staticColorCapacity(body: 64, required: 65, capacity: 64))
+        }
+    }
+
+    func testCheckedRenderInstanceEncoderFailureIsNotSilentOrPhysicsFatal() throws {
+        let solver = try makeGPU(Demos.ground())
+        guard let queue = solver.metalDevice.makeCommandQueue(),
+              let command = queue.makeCommandBuffer(),
+              let instances = solver.metalDevice.makeBuffer(length: 256)
+        else { return XCTFail("could not allocate render test resources") }
+        solver.deniedEncoderStageForTesting = "render-instances"
+
+        XCTAssertThrowsError(try solver.encodeBuildInstancesChecked(
+            command, instances: instances)) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .commandEncoderCreation(
+                    operation: "render instances", stage: "build-instances",
+                    frame: 0))
+        }
+        XCTAssertNil(solver.runtimeFailure,
+                     "a visual-frame failure must not poison physics")
+    }
+
+    func testDisconnectedSoftMeshUsesStructuralContactCapacity() throws {
+        var scene = PhysicsScene(name: "disconnected-soft-capacity")
+        for triangle in 0..<50 {
+            let x = Float(triangle) * 2
+            let ids = (0..<3).map { corner in
+                scene.addParticle(
+                    radius: 0.01, mass: 0.01, friction: 0,
+                    position: F3(x, Float(corner), 1))
+            }
+            scene.addTri(SceneTri(ids: (ids[0], ids[1], ids[2])))
+        }
+        let solver = try makeGPU(scene)
+
+        // 4*150 surface vertices + 4*50 triangles + 4*150 unique edges.
+        XCTAssertEqual(solver.maxSoft, 1_400)
+    }
+
     func testShadersCompile() throws {
         let solver = try makeGPU(Demos.ground())
         XCTAssertNotNil(solver.device)
-        XCTAssertFalse(solver.pso.isEmpty)
+        XCTAssertTrue(GPUSolver.requiredKernelNames.isSubset(of: solver.pso.keys))
+    }
+
+    func testRequiredKernelValidationFailsClosedDeterministically() throws {
+        try GPUSolver.validateRequiredKernelNames(GPUSolver.requiredKernelNames)
+
+        var incomplete = GPUSolver.requiredKernelNames
+        incomplete.remove("build_instances")
+        incomplete.remove("adj_clear_degrees")
+        XCTAssertThrowsError(
+            try GPUSolver.validateRequiredKernelNames(incomplete)
+        ) { error in
+            XCTAssertEqual(
+                error as? GPUSolver.AVBDError,
+                .kernelMissing("adj_clear_degrees"))
+        }
     }
 
     func testCollisionGroupsIsolateOverlappingSimulationReplicas() throws {

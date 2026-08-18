@@ -4,7 +4,8 @@
 This check deliberately does not import MLX or execute a policy. It verifies the
 immutable boundary around an already evaluated policy instead:
 
-* accepted entries are discovered from ``PolicyReplayCatalog.swift``;
+* accepted and external-parity entries are discovered from
+  ``PolicyReplayCatalog.swift``;
 * tracked checkpoint identity is recomputed from the exact replay-semantic files;
 * evaluation reports must match checkpoint task/revision/configuration/lineage;
 * checkpoint robustness aggregates are rebuilt from their raw reports with the
@@ -39,6 +40,21 @@ EVALUATION_KEYS = {
     "successRate",
     "taskMetrics",
 }
+
+UNITREE_H1_SELECTION = "unitree-h1-sim2sim-v0"
+UNITREE_H1_MANIFEST_SHA256 = (
+    "9f434828cf2b2ede587bced686a22d30c3df6b048e631e94641bafeb7a45d117"
+)
+UNITREE_H1_WEIGHTS_SHA256 = (
+    "cb51db3e4ccbecc0d9a863173640f8cb8b5a5fb821bc1db9024c7957297ff4ee"
+)
+UNITREE_H1_LICENSE_SHA256 = (
+    "98335465f43a20b5850e4651db6e74c4aa1e9fc8e8813d38f345178045c0da50"
+)
+UNITREE_H1_SOURCE_REVISION = "276801e46c5d433564f24658bac64f254b7d2d4b"
+UNITREE_H1_SOURCE_CHECKPOINT_SHA256 = (
+    "44a0fbceb81f3877833ae9a398d039bea1759cb0d3c8188181013885f70589eb"
+)
 
 H1_REQUALIFIED_SELECTION = "humanoid-isaac-flat-v1"
 H1_TASK = "humanoid-isaac-flat-v0"
@@ -129,6 +145,7 @@ class CatalogEntry:
     selection_id: str
     task_id: str
     runtime: str
+    qualification: str
     checkpoint_relative_directory: str
     evidence_relative_path: str
 
@@ -355,7 +372,7 @@ def swift_string(expression: str, label: str) -> str | None:
         raise VerificationError(f"cannot decode {label}: {error}") from error
 
 
-def catalog_entries(root: Path) -> list[CatalogEntry]:
+def catalog_entries(root: Path) -> tuple[list[CatalogEntry], list[CatalogEntry]]:
     path = root / "Sources/AVBDLearn/PolicyReplayCatalog.swift"
     try:
         source = path.read_text(encoding="utf-8")
@@ -364,9 +381,19 @@ def catalog_entries(root: Path) -> list[CatalogEntry]:
     declaration = source.find("public static let entries")
     require(declaration >= 0, "PolicyReplayCatalog.entries is missing")
     assignment = source.find("=", declaration)
-    array_start = source.find("[", assignment)
-    require(assignment >= 0 and array_start >= 0,
-            "PolicyReplayCatalog.entries is not a literal array")
+    closure_start = source.find("{", assignment)
+    require(assignment >= 0 and closure_start >= 0,
+            "PolicyReplayCatalog.entries is not an initialized closure")
+    inner_declaration = re.search(
+        r"\blet\s+entries\s*:\s*\[PolicyReplayCatalogEntry\]\s*=",
+        source[closure_start:],
+    )
+    require(inner_declaration is not None,
+            "PolicyReplayCatalog.entries closure has no literal entries array")
+    inner_assignment = closure_start + inner_declaration.end() - 1
+    array_start = source.find("[", inner_assignment + 1)
+    require(array_start >= 0,
+            "PolicyReplayCatalog.entries inner assignment is not an array")
     array_end = matching_delimiter(source, array_start, "[", "]")
     body = source[array_start + 1:array_end]
 
@@ -383,6 +410,7 @@ def catalog_entries(root: Path) -> list[CatalogEntry]:
     require(bool(blocks), "PolicyReplayCatalog contains no literal entries")
 
     accepted: list[CatalogEntry] = []
+    external_parity: list[CatalogEntry] = []
     all_selection_ids: set[str] = set()
     for block in blocks:
         selection_id = swift_string(
@@ -391,7 +419,7 @@ def catalog_entries(root: Path) -> list[CatalogEntry]:
                 f"invalid or duplicate Policy Replay selection {selection_id!r}")
         all_selection_ids.add(selection_id)
         qualification = argument_expression(block, "qualification")
-        if qualification != ".accepted":
+        if qualification not in {".accepted", ".externalParityVerified"}:
             continue
         task_id = swift_string(argument_expression(block, "taskID"), "taskID")
         checkpoint = swift_string(
@@ -404,18 +432,130 @@ def catalog_entries(root: Path) -> list[CatalogEntry]:
         )
         runtime = argument_expression(block, "runtime")
         require(task_id is not None and checkpoint is not None and evidence is not None,
-                f"accepted selection {selection_id} must name task, checkpoint and evidence")
-        require(runtime == ".nativeMLX",
-                f"accepted selection {selection_id} uses unsupported runtime {runtime}")
-        accepted.append(CatalogEntry(
+                f"qualified selection {selection_id} must name task, checkpoint and evidence")
+        entry = CatalogEntry(
             selection_id=selection_id,
             task_id=task_id,
             runtime=runtime,
+            qualification=qualification,
             checkpoint_relative_directory=checkpoint,
             evidence_relative_path=evidence,
-        ))
-    require(bool(accepted), "PolicyReplayCatalog contains no accepted policies")
-    return accepted
+        )
+        if qualification == ".accepted":
+            require(runtime == ".nativeMLX",
+                    f"accepted selection {selection_id} uses unsupported runtime {runtime}")
+            accepted.append(entry)
+        else:
+            require(runtime == ".unitreeRecurrentMLX",
+                    f"external-parity selection {selection_id} uses unsupported runtime {runtime}")
+            external_parity.append(entry)
+    require(bool(accepted) or bool(external_parity),
+            "PolicyReplayCatalog contains no verified policy evidence")
+    return accepted, external_parity
+
+
+def require_numeric_matrix(value: Any, rows: int, columns: int,
+                           label: str) -> None:
+    require(isinstance(value, list) and len(value) == rows,
+            f"{label}: expected {rows} rows")
+    for row_index, row in enumerate(value):
+        require(isinstance(row, list) and len(row) == columns,
+                f"{label}[{row_index}]: expected {columns} values")
+        require(all(isinstance(item, (int, float))
+                    and not isinstance(item, bool)
+                    and math.isfinite(float(item)) for item in row),
+                f"{label}[{row_index}]: values must be finite numbers")
+
+
+def verify_external_parity(root: Path, entry: CatalogEntry) -> None:
+    require(entry.selection_id == UNITREE_H1_SELECTION,
+            f"{entry.selection_id}: unsupported external parity contract")
+    require(entry.task_id == UNITREE_H1_SELECTION,
+            "Unitree external parity entry changed task identity")
+    require(entry.checkpoint_relative_directory == "external/unitree-h1"
+            and entry.evidence_relative_path
+            == "checkpoints/external/unitree-h1/manifest.json",
+            "Unitree external parity entry changed its pinned bundle")
+    directory = repository_path(
+        root, f"checkpoints/{entry.checkpoint_relative_directory}",
+        f"{entry.selection_id} checkpoint",
+    )
+    require(directory.is_dir(),
+            f"{entry.selection_id}: checkpoint directory is missing")
+    evidence = repository_path(
+        root, entry.evidence_relative_path, f"{entry.selection_id} evidence")
+    require(evidence == (directory / "manifest.json").resolve(),
+            f"{entry.selection_id}: parity evidence must be its manifest")
+    require(sha256_file(evidence) == UNITREE_H1_MANIFEST_SHA256,
+            f"{evidence}: SHA-256 does not match the pinned Unitree release")
+    manifest = load_json(evidence)
+    require_exact_keys(manifest, {
+        "schemaVersion", "format", "source", "robot", "weightsFile",
+        "weightsSHA256", "network", "control", "observationLayout",
+        "goldenSequence",
+    }, str(evidence))
+    require(manifest.get("schemaVersion") == 2
+            and manifest.get("format") == "avbd-unitree-h1-lstm-v1"
+            and manifest.get("robot") == "unitree-h1",
+            f"{evidence}: unsupported Unitree parity manifest")
+
+    weights = sealed_bundle_file(
+        directory, manifest.get("weightsFile"), "Unitree policy weights")
+    weights_hash = require_sha256(
+        manifest.get("weightsSHA256"), "Unitree weightsSHA256")
+    require(weights_hash == UNITREE_H1_WEIGHTS_SHA256,
+            "Unitree weightsSHA256 does not match the pinned release")
+    require(sha256_file(weights) == weights_hash,
+            f"{weights}: SHA-256 does not match the parity manifest")
+
+    source = manifest.get("source")
+    require_exact_keys(source, {
+        "project", "revision", "url", "checkpointSHA256", "license",
+        "licenseFile", "licenseSHA256",
+    }, "Unitree source")
+    revision = source.get("revision")
+    require(revision == UNITREE_H1_SOURCE_REVISION,
+            "Unitree source revision does not match the pinned release")
+    checkpoint_hash = require_sha256(
+        source.get("checkpointSHA256"), "Unitree source checkpointSHA256")
+    require(checkpoint_hash == UNITREE_H1_SOURCE_CHECKPOINT_SHA256,
+            "Unitree source checkpointSHA256 does not match the pinned release")
+    license_file = sealed_bundle_file(
+        directory, source.get("licenseFile"), "Unitree source license")
+    license_hash = require_sha256(
+        source.get("licenseSHA256"), "Unitree source licenseSHA256")
+    require(license_hash == UNITREE_H1_LICENSE_SHA256,
+            "Unitree licenseSHA256 does not match the pinned release")
+    require(sha256_file(license_file) == license_hash,
+            f"{license_file}: SHA-256 does not match the parity manifest")
+
+    network = manifest.get("network")
+    require(isinstance(network, dict), "Unitree network must be an object")
+    observation_dimension = network.get("observationDimension")
+    action_dimension = network.get("actionDimension")
+    hidden_dimension = network.get("hiddenDimension")
+    require(type(observation_dimension) is int and observation_dimension > 0
+            and type(action_dimension) is int and action_dimension > 0
+            and type(hidden_dimension) is int and hidden_dimension > 0,
+            "Unitree network dimensions must be positive integers")
+    golden = manifest.get("goldenSequence")
+    require_exact_keys(golden, {
+        "absoluteTolerance", "inputs", "actions", "hiddenStates", "cellStates",
+    }, "Unitree golden sequence")
+    tolerance = golden.get("absoluteTolerance")
+    require(isinstance(tolerance, (int, float)) and not isinstance(tolerance, bool)
+            and math.isfinite(float(tolerance)) and 0 < tolerance <= 1e-3,
+            "Unitree golden tolerance is invalid")
+    rows = len(golden.get("inputs")) if isinstance(golden.get("inputs"), list) else 0
+    require(rows > 0, "Unitree golden sequence must not be empty")
+    require_numeric_matrix(golden.get("inputs"), rows, observation_dimension,
+                           "Unitree golden inputs")
+    require_numeric_matrix(golden.get("actions"), rows, action_dimension,
+                           "Unitree golden actions")
+    require_numeric_matrix(golden.get("hiddenStates"), rows, hidden_dimension,
+                           "Unitree golden hidden states")
+    require_numeric_matrix(golden.get("cellStates"), rows, hidden_dimension,
+                           "Unitree golden cell states")
 
 
 def require_sha256(value: Any, label: str) -> str:
@@ -1156,9 +1296,9 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
     return aggregate_path
 
 
-def verify(root: Path) -> tuple[int, int, int]:
+def verify(root: Path) -> tuple[int, int, int, int]:
     root = root.resolve()
-    accepted = catalog_entries(root)
+    accepted, external_parity = catalog_entries(root)
     aggregate_paths: set[Path] = set()
     report_count = 0
     for entry in accepted:
@@ -1193,7 +1333,10 @@ def verify(root: Path) -> tuple[int, int, int]:
                 f"{entry.selection_id}: unsupported accepted evidence shape "
                 f"at {evidence_path}"
             )
-    return len(accepted), len(aggregate_paths), report_count
+    for entry in external_parity:
+        verify_external_parity(root, entry)
+    return (len(accepted), len(external_parity), len(aggregate_paths),
+            report_count)
 
 
 def main() -> int:
@@ -1204,14 +1347,16 @@ def main() -> int:
         print(f"usage: {Path(sys.argv[0]).name} [--root repository]", file=sys.stderr)
         return 2
     try:
-        accepted, aggregates, reports = verify(root)
+        accepted, external_parity, aggregates, reports = verify(root)
     except (VerificationError, KeyError, OverflowError, struct.error,
             TypeError, ValueError) as error:
         print(f"policy evidence verification failed: {error}", file=sys.stderr)
         return 1
     print(
         "verified policy evidence: "
-        f"{accepted} accepted catalog entries, {aggregates} robustness aggregates, "
+        f"{accepted} accepted catalog entries, "
+        f"{external_parity} external parity entries, "
+        f"{aggregates} robustness aggregates, "
         f"{reports} evaluation reports"
     )
     return 0

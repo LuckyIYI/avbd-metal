@@ -193,16 +193,16 @@ public enum LatentActionPipeline {
             let savedTip = (env.solver.bodyPosition(r.tip), env.solver.bodyRotation(r.tip))
             let tipGoalP = r.center + F3(r.goalPos.x - 0.62, r.goalPos.y - 0.62, PushTEnv.tipHeight)
             env.solver.setBodyPose(r.tip, position: tipGoalP, rotation: savedTip.1)
-            let g = PushTPipeline.obsArray(env, res)
+            let g = try PushTPipeline.obsArrayChecked(env, res)
             let zGoal = model.encoder(concatenated([g, g], axis: 3))
             eval(zGoal)
             env.solver.setBodyPose(r.tip, position: savedTip.0, rotation: savedTip.1)
 
             let horizon = 6, samples = 1024
-            var prevFrame = PushTPipeline.obsArray(env, res)
-            env.step(actions: [env.tipPos(0)], substeps: 4)
+            var prevFrame = try PushTPipeline.obsArrayChecked(env, res)
+            try env.stepChecked(actions: [env.tipPos(0)], substeps: 4)
             for _ in 0..<60 {
-                let cur = PushTPipeline.obsArray(env, res)
+                let cur = try PushTPipeline.obsArrayChecked(env, res)
                 let z0 = model.encoder(concatenated([prevFrame, cur], axis: 3))
                 // random shooting over code sequences
                 let codeIdx = MLXRandom.randInt(low: 0, high: numCodes,
@@ -223,8 +223,8 @@ public enum LatentActionPipeline {
                 eval(a)
                 let act = SIMD2(a[0, 0].item(Float.self) * 3, a[0, 1].item(Float.self) * 3)
                 for k in 0..<8 {
-                    if k == 7 { prevFrame = PushTPipeline.obsArray(env, res) }
-                    env.step(actions: [act])
+                    if k == 7 { prevFrame = try PushTPipeline.obsArrayChecked(env, res) }
+                    try env.stepChecked(actions: [act])
                     if env.success(0) { break }
                 }
                 if env.success(0) { break }

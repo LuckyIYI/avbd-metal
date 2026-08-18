@@ -426,6 +426,9 @@ struct ManifoldGPU {
 #define CTR_SOFT 1                 // element (soft) contact count
 #define CTR_GBAR 2                 // device-scope barrier (multi-TG solver)
 #define CTR_OGC 3                  // OGC bound-exceeder count (refresh trigger)
+#define CTR_PAIR_CANDIDATES 4      // rigid demand before capacity clipping
+#define CTR_SOFT_CANDIDATES 5      // soft demand before capacity clipping
+#define CTR_COLOR_CONFLICTS 6      // unresolved dynamic-color graph edges
 #define CTR_COLOR_BASE 8           // MAX_COLORS entries
 #define CTR_SCATTER_BASE (8 + MAX_COLORS)  // MAX_COLORS scatter cursors
 #define CTR_TOTAL (8 + 2 * MAX_COLORS)

@@ -256,7 +256,18 @@ public final class PushTEnv: RoboticsEnv {
     /// rate-limited to a realistic tool-head speed.
     public func step(actions: [SIMD2<Float>], substeps: Int = 4,
                      maxStep: Float = 0.16) {
+        do {
+            try stepChecked(
+                actions: actions, substeps: substeps, maxStep: maxStep)
+        } catch {
+            fatalError("Push-T simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepChecked(actions: [SIMD2<Float>], substeps: Int = 4,
+                            maxStep: Float = 0.16) throws {
         precondition(actions.count == numEnvs, "expected one action per environment")
+        try solver.synchronize()
         if commanded.isEmpty {
             commanded = (0..<numEnvs).map { tipPos($0) }
         }
@@ -272,7 +283,8 @@ public final class PushTEnv: RoboticsEnv {
             anchors.append(.init(joint: refs[e].dragJoint, point: world))
         }
         solver.setJointWorldAnchors(anchors)
-        for _ in 0..<substeps { solver.step() }
+        for _ in 0..<substeps { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     public func tipPos(_ env: Int) -> SIMD2<Float> {
@@ -520,13 +532,29 @@ public final class PushTEnv: RoboticsEnv {
     private var obsBuffer: MTLBuffer?
 
     public func observations() -> UnsafeBufferPointer<UInt8> {
+        do {
+            return try observationsChecked()
+        } catch {
+            fatalError("Push-T observation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func observationsChecked() throws -> UnsafeBufferPointer<UInt8> {
         if envTable == nil {
             let dev = solver.metalDevice
-            envTable = dev.makeBuffer(length: numEnvs * MemoryLayout<PushTEnvGPU>.stride,
-                                      options: .storageModeShared)
-            obsBuffer = dev.makeBuffer(length: numEnvs * obsRes * obsRes * 3,
-                                       options: .storageModeShared)
-            let t = envTable!.contents().bindMemory(to: PushTEnvGPU.self, capacity: numEnvs)
+            guard let newTable = dev.makeBuffer(
+                    length: numEnvs * MemoryLayout<PushTEnvGPU>.stride,
+                    options: .storageModeShared),
+                  let newObservations = dev.makeBuffer(
+                    length: numEnvs * obsRes * obsRes * 3,
+                    options: .storageModeShared) else {
+                throw GPUSolver.AVBDError.allocFailed(
+                    "Push-T observation buffers")
+            }
+            envTable = newTable
+            obsBuffer = newObservations
+            let t = newTable.contents().bindMemory(
+                to: PushTEnvGPU.self, capacity: numEnvs)
             for e in 0..<numEnvs {
                 let r = refs[e]
                 var g = PushTEnvGPU()
@@ -536,11 +564,11 @@ public final class PushTEnv: RoboticsEnv {
                 t[e] = g
             }
         }
-        solver.sync()
-        solver.renderPushTObs(envTable: envTable!, numEnvs: numEnvs,
-                              out: obsBuffer!, res: obsRes)
-        let ptr = obsBuffer!.contents().bindMemory(to: UInt8.self,
-                                                   capacity: numEnvs * obsRes * obsRes * 3)
+        try solver.renderPushTObsChecked(
+            envTable: envTable!, numEnvs: numEnvs,
+            out: obsBuffer!, res: obsRes)
+        let ptr = obsBuffer!.contents().bindMemory(
+            to: UInt8.self, capacity: numEnvs * obsRes * obsRes * 3)
         return UnsafeBufferPointer(start: ptr, count: numEnvs * obsRes * obsRes * 3)
     }
 }

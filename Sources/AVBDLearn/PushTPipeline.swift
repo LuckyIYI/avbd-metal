@@ -15,7 +15,6 @@ public final class LeWMPlanner {
     let model: LeWorldModel
     var mu: MLXArray
     var zGoal: MLXArray? = nil
-    var goalEnvSeedStamp: Int = -1
     let horizon = 6
     let candidates = 128
     let elites = 16
@@ -31,23 +30,48 @@ public final class LeWMPlanner {
 
     /// One MPC step from the env's current pixels. Returns action in [-1,1].
     public func action(_ env: PushTEnv) -> SIMD2<Float>? {
-        let res = env.obsRes
-        if zGoal == nil || goalEnvSeedStamp != env.refs[0].tip {
-            // render the goal embedding once per episode
-            let r = env.refs[0]
-            let savedBar = (env.solver.bodyPosition(r.blockBar), env.solver.bodyRotation(r.blockBar))
-            let savedStem = (env.solver.bodyPosition(r.blockStem), env.solver.bodyRotation(r.blockStem))
-            let gq = Quat(angle: r.goalYaw, axis: F3(0, 0, 1))
-            let gc = r.center + F3(r.goalPos.x, r.goalPos.y, 0)
-            env.solver.setBodyPose(r.blockBar, position: gc + gq.act(F3(0, 0.125, 0)) + F3(0, 0, 0.09), rotation: gq)
-            env.solver.setBodyPose(r.blockStem, position: gc + gq.act(F3(0, -0.325, 0)) + F3(0, 0, 0.09), rotation: gq)
-            zGoal = model.encoder(PushTPipeline.obsArray(env, res))
-            eval(zGoal!)
-            env.solver.setBodyPose(r.blockBar, position: savedBar.0, rotation: savedBar.1)
-            env.solver.setBodyPose(r.blockStem, position: savedStem.0, rotation: savedStem.1)
-            goalEnvSeedStamp = r.tip
+        do {
+            return try actionChecked(env)
+        } catch {
+            fatalError("LeWM policy observation failed: \(error.localizedDescription)")
         }
-        let z0 = model.encoder(PushTPipeline.obsArray(env, res))
+    }
+
+    /// Throwing interactive entry point. Goal pixels are built in an isolated
+    /// one-environment plant, never by teleporting the live task's block. This
+    /// both preserves physical velocity/contact history and ensures a failed
+    /// observation command cannot strand the visible scene in a synthetic
+    /// goal pose.
+    public func actionChecked(_ env: PushTEnv) throws -> SIMD2<Float>? {
+        let res = env.obsRes
+        if zGoal == nil {
+            // PushTEnv's interactive benchmark has one authored goal. Render
+            // its target embedding in a disposable plant so the source env is
+            // read-only throughout policy inference.
+            let goalEnv = try PushTEnv(numEnvs: 1, seed: 1)
+            let source = env.refs[0]
+            let target = goalEnv.refs[0]
+            let gq = Quat(angle: source.goalYaw, axis: F3(0, 0, 1))
+            let gc = target.center
+                + F3(source.goalPos.x, source.goalPos.y, 0)
+            try goalEnv.solver.synchronize()
+            goalEnv.solver.setBodyPoses([
+                .init(
+                    body: target.blockBar,
+                    position: gc + gq.act(F3(0, 0.125, 0))
+                        + F3(0, 0, 0.09),
+                    rotation: gq),
+                .init(
+                    body: target.blockStem,
+                    position: gc + gq.act(F3(0, -0.325, 0))
+                        + F3(0, 0, 0.09),
+                    rotation: gq),
+            ])
+            zGoal = model.encoder(
+                try PushTPipeline.obsArrayChecked(goalEnv, res))
+            eval(zGoal!)
+        }
+        let z0 = model.encoder(try PushTPipeline.obsArrayChecked(env, res))
         var sigma = MLXArray.ones([horizon, 2]) * 0.5
         for _ in 0..<cemIters {
             let noise = MLXRandom.normal([candidates, horizon, 2])
@@ -88,7 +112,7 @@ public enum PushTPipeline {
             SIMD2<Float>(rng.nextFloat() * 3.6 - 1.8, rng.nextFloat() * 3.6 - 1.8)
         }
         // settle
-        for _ in 0..<10 { env.step(actions: targets) }
+        for _ in 0..<10 { try env.stepChecked(actions: targets) }
 
         var obsData = Data()
         var actData = Data()
@@ -127,7 +151,7 @@ public enum PushTPipeline {
                 }
             }
             }
-            let obs = env.observations()
+            let obs = try env.observationsChecked()
             obsData.append(contentsOf: obs)
             for e in 0..<numEnvs {
                 // normalize over the FULL workspace
@@ -138,11 +162,11 @@ public enum PushTPipeline {
                 var st: [Float] = [bp.x, bp.y, sin(byaw), cos(byaw), tp.x, tp.y]
                 st.withUnsafeBytes { stateData.append(contentsOf: $0) }
             }
-            env.step(actions: targets)
+            try env.stepChecked(actions: targets)
             if t % 50 == 0 { print("collect step \(t)/\(steps)") }
         }
         // final obs for the last next-obs
-        obsData.append(contentsOf: env.observations())
+        obsData.append(contentsOf: try env.observationsChecked())
         try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         try obsData.write(to: URL(fileURLWithPath: "\(path)/obs.bin"))
         try actData.write(to: URL(fileURLWithPath: "\(path)/act.bin"))
@@ -327,7 +351,7 @@ public enum PushTPipeline {
             let tipGoalP = r.center + F3(r.goalPos.x - 0.62, r.goalPos.y - 0.62,
                                          PushTEnv.tipHeight)
             env.solver.setBodyPose(r.tip, position: tipGoalP, rotation: savedTip.1)
-            let g = obsArray(env, res)
+            let g = try obsArrayChecked(env, res)
             let gStack = concatenated([g, g], axis: 3)
             // each ensemble member lives in its OWN latent space: encode the
             // goal separately per member
@@ -347,9 +371,9 @@ public enum PushTPipeline {
             let horizon = 6, candidates = 320, elites = 32, cemIters = 4
             let rep = 8
             var mu = MLXArray.zeros([horizon, 2])
-            var prevFrame = obsArray(env, res)
+            var prevFrame = try obsArrayChecked(env, res)
             for _ in 0..<60 {                       // planning steps
-                let curFrame = obsArray(env, res)
+                let curFrame = try obsArrayChecked(env, res)
                 let curStack = concatenated([prevFrame, curFrame], axis: 3)
                 let z0List = models.isEmpty ? [model.encoder(curStack)]
                                             : models.map { $0.encoder(curStack) }
@@ -442,8 +466,8 @@ public enum PushTPipeline {
                 // so the next stack matches the training spacing (a
                 // duplicated-frame stack is OOD and scrambles the encoder)
                 for k in 0..<rep {
-                    if k == rep - 1 { prevFrame = obsArray(env, res) }
-                    env.step(actions: [SIMD2(a0x * 3, a0y * 3)])
+                    if k == rep - 1 { prevFrame = try obsArrayChecked(env, res) }
+                    try env.stepChecked(actions: [SIMD2(a0x * 3, a0y * 3)])
                     if env.success(0) { break }
                 }
                 mu = concatenated([mu[1..., 0...], MLXArray.zeros([1, 2])], axis: 0)
@@ -468,7 +492,7 @@ public enum PushTPipeline {
             let r = env.refs[0]
             for _ in 0..<controlSteps {
                 let target = env.oracleAction(0)
-                env.step(actions: [target])
+                try env.stepChecked(actions: [target])
                 if env.success(0) { break }
             }
             let ok = env.success(0)
@@ -485,6 +509,14 @@ public enum PushTPipeline {
 
     public static func obsArray(_ env: PushTEnv, _ res: Int) -> MLXArray {
         let obs = env.observations()
+        let arr = MLXArray([UInt8](obs))
+        return arr.reshaped([1, res, res, 3]).asType(.float32) / 255.0
+    }
+
+    /// Checked pixel readback for training and evaluation paths. Interactive
+    /// callers retain `obsArray` as a fail-closed compatibility wrapper.
+    public static func obsArrayChecked(_ env: PushTEnv, _ res: Int) throws -> MLXArray {
+        let obs = try env.observationsChecked()
         let arr = MLXArray([UInt8](obs))
         return arr.reshaped([1, res, res, 3]).asType(.float32) / 255.0
     }
@@ -634,11 +666,11 @@ extension PushTPipeline {
         var actData = Data()
         var stateData = Data()
         var targets = (0..<numEnvs).map { _ in SIMD2<Float>(1.4, 0) }
-        var prev = [UInt8](env.observations())
-        for _ in 0..<10 { env.step(actions: targets) }
+        var prev = [UInt8](try env.observationsChecked())
+        for _ in 0..<10 { try env.stepChecked(actions: targets) }
 
         for t in 0..<steps {
-            let curBuf = [UInt8](env.observations())
+            let curBuf = [UInt8](try env.observationsChecked())
             if t % 8 == 0 {
                 // policy actions from pixels (batch all envs)
                 let pf = MLXArray(prev).reshaped([numEnvs, res, res, 3]).asType(.float32) / 255.0
@@ -666,7 +698,7 @@ extension PushTPipeline {
                 st.withUnsafeBytes { stateData.append(contentsOf: $0) }
             }
             prev = curBuf
-            env.step(actions: targets)
+            try env.stepChecked(actions: targets)
             if t % 100 == 0 { print("dagger step \(t)/\(steps)") }
         }
         // append. NOTE: the base collector writes one trailing extra obs
@@ -782,17 +814,17 @@ extension PushTPipeline {
         for ep in 0..<episodes {
             let env = try PushTEnv(numEnvs: 1, seed: seed &+ UInt64(ep) * 7)
             let res = env.obsRes
-            var prevFrame = obsArray(env, res)
+            var prevFrame = try obsArrayChecked(env, res)
             // settle one macro step so the stack is honest
-            env.step(actions: [env.tipPos(0)], substeps: 4)
+            try env.stepChecked(actions: [env.tipPos(0)], substeps: 4)
             for _ in 0..<60 {
-                let cur = obsArray(env, res)
+                let cur = try obsArrayChecked(env, res)
                 let a = policy(concatenated([prevFrame, cur], axis: 3))
                 eval(a)
                 let act = SIMD2(a[0, 0].item(Float.self) * 3, a[0, 1].item(Float.self) * 3)
                 for k in 0..<8 {
-                    if k == 7 { prevFrame = obsArray(env, res) }
-                    env.step(actions: [act])
+                    if k == 7 { prevFrame = try obsArrayChecked(env, res) }
+                    try env.stepChecked(actions: [act])
                     if env.success(0) { break }
                 }
                 if env.success(0) { break }
@@ -820,7 +852,16 @@ public final class BCPolicyRunner {
 
     /// Returns the action in [-1,1] (the Lab scales by 3).
     public func action(_ env: PushTEnv) -> SIMD2<Float>? {
-        let cur = PushTPipeline.obsArray(env, env.obsRes)
+        do {
+            return try actionChecked(env)
+        } catch {
+            fatalError("BC policy observation failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Throwing interactive entry point used by Robotics Lab.
+    public func actionChecked(_ env: PushTEnv) throws -> SIMD2<Float>? {
+        let cur = try PushTPipeline.obsArrayChecked(env, env.obsRes)
         let prev = prevFrame ?? cur
         let a = policy(concatenated([prev, cur], axis: 3))
         eval(a)

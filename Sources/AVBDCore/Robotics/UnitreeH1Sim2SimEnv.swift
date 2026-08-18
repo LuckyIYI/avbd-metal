@@ -102,12 +102,26 @@ public final class UnitreeH1Sim2SimEnv {
 
     public func step(jointPositionTargets: ContiguousArray<Float>,
                      decimation: Int) {
+        do {
+            try stepChecked(
+                jointPositionTargets: jointPositionTargets,
+                decimation: decimation)
+        } catch {
+            fatalError("Unitree H1 simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepChecked(
+        jointPositionTargets: ContiguousArray<Float>, decimation: Int
+    ) throws {
         precondition(jointPositionTargets.count == 10)
         precondition(decimation > 0)
+        try solver.synchronize()
         solver.setMotorTargets(zip(refs.motors, jointPositionTargets).map {
             GPUSolver.MotorTargetUpdate(joint: $0.0, angle: $0.1)
         })
-        for _ in 0..<decimation { solver.step() }
+        for _ in 0..<decimation { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     /// Launch the reusable physical box toward the measured rigid upper body.

@@ -457,7 +457,7 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
         }
         spec = RLTaskSpec(
             id: taskID,
-            revision: RLPhysicsContract.fixedGainActuatorV2(taskRevision),
+            revision: RLPhysicsContract.deterministicColorSolveV1(taskRevision),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [configuration.recoveryContextObservations
@@ -664,6 +664,7 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
                       into observations: inout RLObservationBatch) throws {
         try observations.validate(for: spec)
         let envIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = envIDs.map {
             seed &+ UInt64($0) &* 0x9E3779B97F4A7C15
         }
@@ -679,6 +680,7 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
                      into result: inout RLStepBatch) throws {
         try actions.validate(for: spec)
         try result.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
         let n = spec.numEnvironments
         let dt = spec.controlStep
@@ -693,10 +695,11 @@ public final class HumanoidIsaacVelocityTask: VectorizedRLTask,
         }
 
         launchScheduledProjectiles()
-        environment.step(normalizedActions: actions.values,
-                         decimation: Self.controlDecimation,
-                         clampActions: false,
-                         clampTargetsToLimits: false)
+        try environment.stepChecked(
+            normalizedActions: actions.values,
+            decimation: Self.controlDecimation,
+            clampActions: false,
+            clampTargetsToLimits: false)
         if trainingMode { trainingControlSteps += 1 }
         var states = environment.states()
         let contacts = environment.groundContacts()

@@ -386,6 +386,42 @@ kernel void color_iterate(
     }
 }
 
+// Verify the final dynamic palette instead of trusting a fixed iteration
+// count. Each conflicting edge is reported once by its larger body id. A
+// conflict means same-color primal updates would race and the frame is not a
+// valid AVBD solve.
+kernel void color_validate(
+    device const float4* posLin     [[buffer(0)]],
+    device const JointGPU* joints   [[buffer(1)]],
+    device const SpringGPU* springs [[buffer(2)]],
+    device const ManifoldGPU* manifolds [[buffer(3)]],
+    device const uint* adjStart     [[buffer(4)]],
+    device const uint* adjCount     [[buffer(5)]],
+    device const uint* adjList      [[buffer(6)]],
+    device const uint* colors       [[buffer(7)]],
+    device atomic_uint* counters    [[buffer(8)]],
+    constant SimParams& P           [[buffer(9)]],
+    device const TetGPU* tets       [[buffer(10)]],
+    device const SoftContactGPU* soft [[buffer(11)]],
+    device const MembraneGPU* membranes [[buffer(12)]],
+    device const BendGPU* bends     [[buffer(13)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= P.numBodies || posLin[gid].w <= 0.0f) return;
+    uint maskLo = 0, maskHi = 0, allLo = 0, allHi = 0;
+    bool conflict = false;
+    uint s = adjStart[gid], e = s + adjCount[gid];
+    for (uint k = s; k < e; k++) {
+        neighborColors(joints, springs, manifolds, tets, soft, membranes,
+                       bends, posLin, colors, adjList[k], gid, colors[gid],
+                       maskLo, maskHi, allLo, allHi, conflict);
+    }
+    if (conflict) {
+        atomic_fetch_add_explicit(&counters[CTR_COLOR_CONFLICTS], 1u,
+                                  memory_order_relaxed);
+    }
+}
+
 // Count bodies per color & remember slot.
 kernel void color_count(
     device const float4* posLin     [[buffer(0)]],
@@ -1499,49 +1535,6 @@ kernel void primal_particles_split(
     }
     posLin[body] = float4(pl.xyz + dxLin, mass);
     if (rigid) posAng[body] = q_addw(posAng[body], dxAng);
-}
-
-// Tail pass: primal-update every body whose color is >= the CPU-encoded
-// bound. The bound comes from an ASYNC readback and can be stale when the
-// palette grows (dense cloth piles); skipping those bodies leaves them
-// ballistic for a frame — they free-fall, ramp their contacts' penalties,
-// and the violent catch-up injects energy. Updating them together is a
-// Jacobi step (paper Sec. 4): safe, and the palette tail holds few bodies.
-kernel void primal_tail(
-    device float4* posLin           [[buffer(0)]],
-    device float4* posAng           [[buffer(1)]],
-    device const float4* initLin    [[buffer(2)]],
-    device const float4* initAng    [[buffer(3)]],
-    device const float4* inertLin   [[buffer(4)]],
-    device const float4* inertAng   [[buffer(5)]],
-    device const float4* props      [[buffer(6)]],
-    device const JointGPU* joints   [[buffer(7)]],
-    device const SpringGPU* springs [[buffer(8)]],
-    device const ManifoldGPU* manifolds [[buffer(9)]],
-    device const uint* adjStart     [[buffer(10)]],
-    device const uint* adjCount     [[buffer(11)]],
-    device const uint* adjList      [[buffer(12)]],
-    device const uint* colorList    [[buffer(13)]],
-    device const uint* colorStart   [[buffer(14)]],
-    constant uint& colorBound       [[buffer(15)]],
-    constant SimParams& P           [[buffer(16)]],
-    device const float4* shape      [[buffer(17)]],
-    device const TetGPU* tets       [[buffer(18)]],
-    device const SoftContactGPU* soft [[buffer(19)]],
-    device const MembraneGPU* membranes [[buffer(20)]],
-    device const BendGPU* bends     [[buffer(21)]],
-    device const uint* boundsBits   [[buffer(22)]],
-    device const float4* ogcPrev    [[buffer(23)]],
-    device atomic_uint* ogcCounters [[buffer(24)]],
-    uint tid                        [[thread_position_in_grid]])
-{
-    uint s = colorStart[colorBound];
-    uint e = colorStart[MAX_COLORS];
-    if (s + tid >= e) return;
-    primal_one(posLin, posAng, initLin, initAng, inertLin, inertAng, props,
-               joints, springs, manifolds, adjStart, adjCount, adjList,
-               P, shape, tets, soft, membranes, bends, boundsBits, ogcPrev,
-               ogcCounters, colorList[s + tid]);
 }
 
 // Dual update for one element contact: bounded normal dual (cap scaled to

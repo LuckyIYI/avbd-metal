@@ -14,6 +14,9 @@ final class HumanoidBoxCarryTests: XCTestCase {
         }
         let single = try makeTask(1)
         let batched = try makeTask(8)
+        XCTAssertEqual(single.spec.revision,
+                       RLPhysicsContract.deterministicColorSolveV1(40))
+        XCTAssertEqual(batched.spec.revision, single.spec.revision)
         _ = try single.reset(seed: 58)
         _ = try batched.reset(seed: 58)
         var singleResult = RLStepBatch(spec: single.spec)

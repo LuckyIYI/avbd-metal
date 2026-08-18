@@ -37,9 +37,19 @@ public struct RLTensorSpec: Equatable, Sendable {
 public enum RLPhysicsContract {
     /// Fixed-gain actuator model with explicit scene-authored modes, no
     /// adaptive motor penalty, and an exact active-set effort clamp.
+    /// Retained to decode and verify historical epoch-1 checkpoints.
     public static func fixedGainActuatorV2(_ taskRevision: Int) -> Int {
         precondition(taskRevision > 0 && taskRevision < 1_000_000)
         return 1_000_000 + taskRevision
+    }
+
+    /// Epoch-2 simulator contract. It includes the fixed-gain actuator model
+    /// and requires exact dynamic-color dispatch, validated coloring, and
+    /// fail-closed contact-capacity handling. The local task revision remains
+    /// visible in the low six digits for independent task evolution.
+    public static func deterministicColorSolveV1(_ taskRevision: Int) -> Int {
+        precondition(taskRevision > 0 && taskRevision < 1_000_000)
+        return 2_000_000 + taskRevision
     }
 }
 

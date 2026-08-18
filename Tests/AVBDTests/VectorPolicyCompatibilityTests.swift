@@ -4,6 +4,14 @@ import Foundation
 @testable import AVBDLearn
 
 final class VectorPolicyCompatibilityTests: XCTestCase {
+    func testPhysicsEpochsPreserveLocalTaskRevision() {
+        XCTAssertEqual(RLPhysicsContract.fixedGainActuatorV2(11), 1_000_011)
+        XCTAssertEqual(
+            RLPhysicsContract.deterministicColorSolveV1(11), 2_000_011)
+        XCTAssertEqual(
+            RLPhysicsContract.deterministicColorSolveV1(122), 2_000_122)
+    }
+
     func testExplicitReplayCheckpointIsAnAuthoritativeSource() {
         XCTAssertEqual(
             PolicyReplayCheckpointResolution.candidates(
@@ -66,22 +74,32 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             .deletingLastPathComponent()
         let selectionIDs = PolicyReplayCatalog.entries.map(\.selectionID)
         XCTAssertEqual(Set(selectionIDs).count, selectionIDs.count)
-        XCTAssertFalse(selectionIDs.contains("humanoid-isaac-flat-v0"))
-        XCTAssertTrue(selectionIDs.contains("humanoid-isaac-flat-v1"))
+        XCTAssertEqual(selectionIDs, [
+            "unitree-h1-sim2sim-v0",
+            "gear-sonic-g1-reference-v0",
+            "arachne15-classical-goal-v0",
+        ])
+        XCTAssertFalse(selectionIDs.contains("humanoid-isaac-flat-v1"))
         XCTAssertEqual(
-            PolicyReplayCatalog.entry(
+            PolicyReplayCatalog.historicalEntry(
                 selectionID: "humanoid-isaac-flat-v1")?.evidenceRelativePath,
             "checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json")
         XCTAssertEqual(
-            PolicyReplayCatalog.entry(
+            PolicyReplayCatalog.historicalEntry(
                 selectionID: "arachne15-velocity-v0")?.qualification,
-            .development)
+            .requalificationRequired)
         XCTAssertTrue(PolicyReplayCatalog.entries.allSatisfy {
             $0.qualification != .requalificationRequired
         })
         XCTAssertEqual(
             PolicyReplayCatalog.historicalEntries.map(\.selectionID),
-            ["humanoid-isaac-flat-v0"])
+            [
+                "humanoid-isaac-flat-v1",
+                "humanoid-isaac-flat-v0",
+                "humanoid-isaac-goal-v0",
+                "arachne15-velocity-v0",
+                "arachne15-goal-v0",
+            ])
         XCTAssertNil(PolicyReplayCatalog.entry(
             selectionID: "humanoid-isaac-flat-v0"))
         XCTAssertEqual(
@@ -221,7 +239,7 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
         }
     }
 
-    func testAcceptedIsaacFlatReplayHasSealedZeroUpdateLineage() throws {
+    func testHistoricalIsaacFlatReplayRetainsSealedZeroUpdateLineage() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -246,9 +264,15 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                 options: options))
         let criteria = try XCTUnwrap(
             (task as? any RLEvaluationCriteriaProviding)?.evaluationCriteria)
+        XCTAssertEqual(task.spec.revision,
+                       RLPhysicsContract.deterministicColorSolveV1(11))
+        XCTAssertTrue(metadata.compatibilityMismatches(with: task.spec)
+            .contains { $0.contains("revision") })
+        var historicalTargetSpec = task.spec
+        historicalTargetSpec.revision = RLPhysicsContract.fixedGainActuatorV2(11)
 
         let manifest = try VectorPolicyRequalification.verify(
-            targetSpec: task.spec,
+            targetSpec: historicalTargetSpec,
             evaluationCriteria: criteria,
             bundleDirectory: bundle.path,
             parentCheckpointDirectory: parent.path)

@@ -1099,6 +1099,8 @@ kernel void soft_finalize(
     uint n = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
     n = min(n, P.maxPairs);
     uint sc = atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed);
+    atomic_store_explicit(&counters[CTR_SOFT_CANDIDATES], sc,
+                          memory_order_relaxed);
     sc = min(sc, P.maxSoft);
     atomic_store_explicit(&counters[CTR_SOFT], sc, memory_order_relaxed);
     dispatchArgs[3] = (P.numJoints + P.numSprings + n + P.numTets + sc

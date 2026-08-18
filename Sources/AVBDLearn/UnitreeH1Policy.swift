@@ -395,7 +395,7 @@ public final class UnitreeH1Sim2SimSession {
     @discardableResult
     public func step() throws -> HumanoidState {
         let control = policy.manifest.control
-        environment.step(
+        try environment.stepChecked(
             jointPositionTargets: jointTargets,
             decimation: control.controlDecimation)
         elapsedTime += control.physicsTimeStep * Float(control.controlDecimation)

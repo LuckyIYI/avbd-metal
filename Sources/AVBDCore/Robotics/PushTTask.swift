@@ -69,6 +69,7 @@ public final class PushTTask: VectorizedRLTask {
         self.configuration = configuration
         spec = RLTaskSpec(
             id: "pusht-state-v0",
+            revision: RLPhysicsContract.deterministicColorSolveV1(1),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(name: "policy", shape: [12]),
             action: RLTensorSpec(name: "tip_delta", shape: [2],
@@ -106,6 +107,7 @@ public final class PushTTask: VectorizedRLTask {
                       into observations: inout RLObservationBatch) throws {
         try observations.validate(for: spec)
         let envIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = envIDs.map { seed &+ UInt64($0) &* 0x9E3779B97F4A7C15 }
         environment.reset(envIDs, seeds: seeds)
         let states = environment.states()
@@ -117,6 +119,7 @@ public final class PushTTask: VectorizedRLTask {
     public func step(actions: RLActionBatch, into result: inout RLStepBatch) throws {
         try result.validate(for: spec)
         try actions.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
         let n = spec.numEnvironments
         var actionRate = ContiguousArray(repeating: Float(0), count: n)
@@ -133,8 +136,9 @@ public final class PushTTask: VectorizedRLTask {
                                     SIMD2(repeating: 3))
         }
 
-        environment.step(actions: targets, substeps: configuration.controlDecimation,
-                         maxStep: configuration.actionScale)
+        try environment.stepChecked(
+            actions: targets, substeps: configuration.controlDecimation,
+            maxStep: configuration.actionScale)
         var states = environment.states()
         fillObservations(states, into: &result.observations.policy)
 

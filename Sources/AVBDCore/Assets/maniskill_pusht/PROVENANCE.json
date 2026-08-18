@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "adaptedFile": {
     "path": "Sources/AVBDCore/Robotics/ManiSkillPushTTask.swift",
-    "sha256": "2132086b676e97da131a0c38c5f16a9a1dd1af1a4088417211fb68a6918f3164"
+    "sha256": "0a9152eee30b0d1ddd89a1a4fbf438a5a45c7071f3bdde8dcf1448e045afd29e"
   },
   "upstream": {
     "project": "ManiSkill",

@@ -83,20 +83,23 @@ Push-T, or otherwise fails its contract. The tracked extension points are
 [`VectorRLAlgorithm`](Sources/AVBDLearn/VectorRLAlgorithm.swift); shipped
 checkpoint contracts are indexed in [the checkpoint catalog](checkpoints/README.md).
 
-The current packaged **H1 Flat** actor is a zero-update requalification of the
-same policy bytes on the BSD-source collision hulls (`taskRevision=1000011`).
-The registry task ID intentionally remains `humanoid-isaac-flat-v0`; `v1`
-names the revised, accepted checkpoint selection rather than a different task.
+The tracked **H1 Flat** actor is immutable epoch-1 evidence on the BSD-source
+collision hulls (`taskRevision=1000011`). The current simulator uses the
+epoch-2 deterministic-color contract, so this checkpoint is intentionally not
+selectable until a zero-update requalification publishes an epoch-2 bundle.
+The registry task ID remains `humanoid-isaac-flat-v0`; `v1` names the
+historical checkpoint selection rather than a different task.
 Four manifest-locked, fixed-seed 512-episode evaluations passed 2028/2048
 episodes (99.02%); the worst run passed 98.63%, while worst-run linear and
 yaw-rate RMSE were
 0.089 m/s and 0.132 rad/s. The sealed bundle binds the unchanged policy, old
 and new task revisions, fixed seeds, raw reports, aggregate, and producing
 commit. Its current fingerprint is `85571805...c7fd2`. The revision-1000010
-bundle remains immutable historical evidence and is not selectable.
+bundle remains immutable older-hull evidence and is not selectable.
 
-The packaged **H1 Goal** replay is also on the corrected actuator contract and
-is the current experimental robustness best:
+The tracked **H1 Goal** replay is also epoch-1 historical evidence and requires
+requalification before replay on the current solver. Its recorded robustness
+result remains:
 it walks 4--8 m to a sampled point goal while one physical 8 kg box is launched
 at 4--6 m/s into the full articulated body. The sealed seed-42010 test reached
 400/512 goals (78.12%) and survived 80.66%; every box launched and made
@@ -104,14 +107,13 @@ physical contact. It is intentionally not labeled an accepted result yet
 because unconditional final/minimum goal distances, 1.208/1.179 m, exceed the
 1.125/0.750 m gates. Its current fingerprint is `15710d3f...113f6`.
 
-The packaged **Arachne Straight Walk** actor is a development-only deterministic
+The tracked **Arachne Straight Walk** actor is a deterministic
 0.15 m/s regression benchmark on the corrected revision-6 foot collider. Its
 single seed-45010 report passed 512/512 episodes, with 0.068 m/s linear and
 0.284 rad/s yaw-rate RMSE and no control steps deeper than 1 mm below the
-floor. It is not labeled accepted until it has a robust multi-seed aggregate
-and an immutable deployment manifest matching the evaluated checkpoint.
-**Arachne Goal** remains the randomized, arbitrary-direction sim-to-real policy;
-its multi-seed qualification reports are shipped beside the robot assets.
+floor. Both it and **Arachne Goal** are epoch-1 historical checkpoints pending
+epoch-2 requalification; Arachne Goal's multi-seed qualification reports remain
+shipped beside the robot assets as immutable prior-contract evidence.
 All three Arachne replay modes also expose separate **Fold** and
 **Unfold & Walk** actions. The physical motor/contact sequence reduces the
 articulated footprint by 41.0%, holds it there, then deploys and hands the

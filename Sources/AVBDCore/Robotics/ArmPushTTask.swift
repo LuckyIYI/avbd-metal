@@ -545,7 +545,18 @@ public final class ArmPushTEnv {
     }
 
     public func step(normalizedActions: ContiguousArray<Float>, decimation: Int) {
+        do {
+            try stepChecked(
+                normalizedActions: normalizedActions, decimation: decimation)
+        } catch {
+            fatalError("Arm Push-T simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepChecked(normalizedActions: ContiguousArray<Float>,
+                            decimation: Int) throws {
         precondition(normalizedActions.count == numEnvironments * 2)
+        try solver.synchronize()
         var updates = [GPUSolver.MotorTargetUpdate]()
         updates.reserveCapacity(normalizedActions.count)
         for e in 0..<numEnvironments {
@@ -558,7 +569,8 @@ public final class ArmPushTEnv {
             }
         }
         solver.setMotorTargets(updates)
-        for _ in 0..<decimation { solver.step() }
+        for _ in 0..<decimation { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     /// Analytic elbow-up IK for the benchmark's planar two-link arm. This is
@@ -1317,7 +1329,7 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
         let taskRevision = featureRevision + 100
         spec = RLTaskSpec(
             id: "arm-pusht-v0",
-            revision: RLPhysicsContract.fixedGainActuatorV2(taskRevision),
+            revision: RLPhysicsContract.deterministicColorSolveV1(taskRevision),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(name: "policy", shape: [19]),
             action: RLTensorSpec(
@@ -1355,6 +1367,7 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
                       into observations: inout RLObservationBatch) throws {
         try observations.validate(for: spec)
         let envIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = envIDs.map { seed &+ UInt64($0) &* 0x9E3779B97F4A7C15 }
         environment.reset(envIDs, seeds: seeds)
         let states = environment.states()
@@ -1365,6 +1378,7 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
     public func step(actions: RLActionBatch, into result: inout RLStepBatch) throws {
         try result.validate(for: spec)
         try actions.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
         var applied = ContiguousArray(repeating: Float.zero,
                                       count: actions.values.count)
@@ -1401,8 +1415,9 @@ public final class ArmPushTTask: VectorizedRLTask, RLEvaluationCriteriaProviding
                 previousActions[i] = requested
             }
         }
-        environment.step(normalizedActions: applied,
-                         decimation: configuration.controlDecimation)
+        try environment.stepChecked(
+            normalizedActions: applied,
+            decimation: configuration.controlDecimation)
         var states = environment.states()
         updateJointVelocities(states)
         fillObservations(states, into: &result.observations.policy)

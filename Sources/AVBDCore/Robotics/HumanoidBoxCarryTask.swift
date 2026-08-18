@@ -680,7 +680,7 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
         self.configuration = configuration
         spec = RLTaskSpec(
             id: "humanoid-box-carry-v0",
-            revision: RLPhysicsContract.fixedGainActuatorV2(40),
+            revision: RLPhysicsContract.deterministicColorSolveV1(40),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),
@@ -1432,6 +1432,7 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                       into observations: inout RLObservationBatch) throws {
         try observations.validate(for: spec)
         let envIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = envIDs.map {
             seed &+ UInt64($0) &* 0x9E3779B97F4A7C15
         }
@@ -1448,6 +1449,7 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                      into result: inout RLStepBatch) throws {
         try actions.validate(for: spec)
         try result.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
         let n = spec.numEnvironments
         let dt = spec.controlStep
@@ -1475,7 +1477,7 @@ public final class HumanoidBoxCarryTask: VectorizedRLTask,
                     configuration.manipulationArmActionScaleMultiplier
             }
         }
-        environment.step(
+        try environment.stepChecked(
             normalizedActions: appliedActions,
             decimation: Self.controlDecimation,
             clampActions: false, clampTargetsToLimits: true)

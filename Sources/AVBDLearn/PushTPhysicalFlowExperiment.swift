@@ -441,7 +441,7 @@ public enum PushTPhysicalFlowExperiment {
         while sourcePreparationSteps < configuration.sourcePreparationSteps,
               !sourceHasContact {
             let action = environment.oracleAction(0)
-            environment.step(
+            try environment.stepChecked(
                 actions: [SIMD2<Float>](
                     repeating: action, count: simulationBatch),
                 substeps: configuration.substeps,
@@ -494,7 +494,7 @@ public enum PushTPhysicalFlowExperiment {
                 action = fixedSettlingTarget!
             }
             referenceActions.append(action)
-            environment.step(
+            try environment.stepChecked(
                 actions: [SIMD2<Float>](
                     repeating: action, count: simulationBatch),
                 substeps: configuration.substeps,
@@ -564,7 +564,7 @@ public enum PushTPhysicalFlowExperiment {
         // there. Cross-replica agreement remains a separate reported guard.
         calibrationPaths[0] = referenceActions
         calibrationPaths[2] = fittedPath
-        let calibrationStates = rollout(
+        let calibrationStates = try rollout(
             environment: environment, source: source,
             paths: calibrationPaths, configuration: configuration)
         let referenceMetrics = metrics(
@@ -654,7 +654,7 @@ public enum PushTPhysicalFlowExperiment {
             }
         }
 
-        func evaluate(_ controls: [[SIMD2<Float>]]) -> [Candidate] {
+        func evaluate(_ controls: [[SIMD2<Float>]]) throws -> [Candidate] {
             precondition(!controls.isEmpty)
             searchReplicaRollouts += ((controls.count + simulationBatch - 1)
                 / simulationBatch) * simulationBatch
@@ -662,7 +662,7 @@ public enum PushTPhysicalFlowExperiment {
                 path(controlPoints: $0, horizon: configuration.horizon,
                      terminalHoldSteps: configuration.terminalHoldSteps)
             }
-            let terminals = rollout(
+            let terminals = try rollout(
                 environment: environment, source: source,
                 paths: paths, configuration: configuration)
             return controls.indices.map { index in
@@ -708,7 +708,7 @@ public enum PushTPhysicalFlowExperiment {
                     probeControls.append(controlPoints(from: parameters))
                     probeSources.append(sourceKind)
                 }
-                let probeCandidates = evaluate(probeControls)
+                let probeCandidates = try evaluate(probeControls)
                 var bestProvided = probeCandidates[0]
                 var bestGeometric = probeCandidates[1]
                 for index in probeCandidates.indices {
@@ -746,7 +746,7 @@ public enum PushTPhysicalFlowExperiment {
                             generator: &generator))
                     }
                     candidates = probeCandidates
-                        + evaluate(exploitationControls)
+                        + (try evaluate(exploitationControls))
                 } else {
                     candidates = probeCandidates
                 }
@@ -767,7 +767,7 @@ public enum PushTPhysicalFlowExperiment {
                     }
                     controls.append(controlPoints(from: candidateParameters))
                 }
-                candidates = evaluate(controls)
+                candidates = try evaluate(controls)
             }
             guard candidates.allSatisfy({ $0.metrics.loss.isFinite }) else {
                 throw RLEnvironmentError.invalidConfiguration(
@@ -866,7 +866,7 @@ public enum PushTPhysicalFlowExperiment {
         let bestPath = path(
             controlPoints: best.controlPoints, horizon: configuration.horizon,
             terminalHoldSteps: configuration.terminalHoldSteps)
-        let replayStates = rollout(
+        let replayStates = try rollout(
             environment: environment, source: source,
             paths: [[SIMD2<Float>]](
                 repeating: bestPath, count: simulationBatch),
@@ -1035,7 +1035,7 @@ public enum PushTPhysicalFlowExperiment {
         source: PushTPhysicalState,
         paths: [[SIMD2<Float>]],
         configuration: PushTPhysicalFlowConfiguration
-    ) -> [PushTPhysicalState] {
+    ) throws -> [PushTPhysicalState] {
         precondition(!paths.isEmpty)
         precondition(paths.allSatisfy { $0.count == configuration.horizon })
         precondition(environment.numEnvs == configuration.simulationBatchSize)
@@ -1054,7 +1054,7 @@ public enum PushTPhysicalFlowExperiment {
             }
             environment.fork(source, into: Array(0..<batch))
             for step in 0..<configuration.horizon {
-                environment.step(
+                try environment.stepChecked(
                     actions: batchedPaths.map { $0[step] },
                     substeps: configuration.substeps,
                     maxStep: configuration.targetGenerationMaximumStep)

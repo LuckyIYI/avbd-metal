@@ -15,12 +15,18 @@ Newly qualified checkpoints keep their sealed held-out report beside the
 weights as `evaluation.json`; Arachne Goal retains its larger multi-seed report
 set under the canonical robot qualification directory linked below.
 
-## Shipped learned policies
+## Tracked learned-policy evidence
+
+The native checkpoints below predate the epoch-2 deterministic-color solver
+contract and are retained as immutable evidence only. Policy Replay exposes no
+native checkpoint until a zero-update requalification binds the same policy to
+the current task revision. External imported policies retain their own parity
+gates.
 
 - `external/unitree-h1` is the unchanged public Unitree RL Gym recurrent H1
   policy imported to MLX. Its source identity and recurrent parity contract are
   recorded in `manifest.json`.
-- `humanoid-isaac-flat-v1` is the accepted H1 Flat deployment for the current
+- `humanoid-isaac-flat-v1` is the former accepted H1 Flat deployment for the
   BSD-source collision hulls (`taskRevision=1000011`). It preserves the v0
   policy bytes exactly and records zero target training updates. Four
   manifest-locked, fixed-seed 512-episode tests passed 2028/2048 episodes
@@ -28,7 +34,7 @@ set under the canonical robot qualification directory linked below.
   of 0.089 m/s and
   0.132 rad/s. `requalification-manifest.json` binds the parent, candidate,
   producing commit, frozen criteria, raw reports, and reconstructed aggregate.
-  Fingerprint:
+  The bundle is now historical and requires epoch-2 requalification. Fingerprint:
   `85571805cc7b688970cf5497beb5916be8fb3b1fcb7855207af6f55b208c7fd2`.
 - `humanoid-isaac-flat-v0` is immutable historical evidence for the H1 Flat
   actor on the former revision-1000010 collision geometry. Its sealed
@@ -37,25 +43,26 @@ set under the canonical robot qualification directory linked below.
   historical bundle; it is not selectable and is not evidence for revision
   1000011. Fingerprint:
   `d6b5d416e7f7d75fa2b9b9dd33f78ae387e3f2a8139aa6d25a69e5dbcae777ab`.
-- `humanoid-isaac-goal-v0` is the current H1 point-goal/impact actor on the
+- `humanoid-isaac-goal-v0` is the epoch-1 H1 point-goal/impact actor on the
   corrected actuator contract (`taskRevision=1000004`). Every episode includes
   a real 8 kg projectile impact. Its sealed seed-42010 test reached 400/512
   goals (78.12%) and survived 80.66%, but it remains a visible development
   policy because aggregate final/minimum goal distance still fails the strict
-  acceptance gate. Fingerprint:
+  acceptance gate. It also requires epoch-2 requalification. Fingerprint:
   `15710d3f81b9ff4b5d14ab1a53d89381efd8effed02b237422ee72e625c113f6`.
 - `arachne15-velocity-v0` is the corrected revision-6 straight-walk benchmark:
   fixed 0.15 m/s command, deterministic plant, no steering. Its single
   512-episode report at seed 45010 passed 512/512, with 0.068 m/s linear and
   0.284 rad/s yaw-rate RMSE and zero control steps deeper than 1 mm below the
   floor. It remains development-only until a robust multi-seed aggregate and
-  matching deployment manifest are present. Fingerprint:
+  matching deployment manifest and epoch-2 requalification are present.
+  Fingerprint:
   `aed643b062df4e0e07e70998212720909bc1b25229455489ba28d4319d202524`.
-- `arachne15-goal-v0` is the separately qualified sim-to-real point-goal actor.
+- `arachne15-goal-v0` is the formerly qualified epoch-1 sim-to-real point-goal actor.
   Its four-seed training-collider and four-seed validation-collider reports are
   retained under
   `Robots/Arachne15/qualification/arachne15-goal-r6-update-000020`.
-  Fingerprint:
+  Those reports do not qualify the epoch-2 solver. Fingerprint:
   `30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027`.
 
 `Arachne Classical` is deliberately also visible in Policy Replay, but is

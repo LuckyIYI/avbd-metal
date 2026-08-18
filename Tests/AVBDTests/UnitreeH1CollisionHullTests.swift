@@ -20,9 +20,9 @@ final class UnitreeH1CollisionHullTests: XCTestCase {
             numEnvironments: 1, pointGoal: true,
             projectileProbability: 0))
         XCTAssertEqual(flat.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(11))
+                       RLPhysicsContract.deterministicColorSolveV1(11))
         XCTAssertEqual(goal.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(3))
+                       RLPhysicsContract.deterministicColorSolveV1(3))
         XCTAssertEqual(enabledGeneratedHullCount(flat), 3)
         XCTAssertEqual(enabledGeneratedHullCount(goal), 3)
 
@@ -47,7 +47,7 @@ final class UnitreeH1CollisionHullTests: XCTestCase {
         for (configuration, revision) in projectileConfigurations {
             let task = try make(configuration)
             XCTAssertEqual(task.spec.revision,
-                           RLPhysicsContract.fixedGainActuatorV2(revision))
+                           RLPhysicsContract.deterministicColorSolveV1(revision))
             XCTAssertEqual(
                 enabledGeneratedHullCount(task), 0,
                 "projectile revision \(revision) uses full primitives, not hulls")

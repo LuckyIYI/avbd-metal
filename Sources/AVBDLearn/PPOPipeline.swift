@@ -95,7 +95,9 @@ public enum PPOPipeline {
         let opt = AdamW(learningRate: lr)
 
         // helpers ---------------------------------------------------------
-        func captureFrames() -> [UInt8] { [UInt8](env.observations()) }
+        func captureFrames() throws -> [UInt8] {
+            [UInt8](try env.observationsChecked())
+        }
         func stackMLX(_ prev: [UInt8], _ cur: [UInt8], rows: [Int]? = nil) -> MLXArray {
             // [B,res,res,6] float in [0,1], channel order (prev,cur) as in BC
             let idx = rows ?? Array(0..<numEnvs)
@@ -116,9 +118,9 @@ public enum PPOPipeline {
         // rollout state ---------------------------------------------------
         env.resetAll(seed: seed)
         var targets = (0..<numEnvs).map { _ in SIMD2<Float>(1.4, 0) }
-        for _ in 0..<10 { env.step(actions: targets) }
-        var prevBuf = captureFrames()
-        var curBuf = captureFrames()
+        for _ in 0..<10 { try env.stepChecked(actions: targets) }
+        var prevBuf = try captureFrames()
+        var curBuf = try captureFrames()
         var epLen = [Int](repeating: 0, count: numEnvs)
         var epRet = [Float](repeating: 0, count: numEnvs)
         var dist = (0..<numEnvs).map { goalDist($0) }
@@ -178,10 +180,10 @@ public enum PPOPipeline {
                 }
                 var nextPrev = curBuf
                 for k in 0..<macro {
-                    if k == macro - 1 { nextPrev = captureFrames() }
-                    env.step(actions: targets)
+                    if k == macro - 1 { nextPrev = try captureFrames() }
+                    try env.stepChecked(actions: targets)
                 }
-                let nextCur = captureFrames()
+                let nextCur = try captureFrames()
 
                 // rewards / dones / resets
                 var truncRows = [Int]()
@@ -226,7 +228,7 @@ public enum PPOPipeline {
                 curBuf = nextCur
                 if anyReset {
                     // refresh frames + dist for reset envs (post-teleport)
-                    let fresh = captureFrames()
+                    let fresh = try captureFrames()
                     for e in 0..<numEnvs where stepDone[e] == 1 {
                         let rge = (e * frameBytes)..<((e + 1) * frameBytes)
                         prevBuf.replaceSubrange(rge, with: fresh[rge])
@@ -355,16 +357,16 @@ public enum PPOPipeline {
         for ep in 0..<episodes {
             let env = try PushTEnv(numEnvs: 1, seed: seed &+ UInt64(ep) * 7)
             let res = env.obsRes
-            var prevFrame = PushTPipeline.obsArray(env, res)
-            env.step(actions: [env.tipPos(0)], substeps: 4)
+            var prevFrame = try PushTPipeline.obsArrayChecked(env, res)
+            try env.stepChecked(actions: [env.tipPos(0)], substeps: 4)
             for _ in 0..<60 {
-                let cur = PushTPipeline.obsArray(env, res)
+                let cur = try PushTPipeline.obsArrayChecked(env, res)
                 let (mu, _, _) = policy.forward(concatenated([prevFrame, cur], axis: 3))
                 eval(mu)
                 let act = SIMD2(mu[0, 0].item(Float.self) * 3, mu[0, 1].item(Float.self) * 3)
                 for k in 0..<8 {
-                    if k == 7 { prevFrame = PushTPipeline.obsArray(env, res) }
-                    env.step(actions: [act])
+                    if k == 7 { prevFrame = try PushTPipeline.obsArrayChecked(env, res) }
+                    try env.stepChecked(actions: [act])
                     if env.success(0) { break }
                 }
                 if env.success(0) { break }

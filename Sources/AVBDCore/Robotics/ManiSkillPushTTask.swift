@@ -270,8 +270,20 @@ public final class PandaStickPushTEnv {
 
     public func step(actions: ContiguousArray<Float>, decimation: Int,
                      deltaScale: Float) {
+        do {
+            try stepChecked(
+                actions: actions, decimation: decimation,
+                deltaScale: deltaScale)
+        } catch {
+            fatalError("ManiSkill Push-T simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepChecked(actions: ContiguousArray<Float>, decimation: Int,
+                            deltaScale: Float) throws {
         precondition(actions.count == numEnvironments * Self.actionCount)
         precondition(decimation > 0 && deltaScale > 0)
+        try solver.synchronize()
         let motorIDs = refs.flatMap(\.motors)
         let measured = solver.motorAngles(motorIDs)
         var updates: [GPUSolver.MotorTargetUpdate] = []
@@ -292,7 +304,8 @@ public final class PandaStickPushTEnv {
             }
         }
         solver.setMotorTargets(updates)
-        for _ in 0..<decimation { solver.step() }
+        for _ in 0..<decimation { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     /// Resolve the task-local tool-tip pose from source Panda joint angles.
@@ -471,6 +484,7 @@ public final class PandaStickPushTEnv {
     public func reset(_ environmentIDs: [Int], seeds: [UInt64],
                       jointNoise: Float) throws {
         precondition(environmentIDs.count == seeds.count && jointNoise >= 0)
+        try solver.synchronize()
         var poses: [GPUSolver.BodyPoseUpdate] = []
         var motors: [GPUSolver.MotorTargetUpdate] = []
         for (offset, environment) in environmentIDs.enumerated() {
@@ -776,7 +790,7 @@ public final class ManiSkillPushTTask: VectorizedRLTask,
             // Revision 3 represented the two T boxes as separately integrated
             // bodies connected by an AVBD weld and used continuous overlap.
             id: "maniskill-pusht-v1",
-            revision: RLPhysicsContract.fixedGainActuatorV2(9),
+            revision: RLPhysicsContract.deterministicColorSolveV1(9),
             numEnvironments: configuration.numEnvironments,
             // ManiSkill state observation: qpos, qvel, TCP pose, goal
             // position, and object pose = 7 + 7 + 7 + 3 + 7 = 31.
@@ -806,6 +820,7 @@ public final class ManiSkillPushTTask: VectorizedRLTask,
                       into observations: inout RLObservationBatch) throws {
         try observations.validate(for: spec)
         let environmentIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = environmentIDs.map {
             seed &+ UInt64($0) &* 0x9E3779B97F4A7C15
         }
@@ -820,8 +835,9 @@ public final class ManiSkillPushTTask: VectorizedRLTask,
                      into result: inout RLStepBatch) throws {
         try actions.validate(for: spec)
         try result.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
-        environment.step(
+        try environment.stepChecked(
             actions: actions.values,
             decimation: configuration.controlDecimation,
             deltaScale: configuration.jointDeltaActionScale)

@@ -155,7 +155,7 @@ public final class HumanoidVelocityTask: VectorizedRLTask,
         self.configuration = configuration
         spec = RLTaskSpec(
             id: "humanoid-velocity-v0",
-            revision: RLPhysicsContract.fixedGainActuatorV2(2),
+            revision: RLPhysicsContract.deterministicColorSolveV1(2),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),
@@ -249,6 +249,7 @@ public final class HumanoidVelocityTask: VectorizedRLTask,
     ) throws {
         try observations.validate(for: spec)
         let envIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = envIDs.map {
             seed &+ UInt64($0) &* 0x9E3779B97F4A7C15
         }
@@ -269,6 +270,7 @@ public final class HumanoidVelocityTask: VectorizedRLTask,
     ) throws {
         try result.validate(for: spec)
         try actions.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
         let n = spec.numEnvironments
         let dt = spec.controlStep
@@ -282,7 +284,7 @@ public final class HumanoidVelocityTask: VectorizedRLTask,
             }
         }
 
-        environment.step(
+        try environment.stepChecked(
             normalizedActions: actions.values,
             decimation: configuration.controlDecimation)
         var states = environment.states()

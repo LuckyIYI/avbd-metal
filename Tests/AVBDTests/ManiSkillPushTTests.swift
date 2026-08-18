@@ -81,7 +81,7 @@ final class ManiSkillPushTTests: XCTestCase {
             numEnvironments: 1, seed: 9351,
             autoReset: false, robotInitialJointNoise: 0))
         XCTAssertEqual(task.spec.revision,
-                       RLPhysicsContract.fixedGainActuatorV2(9))
+                       RLPhysicsContract.deterministicColorSolveV1(9))
         var observations = RLObservationBatch(spec: task.spec)
         try task.reset(environments: nil, seed: 9351,
                        into: &observations)

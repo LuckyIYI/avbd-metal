@@ -296,6 +296,15 @@ public final class Arachne15Env {
     }
 
     public func step(actions: ContiguousArray<Float>, decimation: Int) {
+        do {
+            try stepChecked(actions: actions, decimation: decimation)
+        } catch {
+            fatalError("Arachne simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepChecked(actions: ContiguousArray<Float>,
+                            decimation: Int) throws {
         precondition(actions.count == numEnvironments * Self.actionDimension)
         var relativeTargets = ContiguousArray(
             repeating: Float(0), count: actions.count)
@@ -307,7 +316,7 @@ public final class Arachne15Env {
                 relativeTargets[e * Self.actionDimension + j] = requested
             }
         }
-        stepJointTargets(relativeTargets, decimation: decimation)
+        try stepJointTargetsChecked(relativeTargets, decimation: decimation)
     }
 
     /// Commissioning/reveal path for targets beyond the learned action scale
@@ -317,9 +326,21 @@ public final class Arachne15Env {
     public func stepJointTargets(
         _ relativeTargets: ContiguousArray<Float>, decimation: Int
     ) {
+        do {
+            try stepJointTargetsChecked(
+                relativeTargets, decimation: decimation)
+        } catch {
+            fatalError("Arachne simulation failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func stepJointTargetsChecked(
+        _ relativeTargets: ContiguousArray<Float>, decimation: Int
+    ) throws {
         precondition(relativeTargets.count
             == numEnvironments * Self.actionDimension)
         precondition(decimation > 0)
+        try solver.synchronize()
         var targets: [GPUSolver.MotorTargetUpdate] = []
         targets.reserveCapacity(relativeTargets.count)
         for e in 0..<numEnvironments {
@@ -334,7 +355,8 @@ public final class Arachne15Env {
             }
         }
         solver.setMotorTargets(targets)
-        for _ in 0..<decimation { solver.step() }
+        for _ in 0..<decimation { try solver.submitStep() }
+        try solver.synchronize()
     }
 
     /// Temporarily scale the authored effort budget for short commissioning
@@ -837,7 +859,8 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
         self.configuration = configuration
         let d = configuration.domainRandomization
         spec = RLTaskSpec(
-            id: taskID, revision: 6,
+            id: taskID,
+            revision: RLPhysicsContract.deterministicColorSolveV1(6),
             numEnvironments: configuration.numEnvironments,
             observation: RLTensorSpec(
                 name: "policy", shape: [Self.observationDimension]),
@@ -1056,6 +1079,7 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                       into observations: inout RLObservationBatch) throws {
         try observations.validate(for: spec)
         let envIDs = try checkedEnvironmentIDs(ids)
+        try environment.solver.synchronize()
         let seeds = envIDs.map {
             seed &+ UInt64($0) &* 0x9E3779B97F4A7C15
         }
@@ -1073,10 +1097,12 @@ public final class Arachne15LocomotionTask: VectorizedRLTask,
                      into result: inout RLStepBatch) throws {
         try actions.validate(for: spec)
         try result.validate(for: spec)
+        try environment.solver.synchronize()
         result.clearSignals()
         let applied = delayedActions(actions.values)
-        environment.step(actions: applied,
-                         decimation: configuration.controlDecimation)
+        try environment.stepChecked(
+            actions: applied,
+            decimation: configuration.controlDecimation)
         var states = environment.states()
         let contacts = environment.groundContacts()
         let n = spec.numEnvironments

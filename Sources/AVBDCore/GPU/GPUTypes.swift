@@ -150,6 +150,15 @@ public struct ManifoldGPU {
 public enum GPUCounters {
     public static let pairs = 0
     public static let soft = 1
+    /// Candidate demand before storage-capacity clipping. Keeping this
+    /// separate from `pairs` is what distinguishes a valid exact fill from
+    /// a physics-invalid dropped pair.
+    public static let pairCandidates = 4
+    /// Element-contact demand before storage-capacity clipping.
+    public static let softCandidates = 5
+    /// Dynamic bodies that still share a color with a graph neighbor after
+    /// the final coloring pass. Any nonzero value invalidates the solve.
+    public static let colorConflicts = 6
     public static let colorBase = 8
     public static let total = 8 + 2 * AVBD_MAX_COLORS
 }

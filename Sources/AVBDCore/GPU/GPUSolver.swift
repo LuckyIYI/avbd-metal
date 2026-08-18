@@ -143,6 +143,10 @@ public final class GPUSolver {
 
     // Control
     var counters: MTLBuffer
+    /// Frame-owned readback slots. The solver permits at most two in-flight
+    /// submissions, so parity selects a slot only after its previous owner
+    /// has been retired by throttling.
+    let counterReadbacks: [MTLBuffer]
     var dispatchArgs: MTLBuffer    // 9 uints (pairs / forces / diag)
     var colorArgs: MTLBuffer       // MAX_COLORS * 3 uints
     var scanBlockSums: MTLBuffer
@@ -152,12 +156,68 @@ public final class GPUSolver {
     // Pipelines
     var pso: [String: MTLComputePipelineState] = [:]
 
+    /// Every compute entry point reachable through this solver, including
+    /// optional cloth, rendering, diagnostics, and robotics paths. Validate
+    /// the complete contract at initialization so a Swift/Metal source drift
+    /// is reported as a throwing construction error instead of reaching the
+    /// internal `ps(_:)` invariant and terminating the process later.
+    static let requiredKernelNames: Set<String> = [
+        "adj_clear_degrees",
+        "adj_copy_cursor",
+        "adj_count",
+        "adj_scatter",
+        "adj_sort",
+        "bp_count",
+        "bp_count_pairs_deterministic",
+        "bp_emit_pairs_deterministic",
+        "bp_finalize_deterministic_pairs",
+        "bp_scatter",
+        "bp_sort_cells",
+        "build_instances",
+        "color_count",
+        "color_iterate",
+        "color_scan",
+        "color_scatter",
+        "color_validate",
+        "diag_clear",
+        "diag_error",
+        "dual_all",
+        "ee_emit",
+        "el_count",
+        "el_scatter",
+        "finalize_velocities",
+        "np_collide",
+        "ogc_bounds_refresh",
+        "ogc_refresh_args",
+        "pm_clear",
+        "pm_insert",
+        "primal_particles_split",
+        "primal_solve",
+        "pusht_obs",
+        "rt_emit",
+        "scan_add_offsets",
+        "scan_block_sums",
+        "scan_blocks",
+        "skin_deform",
+        "smooth_particle_velocities",
+        "soft_face_normals",
+        "soft_finalize",
+        "soft_normals",
+        "softmap_clear",
+        "softmap_insert",
+        "solve_persistent",
+        "solve_persistent_multi",
+        "vt_emit",
+        "warmstart_bodies",
+        "warmstart_joints",
+    ]
+
     // Cached per-frame color counts (read back once per step)
     public internal(set) var lastColorCounts: [Int] = []
     public private(set) var lastNumPairs: Int = 0
-    private var warnedPairSaturation = false
-    private var warnedSoftSaturation = false
+    public private(set) var lastPairCandidates: Int = 0
     public private(set) var lastNumSoft: Int = 0
+    public private(set) var lastSoftCandidates: Int = 0
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
@@ -205,18 +265,36 @@ public final class GPUSolver {
         // so without them tet bodies would pass through each other and
         // rigids would only touch their corner features. Collision-only —
         // membranes and the render extractor keep using scene.tris/tets.
-        self.tetBoundaryTris = Self.tetBoundaryFaces(scene)
+        let tetBoundaryTris = Self.tetBoundaryFaces(scene)
+        self.tetBoundaryTris = tetBoundaryTris
         self.numTris = scene.tris.count + tetBoundaryTris.count
         self.skinnedVertexCount = scene.skinnedMeshes.reduce(0) { $0 + $1.vertices.count }
         self.skinnedTriCount = scene.skinnedMeshes.reduce(0) { $0 + $1.triangles.count }
         self.rigidMeshVertexCount = scene.rigidMeshes.reduce(0) {
             $0 + 3 * $1.triangles.count
         }
-        // capacity bound: V-T (4/vertex) + rigid-T (4/tri) + E-E (2/edge,
-        // edges <= 3 per tri)
-        let particleEstimate = scene.bodies.lazy.filter { $0.isParticle }.count
-        self.maxSoft = numTris == 0 ? 1
-            : 4 * particleEstimate + 4 * numTris + 6 * numTris + 256
+        // Structural append bound: each collision-surface vertex retains at
+        // most four V-T candidates, each triangle four rigid-T candidates,
+        // and each authored cloth edge four E-E candidates. Derive the
+        // actual surface and unique edge counts instead of relying on the old
+        // 10*tri heuristic, which under-allocated disconnected/open meshes.
+        let collisionTriangles = scene.tris.map(\.ids) + tetBoundaryTris
+        var surfaceParticles = Set<Int>()
+        for (a, b, c) in collisionTriangles {
+            if scene.bodies[a].isParticle { surfaceParticles.insert(a) }
+            if scene.bodies[b].isParticle { surfaceParticles.insert(b) }
+            if scene.bodies[c].isParticle { surfaceParticles.insert(c) }
+        }
+        var contactEdges = Set<UInt64>()
+        for tri in scene.tris {
+            let (a, b, c) = tri.ids
+            for (u, v) in [(a, b), (b, c), (a, c)] {
+                contactEdges.insert(UInt64(min(u, v)) << 32
+                    | UInt64(max(u, v)))
+            }
+        }
+        self.maxSoft = max(1, 4 * surfaceParticles.count
+            + 4 * numTris + 4 * contactEdges.count)
         self.softMapCapacity = Self.nextPow2(max(64, 2 * maxSoft))
         self.elemHashSize = Self.nextPow2(max(64, 2 * 4 * numTris))
 
@@ -360,6 +438,9 @@ public final class GPUSolver {
         changedFlag = try makeBuf(24 * 4, "changedFlag")  // per-pass slots
 
         counters = try makeBuf(GPUCounters.total * 4, "counters")
+        counterReadbacks = try (0..<2).map {
+            try makeBuf(GPUCounters.total * 4, "counterReadback[\($0)]")
+        }
         dispatchArgs = try makeBuf(9 * 4, "dispatchArgs")
         colorArgs = try makeBuf(AVBD_MAX_COLORS * 3 * 4, "colorArgs")
         let maxScanCount = max(max(gridHashSize, elemHashSize), nb)
@@ -379,11 +460,50 @@ public final class GPUSolver {
         }
     }
 
-    public enum AVBDError: Error {
+    public enum AVBDError: Error, Equatable, LocalizedError {
         case noDevice
         case allocFailed(String)
         case shaderCompile(String)
         case kernelMissing(String)
+        case commandBufferCreation(operation: String, frame: Int)
+        case commandEncoderCreation(operation: String, stage: String,
+                                    frame: Int)
+        case commandExecution(operation: String, frame: Int, status: Int,
+                              domain: String, code: Int, message: String)
+        case rigidPairCapacity(frame: Int, required: Int, capacity: Int)
+        case softContactCapacity(frame: Int, required: Int, capacity: Int)
+        case staticColorCapacity(body: Int, required: Int, capacity: Int)
+        case unresolvedColoring(frame: Int, conflictingBodies: Int)
+
+        public var errorDescription: String? {
+            switch self {
+            case .noDevice:
+                return "Metal device or command queue is unavailable"
+            case .allocFailed(let label):
+                return "Metal buffer allocation failed: \(label)"
+            case .shaderCompile(let message):
+                return "Metal shader compilation failed: \(message)"
+            case .kernelMissing(let name):
+                return "Metal kernel is unavailable: \(name)"
+            case .commandBufferCreation(let operation, let frame):
+                return "\(operation) frame \(frame): command-buffer creation failed"
+            case .commandEncoderCreation(let operation, let stage, let frame):
+                return "\(operation) frame \(frame): encoder creation failed at \(stage)"
+            case .commandExecution(let operation, let frame, let status,
+                                   let domain, let code, let message):
+                let detail = domain.isEmpty ? message
+                    : "\(domain) \(code): \(message)"
+                return "\(operation) frame \(frame): Metal status \(status) (\(detail))"
+            case .rigidPairCapacity(let frame, let required, let capacity):
+                return "physics frame \(frame): rigid-pair demand \(required) exceeds capacity \(capacity)"
+            case .softContactCapacity(let frame, let required, let capacity):
+                return "physics frame \(frame): soft-contact demand \(required) exceeds capacity \(capacity)"
+            case .staticColorCapacity(let body, let required, let capacity):
+                return "greedy static solver coloring at body \(body) exhausted \(capacity) colors (next color \(required))"
+            case .unresolvedColoring(let frame, let conflictingBodies):
+                return "physics frame \(frame): dynamic coloring retained \(conflictingBodies) conflicting bodies"
+            }
+        }
     }
 
     private struct UInt64UniqueBuilder {
@@ -442,8 +562,15 @@ public final class GPUSolver {
             guard let fn = lib.makeFunction(name: name) else { continue }
             pso[name] = try device.makeComputePipelineState(function: fn)
         }
+        try Self.validateRequiredKernelNames(Set(pso.keys))
     }
     var shaderLib: MTLLibrary?
+
+    static func validateRequiredKernelNames(_ available: Set<String>) throws {
+        if let missing = requiredKernelNames.subtracting(available).min() {
+            throw AVBDError.kernelMissing(missing)
+        }
+    }
 
     /// Concatenates the bundled .metal sources (filename order) and compiles.
     static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
@@ -1557,8 +1684,13 @@ public final class GPUSolver {
                 let c = staticColors[nb]
                 if c < 64 { used |= (1 << UInt64(c)) }
             }
+            guard used != UInt64.max else {
+                throw AVBDError.staticColorCapacity(
+                    body: v, required: AVBD_MAX_COLORS + 1,
+                    capacity: AVBD_MAX_COLORS)
+            }
             var c = 0
-            while c < 63 && (used & (1 << UInt64(c))) != 0 { c += 1 }
+            while (used & (1 << UInt64(c))) != 0 { c += 1 }
             staticColors[v] = c
             maxColor = max(maxColor, c)
         }
@@ -1729,17 +1861,68 @@ public final class GPUSolver {
     private var counterBuf: MTLCounterSampleBuffer?
     private var stageNames: [String] = []
 
-    // ---- async pipelining: step() never blocks; the queue serializes GPU
-    // work, and CPU access to shared buffers syncs lazily ----
-    private var inflight: [MTLCommandBuffer] = []
+    // ---- async pipelining: submitStep() never blocks; the queue serializes
+    // GPU work, and checked CPU access synchronizes lazily ----
+    private struct StepSubmission {
+        let commandBuffer: MTLCommandBuffer
+        let counterSnapshot: MTLBuffer
+        let frame: Int
+        let usesDynamicColoring: Bool
+    }
+    private var inflight: [StepSubmission] = []
     private let statsLock = NSLock()
+    private let failureLock = NSLock()
+    private var latchedRuntimeFailure: AVBDError?
+
+    /// A runtime failure is terminal because a failed Metal command may have
+    /// partially modified solver state. Rebuild the solver; never clear and
+    /// continue a training rollout.
+    public var runtimeFailure: AVBDError? {
+        failureLock.lock()
+        defer { failureLock.unlock() }
+        return latchedRuntimeFailure
+    }
+
+    // Instance-scoped deterministic failure injection for unit tests. The
+    // hooks are read only while encoding a new submission; changing one
+    // between submissions is safe even if an older command is still in flight.
+    var commandBufferFactoryForTesting: (() -> MTLCommandBuffer?)?
+    var deniedEncoderStageForTesting: String?
+    var completionFailureForTesting: ((String, Int) -> AVBDError?)?
+    var inflightCountForTesting: Int { inflight.count }
+
+    private func makeRuntimeCommandBuffer() -> MTLCommandBuffer? {
+        if let factory = commandBufferFactoryForTesting { return factory() }
+        return queue.makeCommandBuffer()
+    }
 
     /// Robotics: render parallel Push-T pixel observations via the
     /// analytic top-down compute kernel. envTable: PushTEnvGPU records.
     public func renderPushTObs(envTable: MTLBuffer, numEnvs: Int,
                                out: MTLBuffer, res: Int) {
-        guard let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeComputeCommandEncoder() else { return }
+        do {
+            try renderPushTObsChecked(
+                envTable: envTable, numEnvs: numEnvs, out: out, res: res)
+        } catch {
+            fatalError("Push-T observation rendering failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func renderPushTObsChecked(envTable: MTLBuffer, numEnvs: Int,
+                                      out: MTLBuffer, res: Int) throws {
+        try synchronize()
+        guard let cmd = makeRuntimeCommandBuffer() else {
+            throw latch(.commandBufferCreation(
+                operation: "Push-T observation", frame: frameIndex))
+        }
+        guard deniedEncoderStageForTesting != "Push-T observation",
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw latch(.commandEncoderCreation(
+                operation: "Push-T observation", stage: "render",
+                frame: frameIndex))
+        }
+        cmd.label = "AVBD Push-T observation"
+        enc.label = "Push-T observation"
         let p = ps("pusht_obs")
         enc.setComputePipelineState(p)
         enc.setBuffer(posLin, offset: 0, index: 0)
@@ -1753,7 +1936,8 @@ public final class GPUSolver {
                                  threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         enc.endEncoding()
         cmd.commit()
-        cmd.waitUntilCompleted()
+        try waitForCompletion(
+            cmd, operation: "Push-T observation", frame: frameIndex)
     }
 
     public var metalDevice: MTLDevice { device }
@@ -2229,10 +2413,110 @@ public final class GPUSolver {
         return (vt, rt, ee)
     }
 
-    /// Wait for all committed steps (no-op when already complete).
+    @discardableResult
+    private func latch(_ failure: AVBDError) -> AVBDError {
+        failureLock.lock()
+        defer { failureLock.unlock() }
+        if latchedRuntimeFailure == nil { latchedRuntimeFailure = failure }
+        return latchedRuntimeFailure!
+    }
+
+    private func requireHealthy() throws {
+        if let failure = runtimeFailure { throw failure }
+    }
+
+    private func waitForCompletion(_ command: MTLCommandBuffer,
+                                   operation: String, frame: Int) throws {
+        command.waitUntilCompleted()
+        if let injected = completionFailureForTesting?(operation, frame) {
+            throw latch(injected)
+        }
+        if command.status != .completed || command.error != nil {
+            let nsError = command.error as NSError?
+            throw latch(.commandExecution(
+                operation: operation, frame: frame,
+                status: Int(command.status.rawValue),
+                domain: nsError?.domain ?? "",
+                code: nsError?.code ?? 0,
+                message: nsError?.localizedDescription
+                    ?? "command did not complete successfully"))
+        }
+    }
+
+    private func retire(_ submission: StepSubmission) throws {
+        let command = submission.commandBuffer
+        try waitForCompletion(
+            command, operation: "physics", frame: submission.frame)
+
+        let ctr = submission.counterSnapshot.contents().bindMemory(
+            to: UInt32.self, capacity: GPUCounters.total)
+        let pairCandidates = Int(ctr[GPUCounters.pairCandidates])
+        let softCandidates = Int(ctr[GPUCounters.softCandidates])
+        let pairs = Int(ctr[GPUCounters.pairs])
+        let soft = Int(ctr[GPUCounters.soft])
+        let colorConflicts = Int(ctr[GPUCounters.colorConflicts])
+
+        statsLock.lock()
+        lastPairCandidates = pairCandidates
+        lastNumPairs = pairs
+        lastSoftCandidates = softCandidates
+        lastNumSoft = soft
+        if submission.usesDynamicColoring {
+            var counts = [Int]()
+            counts.reserveCapacity(AVBD_MAX_COLORS)
+            var maxUsed = -1
+            for color in 0..<AVBD_MAX_COLORS {
+                let count = Int(ctr[GPUCounters.colorBase + color])
+                counts.append(count)
+                if count > 0 { maxUsed = color }
+            }
+            lastColorCounts = counts
+            lastMaxColorUsed = maxUsed
+        }
+        statsLock.unlock()
+
+        if pairCandidates > maxPairs {
+            throw latch(.rigidPairCapacity(
+                frame: submission.frame, required: pairCandidates,
+                capacity: maxPairs))
+        }
+        if softCandidates > maxSoft {
+            throw latch(.softContactCapacity(
+                frame: submission.frame, required: softCandidates,
+                capacity: maxSoft))
+        }
+        if colorConflicts > 0 {
+            throw latch(.unresolvedColoring(
+                frame: submission.frame,
+                conflictingBodies: colorConflicts))
+        }
+    }
+
+    /// Wait for every submitted physics frame, validate Metal completion,
+    /// then publish frame-owned statistics. The earliest failure is sticky
+    /// and permanently invalidates this solver instance.
+    public func synchronize() throws {
+        let pending = inflight
+        inflight.removeAll(keepingCapacity: true)
+        var observedFailure: AVBDError?
+        for submission in pending {
+            do {
+                try retire(submission)
+            } catch let failure as AVBDError {
+                if observedFailure == nil { observedFailure = failure }
+            }
+        }
+        if let failure = observedFailure ?? runtimeFailure { throw failure }
+    }
+
+    /// Source-compatible fail-closed wrapper. Production code that can
+    /// recover at a run boundary should call `synchronize()` directly.
     public func sync() {
-        for c in inflight { c.waitUntilCompleted() }
-        inflight.removeAll()
+        do {
+            try synchronize()
+        } catch {
+            fatalError("GPUSolver synchronization failed: \(error.localizedDescription)")
+        }
     }
 
     /// Opaque rigid-scene checkpoint for batched speculative control. Unlike
@@ -2265,7 +2549,9 @@ public final class GPUSolver {
         fileprivate var frameIndex: Int
         fileprivate var lastColorCounts: [Int]
         fileprivate var lastNumPairs: Int
+        fileprivate var lastPairCandidates: Int
         fileprivate var lastNumSoft: Int
+        fileprivate var lastSoftCandidates: Int
         fileprivate var lastMaxColorUsed: Int
     }
 
@@ -2278,7 +2564,8 @@ public final class GPUSolver {
         }
         statsLock.lock()
         let statistics = (
-            lastColorCounts, lastNumPairs, lastNumSoft, lastMaxColorUsed)
+            lastColorCounts, lastNumPairs, lastPairCandidates,
+            lastNumSoft, lastSoftCandidates, lastMaxColorUsed)
         statsLock.unlock()
         return RigidSpeculationSnapshot(
             posLin: copy(posLin), posAng: copy(posAng),
@@ -2292,7 +2579,10 @@ public final class GPUSolver {
             colorsA: copy(colorsA), colorsB: copy(colorsB),
             counters: copy(counters), frameIndex: frameIndex,
             lastColorCounts: statistics.0, lastNumPairs: statistics.1,
-            lastNumSoft: statistics.2, lastMaxColorUsed: statistics.3)
+            lastPairCandidates: statistics.2,
+            lastNumSoft: statistics.3,
+            lastSoftCandidates: statistics.4,
+            lastMaxColorUsed: statistics.5)
     }
 
     func restoreRigidSpeculationSnapshot(
@@ -2332,16 +2622,28 @@ public final class GPUSolver {
         statsLock.lock()
         lastColorCounts = snapshot.lastColorCounts
         lastNumPairs = snapshot.lastNumPairs
+        lastPairCandidates = snapshot.lastPairCandidates
         lastNumSoft = snapshot.lastNumSoft
+        lastSoftCandidates = snapshot.lastSoftCandidates
         lastMaxColorUsed = snapshot.lastMaxColorUsed
         statsLock.unlock()
     }
 
-    /// Cap the pipeline depth: deeper queues make the async color-bound
-    /// readback stale enough to skip colors (observed physics regressions).
-    private func throttle() {
+    /// Cap the pipeline depth to the two frame-owned counter readback slots.
+    private func throttleChecked() throws {
         while inflight.count >= 2 {
-            inflight.removeFirst().waitUntilCompleted()
+            let oldest = inflight.removeFirst()
+            do {
+                try retire(oldest)
+            } catch let failure as AVBDError {
+                // A terminal error invalidates every queued frame. Drain the
+                // queue before returning so no GPU work outlives its solver
+                // resources, while preserving the earliest failure.
+                let remaining = inflight
+                inflight.removeAll(keepingCapacity: true)
+                for submission in remaining { try? retire(submission) }
+                throw failure
+            }
         }
     }
 
@@ -2362,34 +2664,84 @@ public final class GPUSolver {
         return counterBuf
     }
 
+    /// Source-compatible fail-closed wrapper. RL and evaluation code should
+    /// use `submitStep()` and propagate its typed error at the run boundary.
     public func step() {
+        do {
+            try submitStep()
+        } catch {
+            fatalError("GPUSolver step failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Encode and asynchronously submit one physics frame. Synchronous
+    /// creation/encoding failures are thrown immediately; asynchronous Metal,
+    /// contact-capacity, and coloring failures surface at `synchronize()` or
+    /// when pipeline throttling retires the frame.
+    public func submitStep() throws {
+        try requireHealthy()
+        try throttleChecked()
+        if profiling || !spinners.isEmpty {
+            // Profiling retires its own submission synchronously. Drain any
+            // older asynchronous owner before selecting a parity readback
+            // slot; spinners likewise require a CPU-write boundary.
+            try synchronize()
+        }
+        do {
+            try encodeAndSubmitStep()
+        } catch let failure as AVBDError {
+            // A synchronous failure in frame N must still retire every older
+            // submitted frame before it reaches the caller. Otherwise the
+            // throwing API would return while Metal continued mutating the
+            // solver behind an already-failed rollout boundary.
+            let pending = inflight
+            inflight.removeAll(keepingCapacity: true)
+            var earlierFailure: AVBDError?
+            for submission in pending {
+                do {
+                    try retire(submission)
+                } catch let prior as AVBDError {
+                    if earlierFailure == nil { earlierFailure = prior }
+                }
+            }
+            if let earlierFailure { throw earlierFailure }
+            throw latch(failure)
+        }
+    }
+
+    private func encodeAndSubmitStep() throws {
         syncParams()
-        frameIndex += 1
-        throttle()
-        if !spinners.isEmpty { sync() }   // spinner poses are CPU writes
-        advanceSpinners()
+        let submittedFrame = frameIndex + 1
 
         // ---- Command buffer 1: collision + warm start + adjacency + coloring
-        guard let cmd1 = queue.makeCommandBuffer() else { return }
-
-        if let blit = cmd1.makeBlitCommandEncoder() {
-            blit.fill(buffer: counters, range: 0..<counters.length, value: 0)
-            blit.fill(buffer: changedFlag, range: 0..<changedFlag.length, value: 0)
-            blit.fill(buffer: cellCount, range: 0..<(gridHashSize * 4), value: 0)
-            blit.fill(buffer: cellRigid, range: 0..<(gridHashSize * 4), value: 0)
-            if numTris > 0 {
-                // OGC conservative bounds: reset to "far" (0x7F7F7F7F ~ 3e38)
-                blit.fill(buffer: boundsBuf, range: 0..<(numBodies * 4), value: 0x7F)
-            }
-            if numTris > 0 {
-                blit.fill(buffer: elemCellCount, range: 0..<(elemHashSize * 4), value: 0)
-            }
-            blit.endEncoding()
+        guard let cmd1 = makeRuntimeCommandBuffer() else {
+            throw AVBDError.commandBufferCreation(
+                operation: "physics", frame: submittedFrame)
         }
+        cmd1.label = "AVBD physics frame \(submittedFrame)"
 
-        let sampleBuf = makeCounterBuf()
+        guard let clearEncoder = cmd1.makeBlitCommandEncoder() else {
+            throw AVBDError.commandEncoderCreation(
+                operation: "physics", stage: "clear", frame: submittedFrame)
+        }
+        clearEncoder.label = "clear"
+        clearEncoder.fill(buffer: counters, range: 0..<counters.length, value: 0)
+        clearEncoder.fill(buffer: changedFlag, range: 0..<changedFlag.length, value: 0)
+        clearEncoder.fill(buffer: cellCount, range: 0..<(gridHashSize * 4), value: 0)
+        clearEncoder.fill(buffer: cellRigid, range: 0..<(gridHashSize * 4), value: 0)
+        if numTris > 0 {
+            // OGC conservative bounds: reset to "far" (0x7F7F7F7F ~ 3e38)
+            clearEncoder.fill(buffer: boundsBuf,
+                              range: 0..<(numBodies * 4), value: 0x7F)
+            clearEncoder.fill(buffer: elemCellCount,
+                              range: 0..<(elemHashSize * 4), value: 0)
+        }
+        clearEncoder.endEncoding()
+
+        let sampleBuf = profiling ? makeCounterBuf() : nil
         stageNames = []
         func makeEncoder(_ name: String) -> MTLComputeCommandEncoder? {
+            if deniedEncoderStageForTesting == name { return nil }
             guard let sampleBuf, stageNames.count < 63 else {
                 let e = cmd1.makeComputeCommandEncoder()
                 e?.label = name
@@ -2405,19 +2757,28 @@ public final class GPUSolver {
             e?.label = name
             return e
         }
-        guard var enc = makeEncoder("broadphase") else { return }
+        guard var enc = makeEncoder("broadphase") else {
+            throw AVBDError.commandEncoderCreation(
+                operation: "physics", stage: "broadphase",
+                frame: submittedFrame)
+        }
         // ALWAYS split encoders at stage boundaries: measured 2.5-3x faster
         // than one mega-encoder — intra-encoder hazard barriers over long
         // dispatch chains drain the pipe far harder than encoder boundaries
-        func stage(_ name: String) {
+        func stage(_ name: String) throws {
             enc.endEncoding()
-            enc = makeEncoder(name) ?? enc
+            guard let next = makeEncoder(name) else {
+                throw AVBDError.commandEncoderCreation(
+                    operation: "physics", stage: name,
+                    frame: submittedFrame)
+            }
+            enc = next
         }
         var P = params
         var nExcl = numExclusions
 
         // Broadphase
-        if profiling { stage("bp-count") }
+        if profiling { try stage("bp-count") }
         dispatch1D(enc, "bp_count", Int(P.numHashed)) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.hashedIdx, offset: 0, index: 1)
@@ -2431,9 +2792,9 @@ public final class GPUSolver {
             e.setBuffer(self.posAng, offset: 0, index: 9)
             e.setBuffer(self.colliderGroup, offset: 0, index: 10)
         }
-        if profiling { stage("bp-scan") }
+        if profiling { try stage("bp-scan") }
         encodeScan(enc, input: cellCount, output: cellStart, count: gridHashSize)
-        if profiling { stage("bp-scatter") }
+        if profiling { try stage("bp-scatter") }
         dispatch1D(enc, "bp_scatter", Int(P.numHashed)) { e in
             e.setBuffer(self.hashedIdx, offset: 0, index: 0)
             e.setBuffer(self.bodyCellSlot, offset: 0, index: 1)
@@ -2448,7 +2809,7 @@ public final class GPUSolver {
             e.setBuffer(self.cellBodies, offset: 0, index: 2)
             e.setBytes(&hashSize32, length: 4, index: 3)
         }
-        if profiling { stage("bp-pairs") }
+        if profiling { try stage("bp-pairs") }
         let pairProducerCount = Int(P.numHashed + P.numGlobals)
         if pairProducerCount > 0 {
             dispatch1D(enc, "bp_count_pairs_deterministic", pairProducerCount) { e in
@@ -2506,7 +2867,7 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
         }
 
-        stage("narrowphase")
+        try stage("narrowphase")
         // Narrowphase (warm-start from prev manifolds + map)
         dispatchIndirect(enc, "np_collide", argsOffset: 0) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -2533,7 +2894,7 @@ public final class GPUSolver {
             e.setBuffer(self.colliderFriction, offset: 0, index: 21)
         }
 
-        stage("persistence-map")
+        try stage("persistence-map")
         // Rebuild persistence map from THIS frame's manifolds (for next frame)
         dispatch1D(enc, "pm_clear", mapCapacity) { e in
             e.setBuffer(self.mapKeyA, offset: 0, index: 0)
@@ -2554,7 +2915,7 @@ public final class GPUSolver {
         // persistence map), then rebuild the map for next frame. Runs at
         // start-of-step poses like the rigid narrowphase.
         if numTris > 0 {
-            stage("el-bin")
+            try stage("el-bin")
             dispatch1D(enc, "el_count", numTris + Int(P.numEdges)) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.trisBuf, offset: 0, index: 1)
@@ -2579,7 +2940,7 @@ public final class GPUSolver {
                 e.setBuffer(self.elemCells, offset: 0, index: 5)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
             }
-            stage("vt-emit")
+            try stage("vt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
             dispatch1D(enc, "vt_emit", numParticles) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -2611,7 +2972,7 @@ public final class GPUSolver {
                 e.setBuffer(self.clothVertFlag, offset: 0, index: 26)
             }
             }
-            stage("ee-emit")
+            try stage("ee-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_EE"] == nil {
             dispatch1D(enc, "ee_emit", numEdges) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -2644,7 +3005,7 @@ public final class GPUSolver {
                 e.setBuffer(self.clothVertFlag, offset: 0, index: 27)
             }
             }
-            stage("rt-emit")
+            try stage("rt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_RT"] == nil {
             dispatch1D(enc, "rt_emit", numTris) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -2670,7 +3031,7 @@ public final class GPUSolver {
                 e.setBuffer(self.hashedRigidIdx, offset: 0, index: 20)
             }
             }
-            stage("softmap")
+            try stage("softmap")
             dispatch1D(enc, "soft_finalize", 1) { e in
                 e.setBuffer(self.counters, offset: 0, index: 0)
                 e.setBuffer(self.dispatchArgs, offset: 0, index: 1)
@@ -2690,7 +3051,7 @@ public final class GPUSolver {
             }
         }
 
-        stage("warmstart")
+        try stage("warmstart")
         // Warm start joints (before body prediction; uses start-of-step poses)
         dispatch1D(enc, "warmstart_joints", numJoints + numSprings) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -2720,7 +3081,7 @@ public final class GPUSolver {
             e.setBuffer(self.gravityScale, offset: 0, index: 14)
         }
 
-        stage("adjacency")
+        try stage("adjacency")
         // Adjacency
         var nb32 = UInt32(numBodies)
         dispatch1D(enc, "adj_clear_degrees", numBodies) { e in
@@ -2777,7 +3138,7 @@ public final class GPUSolver {
         //   coloring — box stacks and gear trains genuinely need strict
         //   Gauss-Seidel contact ordering (stack/gearclock fail without).
         if usesDynamicColoring {
-            stage("coloring")
+            try stage("coloring")
             var src = colorsA, dst = colorsB
             for pass in 0..<20 {
                 dispatch1D(enc, "color_iterate", numBodies) { e in
@@ -2802,6 +3163,23 @@ public final class GPUSolver {
                 swap(&src, &dst)
             }
             let finalColors = src
+            dispatch1D(enc, "color_validate", numBodies) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.joints, offset: 0, index: 1)
+                e.setBuffer(self.springs, offset: 0, index: 2)
+                e.setBuffer(self.manifolds, offset: 0, index: 3)
+                e.setBuffer(self.adjStart, offset: 0, index: 4)
+                e.setBuffer(self.degrees, offset: 0, index: 5)
+                e.setBuffer(self.adjList, offset: 0, index: 6)
+                e.setBuffer(finalColors, offset: 0, index: 7)
+                e.setBuffer(self.counters, offset: 0, index: 8)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 9)
+                e.setBuffer(self.tets, offset: 0, index: 10)
+                e.setBuffer(self.softContacts, offset: 0, index: 11)
+                e.setBuffer(self.membranes, offset: 0, index: 12)
+                e.setBuffer(self.bends, offset: 0, index: 13)
+            }
             dispatch1D(enc, "color_count", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(finalColors, offset: 0, index: 1)
@@ -2826,7 +3204,7 @@ public final class GPUSolver {
                 dynColorSrc = finalColors
             }
         }
-        stage("solver-iterations")
+        try stage("solver-iterations")
         let persistPSO = ps("solve_persistent")
         let multiPSO = ps("solve_persistent_multi")
         // Multi-threadgroup persistent path: whole solve in one dispatch of
@@ -2913,9 +3291,12 @@ public final class GPUSolver {
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
         } else {
+        // Dynamic indirect dispatch sizes are produced by this same command
+        // buffer. Dispatch every representable color: zero-count indirect
+        // calls are empty, while relying on an asynchronous CPU color bound
+        // previously required a racy in-place "tail" solve.
         let colorBound = usesDynamicColoring
-            ? min(AVBD_MAX_COLORS, max(lastMaxColorUsed + 2, 4))
-            : staticUsedColors
+            ? AVBD_MAX_COLORS : staticUsedColors
         // Rigid scenes use the 8-lane cooperative split primal too: dense
         // piles average 12-27 manifolds/body and the one-thread-per-body
         // kernel was latency-bound walking them serially (boxpile x12
@@ -2959,7 +3340,7 @@ public final class GPUSolver {
                 enc.setBuffer(self.counters, offset: 0, index: 24)
             }
             _ = it
-            if profiling { stage("solve-primal") ; enc.setComputePipelineState(primalPSO)
+            if profiling { try stage("solve-primal") ; enc.setComputePipelineState(primalPSO)
                 enc.setBuffer(posLin, offset: 0, index: 0)
                 enc.setBuffer(posAng, offset: 0, index: 1)
                 enc.setBuffer(initLin, offset: 0, index: 2)
@@ -2998,20 +3379,7 @@ public final class GPUSolver {
                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
                 }
             }
-            // tail: bodies in colors >= colorBound (the async bound can be
-            // stale; skipped bodies would fly ballistic — see kernel
-            // comment). Static palettes are exact: no tail needed.
-            if usesDynamicColoring {
-                let p = ps("primal_tail")
-                enc.setComputePipelineState(p)
-                var cb = UInt32(colorBound)
-                enc.setBytes(&cb, length: 4, index: 15)
-                enc.dispatchThreadgroups(MTLSize(width: (numBodies + 63) / 64, height: 1, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
-                enc.setComputePipelineState(primalPSO)
-            }
-
-            if profiling { stage("solve-dual") }
+            if profiling { try stage("solve-dual") }
             dispatchIndirect(enc, "dual_all", argsOffset: 6) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.posAng, offset: 0, index: 1)
@@ -3058,7 +3426,7 @@ public final class GPUSolver {
         }
 
         }
-        stage("finalize")
+        try stage("finalize")
         dispatch1D(enc, "finalize_velocities", numBodies) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.posAng, offset: 0, index: 1)
@@ -3078,74 +3446,76 @@ public final class GPUSolver {
         if numTris > 0 && visc > 0 {
             // scratch copy for the gather (inertLin is dead after the solve
             // and rewritten by next frame's warmstart)
-            if let blit = cmd1.makeBlitCommandEncoder() {
-                blit.copy(from: velLin, sourceOffset: 0,
-                          to: inertLin, destinationOffset: 0, size: numBodies * 16)
-                blit.endEncoding()
+            guard let blit = cmd1.makeBlitCommandEncoder() else {
+                throw AVBDError.commandEncoderCreation(
+                    operation: "physics", stage: "viscosity-copy",
+                    frame: submittedFrame)
             }
-            if let e2 = cmd1.makeComputeCommandEncoder() {
-                let p = ps("smooth_particle_velocities")
-                e2.setComputePipelineState(p)
-                e2.setBuffer(velLin, offset: 0, index: 0)
-                e2.setBuffer(inertLin, offset: 0, index: 1)
-                e2.setBuffer(particleIdxBuf, offset: 0, index: 2)
-                e2.setBuffer(nbrStart, offset: 0, index: 3)
-                e2.setBuffer(nbrCount, offset: 0, index: 4)
-                e2.setBuffer(nbrList, offset: 0, index: 5)
-                e2.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
-                e2.setBytes(&visc, length: 4, index: 7)
-                e2.dispatchThreadgroups(MTLSize(width: (max(1, numParticles) + 63) / 64,
-                                                height: 1, depth: 1),
-                                        threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
-                e2.endEncoding()
-            }
-        }
-        if let src2 = dynColorSrc, let blit = cmd1.makeBlitCommandEncoder() {
-            blit.copy(from: src2, sourceOffset: 0,
-                      to: colorsA, destinationOffset: 0, size: numBodies * 4)
+            blit.label = "viscosity-copy"
+            blit.copy(from: velLin, sourceOffset: 0,
+                      to: inertLin, destinationOffset: 0, size: numBodies * 16)
             blit.endEncoding()
-            dynColorSrc = nil
+            guard deniedEncoderStageForTesting != "velocity-smoothing",
+                  let e2 = cmd1.makeComputeCommandEncoder() else {
+                throw AVBDError.commandEncoderCreation(
+                    operation: "physics", stage: "velocity-smoothing",
+                    frame: submittedFrame)
+            }
+            e2.label = "velocity-smoothing"
+            let p = ps("smooth_particle_velocities")
+            e2.setComputePipelineState(p)
+            e2.setBuffer(velLin, offset: 0, index: 0)
+            e2.setBuffer(inertLin, offset: 0, index: 1)
+            e2.setBuffer(particleIdxBuf, offset: 0, index: 2)
+            e2.setBuffer(nbrStart, offset: 0, index: 3)
+            e2.setBuffer(nbrCount, offset: 0, index: 4)
+            e2.setBuffer(nbrList, offset: 0, index: 5)
+            e2.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
+            e2.setBytes(&visc, length: 4, index: 7)
+            e2.dispatchThreadgroups(
+                MTLSize(width: (max(1, numParticles) + 63) / 64,
+                        height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+            e2.endEncoding()
         }
-        let dynColors = usesDynamicColoring
-        let readStats = { [weak self] in
-            guard let self else { return }
-            let ctr = self.counters.contents()
-                .bindMemory(to: UInt32.self, capacity: GPUCounters.total)
-            let pairs = Int(ctr[GPUCounters.pairs])
-            let softN = min(Int(ctr[GPUCounters.soft]), self.maxSoft)
-            // Saturated capacity = contacts silently dropped (random subset,
-            // GPU arrival order) = non-deterministic sink-through. Never hide.
-            if pairs >= self.maxPairs && !self.warnedPairSaturation {
-                self.warnedPairSaturation = true
-                print("AVBD WARNING: pair list saturated (\(pairs)/\(self.maxPairs)) — contacts dropped; raise maxPairsPerBody")
-            }
-            if Int(ctr[GPUCounters.soft]) >= self.maxSoft && !self.warnedSoftSaturation {
-                self.warnedSoftSaturation = true
-                print("AVBD WARNING: soft contact list saturated (\(self.maxSoft)) — contacts dropped")
-            }
-            self.statsLock.lock()
-            self.lastNumPairs = pairs
-            self.lastNumSoft = softN
-            if dynColors {
-                var counts: [Int] = []
-                var maxUsed = -1
-                for c in 0..<AVBD_MAX_COLORS {
-                    let n = Int(ctr[GPUCounters.colorBase + c])
-                    counts.append(n)
-                    if n > 0 { maxUsed = c }
-                }
-                self.lastColorCounts = counts
-                self.lastMaxColorUsed = maxUsed
-            }
-            self.statsLock.unlock()
+        guard let readbackEncoder = cmd1.makeBlitCommandEncoder() else {
+            throw AVBDError.commandEncoderCreation(
+                operation: "physics", stage: "readback",
+                frame: submittedFrame)
         }
+        readbackEncoder.label = "readback"
+        if let source = dynColorSrc {
+            readbackEncoder.copy(from: source, sourceOffset: 0,
+                                 to: colorsA, destinationOffset: 0,
+                                 size: numBodies * 4)
+        }
+        let counterSnapshot = counterReadbacks[(submittedFrame - 1) & 1]
+        readbackEncoder.copy(from: counters, sourceOffset: 0,
+                             to: counterSnapshot, destinationOffset: 0,
+                             size: counters.length)
+        readbackEncoder.endEncoding()
+        dynColorSrc = nil
+
+        // CPU-authored kinematic poses are advanced only once the entire
+        // frame encoded successfully, so creation failures do not consume
+        // simulation time or move spinners.
+        advanceSpinners()
+        frameIndex = submittedFrame
+        let submission = StepSubmission(
+            commandBuffer: cmd1, counterSnapshot: counterSnapshot,
+            frame: submittedFrame,
+            usesDynamicColoring: usesDynamicColoring)
+        cmd1.commit()
+
+        // Buffer identity is a submitted-frame contract even if retirement
+        // later discovers a terminal Metal or capacity failure.
+        swap(&manifolds, &prevManifolds)
+        if numTris > 0 { swap(&softContacts, &prevSoftContacts) }
+
         if profiling {
-            cmd1.commit()
-            cmd1.waitUntilCompleted()
+            try retire(submission)
         } else {
-            cmd1.addCompletedHandler { _ in readStats() }
-            cmd1.commit()
-            inflight.append(cmd1)
+            inflight.append(submission)
         }
 
         if profiling, let sampleBuf,
@@ -3169,10 +3539,6 @@ public final class GPUSolver {
             profileFrames += 1
         }
 
-        if profiling { readStats() }
-
-        swap(&manifolds, &prevManifolds)
-        if numTris > 0 { swap(&softContacts, &prevSoftContacts) }
     }
 
     /// Advance kinematic spinners (static bodies with prescribed rotation).
@@ -3355,8 +3721,33 @@ public final class GPUSolver {
     /// Encode instance-transform building into a render command buffer.
     public func encodeBuildInstances(_ cmd: MTLCommandBuffer, instances: MTLBuffer,
                                      colorMode: UInt32 = 0) {
-        // no sync: instances are built on the GPU; queue order serializes
-        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        do {
+            try encodeBuildInstancesChecked(
+                cmd, instances: instances, colorMode: colorMode)
+        } catch {
+            fatalError("Render-instance encoding failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Checked render-instance encoding. A render encoder failure invalidates
+    /// the visual frame, but it does not poison an otherwise healthy physics
+    /// solver because the caller owns this separate render command buffer.
+    public func encodeBuildInstancesChecked(
+        _ cmd: MTLCommandBuffer, instances: MTLBuffer,
+        colorMode: UInt32 = 0
+    ) throws {
+        // The caller may own a different Metal queue. Retire all preceding
+        // physics before that queue reads solver buffers; the caller must in
+        // turn finish this render command before submitting the next physics
+        // mutation (AVBDApp enforces that at the frame boundary).
+        try synchronize()
+        guard deniedEncoderStageForTesting != "render-instances",
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw AVBDError.commandEncoderCreation(
+                operation: "render instances", stage: "build-instances",
+                frame: frameIndex)
+        }
+        enc.label = "build-instances"
         var cm = colorMode
         if renderRigidBodyCount > 0 {
             var nb = UInt32(renderRigidBodyCount)
@@ -3554,10 +3945,30 @@ public final class GPUSolver {
 
     /// Max constraint error: hard-joint violation + contact penetration depth.
     public func maxConstraintError() -> Float {
-        sync()
+        do {
+            return try maxConstraintErrorChecked()
+        } catch {
+            fatalError("Constraint diagnostics failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Checked diagnostics never translate a Metal failure into a false
+    /// perfect zero error.
+    public func maxConstraintErrorChecked() throws -> Float {
+        try synchronize()
         syncParams()
-        guard let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeComputeCommandEncoder() else { return 0 }
+        guard let cmd = makeRuntimeCommandBuffer() else {
+            throw latch(.commandBufferCreation(
+                operation: "constraint diagnostics", frame: frameIndex))
+        }
+        guard deniedEncoderStageForTesting != "constraint diagnostics",
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw latch(.commandEncoderCreation(
+                operation: "constraint diagnostics", stage: "diagnostics",
+                frame: frameIndex))
+        }
+        cmd.label = "AVBD constraint diagnostics"
+        enc.label = "constraint diagnostics"
         var P = params
         dispatch1D(enc, "diag_clear", 1) { e in
             e.setBuffer(self.diag, offset: 0, index: 0)
@@ -3574,7 +3985,8 @@ public final class GPUSolver {
         }
         enc.endEncoding()
         cmd.commit()
-        cmd.waitUntilCompleted()
+        try waitForCompletion(
+            cmd, operation: "constraint diagnostics", frame: frameIndex)
         let bits = diag.contents().load(as: UInt32.self)
         return Float(bitPattern: bits)
     }

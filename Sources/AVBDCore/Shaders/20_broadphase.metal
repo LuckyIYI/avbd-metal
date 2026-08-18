@@ -495,6 +495,8 @@ kernel void bp_finalize_deterministic_pairs(
     uint producers = P.numHashed + P.numGlobals;
     uint n = producers == 0 ? 0
         : pairStarts[producers - 1] + pairCounts[producers - 1];
+    atomic_store_explicit(&counters[CTR_PAIR_CANDIDATES], n,
+                          memory_order_relaxed);
     n = min(n, P.maxPairs);
     atomic_store_explicit(&counters[CTR_PAIRS], n, memory_order_relaxed);
     dispatchArgs[0] = (n + 63) / 64;
@@ -519,6 +521,8 @@ kernel void bp_finalize_pairs(
     constant SimParams& P           [[buffer(2)]])
 {
     uint n = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
+    atomic_store_explicit(&counters[CTR_PAIR_CANDIDATES], n,
+                          memory_order_relaxed);
     n = min(n, P.maxPairs);
     atomic_store_explicit(&counters[CTR_PAIRS], n, memory_order_relaxed);
     dispatchArgs[0] = (n + 63) / 64;
