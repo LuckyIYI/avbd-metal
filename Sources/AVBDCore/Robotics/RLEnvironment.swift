@@ -214,6 +214,14 @@ public struct RLObservationBatch: Sendable {
             throw RLEnvironmentError.invalidObservationCount(expected: privilegedExpected,
                                                               actual: privileged.count)
         }
+        if let index = policy.firstIndex(where: { !$0.isFinite }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy observation at flat index \(index) is not finite")
+        }
+        if let index = privileged.firstIndex(where: { !$0.isFinite }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "privileged observation at flat index \(index) is not finite")
+        }
     }
 }
 
@@ -280,6 +288,42 @@ public struct RLStepBatch: Sendable {
         guard finalObservations.count == expectedFinal else {
             throw RLEnvironmentError.invalidObservationCount(expected: expectedFinal,
                                                               actual: finalObservations.count)
+        }
+        if let index = rewards.firstIndex(where: { !$0.isFinite }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "reward at environment \(index) is not finite")
+        }
+        if let index = finalObservations.firstIndex(where: { !$0.isFinite }) {
+            throw RLEnvironmentError.invalidConfiguration(
+                "final observation at flat index \(index) is not finite")
+        }
+        for name in metrics.keys.sorted() {
+            guard let values = metrics[name] else { continue }
+            guard values.count == n else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "metric '\(name)' has \(values.count) rows; expected \(n)")
+            }
+            if let index = values.firstIndex(where: { !$0.isFinite }) {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "metric '\(name)' at environment \(index) is not finite")
+            }
+        }
+        for environment in 0..<n {
+            // Gymnasium permits termination and truncation to coincide. A
+            // true terminal state must never be bootstrapped even when the
+            // time limit also fired, so only a pure auto-reset truncation
+            // requires the pre-reset observation side channel.
+            if spec.autoReset && truncated[environment]
+                && !terminated[environment]
+                && !hasFinalObservation[environment] {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "truncated environment \(environment) has no final observation")
+            }
+            if hasFinalObservation[environment]
+                && !terminated[environment] && !truncated[environment] {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "environment \(environment) publishes a final observation without ending")
+            }
         }
     }
 }
@@ -653,12 +697,14 @@ public extension VectorizedRLTask {
     func reset(seed: UInt64) throws -> RLObservationBatch {
         var result = RLObservationBatch(spec: spec)
         try reset(environments: nil, seed: seed, into: &result)
+        try result.validate(for: spec)
         return result
     }
 
     func step(actions: RLActionBatch) throws -> RLStepBatch {
         var result = RLStepBatch(spec: spec)
         try step(actions: actions, into: &result)
+        try result.validate(for: spec)
         return result
     }
 

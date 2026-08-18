@@ -4682,6 +4682,7 @@ public final class VectorPPOTrainer {
                     numEnvironments: n, actionDimension: actionDim,
                     values: ContiguousArray(actionHost))
                 try task.step(actions: actionBatch, into: &stepResult)
+                try stepResult.validate(for: spec)
                 for (name, values) in stepResult.metrics
                     where name.hasPrefix("reward/")
                         || name.hasPrefix("penalty/")
@@ -4695,7 +4696,12 @@ public final class VectorPPOTrainer {
                 var adjustedRewards = stepResult.rewards.map {
                     $0 * configuration.resolvedRewardScale
                 }
-                if stepResult.truncated.contains(true) {
+                let hasBootstrapTruncation = (0..<n).contains {
+                    Self.shouldBootstrapFinalObservation(
+                        terminated: stepResult.terminated[$0],
+                        truncated: stepResult.truncated[$0])
+                }
+                if hasBootstrapTruncation {
                     var final = stepResult.finalObservations
                     if usesSymmetryDataAugmentation, let policySymmetry {
                         let mirroredFinal = policySymmetry
@@ -4716,7 +4722,9 @@ public final class VectorPPOTrainer {
                             repeating: 0, count: n)).value
                     eval(finalValues)
                     let host = finalValues.asArray(Float.self)
-                    for e in 0..<n where stepResult.truncated[e] {
+                    for e in 0..<n where Self.shouldBootstrapFinalObservation(
+                        terminated: stepResult.terminated[e],
+                        truncated: stepResult.truncated[e]) {
                         adjustedRewards[e] += configuration.gamma * host[e]
                     }
                 }
@@ -5515,6 +5523,7 @@ public final class VectorPPOTrainer {
                 actionDimension: spec.action.elementCount,
                 values: actionValues)
             try task.step(actions: actionBatch, into: &stepResult)
+            try stepResult.validate(for: spec)
             var resetGroups = [Int: [Int]]()
             for e in 0..<spec.numEnvironments {
                 guard active[e] else { continue }
@@ -5556,6 +5565,7 @@ public final class VectorPPOTrainer {
                         base: seed, episodeIndex: episodeIndex),
                     into: &observation)
             }
+            try observation.validate(for: spec)
             controlSteps += 1
         }
         guard completedReturns.count == requestedEpisodes else {
@@ -5651,6 +5661,14 @@ public final class VectorPPOTrainer {
                                       episodeIndex: Int) -> UInt64 {
         precondition(episodeIndex >= 0)
         return base &+ UInt64(episodeIndex) &* 0xD1B54A32D192ED03
+    }
+
+    /// A time-limit transition bootstraps only when the task did not also
+    /// reach a true terminal state on that same control step.
+    static func shouldBootstrapFinalObservation(
+        terminated: Bool, truncated: Bool
+    ) -> Bool {
+        truncated && !terminated
     }
 
     public static func gaussianLogProbability(_ action: MLXArray, mean: MLXArray,
