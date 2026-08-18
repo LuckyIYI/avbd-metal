@@ -1,0 +1,42 @@
+Isaac Lab H1 flat-velocity configuration attribution
+====================================================
+
+AVBD's H1 flat-velocity task and Isaac control profile adapt configuration
+concepts and numeric values from Isaac Lab. The pinned source is licensed under
+BSD-3-Clause; the adjacent LICENSE is an unmodified copy of its repository
+license.
+
+Project: Isaac Lab
+Repository: https://github.com/isaac-sim/IsaacLab
+Release: v2.3.2
+Revision: 37ddf626871758333d6ed89cf64ad702aef127d0
+
+The adapted boundary includes the H1 home pose, implicit-actuator stiffness,
+damping and simulation effort limits; disabled robot self-collision; the
+0.005-second physics step and four-step control decimation; 0.5-radian joint
+position offsets; the 69-value flat-policy observation order and uniform noise
+ranges; 10-second velocity-command resampling, two-percent standing commands,
+heading control and H1 command ranges; flat terrain without a height scan; the
+H1 velocity-tracking, orientation, action-rate, acceleration, ankle-limit,
+nonessential-joint, positive-biped air-time and foot-slide objective structure;
+and torso-contact termination. The upstream flat PPO configuration also
+informed the compatible 24-step, ELU, Gaussian, 128x128x128 actor/critic recipe
+and standard clipped-PPO hyperparameters documented in the manifest.
+
+This is an adaptation, not an exact Isaac Lab environment or policy port. AVBD
+uses a separately attributed MuJoCo Menagerie H1 plant, AVBD's own AVBD/Metal
+solver and contact implementation, generated Menagerie collision support sets,
+and its own Swift task and MLX PPO implementations. Reward rates are integrated
+over AVBD's control step. AVBD uses its own solver iteration count, evaluation
+criteria, task revisions, symmetry support, batching, reset bookkeeping and
+checkpoint format. Point-goal navigation, rigid-box projectiles, recovery
+experts and related shaping are AVBD extensions, not Isaac Lab adaptations.
+Exact training settings remain per-checkpoint metadata; AVBD does not claim that
+every H1 run uses the pinned RSL-RL recipe or that an AVBD policy is an upstream
+Isaac Lab checkpoint.
+
+No Isaac Lab USD, mesh, texture, policy checkpoint, Python source file or other
+asset is redistributed by this directory. The adjacent provenance manifest
+pins every consulted upstream source file by SHA-256 and records the local
+adaptation boundary. Unitree H1 plant and collision-geometry provenance is
+documented separately under Assets/unitree_h1.
