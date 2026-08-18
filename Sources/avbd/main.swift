@@ -2037,9 +2037,10 @@ case "train-rl":
     let task = try BuiltInRLTasks.registry.make(
         taskID, configuration: RLTaskConfiguration(
             numEnvironments: o.envs, seed: o.seed, options: o.taskOptions))
-    guard o.algorithm == "ppo" else {
+    let algorithmRegistry = VectorRLAlgorithmRegistry.builtIn
+    guard algorithmRegistry.algorithmIDs.contains(o.algorithm) else {
         fail("algorithm '\(o.algorithm)' is not configured; available: "
-             + VectorRLAlgorithmRegistry.builtIn.algorithmIDs.joined(separator: ", "))
+             + algorithmRegistry.algorithmIDs.joined(separator: ", "))
     }
     let config = VectorPPOConfig(
         updates: o.updates, rolloutSteps: o.horizon,
@@ -2089,9 +2090,12 @@ case "train-rl":
     tunedConfig.targetKL = o.targetKL
     tunedConfig.klSchedule = o.klSchedule
     tunedConfig.checkpointInterval = o.checkpointInterval
-    let trainer = VectorPPOTrainer(configuration: tunedConfig)
-    try trainer.train(task: task, outputDirectory: "runs/\(taskID)/\(o.runName)",
-                      resume: o.resume)
+    let algorithm = try algorithmRegistry.make(
+        o.algorithm, configuration: tunedConfig)
+    _ = try algorithm.train(VectorRLTrainingRequest(
+        task: task,
+        outputDirectory: "runs/\(taskID)/\(o.runName)",
+        continuation: o.resume ? .warmResumeLatest : .fresh))
 
 case "eval-rl":
     guard args.count > 1 else {
