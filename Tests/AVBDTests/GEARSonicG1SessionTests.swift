@@ -468,9 +468,6 @@ final class GEARSonicG1SessionTests: XCTestCase {
                 "checkpoints/external/gear-sonic-g1/references/"
                     + "dance_in_da_party_001__A464",
                 isDirectory: true).path,
-            "/tmp/avbd-policy-research/GR00T-WholeBodyControl/"
-                + "gear_sonic_deploy/reference/example/"
-                + "dance_in_da_party_001__A464",
         ].compactMap { $0 }.map {
             URL(fileURLWithPath: $0, isDirectory: true)
         }

@@ -1107,9 +1107,7 @@ extension Demos {
 
     private static func loadDefaultSkinMeshWithKey(meshPath: String?) -> (SurfaceMesh, String) {
         let envPath = ProcessInfo.processInfo.environment["AVBD_SKIN_MESH"]
-        let desktop = "/Users/lakiiinbor/Desktop/bunny.obj"
-        let path = meshPath ?? envPath ?? (FileManager.default.fileExists(atPath: desktop)
-                                           ? desktop : nil)
+        let path = meshPath ?? envPath
         if let path {
             let key = skinMeshFileKey(path)
             let mesh = SkinnedSoftMeshCache.shared.mesh(for: key) {
