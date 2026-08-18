@@ -30,6 +30,9 @@ public struct VectorPolicyDeploymentManifest: Codable, Sendable, Equatable {
 
 public enum VectorPolicyDeploymentBundle {
     public static let manifestFileName = "deployment-manifest.json"
+    public static let policyFileName = "policy.safetensors"
+    public static let metadataFileName = "metadata.json"
+    public static let trainingStateFileName = "training-state.json"
 
     /// Export only deterministic inference state, preserving byte identity.
     /// Refusing to overwrite an existing directory prevents a field bundle
@@ -54,11 +57,11 @@ public enum VectorPolicyDeploymentBundle {
         }
 
         let metadataData = try Data(contentsOf: source.appendingPathComponent(
-            "metadata.json"))
+            metadataFileName))
         let policyData = try Data(contentsOf: source.appendingPathComponent(
-            "policy.safetensors"))
+            policyFileName))
         let trainingStateData = try Data(contentsOf: source.appendingPathComponent(
-            "training-state.json"))
+            trainingStateFileName))
         guard !metadataData.isEmpty, !policyData.isEmpty,
               !trainingStateData.isEmpty else {
             throw RLEnvironmentError.invalidConfiguration(
@@ -68,6 +71,7 @@ public enum VectorPolicyDeploymentBundle {
             VectorPolicyMetadata.self, from: metadataData)
         let trainingState = try JSONDecoder().decode(
             VectorPPOTrainingState.self, from: trainingStateData)
+        try VectorPolicyRunner.validateMetadata(metadata)
         guard let taskRevision = metadata.taskRevision,
               let taskConfiguration = metadata.taskConfiguration,
               let architectureVersion = metadata.architectureVersion,
@@ -76,8 +80,14 @@ public enum VectorPolicyDeploymentBundle {
             throw RLEnvironmentError.invalidConfiguration(
                 "deployment requires a current, fully specified checkpoint")
         }
-        let fingerprint = try VectorPPOTrainer.checkpointFingerprint(
-            directory: checkpointDirectory)
+        guard trainingState.completedUpdates >= 0,
+              trainingState.environmentSteps >= 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "deployment training counters must be non-negative")
+        }
+        let fingerprint = VectorPPOTrainer.checkpointFingerprint(
+            metadataData: metadataData, policyData: policyData,
+            trainingStateData: trainingStateData)
         let policyDigest = SHA256.hash(data: policyData).map {
             String(format: "%02x", $0)
         }.joined()
@@ -87,9 +97,9 @@ public enum VectorPolicyDeploymentBundle {
             taskRevision: taskRevision,
             checkpointFingerprint: fingerprint,
             policySHA256: policyDigest,
-            policyFile: "policy.safetensors",
-            metadataFile: "metadata.json",
-            trainingStateFile: "training-state.json",
+            policyFile: policyFileName,
+            metadataFile: metadataFileName,
+            trainingStateFile: trainingStateFileName,
             architectureVersion: architectureVersion,
             observationDimension: metadata.observationDimension,
             actionDimension: metadata.actionDimension,
@@ -117,12 +127,12 @@ public enum VectorPolicyDeploymentBundle {
             if !published { try? manager.removeItem(at: staging) }
         }
         try metadataData.write(
-            to: staging.appendingPathComponent("metadata.json"), options: .atomic)
+            to: staging.appendingPathComponent(metadataFileName), options: .atomic)
         try policyData.write(
-            to: staging.appendingPathComponent("policy.safetensors"),
+            to: staging.appendingPathComponent(policyFileName),
             options: .atomic)
         try trainingStateData.write(
-            to: staging.appendingPathComponent("training-state.json"),
+            to: staging.appendingPathComponent(trainingStateFileName),
             options: .atomic)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

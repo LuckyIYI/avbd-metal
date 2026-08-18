@@ -71,14 +71,14 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
                 "deployment checkpoint fingerprint does not match the "
                     + "commissioned policy")
         }
-        for name in [decodedManifest.policyFile,
-                     decodedManifest.metadataFile,
-                     decodedManifest.trainingStateFile] {
-            guard !name.isEmpty,
-                  URL(fileURLWithPath: name).lastPathComponent == name else {
-                throw RLEnvironmentError.invalidConfiguration(
-                    "deployment manifest contains a non-local file name")
-            }
+        guard decodedManifest.policyFile
+                == VectorPolicyDeploymentBundle.policyFileName,
+              decodedManifest.metadataFile
+                == VectorPolicyDeploymentBundle.metadataFileName,
+              decodedManifest.trainingStateFile
+                == VectorPolicyDeploymentBundle.trainingStateFileName else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "deployment manifest must use canonical checkpoint file names")
         }
 
         let metadataData = try Data(contentsOf: root.appendingPathComponent(
@@ -98,8 +98,9 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
             throw RLEnvironmentError.invalidConfiguration(
                 "deployment policy SHA-256 does not match its manifest")
         }
-        let fingerprint = try VectorPPOTrainer.checkpointFingerprint(
-            directory: root.path)
+        let fingerprint = VectorPPOTrainer.checkpointFingerprint(
+            metadataData: metadataData, policyData: policyData,
+            trainingStateData: trainingStateData)
         guard fingerprint == decodedManifest.checkpointFingerprint else {
             throw RLEnvironmentError.invalidConfiguration(
                 "deployment checkpoint fingerprint does not match its manifest")
@@ -111,7 +112,8 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
         manifest = decodedManifest
         metadata = decodedMetadata
         trainingState = decodedTrainingState
-        runner = try VectorPolicyRunner(checkpointDirectory: root.path)
+        runner = try VectorPolicyRunner(
+            metadataData: metadataData, policyData: policyData)
     }
 
     public func actions(
@@ -134,6 +136,7 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
         metadata: VectorPolicyMetadata,
         trainingState: VectorPPOTrainingState
     ) throws {
+        try VectorPolicyRunner.validateMetadata(metadata)
         guard manifest.task == metadata.task,
               manifest.taskRevision == metadata.taskRevision,
               manifest.architectureVersion == metadata.architectureVersion,
@@ -162,25 +165,16 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
             throw RLEnvironmentError.invalidConfiguration(
                 "deployment timing or tensor dimensions are invalid")
         }
+        guard trainingState.completedUpdates >= 0,
+              trainingState.environmentSteps >= 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "deployment training counters must be non-negative")
+        }
         let derivedFrequency = 1 / (manifest.simulationStepSeconds
             * Float(manifest.controlDecimation))
         guard abs(derivedFrequency - manifest.controlFrequencyHz) < 1e-3 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "deployment control frequency is internally inconsistent")
-        }
-        let normalizer = metadata.normalizer
-        guard normalizer.mean.count == manifest.observationDimension,
-              normalizer.variance.count == manifest.observationDimension,
-              normalizer.count.isFinite, normalizer.count >= 0,
-              normalizer.mean.allSatisfy(\.isFinite),
-              normalizer.variance.allSatisfy({ $0.isFinite && $0 > 0 }) else {
-            throw RLEnvironmentError.invalidConfiguration(
-                "deployment observation normalizer is invalid")
-        }
-        guard VectorActorCritic.compatibleArchitectureVersions.contains(
-            manifest.architectureVersion) else {
-            throw RLEnvironmentError.invalidConfiguration(
-                "deployment policy architecture is not supported")
         }
     }
 }

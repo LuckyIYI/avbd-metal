@@ -3318,29 +3318,319 @@ public final class VectorPolicyRunner {
     private let policy: VectorActorCritic
     private let normalizer: RunningObservationNormalizer
 
-    public init(checkpointDirectory: String) throws {
-        let metadataURL = URL(fileURLWithPath: "\(checkpointDirectory)/metadata.json")
-        metadata = try JSONDecoder().decode(
-            VectorPolicyMetadata.self, from: Data(contentsOf: metadataURL))
-        guard VectorActorCritic.compatibleArchitectureVersions.contains(
-            metadata.architectureVersion ?? 1) else {
+    public convenience init(checkpointDirectory: String) throws {
+        let root = URL(fileURLWithPath: checkpointDirectory, isDirectory: true)
+        let metadataData = try Data(contentsOf: root.appendingPathComponent(
+            "metadata.json"))
+        let policyData = try Data(contentsOf: root.appendingPathComponent(
+            "policy.safetensors"))
+        try self.init(metadataData: metadataData, policyData: policyData)
+    }
+
+    /// Construct from the exact bytes already authenticated by a deployment
+    /// manifest. Keeping this initializer internal prevents callers from
+    /// bypassing the public checkpoint contract while allowing deployment to
+    /// close the path re-read/TOCTOU window.
+    init(metadataData: Data, policyData: Data) throws {
+        let decodedMetadata = try JSONDecoder().decode(
+            VectorPolicyMetadata.self, from: metadataData)
+        try Self.validateMetadata(decodedMetadata)
+
+        let minimumPayloadBytes = try Self.expectedPolicyPayloadByteCount(
+            metadata: decodedMetadata)
+        guard policyData.count >= minimumPayloadBytes else {
             throw RLEnvironmentError.invalidConfiguration(
-                "legacy policy architecture is not replayable; train a fresh checkpoint")
+                "policy checkpoint is smaller than its declared tensor geometry")
         }
-        policy = VectorActorCritic(
-            observationDimension: metadata.observationDimension,
-            actionDimension: metadata.actionDimension,
-            hiddenSize: metadata.ppo.hiddenSize,
-            hiddenDimensions: metadata.ppo.hiddenDimensions,
-            initialActionStd: metadata.ppo.initialActionStd,
-            activation: metadata.ppo.resolvedActivation)
-        let sourceWeights = try loadArrays(
-            url: URL(fileURLWithPath: "\(checkpointDirectory)/policy.safetensors"))
+
+        // Metadata and all checked integer geometry are validated before MLX
+        // parses tensors or allocates a model. The Data-backed API also makes
+        // the weights below exactly the bytes authenticated by deployment.
+        let sourceWeights = try loadArrays(data: policyData)
+        try Self.validatePolicyTensors(sourceWeights)
         let weights = try VectorActorCritic.compatibleWeights(
-            sourceWeights, architectureVersion: metadata.architectureVersion)
-        try policy.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
-        eval(policy)
-        normalizer = RunningObservationNormalizer(snapshot: metadata.normalizer)
+            sourceWeights,
+            architectureVersion: decodedMetadata.architectureVersion)
+
+        let loadedPolicy = VectorActorCritic(
+            observationDimension: decodedMetadata.observationDimension,
+            actionDimension: decodedMetadata.actionDimension,
+            hiddenSize: decodedMetadata.ppo.hiddenSize,
+            hiddenDimensions: decodedMetadata.ppo.hiddenDimensions,
+            initialActionStd: decodedMetadata.ppo.initialActionStd,
+            activation: decodedMetadata.ppo.resolvedActivation)
+        try loadedPolicy.update(
+            parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(loadedPolicy)
+
+        metadata = decodedMetadata
+        policy = loadedPolicy
+        normalizer = RunningObservationNormalizer(
+            snapshot: decodedMetadata.normalizer)
+    }
+
+    /// Validate every host-side value used to size or initialize inference.
+    /// Training-only fields such as `updates` may legitimately be zero in an
+    /// optimizer-free deployment export, so this is deliberately narrower
+    /// than `VectorPPOConfig.validate(batchSize:)` while remaining strict for
+    /// every PPO field that can affect replay.
+    static func validateMetadata(_ metadata: VectorPolicyMetadata) throws {
+        guard let architectureVersion = metadata.architectureVersion,
+              VectorActorCritic.compatibleArchitectureVersions.contains(
+                architectureVersion),
+              !metadata.task.isEmpty,
+              let taskRevision = metadata.taskRevision, taskRevision > 0,
+              let taskConfiguration = metadata.taskConfiguration,
+              taskConfiguration.keys.allSatisfy({ !$0.isEmpty }),
+              taskConfiguration.values.allSatisfy(\.isFinite),
+              metadata.observationDimension > 0,
+              metadata.actionDimension > 0,
+              metadata.simulationStep.isFinite,
+              metadata.simulationStep > 0,
+              metadata.controlDecimation > 0,
+              metadata.maxEpisodeSteps > 0,
+              metadata.inferenceBatchSize.map({ $0 > 0 }) ?? true else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy checkpoint metadata structure is invalid")
+        }
+        let controlPeriod = metadata.simulationStep
+            * Float(metadata.controlDecimation)
+        let controlFrequency = 1 / controlPeriod
+        guard controlPeriod.isFinite, controlPeriod > 0,
+              controlFrequency.isFinite, controlFrequency > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy checkpoint control timing is invalid")
+        }
+
+        let ppo = metadata.ppo
+        let hiddenDimensions = ppo.resolvedHiddenDimensions
+        guard ppo.hiddenSize > 0,
+              hiddenDimensions.count == 3,
+              hiddenDimensions.allSatisfy({ $0 > 0 }),
+              ppo.initialActionStd.isFinite,
+              ppo.initialActionStd > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy checkpoint PPO inference configuration is invalid")
+        }
+
+        let normalizer = metadata.normalizer
+        let priorWeight = max(normalizer.count - 1, 0)
+        guard normalizer.count.isFinite, normalizer.count >= 0,
+              normalizer.mean.count == metadata.observationDimension,
+              normalizer.variance.count == metadata.observationDimension,
+              normalizer.mean.allSatisfy(\.isFinite),
+              normalizer.variance.allSatisfy({
+                $0.isFinite && $0 >= 0
+                    && ($0 * priorWeight).isFinite
+              }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy checkpoint observation normalizer is invalid")
+        }
+
+        // Validate both the recorded payload and the runtime-expanded model
+        // geometry before their dimensions reach MLX allocation or reshape.
+        _ = try policyElementCount(
+            metadata: metadata,
+            actorBranchCount: try recordedActorBranchCount(metadata))
+        _ = try policyElementCount(metadata: metadata, actorBranchCount: 4)
+        let inferenceRows = metadata.inferenceBatchSize ?? 1
+        _ = try checkedProduct(
+            inferenceRows, metadata.observationDimension,
+            context: "policy inference observation geometry")
+        _ = try checkedProduct(
+            inferenceRows, metadata.actionDimension,
+            context: "policy inference action geometry")
+    }
+
+    private static func checkedProduct(
+        _ lhs: Int, _ rhs: Int, context: String
+    ) throws -> Int {
+        guard lhs >= 0, rhs >= 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "\(context) contains a negative dimension")
+        }
+        let result = lhs.multipliedReportingOverflow(by: rhs)
+        guard !result.overflow else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "\(context) overflows Int")
+        }
+        return result.partialValue
+    }
+
+    private static func checkedSum(
+        _ lhs: Int, _ rhs: Int, context: String
+    ) throws -> Int {
+        let result = lhs.addingReportingOverflow(rhs)
+        guard !result.overflow else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "\(context) overflows Int")
+        }
+        return result.partialValue
+    }
+
+    private static func recordedActorBranchCount(
+        _ metadata: VectorPolicyMetadata
+    ) throws -> Int {
+        guard let architectureVersion = metadata.architectureVersion else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy checkpoint architecture version is missing")
+        }
+        switch architectureVersion {
+        case 3: return 1
+        case 4: return 2
+        case 5: return 3
+        case VectorActorCritic.architectureVersion: return 4
+        default:
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy checkpoint architecture is not replayable")
+        }
+    }
+
+    private static func policyElementCount(
+        metadata: VectorPolicyMetadata, actorBranchCount: Int
+    ) throws -> Int {
+        let hidden = metadata.ppo.resolvedHiddenDimensions
+        func networkElementCount(outputDimension: Int) throws -> Int {
+            let products = [
+                try checkedProduct(
+                    hidden[0], metadata.observationDimension,
+                    context: "policy input-layer geometry"),
+                hidden[0],
+                try checkedProduct(
+                    hidden[1], hidden[0],
+                    context: "policy middle-layer geometry"),
+                hidden[1],
+                try checkedProduct(
+                    hidden[2], hidden[1],
+                    context: "policy final-layer geometry"),
+                hidden[2],
+                try checkedProduct(
+                    outputDimension, hidden[2],
+                    context: "policy output-layer geometry"),
+                outputDimension,
+            ]
+            var result = 0
+            for elements in products {
+                result = try checkedSum(
+                    result, elements,
+                    context: "policy network element count")
+            }
+            return result
+        }
+
+        let actorElements = try networkElementCount(
+            outputDimension: metadata.actionDimension)
+        var total = try checkedProduct(
+            actorElements, actorBranchCount,
+            context: "policy actor element count")
+        total = try checkedSum(
+            total, try networkElementCount(outputDimension: 1),
+            context: "policy actor/critic element count")
+        return try checkedSum(
+            total, metadata.actionDimension,
+            context: "policy total element count")
+    }
+
+    private static func expectedPolicyPayloadByteCount(
+        metadata: VectorPolicyMetadata
+    ) throws -> Int {
+        let totalElements = try policyElementCount(
+            metadata: metadata,
+            actorBranchCount: try recordedActorBranchCount(metadata))
+        return try checkedProduct(
+            totalElements, MemoryLayout<Float>.stride,
+            context: "policy tensor payload byte count")
+    }
+
+    private static func validatePolicyTensors(
+        _ tensors: [String: MLXArray]
+    ) throws {
+        guard !tensors.isEmpty else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy checkpoint contains no tensors")
+        }
+        for (name, tensor) in tensors.sorted(by: { $0.key < $1.key }) {
+            guard tensor.dtype == .float32 else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "policy checkpoint tensor \(name) must use float32")
+            }
+            guard tensor.asArray(Float.self).allSatisfy(\.isFinite) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "policy checkpoint tensor \(name) contains non-finite values")
+            }
+        }
+    }
+
+    /// Validate task-provided routing entirely on the host before constructing
+    /// any MLX gate or mask arrays. The base actor coefficient must remain
+    /// non-negative for every row/action pair, making the routed actor mean a
+    /// convex composition rather than an accidental extrapolation.
+    static func validateRouting(
+        rowCount: Int,
+        actionDimension: Int,
+        expertGates: ContiguousArray<Float>?,
+        expertActionMask: ContiguousArray<Float>?,
+        standExpertGates: ContiguousArray<Float>?,
+        standExpertActionMask: ContiguousArray<Float>?,
+        auxiliaryExpertGates: ContiguousArray<Float>?,
+        auxiliaryExpertActionMask: ContiguousArray<Float>?
+    ) throws {
+        guard rowCount > 0, actionDimension > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "policy routing dimensions must be positive")
+        }
+        _ = try checkedProduct(
+            rowCount, actionDimension,
+            context: "policy routing geometry")
+        let routes: [(
+            name: String,
+            gates: ContiguousArray<Float>?,
+            mask: ContiguousArray<Float>?
+        )] = [
+            ("expert", expertGates, expertActionMask),
+            ("stand expert", standExpertGates, standExpertActionMask),
+            ("auxiliary expert", auxiliaryExpertGates,
+             auxiliaryExpertActionMask),
+        ]
+        for route in routes {
+            if let gates = route.gates {
+                guard gates.count == rowCount,
+                      gates.allSatisfy({
+                        $0.isFinite && (0...1).contains($0)
+                      }) else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "policy \(route.name) gates must match observation "
+                            + "rows and contain finite values in [0, 1]")
+                }
+            }
+            if let mask = route.mask {
+                guard mask.count == actionDimension,
+                      mask.allSatisfy({
+                        $0.isFinite && (0...1).contains($0)
+                      }) else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "policy \(route.name) action mask must match action "
+                            + "dimensions and contain finite values in [0, 1]")
+                }
+            }
+        }
+
+        guard routes.contains(where: { $0.gates != nil }) else { return }
+        for row in 0..<rowCount {
+            for action in 0..<actionDimension {
+                var routedWeight: Float = 0
+                for route in routes {
+                    let gate = route.gates?[row] ?? 0
+                    let mask = route.mask?[action] ?? 1
+                    routedWeight += gate * mask
+                }
+                guard routedWeight.isFinite, routedWeight <= 1 else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "policy expert routing is not a convex actor "
+                            + "composition at row \(row), action \(action)")
+                }
+            }
+        }
     }
 
     public func actions(
@@ -3387,38 +3677,16 @@ public final class VectorPolicyRunner {
             throw RLEnvironmentError.invalidConfiguration(
                 "observation value at flat index \(index) is not finite")
         }
-        if let expertGates, expertGates.count != n {
-            throw RLEnvironmentError.invalidConfiguration(
-                "policy expert gate count must match observation rows")
-        }
-        if let expertActionMask,
-           expertActionMask.count != metadata.actionDimension
-                || !expertActionMask.allSatisfy({ (0...1).contains($0) }) {
-            throw RLEnvironmentError.invalidConfiguration(
-                "policy expert action mask must match action dimensions")
-        }
-        if let standExpertGates, standExpertGates.count != n {
-            throw RLEnvironmentError.invalidConfiguration(
-                "policy stand expert gate count must match observation rows")
-        }
-        if let standExpertActionMask,
-           standExpertActionMask.count != metadata.actionDimension
-                || !standExpertActionMask.allSatisfy({ (0...1).contains($0) }) {
-            throw RLEnvironmentError.invalidConfiguration(
-                "policy stand expert action mask must match action dimensions")
-        }
-        if let auxiliaryExpertGates, auxiliaryExpertGates.count != n {
-            throw RLEnvironmentError.invalidConfiguration(
-                "policy auxiliary expert gate count must match observation rows")
-        }
-        if let auxiliaryExpertActionMask,
-           auxiliaryExpertActionMask.count != metadata.actionDimension
-                || !auxiliaryExpertActionMask.allSatisfy({
-                    (0...1).contains($0)
-                }) {
-            throw RLEnvironmentError.invalidConfiguration(
-                "policy auxiliary expert action mask must match action dimensions")
-        }
+        let actionValueCount = try Self.checkedProduct(
+            n, metadata.actionDimension,
+            context: "policy output geometry")
+        try Self.validateRouting(
+            rowCount: n, actionDimension: metadata.actionDimension,
+            expertGates: expertGates, expertActionMask: expertActionMask,
+            standExpertGates: standExpertGates,
+            standExpertActionMask: standExpertActionMask,
+            auxiliaryExpertGates: auxiliaryExpertGates,
+            auxiliaryExpertActionMask: auxiliaryExpertActionMask)
         // A checkpoint records the Metal matrix row geometry validated during
         // training. Padding smaller calls handles UI/single-environment replay;
         // split larger calls into the same exact row geometry as well. Running
@@ -3427,7 +3695,7 @@ public final class VectorPolicyRunner {
         if let recordedRows = metadata.inferenceBatchSize,
            recordedRows > 0, n > recordedRows {
             var combined = ContiguousArray<Float>()
-            combined.reserveCapacity(n * metadata.actionDimension)
+            combined.reserveCapacity(actionValueCount)
             for range in Self.inferenceBatchRanges(
                 rowCount: n, recordedBatchSize: recordedRows) {
                 let observationStart = range.lowerBound
@@ -3457,11 +3725,16 @@ public final class VectorPolicyRunner {
             return combined
         }
         let inferenceRows = max(n, metadata.inferenceBatchSize ?? n)
+        let inferenceObservationCount = try Self.checkedProduct(
+            inferenceRows, metadata.observationDimension,
+            context: "policy inference observation geometry")
+        _ = try Self.checkedProduct(
+            inferenceRows, metadata.actionDimension,
+            context: "policy inference action geometry")
         var inferenceObservations = policyObservations
         if inferenceRows > n {
             let lastRow = policyObservations.suffix(metadata.observationDimension)
-            inferenceObservations.reserveCapacity(
-                inferenceRows * metadata.observationDimension)
+            inferenceObservations.reserveCapacity(inferenceObservationCount)
             for _ in n..<inferenceRows {
                 inferenceObservations.append(contentsOf: lastRow)
             }
@@ -3501,7 +3774,7 @@ public final class VectorPolicyRunner {
         eval(output)
         let allValues = output.asArray(Float.self)
         let values = ContiguousArray(
-            allValues.prefix(n * metadata.actionDimension))
+            allValues.prefix(actionValueCount))
         if let index = values.firstIndex(where: { !$0.isFinite }) {
             throw RLEnvironmentError.nonFiniteAction(index: index)
         }
@@ -6413,10 +6686,33 @@ public final class VectorPPOTrainer {
     /// semantics. Optimizer moments are intentionally excluded because they
     /// cannot affect policy replay.
     public static func checkpointFingerprint(directory: String) throws -> String {
+        let root = URL(fileURLWithPath: directory, isDirectory: true)
+        let metadataData = try Data(contentsOf: root.appendingPathComponent(
+            "metadata.json"))
+        let policyData = try Data(contentsOf: root.appendingPathComponent(
+            "policy.safetensors"))
+        let trainingStateData = try Data(contentsOf: root.appendingPathComponent(
+            "training-state.json"))
+        return checkpointFingerprint(
+            metadataData: metadataData, policyData: policyData,
+            trainingStateData: trainingStateData)
+    }
+
+    /// Hash exact bytes already read by a deployment or export operation.
+    /// This is intentionally module-internal: filesystem callers use the
+    /// public directory API, while trusted bundle code can avoid re-opening a
+    /// mutable path between authentication and model construction.
+    static func checkpointFingerprint(
+        metadataData: Data,
+        policyData: Data,
+        trainingStateData: Data
+    ) -> String {
         var hasher = SHA256()
-        for name in ["metadata.json", "policy.safetensors", "training-state.json"] {
-            let url = URL(fileURLWithPath: directory).appendingPathComponent(name)
-            let data = try Data(contentsOf: url)
+        for (name, data) in [
+            ("metadata.json", metadataData),
+            ("policy.safetensors", policyData),
+            ("training-state.json", trainingStateData),
+        ] {
             hasher.update(data: Data(name.utf8))
             hasher.update(data: Data([0]))
             hasher.update(data: data)
