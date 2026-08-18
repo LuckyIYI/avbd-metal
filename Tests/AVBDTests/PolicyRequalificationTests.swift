@@ -12,6 +12,7 @@ final class PolicyRequalificationTests: XCTestCase {
         var targetSpec: RLTaskSpec
         var preparation: VectorPolicyRequalificationManifest
         var criteria: RLEvaluationCriteria
+        var suiteContracts: [VectorPolicyRequalificationSuiteContract] = []
     }
 
     func testPrepareCreatesByteIdenticalZeroUpdateCandidateWithoutOverwrite()
@@ -26,7 +27,14 @@ final class PolicyRequalificationTests: XCTestCase {
         XCTAssertEqual(
             fixture.preparation.parentPolicySHA256,
             fixture.preparation.candidatePolicySHA256)
+        XCTAssertEqual(fixture.preparation.schemaVersion, 1)
+        XCTAssertNil(fixture.preparation.qualificationMatrix)
         XCTAssertNil(fixture.preparation.qualification)
+        let preparationObject = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: fixture.candidate.appendingPathComponent(
+                VectorPolicyRequalification.manifestFileName)))
+            as? [String: Any])
+        XCTAssertNil(preparationObject["qualificationMatrix"])
         XCTAssertEqual(
             try Data(contentsOf: fixture.parent.appendingPathComponent(
                 "policy.safetensors")),
@@ -171,6 +179,13 @@ final class PolicyRequalificationTests: XCTestCase {
             outputDirectory: output.path)
 
         XCTAssertEqual(manifest.qualification?.reports.count, 4)
+        let sealedObject = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: output.appendingPathComponent(
+                VectorPolicyRequalification.manifestFileName)))
+            as? [String: Any])
+        let sealedQualification = try XCTUnwrap(
+            sealedObject["qualification"] as? [String: Any])
+        XCTAssertNil(sealedQualification["additionalSuites"])
         XCTAssertEqual(
             try VectorPPOTrainer.checkpointFingerprint(directory: output.path),
             fixture.preparation.candidateCheckpointFingerprint)
@@ -368,6 +383,346 @@ final class PolicyRequalificationTests: XCTestCase {
         }
     }
 
+    func testSchema2PublishesAndVerifiesIndependentNamedSuites() throws {
+        let fixture = try makeMultiSuiteFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let suites = try XCTUnwrap(
+            fixture.preparation.qualificationMatrix?.suites)
+        let nominal = try writeQualification(
+            for: fixture, suite: suites[0], directoryName: "nominal-input",
+            successes: 500)
+        let validation = try writeQualification(
+            for: fixture, suite: suites[1],
+            directoryName: "validation-input", successes: 490)
+        let output = fixture.root.appendingPathComponent("published-v2")
+        let manifest = try VectorPolicyRequalification.publish(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            candidateDirectory: fixture.candidate.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            evaluationReportPaths: nominal.reports.map(\.path),
+            aggregatePath: nominal.aggregate.path,
+            additionalSuiteInputs: [.init(
+                id: suites[1].id,
+                evaluationReportPaths: validation.reports.map(\.path),
+                aggregatePath: validation.aggregate.path)],
+            suiteContracts: fixture.suiteContracts,
+            outputDirectory: output.path)
+
+        XCTAssertEqual(manifest.schemaVersion, 2)
+        XCTAssertEqual(manifest.qualification?.additionalSuites?.count, 1)
+        for suite in suites {
+            for seed in suite.evaluationSeeds {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: output
+                    .appendingPathComponent(
+                        "qualification/\(suite.id)/eval-seed-\(seed).json")
+                    .path))
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: output
+                .appendingPathComponent(
+                    "qualification/\(suite.id)/aggregate.json").path))
+        }
+        XCTAssertNoThrow(try VectorPolicyRequalification.verify(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            bundleDirectory: output.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            suiteContracts: fixture.suiteContracts))
+
+        let extra = output.appendingPathComponent(
+            "qualification/validation-collision/empty-extra",
+            isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: extra, withIntermediateDirectories: false)
+        XCTAssertThrowsError(try VectorPolicyRequalification.verify(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            bundleDirectory: output.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            suiteContracts: fixture.suiteContracts))
+        try FileManager.default.removeItem(at: extra)
+        let manifestURL = output.appendingPathComponent(
+            VectorPolicyRequalification.manifestFileName)
+        var tampered = try decode(
+            VectorPolicyRequalificationManifest.self, at: manifestURL)
+        tampered.qualification?.additionalSuites?[0].reports[0].sha256 =
+            String(repeating: "0", count: 64)
+        try write(tampered, to: manifestURL)
+        XCTAssertThrowsError(try VectorPolicyRequalification.verify(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            bundleDirectory: output.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            suiteContracts: fixture.suiteContracts))
+    }
+
+    func testSchema2RejectsTransferAggregateAndComparisonFailures() throws {
+        do {
+            let fixture = try makeMultiSuiteFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let suites = try XCTUnwrap(
+                fixture.preparation.qualificationMatrix?.suites)
+            let nominal = try writeQualification(
+                for: fixture, suite: suites[0], directoryName: "nominal")
+            let validation = try writeQualification(
+                for: fixture, suite: suites[1], directoryName: "validation")
+            var report = try decode(
+                PPOEvaluationMetrics.self, at: validation.reports[0])
+            report.taskConfigurationTransferred = false
+            try write(report, to: validation.reports[0])
+            XCTAssertThrowsError(try VectorPolicyRequalification.publish(
+                targetSpec: fixture.targetSpec,
+                evaluationCriteria: fixture.criteria,
+                candidateDirectory: fixture.candidate.path,
+                parentCheckpointDirectory: fixture.parent.path,
+                evaluationReportPaths: nominal.reports.map(\.path),
+                aggregatePath: nominal.aggregate.path,
+                additionalSuiteInputs: [.init(
+                    id: suites[1].id,
+                    evaluationReportPaths: validation.reports.map(\.path),
+                    aggregatePath: validation.aggregate.path)],
+                suiteContracts: fixture.suiteContracts,
+                outputDirectory: fixture.root.appendingPathComponent("bad")
+                    .path))
+        }
+
+        do {
+            let fixture = try makeMultiSuiteFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let suites = try XCTUnwrap(
+                fixture.preparation.qualificationMatrix?.suites)
+            let nominal = try writeQualification(
+                for: fixture, suite: suites[0], directoryName: "nominal")
+            let validation = try writeQualification(
+                for: fixture, suite: suites[1], directoryName: "validation")
+            var report = try decode(
+                PPOEvaluationMetrics.self, at: nominal.reports[0])
+            report.taskConfigurationTransferred = true
+            try write(report, to: nominal.reports[0])
+            XCTAssertThrowsError(try VectorPolicyRequalification.publish(
+                targetSpec: fixture.targetSpec,
+                evaluationCriteria: fixture.criteria,
+                candidateDirectory: fixture.candidate.path,
+                parentCheckpointDirectory: fixture.parent.path,
+                evaluationReportPaths: nominal.reports.map(\.path),
+                aggregatePath: nominal.aggregate.path,
+                additionalSuiteInputs: [.init(
+                    id: suites[1].id,
+                    evaluationReportPaths: validation.reports.map(\.path),
+                    aggregatePath: validation.aggregate.path)],
+                suiteContracts: fixture.suiteContracts,
+                outputDirectory: fixture.root.appendingPathComponent(
+                    "nominal-transfer").path))
+        }
+
+        do {
+            let fixture = try makeMultiSuiteFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let suites = try XCTUnwrap(
+                fixture.preparation.qualificationMatrix?.suites)
+            let nominal = try writeQualification(
+                for: fixture, suite: suites[0], directoryName: "nominal")
+            let validation = try writeQualification(
+                for: fixture, suite: suites[1], directoryName: "validation")
+            XCTAssertThrowsError(try VectorPolicyRequalification.publish(
+                targetSpec: fixture.targetSpec,
+                evaluationCriteria: fixture.criteria,
+                candidateDirectory: fixture.candidate.path,
+                parentCheckpointDirectory: fixture.parent.path,
+                evaluationReportPaths: nominal.reports.map(\.path),
+                aggregatePath: validation.aggregate.path,
+                additionalSuiteInputs: [.init(
+                    id: suites[1].id,
+                    evaluationReportPaths: validation.reports.map(\.path),
+                    aggregatePath: nominal.aggregate.path)],
+                suiteContracts: fixture.suiteContracts,
+                outputDirectory: fixture.root.appendingPathComponent("swapped")
+                    .path))
+        }
+
+        do {
+            let fixture = try makeMultiSuiteFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let suites = try XCTUnwrap(
+                fixture.preparation.qualificationMatrix?.suites)
+            let nominal = try writeQualification(
+                for: fixture, suite: suites[0], directoryName: "nominal")
+            let validation = try writeQualification(
+                for: fixture, suite: suites[1], directoryName: "validation",
+                accepted: false)
+            XCTAssertThrowsError(try VectorPolicyRequalification.publish(
+                targetSpec: fixture.targetSpec,
+                evaluationCriteria: fixture.criteria,
+                candidateDirectory: fixture.candidate.path,
+                parentCheckpointDirectory: fixture.parent.path,
+                evaluationReportPaths: nominal.reports.map(\.path),
+                aggregatePath: nominal.aggregate.path,
+                additionalSuiteInputs: [.init(
+                    id: suites[1].id,
+                    evaluationReportPaths: validation.reports.map(\.path),
+                    aggregatePath: validation.aggregate.path)],
+                suiteContracts: fixture.suiteContracts,
+                outputDirectory: fixture.root.appendingPathComponent(
+                    "failed-suite").path))
+        }
+
+        do {
+            let fixture = try makeMultiSuiteFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let suites = try XCTUnwrap(
+                fixture.preparation.qualificationMatrix?.suites)
+            let nominal = try writeQualification(
+                for: fixture, suite: suites[0], directoryName: "nominal",
+                successes: 512)
+            let validation = try writeQualification(
+                for: fixture, suite: suites[1], directoryName: "validation",
+                successes: 450)
+            XCTAssertThrowsError(try VectorPolicyRequalification.publish(
+                targetSpec: fixture.targetSpec,
+                evaluationCriteria: fixture.criteria,
+                candidateDirectory: fixture.candidate.path,
+                parentCheckpointDirectory: fixture.parent.path,
+                evaluationReportPaths: nominal.reports.map(\.path),
+                aggregatePath: nominal.aggregate.path,
+                additionalSuiteInputs: [.init(
+                    id: suites[1].id,
+                    evaluationReportPaths: validation.reports.map(\.path),
+                    aggregatePath: validation.aggregate.path)],
+                suiteContracts: fixture.suiteContracts,
+                outputDirectory: fixture.root.appendingPathComponent("drop")
+                    .path)) { error in
+                XCTAssertTrue(String(describing: error).contains("degraded"))
+            }
+        }
+    }
+
+    func testSchema2RejectsInvalidOrUnvalidatedMatrixContracts() throws {
+        let fixture = try makeMultiSuiteFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let matrix = try XCTUnwrap(
+            fixture.preparation.qualificationMatrix)
+        let nominal = try writeQualification(
+            for: fixture, suite: matrix.suites[0], directoryName: "nominal")
+        let validation = try writeQualification(
+            for: fixture, suite: matrix.suites[1], directoryName: "validation")
+        let validOutput = fixture.root.appendingPathComponent("valid")
+        _ = try VectorPolicyRequalification.publish(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            candidateDirectory: fixture.candidate.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            evaluationReportPaths: nominal.reports.map(\.path),
+            aggregatePath: nominal.aggregate.path,
+            additionalSuiteInputs: [.init(
+                id: matrix.suites[1].id,
+                evaluationReportPaths: validation.reports.map(\.path),
+                aggregatePath: validation.aggregate.path)],
+            suiteContracts: fixture.suiteContracts,
+            outputDirectory: validOutput.path)
+        XCTAssertThrowsError(try VectorPolicyRequalification.verify(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            bundleDirectory: validOutput.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            suiteContracts: []))
+
+        var wrongContract = fixture.suiteContracts
+        wrongContract[1].taskSpec.configurationValues["plant"] = 2
+        XCTAssertThrowsError(try VectorPolicyRequalification.publish(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            candidateDirectory: fixture.candidate.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            evaluationReportPaths: nominal.reports.map(\.path),
+            aggregatePath: nominal.aggregate.path,
+            additionalSuiteInputs: [.init(
+                id: matrix.suites[1].id,
+                evaluationReportPaths: validation.reports.map(\.path),
+                aggregatePath: validation.aggregate.path)],
+            suiteContracts: wrongContract,
+            outputDirectory: fixture.root.appendingPathComponent("wrong-live")
+                .path))
+
+        let manifestURL = fixture.candidate.appendingPathComponent(
+            VectorPolicyRequalification.manifestFileName)
+        var manifest = try decode(
+            VectorPolicyRequalificationManifest.self, at: manifestURL)
+        manifest.qualificationMatrix?.suites[1].evaluationCriteria
+            .minimumSuccessRate = 0
+        try write(manifest, to: manifestURL)
+        XCTAssertThrowsError(try VectorPolicyRequalification.publish(
+            targetSpec: fixture.targetSpec,
+            evaluationCriteria: fixture.criteria,
+            candidateDirectory: fixture.candidate.path,
+            parentCheckpointDirectory: fixture.parent.path,
+            evaluationReportPaths: nominal.reports.map(\.path),
+            aggregatePath: nominal.aggregate.path,
+            additionalSuiteInputs: [.init(
+                id: matrix.suites[1].id,
+                evaluationReportPaths: validation.reports.map(\.path),
+                aggregatePath: validation.aggregate.path)],
+            suiteContracts: fixture.suiteContracts,
+            outputDirectory: fixture.root.appendingPathComponent("criteria")
+                .path))
+    }
+
+    func testSchema2PreparationRejectsAmbiguousOrUnsafeMatrices() throws {
+        let fixture = try makeMultiSuiteFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let original = try XCTUnwrap(
+            fixture.preparation.qualificationMatrix)
+
+        var missingSuite = original
+        missingSuite.suites.removeLast()
+        missingSuite.comparisons.removeAll()
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: missingSuite, outputName: "missing-suite"))
+
+        var duplicateName = original
+        duplicateName.suites[1].id = duplicateName.suites[0].id
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: duplicateName, outputName: "duplicate-name"))
+
+        var overlappingSeeds = original
+        overlappingSeeds.suites[1].evaluationSeeds[0] =
+            overlappingSeeds.suites[0].evaluationSeeds[0]
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: overlappingSeeds, outputName: "overlap"))
+
+        var hiddenDelta = original
+        hiddenDelta.suites[1].evaluationTaskConfiguration["plant"] = 2
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: hiddenDelta, outputName: "hidden-delta"))
+
+        var nonFiniteComparison = original
+        nonFiniteComparison.comparisons[0]
+            .maximumPooledSuccessRateDrop = .nan
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: nonFiniteComparison,
+            outputName: "nonfinite-comparison"))
+
+        var invalidCriteria = original
+        invalidCriteria.suites[1].evaluationCriteria.minimumTaskMetrics = [
+            "overlap": 2,
+        ]
+        invalidCriteria.suites[1].evaluationCriteria.maximumTaskMetrics = [
+            "overlap": 1,
+        ]
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: invalidCriteria,
+            outputName: "invalid-criteria"))
+
+        var wrongBaseline = original
+        wrongBaseline.comparisons[0].baselineSuite = "validation-collision"
+        wrongBaseline.comparisons[0].evaluatedSuite = "nominal"
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: wrongBaseline, outputName: "wrong-baseline"))
+
+        XCTAssertThrowsError(try prepareMatrix(
+            fixture, matrix: original, contracts: [],
+            outputName: "missing-contracts"))
+    }
+
     private func makeFixture() throws -> Fixture {
         let root = temporaryDirectory()
         let parent = root.appendingPathComponent("parent", isDirectory: true)
@@ -399,16 +754,108 @@ final class PolicyRequalificationTests: XCTestCase {
             criteria: criteria)
     }
 
-    private func makeSpec(revision: Int) -> RLTaskSpec {
+    private func makeMultiSuiteFixture(
+        maximumDrop: Float = 0.05
+    ) throws -> Fixture {
+        let root = temporaryDirectory()
+        let parent = root.appendingPathComponent("parent", isDirectory: true)
+        let candidate = root.appendingPathComponent(
+            "candidate", isDirectory: true)
+        let sourceSpec = makeSpec(revision: 7, numEnvironments: 8)
+        let targetSpec = makeSpec(revision: 8, numEnvironments: 8)
+        try writeParent(at: parent, spec: sourceSpec)
+        let fingerprint = try VectorPPOTrainer.checkpointFingerprint(
+            directory: parent.path)
+        let criteria = RLEvaluationCriteria(
+            minimumSuccessRate: 0.8,
+            minimumMeanEpisodeLengthFraction: 0.9)
+        var validationSpec = targetSpec
+        validationSpec.configurationValues["validationCollisionProfile"] = 1
+        let nominal = VectorPolicyRequalificationSuitePlan(
+            id: "nominal", evaluationSeeds: [101, 102, 103, 104],
+            evaluationEnvironments: 8,
+            evaluationTaskConfiguration: targetSpec.configurationValues,
+            changedConfigurationFields: [],
+            evaluationCriteria: criteria)
+        let validation = VectorPolicyRequalificationSuitePlan(
+            id: "validation-collision",
+            evaluationSeeds: [201, 202, 203, 204],
+            evaluationEnvironments: 8,
+            evaluationTaskConfiguration: validationSpec.configurationValues,
+            changedConfigurationFields: ["validationCollisionProfile"],
+            evaluationCriteria: criteria)
+        let matrix = VectorPolicyRequalificationMatrix(
+            suites: [nominal, validation],
+            comparisons: [.init(
+                baselineSuite: "nominal",
+                evaluatedSuite: "validation-collision",
+                maximumPooledSuccessRateDrop: maximumDrop)])
+        let contracts = [
+            VectorPolicyRequalificationSuiteContract(
+                id: nominal.id, taskSpec: targetSpec,
+                evaluationCriteria: criteria),
+            VectorPolicyRequalificationSuiteContract(
+                id: validation.id, taskSpec: validationSpec,
+                evaluationCriteria: criteria),
+        ]
+        let preparation = try VectorPolicyRequalification.prepare(
+            targetSpec: targetSpec,
+            parentCheckpointDirectory: parent.path,
+            outputDirectory: candidate.path,
+            expectedParentCheckpointFingerprint: fingerprint,
+            inferenceBatchSize: 8,
+            declaredSourceCommit: String(repeating: "d", count: 40),
+            qualificationPlan: .init(
+                evaluationSeeds: nominal.evaluationSeeds,
+                evaluationEnvironments: nominal.evaluationEnvironments,
+                episodesPerReport: nominal.episodesPerReport),
+            evaluationCriteria: criteria,
+            qualificationMatrix: matrix,
+            suiteContracts: contracts)
+        return Fixture(
+            root: root, parent: parent, candidate: candidate,
+            targetSpec: targetSpec, preparation: preparation,
+            criteria: criteria, suiteContracts: contracts)
+    }
+
+    private func prepareMatrix(
+        _ fixture: Fixture,
+        matrix: VectorPolicyRequalificationMatrix,
+        contracts: [VectorPolicyRequalificationSuiteContract]? = nil,
+        outputName: String
+    ) throws {
+        _ = try VectorPolicyRequalification.prepare(
+            targetSpec: fixture.targetSpec,
+            parentCheckpointDirectory: fixture.parent.path,
+            outputDirectory: fixture.root.appendingPathComponent(outputName)
+                .path,
+            expectedParentCheckpointFingerprint:
+                fixture.preparation.parentCheckpointFingerprint,
+            inferenceBatchSize:
+                fixture.preparation.qualificationPlan
+                    .evaluationEnvironments,
+            declaredSourceCommit: String(repeating: "e", count: 40),
+            qualificationPlan: fixture.preparation.qualificationPlan,
+            evaluationCriteria: fixture.criteria,
+            qualificationMatrix: matrix,
+            suiteContracts: contracts ?? fixture.suiteContracts)
+    }
+
+    private func makeSpec(
+        revision: Int, numEnvironments: Int = 1
+    ) -> RLTaskSpec {
         RLTaskSpec(
             id: "fixture-task-v0", revision: revision,
-            numEnvironments: 1,
+            numEnvironments: numEnvironments,
             observation: .init(name: "policy", shape: [3]),
             action: .init(name: "action", shape: [2]),
             maxEpisodeSteps: 100,
             simulationStep: 0.005,
             controlDecimation: 4,
-            configurationValues: ["plant": 1])
+            autoReset: false,
+            configurationValues: [
+                "plant": 1, "validationCollisionProfile": 0,
+            ])
     }
 
     private func writeParent(at directory: URL, spec: RLTaskSpec) throws {
@@ -446,8 +893,33 @@ final class PolicyRequalificationTests: XCTestCase {
     private func writeQualification(for fixture: Fixture) throws
         -> (reports: [URL], aggregate: URL)
     {
+        try writeQualification(
+            for: fixture,
+            suite: .init(
+                id: "nominal",
+                evaluationSeeds:
+                    fixture.preparation.qualificationPlan.evaluationSeeds,
+                evaluationEnvironments:
+                    fixture.preparation.qualificationPlan
+                        .evaluationEnvironments,
+                episodesPerReport:
+                    fixture.preparation.qualificationPlan.episodesPerReport,
+                evaluationTaskConfiguration:
+                    fixture.targetSpec.configurationValues,
+                changedConfigurationFields: [],
+                evaluationCriteria: fixture.criteria),
+            directoryName: "qualification")
+    }
+
+    private func writeQualification(
+        for fixture: Fixture,
+        suite: VectorPolicyRequalificationSuitePlan,
+        directoryName: String,
+        successes: Int = 512,
+        accepted: Bool = true
+    ) throws -> (reports: [URL], aggregate: URL) {
         let directory = fixture.root.appendingPathComponent(
-            "qualification", isDirectory: true)
+            directoryName, isDirectory: true)
         if FileManager.default.fileExists(atPath: directory.path) {
             try FileManager.default.removeItem(at: directory)
         }
@@ -458,7 +930,8 @@ final class PolicyRequalificationTests: XCTestCase {
             at: fixture.candidate.appendingPathComponent("metadata.json"))
         var reports = [PPOEvaluationMetrics]()
         var urls = [URL]()
-        for seed in fixture.preparation.qualificationPlan.evaluationSeeds {
+        for seed in suite.evaluationSeeds {
+            let successRate = Float(successes) / 512
             let report = PPOEvaluationMetrics(
                 provenanceVersion: 3,
                 task: fixture.targetSpec.id,
@@ -466,8 +939,10 @@ final class PolicyRequalificationTests: XCTestCase {
                 checkpointTaskConfiguration:
                     fixture.targetSpec.configurationValues,
                 evaluationTaskConfiguration:
-                    fixture.targetSpec.configurationValues,
-                taskConfigurationTransferred: false,
+                    suite.evaluationTaskConfiguration,
+                taskConfigurationTransferred:
+                    suite.evaluationTaskConfiguration
+                        != fixture.targetSpec.configurationValues,
                 checkpointDirectory: fixture.candidate.path,
                 checkpointFingerprint:
                     fixture.preparation.candidateCheckpointFingerprint,
@@ -476,18 +951,18 @@ final class PolicyRequalificationTests: XCTestCase {
                 trainingSeed: metadata.ppo.seed,
                 evaluationSeed: seed,
                 evaluationEnvironments:
-                    fixture.preparation.qualificationPlan
-                        .evaluationEnvironments,
+                    suite.evaluationEnvironments,
                 trainingUpdates: 0,
                 trainingEnvironmentSteps: 0,
                 episodes: 512,
-                successes: 512,
-                successRate: 1,
+                successes: successes,
+                successRate: successRate,
                 meanReturn: 25,
                 meanEpisodeLength: 100,
                 taskMetrics: [:],
                 acceptance: PPOEvaluationAcceptance(
-                    passed: true, failures: []))
+                    passed: accepted,
+                    failures: accepted ? [] : ["failed"]))
             let url = directory.appendingPathComponent(
                 "eval-seed-\(seed).json")
             try write(report, to: url)

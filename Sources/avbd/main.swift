@@ -84,6 +84,7 @@ struct Options {
     var sourceCommit: String? = nil
     var inferenceBatchSize: Int? = nil
     var evaluationSeeds: [UInt64]? = nil
+    var validationCollisionSeeds: [UInt64]? = nil
     var evaluationEnvironments: Int? = nil
     var parentCheckpoint: String? = nil
     var qualificationDirectory: String? = nil
@@ -1083,6 +1084,15 @@ func parseOptions(_ args: [String]) -> Options {
                 fail("--evaluation-seeds expects four comma-separated UInt64 values")
             }
             o.evaluationSeeds = seeds
+        case "--validation-collision-seeds":
+            let rawSeeds = value(after: args[i]).split(
+                separator: ",", omittingEmptySubsequences: false)
+            let seeds = rawSeeds.compactMap { UInt64($0) }
+            guard rawSeeds.count == 4, seeds.count == 4 else {
+                fail("--validation-collision-seeds expects four "
+                    + "comma-separated UInt64 values")
+            }
+            o.validationCollisionSeeds = seeds
         case "--evaluation-environments":
             o.evaluationEnvironments = Int(value(after: args[i]))
         case "--parent-checkpoint":
@@ -1135,21 +1145,156 @@ func makeScene(_ name: String, _ o: Options) -> PhysicsScene {
 /// registered physics revision. Requalification may change that revision and
 /// nothing else.
 func makeCurrentCheckpointTask(
-    taskID: String, checkpointDirectory: String, seed: UInt64 = 1
+    taskID: String, checkpointDirectory: String, seed: UInt64 = 1,
+    numEnvironments: Int = 1,
+    optionOverrides: [String: Float] = [:]
 ) throws -> any VectorizedRLTask {
     let metadata = try JSONDecoder().decode(
         VectorPolicyMetadata.self,
         from: Data(contentsOf: URL(
             fileURLWithPath: "\(checkpointDirectory)/metadata.json")))
-    let options = BuiltInRLTasks.registry.checkpointReplayOptions(
+    var options = BuiltInRLTasks.registry.checkpointReplayOptions(
         for: taskID,
         semanticOptions: metadata.taskConfiguration ?? [:],
         maxEpisodeSteps: metadata.maxEpisodeSteps,
         controlDecimation: metadata.controlDecimation)
+    for (name, value) in optionOverrides {
+        options[name] = value
+    }
     return try BuiltInRLTasks.registry.make(
         taskID, configuration: RLTaskConfiguration(
-            numEnvironments: 1, seed: seed, autoReset: false,
+            numEnvironments: numEnvironments, seed: seed, autoReset: false,
             options: options))
+}
+
+private struct ArachneRequalificationCLIContext {
+    var targetSpec: RLTaskSpec
+    var evaluationCriteria: RLEvaluationCriteria
+    var matrix: VectorPolicyRequalificationMatrix
+    var suiteContracts: [VectorPolicyRequalificationSuiteContract]
+}
+
+/// Reconstruct both Arachne qualification distributions from the registered
+/// task factories. The CLI intentionally supports one named robustness
+/// profile instead of accepting arbitrary configuration JSON: the sealed
+/// matrix is always nominal collision geometry (0) versus validation geometry
+/// (1), at one frozen replica count, with a predeclared five-point success
+/// degradation bound.
+private func makeArachneRequalificationContext(
+    taskID: String, checkpointDirectory: String,
+    evaluationEnvironments: Int, nominalSeeds: [UInt64],
+    validationCollisionSeeds: [UInt64]
+) throws -> ArachneRequalificationCLIContext {
+    guard ["arachne15-velocity-v0", "arachne15-goal-v0"].contains(taskID)
+    else {
+        fail("--validation-collision-seeds is supported only for the "
+            + "Arachne velocity and goal tasks")
+    }
+    guard evaluationEnvironments == 128,
+          nominalSeeds.count == 4,
+          validationCollisionSeeds.count == 4,
+          Set(nominalSeeds).count == nominalSeeds.count,
+          Set(validationCollisionSeeds).count
+            == validationCollisionSeeds.count,
+          Set(nominalSeeds).isDisjoint(with: validationCollisionSeeds),
+          let nominalSeed = nominalSeeds.first,
+          let validationSeed = validationCollisionSeeds.first else {
+        fail("Arachne multi-suite requalification requires exactly 128 "
+            + "replicas and two disjoint sets of four distinct seeds")
+    }
+    let nominalTask = try makeCurrentCheckpointTask(
+        taskID: taskID, checkpointDirectory: checkpointDirectory,
+        seed: nominalSeed, numEnvironments: evaluationEnvironments)
+    let validationTask = try makeCurrentCheckpointTask(
+        taskID: taskID, checkpointDirectory: checkpointDirectory,
+        seed: validationSeed, numEnvironments: evaluationEnvironments,
+        optionOverrides: ["validationCollisionProfile": 1])
+    guard nominalTask.spec.configurationValues[
+            "validationCollisionProfile"] == 0,
+          validationTask.spec.configurationValues[
+            "validationCollisionProfile"] == 1 else {
+        fail("Arachne requalification requires the exact collision profile "
+            + "transition 0 -> 1")
+    }
+    let configurationKeys = Set(nominalTask.spec.configurationValues.keys)
+        .union(validationTask.spec.configurationValues.keys)
+    let changedFields = configurationKeys.filter {
+        nominalTask.spec.configurationValues[$0]
+            != validationTask.spec.configurationValues[$0]
+    }.sorted()
+    guard changedFields == ["validationCollisionProfile"] else {
+        fail("Arachne validation construction changed fields other than "
+            + "validationCollisionProfile")
+    }
+    guard let nominalCriteriaProvider = nominalTask
+            as? any RLEvaluationCriteriaProviding,
+          let validationCriteriaProvider = validationTask
+            as? any RLEvaluationCriteriaProviding else {
+        fail("Arachne requalification requires task-owned evaluation criteria")
+    }
+    let nominalSuite = VectorPolicyRequalificationSuitePlan(
+        id: "nominal", evaluationSeeds: nominalSeeds,
+        evaluationEnvironments: evaluationEnvironments,
+        evaluationTaskConfiguration:
+            nominalTask.spec.configurationValues,
+        changedConfigurationFields: [],
+        evaluationCriteria: nominalCriteriaProvider.evaluationCriteria)
+    let validationSuite = VectorPolicyRequalificationSuitePlan(
+        id: "validation-collision",
+        evaluationSeeds: validationCollisionSeeds,
+        evaluationEnvironments: evaluationEnvironments,
+        evaluationTaskConfiguration:
+            validationTask.spec.configurationValues,
+        changedConfigurationFields: ["validationCollisionProfile"],
+        evaluationCriteria: validationCriteriaProvider.evaluationCriteria)
+    let matrix = VectorPolicyRequalificationMatrix(
+        suites: [nominalSuite, validationSuite],
+        comparisons: [.init(
+            baselineSuite: nominalSuite.id,
+            evaluatedSuite: validationSuite.id,
+            maximumPooledSuccessRateDrop: 0.05)])
+    return ArachneRequalificationCLIContext(
+        targetSpec: nominalTask.spec,
+        evaluationCriteria: nominalCriteriaProvider.evaluationCriteria,
+        matrix: matrix,
+        suiteContracts: [
+            .init(
+                id: nominalSuite.id, taskSpec: nominalTask.spec,
+                evaluationCriteria:
+                    nominalCriteriaProvider.evaluationCriteria),
+            .init(
+                id: validationSuite.id, taskSpec: validationTask.spec,
+                evaluationCriteria:
+                    validationCriteriaProvider.evaluationCriteria),
+        ])
+}
+
+/// Rebuild a sealed schema-v2 matrix through the live registry and require it
+/// to equal the CLI's one supported robustness profile byte-for-byte.
+private func makeArachneRequalificationContext(
+    taskID: String, checkpointDirectory: String,
+    sealedMatrix: VectorPolicyRequalificationMatrix
+) throws -> ArachneRequalificationCLIContext {
+    guard sealedMatrix.suites.count == 2,
+          sealedMatrix.suites[0].id == "nominal",
+          sealedMatrix.suites[1].id == "validation-collision",
+          sealedMatrix.suites[0].evaluationEnvironments
+            == sealedMatrix.suites[1].evaluationEnvironments else {
+        fail("sealed Arachne qualification matrix is not the canonical "
+            + "nominal/validation-collision profile")
+    }
+    let context = try makeArachneRequalificationContext(
+        taskID: taskID, checkpointDirectory: checkpointDirectory,
+        evaluationEnvironments:
+            sealedMatrix.suites[0].evaluationEnvironments,
+        nominalSeeds: sealedMatrix.suites[0].evaluationSeeds,
+        validationCollisionSeeds:
+            sealedMatrix.suites[1].evaluationSeeds)
+    guard context.matrix == sealedMatrix else {
+        fail("sealed Arachne qualification matrix differs from the live "
+            + "registered task contracts")
+    }
+    return context
 }
 
 func makePushTPhysicalFlowConfiguration(
@@ -1203,8 +1348,8 @@ guard let command = args.first else {
       eval-arachne-classical  Evaluate non-neural ripple-gait point-goal control
       train-rl <task>  Train any registered task with MLX PPO
       eval-rl <task>   Evaluate a saved MLX policy deterministically
-      prepare-policy-requalification <task>  Create a zero-update revision candidate
-      publish-policy-requalification <task>  Seal a robustly evaluated candidate
+      prepare-policy-requalification <task>  Freeze zero-update evaluation suites
+      publish-policy-requalification <task>  Seal all predeclared suite evidence
       verify-policy-requalification <task>  Verify sealed revision lineage/evidence
       export-policy-rl <task>  Create an immutable optimizer-free field bundle
       verify-policy-rl <task>  Verify immutable bundle identity and MLX inference
@@ -1229,6 +1374,9 @@ guard let command = args.first else {
       sim2sim-h1       Run Unitree's imported recurrent H1 policy unchanged
       sim2sim-gear-sonic <reference-dir>  Replay NVIDIA GEAR-SONIC on G1
 
+    Requalification v2: add --validation-collision-seeds S1,S2,S3,S4 to
+      freeze Arachne nominal + validation-collision suites at exactly 128
+      environments (maximum pooled success-rate drop 0.05).
     Options: --frames N --iterations N --scale N --dt T --cpu --json --watch BODY --stats-every N
     """)
     exit(0)
@@ -1843,7 +1991,8 @@ case "prepare-policy-requalification":
             + "--checkpoint PARENT --output CANDIDATE "
             + "--expected-checkpoint-fingerprint SHA256 "
             + "--source-commit COMMIT --inference-batch-size N "
-            + "--evaluation-environments N --evaluation-seeds S1,S2,S3,S4")
+            + "--evaluation-environments N --evaluation-seeds S1,S2,S3,S4 "
+            + "[--validation-collision-seeds V1,V2,V3,V4]")
     }
     let o = parseOptions(Array(args.dropFirst(2)))
     let taskID = args[1]
@@ -1857,15 +2006,38 @@ case "prepare-policy-requalification":
         fail("prepare-policy-requalification requires every lineage and "
             + "qualification-plan option shown in --help")
     }
-    let targetTask = try makeCurrentCheckpointTask(
-        taskID: taskID, checkpointDirectory: parent,
-        seed: evaluationSeeds[0])
-    guard let criteriaProvider = targetTask as?
-            any RLEvaluationCriteriaProviding else {
-        fail("requalification preparation requires task-owned evaluation criteria")
+    let targetSpec: RLTaskSpec
+    let evaluationCriteria: RLEvaluationCriteria
+    let qualificationMatrix: VectorPolicyRequalificationMatrix?
+    let suiteContracts: [VectorPolicyRequalificationSuiteContract]
+    if let validationSeeds = o.validationCollisionSeeds {
+        let context = try makeArachneRequalificationContext(
+            taskID: taskID, checkpointDirectory: parent,
+            evaluationEnvironments: evaluationEnvironments,
+            nominalSeeds: evaluationSeeds,
+            validationCollisionSeeds: validationSeeds)
+        targetSpec = context.targetSpec
+        evaluationCriteria = context.evaluationCriteria
+        qualificationMatrix = context.matrix
+        suiteContracts = context.suiteContracts
+    } else {
+        // Preserve the schema-v1 command contract and manifest bytes when no
+        // robustness suite is explicitly requested.
+        let targetTask = try makeCurrentCheckpointTask(
+            taskID: taskID, checkpointDirectory: parent,
+            seed: evaluationSeeds[0])
+        guard let criteriaProvider = targetTask as?
+                any RLEvaluationCriteriaProviding else {
+            fail("requalification preparation requires task-owned "
+                + "evaluation criteria")
+        }
+        targetSpec = targetTask.spec
+        evaluationCriteria = criteriaProvider.evaluationCriteria
+        qualificationMatrix = nil
+        suiteContracts = []
     }
     let manifest = try VectorPolicyRequalification.prepare(
-        targetSpec: targetTask.spec,
+        targetSpec: targetSpec,
         parentCheckpointDirectory: parent,
         outputDirectory: output,
         expectedParentCheckpointFingerprint: expectedFingerprint,
@@ -1874,7 +2046,9 @@ case "prepare-policy-requalification":
         qualificationPlan: .init(
             evaluationSeeds: evaluationSeeds,
             evaluationEnvironments: evaluationEnvironments),
-        evaluationCriteria: criteriaProvider.evaluationCriteria)
+        evaluationCriteria: evaluationCriteria,
+        qualificationMatrix: qualificationMatrix,
+        suiteContracts: suiteContracts)
     print("prepared zero-update \(manifest.task) revision "
         + "\(manifest.sourceTaskRevision) -> \(manifest.targetTaskRevision) "
         + "candidate \(manifest.candidateCheckpointFingerprint) at \(output)")
@@ -1883,7 +2057,9 @@ case "publish-policy-requalification":
     guard args.count > 1 else {
         fail("usage: avbd publish-policy-requalification <task> "
             + "--checkpoint CANDIDATE --parent-checkpoint PARENT "
-            + "--qualification-directory DIR --output BUNDLE")
+            + "--qualification-directory DIR --output BUNDLE "
+            + "(schema v2 reads DIR/<suite-id>/eval-seed-*.json and "
+            + "aggregate.json)")
     }
     let o = parseOptions(Array(args.dropFirst(2)))
     let taskID = args[1]
@@ -1899,23 +2075,73 @@ case "publish-policy-requalification":
             VectorPolicyRequalification.manifestFileName))
     let prepared = try JSONDecoder().decode(
         VectorPolicyRequalificationManifest.self, from: manifestData)
-    let reportPaths = prepared.qualificationPlan.evaluationSeeds.map {
-        "\(qualificationDirectory)/eval-seed-\($0).json"
-    }
-    let targetTask = try makeCurrentCheckpointTask(
-        taskID: taskID, checkpointDirectory: candidate,
-        seed: prepared.qualificationPlan.evaluationSeeds[0])
-    guard let criteriaProvider = targetTask as?
-            any RLEvaluationCriteriaProviding else {
-        fail("requalification publication requires task-owned evaluation criteria")
+    let reportPaths: [String]
+    let aggregatePath: String
+    let additionalSuiteInputs: [VectorPolicyRequalificationSuiteInput]
+    let targetSpec: RLTaskSpec
+    let evaluationCriteria: RLEvaluationCriteria
+    let suiteContracts: [VectorPolicyRequalificationSuiteContract]
+    if let matrix = prepared.qualificationMatrix {
+        let context = try makeArachneRequalificationContext(
+            taskID: taskID, checkpointDirectory: candidate,
+            sealedMatrix: matrix)
+        let root = URL(
+            fileURLWithPath: qualificationDirectory, isDirectory: true)
+        func suiteReportPaths(
+            for suite: VectorPolicyRequalificationSuitePlan
+        ) -> [String] {
+            let directory = root.appendingPathComponent(
+                suite.id, isDirectory: true)
+            return suite.evaluationSeeds.map {
+                directory.appendingPathComponent(
+                    "eval-seed-\($0).json").path
+            }
+        }
+        let primary = matrix.suites[0]
+        let primaryDirectory = root.appendingPathComponent(
+            primary.id, isDirectory: true)
+        reportPaths = suiteReportPaths(for: primary)
+        aggregatePath = primaryDirectory.appendingPathComponent(
+            "aggregate.json").path
+        additionalSuiteInputs = matrix.suites.dropFirst().map { suite in
+            let directory = root.appendingPathComponent(
+                suite.id, isDirectory: true)
+            return .init(
+                id: suite.id,
+                evaluationReportPaths: suiteReportPaths(for: suite),
+                aggregatePath: directory.appendingPathComponent(
+                    "aggregate.json").path)
+        }
+        targetSpec = context.targetSpec
+        evaluationCriteria = context.evaluationCriteria
+        suiteContracts = context.suiteContracts
+    } else {
+        reportPaths = prepared.qualificationPlan.evaluationSeeds.map {
+            "\(qualificationDirectory)/eval-seed-\($0).json"
+        }
+        aggregatePath = "\(qualificationDirectory)/aggregate.json"
+        additionalSuiteInputs = []
+        let targetTask = try makeCurrentCheckpointTask(
+            taskID: taskID, checkpointDirectory: candidate,
+            seed: prepared.qualificationPlan.evaluationSeeds[0])
+        guard let criteriaProvider = targetTask as?
+                any RLEvaluationCriteriaProviding else {
+            fail("requalification publication requires task-owned "
+                + "evaluation criteria")
+        }
+        targetSpec = targetTask.spec
+        evaluationCriteria = criteriaProvider.evaluationCriteria
+        suiteContracts = []
     }
     let manifest = try VectorPolicyRequalification.publish(
-        targetSpec: targetTask.spec,
-        evaluationCriteria: criteriaProvider.evaluationCriteria,
+        targetSpec: targetSpec,
+        evaluationCriteria: evaluationCriteria,
         candidateDirectory: candidate,
         parentCheckpointDirectory: parent,
         evaluationReportPaths: reportPaths,
-        aggregatePath: "\(qualificationDirectory)/aggregate.json",
+        aggregatePath: aggregatePath,
+        additionalSuiteInputs: additionalSuiteInputs,
+        suiteContracts: suiteContracts,
         outputDirectory: output)
     print("published requalified \(manifest.task) revision "
         + "\(manifest.targetTaskRevision) checkpoint "
@@ -1932,17 +2158,39 @@ case "verify-policy-requalification":
           let parent = o.parentCheckpoint else {
         fail("verify-policy-requalification requires bundle and parent checkpoint")
     }
-    let targetTask = try makeCurrentCheckpointTask(
-        taskID: taskID, checkpointDirectory: bundle)
-    guard let criteriaProvider = targetTask as?
-            any RLEvaluationCriteriaProviding else {
-        fail("requalification verification requires task-owned evaluation criteria")
+    let manifestData = try Data(contentsOf: URL(
+        fileURLWithPath: bundle).appendingPathComponent(
+            VectorPolicyRequalification.manifestFileName))
+    let sealed = try JSONDecoder().decode(
+        VectorPolicyRequalificationManifest.self, from: manifestData)
+    let targetSpec: RLTaskSpec
+    let evaluationCriteria: RLEvaluationCriteria
+    let suiteContracts: [VectorPolicyRequalificationSuiteContract]
+    if let matrix = sealed.qualificationMatrix {
+        let context = try makeArachneRequalificationContext(
+            taskID: taskID, checkpointDirectory: bundle,
+            sealedMatrix: matrix)
+        targetSpec = context.targetSpec
+        evaluationCriteria = context.evaluationCriteria
+        suiteContracts = context.suiteContracts
+    } else {
+        let targetTask = try makeCurrentCheckpointTask(
+            taskID: taskID, checkpointDirectory: bundle)
+        guard let criteriaProvider = targetTask as?
+                any RLEvaluationCriteriaProviding else {
+            fail("requalification verification requires task-owned "
+                + "evaluation criteria")
+        }
+        targetSpec = targetTask.spec
+        evaluationCriteria = criteriaProvider.evaluationCriteria
+        suiteContracts = []
     }
     let manifest = try VectorPolicyRequalification.verify(
-        targetSpec: targetTask.spec,
-        evaluationCriteria: criteriaProvider.evaluationCriteria,
+        targetSpec: targetSpec,
+        evaluationCriteria: evaluationCriteria,
         bundleDirectory: bundle,
-        parentCheckpointDirectory: parent)
+        parentCheckpointDirectory: parent,
+        suiteContracts: suiteContracts)
     print("verified requalified \(manifest.task) revision "
         + "\(manifest.targetTaskRevision) checkpoint "
         + manifest.candidateCheckpointFingerprint)

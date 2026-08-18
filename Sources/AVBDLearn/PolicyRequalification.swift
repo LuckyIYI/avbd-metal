@@ -20,6 +20,81 @@ public struct VectorPolicyRequalificationPlan: Codable, Sendable, Equatable {
     }
 }
 
+/// One immutable evaluation distribution in a multi-suite qualification.
+/// The complete configuration is recorded instead of a patch so omitted
+/// options cannot silently inherit different defaults at publication time.
+public struct VectorPolicyRequalificationSuitePlan:
+    Codable, Sendable, Equatable
+{
+    public var id: String
+    public var evaluationSeeds: [UInt64]
+    public var evaluationEnvironments: Int
+    public var episodesPerReport: Int
+    public var evaluationTaskConfiguration: [String: Float]
+    /// Exact sorted keys that differ from the checkpoint task contract.
+    public var changedConfigurationFields: [String]
+    public var evaluationCriteria: VectorPolicyRequalificationCriteria
+
+    public init(
+        id: String, evaluationSeeds: [UInt64],
+        evaluationEnvironments: Int, episodesPerReport: Int = 512,
+        evaluationTaskConfiguration: [String: Float],
+        changedConfigurationFields: [String],
+        evaluationCriteria: RLEvaluationCriteria
+    ) {
+        self.id = id
+        self.evaluationSeeds = evaluationSeeds
+        self.evaluationEnvironments = evaluationEnvironments
+        self.episodesPerReport = episodesPerReport
+        self.evaluationTaskConfiguration = evaluationTaskConfiguration
+        self.changedConfigurationFields = changedConfigurationFields
+        self.evaluationCriteria = .init(evaluationCriteria)
+    }
+
+    fileprivate var legacyPlan: VectorPolicyRequalificationPlan {
+        .init(
+            evaluationSeeds: evaluationSeeds,
+            evaluationEnvironments: evaluationEnvironments,
+            episodesPerReport: episodesPerReport)
+    }
+}
+
+/// A predeclared cross-distribution robustness requirement. A positive drop
+/// means the evaluated suite performed worse than the baseline suite.
+public struct VectorPolicyRequalificationComparison:
+    Codable, Sendable, Equatable
+{
+    public var baselineSuite: String
+    public var evaluatedSuite: String
+    public var maximumPooledSuccessRateDrop: Float
+
+    public init(
+        baselineSuite: String, evaluatedSuite: String,
+        maximumPooledSuccessRateDrop: Float
+    ) {
+        self.baselineSuite = baselineSuite
+        self.evaluatedSuite = evaluatedSuite
+        self.maximumPooledSuccessRateDrop = maximumPooledSuccessRateDrop
+    }
+}
+
+/// Optional schema-v2 extension for evaluating one checkpoint on multiple,
+/// explicitly different task distributions.
+public struct VectorPolicyRequalificationMatrix:
+    Codable, Sendable, Equatable
+{
+    public var suites: [VectorPolicyRequalificationSuitePlan]
+    public var comparisons: [VectorPolicyRequalificationComparison]
+
+    public init(
+        suites: [VectorPolicyRequalificationSuitePlan],
+        comparisons: [VectorPolicyRequalificationComparison]
+    ) {
+        self.suites = suites
+        self.comparisons = comparisons
+    }
+}
+
 /// Exact task-owned thresholds fixed before any qualification seed is run.
 /// Publication compares the live task contract with this snapshot, preventing
 /// post-result threshold shopping through the public API or CLI.
@@ -61,6 +136,73 @@ public struct VectorPolicyRequalificationEvidence:
 {
     public var reports: [VectorPolicyRequalificationReportEvidence]
     public var aggregate: VectorPolicyRequalificationFileEvidence
+    /// Schema-v1 keeps this absent, preserving historical manifest bytes.
+    /// In schema-v2 the primary suite still uses the legacy fields above and
+    /// every remaining suite is named here.
+    public var additionalSuites: [VectorPolicyRequalificationSuiteEvidence]?
+
+    public init(
+        reports: [VectorPolicyRequalificationReportEvidence],
+        aggregate: VectorPolicyRequalificationFileEvidence,
+        additionalSuites: [VectorPolicyRequalificationSuiteEvidence]? = nil
+    ) {
+        self.reports = reports
+        self.aggregate = aggregate
+        self.additionalSuites = additionalSuites
+    }
+}
+
+public struct VectorPolicyRequalificationSuiteEvidence:
+    Codable, Sendable, Equatable
+{
+    public var id: String
+    public var reports: [VectorPolicyRequalificationReportEvidence]
+    public var aggregate: VectorPolicyRequalificationFileEvidence
+
+    public init(
+        id: String,
+        reports: [VectorPolicyRequalificationReportEvidence],
+        aggregate: VectorPolicyRequalificationFileEvidence
+    ) {
+        self.id = id
+        self.reports = reports
+        self.aggregate = aggregate
+    }
+}
+
+/// Publication-time file locations for one non-primary suite. Paths are read
+/// only after the sealed candidate's matrix has been validated.
+public struct VectorPolicyRequalificationSuiteInput: Sendable, Equatable {
+    public var id: String
+    public var evaluationReportPaths: [String]
+    public var aggregatePath: String
+
+    public init(
+        id: String, evaluationReportPaths: [String], aggregatePath: String
+    ) {
+        self.id = id
+        self.evaluationReportPaths = evaluationReportPaths
+        self.aggregatePath = aggregatePath
+    }
+}
+
+/// A live registry-constructed task contract supplied independently from the
+/// manifest at preparation, publication, and verification boundaries.
+public struct VectorPolicyRequalificationSuiteContract:
+    Sendable, Equatable
+{
+    public var id: String
+    public var taskSpec: RLTaskSpec
+    public var evaluationCriteria: RLEvaluationCriteria
+
+    public init(
+        id: String, taskSpec: RLTaskSpec,
+        evaluationCriteria: RLEvaluationCriteria
+    ) {
+        self.id = id
+        self.taskSpec = taskSpec
+        self.evaluationCriteria = evaluationCriteria
+    }
 }
 
 /// Machine-readable lineage for a zero-update task-revision transfer.
@@ -106,6 +248,9 @@ public struct VectorPolicyRequalificationManifest:
     public var targetTrainingEnvironmentSteps: Int
     public var changedFields: [String]
     public var qualificationPlan: VectorPolicyRequalificationPlan
+    /// Present only for schema-v2 multi-distribution qualifications. The
+    /// first suite is mirrored by `qualificationPlan` for schema-v1 readers.
+    public var qualificationMatrix: VectorPolicyRequalificationMatrix?
     public var evaluationCriteria: VectorPolicyRequalificationCriteria
     public var qualification: VectorPolicyRequalificationEvidence?
 }
@@ -135,12 +280,18 @@ public enum VectorPolicyRequalification {
         inferenceBatchSize: Int,
         declaredSourceCommit: String,
         qualificationPlan: VectorPolicyRequalificationPlan,
-        evaluationCriteria: RLEvaluationCriteria
+        evaluationCriteria: RLEvaluationCriteria,
+        qualificationMatrix: VectorPolicyRequalificationMatrix? = nil,
+        suiteContracts: [VectorPolicyRequalificationSuiteContract] = []
     ) throws -> VectorPolicyRequalificationManifest {
         try validate(plan: qualificationPlan)
         let frozenCriteria = VectorPolicyRequalificationCriteria(
             evaluationCriteria)
         try validate(criteria: frozenCriteria)
+        try validate(
+            matrix: qualificationMatrix, primaryPlan: qualificationPlan,
+            primaryCriteria: frozenCriteria, targetSpec: targetSpec,
+            suiteContracts: suiteContracts)
         guard inferenceBatchSize == qualificationPlan.evaluationEnvironments else {
             throw invalid(
                 "inference batch size must equal the declared evaluation replica count")
@@ -230,7 +381,7 @@ public enum VectorPolicyRequalification {
         }
 
         let manifest = VectorPolicyRequalificationManifest(
-            schemaVersion: 1,
+            schemaVersion: qualificationMatrix == nil ? 1 : 2,
             task: targetSpec.id,
             sourceTaskRevision: sourceRevision,
             targetTaskRevision: targetSpec.revision,
@@ -258,6 +409,7 @@ public enum VectorPolicyRequalification {
             targetTrainingEnvironmentSteps: 0,
             changedFields: expectedChangedFields,
             qualificationPlan: qualificationPlan,
+            qualificationMatrix: qualificationMatrix,
             evaluationCriteria: frozenCriteria,
             qualification: nil)
         try encoded(manifest).write(
@@ -276,6 +428,8 @@ public enum VectorPolicyRequalification {
         parentCheckpointDirectory: String,
         evaluationReportPaths: [String],
         aggregatePath: String,
+        additionalSuiteInputs: [VectorPolicyRequalificationSuiteInput] = [],
+        suiteContracts: [VectorPolicyRequalificationSuiteContract] = [],
         outputDirectory: String
     ) throws -> VectorPolicyRequalificationManifest {
         let manager = FileManager.default
@@ -295,11 +449,22 @@ public enum VectorPolicyRequalification {
             candidate.appendingPathComponent(manifestFileName))
         var manifest = try JSONDecoder().decode(
             VectorPolicyRequalificationManifest.self, from: preparationData)
-        guard manifest.schemaVersion == 1, manifest.qualification == nil else {
-            throw invalid("candidate does not contain an unsealed schema-v1 manifest")
+        guard [1, 2].contains(manifest.schemaVersion),
+              manifest.qualification == nil else {
+            throw invalid(
+                "candidate does not contain an unsealed supported manifest")
         }
         try validate(plan: manifest.qualificationPlan)
         try validate(criteria: manifest.evaluationCriteria)
+        try validate(
+            matrix: manifest.qualificationMatrix,
+            primaryPlan: manifest.qualificationPlan,
+            primaryCriteria: manifest.evaluationCriteria,
+            targetSpec: targetSpec, suiteContracts: suiteContracts)
+        guard manifest.schemaVersion
+                == (manifest.qualificationMatrix == nil ? 1 : 2) else {
+            throw invalid("requalification schema does not match its matrix")
+        }
         try validateManifestContract(manifest, targetSpec: targetSpec)
         guard manifest.evaluationCriteria
                 == VectorPolicyRequalificationCriteria(evaluationCriteria) else {
@@ -315,7 +480,10 @@ public enum VectorPolicyRequalification {
         let candidateFingerprint = validated.fingerprint
         let candidateMetadata = validated.metadata
 
-        let plan = manifest.qualificationPlan
+        let suitePlans = resolvedSuites(
+            manifest: manifest, targetSpec: targetSpec)
+        let primarySuite = suitePlans[0]
+        let plan = primarySuite.legacyPlan
         guard evaluationReportPaths.count == plan.evaluationSeeds.count else {
             throw invalid("publication requires exactly four declared reports")
         }
@@ -329,12 +497,14 @@ public enum VectorPolicyRequalification {
             }
             try validate(
                 report: report, targetSpec: targetSpec,
-                criteria: evaluationCriteria,
+                criteria: liveCriteria(primarySuite.evaluationCriteria),
                 expectedCheckpointDirectory:
                     manifest.candidateCheckpointDirectory,
                 candidateFingerprint: candidateFingerprint,
                 candidateMetadata: candidateMetadata,
-                plan: plan)
+                plan: plan,
+                evaluationTaskConfiguration:
+                    primarySuite.evaluationTaskConfiguration)
             reportsBySeed[report.evaluationSeed] = (report, data)
         }
         guard Set(reportsBySeed.keys) == Set(plan.evaluationSeeds) else {
@@ -349,7 +519,86 @@ public enum VectorPolicyRequalification {
             PPOCheckpointEvaluationAggregate.self, from: aggregateData)
         try validateAggregate(
             aggregate, reports: orderedReports, targetSpec: targetSpec,
-            candidateFingerprint: candidateFingerprint, plan: plan)
+            candidateFingerprint: candidateFingerprint, plan: plan,
+            evaluationTaskConfiguration:
+                primarySuite.evaluationTaskConfiguration)
+
+        let expectedAdditionalSuites = Array(suitePlans.dropFirst())
+        guard additionalSuiteInputs.count == expectedAdditionalSuites.count,
+              Set(additionalSuiteInputs.map(\.id)).count
+                == additionalSuiteInputs.count else {
+            throw invalid(
+                "publication requires exactly the predeclared additional suites")
+        }
+        var additionalInputsByID = Dictionary(
+            uniqueKeysWithValues: additionalSuiteInputs.map { ($0.id, $0) })
+        var additionalQualifications = [
+            String: (reports: [UInt64: (PPOEvaluationMetrics, Data)],
+                     aggregate: PPOCheckpointEvaluationAggregate,
+                     aggregateData: Data)
+        ]()
+        for suite in expectedAdditionalSuites {
+            guard let input = additionalInputsByID.removeValue(forKey: suite.id)
+            else {
+                throw invalid("missing qualification suite \(suite.id)")
+            }
+            let suitePlan = suite.legacyPlan
+            guard input.evaluationReportPaths.count
+                    == suitePlan.evaluationSeeds.count else {
+                throw invalid(
+                    "suite \(suite.id) requires exactly four declared reports")
+            }
+            var suiteReports = [UInt64: (PPOEvaluationMetrics, Data)]()
+            for path in input.evaluationReportPaths {
+                let data = try requiredData(URL(fileURLWithPath: path))
+                let report = try JSONDecoder().decode(
+                    PPOEvaluationMetrics.self, from: data)
+                guard suiteReports[report.evaluationSeed] == nil else {
+                    throw invalid(
+                        "suite \(suite.id) evaluation seeds must be distinct")
+                }
+                try validate(
+                    report: report, targetSpec: targetSpec,
+                    criteria: liveCriteria(suite.evaluationCriteria),
+                    expectedCheckpointDirectory:
+                        manifest.candidateCheckpointDirectory,
+                    candidateFingerprint: candidateFingerprint,
+                    candidateMetadata: candidateMetadata,
+                    plan: suitePlan,
+                    evaluationTaskConfiguration:
+                        suite.evaluationTaskConfiguration)
+                suiteReports[report.evaluationSeed] = (report, data)
+            }
+            guard Set(suiteReports.keys) == Set(suitePlan.evaluationSeeds) else {
+                throw invalid(
+                    "suite \(suite.id) reports do not match predeclared seeds")
+            }
+            let ordered = suitePlan.evaluationSeeds.sorted().map {
+                suiteReports[$0]!.0
+            }
+            let aggregateData = try requiredData(
+                URL(fileURLWithPath: input.aggregatePath))
+            let suiteAggregate = try JSONDecoder().decode(
+                PPOCheckpointEvaluationAggregate.self, from: aggregateData)
+            try validateAggregate(
+                suiteAggregate, reports: ordered, targetSpec: targetSpec,
+                candidateFingerprint: candidateFingerprint, plan: suitePlan,
+                evaluationTaskConfiguration:
+                    suite.evaluationTaskConfiguration)
+            additionalQualifications[suite.id] = (
+                suiteReports, suiteAggregate, aggregateData)
+        }
+        guard additionalInputsByID.isEmpty else {
+            throw invalid("publication includes an undeclared qualification suite")
+        }
+        var aggregatesBySuite = [primarySuite.id: aggregate]
+        for suite in expectedAdditionalSuites {
+            aggregatesBySuite[suite.id] = additionalQualifications[suite.id]!
+                .aggregate
+        }
+        try validateComparisons(
+            manifest.qualificationMatrix?.comparisons ?? [],
+            aggregatesBySuite: aggregatesBySuite)
 
         let outputParent = output.deletingLastPathComponent()
         try manager.createDirectory(
@@ -369,26 +618,72 @@ public enum VectorPolicyRequalification {
         try manager.createDirectory(
             at: qualificationDirectory, withIntermediateDirectories: false)
 
+        let primaryDirectory: URL
+        let primaryRelativeDirectory: String
+        if manifest.schemaVersion == 2 {
+            primaryDirectory = qualificationDirectory.appendingPathComponent(
+                primarySuite.id, isDirectory: true)
+            try manager.createDirectory(
+                at: primaryDirectory, withIntermediateDirectories: false)
+            primaryRelativeDirectory = "qualification/\(primarySuite.id)"
+        } else {
+            primaryDirectory = qualificationDirectory
+            primaryRelativeDirectory = "qualification"
+        }
+
         var reportEvidence = [VectorPolicyRequalificationReportEvidence]()
         for seed in plan.evaluationSeeds.sorted() {
             let data = reportsBySeed[seed]!.1
             let name = "eval-seed-\(seed).json"
             try data.write(
-                to: qualificationDirectory.appendingPathComponent(name),
+                to: primaryDirectory.appendingPathComponent(name),
                 options: .atomic)
             reportEvidence.append(.init(
                 evaluationSeed: seed,
-                file: "qualification/\(name)", sha256: sha256(data)))
+                file: "\(primaryRelativeDirectory)/\(name)",
+                sha256: sha256(data)))
         }
         let aggregateName = "aggregate.json"
         try aggregateData.write(
-            to: qualificationDirectory.appendingPathComponent(aggregateName),
+            to: primaryDirectory.appendingPathComponent(aggregateName),
             options: .atomic)
+        var additionalSuiteEvidence = [
+            VectorPolicyRequalificationSuiteEvidence
+        ]()
+        for suite in expectedAdditionalSuites {
+            let validated = additionalQualifications[suite.id]!
+            let suiteDirectory = qualificationDirectory.appendingPathComponent(
+                suite.id, isDirectory: true)
+            try manager.createDirectory(
+                at: suiteDirectory, withIntermediateDirectories: false)
+            var evidence = [VectorPolicyRequalificationReportEvidence]()
+            for seed in suite.evaluationSeeds.sorted() {
+                let data = validated.reports[seed]!.1
+                let name = "eval-seed-\(seed).json"
+                try data.write(
+                    to: suiteDirectory.appendingPathComponent(name),
+                    options: .atomic)
+                evidence.append(.init(
+                    evaluationSeed: seed,
+                    file: "qualification/\(suite.id)/\(name)",
+                    sha256: sha256(data)))
+            }
+            try validated.aggregateData.write(
+                to: suiteDirectory.appendingPathComponent(aggregateName),
+                options: .atomic)
+            additionalSuiteEvidence.append(.init(
+                id: suite.id, reports: evidence,
+                aggregate: .init(
+                    file: "qualification/\(suite.id)/\(aggregateName)",
+                    sha256: sha256(validated.aggregateData))))
+        }
         manifest.qualification = VectorPolicyRequalificationEvidence(
             reports: reportEvidence,
             aggregate: .init(
-                file: "qualification/\(aggregateName)",
-                sha256: sha256(aggregateData)))
+                file: "\(primaryRelativeDirectory)/\(aggregateName)",
+                sha256: sha256(aggregateData)),
+            additionalSuites: additionalSuiteEvidence.isEmpty
+                ? nil : additionalSuiteEvidence)
         try encoded(manifest).write(
             to: staging.appendingPathComponent(manifestFileName),
             options: .atomic)
@@ -399,7 +694,8 @@ public enum VectorPolicyRequalification {
         _ = try verify(
             targetSpec: targetSpec, evaluationCriteria: evaluationCriteria,
             bundleDirectory: staging.path,
-            parentCheckpointDirectory: parentCheckpointDirectory)
+            parentCheckpointDirectory: parentCheckpointDirectory,
+            suiteContracts: suiteContracts)
         try manager.moveItem(at: staging, to: output)
         published = true
         return manifest
@@ -414,7 +710,8 @@ public enum VectorPolicyRequalification {
         targetSpec: RLTaskSpec,
         evaluationCriteria: RLEvaluationCriteria,
         bundleDirectory: String,
-        parentCheckpointDirectory: String
+        parentCheckpointDirectory: String,
+        suiteContracts: [VectorPolicyRequalificationSuiteContract] = []
     ) throws -> VectorPolicyRequalificationManifest {
         let bundle = URL(fileURLWithPath: bundleDirectory, isDirectory: true)
         let parent = URL(
@@ -423,12 +720,21 @@ public enum VectorPolicyRequalification {
             bundle.appendingPathComponent(manifestFileName))
         let manifest = try JSONDecoder().decode(
             VectorPolicyRequalificationManifest.self, from: manifestData)
-        guard manifest.schemaVersion == 1,
+        guard [1, 2].contains(manifest.schemaVersion),
               let evidence = manifest.qualification else {
             throw invalid("requalification bundle is not sealed")
         }
         try validate(plan: manifest.qualificationPlan)
         try validate(criteria: manifest.evaluationCriteria)
+        try validate(
+            matrix: manifest.qualificationMatrix,
+            primaryPlan: manifest.qualificationPlan,
+            primaryCriteria: manifest.evaluationCriteria,
+            targetSpec: targetSpec, suiteContracts: suiteContracts)
+        guard manifest.schemaVersion
+                == (manifest.qualificationMatrix == nil ? 1 : 2) else {
+            throw invalid("requalification schema does not match its matrix")
+        }
         try validateManifestContract(manifest, targetSpec: targetSpec)
         guard manifest.evaluationCriteria
                 == VectorPolicyRequalificationCriteria(evaluationCriteria) else {
@@ -482,14 +788,30 @@ public enum VectorPolicyRequalification {
             throw invalid("deployment manifest does not match requalification")
         }
 
-        let plan = manifest.qualificationPlan
+        let suitePlans = resolvedSuites(
+            manifest: manifest, targetSpec: targetSpec)
+        let primarySuite = suitePlans[0]
+        let plan = primarySuite.legacyPlan
         guard evidence.reports.count == plan.evaluationSeeds.count else {
             throw invalid("sealed report evidence count is invalid")
+        }
+        guard evidence.reports.map(\.evaluationSeed)
+                == plan.evaluationSeeds else {
+            throw invalid("sealed primary report order is not canonical")
         }
         var reportsBySeed = [UInt64: PPOEvaluationMetrics]()
         for item in evidence.reports {
             guard reportsBySeed[item.evaluationSeed] == nil else {
                 throw invalid("sealed report evidence has duplicate seeds")
+            }
+            if manifest.schemaVersion == 2 {
+                let expectedPath =
+                    "qualification/\(primarySuite.id)/eval-seed-"
+                    + "\(item.evaluationSeed).json"
+                guard item.file == expectedPath else {
+                    throw invalid(
+                        "sealed primary report path is not canonical")
+                }
             }
             let data = try verifiedEvidenceData(
                 root: bundle, relativePath: item.file,
@@ -501,12 +823,14 @@ public enum VectorPolicyRequalification {
             }
             try validate(
                 report: report, targetSpec: targetSpec,
-                criteria: evaluationCriteria,
+                criteria: liveCriteria(primarySuite.evaluationCriteria),
                 expectedCheckpointDirectory:
                     manifest.candidateCheckpointDirectory,
                 candidateFingerprint: validated.fingerprint,
                 candidateMetadata: validated.metadata,
-                plan: plan)
+                plan: plan,
+                evaluationTaskConfiguration:
+                    primarySuite.evaluationTaskConfiguration)
             reportsBySeed[item.evaluationSeed] = report
         }
         guard Set(reportsBySeed.keys) == Set(plan.evaluationSeeds) else {
@@ -515,6 +839,12 @@ public enum VectorPolicyRequalification {
         let orderedReports = plan.evaluationSeeds.sorted().map {
             reportsBySeed[$0]!
         }
+        if manifest.schemaVersion == 2 {
+            guard evidence.aggregate.file
+                    == "qualification/\(primarySuite.id)/aggregate.json" else {
+                throw invalid("sealed primary aggregate path is not canonical")
+            }
+        }
         let aggregateData = try verifiedEvidenceData(
             root: bundle, relativePath: evidence.aggregate.file,
             expectedSHA256: evidence.aggregate.sha256)
@@ -522,7 +852,112 @@ public enum VectorPolicyRequalification {
             PPOCheckpointEvaluationAggregate.self, from: aggregateData)
         try validateAggregate(
             aggregate, reports: orderedReports, targetSpec: targetSpec,
-            candidateFingerprint: validated.fingerprint, plan: plan)
+            candidateFingerprint: validated.fingerprint, plan: plan,
+            evaluationTaskConfiguration:
+                primarySuite.evaluationTaskConfiguration)
+
+        let expectedAdditionalSuites = Array(suitePlans.dropFirst())
+        if manifest.schemaVersion == 1,
+           evidence.additionalSuites != nil {
+            throw invalid("schema-v1 evidence must not contain suite extensions")
+        }
+        let additionalEvidence = evidence.additionalSuites ?? []
+        guard additionalEvidence.count == expectedAdditionalSuites.count,
+              Set(additionalEvidence.map(\.id)).count
+                == additionalEvidence.count,
+              additionalEvidence.map(\.id)
+                == expectedAdditionalSuites.map(\.id) else {
+            throw invalid(
+                "sealed evidence does not match the predeclared suite matrix")
+        }
+        var additionalEvidenceByID = Dictionary(
+            uniqueKeysWithValues: additionalEvidence.map { ($0.id, $0) })
+        var aggregatesBySuite = [primarySuite.id: aggregate]
+        for suite in expectedAdditionalSuites {
+            guard let suiteEvidence = additionalEvidenceByID.removeValue(
+                forKey: suite.id) else {
+                throw invalid("sealed evidence is missing suite \(suite.id)")
+            }
+            let suitePlan = suite.legacyPlan
+            guard suiteEvidence.reports.count
+                    == suitePlan.evaluationSeeds.count else {
+                throw invalid("sealed suite \(suite.id) report count is invalid")
+            }
+            guard suiteEvidence.reports.map(\.evaluationSeed)
+                    == suitePlan.evaluationSeeds else {
+                throw invalid(
+                    "sealed suite \(suite.id) report order is not canonical")
+            }
+            var suiteReportsBySeed = [UInt64: PPOEvaluationMetrics]()
+            for item in suiteEvidence.reports {
+                guard suiteReportsBySeed[item.evaluationSeed] == nil else {
+                    throw invalid(
+                        "sealed suite \(suite.id) has duplicate report seeds")
+                }
+                let expectedPath = "qualification/\(suite.id)/eval-seed-"
+                    + "\(item.evaluationSeed).json"
+                guard item.file == expectedPath else {
+                    throw invalid(
+                        "sealed suite \(suite.id) report path is not canonical")
+                }
+                let data = try verifiedEvidenceData(
+                    root: bundle, relativePath: item.file,
+                    expectedSHA256: item.sha256)
+                let report = try JSONDecoder().decode(
+                    PPOEvaluationMetrics.self, from: data)
+                guard report.evaluationSeed == item.evaluationSeed else {
+                    throw invalid(
+                        "sealed suite \(suite.id) report seed is inconsistent")
+                }
+                try validate(
+                    report: report, targetSpec: targetSpec,
+                    criteria: liveCriteria(suite.evaluationCriteria),
+                    expectedCheckpointDirectory:
+                        manifest.candidateCheckpointDirectory,
+                    candidateFingerprint: validated.fingerprint,
+                    candidateMetadata: validated.metadata,
+                    plan: suitePlan,
+                    evaluationTaskConfiguration:
+                        suite.evaluationTaskConfiguration)
+                suiteReportsBySeed[item.evaluationSeed] = report
+            }
+            guard Set(suiteReportsBySeed.keys)
+                    == Set(suitePlan.evaluationSeeds) else {
+                throw invalid(
+                    "sealed suite \(suite.id) reports do not match its seeds")
+            }
+            let expectedAggregatePath =
+                "qualification/\(suite.id)/aggregate.json"
+            guard suiteEvidence.aggregate.file == expectedAggregatePath else {
+                throw invalid(
+                    "sealed suite \(suite.id) aggregate path is not canonical")
+            }
+            let aggregateData = try verifiedEvidenceData(
+                root: bundle,
+                relativePath: suiteEvidence.aggregate.file,
+                expectedSHA256: suiteEvidence.aggregate.sha256)
+            let suiteAggregate = try JSONDecoder().decode(
+                PPOCheckpointEvaluationAggregate.self, from: aggregateData)
+            let ordered = suitePlan.evaluationSeeds.sorted().map {
+                suiteReportsBySeed[$0]!
+            }
+            try validateAggregate(
+                suiteAggregate, reports: ordered, targetSpec: targetSpec,
+                candidateFingerprint: validated.fingerprint, plan: suitePlan,
+                evaluationTaskConfiguration:
+                    suite.evaluationTaskConfiguration)
+            aggregatesBySuite[suite.id] = suiteAggregate
+        }
+        guard additionalEvidenceByID.isEmpty else {
+            throw invalid("sealed evidence includes an undeclared suite")
+        }
+        try validateComparisons(
+            manifest.qualificationMatrix?.comparisons ?? [],
+            aggregatesBySuite: aggregatesBySuite)
+        if manifest.schemaVersion == 2 {
+            try validateSchema2Inventory(
+                bundle: bundle, suitePlans: suitePlans)
+        }
         return manifest
     }
 
@@ -628,18 +1063,21 @@ public enum VectorPolicyRequalification {
         reports: [PPOEvaluationMetrics],
         targetSpec: RLTaskSpec,
         candidateFingerprint: String,
-        plan: VectorPolicyRequalificationPlan
+        plan: VectorPolicyRequalificationPlan,
+        evaluationTaskConfiguration: [String: Float]
     ) throws {
         try aggregate.validateStructure()
         let recomputed = try PPOCheckpointEvaluationAggregate.make(reports)
+        let transferred = evaluationTaskConfiguration
+            != targetSpec.configurationValues
         guard try canonicalJSON(aggregate) == canonicalJSON(recomputed),
               aggregate.scope == "single_checkpoint_across_evaluation_seeds",
               aggregate.task == targetSpec.id,
               aggregate.taskRevision == targetSpec.revision,
               aggregate.checkpointFingerprint == candidateFingerprint,
               aggregate.evaluationTaskConfiguration
-                == targetSpec.configurationValues,
-              aggregate.taskConfigurationTransferred == false,
+                == evaluationTaskConfiguration,
+              aggregate.taskConfigurationTransferred == transferred,
               aggregate.evaluationSeeds == plan.evaluationSeeds.sorted(),
               aggregate.evaluationEnvironments == plan.evaluationEnvironments,
               aggregate.runs == 4,
@@ -664,7 +1102,8 @@ public enum VectorPolicyRequalification {
         expectedCheckpointDirectory: String,
         candidateFingerprint: String,
         candidateMetadata: VectorPolicyMetadata,
-        plan: VectorPolicyRequalificationPlan
+        plan: VectorPolicyRequalificationPlan,
+        evaluationTaskConfiguration: [String: Float]
     ) throws {
         try report.validateStructure()
         let failures = criteria.failures(
@@ -674,14 +1113,16 @@ public enum VectorPolicyRequalification {
             taskMetrics: report.taskMetrics)
         let derivedSuccessRate = Float(report.successes)
             / Float(max(report.episodes, 1))
+        let transferred = evaluationTaskConfiguration
+            != targetSpec.configurationValues
         guard (report.provenanceVersion ?? 0) >= 3,
               report.task == targetSpec.id,
               report.taskRevision == targetSpec.revision,
               report.checkpointTaskConfiguration
                 == targetSpec.configurationValues,
               report.evaluationTaskConfiguration
-                == targetSpec.configurationValues,
-              report.taskConfigurationTransferred == false,
+                == evaluationTaskConfiguration,
+              report.taskConfigurationTransferred == transferred,
               standardizedPath(report.checkpointDirectory)
                 == standardizedPath(expectedCheckpointDirectory),
               report.checkpointFingerprint == candidateFingerprint,
@@ -715,6 +1156,7 @@ public enum VectorPolicyRequalification {
     ) throws {
         guard plan.evaluationSeeds.count == 4,
               Set(plan.evaluationSeeds).count == 4,
+              plan.evaluationSeeds == plan.evaluationSeeds.sorted(),
               plan.evaluationEnvironments > 0,
               plan.episodesPerReport == 512 else {
             throw invalid(
@@ -724,15 +1166,300 @@ public enum VectorPolicyRequalification {
     }
 
     private static func validate(
+        matrix: VectorPolicyRequalificationMatrix?,
+        primaryPlan: VectorPolicyRequalificationPlan,
+        primaryCriteria: VectorPolicyRequalificationCriteria,
+        targetSpec: RLTaskSpec,
+        suiteContracts: [VectorPolicyRequalificationSuiteContract]
+    ) throws {
+        guard let matrix else {
+            guard suiteContracts.isEmpty else {
+                throw invalid(
+                    "schema-v1 requalification must not supply suite contracts")
+            }
+            return
+        }
+        guard matrix.suites.count >= 2,
+              !matrix.comparisons.isEmpty else {
+            throw invalid(
+                "multi-suite requalification requires at least two suites "
+                    + "and one cross-suite comparison")
+        }
+        let identifiers = matrix.suites.map(\.id)
+        guard Set(identifiers).count == identifiers.count,
+              suiteContracts.count == matrix.suites.count,
+              Set(suiteContracts.map(\.id)).count == suiteContracts.count,
+              Set(suiteContracts.map(\.id)) == Set(identifiers) else {
+            throw invalid("qualification suite identifiers must be distinct")
+        }
+        let contractsByID = Dictionary(
+            uniqueKeysWithValues: suiteContracts.map { ($0.id, $0) })
+        var allSeeds = Set<UInt64>()
+        for (index, suite) in matrix.suites.enumerated() {
+            try validate(plan: suite.legacyPlan)
+            try validate(criteria: suite.evaluationCriteria)
+            guard let contract = contractsByID[suite.id] else {
+                throw invalid("qualification suite contract is missing")
+            }
+            let spec = contract.taskSpec
+            guard spec.id == targetSpec.id,
+                  spec.revision == targetSpec.revision,
+                  spec.observation == targetSpec.observation,
+                  spec.privilegedObservation
+                    == targetSpec.privilegedObservation,
+                  spec.action == targetSpec.action,
+                  spec.maxEpisodeSteps == targetSpec.maxEpisodeSteps,
+                  spec.simulationStep == targetSpec.simulationStep,
+                  spec.controlDecimation == targetSpec.controlDecimation,
+                  spec.numEnvironments == suite.evaluationEnvironments,
+                  spec.autoReset == false,
+                  spec.configurationValues
+                    == suite.evaluationTaskConfiguration,
+                  VectorPolicyRequalificationCriteria(
+                    contract.evaluationCriteria)
+                    == suite.evaluationCriteria else {
+                throw invalid(
+                    "qualification suite \(suite.id) does not match its "
+                        + "live task contract")
+            }
+            guard validSuiteIdentifier(suite.id),
+                  suite.evaluationTaskConfiguration.values.allSatisfy(
+                    \.isFinite),
+                  suite.changedConfigurationFields
+                    == suite.changedConfigurationFields.sorted(),
+                  Set(suite.changedConfigurationFields).count
+                    == suite.changedConfigurationFields.count else {
+                throw invalid("qualification suite \(suite.id) is invalid")
+            }
+            let changedFields = Set(
+                targetSpec.configurationValues.keys.filter {
+                    targetSpec.configurationValues[$0]
+                        != suite.evaluationTaskConfiguration[$0]
+                } + suite.evaluationTaskConfiguration.keys.filter {
+                    targetSpec.configurationValues[$0]
+                        != suite.evaluationTaskConfiguration[$0]
+                })
+            guard suite.changedConfigurationFields
+                    == changedFields.sorted() else {
+                throw invalid(
+                    "qualification suite \(suite.id) does not declare its "
+                        + "exact task-configuration delta")
+            }
+            if index == 0 {
+                guard suite.legacyPlan == primaryPlan,
+                      suite.evaluationTaskConfiguration
+                        == targetSpec.configurationValues,
+                      suite.changedConfigurationFields.isEmpty,
+                      suite.evaluationCriteria == primaryCriteria else {
+                    throw invalid(
+                        "the first qualification suite must be the nominal "
+                            + "checkpoint contract and mirror qualificationPlan")
+                }
+            } else {
+                guard suite.evaluationEnvironments
+                        == primaryPlan.evaluationEnvironments,
+                      !suite.changedConfigurationFields.isEmpty else {
+                    throw invalid(
+                        "each validation suite must change at least one "
+                            + "declared task option and use the primary batch size")
+                }
+            }
+            for seed in suite.evaluationSeeds {
+                guard allSeeds.insert(seed).inserted else {
+                    throw invalid(
+                        "qualification seeds must not overlap across suites")
+                }
+            }
+        }
+        let identifiersSet = Set(identifiers)
+        guard matrix.comparisons.count == matrix.suites.count - 1 else {
+            throw invalid(
+                "each validation suite requires exactly one comparison")
+        }
+        var comparisonPairs = Set<String>()
+        for comparison in matrix.comparisons {
+            let key = comparison.baselineSuite + "\u{0}"
+                + comparison.evaluatedSuite
+            guard identifiersSet.contains(comparison.baselineSuite),
+                  identifiersSet.contains(comparison.evaluatedSuite),
+                  comparison.baselineSuite == identifiers[0],
+                  comparison.evaluatedSuite != identifiers[0],
+                  comparison.maximumPooledSuccessRateDrop.isFinite,
+                  (0...1).contains(
+                    comparison.maximumPooledSuccessRateDrop),
+                  comparisonPairs.insert(key).inserted else {
+                throw invalid("qualification suite comparison is invalid")
+            }
+        }
+        let evaluatedSuites = Set(matrix.comparisons.map(\.evaluatedSuite))
+        guard Set(identifiers.dropFirst()) == evaluatedSuites else {
+            throw invalid(
+                "every validation suite requires a cross-suite comparison")
+        }
+    }
+
+    private static func resolvedSuites(
+        manifest: VectorPolicyRequalificationManifest,
+        targetSpec: RLTaskSpec
+    ) -> [VectorPolicyRequalificationSuitePlan] {
+        if let matrix = manifest.qualificationMatrix {
+            return matrix.suites
+        }
+        return [.init(
+            id: "nominal",
+            evaluationSeeds: manifest.qualificationPlan.evaluationSeeds,
+            evaluationEnvironments:
+                manifest.qualificationPlan.evaluationEnvironments,
+            episodesPerReport:
+                manifest.qualificationPlan.episodesPerReport,
+            evaluationTaskConfiguration: targetSpec.configurationValues,
+            changedConfigurationFields: [],
+            evaluationCriteria: liveCriteria(manifest.evaluationCriteria))]
+    }
+
+    private static func liveCriteria(
+        _ criteria: VectorPolicyRequalificationCriteria
+    ) -> RLEvaluationCriteria {
+        .init(
+            minimumSuccessRate: criteria.minimumSuccessRate,
+            minimumMeanEpisodeLengthFraction:
+                criteria.minimumMeanEpisodeLengthFraction,
+            minimumTaskMetrics: criteria.minimumTaskMetrics,
+            maximumTaskMetrics: criteria.maximumTaskMetrics)
+    }
+
+    private static func validateComparisons(
+        _ comparisons: [VectorPolicyRequalificationComparison],
+        aggregatesBySuite: [String: PPOCheckpointEvaluationAggregate]
+    ) throws {
+        for comparison in comparisons {
+            guard let baseline = aggregatesBySuite[comparison.baselineSuite],
+                  let evaluated = aggregatesBySuite[comparison.evaluatedSuite]
+            else {
+                throw invalid("qualification comparison suite is missing")
+            }
+            let drop = baseline.pooledSuccessRate
+                - evaluated.pooledSuccessRate
+            guard drop <= comparison.maximumPooledSuccessRateDrop else {
+                throw invalid(
+                    "suite \(comparison.evaluatedSuite) pooled success rate "
+                        + "degraded beyond its predeclared bound")
+            }
+        }
+    }
+
+    private static func validSuiteIdentifier(_ value: String) -> Bool {
+        guard let first = value.utf8.first,
+              (97...122).contains(first) || (48...57).contains(first) else {
+            return false
+        }
+        return value.utf8.allSatisfy {
+            (97...122).contains($0) || (48...57).contains($0) || $0 == 45
+        }
+    }
+
+    private static func validateSchema2Inventory(
+        bundle: URL, suitePlans: [VectorPolicyRequalificationSuitePlan]
+    ) throws {
+        let manager = FileManager.default
+        let expectedTopLevel = Set([
+            "metadata.json", "policy.safetensors", "training-state.json",
+            VectorPolicyDeploymentBundle.manifestFileName, manifestFileName,
+            "qualification",
+        ])
+        let topLevel = try manager.contentsOfDirectory(
+            atPath: bundle.path)
+        guard Set(topLevel) == expectedTopLevel else {
+            throw invalid("schema-v2 bundle has missing or extra top-level entries")
+        }
+        for name in expectedTopLevel {
+            let url = bundle.appendingPathComponent(name)
+            let values = try url.resourceValues(
+                forKeys: [
+                    .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+                ])
+            let expectedDirectory = name == "qualification"
+            guard values.isSymbolicLink != true,
+                  expectedDirectory
+                    ? values.isDirectory == true
+                    : values.isRegularFile == true else {
+                throw invalid("schema-v2 top-level inventory is invalid")
+            }
+        }
+        var expectedFiles = Set<String>()
+        var expectedDirectories = Set<String>()
+        for suite in suitePlans {
+            let prefix = "qualification/\(suite.id)"
+            expectedDirectories.insert(prefix)
+            expectedFiles.insert("\(prefix)/aggregate.json")
+            for seed in suite.evaluationSeeds {
+                expectedFiles.insert("\(prefix)/eval-seed-\(seed).json")
+            }
+        }
+        guard let enumerator = manager.enumerator(
+            at: bundle.appendingPathComponent("qualification"),
+            includingPropertiesForKeys: [
+                .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+            ])
+        else {
+            throw invalid("schema-v2 qualification directory is missing")
+        }
+        var actualFiles = Set<String>()
+        var actualDirectories = Set<String>()
+        let resolvedBundlePath = bundle.resolvingSymlinksInPath()
+            .standardizedFileURL.path
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(
+                forKeys: [
+                    .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+                ])
+            guard values.isSymbolicLink != true else {
+                throw invalid("schema-v2 evidence must not contain symlinks")
+            }
+            if values.isRegularFile == true {
+                let resolvedPath = url.resolvingSymlinksInPath()
+                    .standardizedFileURL.path
+                let prefix = resolvedBundlePath + "/"
+                guard resolvedPath.hasPrefix(prefix) else {
+                    throw invalid("schema-v2 evidence escaped its bundle")
+                }
+                actualFiles.insert(
+                    String(resolvedPath.dropFirst(prefix.count)))
+            } else if values.isDirectory == true {
+                let resolvedPath = url.resolvingSymlinksInPath()
+                    .standardizedFileURL.path
+                let prefix = resolvedBundlePath + "/"
+                guard resolvedPath.hasPrefix(prefix) else {
+                    throw invalid("schema-v2 evidence escaped its bundle")
+                }
+                actualDirectories.insert(
+                    String(resolvedPath.dropFirst(prefix.count)))
+            } else {
+                throw invalid("schema-v2 evidence contains a special file")
+            }
+        }
+        guard actualFiles == expectedFiles,
+              actualDirectories == expectedDirectories else {
+            throw invalid("schema-v2 qualification has missing or extra files")
+        }
+    }
+
+    private static func validate(
         criteria: VectorPolicyRequalificationCriteria
     ) throws {
+        let overlappingMetrics = Set(criteria.minimumTaskMetrics.keys)
+            .intersection(criteria.maximumTaskMetrics.keys)
         guard criteria.minimumSuccessRate.isFinite,
               (0...1).contains(criteria.minimumSuccessRate),
               criteria.minimumMeanEpisodeLengthFraction.isFinite,
               (0...1).contains(
                 criteria.minimumMeanEpisodeLengthFraction),
               criteria.minimumTaskMetrics.values.allSatisfy(\.isFinite),
-              criteria.maximumTaskMetrics.values.allSatisfy(\.isFinite) else {
+              criteria.maximumTaskMetrics.values.allSatisfy(\.isFinite),
+              overlappingMetrics.allSatisfy({
+                criteria.minimumTaskMetrics[$0]!
+                    <= criteria.maximumTaskMetrics[$0]!
+              }) else {
             throw invalid("requalification evaluation criteria are invalid")
         }
     }

@@ -178,6 +178,30 @@ REQUALIFICATION_MANIFEST_KEYS = {
     "targetTrainingEnvironmentSteps", "changedFields", "qualificationPlan",
     "evaluationCriteria", "qualification",
 }
+REQUALIFICATION_V2_MANIFEST_KEYS = (
+    REQUALIFICATION_MANIFEST_KEYS | {"qualificationMatrix"}
+)
+ARACHNE_EPOCH2_REVISION = 2_000_006
+ARACHNE_QUALIFICATION_PROFILE = {
+    "arachne15-velocity-v0": {
+        "nominalSeeds": [61_001, 61_002, 61_003, 61_004],
+        "validationSeeds": [61_501, 61_502, 61_503, 61_504],
+        "parentDirectory": "checkpoints/arachne15-velocity-v0",
+        "parentFingerprint":
+            "aed643b062df4e0e07e70998212720909bc1b25229455489ba28d4319d202524",
+        "parentPolicySHA256":
+            "a41b162b2bb922605e29a487a736f98b31416457807fc30a30c4e52014bf0638",
+    },
+    "arachne15-goal-v0": {
+        "nominalSeeds": [62_001, 62_002, 62_003, 62_004],
+        "validationSeeds": [63_001, 63_002, 63_003, 63_004],
+        "parentDirectory": "checkpoints/arachne15-goal-v0",
+        "parentFingerprint":
+            "30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027",
+        "parentPolicySHA256":
+            "9521c03cab6fc9e829cd2664fa0e086f69720d4aa46b1e5b893776a4df072c14",
+    },
+}
 
 
 class VerificationError(RuntimeError):
@@ -748,7 +772,7 @@ def task_acceptance_failures(report: dict[str, Any],
         maximum("episode/yaw_rate_rmse_rps", 0.50)
         minimum_length_fraction = f32(0.90)
     else:
-        require(revision == 6
+        require(revision in {6, ARACHNE_EPOCH2_REVISION}
                 and task in {"arachne15-goal-v0", "arachne15-velocity-v0"},
                 f"{context.entry.selection_id}: accepted task criteria are not verified")
 
@@ -779,11 +803,14 @@ def task_acceptance_failures(report: dict[str, Any],
     elif task == "arachne15-velocity-v0":
         require(f32_bits(configuration.get("pointGoal")) == f32_bits(0),
                 "accepted Arachne Velocity evidence enabled pointGoal")
-        if f32(report["successRate"]) < f32(0.80):
+        if f32(report["successRate"]) < f32(0.90):
             failures.append("success rate below threshold")
-        minimum("episode/survived", 0.90)
+        minimum("episode/survived", 0.95)
+        minimum("episode/minimum_foot_collider_clearance_m", -0.003)
         maximum("episode/linear_velocity_rmse_mps", 0.15)
         maximum("episode/yaw_rate_rmse_rps", 0.40)
+        maximum("episode/foot_collider_penetration_rmse_m", 0.0005)
+        maximum("episode/foot_collider_penetration_over_1mm_fraction", 0.025)
         minimum_length_fraction = f32(0.90)
 
     max_episode_steps = context.metadata.get("maxEpisodeSteps")
@@ -1332,6 +1359,9 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
     require(qualification_directory.is_dir()
             and not qualification_directory.is_symlink(),
             f"{manifest_path}: qualification directory is invalid")
+    require(qualification_directory.is_dir()
+            and not qualification_directory.is_symlink(),
+            f"{manifest_path}: qualification directory is invalid")
     require({path.name for path in qualification_directory.iterdir()}
             == expected_report_names | {"aggregate.json"},
             f"{manifest_path}: qualification directory has missing or extra files")
@@ -1404,6 +1434,379 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
     return aggregate_path
 
 
+def configuration_changed_fields(first: dict[str, Any],
+                                 second: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
+    for key in sorted(first.keys() | second.keys()):
+        if key not in first or key not in second:
+            changed.append(key)
+        elif f32_bits(first[key]) != f32_bits(second[key]):
+            changed.append(key)
+    return changed
+
+
+def arachne_evaluation_criteria(task: str,
+                                configuration: dict[str, Any]) -> dict[str, Any]:
+    minimum_metrics: dict[str, float] = {
+        "episode/survived": 0.95,
+        "episode/minimum_foot_collider_clearance_m": -0.003,
+    }
+    maximum_metrics: dict[str, float] = {
+        "episode/yaw_rate_rmse_rps": 0.40,
+        "episode/foot_collider_penetration_rmse_m": 0.0005,
+        "episode/foot_collider_penetration_over_1mm_fraction": 0.025,
+    }
+    if task == "arachne15-velocity-v0":
+        maximum_metrics["episode/linear_velocity_rmse_mps"] = 0.15
+        return {
+            "minimumSuccessRate": 0.90,
+            "minimumMeanEpisodeLengthFraction": 0.90,
+            "minimumTaskMetrics": minimum_metrics,
+            "maximumTaskMetrics": maximum_metrics,
+        }
+    require(task == "arachne15-goal-v0",
+            f"unsupported schema-v2 task {task}")
+    minimum_metrics.update({
+        "episode/goal_reached": 0.90,
+        "episode/goal_front_success_rate": 0.85,
+        "episode/goal_near_success_rate": 0.85,
+        "episode/goal_far_success_rate": 0.85,
+    })
+    direction = f32(configuration["maximumGoalDirectionAngle"])
+    if direction > f32(f32(math.pi) / f32(4)):
+        minimum_metrics["episode/goal_left_success_rate"] = 0.85
+        minimum_metrics["episode/goal_right_success_rate"] = 0.85
+    if direction > f32(f32(3) * f32(math.pi) / f32(4)):
+        minimum_metrics["episode/goal_rear_success_rate"] = 0.85
+    radius = f32(configuration["goalRadius"])
+    maximum_metrics.update({
+        "episode/final_goal_distance_m": f32(radius * f32(1.25)),
+        "episode/minimum_goal_distance_m": radius,
+    })
+    return {
+        "minimumSuccessRate": 0.90,
+        "minimumMeanEpisodeLengthFraction": 0.10,
+        "minimumTaskMetrics": minimum_metrics,
+        "maximumTaskMetrics": maximum_metrics,
+    }
+
+
+def verify_schema2_requalification(
+    root: Path, context: CheckpointContext, manifest_path: Path
+) -> tuple[list[Path], int]:
+    """Verify a generic multi-suite bundle and the pinned Arachne profile."""
+    bundle_manifest = context.directory / "requalification-manifest.json"
+    require(not bundle_manifest.is_symlink()
+            and manifest_path.resolve() == bundle_manifest.resolve(),
+            f"{context.entry.selection_id}: evidence must be the in-bundle "
+            "non-symlink requalification manifest")
+    manifest = load_json(manifest_path)
+    require_exact_keys(manifest, REQUALIFICATION_V2_MANIFEST_KEYS,
+                       str(manifest_path))
+    require(manifest.get("schemaVersion") == 2,
+            f"{manifest_path}: unsupported multi-suite schema")
+    task = context.entry.task_id
+    profile = ARACHNE_QUALIFICATION_PROFILE.get(task)
+    require(profile is not None,
+            f"{context.entry.selection_id}: schema-v2 release profile is not pinned")
+    metadata = context.metadata
+    state = context.training_state
+    require(metadata.get("taskRevision") == ARACHNE_EPOCH2_REVISION
+            and manifest.get("task") == task
+            and manifest.get("targetTaskRevision") == ARACHNE_EPOCH2_REVISION,
+            f"{manifest_path}: Arachne epoch-2 task identity changed")
+    require(manifest.get("changedFields") == REQUALIFICATION_CHANGED_FIELDS,
+            f"{manifest_path}: permitted zero-update transform changed")
+    source_commit = manifest.get("declaredSourceCommit")
+    require(isinstance(source_commit, str)
+            and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                             source_commit) is not None,
+            f"{manifest_path}: declared source commit is not a full lowercase ID")
+    candidate_relative = manifest.get("candidateCheckpointDirectory")
+    require(isinstance(candidate_relative, str) and candidate_relative
+            and candidate_relative != manifest.get("parentCheckpointDirectory"),
+            f"{manifest_path}: candidate checkpoint path is invalid")
+    assert_json_equal(manifest.get("taskConfiguration"),
+                      metadata.get("taskConfiguration"),
+                      f"{manifest_path}.taskConfiguration")
+    require(manifest.get("observationDimension")
+            == metadata.get("observationDimension")
+            and manifest.get("actionDimension")
+            == metadata.get("actionDimension")
+            and f32_bits(manifest.get("simulationStepSeconds"))
+            == f32_bits(metadata.get("simulationStep"))
+            and manifest.get("controlDecimation")
+            == metadata.get("controlDecimation")
+            and manifest.get("maxEpisodeSteps")
+            == metadata.get("maxEpisodeSteps")
+            and manifest.get("inferenceBatchSize") == 128,
+            f"{manifest_path}: rollout contract changed")
+    require(manifest.get("targetTrainingUpdates") == 0
+            and manifest.get("targetTrainingEnvironmentSteps") == 0,
+            f"{manifest_path}: candidate is not optimizer-free")
+    assert_json_equal(state, {
+        "completedUpdates": 0,
+        "environmentSteps": 0,
+        "optimizerSteps": 0,
+    }, f"{manifest_path}: candidate training state")
+
+    parent_relative = manifest.get("parentCheckpointDirectory")
+    require(parent_relative == profile["parentDirectory"]
+            and manifest.get("sourceTaskRevision") == 6,
+            f"{manifest_path}: pinned epoch-1 parent lineage changed")
+    parent = repository_path(root, parent_relative,
+                             f"{context.entry.selection_id} parent checkpoint")
+    require(parent.is_dir() and not (root / parent_relative).is_symlink(),
+            f"{manifest_path}: parent checkpoint is missing or aliased")
+    parent_metadata = load_json(parent / "metadata.json")
+    parent_state = load_json(parent / "training-state.json")
+    require(parent_metadata.get("task") == task
+            and parent_metadata.get("taskRevision")
+                == manifest.get("sourceTaskRevision")
+            and parent_metadata.get("taskRevision") != ARACHNE_EPOCH2_REVISION,
+            f"{manifest_path}: parent task lineage changed")
+    require(config_equal(parent_metadata.get("taskConfiguration"),
+                         metadata.get("taskConfiguration")),
+            f"{manifest_path}: zero-update transfer changed nominal config")
+    require(manifest.get("parentTrainingUpdates")
+            == parent_state.get("completedUpdates")
+            and manifest.get("parentTrainingEnvironmentSteps")
+            == parent_state.get("environmentSteps"),
+            f"{manifest_path}: parent training counters changed")
+    hashes = {
+        "parentPolicySHA256": parent / "policy.safetensors",
+        "candidatePolicySHA256": context.directory / "policy.safetensors",
+        "parentMetadataSHA256": parent / "metadata.json",
+        "candidateMetadataSHA256": context.directory / "metadata.json",
+        "parentTrainingStateSHA256": parent / "training-state.json",
+        "candidateTrainingStateSHA256": context.directory / "training-state.json",
+    }
+    for field, path in hashes.items():
+        digest = require_sha256(manifest.get(field),
+                                f"{manifest_path}.{field}")
+        require(not path.is_symlink() and sha256_file(path) == digest,
+                f"{manifest_path}: {field} does not bind {path}")
+    require((parent / "policy.safetensors").read_bytes()
+            == (context.directory / "policy.safetensors").read_bytes()
+            and manifest["parentPolicySHA256"]
+                == manifest["candidatePolicySHA256"]
+                == profile["parentPolicySHA256"],
+            f"{manifest_path}: policy bytes changed during requalification")
+    require(checkpoint_fingerprint(parent)
+            == manifest.get("parentCheckpointFingerprint")
+            == profile["parentFingerprint"]
+            and context.fingerprint
+            == manifest.get("candidateCheckpointFingerprint"),
+            f"{manifest_path}: checkpoint fingerprint lineage changed")
+
+    expected_metadata = deepcopy(parent_metadata)
+    expected_metadata["taskRevision"] = ARACHNE_EPOCH2_REVISION
+    expected_metadata["taskConfiguration"] = deepcopy(
+        metadata["taskConfiguration"])
+    expected_metadata["inferenceBatchSize"] = 128
+    expected_ppo = expected_metadata.get("ppo")
+    require(isinstance(expected_ppo, dict),
+            f"{manifest_path}: parent PPO metadata is missing")
+    expected_ppo["initializationCheckpoint"] = parent_relative
+    expected_ppo["updates"] = 0
+    assert_json_equal(metadata, expected_metadata,
+                      f"{manifest_path}: candidate metadata transform")
+
+    plan = manifest.get("qualificationPlan")
+    require_exact_keys(plan, {"evaluationSeeds", "evaluationEnvironments",
+                              "episodesPerReport"},
+                       f"{manifest_path}.qualificationPlan")
+    matrix = manifest.get("qualificationMatrix")
+    require_exact_keys(matrix, {"suites", "comparisons"},
+                       f"{manifest_path}.qualificationMatrix")
+    suites = matrix.get("suites")
+    comparisons = matrix.get("comparisons")
+    require(isinstance(suites, list) and len(suites) == 2,
+            f"{manifest_path}: Arachne requires nominal and collision suites")
+    require(isinstance(comparisons, list) and len(comparisons) == 1,
+            f"{manifest_path}: Arachne requires one cross-suite gate")
+    suite_ids = ["nominal", "validation-collision"]
+    expected_seeds = [profile["nominalSeeds"], profile["validationSeeds"]]
+    nominal_configuration = metadata.get("taskConfiguration")
+    require(isinstance(nominal_configuration, dict)
+            and f32_bits(nominal_configuration.get(
+                "validationCollisionProfile")) == f32_bits(0),
+            f"{manifest_path}: nominal collision profile must be zero")
+    validation_configuration = deepcopy(nominal_configuration)
+    validation_configuration["validationCollisionProfile"] = 1
+    expected_configurations = [nominal_configuration, validation_configuration]
+    expected_deltas = [[], ["validationCollisionProfile"]]
+    for index, suite in enumerate(suites):
+        label = f"{manifest_path}.qualificationMatrix.suites[{index}]"
+        require_exact_keys(suite, {
+            "id", "evaluationSeeds", "evaluationEnvironments",
+            "episodesPerReport", "evaluationTaskConfiguration",
+            "changedConfigurationFields", "evaluationCriteria",
+        }, label)
+        require(suite.get("id") == suite_ids[index]
+                and suite.get("evaluationSeeds") == expected_seeds[index]
+                and suite.get("evaluationEnvironments") == 128
+                and suite.get("episodesPerReport") == 512,
+                f"{label}: fixed suite plan changed")
+        assert_json_equal(suite.get("evaluationTaskConfiguration"),
+                          expected_configurations[index],
+                          f"{label}.evaluationTaskConfiguration")
+        require(suite.get("changedConfigurationFields")
+                == expected_deltas[index]
+                == configuration_changed_fields(
+                    nominal_configuration, expected_configurations[index]),
+                f"{label}: collision-profile delta changed")
+        assert_json_equal(
+            suite.get("evaluationCriteria"),
+            arachne_evaluation_criteria(task, expected_configurations[index]),
+            f"{label}.evaluationCriteria")
+    require(plan == {
+        "evaluationSeeds": expected_seeds[0],
+        "evaluationEnvironments": 128,
+        "episodesPerReport": 512,
+    }, f"{manifest_path}: primary qualification alias changed")
+    assert_json_equal(manifest.get("evaluationCriteria"),
+                      suites[0].get("evaluationCriteria"),
+                      f"{manifest_path}.evaluationCriteria")
+    comparison = comparisons[0]
+    require_exact_keys(comparison, {
+        "baselineSuite", "evaluatedSuite", "maximumPooledSuccessRateDrop",
+    }, f"{manifest_path}.qualificationMatrix.comparisons[0]")
+    require(comparison.get("baselineSuite") == "nominal"
+            and comparison.get("evaluatedSuite") == "validation-collision"
+            and f32_bits(comparison.get("maximumPooledSuccessRateDrop"))
+                == f32_bits(0.05),
+            f"{manifest_path}: cross-suite gate changed")
+
+    qualification = manifest.get("qualification")
+    require_exact_keys(qualification, {"reports", "aggregate",
+                                       "additionalSuites"},
+                       f"{manifest_path}.qualification")
+    additional = qualification.get("additionalSuites")
+    require(isinstance(additional, list) and len(additional) == 1
+            and additional[0].get("id") == "validation-collision",
+            f"{manifest_path}: additional suite evidence changed")
+    evidence_by_id = {
+        "nominal": {
+            "reports": qualification.get("reports"),
+            "aggregate": qualification.get("aggregate"),
+        },
+        "validation-collision": additional[0],
+    }
+    qualification_directory = context.directory / "qualification"
+    expected_files: set[Path] = set()
+    aggregate_paths: list[Path] = []
+    report_count = 0
+    aggregates: dict[str, dict[str, Any]] = {}
+    for index, suite_id in enumerate(suite_ids):
+        suite = suites[index]
+        evidence = evidence_by_id[suite_id]
+        require_exact_keys(evidence,
+                           {"reports", "aggregate"}
+                           | ({"id"} if suite_id != "nominal" else set()),
+                           f"{manifest_path}.qualification.{suite_id}")
+        report_evidence = evidence.get("reports")
+        require(isinstance(report_evidence, list)
+                and len(report_evidence) == 4,
+                f"{manifest_path}: suite {suite_id} needs four reports")
+        for item, seed in zip(report_evidence, expected_seeds[index]):
+            require_exact_keys(item, {"evaluationSeed", "file", "sha256"},
+                               f"{manifest_path}.{suite_id}.report")
+            relative = f"qualification/{suite_id}/eval-seed-{seed}.json"
+            require(item.get("evaluationSeed") == seed
+                    and item.get("file") == relative,
+                    f"{manifest_path}: suite report path or seed changed")
+            path = sealed_bundle_file(context.directory, relative,
+                                      f"{manifest_path}.{suite_id}.report")
+            require(sha256_file(path) == require_sha256(
+                item.get("sha256"), f"{manifest_path}.{suite_id}.sha256"),
+                f"{path}: sealed report digest mismatch")
+            report = load_json(path)
+            require(report.get("evaluationSeed") == seed
+                    and report.get("evaluationEnvironments") == 128
+                    and report.get("episodes") == 512
+                    and report.get("checkpointDirectory")
+                        == manifest.get("candidateCheckpointDirectory")
+                    and config_equal(report.get("evaluationTaskConfiguration"),
+                                     expected_configurations[index])
+                    and report.get("taskConfigurationTransferred")
+                        == (index == 1),
+                    f"{path}: report differs from its frozen suite")
+            expected_files.add(Path(relative))
+        aggregate_evidence = evidence.get("aggregate")
+        require_exact_keys(aggregate_evidence, {"file", "sha256"},
+                           f"{manifest_path}.{suite_id}.aggregate")
+        aggregate_relative = f"qualification/{suite_id}/aggregate.json"
+        require(aggregate_evidence.get("file") == aggregate_relative,
+                f"{manifest_path}: aggregate path changed")
+        aggregate_path = sealed_bundle_file(
+            context.directory, aggregate_relative,
+            f"{manifest_path}.{suite_id}.aggregate")
+        require(sha256_file(aggregate_path) == require_sha256(
+            aggregate_evidence.get("sha256"),
+            f"{manifest_path}.{suite_id}.aggregate.sha256"),
+            f"{aggregate_path}: sealed aggregate digest mismatch")
+        aggregate = load_json(aggregate_path)
+        require(aggregate.get("evaluationSeeds") == expected_seeds[index]
+                and aggregate.get("evaluationEnvironments") == 128
+                and aggregate.get("requiredRuns") == 4
+                and aggregate.get("runs") == 4
+                and aggregate.get("requiredEpisodesPerRun") == 512
+                and aggregate.get("acceptedRuns") == 4
+                and aggregate.get("allRunsPassed") is True
+                and aggregate.get("robustAcrossEvaluationSeeds") is True
+                and config_equal(aggregate.get("evaluationTaskConfiguration"),
+                                 expected_configurations[index])
+                and aggregate.get("taskConfigurationTransferred")
+                    == (index == 1),
+                f"{aggregate_path}: suite aggregate is not independently robust")
+        report_count += verify_aggregate(aggregate_path, context)
+        aggregate_paths.append(aggregate_path)
+        aggregates[suite_id] = aggregate
+        expected_files.add(Path(aggregate_relative))
+
+    nominal_rate = f32(aggregates["nominal"]["pooledSuccessRate"])
+    validation_rate = f32(
+        aggregates["validation-collision"]["pooledSuccessRate"])
+    require(f32(nominal_rate - validation_rate) <= f32(0.05),
+            f"{manifest_path}: validation pooled success degraded by over 5pp")
+
+    actual_files: set[Path] = set()
+    actual_directories: set[Path] = {Path("qualification")}
+    for path in qualification_directory.rglob("*"):
+        require(not path.is_symlink(),
+                f"{manifest_path}: qualification evidence contains a symlink")
+        relative = path.relative_to(context.directory)
+        if path.is_file():
+            actual_files.add(relative)
+        elif path.is_dir():
+            actual_directories.add(relative)
+        else:
+            raise VerificationError(
+                f"{manifest_path}: qualification contains a special file")
+    require(actual_files == expected_files
+            and actual_directories == {
+                Path("qualification"), Path("qualification/nominal"),
+                Path("qualification/validation-collision"),
+            }, f"{manifest_path}: qualification inventory is not exact")
+    expected_top_level = {
+        "metadata.json", "policy.safetensors", "training-state.json",
+        "deployment-manifest.json", "requalification-manifest.json",
+        "qualification",
+    }
+    require({path.name for path in context.directory.iterdir()}
+            == expected_top_level,
+            f"{manifest_path}: bundle has missing or extra top-level entries")
+    for name in expected_top_level:
+        path = context.directory / name
+        require(not path.is_symlink(),
+                f"{manifest_path}: top-level entry is a symlink: {name}")
+        require(path.is_dir() if name == "qualification" else path.is_file(),
+                f"{manifest_path}: top-level entry has wrong type: {name}")
+    verify_deployment_manifest(context, required=True, exact=True)
+    return aggregate_paths, report_count
+
+
 def verify(root: Path) -> tuple[int, int, int, int]:
     root = root.resolve()
     accepted, external_parity = catalog_entries(root)
@@ -1423,6 +1826,12 @@ def verify(root: Path) -> tuple[int, int, int, int]:
                 root, context, evidence_path)
             aggregate_paths.add(aggregate_path.resolve())
             report_count += verify_aggregate(aggregate_path, context)
+            continue
+        if evidence.get("schemaVersion") == 2:
+            suite_aggregates, suite_reports = verify_schema2_requalification(
+                root, context, evidence_path)
+            aggregate_paths.update(path.resolve() for path in suite_aggregates)
+            report_count += suite_reports
             continue
         if evidence.get("scope") == "single_checkpoint_across_evaluation_seeds":
             siblings = sorted(evidence_path.parent.glob("*aggregate*.json"))
