@@ -763,8 +763,15 @@ public struct RLTaskConfiguration: Sendable {
     }
 }
 
+/// Concurrent-safe registry of vectorized task factories.
+///
+/// Registration and lookup are linearizable. Factories are snapshotted while
+/// locked and executed after unlocking, so they may safely reenter the same
+/// registry. A factory can be invoked concurrently and therefore must be
+/// sendable.
 public final class RLTaskRegistry: @unchecked Sendable {
-    public typealias Factory = (RLTaskConfiguration) throws -> any VectorizedRLTask
+    public typealias Factory = @Sendable (RLTaskConfiguration) throws
+        -> any VectorizedRLTask
 
     private let lock = NSLock()
     private var factories: [String: Factory] = [:]
@@ -777,6 +784,7 @@ public final class RLTaskRegistry: @unchecked Sendable {
         optionSchema: RLTaskOptionSchema? = nil,
         factory: @escaping Factory
     ) throws {
+        try Self.validateIdentifier(id)
         lock.lock()
         defer { lock.unlock() }
         guard factories[id] == nil else { throw RLEnvironmentError.duplicateTask(id) }
@@ -820,6 +828,7 @@ public final class RLTaskRegistry: @unchecked Sendable {
 
     public func make(_ id: String, configuration: RLTaskConfiguration) throws
         -> any VectorizedRLTask {
+        try Self.validateIdentifier(id)
         guard configuration.numEnvironments > 0 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "numEnvironments must be positive")
@@ -833,6 +842,30 @@ public final class RLTaskRegistry: @unchecked Sendable {
             throw RLEnvironmentError.unknownTask(id, available: available)
         }
         try optionSchema?.validate(configuration, taskID: id)
-        return try factory(configuration)
+        let task = try factory(configuration)
+        guard task.spec.id == id else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "task factory registered as '\(id)' produced task "
+                + "'\(task.spec.id)'")
+        }
+        guard task.spec.numEnvironments == configuration.numEnvironments else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "task '\(id)' factory produced "
+                + "\(task.spec.numEnvironments) environments; requested "
+                + "\(configuration.numEnvironments)")
+        }
+        return task
+    }
+
+    private static func validateIdentifier(_ id: String) throws {
+        guard !id.isEmpty,
+              id.unicodeScalars.allSatisfy({
+                  !CharacterSet.whitespacesAndNewlines.contains($0)
+                      && !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "invalid RL task identifier '\(id)': identifiers must be "
+                + "non-empty and contain no whitespace or control characters")
+        }
     }
 }
