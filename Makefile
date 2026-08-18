@@ -71,12 +71,13 @@ ml-tool:
 	xcodebuild -scheme avbd -configuration Release -destination 'platform=macOS' -derivedDataPath .xcbuild build -quiet
 	@echo "binary: .xcbuild/Build/Products/Release/avbd"
 
-# App with working MLX policy mode (xcodebuild; SwiftPM cannot build MLX shaders)
-app-ml:
+# App with working MLX policy mode (xcodebuild; SwiftPM cannot build MLX shaders).
+# Accepted policy evidence is verified before any checkpoint enters the bundle.
+app-ml: verify-policy-evidence
 	xcodebuild -scheme AVBDApp -configuration Release -destination 'platform=macOS' -derivedDataPath .xcbuild build -quiet
 	rm -rf AVBD.app
 	mkdir -p AVBD.app/Contents/MacOS AVBD.app/Contents/Resources/checkpoints/external/unitree-h1
-	mkdir -p AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v0
+	mkdir -p AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v1/qualification
 	mkdir -p AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-goal-v0
 	mkdir -p AVBD.app/Contents/Resources/checkpoints/arachne15-velocity-v0
 	mkdir -p AVBD.app/Contents/Resources/checkpoints/arachne15-goal-v0
@@ -87,11 +88,19 @@ app-ml:
 	  checkpoints/external/unitree-h1/manifest.json \
 	  checkpoints/external/unitree-h1/policy.safetensors \
 	  AVBD.app/Contents/Resources/checkpoints/external/unitree-h1/
-	cp checkpoints/humanoid-isaac-flat-v0/evaluation.json \
-	  checkpoints/humanoid-isaac-flat-v0/metadata.json \
-	  checkpoints/humanoid-isaac-flat-v0/policy.safetensors \
-	  checkpoints/humanoid-isaac-flat-v0/training-state.json \
-	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v0/
+	# v0 remains repository-only lineage evidence; ship the physics-compatible v1.
+	cp checkpoints/humanoid-isaac-flat-v1/deployment-manifest.json \
+	  checkpoints/humanoid-isaac-flat-v1/metadata.json \
+	  checkpoints/humanoid-isaac-flat-v1/policy.safetensors \
+	  checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json \
+	  checkpoints/humanoid-isaac-flat-v1/training-state.json \
+	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v1/
+	cp checkpoints/humanoid-isaac-flat-v1/qualification/aggregate.json \
+	  checkpoints/humanoid-isaac-flat-v1/qualification/eval-seed-51001.json \
+	  checkpoints/humanoid-isaac-flat-v1/qualification/eval-seed-51002.json \
+	  checkpoints/humanoid-isaac-flat-v1/qualification/eval-seed-51003.json \
+	  checkpoints/humanoid-isaac-flat-v1/qualification/eval-seed-51004.json \
+	  AVBD.app/Contents/Resources/checkpoints/humanoid-isaac-flat-v1/qualification/
 	cp checkpoints/humanoid-isaac-goal-v0/evaluation.json \
 	  checkpoints/humanoid-isaac-goal-v0/metadata.json \
 	  checkpoints/humanoid-isaac-goal-v0/policy.safetensors \

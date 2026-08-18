@@ -4,6 +4,19 @@ import Foundation
 @testable import AVBDLearn
 
 final class VectorPolicyCompatibilityTests: XCTestCase {
+    func testExplicitReplayCheckpointIsAnAuthoritativeSource() {
+        XCTAssertEqual(
+            PolicyReplayCheckpointResolution.candidates(
+                explicit: "/operator/checkpoint",
+                fallbacks: ["/live/latest", "/bundled", nil]),
+            ["/operator/checkpoint"])
+        XCTAssertEqual(
+            PolicyReplayCheckpointResolution.candidates(
+                explicit: nil,
+                fallbacks: ["/live/latest", nil, "/bundled"]),
+            ["/live/latest", "/bundled"])
+    }
+
     func testMetadataRejectsSameShapeWrongTaskAndPhysicsContract() {
         let spec = RLTaskSpec(
             id: "destination-v0", revision: 4, numEnvironments: 1,
@@ -53,12 +66,28 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             .deletingLastPathComponent()
         let selectionIDs = PolicyReplayCatalog.entries.map(\.selectionID)
         XCTAssertEqual(Set(selectionIDs).count, selectionIDs.count)
+        XCTAssertFalse(selectionIDs.contains("humanoid-isaac-flat-v0"))
+        XCTAssertTrue(selectionIDs.contains("humanoid-isaac-flat-v1"))
         XCTAssertEqual(
-            PolicyReplayCatalog.entries.filter {
-                $0.qualification == .requalificationRequired
-            }.map(\.selectionID),
+            PolicyReplayCatalog.entry(
+                selectionID: "humanoid-isaac-flat-v1")?.evidenceRelativePath,
+            "checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json")
+        XCTAssertTrue(PolicyReplayCatalog.entries.allSatisfy {
+            $0.qualification != .requalificationRequired
+        })
+        XCTAssertEqual(
+            PolicyReplayCatalog.historicalEntries.map(\.selectionID),
             ["humanoid-isaac-flat-v0"])
-        for entry in PolicyReplayCatalog.entries {
+        XCTAssertNil(PolicyReplayCatalog.entry(
+            selectionID: "humanoid-isaac-flat-v0"))
+        XCTAssertEqual(
+            PolicyReplayCatalog.historicalEntry(
+                selectionID: "humanoid-isaac-flat-v0")?.qualification,
+            .requalificationRequired)
+        let allSelectionIDs = PolicyReplayCatalog.allDeclaredEntries.map(
+            \.selectionID)
+        XCTAssertEqual(Set(allSelectionIDs).count, allSelectionIDs.count)
+        for entry in PolicyReplayCatalog.allDeclaredEntries {
             XCTAssertEqual(
                 entry.runtime == .classicalController,
                 entry.checkpointRelativeDirectory == nil,
@@ -74,9 +103,9 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                     evidence)
             }
         }
-        let policyDirectories = PolicyReplayCatalog.nativeLearnedEntries.map {
-            "checkpoints/" + $0.checkpointRelativeDirectory!
-        }
+        let policyDirectories = PolicyReplayCatalog.allDeclaredEntries
+            .filter { $0.runtime == .nativeMLX }
+            .map { "checkpoints/" + $0.checkpointRelativeDirectory! }
 
         let checkpointRoot = root.appendingPathComponent("checkpoints")
         let actualTaskDirectories = try FileManager.default.contentsOfDirectory(
@@ -128,15 +157,85 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                     numEnvironments: 1, seed: 1, autoReset: false,
                     options: options))
             let mismatches = metadata.compatibilityMismatches(with: task.spec)
-            if entry.qualification == .requalificationRequired {
-                XCTAssertFalse(mismatches.isEmpty, directory)
-                XCTAssertTrue(mismatches.contains { $0.contains("revision") },
-                              "\(directory): \(mismatches)")
-            } else {
-                XCTAssertTrue(
-                    mismatches.isEmpty,
-                    "\(directory): \(mismatches.joined(separator: "; "))")
-            }
+            XCTAssertTrue(
+                mismatches.isEmpty,
+                "\(directory): \(mismatches.joined(separator: "; "))")
         }
+
+        for entry in PolicyReplayCatalog.historicalEntries
+            where entry.runtime == .nativeMLX {
+            let directory = "checkpoints/"
+                + (try XCTUnwrap(entry.checkpointRelativeDirectory))
+            let policyDirectory = root.appendingPathComponent(directory)
+            let metadata = try JSONDecoder().decode(
+                VectorPolicyMetadata.self,
+                from: Data(contentsOf: policyDirectory.appendingPathComponent(
+                    "metadata.json")))
+            let options = BuiltInRLTasks.registry.checkpointReplayOptions(
+                for: metadata.task,
+                semanticOptions: try XCTUnwrap(metadata.taskConfiguration),
+                maxEpisodeSteps: metadata.maxEpisodeSteps,
+                controlDecimation: metadata.controlDecimation)
+            let task = try BuiltInRLTasks.registry.make(
+                metadata.task,
+                configuration: .init(
+                    numEnvironments: 1, seed: 1, autoReset: false,
+                    options: options))
+            let mismatches = metadata.compatibilityMismatches(with: task.spec)
+            XCTAssertFalse(mismatches.isEmpty, directory)
+            XCTAssertTrue(mismatches.contains { $0.contains("revision") },
+                          "\(directory): \(mismatches)")
+        }
+    }
+
+    func testAcceptedIsaacFlatReplayHasSealedZeroUpdateLineage() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let parent = root.appendingPathComponent(
+            "checkpoints/humanoid-isaac-flat-v0", isDirectory: true)
+        let bundle = root.appendingPathComponent(
+            "checkpoints/humanoid-isaac-flat-v1", isDirectory: true)
+        let metadata = try JSONDecoder().decode(
+            VectorPolicyMetadata.self,
+            from: Data(contentsOf: bundle.appendingPathComponent(
+                "metadata.json")))
+        let options = BuiltInRLTasks.registry.checkpointReplayOptions(
+            for: metadata.task,
+            semanticOptions: try XCTUnwrap(metadata.taskConfiguration),
+            maxEpisodeSteps: metadata.maxEpisodeSteps,
+            controlDecimation: metadata.controlDecimation)
+        let task = try BuiltInRLTasks.registry.make(
+            metadata.task,
+            configuration: .init(
+                numEnvironments: 1, seed: 51_001, autoReset: false,
+                options: options))
+        let criteria = try XCTUnwrap(
+            (task as? any RLEvaluationCriteriaProviding)?.evaluationCriteria)
+
+        let manifest = try VectorPolicyRequalification.verify(
+            targetSpec: task.spec,
+            evaluationCriteria: criteria,
+            bundleDirectory: bundle.path,
+            parentCheckpointDirectory: parent.path)
+
+        XCTAssertEqual(manifest.sourceTaskRevision,
+                       RLPhysicsContract.fixedGainActuatorV2(10))
+        XCTAssertEqual(manifest.targetTaskRevision,
+                       RLPhysicsContract.fixedGainActuatorV2(11))
+        XCTAssertEqual(manifest.parentPolicySHA256,
+                       manifest.candidatePolicySHA256)
+        XCTAssertEqual(manifest.targetTrainingUpdates, 0)
+        XCTAssertEqual(manifest.targetTrainingEnvironmentSteps, 0)
+        XCTAssertEqual(manifest.qualificationPlan.evaluationSeeds,
+                       [51_001, 51_002, 51_003, 51_004])
+        XCTAssertEqual(manifest.qualificationPlan.episodesPerReport, 512)
+        XCTAssertEqual(manifest.qualification?.reports.count, 4)
+        XCTAssertEqual(
+            try Data(contentsOf: parent.appendingPathComponent(
+                "policy.safetensors")),
+            try Data(contentsOf: bundle.appendingPathComponent(
+                "policy.safetensors")))
     }
 }

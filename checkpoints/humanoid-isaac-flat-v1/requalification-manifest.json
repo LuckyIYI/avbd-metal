@@ -1,0 +1,93 @@
+{
+  "actionDimension" : 19,
+  "candidateCheckpointDirectory" : "runs\/humanoid-isaac-flat-v1\/requalification-r1000011\/candidate",
+  "candidateCheckpointFingerprint" : "85571805cc7b688970cf5497beb5916be8fb3b1fcb7855207af6f55b208c7fd2",
+  "candidateMetadataSHA256" : "b0058de2a89ef4e27520d2bc1c00a9822c01bf8d8ac5a03a1bce31596e4d7be4",
+  "candidatePolicySHA256" : "3e0a21600afd6ee2e50383ed33f69007f9855c3f8b85ec0b52c4f2acc2c285ae",
+  "candidateTrainingStateSHA256" : "15857f493c4a481825b008864879d53be5d398865a33c2249adfbbabe6d51e3e",
+  "changedFields" : [
+    "metadata.taskRevision",
+    "metadata.inferenceBatchSize",
+    "metadata.ppo.initializationCheckpoint",
+    "metadata.ppo.updates",
+    "training-state.completedUpdates",
+    "training-state.environmentSteps",
+    "training-state.optimizerSteps",
+    "training-state.adaptiveLearningRate"
+  ],
+  "controlDecimation" : 4,
+  "declaredSourceCommit" : "d3d07bf1bd0b78c62235794a7c81621ffe748ed7",
+  "evaluationCriteria" : {
+    "maximumTaskMetrics" : {
+      "episode\/linear_velocity_rmse_mps" : 0.35,
+      "episode\/yaw_rate_rmse_rps" : 0.5
+    },
+    "minimumMeanEpisodeLengthFraction" : 0.9,
+    "minimumSuccessRate" : 0.8,
+    "minimumTaskMetrics" : {
+      "episode\/survived" : 0.9
+    }
+  },
+  "inferenceBatchSize" : 128,
+  "maxEpisodeSteps" : 1000,
+  "observationDimension" : 69,
+  "parentCheckpointDirectory" : "checkpoints\/humanoid-isaac-flat-v0",
+  "parentCheckpointFingerprint" : "d6b5d416e7f7d75fa2b9b9dd33f78ae387e3f2a8139aa6d25a69e5dbcae777ab",
+  "parentMetadataSHA256" : "30bceef674cf25d99bb8f1e0e3ce9867843ff926755ecfd27383915acde9a1ce",
+  "parentPolicySHA256" : "3e0a21600afd6ee2e50383ed33f69007f9855c3f8b85ec0b52c4f2acc2c285ae",
+  "parentTrainingEnvironmentSteps" : 6144,
+  "parentTrainingStateSHA256" : "56bb45619a02264a02199d0c0ac0d96ff7fb9b3c9c8c6c58fc55756881c262e3",
+  "parentTrainingUpdates" : 1,
+  "qualification" : {
+    "aggregate" : {
+      "file" : "qualification\/aggregate.json",
+      "sha256" : "a3e54308ac978e68509ff1ea437a7f908be3b2c2a0df6699755e03a98d7e3f6d"
+    },
+    "reports" : [
+      {
+        "evaluationSeed" : 51001,
+        "file" : "qualification\/eval-seed-51001.json",
+        "sha256" : "2c48696385668a22417bfb2d811adb39c05e6a501ac3ef7bf74bef2d046d3815"
+      },
+      {
+        "evaluationSeed" : 51002,
+        "file" : "qualification\/eval-seed-51002.json",
+        "sha256" : "e0c4c03dcbfa18b6258f87ed135bf70304e97bc4640a6d4858026513ea57aba9"
+      },
+      {
+        "evaluationSeed" : 51003,
+        "file" : "qualification\/eval-seed-51003.json",
+        "sha256" : "7412147895ddb1a48eec036a7e9d79bdd2379139b4997e62a6abbddf5e9fb124"
+      },
+      {
+        "evaluationSeed" : 51004,
+        "file" : "qualification\/eval-seed-51004.json",
+        "sha256" : "015bbb14ec3c9d1c7462ed1cd584f8af84685a02f0818f43428df6d6559b9e60"
+      }
+    ]
+  },
+  "qualificationPlan" : {
+    "episodesPerReport" : 512,
+    "evaluationEnvironments" : 128,
+    "evaluationSeeds" : [
+      51001,
+      51002,
+      51003,
+      51004
+    ]
+  },
+  "schemaVersion" : 1,
+  "simulationStepSeconds" : 0.005,
+  "sourceTaskRevision" : 1000010,
+  "targetTaskRevision" : 1000011,
+  "targetTrainingEnvironmentSteps" : 0,
+  "targetTrainingUpdates" : 0,
+  "task" : "humanoid-isaac-flat-v0",
+  "taskConfiguration" : {
+    "commandResamplingSteps" : 500,
+    "initialYawRange" : 3.1415925,
+    "observationNoise" : 1,
+    "solverIterations" : 20,
+    "standingCommandProbability" : 0.02
+  }
+}

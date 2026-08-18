@@ -65,8 +65,9 @@ make ml-tool
   --envs 256 --episodes 512 --seed 10001 --json \
   --output runs/humanoid-isaac-flat-v0/my-h1-seed-1/eval.json
 
-# Open Policy Replay. The source-verified Unitree H1 Sim2Sim policy is the
-# clean default while the native Flat actor crosses its explicit revision gate.
+# Open Policy Replay. The native H1 Flat actor is qualified on the current
+# BSD-source collision hulls; the source-verified Unitree actor remains an
+# independent Sim2Sim reference.
 make app-ml
 AVBD_POLICY_REPLAY=1 open AVBD.app
 ```
@@ -82,14 +83,17 @@ Push-T, or otherwise fails its contract. The tracked extension points are
 [`VectorRLAlgorithm`](Sources/AVBDLearn/VectorRLAlgorithm.swift); shipped
 checkpoint contracts are indexed in [the checkpoint catalog](checkpoints/README.md).
 
-The packaged H1 Flat actor is retained as immutable evidence for the corrected
-fixed-gain actuator contract and former collision geometry
-(`taskRevision=1000010`). Its sealed seed-41010 test achieved 507/512 successes
-(99.02%), 0.089 m/s linear RMSE, and 0.134 rad/s yaw-rate RMSE. The current
-BSD-source hull task is revision 1000011, so Policy Replay rejects that bundle
-until the unchanged weights are requalified and republished. Its historical
-fingerprint is `d6b5d416...e777ab`; the old result is not presented as evidence
-for the new physics contract.
+The current packaged **H1 Flat** actor is a zero-update requalification of the
+same policy bytes on the BSD-source collision hulls (`taskRevision=1000011`).
+The registry task ID intentionally remains `humanoid-isaac-flat-v0`; `v1`
+names the revised, accepted checkpoint selection rather than a different task.
+Four manifest-locked, fixed-seed 512-episode evaluations passed 2028/2048
+episodes (99.02%); the worst run passed 98.63%, while worst-run linear and
+yaw-rate RMSE were
+0.089 m/s and 0.132 rad/s. The sealed bundle binds the unchanged policy, old
+and new task revisions, fixed seeds, raw reports, aggregate, and producing
+commit. Its current fingerprint is `85571805...c7fd2`. The revision-1000010
+bundle remains immutable historical evidence and is not selectable.
 
 The packaged **H1 Goal** replay is also on the corrected actuator contract and
 is the current experimental robustness best:
@@ -125,8 +129,13 @@ They are visual-only and are never observations, rewards, or success inputs.
 The H1 gate requires a full 20-second episode plus low linear and yaw tracking
 error; merely standing upright cannot pass.
 
-The historical Flat actor's tracked held-out evidence is
-[`checkpoints/humanoid-isaac-flat-v0/evaluation.json`](checkpoints/humanoid-isaac-flat-v0/evaluation.json).
+The current Flat actor's tracked multi-seed evidence is
+[`checkpoints/humanoid-isaac-flat-v1/qualification/aggregate.json`](checkpoints/humanoid-isaac-flat-v1/qualification/aggregate.json);
+its exact zero-update lineage is sealed by the adjacent
+[`requalification-manifest.json`](checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json).
+The revision-1000010
+[`historical evaluation`](checkpoints/humanoid-isaac-flat-v0/evaluation.json)
+is retained but is not evidence for the revised collision geometry.
 Replay videos and frame-locked single-episode reports are generated outputs
 under the ignored `artifacts/` directory; they are deliberately not required
 by a clean clone or treated as release evidence.

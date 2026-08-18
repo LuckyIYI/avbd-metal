@@ -15,7 +15,7 @@ public enum PolicyReplayQualification: String, Sendable, Codable {
     case accepted
     case development
     /// The immutable packaged checkpoint predates the current task physics
-    /// revision and remains visible only as a migration/retraining boundary.
+    /// revision and is retained only as a historical migration boundary.
     case requalificationRequired
     case nonNeuralBaseline
 }
@@ -49,6 +49,18 @@ public struct PolicyReplayCatalogEntry: Sendable, Equatable {
     }
 }
 
+/// Shared source-precedence rule for replay checkpoints. An explicit path is
+/// an auditable provenance boundary: an invalid override must fail rather than
+/// silently executing different live, bundled, or repository weights.
+public enum PolicyReplayCheckpointResolution {
+    public static func candidates(
+        explicit: String?, fallbacks: [String?]
+    ) -> [String] {
+        if let explicit { return [explicit] }
+        return fallbacks.compactMap { $0 }
+    }
+}
+
 /// Single source of truth for the polished replay surface. Experimental tasks
 /// remain trainable through the generic registry without appearing here.
 public enum PolicyReplayCatalog {
@@ -70,14 +82,14 @@ public enum PolicyReplayCatalog {
             qualification: .development,
             evidenceRelativePath: "Tools/import_gear_sonic_policy.py"),
         .init(
-            selectionID: "humanoid-isaac-flat-v0",
-            displayName: "H1 Flat (Requalify)",
+            selectionID: "humanoid-isaac-flat-v1",
+            displayName: "H1 Flat",
             taskID: "humanoid-isaac-flat-v0",
             runtime: .nativeMLX,
-            checkpointRelativeDirectory: "humanoid-isaac-flat-v0",
-            qualification: .requalificationRequired,
+            checkpointRelativeDirectory: "humanoid-isaac-flat-v1",
+            qualification: .accepted,
             evidenceRelativePath:
-                "checkpoints/humanoid-isaac-flat-v0/evaluation.json"),
+                "checkpoints/humanoid-isaac-flat-v1/requalification-manifest.json"),
         .init(
             selectionID: "humanoid-isaac-goal-v0",
             displayName: "H1 Goal",
@@ -116,10 +128,37 @@ public enum PolicyReplayCatalog {
             evidenceRelativePath: nil),
     ]
 
+    /// Immutable tracked checkpoints retained for provenance and migration.
+    /// These entries are deliberately excluded from `entries`, so they cannot
+    /// appear in a replay picker or be selected by `entry(selectionID:)`.
+    public static let historicalEntries: [PolicyReplayCatalogEntry] = [
+        .init(
+            selectionID: "humanoid-isaac-flat-v0",
+            displayName: "H1 Flat (Historical)",
+            taskID: "humanoid-isaac-flat-v0",
+            runtime: .nativeMLX,
+            checkpointRelativeDirectory: "humanoid-isaac-flat-v0",
+            qualification: .requalificationRequired,
+            evidenceRelativePath:
+                "checkpoints/humanoid-isaac-flat-v0/evaluation.json"),
+    ]
+
+    /// Complete repository inventory, including nonselectable historical
+    /// lineage. This is broader than the app's runtime package allowlist.
+    public static var allDeclaredEntries: [PolicyReplayCatalogEntry] {
+        entries + historicalEntries
+    }
+
     public static func entry(selectionID: String)
         -> PolicyReplayCatalogEntry?
     {
         entries.first { $0.selectionID == selectionID }
+    }
+
+    public static func historicalEntry(selectionID: String)
+        -> PolicyReplayCatalogEntry?
+    {
+        historicalEntries.first { $0.selectionID == selectionID }
     }
 
     public static var nativeLearnedEntries: [PolicyReplayCatalogEntry] {

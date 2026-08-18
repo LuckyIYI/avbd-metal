@@ -37,7 +37,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             switch self {
             case .unitreeH1: return "unitree-h1-sim2sim-v0"
             case .gearSonicG1: return "gear-sonic-g1-reference-v0"
-            case .humanoidIsaac: return "humanoid-isaac-flat-v0"
+            case .humanoidIsaac: return "humanoid-isaac-flat-v1"
             case .humanoidIsaacGoal: return "humanoid-isaac-goal-v0"
             case .humanoidBoxCarry: return "humanoid-box-carry-v0"
             case .arachne: return "arachne15-velocity-v0"
@@ -70,7 +70,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         }
 
         static func fromSelectionID(_ id: String) -> Robot? {
-            allCases.first { $0.selectionID == id }
+            // Migrate the only retired picker identifier. This is intentionally
+            // a UI preference migration, not a checkpoint compatibility
+            // bypass: an explicit v0 checkpoint is still rejected by the
+            // current task-revision check during installation.
+            if id == "humanoid-isaac-flat-v0" { return .humanoidIsaac }
+            return allCases.first { $0.selectionID == id }
         }
 
         init?(taskID: String) {
@@ -95,11 +100,17 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let environment = ProcessInfo.processInfo.environment
         if environment["AVBD_REPLAY_CONTROLLER"]?.lowercased()
             == "classical" { return .arachneClassical }
-        let requestedTask = environment["AVBD_REPLAY_TASK"]
-            ?? UserDefaults.standard.string(
-                forKey: "AVBDPolicyReplaySelectedTask")
-        return requestedTask.flatMap(Robot.fromSelectionID)
-            ?? .unitreeH1
+        let selectionKey = "AVBDPolicyReplaySelectedTask"
+        let persistedTask = UserDefaults.standard.string(forKey: selectionKey)
+        let requestedTask = environment["AVBD_REPLAY_TASK"] ?? persistedTask
+        let selected = requestedTask.flatMap(Robot.fromSelectionID)
+        if environment["AVBD_REPLAY_TASK"] == nil,
+           persistedTask == "humanoid-isaac-flat-v0",
+           let selected {
+            UserDefaults.standard.set(
+                selected.selectionID, forKey: selectionKey)
+        }
+        return selected ?? .humanoidIsaac
     }() {
         didSet {
             UserDefaults.standard.set(
@@ -156,6 +167,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private var arachneRevealController: Arachne15RevealController?
     private var arachneAutoUnfold = false
     private var loadedCheckpointDirectory: String?
+    private var explicitCheckpointPath: String? {
+        ProcessInfo.processInfo.environment["AVBD_REPLAY_CHECKPOINT"]
+    }
     private let liveRunDirectory = ProcessInfo.processInfo.environment[
         "AVBD_REPLAY_RUN_DIR"]
     private var accumulator: Double = 0
@@ -225,7 +239,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     /// A learned actor is active, regardless of whether it came from native
     /// training or an immutable external import.
     var usesCheckpoint: Bool { !robot.usesClassicalController }
-    var supportsLiveCheckpointLoading: Bool { robot.runtime == .nativeMLX }
+    var supportsLiveCheckpointLoading: Bool {
+        robot.runtime == .nativeMLX && explicitCheckpointPath == nil
+    }
     var supportsGEARSonicReferenceSelection: Bool { robot == .gearSonicG1 }
     var hasReplayScene: Bool { solver != nil }
     var controllerSectionTitle: String {
@@ -315,7 +331,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         case .gearSonicG1:
             return "NVIDIA GEAR-SONIC's 29-DoF G1 reference-following policy, imported from ONNX to native batched MLX and replayed on its analytic training collision plant. Full walking and dance clips pass; high-dynamic clips remain development-qualified."
         case .humanoidIsaac:
-            return "The packaged H1 Flat checkpoint predates the current BSD-source collision-hull physics revision. It is intentionally rejected until the unchanged weights are requalified and republished against this task; markers show the current command segment, not a point goal."
+            return "Accepted native MLX H1 flat locomotion: unchanged weights requalified on the current BSD-source collision hulls with zero target updates, passing 2,028 of 2,048 sealed episodes (99.02%) across four fixed seeds. Markers show the commanded velocity segment, not a point goal."
         case .humanoidIsaacGoal:
             return "Development H1 point-goal/8 kg impact policy on the current actuator contract (78.1% sealed-test goal success); PPO owns every joint action, but this policy is not acceptance-qualified yet."
         case .humanoidBoxCarry:
@@ -447,12 +463,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
             let bundledPath = Bundle.main.resourceURL?
                 .appendingPathComponent(
                     "checkpoints/\(checkpointRelativeDirectory)").path
-            let overridePath = ProcessInfo.processInfo.environment[
-                "AVBD_REPLAY_CHECKPOINT"]
-            let configurationPaths = robot.usesClassicalController ? [] : [
-                autoLoadLatest ? liveRunDirectory : nil,
-                overridePath, bundledPath, packagedPath,
-            ].compactMap { $0 }
+            let overridePath = explicitCheckpointPath
+            let configurationPaths = robot.usesClassicalController ? []
+                : PolicyReplayCheckpointResolution.candidates(
+                    explicit: overridePath, fallbacks: [
+                        autoLoadLatest ? liveRunDirectory : nil,
+                        bundledPath, packagedPath,
+                    ])
             let checkpointMetadata = configurationPaths.lazy.compactMap {
                 self.replayMetadata(at: $0, task: desiredTaskID)
             }.first
@@ -490,19 +507,31 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
                 goalDistance = 1.5
             }
             guard let task else { return }
-            let liveCheckpoint = robot.usesClassicalController ? nil
-                : liveRunDirectory.flatMap {
-                VectorPolicyCheckpointDiscovery.latestCompleteCheckpoint(
-                    inRunDirectory: $0, task: task.spec.id,
-                    taskRevision: task.spec.revision)
+            let liveCheckpoint: VectorPolicyCheckpointCandidate?
+            if robot.usesClassicalController || overridePath != nil {
+                liveCheckpoint = nil
+            } else {
+                liveCheckpoint = liveRunDirectory.flatMap {
+                    VectorPolicyCheckpointDiscovery.latestCompleteCheckpoint(
+                        inRunDirectory: $0, task: task.spec.id,
+                        taskRevision: task.spec.revision)
+                }
             }
             newestUpdate = liveCheckpoint?.completedUpdates
             let startupLiveCheckpoint = autoLoadLatest ? liveCheckpoint : nil
-            let candidates = robot.usesClassicalController ? [] : [
-                startupLiveCheckpoint?.directory, overridePath,
-                bundledPath, packagedPath,
-            ].compactMap { $0 }
+            let candidates = robot.usesClassicalController ? []
+                : PolicyReplayCheckpointResolution.candidates(
+                    explicit: overridePath, fallbacks: [
+                        startupLiveCheckpoint?.directory, bundledPath,
+                        packagedPath,
+                    ])
             var loadFailures = [String]()
+            if let overridePath,
+               !FileManager.default.fileExists(
+                    atPath: "\(overridePath)/metadata.json") {
+                loadFailures.append(
+                    "\(overridePath): metadata.json not found")
+            }
             for path in candidates
                 where FileManager.default.fileExists(atPath: "\(path)/metadata.json") {
                 do {
@@ -564,12 +593,13 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     }
 
     private func installUnitreeH1Replay() throws {
-        let overridePath = ProcessInfo.processInfo.environment[
-            "AVBD_REPLAY_CHECKPOINT"]
+        let overridePath = explicitCheckpointPath
         let bundledPath = Bundle.main.resourceURL?
             .appendingPathComponent("checkpoints/external/unitree-h1").path
-        let candidates = [overridePath, bundledPath,
-                          "checkpoints/external/unitree-h1"].compactMap { $0 }
+        let candidates = PolicyReplayCheckpointResolution.candidates(
+            explicit: overridePath, fallbacks: [
+                bundledPath, "checkpoints/external/unitree-h1",
+            ])
         guard let directory = candidates.first(where: {
             FileManager.default.fileExists(atPath: "\($0)/manifest.json")
                 && FileManager.default.fileExists(
@@ -599,10 +629,10 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
         let bundledPath = Bundle.main.resourceURL?
             .appendingPathComponent(
                 "checkpoints/external/gear-sonic-g1").path
-        let candidates = [
-            overridePath, bundledPath,
-            "checkpoints/external/gear-sonic-g1",
-        ].compactMap { $0 }
+        let candidates = PolicyReplayCheckpointResolution.candidates(
+            explicit: overridePath, fallbacks: [
+                bundledPath, "checkpoints/external/gear-sonic-g1",
+            ])
         guard let bundleDirectory = candidates.first(where: {
             Self.isGEARSonicBundle(at: $0)
         }) else {
@@ -1050,6 +1080,12 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     private func refreshTrainingMetrics() {
         if robot.usesClassicalController {
             trainingStatus = "deterministic classical controller · training not required"
+            return
+        }
+        if robot.runtime == .nativeMLX, explicitCheckpointPath != nil {
+            if flowReplayController == nil {
+                trainingStatus = "static explicit checkpoint replay"
+            }
             return
         }
         guard supportsLiveCheckpointLoading else {

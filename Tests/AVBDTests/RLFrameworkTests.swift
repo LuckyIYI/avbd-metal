@@ -4626,6 +4626,95 @@ final class RLFrameworkTests: XCTestCase {
             outputDirectory: output.path))
     }
 
+    func testPromotedH1V1PackagedMLXInferenceMapsIntoTaskControls() throws {
+        guard ProcessInfo.processInfo.environment[
+            "AVBD_MLX_INTEGRATION_TESTS"] == "1" else {
+            throw XCTSkip(
+                "requires an Xcode-packaged MLX default.metallib")
+        }
+        try requirePackagedMLXMetalLibrary()
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bundle = packageRoot.appendingPathComponent(
+            "checkpoints/humanoid-isaac-flat-v1", isDirectory: true)
+        let expectedFingerprint =
+            "85571805cc7b688970cf5497beb5916be8fb3b1fcb7855207af6f55b208c7fd2"
+        XCTAssertEqual(
+            try VectorPPOTrainer.checkpointFingerprint(
+                directory: bundle.path),
+            expectedFingerprint)
+
+        let metadata = try JSONDecoder().decode(
+            VectorPolicyMetadata.self,
+            from: Data(contentsOf: bundle.appendingPathComponent(
+                "metadata.json")))
+        XCTAssertEqual(metadata.task, "humanoid-isaac-flat-v0")
+        XCTAssertEqual(metadata.taskRevision, 1_000_011)
+        XCTAssertEqual(metadata.inferenceBatchSize, 128)
+        XCTAssertEqual(metadata.observationDimension, 69)
+        XCTAssertEqual(metadata.actionDimension, 19)
+        let deployment = try VectorPolicyDeploymentRuntime(
+            bundleDirectory: bundle.path,
+            expectedTask: "humanoid-isaac-flat-v0",
+            expectedTaskRevision: 1_000_011,
+            expectedCheckpointFingerprint: expectedFingerprint)
+        XCTAssertEqual(deployment.observationDimension, 69)
+        XCTAssertEqual(deployment.actionDimension, 19)
+        XCTAssertEqual(deployment.controlPeriodSeconds, 0.02, accuracy: 1e-8)
+        let options = BuiltInRLTasks.registry.checkpointReplayOptions(
+            for: metadata.task,
+            semanticOptions: try XCTUnwrap(metadata.taskConfiguration),
+            maxEpisodeSteps: metadata.maxEpisodeSteps,
+            controlDecimation: metadata.controlDecimation)
+        let task = try BuiltInRLTasks.registry.make(
+            metadata.task,
+            configuration: .init(
+                numEnvironments: 4, seed: 51_001, autoReset: false,
+                options: options))
+        XCTAssertEqual(task.spec.revision, 1_000_011)
+        XCTAssertTrue(metadata.compatibilityMismatches(with: task.spec).isEmpty)
+
+        let runner = try VectorPolicyRunner(
+            checkpointDirectory: bundle.path)
+        let observation = try task.reset(seed: 51_001)
+        let first = try runner.actions(for: observation, task: task)
+        let repeated = try runner.actions(for: observation, task: task)
+        XCTAssertEqual(first.values.count, 4 * 19)
+        XCTAssertEqual(first.values, repeated.values,
+                       "deployed inference must be deterministic")
+        XCTAssertTrue(first.values.allSatisfy(\.isFinite))
+        XCTAssertGreaterThan(first.values.map(abs).max() ?? 0, 0.01)
+
+        // Recorded 128-row padding must not couple independent environments.
+        // Each row inferred alone must match its row in the batched result.
+        for environment in 0..<4 {
+            let observationStart = environment * 69
+            let actionStart = environment * 19
+            let isolated = try deployment.actions(for: ContiguousArray(
+                observation.policy[observationStart..<(observationStart + 69)]))
+            for joint in 0..<19 {
+                XCTAssertEqual(
+                    isolated[joint], first.values[actionStart + joint],
+                    accuracy: 1e-6)
+            }
+        }
+
+        var result = RLStepBatch(spec: task.spec)
+        try task.step(actions: first, into: &result)
+        XCTAssertTrue(result.observations.policy.allSatisfy(\.isFinite))
+        // H1 observations 50...68 are the previous command. This proves the
+        // runner's 19 outputs traversed the task's real actuator-control path,
+        // rather than merely loading and evaluating an orphan network.
+        for environment in 0..<4 {
+            for joint in 0..<19 {
+                XCTAssertEqual(
+                    result.observations.policy[environment * 69 + 50 + joint],
+                    first.values[environment * 19 + joint], accuracy: 1e-6)
+            }
+        }
+    }
+
     func testTrackedArachneDeploymentRuntimeHasExactInferenceParity() throws {
         guard ProcessInfo.processInfo.environment[
             "AVBD_MLX_INTEGRATION_TESTS"] == "1" else {
