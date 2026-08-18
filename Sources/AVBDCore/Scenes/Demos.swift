@@ -17,7 +17,7 @@ public struct DemoParam: Identifiable {
 
 public enum Demos {
     public static var all: [String] {
-        ["stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+        ["gaudifunicular", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
          "wreckingball", "trebuchet", "rubegoldberg",
@@ -36,6 +36,12 @@ public enum Demos {
         let membrane = DemoParam("membrane", "Membrane µ", 30...1500, 300)
         let bending = DemoParam("bending", "Bending ×1e-4", 0...40, 5)
         switch name {
+        case "gaudifunicular": return [
+            DemoParam("loadScale", "Stone load", 0.25...2, 1),
+            DemoParam("slack", "Cord slack", 1.02...1.30, 1.12),
+            DemoParam("linearDamping", "Linear damping /s", 0...4, 1.8),
+            DemoParam("angularDamping", "Angular damping /s", 0...6, 2.6)
+        ]
         case "clothfold": return [fric(0.9), membrane, bending]
         case "boxoncloth": return [fric(0.8),
                                    DemoParam("massRatio", "Box mass ×cloth", 1...16, 8),
@@ -88,6 +94,12 @@ public enum Demos {
             }
         }
         switch name {
+        case "gaudifunicular": return gaudiFunicular(
+            segmentsPerCable: min(9, 5 + s / 4),
+            loadScale: p("loadScale", 1),
+            slack: p("slack", 1.12),
+            linearDamping: p("linearDamping", 1.8),
+            angularDamping: p("angularDamping", 2.6))
         case "stack": return stack(height: 10 * s)
         case "ratiostack": return ratiostack(levels: min(8, 3 + s))
         case "slopefriction": return slopefriction(count: 6 + 2 * s)

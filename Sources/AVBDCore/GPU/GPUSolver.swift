@@ -58,6 +58,7 @@ public final class GPUSolver {
     var colliderOwner, colliderShape, colliderShapeType, colliderGroup: MTLBuffer
     var colliderSharedCollision: MTLBuffer
     var colliderLocalPosition, colliderLocalRotation: MTLBuffer
+    var colliderRenderColor: MTLBuffer
     var colliderFriction: MTLBuffer
     var colliderHullRange, convexHullVertices: MTLBuffer
 
@@ -165,6 +166,11 @@ public final class GPUSolver {
         precondition(scene.settings.collisionMargin >= 0
             && scene.settings.collisionMargin.isFinite,
             "collision margin must be finite and nonnegative")
+        precondition(scene.settings.rigidLinearDamping >= 0
+            && scene.settings.rigidLinearDamping.isFinite
+            && scene.settings.rigidAngularDamping >= 0
+            && scene.settings.rigidAngularDamping.isFinite,
+            "rigid damping must be finite and nonnegative")
         guard let dev = device ?? MTLCreateSystemDefaultDevice() else {
             throw AVBDError.noDevice
         }
@@ -245,6 +251,7 @@ public final class GPUSolver {
             numColliders * 4, "colliderSharedCollision")
         colliderLocalPosition = try makeBuf(numColliders * 16, "colliderLocalPosition")
         colliderLocalRotation = try makeBuf(numColliders * 16, "colliderLocalRotation")
+        colliderRenderColor = try makeBuf(numColliders * 16, "colliderRenderColor")
         colliderFriction = try makeBuf(
             numColliders * MemoryLayout<SIMD2<Float>>.stride,
             "colliderFriction")
@@ -579,6 +586,8 @@ public final class GPUSolver {
                                                              capacity: numColliders)
         let cq = colliderLocalRotation.contents().bindMemory(to: SIMD4<Float>.self,
                                                              capacity: numColliders)
+        let crc = colliderRenderColor.contents().bindMemory(to: SIMD4<Float>.self,
+                                                            capacity: numColliders)
         let cf = colliderFriction.contents().bindMemory(
             to: SIMD2<Float>.self, capacity: numColliders)
         let chr = colliderHullRange.contents().bindMemory(
@@ -610,6 +619,7 @@ public final class GPUSolver {
             cs[i] = SIMD4(c.size, particle ? -r : r)
             cp[i] = SIMD4(c.localPosition, c.friction)
             cq[i] = SIMD4(c.localRotation.imag, c.localRotation.real)
+            crc[i] = c.renderColor.map { SIMD4($0, 1) } ?? .zero
             cf[i] = SIMD2(c.friction, c.dynamicFriction)
             if c.convexHullVertices.isEmpty {
                 chr[i] = .zero
@@ -1644,6 +1654,8 @@ public final class GPUSolver {
         params.frame = UInt32(truncatingIfNeeded: frameIndex)
         params.frictionCombineMode = settings.frictionCombineMode.rawValue
         params.collisionMargin = max(settings.collisionMargin, 0)
+        params.rigidLinearDamping = max(settings.rigidLinearDamping, 0)
+        params.rigidAngularDamping = max(settings.rigidAngularDamping, 0)
 
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
            let v = Float(env) {
@@ -3362,6 +3374,7 @@ public final class GPUSolver {
             enc.setBuffer(colliderOwner, offset: 0, index: 9)
             enc.setBuffer(colliderLocalPosition, offset: 0, index: 10)
             enc.setBuffer(colliderLocalRotation, offset: 0, index: 11)
+            enc.setBuffer(colliderRenderColor, offset: 0, index: 12)
             enc.dispatchThreadgroups(MTLSize(width: (renderRigidBodyCount + 255) / 256,
                                              height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256,

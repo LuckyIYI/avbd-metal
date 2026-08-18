@@ -44,6 +44,7 @@ kernel void build_instances(
     device const uint* colliderOwner [[buffer(9)]],
     device const float4* colliderLocalPosition [[buffer(10)]],
     device const float4* colliderLocalRotation [[buffer(11)]],
+    device const float4* colliderRenderColor [[buffer(12)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= numInstances) return;
@@ -75,6 +76,9 @@ kernel void build_instances(
     float3 c = pl.w > 0.0f
         ? palette(colorMode == 1 ? colors[body] : body)
         : float3(0.58f, 0.60f, 0.66f);
+    if (colliderRenderColor[collider].w > 0.0f) {
+        c = colliderRenderColor[collider].xyz;
+    }
     out[gid].color = float4(c, float(st));
     // params.z = bounding radius (blob shadow size), w = shadow strength
     // (statics cast none — they're scenery)

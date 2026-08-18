@@ -58,7 +58,9 @@ struct ContentView: View {
 
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
-                        ForEach(Demos.all, id: \.self) { Text($0) }
+                        ForEach(Demos.all, id: \.self) {
+                            Text($0 == "gaudifunicular" ? "Gaudí Funicular" : $0)
+                        }
                     }
                     Picker("Size", selection: $model.scale) {
                         Text("Small").tag(1)
@@ -96,11 +98,38 @@ struct ContentView: View {
                     }
                 }
 
+                if model.demoName == "gaudifunicular" {
+                    GroupBox("Gaudí's gravity computer") {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text("TENSION MODEL")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.orange)
+                            Text("The overhead lattice is the foundation plan. Gravity pulls low-mass cord and weighted shot bags into pure-tension load paths. Invert those paths and they become compression-only columns and vaults.")
+                                .font(.caption)
+                            Divider()
+                            Text("Blueprint basis")
+                                .font(.caption.weight(.semibold))
+                            Text("7.5 m module · 90 m interior\n45 m naves · 60 m transept\n15 m central nave")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Text("Historically, the physical polyfunicular model was for Colònia Güell. Gaudí applied its corresponding graphical method at Sagrada Família.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text("Try it: drag a bag or knot and release it. The whole network recomputes the force geometry under gravity.")
+                                .font(.caption2.weight(.medium))
+                            Text("Damping is explicit in Demo parameters. Set both damping sliders to 0 for an undamped run.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
                 GroupBox("Solver") {
-                    labeledSlider("Iterations", $model.iterations, 1...30, "%.0f")
+                    labeledSlider("Iterations", $model.iterations, 1...60, "%.0f")
                     labeledSlider("α stabilization", $model.alpha, 0...1, "%.2f")
                     labeledSlider("β stiffness ramp", $model.betaLin, 10...100000, "%.0f", log: true)
-                    labeledSlider("γ warm start", $model.gamma, 0...0.9999, "%.4f")
+                    labeledSlider("γ warm start", $model.gamma, 0...1, "%.4f")
                     labeledSlider("Gravity", $model.gravity, -30...0, "%.1f")
                     labeledSlider("Time scale", $model.timeScale, 0.05...2, "%.2f")
                 }

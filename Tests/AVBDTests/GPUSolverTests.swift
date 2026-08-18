@@ -28,6 +28,84 @@ final class GPUSolverTests: XCTestCase {
                        cpu.bodies[1].positionLin.z, accuracy: 2e-3)
     }
 
+    func testRigidLinearDampingMatchesCPUAndGPU() throws {
+        var scene = PhysicsScene(name: "rigid-damping")
+        scene.settings.gravity = 0
+        scene.settings.dt = 1 / 120
+        scene.settings.rigidLinearDamping = 2
+        let body = scene.addBody(
+            size: F3(repeating: 0.2), density: 1_000, friction: 0,
+            position: .zero, velocity: F3(1, 0, 0), shape: .sphere)
+
+        let cpu = scene.makeCPUSolver()
+        let gpu = try makeGPU(scene)
+        for _ in 0..<120 {
+            cpu.step()
+            gpu.step()
+        }
+
+        let expected = exp(Float(-2))
+        XCTAssertEqual(cpu.bodies[body].velocityLin.x, expected, accuracy: 1e-4)
+        XCTAssertEqual(gpu.bodyVelocity(body).x, expected, accuracy: 1e-4)
+        XCTAssertEqual(gpu.bodyVelocity(body).x,
+                       cpu.bodies[body].velocityLin.x, accuracy: 1e-5)
+    }
+
+    func testRigidAngularDampingMatchesCPUAndGPU() throws {
+        var scene = PhysicsScene(name: "rigid-angular-damping")
+        scene.settings.gravity = 0
+        scene.settings.dt = 1 / 120
+        scene.settings.rigidAngularDamping = 2
+        let body = scene.addBody(
+            size: F3(0.3, 0.2, 0.1), density: 1_000, friction: 0,
+            position: .zero)
+
+        let cpu = scene.makeCPUSolver()
+        let gpu = try makeGPU(scene)
+        let initialAngularVelocity = F3(0, 0, 1)
+        cpu.bodies[body].velocityAng = initialAngularVelocity
+        gpu.setBodyStates([.init(
+            body: body, position: .zero,
+            rotation: Quat(real: 1, imag: .zero),
+            angularVelocity: initialAngularVelocity)])
+        for _ in 0..<120 {
+            cpu.step()
+            gpu.step()
+        }
+
+        let expected = exp(Float(-2))
+        let gpuAngular = gpu.bodyStates([body])[0].angularVelocity.z
+        XCTAssertEqual(cpu.bodies[body].velocityAng.z,
+                       expected, accuracy: 2e-3)
+        XCTAssertEqual(gpuAngular, expected, accuracy: 2e-3)
+        XCTAssertEqual(gpuAngular, cpu.bodies[body].velocityAng.z,
+                       accuracy: 2e-3)
+    }
+
+    func testRigidDampingDoesNotDampParticles() throws {
+        var scene = PhysicsScene(name: "rigid-damping-particle-isolation")
+        scene.settings.gravity = 0
+        scene.settings.dt = 1 / 120
+        scene.settings.rigidLinearDamping = 2
+        scene.settings.rigidAngularDamping = 2
+        let particle = scene.addBody(
+            size: F3(repeating: 0.08), density: 1_000, friction: 0,
+            position: .zero, velocity: F3(1, 0, 0), shape: .sphere,
+            collisionEnabled: false)
+        scene.bodies[particle].isParticle = true
+
+        let cpu = scene.makeCPUSolver()
+        let gpu = try makeGPU(scene)
+        for _ in 0..<120 {
+            cpu.step()
+            gpu.step()
+        }
+
+        XCTAssertEqual(cpu.bodies[particle].velocityLin.x, 1,
+                       accuracy: 1e-4)
+        XCTAssertEqual(gpu.bodyVelocity(particle).x, 1, accuracy: 1e-4)
+    }
+
     func testWorldSpaceInertiaRotatesPrincipalAxes() {
         let principal = F3(1, 2, 3)
         let rotation = Quat(angle: .pi / 2, axis: F3(0, 0, 1))

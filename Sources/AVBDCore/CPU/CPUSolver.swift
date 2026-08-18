@@ -130,6 +130,8 @@ public final class CPUSolver {
     public var gamma: Float = 0.999
     public var lambdaMax: Float = 1.0e6
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
+    public var rigidLinearDamping: Float = 0
+    public var rigidAngularDamping: Float = 0
 
     public private(set) var bodies: [CPURigid] = []
     public var forces: [CPUForce] = []
@@ -274,6 +276,10 @@ public final class CPUSolver {
             if body.mass > 0 {
                 body.velocityLin = (body.positionLin - body.initialLin) / dt
                 body.velocityAng = quatSub(body.positionAng, body.initialAng) / dt
+                if !body.isParticle {
+                    body.velocityLin *= exp(-rigidLinearDamping * dt)
+                    body.velocityAng *= exp(-rigidAngularDamping * dt)
+                }
             }
         }
     }

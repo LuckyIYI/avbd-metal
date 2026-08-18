@@ -1995,8 +1995,15 @@ kernel void finalize_velocities(
                 + float3(0, 0, P.gravity * gravityScale[gid]) * P.dt;
             v = ballistic + (v - ballistic) / (1.0f + P.particleDamping * P.dt);
         }
+        if (shape[gid].w >= 0.0f && P.rigidLinearDamping > 0.0f) {
+            v *= exp(-P.rigidLinearDamping * P.dt);
+        }
+        float3 omega = q_sub(posAng[gid], initAng[gid]) / P.dt;
+        if (shape[gid].w >= 0.0f && P.rigidAngularDamping > 0.0f) {
+            omega *= exp(-P.rigidAngularDamping * P.dt);
+        }
         velLin[gid] = float4(v, 0);
-        velAng[gid] = float4(q_sub(posAng[gid], initAng[gid]) / P.dt, 0);
+        velAng[gid] = float4(omega, 0);
     }
 }
 

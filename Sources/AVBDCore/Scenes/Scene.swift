@@ -128,6 +128,9 @@ public struct SceneCollider {
     /// selects a reduced collision model (for example MuJoCo Playground's
     /// feet-only H1 training scene).
     public var collisionEnabled: Bool
+    /// Optional authored display color. Physics ignores this value; when it
+    /// is nil the renderer keeps the normal body/graph palette.
+    public var renderColor: F3?
     /// Physics collision remains enabled when false; only analytic debug
     /// rendering omits this primitive. Imported robot assets use this for
     /// protective contact geoms that look misleading without the visual mesh.
@@ -147,7 +150,8 @@ public struct SceneCollider {
                 collidesWithSharedGeometry: Bool = true,
                 collisionEnabled: Bool = true,
                 usesWorldSpaceRoundAnchor: Bool = false,
-                isRendered: Bool = true) {
+                isRendered: Bool = true,
+                renderColor: F3? = nil) {
         precondition(body >= 0, "collider requires a valid body owner")
         switch shape {
         case .sphere: self.size = F3(repeating: size.x)
@@ -165,6 +169,7 @@ public struct SceneCollider {
         self.collisionEnabled = collisionEnabled
         self.isRendered = isRendered
         self.usesWorldSpaceRoundAnchor = usesWorldSpaceRoundAnchor
+        self.renderColor = renderColor
     }
 }
 
@@ -456,6 +461,12 @@ public struct SimSettings {
     /// rigid bodies free-fall at the same rate; damping bleeds
     /// solver/contact/internal jitter.
     public var particleDamping: Float = 0
+    /// Isotropic viscous drag for rigid-body translation and rotation
+    /// (per second). Zero preserves legacy ballistic behavior. Hanging-chain
+    /// form finding uses modest drag to model thread/air dissipation so the
+    /// apparatus converges instead of oscillating indefinitely.
+    public var rigidLinearDamping: Float = 0
+    public var rigidAngularDamping: Float = 0
     /// Internal sheet viscosity: per-frame blend of each particle velocity
     /// toward its topological 1-ring average (0..1). Damps relative flutter
     /// (bending-rate viscosity), preserves bulk motion.
@@ -540,7 +551,8 @@ public struct PhysicsScene {
                                      collisionGroup: UInt32 = 0,
                                      collidesWithSharedGeometry: Bool = true,
                                      collisionEnabled: Bool = true,
-                                     isRendered: Bool = true) -> Int {
+                                     isRendered: Bool = true,
+                                     renderColor: F3? = nil) -> Int {
         precondition(bodies.indices.contains(body), "collider owner out of range")
         colliders.append(SceneCollider(
             body: body, size: size, friction: friction ?? bodies[body].friction,
@@ -552,7 +564,8 @@ public struct PhysicsScene {
             collidesWithSharedGeometry: collidesWithSharedGeometry,
             collisionEnabled: collisionEnabled,
             usesWorldSpaceRoundAnchor: false,
-            isRendered: isRendered))
+            isRendered: isRendered,
+            renderColor: renderColor))
         return colliders.count - 1
     }
 
@@ -682,6 +695,8 @@ public struct PhysicsScene {
         solver.lambdaMax = settings.lambdaMax
         solver.collisionMargin = max(settings.collisionMargin, 0)
         solver.frictionCombineMode = settings.frictionCombineMode
+        solver.rigidLinearDamping = settings.rigidLinearDamping
+        solver.rigidAngularDamping = settings.rigidAngularDamping
 
         for b in bodies {
             let rb = solver.addBody(size: b.size, density: b.density,
