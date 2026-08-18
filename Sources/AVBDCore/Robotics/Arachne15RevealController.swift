@@ -83,7 +83,10 @@ public final class Arachne15RevealController {
     ]
     public static let deployedJointTargets =
         [Float](repeating: 0, count: Arachne15PolicyContract.actionDimension)
-    public static let transportKneeTarget: Float = -0.18
+    /// Commissioning-only reserve that keeps tibias clear of the ground
+    /// during the physical hip-deployment waves. This does not change the
+    /// learned policy's action envelope.
+    public static let transportKneeTarget: Float = -0.22
 
     /// Complementary diagonal waves keep forces left/right symmetric while
     /// their four planted legs span the COM.
