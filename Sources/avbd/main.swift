@@ -1234,6 +1234,7 @@ guard let command = args.first else {
     exit(0)
 }
 
+do {
 switch command {
 case "list":
     for d in Demos.all { print(d) }
@@ -3956,7 +3957,8 @@ case "solve-pusht":
     let o = parseOptions(Array(args.dropFirst(1)))
     try PushTPipeline.solve(modelPath: "runs/pusht/model", episodes: o.episodes,
                             seed: UInt64(o.watch ?? 11),
-                            latent: o.latent, debug: args.contains("--debug"),
+                            latent: args.contains("--latent") ? o.latent : nil,
+                            debug: args.contains("--debug"),
                             oracleNull: args.contains("--oracle-null"))
 
 case "bench":
@@ -4032,4 +4034,7 @@ case "parity":
 
 default:
     fail("unknown command '\(command)'")
+}
+} catch {
+    fail(error.localizedDescription)
 }

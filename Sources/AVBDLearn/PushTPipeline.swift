@@ -10,6 +10,45 @@ import AVBDCore
 // End-to-end Push-T pipeline: parallel data collection from the AVBD
 // simulator, LeWM training, and CEM planning in latent space.
 
+/// Architecture contract stored beside each interactive Push-T world model.
+/// It keeps CLI evaluation and app replay from silently constructing a model
+/// with dimensions different from the checkpoint that was trained.
+public struct PushTWorldModelConfiguration: Codable, Equatable, Sendable {
+    public static let currentSchemaVersion = 1
+    public var schemaVersion: Int
+    public var modelType: String
+    public var latentDimension: Int
+    public var observationResolution: Int
+    public var observationStack: Int
+    public var actionDimension: Int
+
+    public init(
+        latentDimension: Int,
+        observationResolution: Int = 64,
+        observationStack: Int = 2,
+        actionDimension: Int = 2
+    ) {
+        schemaVersion = Self.currentSchemaVersion
+        modelType = "lewm"
+        self.latentDimension = latentDimension
+        self.observationResolution = observationResolution
+        self.observationStack = observationStack
+        self.actionDimension = actionDimension
+    }
+
+    public func validate() throws {
+        guard schemaVersion == Self.currentSchemaVersion,
+              modelType == "lewm",
+              latentDimension > 0,
+              observationResolution == 64,
+              observationStack == 2,
+              actionDimension == 2 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "unsupported Push-T world-model architecture contract")
+        }
+    }
+}
+
 /// Stateful LeWM + CEM planner for interactive use (the Robotics Lab).
 public final class LeWMPlanner {
     let model: LeWorldModel
@@ -19,9 +58,14 @@ public final class LeWMPlanner {
     let candidates = 128
     let elites = 16
     let cemIters = 2
+    public var latentDimension: Int { model.latent }
 
     public init(modelPath: String) throws {
-        model = LeWorldModel()
+        let configuration = try PushTPipeline.worldModelConfiguration(
+            modelPath: modelPath)
+        model = LeWorldModel(
+            latent: configuration.latentDimension,
+            stack: configuration.observationStack)
         let weights = try loadArrays(url: URL(fileURLWithPath: "\(modelPath)/lewm.safetensors"))
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(model)
@@ -98,6 +142,52 @@ public final class LeWMPlanner {
 }
 
 public enum PushTPipeline {
+    static let worldModelConfigurationFile = "lewm-config.json"
+
+    static func worldModelConfiguration(
+        modelPath: String,
+        requestedLatent: Int? = nil
+    ) throws -> PushTWorldModelConfiguration {
+        let url = URL(fileURLWithPath: modelPath, isDirectory: true)
+            .appendingPathComponent(worldModelConfigurationFile)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            // Legacy latent-128 checkpoints predate the explicit contract.
+            let configuration = PushTWorldModelConfiguration(
+                latentDimension: requestedLatent ?? 128)
+            try configuration.validate()
+            return configuration
+        }
+        let configuration: PushTWorldModelConfiguration
+        do {
+            configuration = try JSONDecoder().decode(
+                PushTWorldModelConfiguration.self,
+                from: Data(contentsOf: url))
+        } catch {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T world-model architecture contract is unreadable: "
+                    + error.localizedDescription)
+        }
+        try configuration.validate()
+        if let requestedLatent,
+           requestedLatent != configuration.latentDimension {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T world-model latent dimension is "
+                    + "\(configuration.latentDimension), not \(requestedLatent)")
+        }
+        return configuration
+    }
+
+    private static func writeWorldModelConfiguration(
+        _ configuration: PushTWorldModelConfiguration,
+        modelPath: String
+    ) throws {
+        try configuration.validate()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let url = URL(fileURLWithPath: modelPath, isDirectory: true)
+            .appendingPathComponent(worldModelConfigurationFile)
+        try encoder.encode(configuration).write(to: url, options: .atomic)
+    }
 
     // ---------------- data collection ----------------
     /// Random smooth waypoint policy across parallel envs. Saves
@@ -159,7 +249,7 @@ public enum PushTPipeline {
                 withUnsafeBytes(of: &a) { actData.append(contentsOf: $0) }
                 let (bp, byaw) = env.blockPose(e)
                 let tp = env.tipPos(e)
-                var st: [Float] = [bp.x, bp.y, sin(byaw), cos(byaw), tp.x, tp.y]
+                let st: [Float] = [bp.x, bp.y, sin(byaw), cos(byaw), tp.x, tp.y]
                 st.withUnsafeBytes { stateData.append(contentsOf: $0) }
             }
             try env.stepChecked(actions: targets)
@@ -181,20 +271,75 @@ public enum PushTPipeline {
                              latent: Int = 128, lr: Float = 3e-4,
                              lambda: Float = 0.5, modelPath: String,
                              member: Int = -1) throws {
-        if member >= 0 { MLXRandom.seed(UInt64(1234 + member * 777)) }
-        let meta = try String(contentsOfFile: "\(dataPath)/meta.txt", encoding: .utf8)
-            .split(separator: " ").map { Int($0)! }
-        let (numEnvs, steps, res) = (meta[0], meta[1], meta[2])
-        let obsRaw = try Data(contentsOf: URL(fileURLWithPath: "\(dataPath)/obs.bin"))
-        let actRaw = try Data(contentsOf: URL(fileURLWithPath: "\(dataPath)/act.bin"))
-        let frameBytes = res * res * 3
-        print("dataset: \(numEnvs) envs x \(steps) steps")
-
-        let model = LeWorldModel(latent: latent, stack: 2)
-        let opt = AdamW(learningRate: lr)
+        guard iters > 0, batch > 0, latent > 0,
+              lr.isFinite, lr > 0, lambda.isFinite, lambda >= 0,
+              member >= -1 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T world-model training arguments must be positive and finite")
+        }
+        let metadata: String
+        do {
+            metadata = try String(
+                contentsOfFile: "\(dataPath)/meta.txt", encoding: .utf8)
+        } catch {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T dataset metadata could not be read: \(error.localizedDescription)")
+        }
+        let fields = metadata.split(whereSeparator: \.isWhitespace)
+        guard fields.count == 3,
+              let numEnvs = Int(fields[0]), numEnvs > 0,
+              let steps = Int(fields[1]), steps > 0,
+              let res = Int(fields[2]), res > 0 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T dataset metadata must be '<environments> <steps> <resolution>'")
+        }
+        guard res == 64 else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T world-model training requires 64x64 observations, got \(res)x\(res)")
+        }
 
         let K = 3   // rollout depth (macro-steps)
         let S = 8   // control steps per macro-step: one action ~ one reached waypoint
+        let minimumSteps = (K + 1) * S + 1
+        guard steps >= minimumSteps else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T world-model dataset has \(steps) steps; at least "
+                    + "\(minimumSteps) are required for a \(K)-macro-step window")
+        }
+
+        guard steps < Int.max else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T dataset step count is too large")
+        }
+        let frameBytes = try checkedByteCount([res, res, 3], label: "frame")
+        let actionValueCount = try checkedByteCount(
+            [steps, numEnvs, 2], label: "action values")
+        let stateValueCount = try checkedByteCount(
+            [steps, numEnvs, 6], label: "state values")
+        let expectedObservationBytes = try checkedByteCount(
+            [steps + 1, numEnvs, frameBytes], label: "observations")
+        let expectedActionBytes = try checkedByteCount(
+            [actionValueCount, MemoryLayout<Float>.size], label: "actions")
+        let expectedStateBytes = try checkedByteCount(
+            [stateValueCount, MemoryLayout<Float>.size], label: "states")
+        let obsRaw = try readDatasetFile(
+            dataPath, name: "obs.bin", expectedBytes: expectedObservationBytes)
+        let actRaw = try readDatasetFile(
+            dataPath, name: "act.bin", expectedBytes: expectedActionBytes)
+        let stateRaw = try readDatasetFile(
+            dataPath, name: "state.bin", expectedBytes: expectedStateBytes)
+        try validateFloatPayload(
+            actRaw, valueCount: actionValueCount, label: "action", magnitudeLimit: 1)
+        try validateFloatPayload(
+            stateRaw, valueCount: stateValueCount, label: "state")
+        print("dataset: \(numEnvs) envs x \(steps) steps")
+
+        if member >= 0 {
+            MLXRandom.seed(1_234 &+ UInt64(member) &* 777)
+        }
+        let model = LeWorldModel(latent: latent, stack: 2)
+        let opt = AdamW(learningRate: lr)
+
         // index transitions where the BLOCK moves during the K-window:
         // without oversampling them, "the block never moves" is a free
         // prediction and the encoder learns to ignore the block entirely
@@ -204,8 +349,7 @@ public enum PushTPipeline {
         // constant-action macro windows + block-motion index
         actRaw.withUnsafeBytes { araw in
             let af = araw.bindMemory(to: Float.self)
-            (try? Data(contentsOf: URL(fileURLWithPath: "\(dataPath)/state.bin")))?
-                .withUnsafeBytes { raw in
+            stateRaw.withUnsafeBytes { raw in
                 let f = raw.bindMemory(to: Float.self)
                 for e in 0..<numEnvs {
                     for t in S..<(steps - K * S) {
@@ -286,13 +430,87 @@ public enum PushTPipeline {
             model.parameters().flattened().map { ($0.0, $0.1) })
         let name = member >= 0 ? "lewm-\(member).safetensors" : "lewm.safetensors"
         try save(arrays: flat, url: URL(fileURLWithPath: "\(modelPath)/\(name)"))
+        try writeWorldModelConfiguration(
+            PushTWorldModelConfiguration(latentDimension: latent),
+            modelPath: modelPath)
         print("model saved -> \(modelPath)/\(name)")
+    }
+
+    private static func checkedByteCount(
+        _ factors: [Int], label: String
+    ) throws -> Int {
+        var result = 1
+        for factor in factors {
+            let product = result.multipliedReportingOverflow(by: factor)
+            guard !product.overflow else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "Push-T \(label) byte count overflows Int")
+            }
+            result = product.partialValue
+        }
+        return result
+    }
+
+    private static func readDatasetFile(
+        _ directory: String, name: String, expectedBytes: Int
+    ) throws -> Data {
+        let url = URL(fileURLWithPath: directory).appendingPathComponent(name)
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let fileSize = attributes[.size] as? NSNumber,
+                  fileSize.uint64Value == UInt64(expectedBytes) else {
+                let actual = (attributes[.size] as? NSNumber)?.stringValue ?? "unknown"
+                throw RLEnvironmentError.invalidConfiguration(
+                    "Push-T dataset file '\(name)' byte count is \(actual); "
+                        + "expected \(expectedBytes)")
+            }
+            let data = try Data(contentsOf: url)
+            guard data.count == expectedBytes else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "Push-T dataset file '\(name)' changed while reading "
+                        + "(\(data.count) bytes; expected \(expectedBytes))")
+            }
+            return data
+        } catch let error as RLEnvironmentError {
+            throw error
+        } catch {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Push-T dataset file '\(name)' could not be read: "
+                    + error.localizedDescription)
+        }
+    }
+
+    private static func validateFloatPayload(
+        _ data: Data,
+        valueCount: Int,
+        label: String,
+        magnitudeLimit: Float? = nil
+    ) throws {
+        try data.withUnsafeBytes { raw in
+            for index in 0..<valueCount {
+                let value = raw.loadUnaligned(
+                    fromByteOffset: index * MemoryLayout<Float>.size,
+                    as: Float.self)
+                guard value.isFinite else {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "Push-T dataset \(label) value \(index) is not finite")
+                }
+                if let magnitudeLimit, abs(value) > magnitudeLimit + 1e-6 {
+                    throw RLEnvironmentError.invalidConfiguration(
+                        "Push-T dataset \(label) value \(index) is outside "
+                            + "[-\(magnitudeLimit), \(magnitudeLimit)]")
+                }
+            }
+        }
     }
 
     // ---------------- planning (latent MPC with CEM) ----------------
     public static func solve(modelPath: String, episodes: Int, seed: UInt64 = 11,
-                             latent: Int = 128, debug: Bool = false,
+                             latent: Int? = nil, debug: Bool = false,
                              oracleNull: Bool = false) throws {
+        let configuration = try worldModelConfiguration(
+            modelPath: modelPath, requestedLatent: latent)
+        let latent = configuration.latentDimension
         // load an ensemble if present (lewm-0/1/2...), else the single model.
         // Disagreement across independently-initialized models marks the OOD
         // regions the planner exploits (PETS-style epistemic penalty).
@@ -489,7 +707,6 @@ public enum PushTPipeline {
         var successes = 0
         for ep in 0..<episodes {
             let env = try PushTEnv(numEnvs: 1, seed: seed &+ UInt64(ep) * 7)
-            let r = env.refs[0]
             for _ in 0..<controlSteps {
                 let target = env.oracleAction(0)
                 try env.stepChecked(actions: [target])
@@ -694,7 +911,7 @@ extension PushTPipeline {
                 withUnsafeBytes(of: &label) { actData.append(contentsOf: $0) }
                 let (bp, byaw) = env.blockPose(e)
                 let tp = env.tipPos(e)
-                var st: [Float] = [bp.x, bp.y, sin(byaw), cos(byaw), tp.x, tp.y]
+                let st: [Float] = [bp.x, bp.y, sin(byaw), cos(byaw), tp.x, tp.y]
                 st.withUnsafeBytes { stateData.append(contentsOf: $0) }
             }
             prev = curBuf
