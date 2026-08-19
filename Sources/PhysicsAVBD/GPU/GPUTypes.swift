@@ -6,6 +6,15 @@ import SimCore
 
 public let AVBD_MAX_COLORS = 64
 public let AVBD_MAX_CONTACTS = 8
+/// Default compact safety-pair budget. Unlike Newton's per-owner 32/64
+/// slices, this is one global stream: sparse rows can lend capacity to dense
+/// rows, while the raw demand counter still makes overflow fail closed.
+// Allocation heuristics, not silent per-owner caps: both exact endpoint
+// queries append into one reusable global stream and fail closed if either
+// query's total demand exceeds it. Keep enough headroom for folded multilayer
+// scenes while retaining memory linear in mesh size.
+public let AVBD_PLANAR_DAT_PAIRS_PER_PARTICLE = 64
+public let AVBD_PLANAR_DAT_PAIRS_PER_EDGE = 128
 
 public struct SimParamsGPU {
     public var dt: Float = 1.0 / 60.0
@@ -48,6 +57,19 @@ public struct SimParamsGPU {
     public var collisionMargin: Float = 0.01
     public var rigidLinearDamping: Float = 0
     public var rigidAngularDamping: Float = 0
+    /// 0 = disabled/no surface, 1 = legacy isotropic OGC bound,
+    /// 2 = direction-aware Planar-DAT.
+    public var surfaceTruncationMode: UInt32 = 0
+    public var maxPlanarDATPairs: UInt32 = 0
+    /// Authored cloth edges eligible for the OGC E-E force model. Planar-DAT
+    /// may additionally protect synthesized tet-boundary edges.
+    public var numSurfaceContactEdges: UInt32 = 0
+    public var planarDATQueryRadius: Float = 0
+    public var planarDATRelaxation: Float = 0.85
+    /// Legacy OGC velocity-inflation cap. Kept separate from the wider
+    /// Planar-DAT broadphase cell so changing safety-query geometry cannot
+    /// silently widen the force model.
+    public var surfaceContactCellSize: Float = 1
 }
 
 extension SimParamsGPU: Equatable {}
@@ -160,6 +182,14 @@ public enum GPUCounters {
     /// Dynamic bodies that still share a color with a graph neighbor after
     /// the final coloring pass. Any nonzero value invalidates the solve.
     public static let colorConflicts = 6
-    public static let colorBase = 8
-    public static let total = 8 + 2 * AVBD_MAX_COLORS
+    /// Raw compact Planar-DAT pair demand before storage clipping.
+    public static let planarDATPairs = 7
+    public static let planarDATVertexTrianglePairs = 8
+    public static let planarDATEdgeEdgePairs = 9
+    /// Element AABB exceeded the truncation mode's supported grid span.
+    public static let planarDATGridOverflows = 10
+    public static let planarDATInvalidAnchors = 11
+    public static let planarDATTruncations = 12
+    public static let colorBase = 13
+    public static let total = 13 + 2 * AVBD_MAX_COLORS
 }

@@ -63,9 +63,10 @@ final class ClothTests: XCTestCase {
             scene.joints[i].rA
         }
         // Pass-through detector: a B node whose closest point on an A
-        // triangle is INTERIOR and on the wrong (under) side, deeper than
-        // half the skin, has gone through the strip. Hanging next to A's
-        // edges resolves to boundary closest points and doesn't count.
+        // triangle is INTERIOR and on the wrong (under) side has crossed the
+        // oriented sheet. Sample every accepted frame: unsigned final gaps or
+        // sparse sampling can miss a cross-and-return trajectory. Hanging next
+        // to A's edges resolves to boundary closest points and doesn't count.
         let aSet = Set(aNodes)
         let aTris = scene.tris.filter {
             aSet.contains($0.ids.0) && aSet.contains($0.ids.1) && aSet.contains($0.ids.2)
@@ -78,7 +79,6 @@ final class ClothTests: XCTestCase {
                 gpu.setJointWorldAnchor(j, point: anchors[k])
             }
             gpu.step()
-            if f % 5 != 0 { continue }
             for b in bNodes {
                 let p = gpu.bodyPosition(b)
                 guard abs(p.x) < 1.0 && abs(p.y) < 0.25 && abs(p.z - 0.12) < 0.25 else { continue }
@@ -88,7 +88,7 @@ final class ClothTests: XCTestCase {
                     let c = gpu.bodyPosition(t.ids.2)
                     let n = normalize(cross(bb - a, c - a))    // +z winding
                     let sd = dot(p - a, n)
-                    guard sd < -0.06 && sd > -0.3 else { continue }
+                    guard sd < -1e-4 else { continue }
                     // interior check via barycentric of the planar projection
                     let q = p - n * sd
                     let v0 = bb - a, v1 = c - a, v2 = q - a
@@ -100,8 +100,6 @@ final class ClothTests: XCTestCase {
                     let w = (d00 * d21 - d01 * d20) / den
                     if v > 0.1 && w > 0.1 && (1 - v - w) > 0.1 {
                         violations += 1
-                        print(String(format: "VIOLATION f=%d node=%d depth=%.3f at (%.2f, %.2f, %.2f)",
-                                     f, b, sd, p.x, p.y, p.z))
                     }
                 }
             }

@@ -278,6 +278,12 @@ struct SimParams {
     float collisionMargin;  // scene-scale rigid contact skin/margin (metres)
     float rigidLinearDamping;  // isotropic viscous drag, per second
     float rigidAngularDamping;
+    uint surfaceTruncationMode; // 0 off, 1 isotropic, 2 Planar-DAT
+    uint maxPlanarDATPairs;     // compact V-T + canonical E-E pair capacity
+    uint numSurfaceContactEdges; // authored cloth E-E force-model prefix
+    float planarDATQueryRadius;
+    float planarDATRelaxation;
+    float surfaceContactCellSize; // legacy OGC velocity-inflation reference
 };
 
 inline float combine_friction(float a, float b, uint mode) {
@@ -381,7 +387,9 @@ struct SoftContactGPU {
     float4 normal;      // xyz = contact normal (pushes slot 0 along +n), w = friction
     float4 anchorA;     // xyz = slot-0 LOCAL anchor (rigid slot 0 only); w = flag bits
     float4 weights;     // signed weight per slot (gradient_i = w_i * basis row)
-    float4 C0;          // xyz = (n,t1,t2) constraint at detection; w = lambda cap
+    // xyz = (n,t1,t2) constraint linearized at step start. Contacts found at
+    // the accepted predictor pose are back-evaluated to that same reference.
+    float4 C0;          // w = lambda cap
     float4 lambda;      // xyz = duals; w = persistence key A (bits)
     float4 penalty;     // xyz = penalties; w = persistence key B (bits)
 };
@@ -429,6 +437,27 @@ struct ManifoldGPU {
 #define CTR_PAIR_CANDIDATES 4      // rigid demand before capacity clipping
 #define CTR_SOFT_CANDIDATES 5      // soft demand before capacity clipping
 #define CTR_COLOR_CONFLICTS 6      // unresolved dynamic-color graph edges
-#define CTR_COLOR_BASE 8           // MAX_COLORS entries
-#define CTR_SCATTER_BASE (8 + MAX_COLORS)  // MAX_COLORS scatter cursors
-#define CTR_TOTAL (8 + 2 * MAX_COLORS)
+#define CTR_DAT_PAIRS 7            // raw compact DAT pair demand
+#define CTR_DAT_VT_PAIRS 8         // raw V-T DAT pair demand
+#define CTR_DAT_EE_PAIRS 9         // raw canonical E-E DAT pair demand
+#define CTR_DAT_GRID_OVERFLOW 10   // element AABB exceeded supported span
+#define CTR_DAT_INVALID_ANCHOR 11  // coincident/non-finite fixed pair anchor
+#define CTR_DAT_TRUNCATIONS 12     // particles directionally/cap truncated
+#define CTR_COLOR_BASE 13          // MAX_COLORS entries
+#define CTR_SCATTER_BASE (13 + MAX_COLORS) // MAX_COLORS scatter cursors
+#define CTR_TOTAL (13 + 2 * MAX_COLORS)
+
+#define SURFACE_TRUNCATION_ISOTROPIC 1u
+#define SURFACE_TRUNCATION_PLANAR_DAT 2u
+#define DAT_PAIR_VT 0u
+#define DAT_PAIR_EE 1u
+#define DAT_PAIR_TRUNCATE 1u
+#define DAT_PAIR_CONTACT 2u
+
+struct PlanarDATPairGPU {
+    // kind, owner vertex/edge, opposing triangle/edge, eligibility flags.
+    // One one-ring-filtered stream feeds both consumers. Same connected-solid
+    // safety pairs and synthesized tet boundary edges are truncation-only so
+    // Planar-DAT does not expand the established OGC force-model eligibility.
+    uint4 data;
+};

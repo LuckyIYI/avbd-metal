@@ -612,7 +612,7 @@ kernel void warmstart_bodies(
     constant SimParams& P           [[buffer(9)]],
     device float4* ogcPrev          [[buffer(10)]],
     device const uint* boundsBits   [[buffer(11)]],
-    constant uint& doOgc            [[buffer(12)]],
+    constant uint& truncationMode   [[buffer(12)]],
     device const float4* shapeW     [[buffer(13)]],
     device const float* gravityScale [[buffer(14)]],
     uint gid                        [[thread_position_in_grid]])
@@ -640,14 +640,19 @@ kernel void warmstart_bodies(
 
     initLin[gid] = float4(pl.xyz, 0);
     initAng[gid] = pa;
+    // The committed collision-query pose is required for every surface
+    // vertex, including mass-zero pins referenced by a moving triangle.
+    if (truncationMode != 0u && shapeW[gid].w < 0.0f) {
+        ogcPrev[gid] = float4(pl.xyz, 0);
+    }
     if (mass > 0.0f) {
         float3 guess = pl.xyz + vl * dt
                      + float3(0, 0, bodyGravity) * (accelWeight * dt * dt);
         // OGC anchor = the detection pose; the warmstart placement itself
         // is truncated within the bound (paper Eq 28) so the step STARTS
         // penetration-free — the in-loop refresh grants further budget
-        if (doOgc != 0u && shapeW[gid].w < 0.0f) {
-            ogcPrev[gid] = float4(pl.xyz, 0);
+        if (truncationMode == SURFACE_TRUNCATION_ISOTROPIC
+            && shapeW[gid].w < 0.0f) {
             float d2 = as_type<float>(boundsBits[gid]);
             if (d2 < 1e37f) {
                 float bv = max(0.45f * sqrt(d2), -0.2f * shapeW[gid].w);
@@ -1529,7 +1534,8 @@ kernel void primal_particles_split(
     float maxLin = 0.35f * fabs(shape[body].w);
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
-    if (!rigid && P.numTris > 0u) {         // soft-surface particles only
+    if (!rigid && P.numTris > 0u
+        && P.surfaceTruncationMode == SURFACE_TRUNCATION_ISOTROPIC) {
         dxLin = ogcTruncate(dxLin, pl.xyz, ogcPrev[body].xyz,
                             boundsBits[body], -shape[body].w, ogcCounters);
     }
