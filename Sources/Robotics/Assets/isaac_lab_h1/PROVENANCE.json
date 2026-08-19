@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 1,
+  "adaptation": {
+    "exactSourceEquivalence": false,
+    "implementationFiles": [
+      {
+        "path": "Sources/RL/HumanoidWalkTask.swift",
+        "role": "Isaac control profile, H1 home pose, actuator configuration and collision-topology selection"
+      },
+      {
+        "path": "Sources/RL/HumanoidIsaacVelocityTask.swift",
+        "role": "Flat velocity task observations, commands, rewards, termination and AVBD extensions"
+      }
+    ],
+    "statement": "AVBD independently reimplements selected Isaac Lab H1 flat-velocity configuration concepts and values in Swift on a separately sourced plant and AVBD physics. It is not an exact PhysX environment or policy port."
+  },
+  "upstream": {
+    "project": "Isaac Lab",
+    "repository": "https://github.com/isaac-sim/IsaacLab",
+    "release": "v2.3.2",
+    "revision": "37ddf626871758333d6ed89cf64ad702aef127d0",
+    "license": "BSD-3-Clause",
+    "noticeFile": null,
+    "files": [
+      {
+        "path": "LICENSE",
+        "sha256": "df351ebfa8af317bf5a9ad83df63a8b68e4f5c04b71f30767cdb27aa434eac62"
+      },
+      {
+        "path": "source/isaaclab_assets/isaaclab_assets/robots/unitree.py",
+        "sha256": "6cb64bee3e04c9c4d46d78ad8e1d6f231115a646d35ef15f7335c15d3694ce26"
+      },
+      {
+        "path": "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/velocity_env_cfg.py",
+        "sha256": "8bc788ece76116f238e4469542a9320710090d8dc2801f4380134158aa64cc6a"
+      },
+      {
+        "path": "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/mdp/rewards.py",
+        "sha256": "7904feeb2a0fc6b412ba6aa1f062a1428883535958f57fcff8dec0348e0cef56"
+      },
+      {
+        "path": "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/h1/rough_env_cfg.py",
+        "sha256": "c29fc7fd605a19009e8be420633b5e8ab9183f62730522e903325c17053c2451"
+      },
+      {
+        "path": "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/h1/flat_env_cfg.py",
+        "sha256": "7faf26c3207eb547cd83b4ca2b9aa65c473848a78b12a4b2f251242a89baff17"
+      },
+      {
+        "path": "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/h1/agents/rsl_rl_ppo_cfg.py",
+        "sha256": "ed88ddb1b382862a408459ea2252db21d83f3580d5394495a0573898fd64ebd6"
+      }
+    ]
+  },
+  "contracts": [
+    {
+      "id": "h1-control-profile",
+      "sourceFiles": [
+        "source/isaaclab_assets/isaaclab_assets/robots/unitree.py",
+        "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/velocity_env_cfg.py"
+      ],
+      "adaptedConcepts": [
+        "H1 crouched home joint pose",
+        "implicit position-control stiffness and damping by joint family",
+        "300 Nm leg/torso/arm and 100 Nm ankle simulation effort limits",
+        "disabled robot self-collision",
+        "0.5 radian position-offset action scale",
+        "0.005 second simulation step and four-step control decimation"
+      ],
+      "avbdDifferences": [
+        "Menagerie MJCF supplies the plant instead of Isaac Lab USD",
+        "AVBD fixed-PD and contact solvers replace PhysX implicit actuators and contacts",
+        "AVBD uses its own solver iteration and stabilization settings",
+        "collision support sets are generated from separately attributed Menagerie meshes"
+      ]
+    },
+    {
+      "id": "h1-flat-velocity-task",
+      "sourceFiles": [
+        "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/velocity_env_cfg.py",
+        "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/mdp/rewards.py",
+        "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/h1/rough_env_cfg.py",
+        "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/h1/flat_env_cfg.py"
+      ],
+      "adaptedConcepts": [
+        "69-value policy observation order and uniform corruption ranges",
+        "ten-second command resampling, two-percent standing commands, heading control and H1 velocity ranges",
+        "flat plane with no height scan or terrain curriculum",
+        "linear and yaw velocity tracking with 0.5 standard deviation",
+        "flat orientation, angular velocity, action rate, joint acceleration, ankle limit and nonessential-joint regularization",
+        "positive-biped air-time with flat-task threshold 0.6 and foot-slide penalty",
+        "torso-contact termination with a -200 per-second termination reward rate"
+      ],
+      "avbdDifferences": [
+        "reward rates are explicitly integrated over the 0.02 second AVBD control step",
+        "AVBD evaluation success criteria and metrics are not Isaac Lab reward terms",
+        "point-goal commands, physical projectiles and post-impact recovery are AVBD extensions",
+        "AVBD reset, contact measurement and batching implementations are independent"
+      ]
+    },
+    {
+      "id": "h1-flat-ppo-reference",
+      "sourceFiles": [
+        "source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/config/h1/agents/rsl_rl_ppo_cfg.py"
+      ],
+      "adaptedConcepts": [
+        "24 rollout steps per environment",
+        "128x128x128 ELU actor and critic",
+        "Gaussian action standard deviation initialized to 1",
+        "clipped value and policy losses, gamma 0.99, GAE lambda 0.95, entropy 0.01, target KL 0.01 and gradient norm 1"
+      ],
+      "avbdDifferences": [
+        "MLX PPO is an independent implementation rather than RSL-RL",
+        "training run optimizer, minibatch, normalization, symmetry and schedule settings are checkpoint-specific",
+        "the manifest does not claim every AVBD H1 run uses the upstream recipe"
+      ]
+    }
+  ],
+  "localContractMarkers": [
+    {
+      "path": "Sources/RL/HumanoidWalkTask.swift",
+      "markers": [
+        "public static let actionScales: [Float] = [Float](repeating: 0.5, count: 19)",
+        "\"left_hip_pitch\": -0.28, \"left_knee\": 0.79, \"left_ankle\": -0.52",
+        "gains[\"\\(side)_hip_yaw\"] = .init(stiffness: 150, damping: 5)",
+        "gains[\"\\(side)_hip_pitch\"] = .init(stiffness: 200, damping: 5)",
+        "gains[\"\\(side)_ankle\"] = .init(stiffness: 20, damping: 4)",
+        "gains[\"\\(side)_shoulder_pitch\"] = .init(stiffness: 40, damping: 10)",
+        "gains[\"torso\"] = .init(stiffness: 200, damping: 5)",
+        "case .isaacLab: built.settings.dt = 1 / 200",
+        "built.settings.frictionCombineMode = controlProfile == .isaacLab ? .multiply : .geometricMean",
+        "selfCollisions: false",
+        "name.hasSuffix(\"_ankle\") ? 100 : 300"
+      ]
+    },
+    {
+      "path": "Sources/RL/HumanoidIsaacVelocityTask.swift",
+      "markers": [
+        "public static let observationDimension = 69",
+        "private static let trackingVariance: Float = 0.25",
+        "private static let controlDecimation = 4",
+        "private static let footAirTimeThreshold: Float = 0.6",
+        "maxEpisodeSteps: Int = 1_000",
+        "commandResamplingSteps: Int = 500",
+        "standingCommandProbability: Float = 0.02",
+        "output[base] = localLinear.x + noise(0.1)",
+        "output[base + 3] = localAngular.x + noise(0.2)",
+        "output[base + 6] = gravity.x + noise(0.05)",
+        "output[base + 12 + j] = state.jointAngles[j] + noise(0.01)",
+        "output[base + 31 + j] = jointVelocities[e][j] + noise(1.5)",
+        "commands[e] = F3(commandRNGs[e].nextFloat(), 0, 0)",
+        "commands[e].z = simd_clamp(0.5 * error, -1, 1)",
+        "let fallen = contacts.torso[e]",
+        "let rewardRate = trackingLinear[e] + trackingYaw[e] + feetAirTimeReward[e] - 0.25 * feetSlideCost[e] - orientationCost[e] - 0.05 * angularVelocityXYCost[e] - ankleLimitCost[e] - jointDeviationCost[e] - 0.005 * actionRate[e] - 1.25e-7 * jointAccelerationCost[e] - (fallen ? 200 : 0)",
+        "runningReward[e] = shapedRewardRate * dt"
+      ]
+    }
+  ],
+  "redistributedFiles": [
+    {
+      "path": "Sources/Robotics/Assets/isaac_lab_h1/LICENSE",
+      "sha256": "df351ebfa8af317bf5a9ad83df63a8b68e4f5c04b71f30767cdb27aa434eac62"
+    },
+    {
+      "path": "Sources/Robotics/Assets/isaac_lab_h1/NOTICE",
+      "sha256": "5c60d83633d6dfc131bfb76058a40b791e3f6a99a8fdb684cb6a7bec3e1d35d8"
+    }
+  ],
+  "redistributionBoundary": {
+    "redistributesIsaacLabSourceOrAssets": false,
+    "statement": "Only the BSD-3-Clause license and this attribution metadata are redistributed from the Isaac Lab provenance boundary; no upstream source, USD, mesh, texture or checkpoint payload is included."
+  }
+}

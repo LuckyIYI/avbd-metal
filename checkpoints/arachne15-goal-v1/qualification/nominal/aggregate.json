@@ -1,0 +1,313 @@
+{
+  "acceptedRuns" : 4,
+  "allRunsHaveRequiredEpisodes" : true,
+  "allRunsPassed" : true,
+  "checkpointDirectory" : "runs\/arachne15-goal-v1\/requalification-r2000006\/candidate",
+  "checkpointFingerprint" : "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02",
+  "evaluationEnvironments" : 128,
+  "evaluationSeeds" : [
+    62001,
+    62002,
+    62003,
+    62004
+  ],
+  "evaluationTaskConfiguration" : {
+    "armatureScaleLower" : 0.8,
+    "armatureScaleUpper" : 1.2,
+    "commandProgressRewardWeight" : 20,
+    "commandResamplingSteps" : 500,
+    "frictionScaleLower" : 0.75,
+    "frictionScaleUpper" : 1.25,
+    "goalBoundaryCommandSpeed" : 0.02,
+    "goalCommandSpeed" : 0.15,
+    "goalDwellSteps" : 15,
+    "goalProgressRewardWeight" : 4,
+    "goalRadius" : 0.12,
+    "goalSlowdownDistance" : 0.5,
+    "goalStableRewardWeight" : 1,
+    "goalSuccessBonus" : 8,
+    "inertiaScaleLower" : 0.9,
+    "inertiaScaleUpper" : 1.1,
+    "initialRollPitchRange" : 0.02,
+    "initialYawRange" : 3.1415925,
+    "massScaleLower" : 0.9,
+    "massScaleUpper" : 1.1,
+    "maximumActionLatencySteps" : 2,
+    "maximumForwardVelocity" : 0.25,
+    "maximumGoalArrivalSpeed" : 0.08,
+    "maximumGoalDirectionAngle" : 3.1415925,
+    "maximumGoalDistance" : 2,
+    "maximumLateralVelocity" : 0.12,
+    "maximumYawRate" : 0.8,
+    "minimumForwardVelocity" : 0.05,
+    "minimumGoalDistance" : 0.6,
+    "motorDampingScaleLower" : 0.8,
+    "motorDampingScaleUpper" : 1.2,
+    "motorStiffnessScaleLower" : 0.85,
+    "motorStiffnessScaleUpper" : 1.15,
+    "motorTorqueScaleLower" : 0.85,
+    "motorTorqueScaleUpper" : 1.05,
+    "observationNoise" : 1,
+    "pointGoal" : 1,
+    "solverIterations" : 20,
+    "standingCommandProbability" : 0,
+    "validationCollisionProfile" : 0,
+    "velocityErrorPenaltyWeight" : 5,
+    "yawErrorPenaltyWeight" : 5
+  },
+  "hasRequiredRunCount" : true,
+  "initializationCheckpoint" : "checkpoints\/arachne15-goal-v0",
+  "meanEpisodeLength" : {
+    "firstQuartile" : 519.4346,
+    "maximum" : 525.3887,
+    "median" : 522.52734,
+    "minimum" : 515.8281,
+    "thirdQuartile" : 524.66064
+  },
+  "meanReturn" : {
+    "firstQuartile" : 43.147182,
+    "maximum" : 43.436024,
+    "median" : 43.22953,
+    "minimum" : 43.05104,
+    "thirdQuartile" : 43.318874
+  },
+  "pooledSuccessRate" : 0.9482422,
+  "provenanceComplete" : true,
+  "requiredEpisodesPerRun" : 512,
+  "requiredRuns" : 4,
+  "robustAcrossEvaluationSeeds" : true,
+  "runs" : 4,
+  "scope" : "single_checkpoint_across_evaluation_seeds",
+  "successRate" : {
+    "firstQuartile" : 0.94384766,
+    "maximum" : 0.9609375,
+    "median" : 0.94921875,
+    "minimum" : 0.93359375,
+    "thirdQuartile" : 0.9536133
+  },
+  "task" : "arachne15-goal-v0",
+  "taskConfigurationTransferred" : false,
+  "taskMetrics" : {
+    "episode\/arrival_speed_mps" : {
+      "firstQuartile" : 0.0335088,
+      "maximum" : 0.034278255,
+      "median" : 0.033900842,
+      "minimum" : 0.03289974,
+      "thirdQuartile" : 0.034136966
+    },
+    "episode\/command_progress_m" : {
+      "firstQuartile" : 1.174941,
+      "maximum" : 1.186911,
+      "median" : 1.1789784,
+      "minimum" : 1.1654534,
+      "thirdQuartile" : 1.1816179
+    },
+    "episode\/final_goal_distance_m" : {
+      "firstQuartile" : 0.08655085,
+      "maximum" : 0.09328073,
+      "median" : 0.08877454,
+      "minimum" : 0.084447905,
+      "thirdQuartile" : 0.09104312
+    },
+    "episode\/foot_collider_penetration_over_1mm_fraction" : {
+      "firstQuartile" : 0.014013186,
+      "maximum" : 0.014711763,
+      "median" : 0.014244689,
+      "minimum" : 0.013644537,
+      "thirdQuartile" : 0.014442923
+    },
+    "episode\/foot_collider_penetration_rmse_m" : {
+      "firstQuartile" : 0.0003608683,
+      "maximum" : 0.0003637902,
+      "median" : 0.00036196713,
+      "minimum" : 0.00035864444,
+      "thirdQuartile" : 0.00036269106
+    },
+    "episode\/goal_dwell_steps" : {
+      "firstQuartile" : 14.185547,
+      "maximum" : 14.4140625,
+      "median" : 14.264648,
+      "minimum" : 14.003906,
+      "thirdQuartile" : 14.315918
+    },
+    "episode\/goal_entered" : {
+      "firstQuartile" : 0.95410156,
+      "maximum" : 0.96484375,
+      "median" : 0.9609375,
+      "minimum" : 0.93359375,
+      "thirdQuartile" : 0.96191406
+    },
+    "episode\/goal_far_bin" : {
+      "firstQuartile" : 0.5048828,
+      "maximum" : 0.53125,
+      "median" : 0.515625,
+      "minimum" : 0.47851562,
+      "thirdQuartile" : 0.5209961
+    },
+    "episode\/goal_far_success" : {
+      "firstQuartile" : 0.46484375,
+      "maximum" : 0.49414062,
+      "median" : 0.47851562,
+      "minimum" : 0.44726562,
+      "thirdQuartile" : 0.48828125
+    },
+    "episode\/goal_far_success_rate" : {
+      "firstQuartile" : 0.92669773,
+      "maximum" : 0.93962264,
+      "median" : 0.9324205,
+      "minimum" : 0.9163498,
+      "thirdQuartile" : 0.9359261
+    },
+    "episode\/goal_front_bin" : {
+      "firstQuartile" : 0.25048828,
+      "maximum" : 0.3046875,
+      "median" : 0.25390625,
+      "minimum" : 0.24023438,
+      "thirdQuartile" : 0.26660156
+    },
+    "episode\/goal_front_success" : {
+      "firstQuartile" : 0.24121094,
+      "maximum" : 0.29101562,
+      "median" : 0.24511719,
+      "minimum" : 0.23242188,
+      "thirdQuartile" : 0.25732422
+    },
+    "episode\/goal_front_success_rate" : {
+      "firstQuartile" : 0.9599359,
+      "maximum" : 0.9692308,
+      "median" : 0.964509,
+      "minimum" : 0.9551282,
+      "thirdQuartile" : 0.96791744
+    },
+    "episode\/goal_left_bin" : {
+      "firstQuartile" : 0.24267578,
+      "maximum" : 0.26953125,
+      "median" : 0.25683594,
+      "minimum" : 0.2265625,
+      "thirdQuartile" : 0.26660156
+    },
+    "episode\/goal_left_success" : {
+      "firstQuartile" : 0.2265625,
+      "maximum" : 0.265625,
+      "median" : 0.23925781,
+      "minimum" : 0.21484375,
+      "thirdQuartile" : 0.2524414
+    },
+    "episode\/goal_left_success_rate" : {
+      "firstQuartile" : 0.9326511,
+      "maximum" : 0.98550725,
+      "median" : 0.9410497,
+      "minimum" : 0.92913383,
+      "thirdQuartile" : 0.9575837
+    },
+    "episode\/goal_near_bin" : {
+      "firstQuartile" : 0.4790039,
+      "maximum" : 0.5214844,
+      "median" : 0.484375,
+      "minimum" : 0.46875,
+      "thirdQuartile" : 0.4951172
+    },
+    "episode\/goal_near_success" : {
+      "firstQuartile" : 0.46044922,
+      "maximum" : 0.50390625,
+      "median" : 0.46875,
+      "minimum" : 0.453125,
+      "thirdQuartile" : 0.4819336
+    },
+    "episode\/goal_near_success_rate" : {
+      "firstQuartile" : 0.9626709,
+      "maximum" : 0.98380566,
+      "median" : 0.9664794,
+      "minimum" : 0.9518072,
+      "thirdQuartile" : 0.9709514
+    },
+    "episode\/goal_reached" : {
+      "firstQuartile" : 0.94384766,
+      "maximum" : 0.9609375,
+      "median" : 0.94921875,
+      "minimum" : 0.93359375,
+      "thirdQuartile" : 0.9536133
+    },
+    "episode\/goal_rear_bin" : {
+      "firstQuartile" : 0.22949219,
+      "maximum" : 0.24609375,
+      "median" : 0.23339844,
+      "minimum" : 0.2265625,
+      "thirdQuartile" : 0.23876953
+    },
+    "episode\/goal_rear_success" : {
+      "firstQuartile" : 0.20703125,
+      "maximum" : 0.22265625,
+      "median" : 0.21191406,
+      "minimum" : 0.20703125,
+      "thirdQuartile" : 0.21826172
+    },
+    "episode\/goal_rear_success_rate" : {
+      "firstQuartile" : 0.9031477,
+      "maximum" : 0.91735536,
+      "median" : 0.9092775,
+      "minimum" : 0.89830506,
+      "thirdQuartile" : 0.91468364
+    },
+    "episode\/goal_right_bin" : {
+      "firstQuartile" : 0.24023438,
+      "maximum" : 0.28320312,
+      "median" : 0.24902344,
+      "minimum" : 0.21679688,
+      "thirdQuartile" : 0.25830078
+    },
+    "episode\/goal_right_success" : {
+      "firstQuartile" : 0.23291016,
+      "maximum" : 0.27539062,
+      "median" : 0.24316406,
+      "minimum" : 0.20507812,
+      "thirdQuartile" : 0.25195312
+    },
+    "episode\/goal_right_success_rate" : {
+      "firstQuartile" : 0.963049,
+      "maximum" : 0.984252,
+      "median" : 0.9705819,
+      "minimum" : 0.9459459,
+      "thirdQuartile" : 0.9753733
+    },
+    "episode\/linear_velocity_rmse_mps" : {
+      "firstQuartile" : 0.09803492,
+      "maximum" : 0.09920056,
+      "median" : 0.09867579,
+      "minimum" : 0.09734521,
+      "thirdQuartile" : 0.09911521
+    },
+    "episode\/minimum_foot_collider_clearance_m" : {
+      "firstQuartile" : -0.002459419,
+      "maximum" : -0.0023752716,
+      "median" : -0.0024375943,
+      "minimum" : -0.002461387,
+      "thirdQuartile" : -0.002406137
+    },
+    "episode\/minimum_goal_distance_m" : {
+      "firstQuartile" : 0.084404215,
+      "maximum" : 0.09015133,
+      "median" : 0.08655724,
+      "minimum" : 0.080574304,
+      "thirdQuartile" : 0.08811305
+    },
+    "episode\/survived" : {
+      "firstQuartile" : 1,
+      "maximum" : 1,
+      "median" : 1,
+      "minimum" : 1,
+      "thirdQuartile" : 1
+    },
+    "episode\/yaw_rate_rmse_rps" : {
+      "firstQuartile" : 0.29483563,
+      "maximum" : 0.29693267,
+      "median" : 0.29575753,
+      "minimum" : 0.29438275,
+      "thirdQuartile" : 0.29662955
+    }
+  },
+  "taskRevision" : 2000006,
+  "totalEpisodes" : 2048,
+  "totalSuccesses" : 1942,
+  "trainingSeed" : 523
+}

@@ -1,6 +1,10 @@
 import SwiftUI
 import MetalKit
-import AVBDCore
+import SimCore
+import PhysicsAVBD
+import Robotics
+import RL
+import MLXRL
 import simd
 
 @main
@@ -19,7 +23,9 @@ struct AVBDApp: App {
     var body: some SwiftUI.Scene {
         WindowGroup("AVBD Metal") {
             ContentView(model: model)
-                .frame(minWidth: 1000, minHeight: 640)
+                // Policy Replay reserves enough room for both an inspectable
+                // robot viewport and its non-clipped 520-point control panel.
+                .frame(minWidth: 1200, minHeight: 680)
         }
     }
 }
@@ -27,9 +33,10 @@ struct AVBDApp: App {
 struct ContentView: View {
     @ObservedObject var model: SimulationModel
     @StateObject var robotics = RoboticsModel()
+    @State private var selectedTab = ProcessInfo.processInfo.environment["AVBD_POLICY_REPLAY"] == nil ? 0 : 2
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             HSplitView {
                 MetalView(model: model)
                     .frame(minWidth: 600)
@@ -38,8 +45,13 @@ struct ContentView: View {
                     .padding(12)
             }
             .tabItem { Text("Playground") }
+            .tag(0)
             RoboticsLabView(model: robotics)
                 .tabItem { Text("Robotics Lab") }
+                .tag(1)
+            PolicyReplayLabView()
+                .tabItem { Text("Policy Replay") }
+                .tag(2)
         }
     }
 
@@ -50,7 +62,9 @@ struct ContentView: View {
 
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
-                        ForEach(Demos.all, id: \.self) { Text($0) }
+                        ForEach(Demos.all, id: \.self) {
+                            Text($0 == "gaudifunicular" ? "Gaudí Funicular" : $0)
+                        }
                     }
                     Picker("Size", selection: $model.scale) {
                         Text("Small").tag(1)
@@ -88,11 +102,38 @@ struct ContentView: View {
                     }
                 }
 
+                if model.demoName == "gaudifunicular" {
+                    GroupBox("Gaudí's gravity computer") {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text("TENSION MODEL")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.orange)
+                            Text("The overhead lattice is the foundation plan. Gravity pulls low-mass cord and weighted shot bags into pure-tension load paths. Invert those paths and they become compression-only columns and vaults.")
+                                .font(.caption)
+                            Divider()
+                            Text("Blueprint basis")
+                                .font(.caption.weight(.semibold))
+                            Text("7.5 m module · 90 m interior\n45 m naves · 60 m transept\n15 m central nave")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Text("Historically, the physical polyfunicular model was for Colònia Güell. Gaudí applied its corresponding graphical method at Sagrada Família.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text("Try it: drag a bag or knot and release it. The whole network recomputes the force geometry under gravity.")
+                                .font(.caption2.weight(.medium))
+                            Text("Damping is explicit in Demo parameters. Set both damping sliders to 0 for an undamped run.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
                 GroupBox("Solver") {
-                    labeledSlider("Iterations", $model.iterations, 1...30, "%.0f")
+                    labeledSlider("Iterations", $model.iterations, 1...60, "%.0f")
                     labeledSlider("α stabilization", $model.alpha, 0...1, "%.2f")
                     labeledSlider("β stiffness ramp", $model.betaLin, 10...100000, "%.0f", log: true)
-                    labeledSlider("γ warm start", $model.gamma, 0...0.9999, "%.4f")
+                    labeledSlider("γ warm start", $model.gamma, 0...1, "%.4f")
                     labeledSlider("Gravity", $model.gravity, -30...0, "%.1f")
                     labeledSlider("Time scale", $model.timeScale, 0.05...2, "%.2f")
                 }
@@ -145,18 +186,30 @@ struct MetalView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> InteractiveMTKView {
-        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()!
+        let device = model.solver?.device ?? MTLCreateSystemDefaultDevice()
         let view = InteractiveMTKView(frame: .zero, device: device)
-        if ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil {
+        if ProcessInfo.processInfo.environment["AVBD_SHOT"] != nil
+            || ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] != nil {
             view.framebufferOnly = false
         }
         view.colorPixelFormat = Renderer.colorFormat
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = Renderer.sampleCount
         view.preferredFramesPerSecond = 60
-        let renderer = try! Renderer(device: device, model: model)
-        context.coordinator.renderer = renderer
-        view.delegate = renderer
+        guard let device else {
+            model.reportRenderFailure("no Metal device is available")
+            view.isPaused = true
+            view.coordinator = context.coordinator
+            return view
+        }
+        do {
+            let renderer = try Renderer(device: device, model: model)
+            context.coordinator.renderer = renderer
+            view.delegate = renderer
+        } catch {
+            model.reportRenderFailure(error.localizedDescription)
+            view.isPaused = true
+        }
         view.coordinator = context.coordinator
         return view
     }

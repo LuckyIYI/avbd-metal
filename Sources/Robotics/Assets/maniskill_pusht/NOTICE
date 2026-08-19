@@ -1,0 +1,25 @@
+ManiSkill PushT-v1 benchmark attribution
+========================================
+
+AVBD's ManiSkillPushTTask.swift adapts the state task contract implemented by
+ManiSkill's mani_skill/envs/tasks/tabletop/push_t.py. The source is licensed
+under Apache-2.0; the adjacent LICENSE is an unmodified copy of the upstream
+license.
+
+Project: ManiSkill
+Repository: https://github.com/haosulab/ManiSkill
+Revision: 62ff3a5896b4d5b4cf0ac4c8d79afe600c9404a3
+Source: mani_skill/envs/tasks/tabletop/push_t.py
+Pinned source SHA-256: da3aa9dfd69802f17cfad244250da0ead7ff8df4c008c97c5f3f27c5be4fc040
+Pinned LICENSE SHA-256: c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4
+
+The adapted contract includes the seven-joint reset pose and noise, robot base
+pose, T workpiece dimensions/mass/friction, spawn distribution, fixed goal,
+100-step horizon, state observation fields, dense reward, 64x64 pseudo-render
+coverage calculation, and 90 percent success threshold. AVBD changes the
+physics engine and controller implementation and uses its separately sourced
+Menagerie Panda plant with a first-party pusher.
+
+No ManiSkill robot, mesh, URDF, texture, image, or video asset is redistributed
+by this package. The pinned ManiSkill repository contains no upstream NOTICE
+file, and push_t.py contains no additional embedded copyright notice.

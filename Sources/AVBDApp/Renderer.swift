@@ -5,6 +5,10 @@ import MetalKit
 /// serve both the physics playground and the Robotics Lab.
 @MainActor
 protocol RenderableModel {
+    /// Stable routing key for screenshots/video. SwiftUI may instantiate and
+    /// render hidden tabs, so capture must never be selected merely because a
+    /// renderer exists.
+    nonisolated var captureID: String { get }
     var solver: GPUSolver? { get }
     var colorByGraphColor: Bool { get }
     var statsText: String { get }
@@ -12,13 +16,28 @@ protocol RenderableModel {
     /// keep the user's camera.
     var cameraEpoch: Int { get }
     func tickIfRunning()
+    /// Stop the driving model and expose a renderer failure through that
+    /// model's existing status UI. Render failures are deliberately separate
+    /// from GPUSolver's terminal physics health.
+    func reportRenderFailure(_ message: String)
 }
-import AVBDCore
+
+extension SimulationModel {
+    func reportRenderFailure(_ message: String) {
+        running = false
+        statsText = "render stopped: \(message)"
+    }
+}
+import SimCore
+import PhysicsAVBD
+import Robotics
+import RL
+import MLXRL
 import simd
 
 // Renderer: PBR (GGX metallic-roughness) + ACES, sRGB-correct framebuffer,
-// GTAO-style ambient occlusion from a world-position prepass, soft blob shadows,
-// horizon-only fog, analytic instanced geometry for box/sphere/torus/capsule.
+// GTAO-style ambient occlusion from a world-position prepass, directional
+// shadow mapping, horizon-only fog, and analytic instanced geometry.
 
 let renderShaderSource = """
 #include <metal_stdlib>
@@ -35,6 +54,12 @@ struct SkinRenderVertex {
     float4 normal;
 };
 
+struct RigidMeshVertex {
+    float4 positionBody; // xyz body-local; w stores uint body id bits
+    float4 normal;
+    float4 color;
+};
+
 struct Uniforms {
     float4x4 viewProj;
     float4 lightDir;    // xyz
@@ -44,6 +69,8 @@ struct Uniforms {
     float4 camUp;       // xyz: world dir of UV +y (down on screen)
     float4x4 prevViewProj;
     float4 temporal;    // x = per-frame noise offset, y = history blend
+    float4x4 shadowViewProj;
+    float4 shadowParams; // x = constant bias, y = normal/slope bias
 };
 
 struct VOut {
@@ -69,6 +96,41 @@ inline float horizonFog(float d) {
 inline float3 acesTonemap(float3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Three-by-three comparison-filtered directional shadow. The light projection
+// follows the camera target, so the useful texel density stays around the robot
+// instead of being spent on the effectively infinite floor.
+inline float shadowVisibility(float3 world, float3 normal,
+                              constant Uniforms& U,
+                              depth2d<float> shadowTex)
+{
+    float4 clip = U.shadowViewProj * float4(world, 1.0);
+    if (clip.w <= 0.0) return 1.0;
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv <= 0.0) || any(uv >= 1.0) || ndc.z <= 0.0 || ndc.z >= 1.0) {
+        return 1.0;
+    }
+
+    float NdL = saturate(dot(normalize(normal), -U.lightDir.xyz));
+    float receiverDepth = ndc.z - (U.shadowParams.x
+                                  + U.shadowParams.y * (1.0 - NdL));
+    float2 texel = 1.0 / float2(shadowTex.get_width(), shadowTex.get_height());
+    constexpr sampler shadowSampler(coord::normalized, filter::linear,
+                                    address::clamp_to_edge,
+                                    compare_func::less_equal);
+    float visible = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            visible += shadowTex.sample_compare(
+                shadowSampler, uv + float2(float(x), float(y)) * texel,
+                receiverDepth);
+        }
+    }
+    // A small floor keeps shaded faces readable without washing out the
+    // articulated silhouette. Indirect light remains governed by GTAO below.
+    return mix(0.16, 1.0, visible / 9.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -245,12 +307,37 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     return o;
 }
 
+inline float3 rigidMeshRotate(float4 q, float3 v) {
+    return v + 2.0f * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+vertex VOut rigid_mesh_vertex(
+    uint vid [[vertex_id]],
+    device const RigidMeshVertex* vertices [[buffer(0)]],
+    constant Uniforms& U [[buffer(1)]],
+    device const float4* posLin [[buffer(2)]],
+    device const float4* posAng [[buffer(3)]])
+{
+    RigidMeshVertex v = vertices[vid];
+    uint body = as_type<uint>(v.positionBody.w);
+    float4 q = posAng[body];
+    float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
+    VOut o;
+    o.position = U.viewProj * float4(world, 1);
+    o.world = world;
+    o.normal = normalize(rigidMeshRotate(q, v.normal.xyz));
+    o.albedo = srgbToLin(v.color.rgb);
+    o.flatShade = 0;
+    return o;
+}
+
 // ---------------------------------------------------------------------------
 // PBR main fragment (samples the GTAO texture)
 // ---------------------------------------------------------------------------
 fragment float4 pbr_fragment(VOut in [[stage_in]],
                              constant Uniforms& U [[buffer(1)]],
-                             texture2d<float> aoTex [[texture(0)]])
+                             texture2d<float> aoTex [[texture(0)]],
+                             depth2d<float> shadowTex [[texture(1)]])
 {
     constexpr sampler smp(filter::linear);
     float ao = aoTex.sample(smp, in.position.xy / U.screen.xy).r;
@@ -274,7 +361,8 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float3 F = F0 + (1.0 - F0) * pow(1.0 - HdV, 5.0);
     float3 spec = D * G * F / max(4.0 * NdV * NdL, 1e-4);
 
-    float3 direct = (in.albedo / M_PI_F * (1.0 - F) + spec) * SUN_COL * NdL;
+    float shadow = shadowVisibility(in.world, n, U, shadowTex);
+    float3 direct = (in.albedo / M_PI_F * (1.0 - F) + spec) * SUN_COL * NdL * shadow;
 
     float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
     float3 ambient = in.albedo * irr;
@@ -307,7 +395,8 @@ fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
 // Thin sheets are double-sided: shade with the normal facing the viewer.
 fragment float4 soft_fragment(VOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
-                              texture2d<float> aoTex [[texture(0)]])
+                              texture2d<float> aoTex [[texture(0)]],
+                              depth2d<float> shadowTex [[texture(1)]])
 {
     constexpr sampler smp(filter::linear);
     float ao = aoTex.sample(smp, in.position.xy / U.screen.xy).r;
@@ -340,7 +429,8 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
 
     // a touch of wrap so the unlit side of folds doesn't go dead black
     float wrap = max((dot(n, L) + 0.35) / 1.35, 0.0);
-    float3 direct = (in.albedo / M_PI_F * (1.0 - F) * wrap + spec * NdL) * SUN_COL;
+    float shadow = shadowVisibility(in.world, n, U, shadowTex);
+    float3 direct = (in.albedo / M_PI_F * (1.0 - F) * wrap + spec * NdL) * SUN_COL * shadow;
 
     float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
     float3 ambient = in.albedo * irr * 1.15;
@@ -581,7 +671,7 @@ fragment float4 blur_fragment(FSOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Sky (whitish), floor (AA checker, melts then fogs), blob shadows
+// Sky (whitish) and floor (AA checker, melts then fogs)
 // ---------------------------------------------------------------------------
 fragment float4 sky_fragment(FSOut in [[stage_in]]) {
     float t = 1.0 - in.uv.y;
@@ -624,7 +714,8 @@ fragment FloorPre floor_prepass_fragment(FloorOut in [[stage_in]]) {
 
 fragment float4 floor_fragment(FloorOut in [[stage_in]],
                                constant Uniforms& U [[buffer(1)]],
-                               texture2d<float> aoTex [[texture(0)]])
+                               texture2d<float> aoTex [[texture(0)]],
+                               depth2d<float> shadowTex [[texture(1)]])
 {
     constexpr sampler smp(filter::linear);
     float ao = aoTex.sample(smp, in.position.xy / U.screen.xy).r;
@@ -647,56 +738,15 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
 
     float3 L = -U.lightDir.xyz;
     float NdL = max(L.z, 0.0);
-    float3 lit = albedo * (SKY_IRR * 1.1 * ao + SUN_COL / M_PI_F * NdL * 0.85);
+    float shadow = shadowVisibility(in.world, float3(0, 0, 1), U, shadowTex);
+    float3 lit = albedo * (SKY_IRR * 1.1 * ao
+                         + SUN_COL / M_PI_F * NdL * 0.85 * shadow);
 
     float fog = horizonFog(d);
     lit = mix(lit, HORIZON_LIN, fog);
     return float4(acesTonemap(lit), 1);
 }
 
-struct ShadowOut {
-    float4 position [[position]];
-    float2 local;
-    float strength;
-};
-
-vertex ShadowOut shadow_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                               device const RenderInstance* instances [[buffer(0)]],
-                               constant Uniforms& U [[buffer(1)]])
-{
-    RenderInstance inst = instances[iid];
-    float r = inst.params.z;
-    float3 c = inst.model[3].xyz;
-    float h = max(c.z - r * 0.5, 0.0);
-    float strength = inst.params.w * clamp(1.0 - h / 8.0, 0.0, 1.0) * 0.26;
-    float size = r * (1.45 + h * 0.10);
-    float2 corners[6] = {
-        float2(-1,-1), float2(1,-1), float2(1,1),
-        float2(-1,-1), float2(1,1), float2(-1,1)
-    };
-    ShadowOut o;
-    if (strength < 0.012 || r <= 0.0) {
-        o.position = float4(0, 0, -2, 1);
-        o.local = float2(0); o.strength = 0;
-        return o;
-    }
-    // lift scales with camera distance: a fixed 3cm offset falls below
-    // depth precision far away and the quad z-fights the floor (blinking)
-    float2 quadXY = c.xy + corners[vid] * size;
-    float lift = 0.02 + 0.004 * length(float3(quadXY, 0) - U.eye.xyz);
-    float3 p = float3(quadXY, lift);
-    o.position = U.viewProj * float4(p, 1);
-    o.local = corners[vid];
-    o.strength = strength;
-    return o;
-}
-
-fragment float4 shadow_fragment(ShadowOut in [[stage_in]]) {
-    float d = length(in.local);
-    // wide gaussian falloff: soft penumbra, no hard rim
-    float a = in.strength * exp(-d * d * 3.2);
-    return float4(0.05, 0.06, 0.09, a);
-}
 """
 
 struct Uniforms {
@@ -708,26 +758,49 @@ struct Uniforms {
     var camUp: SIMD4<Float>
     var prevViewProj: simd_float4x4
     var temporal: SIMD4<Float>
+    var shadowViewProj: simd_float4x4
+    var shadowParams: SIMD4<Float>
 }
 
 let SPHV = 12 * 18 * 6
 let TORV = 24 * 12 * 6
 let CAPV = (2 * 6 + 1) * 16 * 6
 
+private enum RendererInitializationError: LocalizedError {
+    case commandQueue
+    case shaderFunction(String)
+    case depthState(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .commandQueue:
+            return "could not create the Metal render command queue"
+        case .shaderFunction(let name):
+            return "render shader function '\(name)' is missing"
+        case .depthState(let name):
+            return "could not create the \(name) depth state"
+        }
+    }
+}
+
 final class Renderer: NSObject, MTKViewDelegate {
     static let sampleCount = 4
     static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
+    static let shadowMapSize = 2048
 
     let device: MTLDevice
     let queue: MTLCommandQueue
     weak var model: (AnyObject & RenderableModel)?
 
-    var boxP, sphereP, torusP, capsuleP, softP, skinP: MTLRenderPipelineState!
-    var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre: MTLRenderPipelineState!
-    var skyP, floorP, shadowP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
-    var depthState, noDepthState, noWriteDepthState: MTLDepthStencilState!
+    var boxP, sphereP, torusP, capsuleP, softP, skinP, rigidMeshP: MTLRenderPipelineState!
+    var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre,
+        rigidMeshPre: MTLRenderPipelineState!
+    var boxShadow, sphereShadow, torusShadow, capsuleShadow, softShadow,
+        skinShadow, rigidMeshShadow: MTLRenderPipelineState!
+    var skyP, floorP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
+    var depthState, noDepthState: MTLDepthStencilState!
 
-    var posTex, normTex, aoTexA, aoTexB, preDepthTex: MTLTexture?
+    var posTex, normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
     var histTex, prevPosTex: MTLTexture?
     var prevVP: simd_float4x4?
     var frameIdx: UInt32 = 0
@@ -741,11 +814,47 @@ final class Renderer: NSObject, MTKViewDelegate {
     var viewportSize = SIMD2<Float>(1, 1)
     private var framesDrawn = 0
     private var lastCameraEpoch: Int = -1
+    private var lastSolverIdentity: ObjectIdentifier?
     private var envCameraSet = false
+    private var runtimeFailure: String?
+
+    private func reportFailure(_ message: String) {
+        guard runtimeFailure == nil else { return }
+        runtimeFailure = message
+        // A failed render command can leave temporal targets partially
+        // written. Ignore their history if a later frame is retried.
+        prevVP = nil
+        let target = model
+        DispatchQueue.main.async {
+            target?.reportRenderFailure(message)
+        }
+    }
+
+    private func commandFailureDescription(_ command: MTLCommandBuffer) -> String? {
+        guard command.status != .completed || command.error != nil else {
+            return nil
+        }
+        let status = String(describing: command.status)
+        guard let error = command.error as NSError? else {
+            return "Metal command ended with status \(status)"
+        }
+        return "Metal command ended with status \(status): "
+            + "\(error.domain) \(error.code) — \(error.localizedDescription)"
+    }
+
+    private var scriptedCaptureAllowed: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        let selected = environment["AVBD_CAPTURE_VIEW"]
+            ?? (environment["AVBD_POLICY_REPLAY"] == nil ? "playground" : "policy")
+        return model?.captureID == selected
+    }
 
     init(device: MTLDevice, model: AnyObject & RenderableModel) throws {
         self.device = device
-        self.queue = device.makeCommandQueue()!
+        guard let queue = device.makeCommandQueue() else {
+            throw RendererInitializationError.commandQueue
+        }
+        self.queue = queue
         self.model = model
         super.init()
         // scripted-capture camera overrides
@@ -757,22 +866,34 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
         func pipe(_ v: String, _ f: String, samples: Int = Renderer.sampleCount,
-                  blend: Bool = false,
                   colorFormats: [MTLPixelFormat] = [Renderer.colorFormat],
                   depth: MTLPixelFormat = .depth32Float) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
-            d.vertexFunction = lib.makeFunction(name: v)!
-            d.fragmentFunction = lib.makeFunction(name: f)!
+            guard let vertex = lib.makeFunction(name: v) else {
+                throw RendererInitializationError.shaderFunction(v)
+            }
+            guard let fragment = lib.makeFunction(name: f) else {
+                throw RendererInitializationError.shaderFunction(f)
+            }
+            d.vertexFunction = vertex
+            d.fragmentFunction = fragment
             for (i, fmt) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = fmt
-                if blend && i == 0 {
-                    d.colorAttachments[i].isBlendingEnabled = true
-                    d.colorAttachments[i].sourceRGBBlendFactor = .sourceAlpha
-                    d.colorAttachments[i].destinationRGBBlendFactor = .oneMinusSourceAlpha
-                }
             }
             d.depthAttachmentPixelFormat = depth
             d.rasterSampleCount = samples
+            return try device.makeRenderPipelineState(descriptor: d)
+        }
+        func depthPipe(_ vertex: String) throws -> MTLRenderPipelineState {
+            let d = MTLRenderPipelineDescriptor()
+            d.label = "Directional shadow: \(vertex)"
+            guard let function = lib.makeFunction(name: vertex) else {
+                throw RendererInitializationError.shaderFunction(vertex)
+            }
+            d.vertexFunction = function
+            d.fragmentFunction = nil
+            d.depthAttachmentPixelFormat = .depth32Float
+            d.rasterSampleCount = 1
             return try device.makeRenderPipelineState(descriptor: d)
         }
 
@@ -782,9 +903,17 @@ final class Renderer: NSObject, MTKViewDelegate {
         capsuleP = try pipe("capsule_vertex", "pbr_fragment")
         softP = try pipe("soft_vertex", "soft_fragment")
         skinP = try pipe("skin_vertex", "soft_fragment")
+        rigidMeshP = try pipe("rigid_mesh_vertex", "pbr_fragment")
         skyP = try pipe("fs_vertex", "sky_fragment")
         floorP = try pipe("floor_vertex", "floor_fragment")
-        shadowP = try pipe("shadow_vertex", "shadow_fragment", blend: true)
+
+        boxShadow = try depthPipe("box_vertex")
+        sphereShadow = try depthPipe("sphere_vertex")
+        torusShadow = try depthPipe("torus_vertex")
+        capsuleShadow = try depthPipe("capsule_vertex")
+        softShadow = try depthPipe("soft_vertex_front")
+        skinShadow = try depthPipe("skin_vertex")
+        rigidMeshShadow = try depthPipe("rigid_mesh_vertex")
 
         let preFmt: [MTLPixelFormat] = [.rgba32Float, .rgba16Float]
         boxPre = try pipe("box_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
@@ -794,6 +923,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         floorPreP = try pipe("floor_vertex", "floor_prepass_fragment", samples: 1, colorFormats: preFmt)
         softPre = try pipe("soft_vertex_front", "soft_prepass_fragment", samples: 1, colorFormats: preFmt)
         skinPre = try pipe("skin_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+        rigidMeshPre = try pipe("rigid_mesh_vertex", "prepass_fragment",
+                                samples: 1, colorFormats: preFmt)
         gtaoP = try pipe("fs_vertex", "gtao_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
         blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
@@ -804,44 +935,71 @@ final class Renderer: NSObject, MTKViewDelegate {
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
-        depthState = device.makeDepthStencilState(descriptor: dd)
+        guard let depthState = device.makeDepthStencilState(descriptor: dd) else {
+            throw RendererInitializationError.depthState("geometry")
+        }
+        self.depthState = depthState
 
         let nd = MTLDepthStencilDescriptor()
         nd.depthCompareFunction = .always
         nd.isDepthWriteEnabled = false
-        noDepthState = device.makeDepthStencilState(descriptor: nd)
+        guard let noDepthState = device.makeDepthStencilState(descriptor: nd) else {
+            throw RendererInitializationError.depthState("background")
+        }
+        self.noDepthState = noDepthState
 
-        let nw = MTLDepthStencilDescriptor()
-        nw.depthCompareFunction = .less
-        nw.isDepthWriteEnabled = false
-        noWriteDepthState = device.makeDepthStencilState(descriptor: nw)
     }
 
-    private func ensureTargets(_ size: CGSize) {
+    @discardableResult
+    private func ensureTargets(_ size: CGSize) -> Bool {
         let w = max(Int(size.width), 4), h = max(Int(size.height), 4)
-        if targetSize == SIMD2(w, h), posTex != nil { return }
-        targetSize = SIMD2(w, h)
-        func tex(_ fmt: MTLPixelFormat) -> MTLTexture {
+        if targetSize == SIMD2(w, h), posTex != nil, normTex != nil,
+           aoTexA != nil, aoTexB != nil, histTex != nil, prevPosTex != nil,
+           preDepthTex != nil, shadowTex != nil { return true }
+        func tex(_ fmt: MTLPixelFormat) -> MTLTexture? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt,
                                                              width: w, height: h,
                                                              mipmapped: false)
             d.usage = [.renderTarget, .shaderRead]
             d.storageMode = .private
-            return device.makeTexture(descriptor: d)!
+            return device.makeTexture(descriptor: d)
         }
-        posTex = tex(.rgba32Float)
-        normTex = tex(.rgba16Float)
-        aoTexA = tex(.r8Unorm)
-        aoTexB = tex(.r8Unorm)
-        histTex = tex(.r8Unorm)
-        prevPosTex = tex(.rgba32Float)
-        prevVP = nil                      // resize invalidates history
+        let newPos = tex(.rgba32Float)
+        let newNorm = tex(.rgba16Float)
+        let newAOA = tex(.r8Unorm)
+        let newAOB = tex(.r8Unorm)
+        let newHistory = tex(.r8Unorm)
+        let newPreviousPosition = tex(.rgba32Float)
         let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                                                           width: w, height: h,
                                                           mipmapped: false)
         dd.usage = .renderTarget
         dd.storageMode = .private
-        preDepthTex = device.makeTexture(descriptor: dd)
+        let newPreDepth = device.makeTexture(descriptor: dd)
+
+        let sd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float,
+            width: Renderer.shadowMapSize,
+            height: Renderer.shadowMapSize,
+            mipmapped: false)
+        sd.usage = [.renderTarget, .shaderRead]
+        sd.storageMode = .private
+        let newShadow = device.makeTexture(descriptor: sd)
+        guard let newPos, let newNorm, let newAOA, let newAOB,
+              let newHistory, let newPreviousPosition, let newPreDepth,
+              let newShadow else { return false }
+        posTex = newPos
+        normTex = newNorm
+        aoTexA = newAOA
+        aoTexB = newAOB
+        histTex = newHistory
+        prevPosTex = newPreviousPosition
+        preDepthTex = newPreDepth
+        shadowTex = newShadow
+        shadowTex?.label = "Directional shadow map"
+        targetSize = SIMD2(w, h)
+        prevVP = nil                      // resize invalidates history
+        return true
     }
 
     // MARK: - Camera
@@ -881,14 +1039,31 @@ final class Renderer: NSObject, MTKViewDelegate {
     // MARK: - Frame
 
     func draw(in view: MTKView) {
+        guard runtimeFailure == nil else { return }
         guard let model,
               let solver = model.solver,
               let rpd = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable,
-              let cmd = queue.makeCommandBuffer() else { return }
+              let drawable = view.currentDrawable else { return }
+
+        guard let cmd = queue.makeCommandBuffer() else {
+            reportFailure("could not create a Metal command buffer")
+            return
+        }
+        cmd.label = "AVBD render frame"
 
         model.tickIfRunning()
-        ensureTargets(view.drawableSize)
+        // The model owns physics failure reporting. Never relabel a poisoned
+        // solver as a renderer failure or read its potentially invalid state.
+        guard solver.runtimeFailure == nil else { return }
+        let solverIdentity = ObjectIdentifier(solver)
+        if solverIdentity != lastSolverIdentity {
+            lastSolverIdentity = solverIdentity
+            prevVP = nil
+        }
+        guard ensureTargets(view.drawableSize) else {
+            reportFailure("could not allocate required Metal render targets")
+            return
+        }
 
         // Per-scene default framing (small cloth rigs drown at the rigid-rig
         // default distance). Applied only when the DEMO changes — resets and
@@ -901,8 +1076,16 @@ final class Renderer: NSObject, MTKViewDelegate {
                     ? solver.settings.cameraDistance : 30
                 target.z = solver.settings.cameraTargetZ != 0
                     ? solver.settings.cameraTargetZ : 3
-                target.x = 0
-                target.y = 0
+                target.x = solver.settings.cameraTargetX.isFinite
+                    ? solver.settings.cameraTargetX : 0
+                target.y = solver.settings.cameraTargetY.isFinite
+                    ? solver.settings.cameraTargetY : 0
+                if solver.settings.cameraAzimuth.isFinite {
+                    azimuth = solver.settings.cameraAzimuth
+                }
+                if solver.settings.cameraElevation.isFinite {
+                    elevation = solver.settings.cameraElevation
+                }
             }
         }
 
@@ -914,10 +1097,23 @@ final class Renderer: NSObject, MTKViewDelegate {
                                           options: .storageModePrivate)
         }
         guard let instances, let posTex, let normTex, let aoTexA, let aoTexB,
-              let preDepthTex else { return }
+              let histTex, let prevPosTex, let preDepthTex, let shadowTex else {
+            reportFailure("could not allocate required Metal render resources")
+            return
+        }
 
-        solver.encodeBuildInstances(cmd, instances: instances,
-                                    colorMode: model.colorByGraphColor ? 1 : 0)
+        do {
+            try solver.encodeBuildInstancesChecked(
+                cmd, instances: instances,
+                colorMode: model.colorByGraphColor ? 1 : 0)
+        } catch {
+            // synchronize() inside the checked API may be the first observer
+            // of a physics error. Its owning model will report it on the next
+            // tick; do not poison or misclassify it here.
+            guard solver.runtimeFailure == nil else { return }
+            reportFailure("instance-build encoder failed: \(error.localizedDescription)")
+            return
+        }
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
         let pxPerUnit = viewportSize.y * 0.5 / tan(25 * Float.pi / 180)
@@ -925,19 +1121,104 @@ final class Renderer: NSObject, MTKViewDelegate {
         let camR = normalize(cross(fwd, F3(0, 0, 1)))
         let camU = cross(camR, fwd)          // screen +y in UV space is DOWN
         let vp = projectionMatrix(aspect: aspect) * viewMatrix
+        let lightDirection = normalize(F3(0.4, 0.25, -0.85))
+
+        // A camera-targeted, texel-stabilized orthographic light projection.
+        // This keeps articulated robot detail crisp while preventing shadows
+        // from crawling when the follow camera advances with a policy.
+        let shadowExtent = max(7.0, min(distance * 0.9, 40.0))
+        let lightUp = F3(0, 1, 0)
+        let lightRight = normalize(cross(lightDirection, lightUp))
+        let lightMapUp = cross(lightRight, lightDirection)
+        let texelWorld = (2 * shadowExtent) / Float(Renderer.shadowMapSize)
+        let rightCoord = (dot(target, lightRight) / texelWorld).rounded() * texelWorld
+        let upCoord = (dot(target, lightMapUp) / texelWorld).rounded() * texelWorld
+        let shadowCenter = target
+            + lightRight * (rightCoord - dot(target, lightRight))
+            + lightMapUp * (upCoord - dot(target, lightMapUp))
+        let lightEye = shadowCenter - lightDirection * (shadowExtent * 2.5)
+        let shadowVP = metalOrthographicProjection(
+            left: -shadowExtent, right: shadowExtent,
+            bottom: -shadowExtent, top: shadowExtent,
+            near: 0.1, far: shadowExtent * 5.0)
+            * lookAt(eye: lightEye, center: shadowCenter, up: lightUp)
         let noiseOff = Float(frameIdx % 64) * 0.6180339887
+        let screenViewport = MTLViewport(originX: 0, originY: 0,
+                                         width: Double(targetSize.x),
+                                         height: Double(targetSize.y),
+                                         znear: 0, zfar: 1)
         var U = Uniforms(viewProj: vp,
-                         lightDir: SIMD4(normalize(F3(0.4, 0.25, -0.85)), 0),
+                         lightDir: SIMD4(lightDirection, 0),
                          eye: SIMD4(eyePosition, 0),
                          screen: SIMD4(viewportSize.x, viewportSize.y, pxPerUnit, 0),
                          camRight: SIMD4(camR, 0),
                          camUp: SIMD4(-camU, 0),
                          prevViewProj: prevVP ?? vp,
                          temporal: SIMD4(noiseOff.truncatingRemainder(dividingBy: 1),
-                                         prevVP == nil ? 1.0 : 0.12, 0, 0))
-        frameIdx &+= 1
+                                         prevVP == nil ? 1.0 : 0.12, 0, 0),
+                         shadowViewProj: shadowVP,
+                         shadowParams: SIMD4(0.00008, 0.00030, 0, 0))
+        // ---- 1. directional shadow depth ----
+        let shadowPass = MTLRenderPassDescriptor()
+        shadowPass.depthAttachment.texture = shadowTex
+        shadowPass.depthAttachment.loadAction = .clear
+        shadowPass.depthAttachment.clearDepth = 1
+        shadowPass.depthAttachment.storeAction = .store
+        guard let shadowEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: shadowPass) else {
+            reportFailure("could not create the directional-shadow encoder")
+            return
+        }
+        do {
+            let enc = shadowEncoder
+            enc.label = "Directional shadow casters"
+            enc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                        width: Double(Renderer.shadowMapSize),
+                                        height: Double(Renderer.shadowMapSize),
+                                        znear: 0, zfar: 1))
+            enc.setDepthStencilState(depthState)
+            var shadowU = U
+            shadowU.viewProj = shadowVP
+            if rigidCount > 0 {
+                for (p, verts) in [(boxShadow!, 36), (sphereShadow!, SPHV),
+                                   (torusShadow!, TORV), (capsuleShadow!, CAPV)] {
+                    enc.setRenderPipelineState(p)
+                    enc.setVertexBuffer(instances, offset: 0, index: 0)
+                    enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: verts, instanceCount: rigidCount)
+                }
+            }
+            if let surf = solver.renderSurface {
+                enc.setRenderPipelineState(softShadow)
+                enc.setVertexBuffer(surf.tris, offset: 0, index: 0)
+                enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
+                enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: surf.triCount * 3)
+            }
+            if let skin = solver.renderSkinnedSurface {
+                enc.setRenderPipelineState(skinShadow)
+                enc.setVertexBuffer(skin.tris, offset: 0, index: 0)
+                enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: skin.triCount * 3)
+            }
+            if let mesh = solver.renderRigidMeshSurface {
+                enc.setRenderPipelineState(rigidMeshShadow)
+                enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
+                enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
+                enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: mesh.vertexCount)
+            }
+            enc.endEncoding()
+        }
 
-        // ---- 1. prepass: world pos + normals ----
+        // ---- 2. prepass: world pos + normals ----
         let pre = MTLRenderPassDescriptor()
         pre.colorAttachments[0].texture = posTex
         pre.colorAttachments[0].loadAction = .clear
@@ -950,7 +1231,15 @@ final class Renderer: NSObject, MTKViewDelegate {
         pre.depthAttachment.loadAction = .clear
         pre.depthAttachment.clearDepth = 1
         pre.depthAttachment.storeAction = .dontCare
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: pre) {
+        guard let prepassEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: pre) else {
+            reportFailure("could not create the world-position prepass encoder")
+            return
+        }
+        do {
+            let enc = prepassEncoder
+            enc.label = "World-position and normal prepass"
+            enc.setViewport(screenViewport)
             enc.setDepthStencilState(depthState)
             enc.setRenderPipelineState(floorPreP)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -983,15 +1272,32 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: skin.triCount * 3)
             }
+            if let mesh = solver.renderRigidMeshSurface {
+                enc.setRenderPipelineState(rigidMeshPre)
+                enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
+                enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: mesh.vertexCount)
+            }
             enc.endEncoding()
         }
 
-        // ---- 2. GTAO ----
+        // ---- 3. GTAO ----
         let aoPass = MTLRenderPassDescriptor()
         aoPass.colorAttachments[0].texture = aoTexA
         aoPass.colorAttachments[0].loadAction = .dontCare
         aoPass.colorAttachments[0].storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: aoPass) {
+        guard let gtaoEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: aoPass) else {
+            reportFailure("could not create the GTAO encoder")
+            return
+        }
+        do {
+            let enc = gtaoEncoder
+            enc.label = "GTAO"
+            enc.setViewport(screenViewport)
             enc.setRenderPipelineState(gtaoP)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(posTex, index: 0)
@@ -1000,12 +1306,20 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.endEncoding()
         }
 
-        // ---- 3a. temporal resolve: raw A + reprojected history -> B ----
+        // ---- 4a. temporal resolve: raw A + reprojected history -> B ----
         let tPass = MTLRenderPassDescriptor()
         tPass.colorAttachments[0].texture = aoTexB
         tPass.colorAttachments[0].loadAction = .dontCare
         tPass.colorAttachments[0].storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: tPass) {
+        guard let temporalEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: tPass) else {
+            reportFailure("could not create the temporal-AO encoder")
+            return
+        }
+        do {
+            let enc = temporalEncoder
+            enc.label = "Temporal AO resolve"
+            enc.setViewport(screenViewport)
             enc.setRenderPipelineState(temporalP)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
@@ -1015,20 +1329,29 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }
-        // ---- 3b. save history (resolved AO + world positions) ----
-        if let blit = cmd.makeBlitCommandEncoder(),
-           let hist = histTex, let pp = prevPosTex {
-            blit.copy(from: aoTexB, to: hist)
-            blit.copy(from: posTex, to: pp)
-            blit.endEncoding()
+        // ---- 4b. save history (resolved AO + world positions) ----
+        guard let historyEncoder = cmd.makeBlitCommandEncoder() else {
+            reportFailure("could not create the temporal-history encoder")
+            return
         }
-        prevVP = vp
-        // ---- 3c. one depth-aware spatial blur: B -> A ----
+        historyEncoder.label = "Temporal history copy"
+        historyEncoder.copy(from: aoTexB, to: histTex)
+        historyEncoder.copy(from: posTex, to: prevPosTex)
+        historyEncoder.endEncoding()
+        // ---- 4c. one depth-aware spatial blur: B -> A ----
         let blurPass = MTLRenderPassDescriptor()
         blurPass.colorAttachments[0].texture = aoTexA
         blurPass.colorAttachments[0].loadAction = .dontCare
         blurPass.colorAttachments[0].storeAction = .store
-        if let enc = cmd.makeRenderCommandEncoder(descriptor: blurPass) {
+        guard let blurEncoder = cmd.makeRenderCommandEncoder(
+                descriptor: blurPass) else {
+            reportFailure("could not create the AO-blur encoder")
+            return
+        }
+        do {
+            let enc = blurEncoder
+            enc.label = "Depth-aware AO blur"
+            enc.setViewport(screenViewport)
             enc.setRenderPipelineState(blurP)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexB, index: 0)
@@ -1037,8 +1360,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.endEncoding()
         }
 
-        // ---- 4. main pass ----
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        // ---- 5. main pass ----
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
+            reportFailure("could not create the main render encoder")
+            return
+        }
+        enc.label = "Main PBR pass"
+        enc.setViewport(screenViewport)
 
         enc.setDepthStencilState(noDepthState)
         enc.setRenderPipelineState(skyP)
@@ -1049,16 +1377,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentTexture(aoTexA, index: 0)
+        enc.setFragmentTexture(shadowTex, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-
-        enc.setDepthStencilState(noWriteDepthState)
-        if rigidCount > 0 {
-            enc.setRenderPipelineState(shadowP)
-            enc.setVertexBuffer(instances, offset: 0, index: 0)
-            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
-                               instanceCount: rigidCount)
-        }
 
         enc.setDepthStencilState(depthState)
         if rigidCount > 0 {
@@ -1068,6 +1388,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentTexture(aoTexA, index: 0)
+                enc.setFragmentTexture(shadowTex, index: 1)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: verts, instanceCount: rigidCount)
             }
@@ -1080,6 +1401,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
+            enc.setFragmentTexture(shadowTex, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: surf.triCount * 3)
         }
@@ -1090,13 +1412,40 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
+            enc.setFragmentTexture(shadowTex, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: skin.triCount * 3)
+        }
+        if let mesh = solver.renderRigidMeshSurface {
+            enc.setRenderPipelineState(rigidMeshP)
+            enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
+            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
+            enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentTexture(aoTexA, index: 0)
+            enc.setFragmentTexture(shadowTex, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: mesh.vertexCount)
         }
         enc.endEncoding()
 
         cmd.present(drawable)
         cmd.commit()
+
+        // Physics and rendering own different command queues but share pose
+        // buffers. Retire every visual frame before returning to the main run
+        // loop, where Play/Step/Reset/goal/impact actions may mutate those
+        // buffers. This is the conservative cross-queue correctness boundary;
+        // a future shared-event/read-lease API can recover overlap safely.
+        cmd.waitUntilCompleted()
+        if let failure = commandFailureDescription(cmd) {
+            reportFailure(failure)
+            return
+        }
+
+        prevVP = vp
+        frameIdx &+= 1
 
         framesDrawn += 1
         if framesDrawn == 30, ProcessInfo.processInfo.environment["AVBD_MARKER"] != nil {
@@ -1105,11 +1454,21 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         // Scripted capture: AVBD_SHOT=<path.png> [AVBD_SHOT_FRAME=n] writes
         // the resolved frame and exits (needs framebufferOnly = false).
-        if let shotPath = ProcessInfo.processInfo.environment["AVBD_SHOT"],
+        if scriptedCaptureAllowed,
+           let shotPath = ProcessInfo.processInfo.environment["AVBD_SHOT"],
            framesDrawn == (Int(ProcessInfo.processInfo.environment["AVBD_SHOT_FRAME"] ?? "") ?? 90) {
-            cmd.waitUntilCompleted()
             writePNG(texture: drawable.texture, to: shotPath)
             exit(0)
+        }
+        if scriptedCaptureAllowed,
+           let directory = ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] {
+            let every = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_EVERY"] ?? "") ?? 3, 1)
+            let maximum = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_FRAMES"] ?? "") ?? 600, 1)
+            if framesDrawn.isMultiple(of: every) {
+                let path = String(format: "%@/%05d.png", directory, framesDrawn / every)
+                writePNG(texture: drawable.texture, to: path)
+            }
+            if framesDrawn >= maximum { exit(0) }
         }
     }
 

@@ -1,0 +1,27 @@
+{
+  "actionDimension" : 19,
+  "actionDistribution" : "gaussian",
+  "architectureVersion" : 5,
+  "checkpointFingerprint" : "00bc782d1845ddde94282b46f0d7fa2732feeb4a8e52215a5abe62128bccc756",
+  "controlDecimation" : 4,
+  "controlFrequencyHz" : 50,
+  "metadataFile" : "metadata.json",
+  "normalizesObservations" : false,
+  "observationDimension" : 69,
+  "policyFile" : "policy.safetensors",
+  "policySHA256" : "3e0a21600afd6ee2e50383ed33f69007f9855c3f8b85ec0b52c4f2acc2c285ae",
+  "schemaVersion" : 1,
+  "simulationStepSeconds" : 0.005,
+  "task" : "humanoid-isaac-flat-v0",
+  "taskConfiguration" : {
+    "commandResamplingSteps" : 500,
+    "initialYawRange" : 3.1415925,
+    "observationNoise" : 1,
+    "solverIterations" : 20,
+    "standingCommandProbability" : 0.02
+  },
+  "taskRevision" : 2000011,
+  "trainingEnvironmentSteps" : 0,
+  "trainingStateFile" : "training-state.json",
+  "trainingUpdates" : 0
+}

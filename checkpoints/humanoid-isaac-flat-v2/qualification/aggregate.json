@@ -1,0 +1,143 @@
+{
+  "acceptedRuns" : 4,
+  "allRunsHaveRequiredEpisodes" : true,
+  "allRunsPassed" : true,
+  "checkpointDirectory" : "runs\/humanoid-isaac-flat-v2\/requalification-r2000011\/candidate",
+  "checkpointFingerprint" : "00bc782d1845ddde94282b46f0d7fa2732feeb4a8e52215a5abe62128bccc756",
+  "evaluationEnvironments" : 128,
+  "evaluationSeeds" : [
+    51001,
+    51002,
+    51003,
+    51004
+  ],
+  "evaluationTaskConfiguration" : {
+    "commandResamplingSteps" : 500,
+    "initialYawRange" : 3.1415925,
+    "observationNoise" : 1,
+    "solverIterations" : 20,
+    "standingCommandProbability" : 0.02
+  },
+  "hasRequiredRunCount" : true,
+  "initializationCheckpoint" : "checkpoints\/humanoid-isaac-flat-v1",
+  "meanEpisodeLength" : {
+    "firstQuartile" : 995.51514,
+    "maximum" : 998.6367,
+    "median" : 996.19727,
+    "minimum" : 994.52344,
+    "thirdQuartile" : 997.0708
+  },
+  "meanReturn" : {
+    "firstQuartile" : 37.40407,
+    "maximum" : 37.578293,
+    "median" : 37.43442,
+    "minimum" : 37.395596,
+    "thirdQuartile" : 37.49103
+  },
+  "pooledSuccessRate" : 0.9902344,
+  "provenanceComplete" : true,
+  "requiredEpisodesPerRun" : 512,
+  "requiredRuns" : 4,
+  "robustAcrossEvaluationSeeds" : true,
+  "runs" : 4,
+  "scope" : "single_checkpoint_across_evaluation_seeds",
+  "successRate" : {
+    "firstQuartile" : 0.98779297,
+    "maximum" : 0.99609375,
+    "median" : 0.9892578,
+    "minimum" : 0.9863281,
+    "thirdQuartile" : 0.9916992
+  },
+  "task" : "humanoid-isaac-flat-v0",
+  "taskConfigurationTransferred" : false,
+  "taskMetrics" : {
+    "episode\/final_goal_distance_m" : {
+      "firstQuartile" : 0,
+      "maximum" : 0,
+      "median" : 0,
+      "minimum" : 0,
+      "thirdQuartile" : 0
+    },
+    "episode\/forward_path_m" : {
+      "firstQuartile" : 9.109442,
+      "maximum" : 9.473436,
+      "median" : 9.26458,
+      "minimum" : 9.069056,
+      "thirdQuartile" : 9.423052
+    },
+    "episode\/goal_arrival_speed_mps" : {
+      "firstQuartile" : 0,
+      "maximum" : 0,
+      "median" : 0,
+      "minimum" : 0,
+      "thirdQuartile" : 0
+    },
+    "episode\/goal_dwell_steps" : {
+      "firstQuartile" : 0,
+      "maximum" : 0,
+      "median" : 0,
+      "minimum" : 0,
+      "thirdQuartile" : 0
+    },
+    "episode\/goal_entered" : {
+      "firstQuartile" : 0,
+      "maximum" : 0,
+      "median" : 0,
+      "minimum" : 0,
+      "thirdQuartile" : 0
+    },
+    "episode\/goal_reached" : {
+      "firstQuartile" : 0,
+      "maximum" : 0,
+      "median" : 0,
+      "minimum" : 0,
+      "thirdQuartile" : 0
+    },
+    "episode\/linear_velocity_rmse_mps" : {
+      "firstQuartile" : 0.08678026,
+      "maximum" : 0.08900721,
+      "median" : 0.08753008,
+      "minimum" : 0.08584574,
+      "thirdQuartile" : 0.08822809
+    },
+    "episode\/mean_commanded_forward_velocity_mps" : {
+      "firstQuartile" : 0.482188,
+      "maximum" : 0.5005025,
+      "median" : 0.49128896,
+      "minimum" : 0.48141629,
+      "thirdQuartile" : 0.5002251
+    },
+    "episode\/mean_local_forward_velocity_mps" : {
+      "firstQuartile" : 0.45780885,
+      "maximum" : 0.47428834,
+      "median" : 0.46528846,
+      "minimum" : 0.45707425,
+      "thirdQuartile" : 0.4729645
+    },
+    "episode\/minimum_goal_distance_m" : {
+      "firstQuartile" : 0,
+      "maximum" : 0,
+      "median" : 0,
+      "minimum" : 0,
+      "thirdQuartile" : 0
+    },
+    "episode\/survived" : {
+      "firstQuartile" : 0.98779297,
+      "maximum" : 0.99609375,
+      "median" : 0.9892578,
+      "minimum" : 0.9863281,
+      "thirdQuartile" : 0.9916992
+    },
+    "episode\/yaw_rate_rmse_rps" : {
+      "firstQuartile" : 0.12867671,
+      "maximum" : 0.13236159,
+      "median" : 0.12956479,
+      "minimum" : 0.12774745,
+      "thirdQuartile" : 0.13069771
+    }
+  },
+  "taskRevision" : 2000011,
+  "totalEpisodes" : 2048,
+  "totalSuccesses" : 2028,
+  "trainingSeed" : 41002
+}
