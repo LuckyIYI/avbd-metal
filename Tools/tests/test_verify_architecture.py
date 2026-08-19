@@ -90,16 +90,6 @@ def valid_manifest() -> dict[str, object]:
             ],
         ),
         target(
-            "AVBDCore",
-            [
-                target_dependency("SimCore"),
-                target_dependency("PhysicsAVBD"),
-                target_dependency("Robotics"),
-                target_dependency("RL"),
-            ],
-        ),
-        target("AVBDLearn", [target_dependency("MLXRL")]),
-        target(
             "avbd",
             [target_dependency(name) for name in architecture.LAYER_TARGETS],
             target_type="executable",
@@ -113,8 +103,6 @@ def valid_manifest() -> dict[str, object]:
     ]
     products = [
         *(product(name) for name in ("SimCore", "PhysicsAVBD", "Robotics", "RL", "MLXRL")),
-        product("AVBDCore"),
-        product("AVBDLearn"),
         product("avbd", "executable"),
         product("AVBDApp", "executable"),
     ]
@@ -164,24 +152,6 @@ def create_valid_sources(root: Path) -> None:
                 "",
             ]
         ),
-    )
-    write(
-        root,
-        "Sources/AVBDCore/Exports.swift",
-        """// Compatibility surface only.
-/* public struct ThisCommentIsNotImplementation {
-   /* nested comment */
-} */
-@_exported import SimCore
-@_exported import PhysicsAVBD
-@_exported import Robotics
-@_exported import RL
-""",
-    )
-    write(
-        root,
-        "Sources/AVBDLearn/Exports.swift",
-        "// Compatibility surface only.\n@_exported import MLXRL\n",
     )
     write(
         root,
@@ -268,6 +238,30 @@ class ManifestVerificationTests(unittest.TestCase):
         ):
             architecture.verify_manifest(manifest)
 
+    def test_former_umbrella_target_name_is_rejected(self) -> None:
+        manifest = valid_manifest()
+        targets = manifest["targets"]
+        assert isinstance(targets, list)
+        targets.append(target("AVBDCore"))
+
+        with self.assertRaisesRegex(
+            architecture.VerificationError,
+            r"superseded target/product names.*AVBDCore",
+        ):
+            architecture.verify_manifest(manifest)
+
+    def test_former_umbrella_product_name_is_rejected(self) -> None:
+        manifest = valid_manifest()
+        products = manifest["products"]
+        assert isinstance(products, list)
+        products.append(product("AVBDLearn"))
+
+        with self.assertRaisesRegex(
+            architecture.VerificationError,
+            r"superseded target/product names.*AVBDLearn",
+        ):
+            architecture.verify_manifest(manifest)
+
     def test_unknown_production_target_cannot_bypass_the_gate(self) -> None:
         manifest = valid_manifest()
         targets = manifest["targets"]
@@ -301,6 +295,7 @@ class SourceAndResourceVerificationTests(unittest.TestCase):
     def test_valid_sources_and_resources_pass(self) -> None:
         architecture.verify_source_imports(self.root)
         architecture.verify_resource_layout(self.root)
+        architecture.verify_external_project_layout(self.root)
 
     def test_reverse_import_is_rejected(self) -> None:
         write(
@@ -343,28 +338,29 @@ class SourceAndResourceVerificationTests(unittest.TestCase):
         ):
             architecture.verify_source_imports(self.root)
 
-    def test_legacy_umbrella_implementation_is_rejected(self) -> None:
+    def test_former_umbrella_import_is_rejected(self) -> None:
         write(
             self.root,
-            "Sources/AVBDLearn/Implementation.swift",
-            "public struct CompatibilityLeak {}\n",
+            "Sources/MLXRL/CompatibilityLeak.swift",
+            "import AVBDLearn\n",
         )
 
         with self.assertRaisesRegex(
             architecture.VerificationError,
-            r"legacy umbrella AVBDLearn may contain only @_exported import",
+            r"imports superseded module AVBDLearn",
         ):
             architecture.verify_source_imports(self.root)
 
-    def test_legacy_umbrella_must_export_exact_modules(self) -> None:
+    def test_production_reexport_is_rejected(self) -> None:
         write(
             self.root,
-            "Sources/AVBDLearn/Exports.swift",
-            "@_exported import MLXRL\n@_exported import RL\n",
+            "Sources/MLXRL/Exports.swift",
+            "@_exported import RL\n",
         )
 
         with self.assertRaisesRegex(
-            architecture.VerificationError, r"AVBDLearn exports must be"
+            architecture.VerificationError,
+            r"production modules may not re-export modules",
         ):
             architecture.verify_source_imports(self.root)
 
@@ -374,6 +370,15 @@ class SourceAndResourceVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(
             architecture.VerificationError,
             r"superseded source directory remains: Sources/RLCore",
+        ):
+            architecture.verify_source_imports(self.root)
+
+    def test_former_umbrella_source_directory_is_rejected_even_when_empty(self) -> None:
+        (self.root / "Sources" / "AVBDCore").mkdir()
+
+        with self.assertRaisesRegex(
+            architecture.VerificationError,
+            r"superseded source directory remains: Sources/AVBDCore",
         ):
             architecture.verify_source_imports(self.root)
 
@@ -400,13 +405,33 @@ class SourceAndResourceVerificationTests(unittest.TestCase):
             architecture.verify_resource_layout(self.root)
 
     def test_misplaced_asset_is_rejected(self) -> None:
-        write(self.root, "Sources/AVBDCore/Assets/robot.xml", "<mujoco/>\n")
+        write(self.root, "Sources/RL/Assets/robot.xml", "<mujoco/>\n")
 
         with self.assertRaisesRegex(
             architecture.VerificationError,
-            r"AVBDCore/Assets/robot.xml: simulator/robot assets belong to",
+            r"RL/Assets/robot.xml: simulator/robot assets belong to",
         ):
             architecture.verify_resource_layout(self.root)
+
+    def test_external_arachne_project_is_rejected(self) -> None:
+        (self.root / "Robots" / "Arachne15").mkdir(parents=True)
+
+        with self.assertRaisesRegex(
+            architecture.VerificationError,
+            r"external project directory must not be vendored: Robots/Arachne15",
+        ):
+            architecture.verify_external_project_layout(self.root)
+
+    def test_dangling_external_project_symlink_is_rejected(self) -> None:
+        robots = self.root / "Robots"
+        robots.mkdir()
+        (robots / "Arachne15").symlink_to(self.root / "missing-project")
+
+        with self.assertRaisesRegex(
+            architecture.VerificationError,
+            r"external project directory must not be vendored: Robots/Arachne15",
+        ):
+            architecture.verify_external_project_layout(self.root)
 
 
 if __name__ == "__main__":

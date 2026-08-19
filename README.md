@@ -34,8 +34,6 @@ crossing protection with boundary release, runtime shader concatenation
 | `Robotics` | Robot models, MJCF import, calibration, and hardware-facing contracts; depends only on `SimCore` |
 | `RL` | Vector task contracts, task registry, rewards, and the current AVBD-backed environments |
 | `MLXRL` | MLX learning, checkpoint/evidence formats, policy runtime, and research pipelines |
-| `AVBDCore` | Source-compatibility umbrella that re-exports `SimCore`, `PhysicsAVBD`, `Robotics`, and `RL` |
-| `AVBDLearn` | Source-compatibility umbrella that re-exports `MLXRL` |
 | `avbd` | CLI: `run`, `bench`, `parity`, `profile` (per-kernel GPU timings), `clothgate` (gap/stretch/KE gates), `rodexp` |
 | `AVBDApp` | macOS app: viewer, demos, Robotics Lab |
 | `AVBDTests` | Cross-layer and MLX integration tests; lower layers also have dependency-limited test targets |
@@ -44,9 +42,9 @@ The production dependency graph is intentionally small: `SimCore` is the
 foundation; `PhysicsAVBD` and `Robotics` are independent siblings; `RL`
 composes them; and `MLXRL` is the only layer that depends on MLX. Policy
 metadata and runtime stay together with learning until they have an independent
-consumer or release cadence. The legacy umbrellas preserve existing source
-imports, but moving public declarations to their owning modules is an
-intentional binary-module boundary for precompiled clients.
+consumer or release cadence. Clients depend on the owning products directly;
+the `AVBD` name is reserved for the concrete physics backend rather than used
+as a generic simulator or learning namespace.
 
 ## Robot learning
 
@@ -56,6 +54,9 @@ arm Push-T, the full seven-axis Panda port of ManiSkill PushT-v1, the imported
 19-DoF Unitree H1 tasks aligned to Isaac Lab, the printable 16-DoF Arachne-15
 spider, and earlier native humanoid research tasks. Policy Replay is narrower:
 it exposes only maintained examples with a packaged current-contract policy.
+The Arachne-15 CAD, hardware, and device-qualification workspace is maintained
+as a separate project; this repository contains only its reviewed simulator
+runtime snapshot and sealed policy releases.
 
 ```bash
 make build

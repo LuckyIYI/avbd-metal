@@ -280,7 +280,7 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             XCTAssertEqual(
                 entry.runtime == .classicalController,
                 entry.evidenceRelativePath == nil,
-                "every learned replay must name machine-readable evidence")
+                "every learned replay must name machine-readable evidence or provenance")
             if let evidence = entry.evidenceRelativePath {
                 XCTAssertTrue(
                     FileManager.default.fileExists(

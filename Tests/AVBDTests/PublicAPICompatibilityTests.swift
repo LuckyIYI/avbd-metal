@@ -1,7 +1,9 @@
 import XCTest
 import simd
-import AVBDCore
-import AVBDLearn
+import SimCore
+import PhysicsAVBD
+import RL
+import MLXRL
 
 final class PublicAPICompatibilityTests: XCTestCase {
     func testLegacyCPUBodyAPIsForwardLegacyDefaults() {
