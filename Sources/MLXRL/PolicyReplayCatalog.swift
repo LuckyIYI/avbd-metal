@@ -114,8 +114,8 @@ public struct PolicyReplayCatalogEntry: Sendable, Equatable {
     /// Relative to the app's `checkpoints` resource directory.
     public var checkpointRelativeDirectory: String?
     public var qualification: PolicyReplayQualification
-    /// Repository-relative parity/evaluation evidence or deterministic,
-    /// source-locked importer for a locally installed external artifact.
+    /// Repository-relative evaluation evidence, historical provenance, or a
+    /// deterministic source-locked importer for an external artifact.
     public var evidenceRelativePath: String?
     /// A decoded, internally consistent robustness aggregate is required for
     /// every entry advertised as accepted.
@@ -382,13 +382,8 @@ public enum PolicyReplayCatalog {
             runtime: .nativeMLX,
             checkpointRelativeDirectory: "arachne15-goal-v0",
             qualification: .requalificationRequired,
-            evidenceRelativePath: "Robots/Arachne15/qualification/"
-                + "arachne15-goal-r6-update-000020/"
-                + "aggregate-update-000020.json",
-            acceptanceAggregateRelativePath:
-                "Robots/Arachne15/qualification/"
-                + "arachne15-goal-r6-update-000020/"
-                + "aggregate-update-000020.json",
+            evidenceRelativePath:
+                "checkpoints/arachne15-goal-v0/deployment-manifest.json",
             deploymentManifestRelativePath:
                 "checkpoints/arachne15-goal-v0/deployment-manifest.json"),
     ]

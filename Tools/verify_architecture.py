@@ -20,12 +20,14 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 LAYER_TARGETS = ("SimCore", "PhysicsAVBD", "Robotics", "RL", "MLXRL")
-LEGACY_TARGETS = ("AVBDCore", "AVBDLearn")
 ENTRY_POINT_TARGETS = ("avbd", "AVBDApp")
+EXTERNAL_PROJECT_DIRECTORIES = (Path("Robots/Arachne15"),)
 
 MLX_PRODUCTS = ("MLX", "MLXNN", "MLXOptimizers", "MLXRandom", "MLXLinalg")
 SUPERSEDED_TARGETS = frozenset(
     {
+        "AVBDCore",
+        "AVBDLearn",
         "RLCore",
         "RLTasks",
         "PolicyFormat",
@@ -62,21 +64,12 @@ EXPECTED_TARGET_DEPENDENCIES = {
             *(_product(name, "mlx-swift") for name in MLX_PRODUCTS),
         }
     ),
-    "AVBDCore": frozenset(
-        {
-            _target("SimCore"),
-            _target("PhysicsAVBD"),
-            _target("Robotics"),
-            _target("RL"),
-        }
-    ),
-    "AVBDLearn": frozenset({_target("MLXRL")}),
     "avbd": frozenset({_target(name) for name in LAYER_TARGETS}),
     "AVBDApp": frozenset({_target(name) for name in LAYER_TARGETS}),
 }
 
 EXPECTED_TARGET_TYPES = {
-    **{name: "regular" for name in (*LAYER_TARGETS, *LEGACY_TARGETS)},
+    **{name: "regular" for name in LAYER_TARGETS},
     **{name: "executable" for name in ENTRY_POINT_TARGETS},
 }
 
@@ -87,7 +80,7 @@ EXPECTED_RESOURCES = {
 }
 
 EXPECTED_PRODUCTS = {
-    **{name: ("library", (name,)) for name in (*LAYER_TARGETS, *LEGACY_TARGETS)},
+    **{name: ("library", (name,)) for name in LAYER_TARGETS},
     **{name: ("executable", (name,)) for name in ENTRY_POINT_TARGETS},
 }
 
@@ -101,13 +94,8 @@ ALLOWED_LOCAL_IMPORTS = {
     "AVBDApp": frozenset(LAYER_TARGETS),
 }
 
-EXPECTED_LEGACY_EXPORTS = {
-    "AVBDCore": frozenset({"SimCore", "PhysicsAVBD", "Robotics", "RL"}),
-    "AVBDLearn": frozenset({"MLXRL"}),
-}
-
 ALL_LOCAL_MODULES = frozenset(
-    {*LAYER_TARGETS, *LEGACY_TARGETS, *ENTRY_POINT_TARGETS, *SUPERSEDED_TARGETS}
+    {*LAYER_TARGETS, *ENTRY_POINT_TARGETS, *SUPERSEDED_TARGETS}
 )
 
 _IMPORT_RE = re.compile(
@@ -117,11 +105,6 @@ _IMPORT_RE = re.compile(
     r"(?:(?:typealias|struct|class|enum|protocol|let|var|func|operator)[ \t]+)?"
     r"(?P<module>[A-Za-z_][A-Za-z0-9_]*)\b"
 )
-_LEGACY_EXPORT_RE = re.compile(
-    r"^@_exported[ \t]+import[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*;?[ \t]*$"
-)
-
-
 class VerificationError(RuntimeError):
     """An architecture invariant was violated."""
 
@@ -429,7 +412,7 @@ def _verify_imports_in_target(root: Path, target_name: str) -> None:
                 )
             if "@_exported" in attributes:
                 raise VerificationError(
-                    f"{relative_path}:{line}: only legacy umbrellas may re-export modules"
+                    f"{relative_path}:{line}: production modules may not re-export modules"
                 )
             if module in SUPERSEDED_TARGETS:
                 raise VerificationError(
@@ -446,48 +429,8 @@ def _verify_imports_in_target(root: Path, target_name: str) -> None:
                 )
 
 
-def _verify_legacy_umbrella(root: Path, target_name: str) -> None:
-    target_directory = root / "Sources" / target_name
-    if not target_directory.is_dir():
-        raise VerificationError(f"missing source directory Sources/{target_name}")
-
-    exports: list[str] = []
-    source_files = _source_files(target_directory)
-    if not source_files:
-        raise VerificationError(f"legacy umbrella {target_name} has no Swift source")
-
-    for source_path in source_files:
-        relative_path = source_path.relative_to(root)
-        source = _strip_swift_comments(source_path.read_text(encoding="utf-8"))
-        for line_number, line in enumerate(source.splitlines(), start=1):
-            if not line.strip():
-                continue
-            match = _LEGACY_EXPORT_RE.fullmatch(line.strip())
-            if not match:
-                raise VerificationError(
-                    f"{relative_path}:{line_number}: legacy umbrella {target_name} "
-                    "may contain only @_exported import declarations"
-                )
-            module = match.group(1)
-            if module in SUPERSEDED_TARGETS:
-                raise VerificationError(
-                    f"{relative_path}:{line_number}: exports superseded module {module}"
-                )
-            exports.append(module)
-
-    if len(exports) != len(set(exports)):
-        raise VerificationError(f"legacy umbrella {target_name} repeats an export")
-    expected_exports = EXPECTED_LEGACY_EXPORTS[target_name]
-    actual_exports = frozenset(exports)
-    if actual_exports != expected_exports:
-        raise VerificationError(
-            f"legacy umbrella {target_name} exports must be "
-            f"{_describe(expected_exports)}, got {_describe(actual_exports)}"
-        )
-
-
 def verify_source_imports(root: Path | str) -> None:
-    """Verify source-level direction and pure compatibility umbrellas."""
+    """Verify source-level direction and reject superseded modules."""
 
     root = Path(root).resolve()
     sources = root / "Sources"
@@ -500,8 +443,6 @@ def verify_source_imports(root: Path | str) -> None:
 
     for target_name in ALLOWED_LOCAL_IMPORTS:
         _verify_imports_in_target(root, target_name)
-    for target_name in LEGACY_TARGETS:
-        _verify_legacy_umbrella(root, target_name)
 
     demo_root = sources / "PhysicsAVBD" / "Demos"
     if not (demo_root / "Demos.swift").is_file():
@@ -574,6 +515,17 @@ def verify_resource_layout(root: Path | str) -> None:
             )
 
 
+def verify_external_project_layout(root: Path | str) -> None:
+    """Reject hardware/design workspaces that must remain separate projects."""
+
+    root = Path(root).resolve()
+    for relative in EXTERNAL_PROJECT_DIRECTORIES:
+        if os.path.lexists(root / relative):
+            raise VerificationError(
+                f"external project directory must not be vendored: {relative}"
+            )
+
+
 def load_package_dump(root: Path | str) -> Mapping[str, Any]:
     """Return a SwiftPM package dump without using repository build caches."""
 
@@ -631,6 +583,7 @@ def verify(root: Path | str) -> None:
     verify_manifest(load_package_dump(root))
     verify_source_imports(root)
     verify_resource_layout(root)
+    verify_external_project_layout(root)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

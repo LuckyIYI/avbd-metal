@@ -10,8 +10,6 @@ let package = Package(
         .library(name: "Robotics", targets: ["Robotics"]),
         .library(name: "RL", targets: ["RL"]),
         .library(name: "MLXRL", targets: ["MLXRL"]),
-        .library(name: "AVBDCore", targets: ["AVBDCore"]),
-        .library(name: "AVBDLearn", targets: ["AVBDLearn"]),
         .executable(name: "avbd", targets: ["avbd"]),
         .executable(name: "AVBDApp", targets: ["AVBDApp"]),
     ],
@@ -45,16 +43,6 @@ let package = Package(
                 .product(name: "MLXLinalg", package: "mlx-swift"),
             ]
         ),
-        .target(
-            name: "AVBDCore",
-            dependencies: [
-                "SimCore", "PhysicsAVBD", "Robotics", "RL",
-            ]
-        ),
-        .target(
-            name: "AVBDLearn",
-            dependencies: ["MLXRL"]
-        ),
         .executableTarget(
             name: "avbd",
             dependencies: [
@@ -81,10 +69,6 @@ let package = Package(
         .testTarget(
             name: "PhysicsAVBDTests",
             dependencies: ["SimCore", "PhysicsAVBD"]
-        ),
-        .testTarget(
-            name: "LegacyCompatibilityTests",
-            dependencies: ["AVBDCore", "AVBDLearn"]
         ),
     ]
 )

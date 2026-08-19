@@ -545,25 +545,16 @@ final class RLFrameworkTests: XCTestCase {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
-        let templateURL = packageRoot.appendingPathComponent(
-            "Robots/Arachne15/iphone/hardware-calibration.template.json")
-        let template = try JSONDecoder().decode(
-            Arachne15HardwareCalibration.self,
-            from: Data(contentsOf: templateURL))
-        let fingerprint = template.policyCheckpointFingerprint
         let acceptedGoal = try XCTUnwrap(PolicyReplayCatalog.entry(
             selectionID: "arachne15-goal-v1"))
         XCTAssertEqual(acceptedGoal.qualification, .accepted)
+        let fingerprint = try XCTUnwrap(
+            acceptedGoal.expectedCheckpointFingerprint)
         XCTAssertEqual(
             fingerprint,
             try VectorPPOTrainer.checkpointFingerprint(
                 directory: packageRoot.appendingPathComponent(
                     "checkpoints/arachne15-goal-v1", isDirectory: true).path))
-        XCTAssertThrowsError(try template.validate(
-            expectedPolicyFingerprint: fingerprint))
-        XCTAssertTrue(template.validationFailures(
-            expectedPolicyFingerprint: fingerprint).contains(
-                "calibration is not commissioned"))
 
         let lower: [Float] = (0..<16).map {
             $0.isMultiple(of: 2) ? -0.55 : -0.7
@@ -571,6 +562,22 @@ final class RLFrameworkTests: XCTestCase {
         let upper: [Float] = (0..<16).map {
             $0.isMultiple(of: 2) ? 0.55 : 0.7
         }
+        let template = Arachne15HardwareCalibration(
+            robotSerial: "", commissioned: false, measuredAtUTC: "",
+            policyCheckpointFingerprint: fingerprint,
+            servoIDs: Array(1...16),
+            servoZeroRadians: [Float](repeating: 0, count: 16),
+            servoDirectionSigns: [Float](repeating: 1, count: 16),
+            jointLowerRadians: lower, jointUpperRadians: upper,
+            currentLimitsMilliamps: [Int](repeating: 0, count: 16),
+            maximumServoTemperatureCelsius: 55,
+            measuredMaximumRoundTripLatencySeconds: 0)
+        XCTAssertThrowsError(try template.validate(
+            expectedPolicyFingerprint: fingerprint))
+        XCTAssertTrue(template.validationFailures(
+            expectedPolicyFingerprint: fingerprint).contains(
+                "calibration is not commissioned"))
+
         let calibration = Arachne15HardwareCalibration(
             robotSerial: "AR15-001", commissioned: true,
             measuredAtUTC: "2026-07-16T00:00:00Z",

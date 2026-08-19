@@ -1,12 +1,14 @@
-# Arachne-15 simulation assets
+# Arachne-15 runtime snapshot
 
-The XML files are generated from `Robots/Arachne15/sim/generate_model.py`.
-The packaged STL files are installed from the parametric CAD by
-`Robots/Arachne15/scripts/build_cad.sh`. Do not edit either snapshot by hand.
-To regenerate and validate MJCF without rebuilding CAD, run:
+This directory is the reviewed simulator import boundary. The Arachne-15 CAD,
+BOM, generators, hardware integration, and device qualification live in an
+external project and are intentionally not vendored here. Changes arrive as
+an explicit runtime-asset import and must update the repository-owned verifier.
+
+Validate the imported snapshot with:
 
 ```sh
-Robots/Arachne15/scripts/build_sim.sh
+make verify-arachne-assets
 ```
 
 The printable meshes are rendering assets only. Physics uses the explicit

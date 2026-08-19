@@ -88,10 +88,10 @@ own parity gates.
   Fingerprint:
   `aed643b062df4e0e07e70998212720909bc1b25229455489ba28d4319d202524`.
 - `arachne15-goal-v0` is the formerly qualified epoch-1 sim-to-real point-goal actor.
-  Its four-seed training-collider and four-seed validation-collider reports are
-  retained under
-  `Robots/Arachne15/qualification/arachne15-goal-r6-update-000020`.
-  Those reports do not qualify the epoch-2 solver. Fingerprint:
+  Its detailed hardware-project qualification reports are retained in the
+  external Arachne-15 project, not this simulator repository. The tracked
+  deployment manifest preserves the historical checkpoint identity, but does
+  not qualify it for the epoch-2 solver. Fingerprint:
   `30c125b7f01b73bdd1524bc96cf8deb5e8a09897593a49e87aa6ce96f16d3027`.
 
 Both v0 Arachne bundles remain historical and cannot be selected through

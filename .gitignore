@@ -18,11 +18,11 @@ __pycache__/
 .venv/
 venv/
 
-# Generated training/evaluation output and replay media stay local. The source
-# tree contains the scripts and textual methodology needed to reproduce them.
+# Generated training/evaluation output and replay media stay local.
 artifacts/
-Robots/*/build/
-Robots/Arachne15/policies/
+# Hardware/CAD projects are maintained in separate repositories. The simulator
+# keeps only reviewed runtime snapshots under Sources/Robotics/Assets.
+/Robots/Arachne15/
 checkpoints/*
 !checkpoints/README.md
 !checkpoints/external/

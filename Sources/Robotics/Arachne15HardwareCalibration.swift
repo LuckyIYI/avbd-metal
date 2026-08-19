@@ -3,8 +3,9 @@ import simd
 import SimCore
 
 /// Measured actuator mapping required before a policy can command physical
-/// hardware. A checked-in template remains deliberately uncommissioned; the
-/// iPhone app must refuse to arm until every value is measured and signed off.
+/// hardware. The external hardware integration owns its calibration template;
+/// every runtime must refuse to arm until those values are measured and signed
+/// off.
 public struct Arachne15HardwareCalibration: Codable, Sendable, Equatable {
     public var schemaVersion: Int
     public var robotSerial: String

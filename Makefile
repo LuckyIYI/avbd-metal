@@ -8,7 +8,7 @@ PHYSICS_RESOURCE_BUNDLE := avbd-metal_PhysicsAVBD.bundle
 ROBOTICS_RESOURCE_BUNDLE := avbd-metal_Robotics.bundle
 
 .PHONY: build test verify-core verify-mlx-rl verify-release app cli bench clean clean-all ml-tool \
-	app-ml ios-ml generate-arachne-assets verify-arachne-assets \
+	app-ml ios-ml verify-arachne-assets \
 	verify-arachne-policy verify-policy-evidence verify-panda-provenance \
 	verify-h1-provenance verify-architecture
 
@@ -240,25 +240,18 @@ app-ml: verify-policy-evidence
 # Compile the reusable MLX runtime for a physical iOS device. Xcode must have
 # the matching iOS platform installed; no signing is required for this library.
 ios-ml:
-	xcodebuild -scheme AVBDLearn -configuration Release \
+	xcodebuild -scheme MLXRL -configuration Release \
 	  -destination 'generic/platform=iOS' -derivedDataPath .xcbuild-ios \
 	  -clonedSourcePackagesDirPath .xcbuild/SourcePackages \
 	  -disableAutomaticPackageResolution \
 	  -onlyUsePackageVersionsFromResolvedFile build -quiet
 
-# Rewrite the tracked MJCF files from their generator, then validate both the
-# robot-tree and SwiftPM-resource versions against packaged visual meshes.
-# Rebuilding CAD explicitly installs refreshed visual meshes first.
-generate-arachne-assets:
-	Robots/Arachne15/scripts/build_sim.sh
-
-# Read-only CI guard: fail when generated MJCF is stale, a required packaged
-# mesh is missing, or the structural/mass/articulation contract is violated.
-# It does not depend on ignored Robots/*/build output, so it works in a clone.
+# Read-only CI guard for the imported runtime snapshot. The CAD, hardware,
+# generator, and device-qualification project is intentionally external.
 verify-arachne-assets:
-	python3 Robots/Arachne15/sim/generate_model.py --check
-	python3 Robots/Arachne15/sim/validate_model.py
-	python3 Robots/Arachne15/analysis/reveal_pose.py --check
+	python3 Tools/verify_arachne15_assets.py
+	PYTHONPYCACHEPREFIX=/tmp/avbd-arachne-pycache \
+	  python3 -m unittest Tools.tests.test_verify_arachne15_assets
 
 # Verify the cleanly sourced Panda plant, first-party pusher and explicitly
 # attributed ManiSkill Push-T task boundary.
