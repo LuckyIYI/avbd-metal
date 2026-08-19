@@ -12,7 +12,8 @@ research playground built on top of it.
 |---|---|
 | **AVBD** (Giles, Diaz, Yuksel, SIGGRAPH 2025) | Core solver: per-color 6×6 LDLᵀ block primal, bounded AL duals, penalty ramping, α-stabilization, γ warm-start |
 | **VBD** (Chen et al., SIGGRAPH 2024) | Block-descent structure the GPU loop follows; trust-region step caps |
-| **[OGC](https://graphics.cs.utah.edu/research/projects/ogc/)** (Chen et al., SIGGRAPH 2025) | Contact model alignment (face blocks ⊥, radial boundaries) + the penetration-free machinery: 2-ring-excluded conservative bounds, Eq-28 warmstart truncation, counter-driven in-loop bound refresh (indirect dispatch, no CPU sync), divergent cloth-cloth log barrier |
+| **[OGC](https://graphics.cs.utah.edu/research/projects/ogc/)** (Chen et al., SIGGRAPH 2025) | Deformable contact-force model alignment (face blocks ⊥, radial boundaries), persistence, and divergent cloth-cloth log barrier; its isotropic conservative bound remains available as the legacy truncation mode |
+| **[Divide and Truncate / Planar-DAT](https://arxiv.org/abs/2604.15513)** (Chen et al., 2026) | Default direction-aware displacement truncation for deformable-surface V–T/E–E pairs, applied after forward initialization and every VBD color; OGC remains the contact-force model. Rigid curved-trajectory DAT, animated-DoF truncation, and explicit tet-inversion planes are not implemented |
 | **Stable Neo-Hookean** (Smith et al. 2018) | Tet FEM material with per-vertex SPD Hessian |
 | **Bergou et al. 2006** | Quadratic bending; hinge K derived numerically from the intrinsic unfolded shape |
 | **IPC / Codimensional IPC** (Li et al.) | Lagged friction formulation; contact-radius framing |

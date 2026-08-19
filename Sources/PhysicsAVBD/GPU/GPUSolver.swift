@@ -15,6 +15,14 @@ import SimCore
 //   5. n iterations of: per-color primal solve (6x6 LDL) + dual update
 //   6. BDF1 velocity finalize
 public final class GPUSolver {
+    /// Collision-safe displacement limiter for deformable surface V-T/E-E
+    /// motion. Planar-DAT is the production default; isotropicDAT remains an
+    /// exact in-process A/B and compatibility path.
+    public enum SurfaceTruncationMode: UInt32, Sendable {
+        case isotropicDAT = 1
+        case planarDAT = 2
+    }
+
     private static let jointMotorModeMask: UInt32 = 3 << 4
     private static let jointMotorModeImplicitPositionPD: UInt32 = 1 << 4
     private static let jointMotorModeExplicitTorquePD: UInt32 = 2 << 4
@@ -39,10 +47,23 @@ public final class GPUSolver {
     let numTris: Int
     public let tetBoundaryTris: [(Int, Int, Int)]
     var numEdges: Int = 0
+    var numPlanarDATEdges: Int = 0
     var numParticles: Int = 0
     let maxSoft: Int
     let softMapCapacity: Int
+    let maxIsotropicSoft: Int
+    let isotropicSoftMapCapacity: Int
     let elemHashSize: Int
+    let maxPlanarDATPairs: Int
+    var isotropicElemCellSize: Float = 1
+    var planarDATElemCellSize: Float = 1
+
+    public var surfaceTruncationMode: SurfaceTruncationMode = .planarDAT
+
+    enum PlanarDATPassSite: Equatable {
+        case predictor
+        case color(iteration: Int, color: Int)
+    }
 
     var params = SimParamsGPU()
 
@@ -124,6 +145,11 @@ public final class GPUSolver {
     var vtTrackBuf, eeTrackBuf, triAdjBuf: MTLBuffer
     var clothVertFlag: MTLBuffer
     var boundsBuf, ogcPrevBuf, ogcArgsBuf: MTLBuffer
+    // Full compact V-T/E-E safety neighborhood used by Planar-DAT. Contact
+    // emission consumes the same stream, so safety and force generation
+    // cannot silently disagree about which nearby primitives exist.
+    var planarDATPairsBuf, planarDATPairCountsBuf: MTLBuffer
+    var planarDATTBuf, planarDATArgsBuf: MTLBuffer
     var nbr2Start, nbr2Count, nbr2List: MTLBuffer
     var vertEdgeStart, vertEdgeCount, vertEdgeList: MTLBuffer
     public private(set) var surfaceTriCount: Int = 0
@@ -180,6 +206,16 @@ public final class GPUSolver {
         "color_scan",
         "color_scatter",
         "color_validate",
+        "dat_apply",
+        "dat_build_ee_pairs",
+        "dat_build_vt_pairs",
+        "dat_clear_element_grid",
+        "dat_clear_pair_counts",
+        "dat_emit_contacts",
+        "dat_finalize_pairs",
+        "dat_reanchor",
+        "dat_reduce",
+        "dat_restore_failed_surface",
         "diag_clear",
         "diag_error",
         "dual_all",
@@ -219,6 +255,10 @@ public final class GPUSolver {
     public private(set) var lastPairCandidates: Int = 0
     public private(set) var lastNumSoft: Int = 0
     public private(set) var lastSoftCandidates: Int = 0
+    public private(set) var lastPlanarDATPairs: Int = 0
+    public private(set) var lastPlanarDATVertexTrianglePairs: Int = 0
+    public private(set) var lastPlanarDATEdgeEdgePairs: Int = 0
+    public private(set) var lastPlanarDATTruncations: Int = 0
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
@@ -276,11 +316,9 @@ public final class GPUSolver {
         self.rigidMeshVertexCount = scene.rigidMeshes.reduce(0) {
             $0 + 3 * $1.triangles.count
         }
-        // Structural append bound: each collision-surface vertex retains at
-        // most four V-T candidates, each triangle four rigid-T candidates,
-        // and each authored cloth edge four E-E candidates. Derive the
-        // actual surface and unique edge counts instead of relying on the old
-        // 10*tri heuristic, which under-allocated disconnected/open meshes.
+        // Derive the actual surface and unique edge counts instead of relying
+        // on the old triangle heuristic, which under-allocated disconnected
+        // and open meshes.
         let collisionTriangles = scene.tris.map(\.ids) + tetBoundaryTris
         var surfaceParticles = Set<Int>()
         for (a, b, c) in collisionTriangles {
@@ -289,16 +327,39 @@ public final class GPUSolver {
             if scene.bodies[c].isParticle { surfaceParticles.insert(c) }
         }
         var contactEdges = Set<UInt64>()
-        for tri in scene.tris {
-            let (a, b, c) = tri.ids
+        for (a, b, c) in collisionTriangles {
             for (u, v) in [(a, b), (b, c), (a, c)] {
                 contactEdges.insert(UInt64(min(u, v)) << 32
                     | UInt64(max(u, v)))
             }
         }
-        self.maxSoft = max(1, 4 * surfaceParticles.count
-            + 4 * numTris + 4 * contactEdges.count)
+        var isotropicContactEdges = Set<UInt64>()
+        for tri in scene.tris {
+            let (a, b, c) = tri.ids
+            for (u, v) in [(a, b), (b, c), (a, c)] {
+                isotropicContactEdges.insert(UInt64(min(u, v)) << 32
+                    | UInt64(max(u, v)))
+            }
+        }
+        let planarPairCapacity = max(
+            1,
+            AVBD_PLANAR_DAT_PAIRS_PER_PARTICLE * surfaceParticles.count
+                + AVBD_PLANAR_DAT_PAIRS_PER_EDGE * contactEdges.count)
+        self.maxPlanarDATPairs = planarPairCapacity
+        // Full contact emission is no longer capped at four per owner. Keep a
+        // generous linear operational budget while the independent raw count
+        // remains exact and terminal on overflow; sizing this to the much
+        // larger complete safety-pair capacity would waste hundreds of MB on
+        // folds.
+        let planarContactBudget = min(
+            planarPairCapacity,
+            8 * surfaceParticles.count + 8 * contactEdges.count)
+        self.maxSoft = max(1, 4 * numTris + planarContactBudget)
         self.softMapCapacity = Self.nextPow2(max(64, 2 * maxSoft))
+        self.maxIsotropicSoft = max(1, 4 * surfaceParticles.count
+            + 4 * numTris + 4 * isotropicContactEdges.count)
+        self.isotropicSoftMapCapacity = Self.nextPow2(
+            max(64, 2 * maxIsotropicSoft))
         self.elemHashSize = Self.nextPow2(max(64, 2 * 4 * numTris))
 
         func makeBuf(_ length: Int, _ label: String) throws -> MTLBuffer {
@@ -356,6 +417,14 @@ public final class GPUSolver {
         boundsBuf = try makeBuf(nb * 4, "ogcBounds")
         ogcPrevBuf = try makeBuf(nb * 16, "ogcPrev")
         ogcArgsBuf = try makeBuf(3 * 4, "ogcArgs")
+        planarDATPairsBuf = try makeBuf(
+            maxPlanarDATPairs * 16, "planarDATPairs")
+        planarDATPairCountsBuf = try makeBuf(3 * 4, "planarDATPairCounts")
+        planarDATTBuf = try makeBuf(nb * 4, "planarDATT")
+        planarDATTBuf.contents().bindMemory(
+            to: UInt32.self, capacity: nb
+        ).initialize(repeating: Float(1).bitPattern, count: nb)
+        planarDATArgsBuf = try makeBuf(3 * 4, "planarDATArgs")
         // 2-ring CSR sized after derivation below (~19/vertex upper bound)
         nbr2Start = try makeBuf(nb * 4, "nbr2Start")
         nbr2Count = try makeBuf(nb * 4, "nbr2Count")
@@ -387,9 +456,11 @@ public final class GPUSolver {
         nbrList = try makeBuf(max(1, numTris * 6) * 4, "nbrList")
         elemCellCount = try makeBuf(elemHashSize * 4, "elemCellCount")
         elemCellStart = try makeBuf(elemHashSize * 4, "elemCellStart")
-        // AABB multi-cell: cover loops are clamped to 3x3x3 per element,
-        // so 27x capacity makes overflow impossible
-        elemCells = try makeBuf(max(1, 27 * (numTris + maxEdges)) * 4, "elemCells")
+        // AABB multi-cell: Planar-DAT permits a 4x4x4 cover (the isotropic
+        // path retains its legacy 3x3x3 logical span), so 64x capacity makes
+        // every healthy scatter exact.
+        elemCells = try makeBuf(max(1, 64 * (numTris + maxEdges)) * 4,
+                                "elemCells")
         elemSlot = try makeBuf(elemHashSize * 4, "elemCursor")
         softContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "softContacts")
         prevSoftContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "prevSoftContacts")
@@ -497,6 +568,45 @@ public final class GPUSolver {
         case staticColorCapacity(body: Int, required: Int, capacity: Int)
         case unresolvedColoring(frame: Int, conflictingBodies: Int)
 
+        // Planar-DAT host validation failures use the pre-existing extensible
+        // commandExecution payload rather than adding enum cases. That keeps
+        // exhaustive switches over RuntimeFailure source-compatible while the
+        // domain/code pair remains machine-readable.
+        static let planarDATFailureDomain = "PhysicsAVBD.PlanarDAT"
+        static let planarDATPairCapacityCode = 1
+        static let planarDATElementGridSpanCode = 2
+        static let planarDATInvalidAnchorCode = 3
+
+        public static func planarDATPairCapacity(
+            frame: Int, required: Int, capacity: Int
+        ) -> Self {
+            .commandExecution(
+                operation: "Planar-DAT safety validation", frame: frame,
+                status: 0, domain: planarDATFailureDomain,
+                code: planarDATPairCapacityCode,
+                message: "Planar-DAT safety-pair demand \(required) exceeds capacity \(capacity)")
+        }
+
+        public static func planarDATElementGridSpan(
+            frame: Int, offendingElements: Int
+        ) -> Self {
+            .commandExecution(
+                operation: "Planar-DAT safety validation", frame: frame,
+                status: 0, domain: planarDATFailureDomain,
+                code: planarDATElementGridSpanCode,
+                message: "\(offendingElements) Planar-DAT element AABBs exceeded the supported 4x4x4 grid span")
+        }
+
+        public static func planarDATInvalidAnchor(
+            frame: Int, offendingPairs: Int
+        ) -> Self {
+            .commandExecution(
+                operation: "Planar-DAT safety validation", frame: frame,
+                status: 0, domain: planarDATFailureDomain,
+                code: planarDATInvalidAnchorCode,
+                message: "\(offendingPairs) Planar-DAT pairs had a coincident or non-finite collision anchor")
+        }
+
         public var errorDescription: String? {
             switch self {
             case .commandBufferCreation(let operation, let frame):
@@ -505,6 +615,9 @@ public final class GPUSolver {
                 return "\(operation) frame \(frame): encoder creation failed at \(stage)"
             case .commandExecution(let operation, let frame, let status,
                                    let domain, let code, let message):
+                if domain == Self.planarDATFailureDomain {
+                    return "physics frame \(frame): \(message)"
+                }
                 let detail = domain.isEmpty ? message
                     : "\(domain) \(code): \(message)"
                 return "\(operation) frame \(frame): Metal status \(status) (\(detail))"
@@ -1065,7 +1178,7 @@ public final class GPUSolver {
         var topoEdgeSet = UInt64UniqueBuilder(capacity: collTris.count * 3)
         var topoEdgeKeys: [UInt64] = []
         topoEdgeKeys.reserveCapacity(collTris.count * 3)
-        var contactEdgeSet = UInt64UniqueBuilder(capacity: scene.tris.count * 3)
+        var contactEdgeSet = UInt64UniqueBuilder(capacity: collTris.count * 3)
         var contactEdgeKeys: [UInt64] = []
         contactEdgeKeys.reserveCapacity(scene.tris.count * 3)
         var maxElemR: Float = 0
@@ -1090,9 +1203,19 @@ public final class GPUSolver {
             maxElemR = max(maxElemR, max(distance(m, pa), max(distance(m, pb),
                                                                               distance(m, pc))) + thick)
         }
+        // Preserve authored cloth edges as the force-model prefix, then append
+        // synthesized tet-boundary edges for Planar-DAT safety only. V-T alone
+        // cannot detect every triangle-triangle crossing: an edge-edge event
+        // can occur with no vertex entering the opposing triangle. Keeping
+        // `numEdges` at the authored count also preserves the established
+        // contract that closed tet solids do not acquire cloth E-E forces.
         numEdges = contactEdgeKeys.count
+        for key in topoEdgeKeys where contactEdgeSet.insert(key) {
+            contactEdgeKeys.append(key)
+        }
+        numPlanarDATEdges = contactEdgeKeys.count
         let ep2 = edgesBuf.contents().bindMemory(to: SIMD2<UInt32>.self,
-                                                 capacity: max(1, numEdges))
+                                                 capacity: max(1, numPlanarDATEdges))
         var nbrArrays = [[UInt32]](repeating: [], count: numBodies)
         var vertEdges: [[UInt32]] = Array(repeating: [], count: numBodies)
         for key in topoEdgeKeys {
@@ -1387,18 +1510,32 @@ public final class GPUSolver {
         }
         let meanEdge = topoEdgeKeys.isEmpty ? 0.2 : edgeLenSum / Float(topoEdgeKeys.count)
         params.elemMargin = min(0.01, max(0.002, 0.5 * maxPartR))
+        // Planar-DAT queries a wider safety neighborhood than the active
+        // OGC force band. Anything beyond this radius is protected by the
+        // unconditional 0.5*gamma*rq accumulated-displacement cap.
+        let forceReach = 2 * maxPartR + params.elemMargin
+        params.planarDATQueryRadius = max(1.5 * forceReach,
+                                          0.75 * meanEdge)
+        params.planarDATRelaxation = 0.85
+        params.maxPlanarDATPairs = UInt32(maxPlanarDATPairs)
         // Detection-radius cells (AABB multi-cell insertion): reach must
         // cover skin + margin + velocity inflation (<= 0.3 cell, hence /0.7).
         // The broadphase bins fat element AABBs and clamps cover loops to
         // 3 cells/axis, so the cell also has to cover the largest element
         // radius plus collision padding.
         let reach = (2 * maxPartR + params.elemMargin) / 0.7
-        params.elemCellSize = max(0.02, max(max(reach, meanEdge * 1.05),
-                                            maxElemR + maxPartR
-                                                + params.elemMargin))
+        isotropicElemCellSize = max(
+            0.02, max(max(reach, meanEdge * 1.05),
+                      maxElemR + maxPartR + params.elemMargin))
+        params.surfaceContactCellSize = isotropicElemCellSize
+        planarDATElemCellSize = max(
+            0.02, max(max(reach, meanEdge * 1.05),
+                      2 * maxElemR + params.planarDATQueryRadius))
+        params.elemCellSize = planarDATElemCellSize
         params.elemHashSize = UInt32(elemHashSize)
         params.numTris = UInt32(numTris)
-        params.numEdges = UInt32(numEdges)
+        params.numEdges = UInt32(numPlanarDATEdges)
+        params.numSurfaceContactEdges = UInt32(numEdges)
         params.numParticles = UInt32(numParticles)
         params.maxSoft = UInt32(maxSoft)
         params.softMapCapacity = UInt32(softMapCapacity)
@@ -1832,6 +1969,22 @@ public final class GPUSolver {
         params.collisionMargin = max(settings.collisionMargin, 0)
         params.rigidLinearDamping = max(settings.rigidLinearDamping, 0)
         params.rigidAngularDamping = max(settings.rigidAngularDamping, 0)
+        params.surfaceTruncationMode = numParticles > 0
+            ? surfaceTruncationMode.rawValue : 0
+        params.maxPlanarDATPairs = UInt32(max(0, min(
+            maxPlanarDATPairs,
+            planarDATPairCapacityForTesting ?? maxPlanarDATPairs)))
+        params.numEdges = UInt32(surfaceTruncationMode == .planarDAT
+            ? numPlanarDATEdges : numEdges)
+        params.elemCellSize = surfaceTruncationMode == .planarDAT
+            ? planarDATElemCellSize : isotropicElemCellSize
+        let selectedSoftCapacity = surfaceTruncationMode == .planarDAT
+            ? maxSoft : maxIsotropicSoft
+        params.maxSoft = UInt32(max(
+            0, min(selectedSoftCapacity,
+                   planarDATSoftCapacityForTesting ?? selectedSoftCapacity)))
+        params.softMapCapacity = UInt32(surfaceTruncationMode == .planarDAT
+            ? softMapCapacity : isotropicSoftMapCapacity)
 
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
            let v = Float(env) {
@@ -1912,6 +2065,8 @@ public final class GPUSolver {
         let counterSnapshot: MTLBuffer
         let frame: Int
         let usesDynamicColoring: Bool
+        let softCapacity: Int
+        let planarDATCapacity: Int
     }
     private var inflight: [StepSubmission] = []
     private let statsLock = NSLock()
@@ -1932,6 +2087,9 @@ public final class GPUSolver {
     // between submissions is safe even if an older command is still in flight.
     var commandBufferFactoryForTesting: (() -> MTLCommandBuffer?)?
     var deniedEncoderStageForTesting: String?
+    var planarDATPairCapacityForTesting: Int?
+    var planarDATSoftCapacityForTesting: Int?
+    var planarDATPassObserverForTesting: ((PlanarDATPassSite) -> Void)?
     var completionFailureForTesting: ((String, Int) -> RuntimeFailure?)?
     var inflightCountForTesting: Int { inflight.count }
 
@@ -2506,12 +2664,24 @@ public final class GPUSolver {
         let pairs = Int(ctr[GPUCounters.pairs])
         let soft = Int(ctr[GPUCounters.soft])
         let colorConflicts = Int(ctr[GPUCounters.colorConflicts])
+        let planarDATPairs = Int(ctr[GPUCounters.planarDATPairs])
+        let planarDATVT = Int(ctr[GPUCounters.planarDATVertexTrianglePairs])
+        let planarDATEE = Int(ctr[GPUCounters.planarDATEdgeEdgePairs])
+        let planarDATGridOverflows = Int(
+            ctr[GPUCounters.planarDATGridOverflows])
+        let planarDATInvalidAnchors = Int(
+            ctr[GPUCounters.planarDATInvalidAnchors])
+        let planarDATTruncations = Int(ctr[GPUCounters.planarDATTruncations])
 
         statsLock.lock()
         lastPairCandidates = pairCandidates
         lastNumPairs = pairs
         lastSoftCandidates = softCandidates
         lastNumSoft = soft
+        lastPlanarDATPairs = planarDATPairs
+        lastPlanarDATVertexTrianglePairs = planarDATVT
+        lastPlanarDATEdgeEdgePairs = planarDATEE
+        lastPlanarDATTruncations = planarDATTruncations
         if submission.usesDynamicColoring {
             var counts = [Int]()
             counts.reserveCapacity(AVBD_MAX_COLORS)
@@ -2531,10 +2701,25 @@ public final class GPUSolver {
                 frame: submission.frame, required: pairCandidates,
                 capacity: maxPairs))
         }
-        if softCandidates > maxSoft {
+        if softCandidates > submission.softCapacity {
             throw latch(.softContactCapacity(
                 frame: submission.frame, required: softCandidates,
-                capacity: maxSoft))
+                capacity: submission.softCapacity))
+        }
+        if planarDATPairs > submission.planarDATCapacity {
+            throw latch(.planarDATPairCapacity(
+                frame: submission.frame, required: planarDATPairs,
+                capacity: submission.planarDATCapacity))
+        }
+        if planarDATGridOverflows > 0 {
+            throw latch(.planarDATElementGridSpan(
+                frame: submission.frame,
+                offendingElements: planarDATGridOverflows))
+        }
+        if planarDATInvalidAnchors > 0 {
+            throw latch(.planarDATInvalidAnchor(
+                frame: submission.frame,
+                offendingPairs: planarDATInvalidAnchors))
         }
         if colorConflicts > 0 {
             throw latch(.unresolvedColoring(
@@ -2827,6 +3012,209 @@ public final class GPUSolver {
         }
         var P = params
         var nExcl = numExclusions
+        let isPlanarDAT = P.surfaceTruncationMode
+            == SurfaceTruncationMode.planarDAT.rawValue
+
+        func encodeElementGrid(_ encoder: MTLComputeCommandEncoder,
+                               clearFirst: Bool) {
+            if clearFirst {
+                dispatch1D(encoder, "dat_clear_element_grid", elemHashSize) { e in
+                    e.setBuffer(self.elemCellCount, offset: 0, index: 0)
+                    e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                               index: 1)
+                }
+            }
+            dispatch1D(encoder, "el_count", numTris + Int(P.numEdges)) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.trisBuf, offset: 0, index: 1)
+                e.setBuffer(self.edgesBuf, offset: 0, index: 2)
+                e.setBuffer(self.shape, offset: 0, index: 3)
+                e.setBuffer(self.elemCellCount, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 5)
+                e.setBuffer(self.counters, offset: 0, index: 6)
+            }
+            encodeScan(encoder, input: elemCellCount,
+                       output: elemCellStart, count: elemHashSize)
+            var hashSize = UInt32(elemHashSize)
+            dispatch1D(encoder, "adj_copy_cursor", elemHashSize) { e in
+                e.setBuffer(self.elemCellStart, offset: 0, index: 0)
+                e.setBuffer(self.elemSlot, offset: 0, index: 1)
+                e.setBytes(&hashSize, length: 4, index: 2)
+            }
+            dispatch1D(encoder, "el_scatter", numTris + Int(P.numEdges)) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.trisBuf, offset: 0, index: 1)
+                e.setBuffer(self.edgesBuf, offset: 0, index: 2)
+                e.setBuffer(self.shape, offset: 0, index: 3)
+                e.setBuffer(self.elemSlot, offset: 0, index: 4)
+                e.setBuffer(self.elemCells, offset: 0, index: 5)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 6)
+            }
+        }
+
+        func encodePlanarPairBuild(_ encoder: MTLComputeCommandEncoder) {
+            dispatch1D(encoder, "dat_clear_pair_counts", 3) { e in
+                e.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 0)
+            }
+            if numParticles > 0
+                && ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
+                encoder.setComputePipelineState(ps("dat_build_vt_pairs"))
+                encoder.setBuffer(self.posLin, offset: 0, index: 0)
+                encoder.setBuffer(self.particleIdxBuf, offset: 0, index: 1)
+                encoder.setBuffer(self.trisBuf, offset: 0, index: 2)
+                encoder.setBuffer(self.elemCellStart, offset: 0, index: 3)
+                encoder.setBuffer(self.elemCellCount, offset: 0, index: 4)
+                encoder.setBuffer(self.elemCells, offset: 0, index: 5)
+                // Newton's default topology threshold: one-edge-ring
+                // primitives are excluded once, then the exact same retained
+                // pair set feeds OGC forces and Planar-DAT.
+                encoder.setBuffer(self.nbrStart, offset: 0, index: 6)
+                encoder.setBuffer(self.nbrCount, offset: 0, index: 7)
+                encoder.setBuffer(self.nbrList, offset: 0, index: 8)
+                encoder.setBuffer(self.shape, offset: 0, index: 9)
+                encoder.setBuffer(self.clothGroupBuf, offset: 0, index: 10)
+                encoder.setBuffer(self.clothVertFlag, offset: 0, index: 11)
+                encoder.setBuffer(self.planarDATPairsBuf, offset: 0, index: 12)
+                encoder.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 13)
+                encoder.setBuffer(self.counters, offset: 0, index: 14)
+                encoder.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                                 index: 15)
+                encoder.setBuffer(self.edgesBuf, offset: 0, index: 19)
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: numParticles, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                                   depth: 1))
+            }
+            if P.numEdges > 0
+                && ProcessInfo.processInfo.environment["AVBD_NO_EE"] == nil {
+                encoder.setComputePipelineState(ps("dat_build_ee_pairs"))
+                encoder.setBuffer(self.posLin, offset: 0, index: 0)
+                encoder.setBuffer(self.edgesBuf, offset: 0, index: 1)
+                encoder.setBuffer(self.trisBuf, offset: 0, index: 2)
+                encoder.setBuffer(self.elemCellStart, offset: 0, index: 3)
+                encoder.setBuffer(self.elemCellCount, offset: 0, index: 4)
+                encoder.setBuffer(self.elemCells, offset: 0, index: 5)
+                encoder.setBuffer(self.nbrStart, offset: 0, index: 6)
+                encoder.setBuffer(self.nbrCount, offset: 0, index: 7)
+                encoder.setBuffer(self.nbrList, offset: 0, index: 8)
+                encoder.setBuffer(self.shape, offset: 0, index: 9)
+                encoder.setBuffer(self.clothGroupBuf, offset: 0, index: 10)
+                encoder.setBuffer(self.clothVertFlag, offset: 0, index: 11)
+                encoder.setBuffer(self.planarDATPairsBuf, offset: 0, index: 12)
+                encoder.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 13)
+                encoder.setBuffer(self.counters, offset: 0, index: 14)
+                encoder.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                                 index: 15)
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: Int(P.numEdges), height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                                   depth: 1))
+            }
+            dispatch1D(encoder, "dat_finalize_pairs", 1) { e in
+                e.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 0)
+                e.setBuffer(self.counters, offset: 0, index: 1)
+                e.setBuffer(self.planarDATArgsBuf, offset: 0, index: 2)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 3)
+            }
+        }
+
+        func encodePlanarContacts(_ encoder: MTLComputeCommandEncoder,
+                                  pairs: MTLBuffer,
+                                  pairCounts: MTLBuffer,
+                                  positions: MTLBuffer,
+                                  referencePositions: MTLBuffer) {
+            let contactPSO = ps("dat_emit_contacts")
+            encoder.setComputePipelineState(contactPSO)
+            encoder.setBuffer(pairs, offset: 0, index: 0)
+            encoder.setBuffer(positions, offset: 0, index: 1)
+            encoder.setBuffer(shape, offset: 0, index: 2)
+            encoder.setBuffer(props, offset: 0, index: 3)
+            encoder.setBuffer(velLin, offset: 0, index: 4)
+            encoder.setBuffer(trisBuf, offset: 0, index: 5)
+            encoder.setBuffer(edgesBuf, offset: 0, index: 6)
+            encoder.setBuffer(softContacts, offset: 0, index: 7)
+            encoder.setBuffer(counters, offset: 0, index: 8)
+            encoder.setBuffer(prevSoftContacts, offset: 0, index: 9)
+            encoder.setBuffer(softMapKeyA, offset: 0, index: 10)
+            encoder.setBuffer(softMapKeyB, offset: 0, index: 11)
+            encoder.setBuffer(softMapVal, offset: 0, index: 12)
+            encoder.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                             index: 13)
+            encoder.setBuffer(pairCounts, offset: 0, index: 14)
+            // initLin deliberately stores only coordinates (w == 0). Keep
+            // dynamic mass classification bound to the authoritative state.
+            encoder.setBuffer(posLin, offset: 0, index: 15)
+            // Contacts are detected at the accepted predictor pose but the
+            // solver linearizes from initLin. The kernel reconstructs C0 from
+            // these exact step-start coordinates rather than double-counting
+            // predictor displacement.
+            encoder.setBuffer(referencePositions, offset: 0, index: 16)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: planarDATArgsBuf,
+                indirectBufferOffset: 0,
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                               depth: 1))
+        }
+
+        func encodeSoftContactMap(_ encoder: MTLComputeCommandEncoder) {
+            dispatch1D(encoder, "soft_finalize", 1) { e in
+                e.setBuffer(self.counters, offset: 0, index: 0)
+                e.setBuffer(self.dispatchArgs, offset: 0, index: 1)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 2)
+            }
+            var clearCapacity = UInt32(self.softMapCapacity)
+            dispatch1D(encoder, "softmap_clear", self.softMapCapacity) { e in
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 1)
+                e.setBytes(&clearCapacity, length: 4, index: 2)
+            }
+            dispatch1D(encoder, "softmap_insert", Int(P.maxSoft)) { e in
+                e.setBuffer(self.softContacts, offset: 0, index: 0)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 1)
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 2)
+                e.setBuffer(self.softMapVal, offset: 0, index: 3)
+                e.setBuffer(self.counters, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 5)
+            }
+        }
+
+        func encodePlanarPass(_ encoder: MTLComputeCommandEncoder,
+                              pairs: MTLBuffer,
+                              pairCounts: MTLBuffer) {
+            let reducePSO = ps("dat_reduce")
+            encoder.setComputePipelineState(reducePSO)
+            encoder.setBuffer(pairs, offset: 0, index: 0)
+            encoder.setBuffer(posLin, offset: 0, index: 1)
+            encoder.setBuffer(ogcPrevBuf, offset: 0, index: 2)
+            encoder.setBuffer(trisBuf, offset: 0, index: 3)
+            encoder.setBuffer(edgesBuf, offset: 0, index: 4)
+            encoder.setBuffer(planarDATTBuf, offset: 0, index: 5)
+            encoder.setBuffer(pairCounts, offset: 0, index: 6)
+            encoder.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                             index: 7)
+            encoder.setBuffer(counters, offset: 0, index: 8)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: planarDATArgsBuf,
+                indirectBufferOffset: 0,
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                               depth: 1))
+            dispatch1D(encoder, "dat_apply", numParticles) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.ogcPrevBuf, offset: 0, index: 1)
+                e.setBuffer(self.particleIdxBuf, offset: 0, index: 2)
+                e.setBuffer(self.planarDATTBuf, offset: 0, index: 3)
+                e.setBuffer(pairCounts, offset: 0, index: 4)
+                e.setBuffer(self.counters, offset: 0, index: 5)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 6)
+            }
+        }
 
         // Broadphase
         if profiling { try stage("bp-count") }
@@ -2961,36 +3349,14 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
         }
 
-        // ---- Cloth element contacts: bin triangles into the element grid,
-        // emit V-T and rigid-feature-T records (warm-started from the soft
-        // persistence map), then rebuild the map for next frame. Runs at
-        // start-of-step poses like the rigid narrowphase.
+            // ---- Soft contacts. Planar-DAT replaces the legacy best-four
+            // VT/EE trackers with exact endpoint queries; rigid-triangle
+            // records remain on their existing start-pose path. The accepted
+            // Planar stream is emitted after predictor acceptance below.
         if numTris > 0 {
+            if !isPlanarDAT {
             try stage("el-bin")
-            dispatch1D(enc, "el_count", numTris + Int(P.numEdges)) { e in
-                e.setBuffer(self.posLin, offset: 0, index: 0)
-                e.setBuffer(self.trisBuf, offset: 0, index: 1)
-                e.setBuffer(self.edgesBuf, offset: 0, index: 2)
-                e.setBuffer(self.shape, offset: 0, index: 3)
-                e.setBuffer(self.elemCellCount, offset: 0, index: 4)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
-            }
-            encodeScan(enc, input: elemCellCount, output: elemCellStart, count: elemHashSize)
-            var ehs = UInt32(elemHashSize)
-            dispatch1D(enc, "adj_copy_cursor", elemHashSize) { e in
-                e.setBuffer(self.elemCellStart, offset: 0, index: 0)
-                e.setBuffer(self.elemSlot, offset: 0, index: 1)
-                e.setBytes(&ehs, length: 4, index: 2)
-            }
-            dispatch1D(enc, "el_scatter", numTris + Int(P.numEdges)) { e in
-                e.setBuffer(self.posLin, offset: 0, index: 0)
-                e.setBuffer(self.trisBuf, offset: 0, index: 1)
-                e.setBuffer(self.edgesBuf, offset: 0, index: 2)
-                e.setBuffer(self.shape, offset: 0, index: 3)
-                e.setBuffer(self.elemSlot, offset: 0, index: 4)
-                e.setBuffer(self.elemCells, offset: 0, index: 5)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 6)
-            }
+            encodeElementGrid(enc, clearFirst: false)
             try stage("vt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
             dispatch1D(enc, "vt_emit", numParticles) { e in
@@ -3025,7 +3391,7 @@ public final class GPUSolver {
             }
             try stage("ee-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_EE"] == nil {
-            dispatch1D(enc, "ee_emit", numEdges) { e in
+            dispatch1D(enc, "ee_emit", Int(P.numEdges)) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.shape, offset: 0, index: 1)
                 e.setBuffer(self.props, offset: 0, index: 2)
@@ -3056,6 +3422,13 @@ public final class GPUSolver {
                 e.setBuffer(self.clothVertFlag, offset: 0, index: 27)
             }
             }
+            }
+            else {
+                try stage("el-bin")
+                encodeElementGrid(enc, clearFirst: false)
+                try stage("dat-pairs")
+                encodePlanarPairBuild(enc)
+            }
             try stage("rt-emit")
             if ProcessInfo.processInfo.environment["AVBD_NO_RT"] == nil {
             dispatch1D(enc, "rt_emit", numTris) { e in
@@ -3082,23 +3455,9 @@ public final class GPUSolver {
                 e.setBuffer(self.hashedRigidIdx, offset: 0, index: 20)
             }
             }
-            try stage("softmap")
-            dispatch1D(enc, "soft_finalize", 1) { e in
-                e.setBuffer(self.counters, offset: 0, index: 0)
-                e.setBuffer(self.dispatchArgs, offset: 0, index: 1)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 2)
-            }
-            dispatch1D(enc, "softmap_clear", softMapCapacity) { e in
-                e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 1)
-            }
-            dispatch1D(enc, "softmap_insert", maxSoft) { e in
-                e.setBuffer(self.softContacts, offset: 0, index: 0)
-                e.setBuffer(self.softMapKeyA, offset: 0, index: 1)
-                e.setBuffer(self.softMapKeyB, offset: 0, index: 2)
-                e.setBuffer(self.softMapVal, offset: 0, index: 3)
-                e.setBuffer(self.counters, offset: 0, index: 4)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
+            if !isPlanarDAT {
+                try stage("softmap")
+                encodeSoftContactMap(enc)
             }
         }
 
@@ -3126,10 +3485,46 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 9)
             e.setBuffer(self.ogcPrevBuf, offset: 0, index: 10)
             e.setBuffer(self.boundsBuf, offset: 0, index: 11)
-            var doOgc: UInt32 = self.numTris > 0 ? 1 : 0
-            e.setBytes(&doOgc, length: 4, index: 12)
+            var truncationMode = P.surfaceTruncationMode
+            e.setBytes(&truncationMode, length: 4, index: 12)
             e.setBuffer(self.shape, offset: 0, index: 13)
             e.setBuffer(self.gravityScale, offset: 0, index: 14)
+        }
+
+        if isPlanarDAT {
+            // Start from the exact rq neighborhood. Since the predictor caps
+            // each side to R=0.5*gamma*rq, a pair outside this query cannot
+            // close its positive gap before the accepted-pose query below.
+            try stage("dat-predict")
+            let predictorSite = PlanarDATPassSite.predictor
+            planarDATPassObserverForTesting?(predictorSite)
+            encodePlanarPass(enc, pairs: planarDATPairsBuf,
+                             pairCounts: planarDATPairCountsBuf)
+
+            // Newton's two-detection schedule: rebuild at the accepted
+            // predictor pose, then use this exact rq set for OGC forces and
+            // every per-color DAT pass. Clearing these working counts does
+            // not clear the sticky peak/failure counters, so an overflow in
+            // either query remains terminal and restores the failed frame.
+            try stage("dat-accepted-grid")
+            encodeElementGrid(enc, clearFirst: true)
+            try stage("dat-accepted-pairs")
+            encodePlanarPairBuild(enc)
+            try stage("vt-ee-emit")
+            encodePlanarContacts(
+                enc, pairs: planarDATPairsBuf,
+                pairCounts: planarDATPairCountsBuf,
+                positions: posLin, referencePositions: initLin)
+            try stage("softmap")
+            encodeSoftContactMap(enc)
+            try stage("dat-reanchor")
+            dispatch1D(enc, "dat_reanchor", numParticles) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.particleIdxBuf, offset: 0, index: 1)
+                e.setBuffer(self.ogcPrevBuf, offset: 0, index: 2)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 3)
+            }
         }
 
         try stage("adjacency")
@@ -3273,7 +3668,7 @@ public final class GPUSolver {
         let persistentRequested = ProcessInfo.processInfo.environment[
             "AVBD_PERSIST"] != nil
             && ProcessInfo.processInfo.environment["AVBD_NO_PERSIST"] == nil
-        if multiOK && numBodies <= 4096 {
+        if multiOK && !isPlanarDAT && numBodies <= 4096 {
             let tgW = min(256, multiPSO.maxTotalThreadsPerThreadgroup)
             var ntg = UInt32(min(8, max(1, (numBodies + tgW - 1) / tgW + 1)))
             enc.setComputePipelineState(multiPSO)
@@ -3305,7 +3700,7 @@ public final class GPUSolver {
             enc.setBuffer(counters, offset: 0, index: 28)
             enc.dispatchThreadgroups(MTLSize(width: Int(ntg), height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
-        } else if persistentRequested
+        } else if persistentRequested && !isPlanarDAT
                     && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
             // small scene: the whole solve loop in ONE dispatch — hundreds
             // of per-dispatch launch/barrier latencies become threadgroup
@@ -3429,6 +3824,33 @@ public final class GPUSolver {
                         MTLSize(width: (splitSizes[c] + 63) / 64, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
                 }
+                if isPlanarDAT {
+                    // A VBD color is a Gauss-Seidel iteration in DAT's
+                    // terminology: later colors must never observe a trial
+                    // pose that already crossed one of the fixed division
+                    // planes. Reduce and apply immediately after every color.
+                    let passSite = PlanarDATPassSite.color(
+                        iteration: it, color: c)
+                    planarDATPassObserverForTesting?(passSite)
+                    encodePlanarPass(
+                        enc, pairs: planarDATPairsBuf,
+                        pairCounts: planarDATPairCountsBuf)
+                    if c + 1 < colorBound {
+                        // DAT reuses the low slots through index 8. Restore
+                        // every overwritten primal binding before the next
+                        // color; the higher bindings and cIdx stay intact.
+                        enc.setComputePipelineState(primalPSO)
+                        enc.setBuffer(posLin, offset: 0, index: 0)
+                        enc.setBuffer(posAng, offset: 0, index: 1)
+                        enc.setBuffer(initLin, offset: 0, index: 2)
+                        enc.setBuffer(initAng, offset: 0, index: 3)
+                        enc.setBuffer(inertLin, offset: 0, index: 4)
+                        enc.setBuffer(inertAng, offset: 0, index: 5)
+                        enc.setBuffer(props, offset: 0, index: 6)
+                        enc.setBuffer(joints, offset: 0, index: 7)
+                        enc.setBuffer(springs, offset: 0, index: 8)
+                    }
+                }
             }
             if profiling { try stage("solve-dual") }
             dispatchIndirect(enc, "dual_all", argsOffset: 6) { e in
@@ -3447,7 +3869,8 @@ public final class GPUSolver {
             // turns the exceed counter into indirect dispatch args, so the
             // refresh runs ONLY in iterations where >1% of particles were
             // bound-limited — settled scenes pay an empty dispatch
-            if numParticles > 0 && it + 1 < settings.iterations {
+            if !isPlanarDAT && numParticles > 0
+                && it + 1 < settings.iterations {
                 dispatch1D(enc, "ogc_refresh_args", 1) { e in
                     e.setBuffer(self.counters, offset: 0, index: 0)
                     e.setBuffer(self.ogcArgsBuf, offset: 0, index: 1)
@@ -3478,6 +3901,16 @@ public final class GPUSolver {
 
         }
         try stage("finalize")
+        if isPlanarDAT {
+            dispatch1D(enc, "dat_restore_failed_surface", numParticles) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.initLin, offset: 0, index: 1)
+                e.setBuffer(self.particleIdxBuf, offset: 0, index: 2)
+                e.setBuffer(self.counters, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
+            }
+        }
         dispatch1D(enc, "finalize_velocities", numBodies) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.posAng, offset: 0, index: 1)
@@ -3555,7 +3988,9 @@ public final class GPUSolver {
         let submission = StepSubmission(
             commandBuffer: cmd1, counterSnapshot: counterSnapshot,
             frame: submittedFrame,
-            usesDynamicColoring: usesDynamicColoring)
+            usesDynamicColoring: usesDynamicColoring,
+            softCapacity: Int(P.maxSoft),
+            planarDATCapacity: Int(P.maxPlanarDATPairs))
         cmd1.commit()
 
         // Buffer identity is a submitted-frame contract even if retirement

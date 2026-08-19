@@ -382,8 +382,10 @@ final class GPUSolverTests: XCTestCase {
         }
         let solver = try makeGPU(scene)
 
-        // 4*150 surface vertices + 4*50 triangles + 4*150 unique edges.
-        XCTAssertEqual(solver.maxSoft, 1_400)
+        // Full Planar emission budgets 8 records per surface vertex/edge,
+        // plus four rigid-triangle records per triangle. Raw demand is still
+        // checked exactly and fails terminally rather than clipping silently.
+        XCTAssertEqual(solver.maxSoft, 2_600)
     }
 
     func testShadersCompile() throws {

@@ -8,7 +8,9 @@ using namespace metal;
 // the full AVBD treatment downstream: persistent warm-started lambda/penalty,
 // bounded duals scaled to participant masses, graph-coloring conflicts across
 // the whole stencil, and the block-descent primal.
-// Runs at start-of-step poses, before body prediction (like np_collide).
+// Legacy isotropic V-T/E-E and rigid-T detection run at step start. The
+// Planar-DAT V-T/E-E stream is rebuilt at the accepted predictor pose in
+// 27_planar_dat.metal, then feeds the same downstream contact machinery.
 // ============================================================================
 
 #define VT_MAX_PER_VERTEX 4u
@@ -99,9 +101,10 @@ inline int softMapFind(device const atomic_uint* keyAs,
 kernel void softmap_clear(
     device atomic_uint* keyAs       [[buffer(0)]],
     constant SimParams& P           [[buffer(1)]],
+    constant uint& clearCapacity    [[buffer(2)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    if (gid < P.softMapCapacity)
+    if (gid < clearCapacity)
         atomic_store_explicit(&keyAs[gid], 0u, memory_order_relaxed);
 }
 
@@ -137,8 +140,9 @@ kernel void softmap_insert(
 // overlaps, at a DETECTION-radius cell size (coarse centroid cells made
 // every query scan most of the sheet at high resolution: ~1000 candidate
 // tests per vertex; AABB multi-cell brings it to ~10-30). Cover loops are
-// clamped to 3x3x3 — the cell size is chosen at init so elements span at
-// most ~2 cells per axis with stretch headroom.
+// Isotropic-DAT retains its exact legacy 3x3x3 cover. Planar-DAT permits a
+// 4x4x4 cover as fail-closed floating-point boundary headroom without
+// coarsening every hash bucket.
 // ----------------------------------------------------------------------------
 inline void elemBounds(device const float4* posLin,
                        device const float4* shape,
@@ -150,15 +154,26 @@ inline void elemBounds(device const float4* posLin,
     if (gid < P.numTris) {
         uint4 t = tris[gid];
         float3 a = posLin[t.x].xyz, b = posLin[t.y].xyz, c = posLin[t.z].xyz;
-        float pad = max(fabs(shape[t.x].w),
-                        max(fabs(shape[t.y].w), fabs(shape[t.z].w)))
-                  + P.elemMargin;
+        float contactPad = max(fabs(shape[t.x].w),
+                               max(fabs(shape[t.y].w), fabs(shape[t.z].w)))
+                         + P.elemMargin;
+        // Planar-DAT performs an exact rq query both before and after forward
+        // initialization. The global per-particle displacement cap makes the
+        // first query safe; the second query becomes the fixed color-solve
+        // neighborhood.
+        float pad = P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+            ? P.planarDATQueryRadius
+            : contactPad;
         lo = min(min(a, b), c) - float3(pad);
         hi = max(max(a, b), c) + float3(pad);
     } else {
         uint2 e = edges[gid - P.numTris];
         float3 a = posLin[e.x].xyz, b = posLin[e.y].xyz;
-        float pad = max(fabs(shape[e.x].w), fabs(shape[e.y].w)) + P.elemMargin;
+        float contactPad = max(fabs(shape[e.x].w), fabs(shape[e.y].w))
+                         + P.elemMargin;
+        float pad = P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+            ? P.planarDATQueryRadius
+            : contactPad;
         lo = min(a, b) - float3(pad);
         hi = max(a, b) + float3(pad);
     }
@@ -171,18 +186,39 @@ kernel void el_count(
     device const float4* shape      [[buffer(3)]],
     device atomic_uint* cellCount   [[buffer(4)]],
     constant SimParams& P           [[buffer(5)]],
+    device atomic_uint* counters    [[buffer(6)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint total = P.numTris + P.numEdges;
     if (gid >= total) return;
     float3 lo, hi;
     elemBounds(posLin, shape, tris, edges, P, gid, lo, hi);
+    if (P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        && (!finite3(lo) || !finite3(hi))) {
+        atomic_fetch_add_explicit(&counters[CTR_DAT_INVALID_ANCHOR], 1u,
+                                  memory_order_relaxed);
+        return;
+    }
     int3 c0 = cellCoord(lo, P.elemCellSize);
-    int3 c1 = min(cellCoord(hi, P.elemCellSize), c0 + 2);
+    int3 rawC1 = cellCoord(hi, P.elemCellSize);
+    int maxSpan = P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        ? 3 : 2;
+    if (P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        && any(rawC1 - c0 > int3(maxSpan))) {
+        atomic_fetch_add_explicit(&counters[CTR_DAT_GRID_OVERFLOW], 1u,
+                                  memory_order_relaxed);
+    }
+    int3 c1 = min(rawC1, c0 + maxSpan);
+    uint seen[64];
+    uint seenCount = 0u;
     for (int z = c0.z; z <= c1.z; z++)
     for (int y = c0.y; y <= c1.y; y++)
     for (int x = c0.x; x <= c1.x; x++) {
         uint h = cellHash(int3(x, y, z), P.elemHashSize);
+        bool duplicate = false;
+        for (uint i = 0u; i < seenCount; ++i) duplicate = duplicate || seen[i] == h;
+        if (duplicate) continue;
+        seen[seenCount++] = h;
         atomic_fetch_add_explicit(&cellCount[h], 1u, memory_order_relaxed);
     }
 }
@@ -201,13 +237,23 @@ kernel void el_scatter(
     if (gid >= total) return;
     float3 lo, hi;
     elemBounds(posLin, shape, tris, edges, P, gid, lo, hi);
+    if (P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        && (!finite3(lo) || !finite3(hi))) return;
     uint entry = gid < P.numTris ? gid : (ELEM_EDGE_BIT | (gid - P.numTris));
     int3 c0 = cellCoord(lo, P.elemCellSize);
-    int3 c1 = min(cellCoord(hi, P.elemCellSize), c0 + 2);
+    int maxSpan = P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        ? 3 : 2;
+    int3 c1 = min(cellCoord(hi, P.elemCellSize), c0 + maxSpan);
+    uint seen[64];
+    uint seenCount = 0u;
     for (int z = c0.z; z <= c1.z; z++)
     for (int y = c0.y; y <= c1.y; y++)
     for (int x = c0.x; x <= c1.x; x++) {
         uint h = cellHash(int3(x, y, z), P.elemHashSize);
+        bool duplicate = false;
+        for (uint i = 0u; i < seenCount; ++i) duplicate = duplicate || seen[i] == h;
+        if (duplicate) continue;
+        seen[seenCount++] = h;
         uint slot = atomic_fetch_add_explicit(&cellCursor[h], 1u, memory_order_relaxed);
         cellElems[slot] = entry;
     }
@@ -498,7 +544,8 @@ kernel void vt_emit(
                        max(fabs(shape[tid.y].w), fabs(shape[tid.z].w)));
         float hSum = rv + rt;
         float3 velT = (velLin[tid.x].xyz + velLin[tid.y].xyz + velLin[tid.z].xyz) / 3.0f;
-        float inflate = min(length(velV - velT) * P.dt, 0.3f * P.elemCellSize);
+        float inflate = min(length(velV - velT) * P.dt,
+                            0.3f * P.surfaceContactCellSize);
         float detect = hSum + P.elemMargin + inflate;
         if (dist2 > detect * detect) continue;
         float dist = sqrt(dist2);
@@ -753,7 +800,8 @@ kernel void ee_emit(
         float rB = max(fabs(shape[eB.x].w), fabs(shape[eB.y].w));
         float hSum = rA + rB;
         float3 velB = (velLin[eB.x].xyz + velLin[eB.y].xyz) * 0.5f;
-        float inflate = min(length(velA - velB) * P.dt, 0.3f * P.elemCellSize);
+        float inflate = min(length(velA - velB) * P.dt,
+                            0.3f * P.surfaceContactCellSize);
         if (dist - hSum > P.elemMargin + inflate) continue;
         if (dist < 1e-7f) continue;             // degenerate: let V-T handle
 
