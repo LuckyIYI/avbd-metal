@@ -998,9 +998,19 @@ final class RLFrameworkTests: XCTestCase {
         }
         try requirePackagedMLXMetalLibrary()
 
+        let unpinnedCandidate = try UnitreeH1RecurrentPolicy(
+            directory: policyDirectory)
+        XCTAssertEqual(unpinnedCandidate.trust, .unverifiedCandidate)
+        let identity = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "unitree-h1-sim2sim-v0")?
+            .unitreeH1ReleaseIdentity)
         let session = try UnitreeH1Sim2SimSession(
             policyDirectory: policyDirectory,
-            command: SIMD3<Float>(0.5, 0, 0))
+            command: SIMD3<Float>(0.5, 0, 0),
+            expectedReleaseIdentity: identity)
+        XCTAssertEqual(session.policy.trust, .knownReleaseVerified)
+        XCTAssertEqual(
+            session.policy.manifestSHA256, identity.manifestSHA256)
         XCTAssertEqual(session.policy.manifest.schemaVersion, 2)
         XCTAssertEqual(
             session.policy.manifest.source.url,
@@ -1070,6 +1080,53 @@ final class RLFrameworkTests: XCTestCase {
                 }
                 XCTAssertTrue(message.contains("SHA-256"), message)
             }
+        }
+    }
+
+    func testExternalUnitreeH1KnownReleaseRejectsSelfConsistentManifestSwap()
+        throws
+    {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceManifest = repository.appendingPathComponent(
+            "checkpoints/external/unitree-h1/manifest.json")
+        guard FileManager.default.fileExists(atPath: sourceManifest.path) else {
+            throw XCTSkip("external Unitree H1 manifest is not installed")
+        }
+        let copy = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "unitree-h1-self-consistent-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: copy, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: copy) }
+
+        var manifest = try XCTUnwrap(
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: sourceManifest)) as? [String: Any])
+        var claimedSource = try XCTUnwrap(
+            manifest["source"] as? [String: Any])
+        // The old loader trusted this candidate-provided identity and had no
+        // independent way to distinguish the replacement manifest.
+        claimedSource["checkpointSHA256"] = String(repeating: "a", count: 64)
+        manifest["source"] = claimedSource
+        let replacement = try JSONSerialization.data(
+            withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+        try replacement.write(
+            to: copy.appendingPathComponent("manifest.json"), options: .atomic)
+
+        let identity = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "unitree-h1-sim2sim-v0")?
+            .unitreeH1ReleaseIdentity)
+        XCTAssertThrowsError(try UnitreeH1RecurrentPolicy(
+            directory: copy.path,
+            expectedReleaseIdentity: identity)) { error in
+            XCTAssertTrue(
+                String(describing: error).contains(
+                    "manifest bytes do not match the known release"),
+                String(describing: error))
         }
     }
 
@@ -4759,7 +4816,9 @@ final class RLFrameworkTests: XCTestCase {
             bundleDirectory: bundle.path,
             expectedTask: "humanoid-isaac-flat-v0",
             expectedTaskRevision: 2_000_011,
-            expectedCheckpointFingerprint: expectedFingerprint)
+            expectedCheckpointFingerprint: expectedFingerprint,
+            expectedDeploymentManifestSHA256:
+                "cb04233bd11bcc8dc3e0d2e1f0d6cc2e1ec27d4318344c7ea021d8b117be5d59")
         XCTAssertEqual(deployment.observationDimension, 69)
         XCTAssertEqual(deployment.actionDimension, 19)
         XCTAssertEqual(deployment.controlPeriodSeconds, 0.02, accuracy: 1e-8)
@@ -4781,6 +4840,12 @@ final class RLFrameworkTests: XCTestCase {
             checkpointDirectory: bundle.path)
         let observation = try task.reset(seed: 51_001)
         let mapped = try runner.actions(for: observation, task: task)
+        let authenticatedProvider: any RLActionProvider = deployment
+        let authenticatedMapped = try authenticatedProvider.actions(
+            for: observation, task: task)
+        XCTAssertEqual(
+            authenticatedMapped.values, mapped.values,
+            "qualified replay must use the already-authenticated deployment actor")
         let first = try runner.actions(for: observation.policy)
         let repeated = try runner.actions(for: observation.policy)
         XCTAssertEqual(first.count, 4 * 19)
@@ -4823,13 +4888,17 @@ final class RLFrameworkTests: XCTestCase {
                 selection: "arachne15-velocity-v1",
                 task: "arachne15-velocity-v0",
                 fingerprint:
-                    "97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5"
+                    "97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5",
+                deploymentSHA256:
+                    "7295cf74dc9576a8b2bce74eeae0beb2932af96c5ff0617b0b99b82796b5039c"
             ),
             (
                 selection: "arachne15-goal-v1",
                 task: "arachne15-goal-v0",
                 fingerprint:
-                    "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02"
+                    "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02",
+                deploymentSHA256:
+                    "e7d747a41b3f724940bbe42d92dc38de8798dafbc7d39909e4ad1cf10ae1e127"
             ),
         ]
         let observation = ContiguousArray((0..<60).map {
@@ -4848,7 +4917,9 @@ final class RLFrameworkTests: XCTestCase {
                 expectedTask: policy.task,
                 expectedTaskRevision:
                     Arachne15LocomotionTask.currentTaskRevision,
-                expectedCheckpointFingerprint: policy.fingerprint)
+                expectedCheckpointFingerprint: policy.fingerprint,
+                expectedDeploymentManifestSHA256:
+                    policy.deploymentSHA256)
             XCTAssertEqual(runtime.observationDimension, 60)
             XCTAssertEqual(runtime.actionDimension, 16)
             XCTAssertEqual(

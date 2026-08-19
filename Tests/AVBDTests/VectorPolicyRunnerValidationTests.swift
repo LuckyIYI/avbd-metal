@@ -235,6 +235,42 @@ final class VectorPolicyRunnerValidationTests: XCTestCase {
         }
     }
 
+    func testDeploymentRuntimeRejectsSemanticallyValidButUncommissionedManifestBytes()
+        throws
+    {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = packageRoot.appendingPathComponent(
+            "checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json")
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw XCTSkip("accepted H1 deployment manifest is not installed")
+        }
+        let directory = try temporaryDirectory("deployment-manifest-bytes")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var bytes = try Data(contentsOf: source)
+        // JSON whitespace preserves every decoded claim but changes the exact
+        // commissioned artifact. Rejection must happen before model loading.
+        bytes.append(0x0a)
+        try bytes.write(to: directory.appendingPathComponent(
+            VectorPolicyDeploymentBundle.manifestFileName))
+        let entry = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "humanoid-isaac-flat-v2"))
+
+        XCTAssertThrowsError(try VectorPolicyDeploymentRuntime(
+            bundleDirectory: directory.path,
+            expectedTask: entry.taskID,
+            expectedTaskRevision: entry.expectedTaskRevision,
+            expectedCheckpointFingerprint:
+                entry.expectedCheckpointFingerprint,
+            expectedDeploymentManifestSHA256:
+                entry.expectedDeploymentManifestSHA256)) { error in
+            XCTAssertTrue(String(describing: error).contains(
+                "manifest bytes do not match the commissioned policy"))
+        }
+    }
+
     func testExportUsesRunnerMetadataContract() throws {
         let root = try temporaryDirectory("deployment-metadata-contract")
         defer { try? FileManager.default.removeItem(at: root) }

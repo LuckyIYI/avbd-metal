@@ -42,13 +42,26 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
         bundleDirectory: String,
         expectedTask: String? = nil,
         expectedTaskRevision: Int? = nil,
-        expectedCheckpointFingerprint: String? = nil
+        expectedCheckpointFingerprint: String? = nil,
+        expectedDeploymentManifestSHA256: String? = nil
     ) throws {
         let root = URL(fileURLWithPath: bundleDirectory, isDirectory: true)
             .standardizedFileURL
         let manifestURL = root.appendingPathComponent(
             VectorPolicyDeploymentBundle.manifestFileName)
         let manifestData = try Data(contentsOf: manifestURL)
+        if let expectedDeploymentManifestSHA256 {
+            guard Self.isSHA256(expectedDeploymentManifestSHA256) else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "expected deployment manifest SHA-256 is invalid")
+            }
+            let manifestDigest = Self.sha256(manifestData)
+            guard manifestDigest
+                    == expectedDeploymentManifestSHA256.lowercased() else {
+                throw RLEnvironmentError.invalidConfiguration(
+                    "deployment manifest bytes do not match the commissioned policy")
+            }
+        }
         let decodedManifest = try JSONDecoder().decode(
             VectorPolicyDeploymentManifest.self, from: manifestData)
         guard decodedManifest.schemaVersion == 1 else {
@@ -94,9 +107,7 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
             VectorPolicyMetadata.self, from: metadataData)
         let decodedTrainingState = try JSONDecoder().decode(
             VectorPPOTrainingState.self, from: trainingStateData)
-        let digest = SHA256.hash(data: policyData).map {
-            String(format: "%02x", $0)
-        }.joined()
+        let digest = Self.sha256(policyData)
         guard digest == decodedManifest.policySHA256 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "deployment policy SHA-256 does not match its manifest")
@@ -179,6 +190,38 @@ public final class VectorPolicyDeploymentRuntime: VectorPolicyInferencing {
             throw RLEnvironmentError.invalidConfiguration(
                 "deployment control frequency is internally inconsistent")
         }
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy { $0.isHexDigit }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+/// Replay uses the same already-authenticated in-memory actor as the hardware
+/// deployment surface. No checkpoint path is reopened after construction.
+extension VectorPolicyDeploymentRuntime: RLActionProvider {
+    public var actionProviderID: String {
+        "mlx-deployment-" + checkpointFingerprint.prefix(12)
+    }
+
+    public func actions(
+        for observation: RLObservationBatch,
+        task: any VectorizedRLTask
+    ) throws -> RLActionBatch {
+        try observation.validate(for: task.spec)
+        let mismatches = metadata.compatibilityMismatches(with: task.spec)
+        guard mismatches.isEmpty else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "deployment/task mismatch: \(mismatches.joined(separator: "; "))")
+        }
+        let actions = try runner.actions(for: observation, task: task)
+        try actions.validate(for: task.spec)
+        return actions
     }
 }
 

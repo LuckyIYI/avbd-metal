@@ -1728,13 +1728,19 @@ case "eval-arachne-classical":
 case "sim2sim-h1":
     let o = parseOptions(Array(args.dropFirst(1)))
     let policyDirectory = o.checkpoint ?? "checkpoints/external/unitree-h1"
+    let expectedReleaseIdentity = o.checkpoint == nil
+        ? PolicyReplayCatalog.entry(
+            selectionID: "unitree-h1-sim2sim-v0")?
+            .unitreeH1ReleaseIdentity
+        : nil
     let command = SIMD3<Float>(
         o.taskOptions["forward"] ?? 0.5,
         o.taskOptions["lateral"] ?? 0,
         o.taskOptions["yaw"] ?? 0)
     let session = try UnitreeH1Sim2SimSession(
         policyDirectory: policyDirectory, command: command,
-        solverIterations: o.iterations)
+        solverIterations: o.iterations,
+        expectedReleaseIdentity: expectedReleaseIdentity)
     let report = try session.run(controlSteps: o.frames) { step, state in
         if args.contains("--trace") {
             func values(_ input: some Collection<Float>) -> String {
@@ -1788,13 +1794,19 @@ case "sim2sim-h1":
                 ? String(format: "FELL at %.2fs",
                          report.firstFallTimeSeconds ?? .nan)
                 : "STABLE"))
+        let verificationLabel = session.policy.trust == .knownReleaseVerified
+            ? "anchored TorchScript->MLX parity"
+            : "candidate-recorded golden self-check · provenance UNVERIFIED"
         print(String(format:
-            "TorchScript->MLX max errors: action %.3g  hidden %.3g  cell %.3g  %@",
+            "%@ max errors: action %.3g  hidden %.3g  cell %.3g  %@",
+            verificationLabel,
             report.policyVerification.maximumActionError,
             report.policyVerification.maximumHiddenStateError,
             report.policyVerification.maximumCellStateError,
             report.policyVerification.passed ? "PASS" : "FAIL"))
-        print("source sha256 \(report.checkpointSHA256)")
+        print("executing weights sha256 \(session.policy.manifest.weightsSHA256)")
+        print("manifest-claimed upstream source sha256 "
+            + report.checkpointSHA256)
     }
     if !report.finite || !report.policyVerification.passed { exit(2) }
 

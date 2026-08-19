@@ -31,6 +31,57 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             ["/live/latest", "/bundled"])
     }
 
+    func testQualifiedCatalogIdentityNeverTransfersToOverridesOrLiveSources()
+        throws
+    {
+        let entry = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "humanoid-isaac-flat-v2"))
+        let explicit = PolicyReplayCheckpointResolution.sources(
+            explicit: "/operator/checkpoint", live: "/live/latest",
+            bundled: "/App/Resources/checkpoints/h1",
+            repository: "checkpoints/h1", entry: entry)
+        XCTAssertEqual(explicit, [.init(
+            directory: "/operator/checkpoint", origin: .explicitOverride,
+            trust: .unverifiedOperatorOverride)])
+
+        let automatic = PolicyReplayCheckpointResolution.sources(
+            explicit: nil, live: "/live/latest",
+            bundled: "/App/Resources/checkpoints/h1",
+            repository: "checkpoints/h1", entry: entry)
+        XCTAssertEqual(automatic.map(\.origin), [
+            .liveRun, .applicationBundle, .repository,
+        ])
+        XCTAssertEqual(automatic.map(\.trust), [
+            .developmentCheckpoint, .qualifiedPackagedNative,
+            .developmentCheckpoint,
+        ])
+        XCTAssertEqual(
+            automatic.filter { $0.trust == .qualifiedPackagedNative }
+                .map(\.origin),
+            [.applicationBundle])
+    }
+
+    func testUnitreeVerifiedIdentityIsBundleOnlyAndExplicitIsUnverified()
+        throws
+    {
+        let entry = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "unitree-h1-sim2sim-v0"))
+        XCTAssertEqual(
+            PolicyReplayCheckpointResolution.sources(
+                explicit: "/operator/unitree", live: nil,
+                bundled: "/App/Resources/checkpoints/unitree",
+                repository: "checkpoints/external/unitree-h1",
+                entry: entry).map(\.trust),
+            [.unverifiedOperatorOverride])
+        XCTAssertEqual(
+            PolicyReplayCheckpointResolution.sources(
+                explicit: nil, live: nil,
+                bundled: "/App/Resources/checkpoints/unitree",
+                repository: "checkpoints/external/unitree-h1",
+                entry: entry).map(\.trust),
+            [.verifiedPackagedExternal, .developmentCheckpoint])
+    }
+
     func testMetadataRejectsSameShapeWrongTaskAndPhysicsContract() {
         let spec = RLTaskSpec(
             id: "destination-v0", revision: 4, numEnvironments: 1,
@@ -98,14 +149,29 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
             "checkpoints/humanoid-isaac-flat-v2/qualification/aggregate.json")
         XCTAssertEqual(acceptedH1.deploymentManifestRelativePath,
             "checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json")
+        XCTAssertEqual(acceptedH1.expectedTaskRevision, 2_000_011)
+        XCTAssertEqual(
+            acceptedH1.expectedCheckpointFingerprint,
+            "00bc782d1845ddde94282b46f0d7fa2732feeb4a8e52215a5abe62128bccc756")
+        XCTAssertEqual(
+            acceptedH1.expectedDeploymentManifestSHA256,
+            "cb04233bd11bcc8dc3e0d2e1f0d6cc2e1ec27d4318344c7ea021d8b117be5d59")
         let acceptedArachne = [
             (
                 selection: "arachne15-velocity-v1",
-                task: "arachne15-velocity-v0"
+                task: "arachne15-velocity-v0",
+                fingerprint:
+                    "97f79641c8b7acf87c903b9d6baf739a5dc3c2536e52cb0e44121260133d79d5",
+                deploymentSHA256:
+                    "7295cf74dc9576a8b2bce74eeae0beb2932af96c5ff0617b0b99b82796b5039c"
             ),
             (
                 selection: "arachne15-goal-v1",
-                task: "arachne15-goal-v0"
+                task: "arachne15-goal-v0",
+                fingerprint:
+                    "923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02",
+                deploymentSHA256:
+                    "e7d747a41b3f724940bbe42d92dc38de8798dafbc7d39909e4ad1cf10ae1e127"
             ),
         ]
         for policy in acceptedArachne {
@@ -121,7 +187,35 @@ final class VectorPolicyCompatibilityTests: XCTestCase {
                 "checkpoints/\(policy.selection)/qualification/nominal/aggregate.json")
             XCTAssertEqual(entry.deploymentManifestRelativePath,
                 "checkpoints/\(policy.selection)/deployment-manifest.json")
+            XCTAssertEqual(entry.expectedTaskRevision, 2_000_006)
+            XCTAssertEqual(
+                entry.expectedCheckpointFingerprint, policy.fingerprint)
+            XCTAssertEqual(
+                entry.expectedDeploymentManifestSHA256,
+                policy.deploymentSHA256)
         }
+        let unitree = try XCTUnwrap(PolicyReplayCatalog.entry(
+            selectionID: "unitree-h1-sim2sim-v0"))
+        let unitreeIdentity = try XCTUnwrap(
+            unitree.unitreeH1ReleaseIdentity)
+        XCTAssertEqual(
+            unitreeIdentity.manifestSHA256,
+            "9f434828cf2b2ede587bced686a22d30c3df6b048e631e94641bafeb7a45d117")
+        XCTAssertEqual(
+            unitreeIdentity.sourceRevision,
+            "276801e46c5d433564f24658bac64f254b7d2d4b")
+        XCTAssertEqual(
+            unitreeIdentity.sourceCheckpointSHA256,
+            "44a0fbceb81f3877833ae9a398d039bea1759cb0d3c8188181013885f70589eb")
+        XCTAssertEqual(
+            unitreeIdentity.weightsSHA256,
+            "cb51db3e4ccbecc0d9a863173640f8cb8b5a5fb821bc1db9024c7957297ff4ee")
+        XCTAssertEqual(
+            unitreeIdentity.licenseSHA256,
+            "98335465f43a20b5850e4651db6e74c4aa1e9fc8e8813d38f345178045c0da50")
+        XCTAssertEqual(
+            unitreeIdentity.goldenSequenceSHA256,
+            "705e5d5bad46f696b4617ea440cfda1b4ff51b9504d949c5384e5d73cc14015b")
         XCTAssertFalse(selectionIDs.contains("humanoid-isaac-flat-v1"))
         XCTAssertEqual(
             PolicyReplayCatalog.historicalEntry(

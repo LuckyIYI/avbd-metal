@@ -76,12 +76,23 @@ public struct UnitreeH1PolicyVerification: Sendable {
     }
 }
 
+public enum UnitreeH1PolicyTrust: String, Codable, Sendable, Equatable {
+    /// Exact manifest bytes and every independently pinned release identity
+    /// match the code/catalog trust anchor supplied by the caller.
+    case knownReleaseVerified
+    /// Golden vectors may still provide a useful candidate self-check, but
+    /// they came from the same unanchored manifest and prove no provenance.
+    case unverifiedCandidate
+}
+
 /// MLX implementation of Unitree's exported `PolicyExporterLSTM` graph.
 ///
 /// Torch is needed only by the explicit import tool. Runtime replay loads a
 /// small, architecture-checked safetensors file and executes entirely in MLX.
 public final class UnitreeH1RecurrentPolicy {
     public let manifest: UnitreeH1PolicyManifest
+    public let manifestSHA256: String
+    public let trust: UnitreeH1PolicyTrust
 
     private let weightInputHidden: MLXArray
     private let weightHiddenHidden: MLXArray
@@ -95,15 +106,35 @@ public final class UnitreeH1RecurrentPolicy {
     private var cellState: MLXArray
     private var batchSize: Int
 
-    public init(directory: String, batchSize: Int = 1) throws {
+    public init(
+        directory: String, batchSize: Int = 1,
+        expectedReleaseIdentity: UnitreeH1ReleaseIdentity? = nil
+    ) throws {
         guard batchSize > 0 else {
             throw RLEnvironmentError.invalidConfiguration(
                 "Unitree H1 policy batch size must be positive")
         }
         let root = URL(fileURLWithPath: directory)
-        manifest = try JSONDecoder().decode(
-            UnitreeH1PolicyManifest.self,
-            from: Data(contentsOf: root.appendingPathComponent("manifest.json")))
+        let manifestData = try Data(contentsOf: root.appendingPathComponent(
+            "manifest.json"))
+        let actualManifestSHA256 = Self.sha256(manifestData)
+        if let expectedReleaseIdentity {
+            try Self.verifyDigest(
+                actual: actualManifestSHA256,
+                expected: expectedReleaseIdentity.manifestSHA256,
+                label: "Unitree H1 manifest")
+        }
+        let decodedManifest = try JSONDecoder().decode(
+            UnitreeH1PolicyManifest.self, from: manifestData)
+        if let expectedReleaseIdentity {
+            try Self.verifyKnownRelease(
+                manifest: decodedManifest, manifestData: manifestData,
+                expected: expectedReleaseIdentity)
+        }
+        manifest = decodedManifest
+        manifestSHA256 = actualManifestSHA256
+        trust = expectedReleaseIdentity == nil
+            ? .unverifiedCandidate : .knownReleaseVerified
         guard manifest.schemaVersion == 2,
               manifest.format == "avbd-unitree-h1-lstm-v1",
               manifest.robot == "unitree-h1",
@@ -122,14 +153,18 @@ public final class UnitreeH1RecurrentPolicy {
                 "unsupported Unitree H1 import manifest")
         }
         let weightsURL = root.appendingPathComponent(manifest.weightsFile)
+        let weightsData = try Data(contentsOf: weightsURL)
         try Self.verifySHA256(
-            url: weightsURL, expected: manifest.weightsSHA256,
+            data: weightsData, expected: manifest.weightsSHA256,
             label: "Unitree H1 converted policy")
         try Self.verifySHA256(
-            url: root.appendingPathComponent(manifest.source.licenseFile),
+            data: try Data(contentsOf: root.appendingPathComponent(
+                manifest.source.licenseFile)),
             expected: manifest.source.licenseSHA256,
             label: "Unitree H1 license")
-        let weights = try loadArrays(url: weightsURL)
+        // Execute the same immutable bytes authenticated immediately above;
+        // never reopen a mutable override directory between hash and parse.
+        let weights = try loadArrays(data: weightsData)
         func tensor(_ name: String, shape: [Int]) throws -> MLXArray {
             guard let value = weights[name], value.shape == shape else {
                 throw RLEnvironmentError.invalidConfiguration(
@@ -240,20 +275,67 @@ public final class UnitreeH1RecurrentPolicy {
     }
 
     private static func verifySHA256(
-        url: URL, expected: String, label: String
+        data: Data, expected: String, label: String
     ) throws {
         guard expected.count == 64,
               expected.allSatisfy({ $0.isHexDigit }) else {
             throw RLEnvironmentError.invalidConfiguration(
                 "\(label) manifest SHA-256 is invalid")
         }
-        let digest = SHA256.hash(data: try Data(contentsOf: url)).map {
-            String(format: "%02x", $0)
-        }.joined()
+        let digest = sha256(data)
         guard digest == expected.lowercased() else {
             throw RLEnvironmentError.invalidConfiguration(
                 "\(label) SHA-256 does not match its import manifest")
         }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func verifyDigest(
+        actual: String, expected: String, label: String
+    ) throws {
+        guard expected.count == 64,
+              expected.allSatisfy({ $0.isHexDigit }) else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "expected \(label) SHA-256 is invalid")
+        }
+        guard actual == expected.lowercased() else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "\(label) bytes do not match the known release")
+        }
+    }
+
+    private static func verifyKnownRelease(
+        manifest: UnitreeH1PolicyManifest, manifestData: Data,
+        expected: UnitreeH1ReleaseIdentity
+    ) throws {
+        guard manifest.source.revision == expected.sourceRevision,
+              manifest.source.checkpointSHA256.lowercased()
+                == expected.sourceCheckpointSHA256.lowercased(),
+              manifest.weightsSHA256.lowercased()
+                == expected.weightsSHA256.lowercased(),
+              manifest.source.licenseSHA256.lowercased()
+                == expected.licenseSHA256.lowercased() else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Unitree H1 source, weights, or license identity does not "
+                    + "match the known release")
+        }
+        let object = try JSONSerialization.jsonObject(with: manifestData)
+        guard let dictionary = object as? [String: Any],
+              let golden = dictionary["goldenSequence"] else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "Unitree H1 manifest has no golden sequence")
+        }
+        let canonicalGolden = try JSONSerialization.data(
+            withJSONObject: golden,
+            options: [.sortedKeys, .withoutEscapingSlashes])
+        try verifyDigest(
+            actual: sha256(canonicalGolden),
+            expected: expected.goldenSequenceSHA256,
+            label: "Unitree H1 golden sequence")
     }
 }
 
@@ -322,6 +404,8 @@ public struct UnitreeH1Sim2SimReport: Codable, Sendable {
     public var firstFallTimeSeconds: Float?
     public var fell: Bool
     public var finite: Bool
+    public var manifestSHA256: String?
+    public var policyTrust: UnitreeH1PolicyTrust?
     public var policyVerification: UnitreeH1PolicyVerificationRecord
 }
 
@@ -365,8 +449,11 @@ public final class UnitreeH1Sim2SimSession {
 
     public init(policyDirectory: String,
                 command: SIMD3<Float> = SIMD3(0.5, 0, 0),
-                solverIterations: Int? = nil) throws {
-        policy = try UnitreeH1RecurrentPolicy(directory: policyDirectory)
+                solverIterations: Int? = nil,
+                expectedReleaseIdentity: UnitreeH1ReleaseIdentity? = nil) throws {
+        policy = try UnitreeH1RecurrentPolicy(
+            directory: policyDirectory,
+            expectedReleaseIdentity: expectedReleaseIdentity)
         policyVerification = try policy.verifyGoldenSequence()
         guard policyVerification.passed else {
             throw RLEnvironmentError.invalidConfiguration(
@@ -464,6 +551,8 @@ public final class UnitreeH1Sim2SimSession {
             },
             fell: firstFallStep != nil,
             finite: allFinite,
+            manifestSHA256: policy.manifestSHA256,
+            policyTrust: policy.trust,
             policyVerification: .init(policyVerification))
     }
 }

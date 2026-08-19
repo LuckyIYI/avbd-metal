@@ -60,6 +60,9 @@ UNITREE_H1_SOURCE_REVISION = "276801e46c5d433564f24658bac64f254b7d2d4b"
 UNITREE_H1_SOURCE_CHECKPOINT_SHA256 = (
     "44a0fbceb81f3877833ae9a398d039bea1759cb0d3c8188181013885f70589eb"
 )
+UNITREE_H1_GOLDEN_SEQUENCE_SHA256 = (
+    "705e5d5bad46f696b4617ea440cfda1b4ff51b9504d949c5384e5d73cc14015b"
+)
 
 H1_REQUALIFIED_SELECTION = "humanoid-isaac-flat-v2"
 H1_TASK = "humanoid-isaac-flat-v0"
@@ -347,6 +350,15 @@ class CatalogEntry:
     qualification: str
     checkpoint_relative_directory: str
     evidence_relative_path: str
+    expected_task_revision: int | None = None
+    expected_checkpoint_fingerprint: str | None = None
+    expected_deployment_manifest_sha256: str | None = None
+    unitree_manifest_sha256: str | None = None
+    unitree_source_revision: str | None = None
+    unitree_source_checkpoint_sha256: str | None = None
+    unitree_weights_sha256: str | None = None
+    unitree_license_sha256: str | None = None
+    unitree_golden_sequence_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -669,6 +681,24 @@ def swift_string(expression: str, label: str) -> str | None:
         raise VerificationError(f"cannot decode {label}: {error}") from error
 
 
+def swift_int(expression: str, label: str) -> int:
+    compact = expression.replace("_", "").strip()
+    require(re.fullmatch(r"-?\d+", compact) is not None,
+            f"{label} must be a static Swift integer")
+    return int(compact)
+
+
+def swift_initializer_arguments(expression: str, label: str) -> str:
+    match = re.match(r"\s*\.init\s*\(", expression, re.DOTALL)
+    require(match is not None, f"{label} must be a literal .init(...)")
+    body = expression[match.end():].rstrip()
+    # argument_expression removes the outer entry's trailing parenthesis and,
+    # for a final nested initializer, may remove its adjacent close as well.
+    if body.endswith(")"):
+        body = body[:-1].rstrip()
+    return body
+
+
 def catalog_entries(root: Path) -> tuple[list[CatalogEntry], list[CatalogEntry]]:
     path = root / "Sources/MLXRL/PolicyReplayCatalog.swift"
     try:
@@ -730,21 +760,58 @@ def catalog_entries(root: Path) -> tuple[list[CatalogEntry], list[CatalogEntry]]
         runtime = argument_expression(block, "runtime")
         require(task_id is not None and checkpoint is not None and evidence is not None,
                 f"qualified selection {selection_id} must name task, checkpoint and evidence")
-        entry = CatalogEntry(
-            selection_id=selection_id,
-            task_id=task_id,
-            runtime=runtime,
-            qualification=qualification,
-            checkpoint_relative_directory=checkpoint,
-            evidence_relative_path=evidence,
-        )
         if qualification == ".accepted":
             require(runtime == ".nativeMLX",
                     f"accepted selection {selection_id} uses unsupported runtime {runtime}")
+            expected_revision = swift_int(
+                argument_expression(block, "expectedTaskRevision"),
+                f"{selection_id} expectedTaskRevision")
+            expected_fingerprint = swift_string(
+                argument_expression(block, "expectedCheckpointFingerprint"),
+                f"{selection_id} expectedCheckpointFingerprint")
+            expected_manifest = swift_string(
+                argument_expression(block,
+                                    "expectedDeploymentManifestSHA256"),
+                f"{selection_id} expectedDeploymentManifestSHA256")
+            require(expected_fingerprint is not None
+                    and SHA256_PATTERN.fullmatch(expected_fingerprint)
+                    and expected_manifest is not None
+                    and SHA256_PATTERN.fullmatch(expected_manifest),
+                    f"{selection_id}: accepted runtime identity is invalid")
+            entry = CatalogEntry(
+                selection_id=selection_id, task_id=task_id, runtime=runtime,
+                qualification=qualification,
+                checkpoint_relative_directory=checkpoint,
+                evidence_relative_path=evidence,
+                expected_task_revision=expected_revision,
+                expected_checkpoint_fingerprint=expected_fingerprint,
+                expected_deployment_manifest_sha256=expected_manifest)
             accepted.append(entry)
         else:
             require(runtime == ".unitreeRecurrentMLX",
                     f"external-parity selection {selection_id} uses unsupported runtime {runtime}")
+            identity = swift_initializer_arguments(
+                argument_expression(block, "unitreeH1ReleaseIdentity"),
+                f"{selection_id} unitreeH1ReleaseIdentity")
+            def identity_string(name: str) -> str:
+                value = swift_string(argument_expression(identity, name),
+                                     f"{selection_id} {name}")
+                require(value is not None,
+                        f"{selection_id}: {name} may not be nil")
+                return value
+            entry = CatalogEntry(
+                selection_id=selection_id, task_id=task_id, runtime=runtime,
+                qualification=qualification,
+                checkpoint_relative_directory=checkpoint,
+                evidence_relative_path=evidence,
+                unitree_manifest_sha256=identity_string("manifestSHA256"),
+                unitree_source_revision=identity_string("sourceRevision"),
+                unitree_source_checkpoint_sha256=identity_string(
+                    "sourceCheckpointSHA256"),
+                unitree_weights_sha256=identity_string("weightsSHA256"),
+                unitree_license_sha256=identity_string("licenseSHA256"),
+                unitree_golden_sequence_sha256=identity_string(
+                    "goldenSequenceSHA256"))
             external_parity.append(entry)
     require(bool(accepted) or bool(external_parity),
             "PolicyReplayCatalog contains no verified policy evidence")
@@ -773,6 +840,15 @@ def verify_external_parity(root: Path, entry: CatalogEntry) -> None:
             and entry.evidence_relative_path
             == "checkpoints/external/unitree-h1/manifest.json",
             "Unitree external parity entry changed its pinned bundle")
+    require(entry.unitree_manifest_sha256 == UNITREE_H1_MANIFEST_SHA256
+            and entry.unitree_source_revision == UNITREE_H1_SOURCE_REVISION
+            and entry.unitree_source_checkpoint_sha256
+                == UNITREE_H1_SOURCE_CHECKPOINT_SHA256
+            and entry.unitree_weights_sha256 == UNITREE_H1_WEIGHTS_SHA256
+            and entry.unitree_license_sha256 == UNITREE_H1_LICENSE_SHA256
+            and entry.unitree_golden_sequence_sha256
+                == UNITREE_H1_GOLDEN_SEQUENCE_SHA256,
+            "Unitree catalog runtime identity differs from the sealed release")
     directory = repository_path(
         root, f"checkpoints/{entry.checkpoint_relative_directory}",
         f"{entry.selection_id} checkpoint",
@@ -963,6 +1039,19 @@ def verify_checkpoint(root: Path, entry: CatalogEntry) -> CheckpointContext:
             and type(state.get("environmentSteps")) is int,
             f"{entry.selection_id}: checkpoint training state is incomplete")
     fingerprint = checkpoint_fingerprint(directory)
+    require(fingerprint == entry.expected_checkpoint_fingerprint,
+            f"{entry.selection_id}: runtime fingerprint anchor differs from "
+            "the sealed checkpoint")
+    deployment_path = directory / "deployment-manifest.json"
+    require(entry.expected_deployment_manifest_sha256 is not None
+            and deployment_path.is_file()
+            and sha256_file(deployment_path)
+                == entry.expected_deployment_manifest_sha256,
+            f"{entry.selection_id}: runtime deployment-manifest anchor "
+            "differs from the sealed bytes")
+    require(metadata.get("taskRevision") == entry.expected_task_revision,
+            f"{entry.selection_id}: runtime task-revision anchor differs "
+            "from checkpoint metadata")
     context = CheckpointContext(entry, directory, metadata, state, fingerprint)
     verify_deployment_manifest(context)
     return context
