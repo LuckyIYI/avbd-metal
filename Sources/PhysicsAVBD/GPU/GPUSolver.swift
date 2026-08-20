@@ -1462,10 +1462,10 @@ public final class GPUSolver {
                 parent[findCollisionRoot(c)] = r
             }
             // Thin shells self-collide by default. Volumetric bodies do not:
-            // they already have internal elasticity and inversion protection,
-            // and their dense boundary-vs-boundary stream is useful only for
-            // assets that explicitly author self-collision. Inter-component
-            // soft contact remains unconditional in the pair kernels.
+            // they already have internal elasticity, and their dense
+            // boundary-vs-boundary stream is useful only for assets that
+            // explicitly author self-collision. Inter-component soft contact
+            // remains unconditional in the pair kernels.
             var selfCollisionRoots = Set<Int>()
             for tri in scene.tris {
                 selfCollisionRoots.insert(findCollisionRoot(tri.ids.0))
@@ -3196,6 +3196,7 @@ public final class GPUSolver {
             dispatch1D(encoder, "dat_clear_pair_counts", 3) { e in
                 e.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 0)
             }
+            encoder.memoryBarrier(resources: [planarDATPairCountsBuf])
             if numParticles > 0
                 && ProcessInfo.processInfo.environment["AVBD_NO_VT"] == nil {
                 encoder.setComputePipelineState(ps("dat_build_vt_pairs"))
@@ -3252,6 +3253,12 @@ public final class GPUSolver {
                     threadsPerThreadgroup: MTLSize(width: 64, height: 1,
                                                    depth: 1))
             }
+            // Pair builders publish payload and relaxed atomic counts from
+            // thousands of lanes. Make both visible before the single-lane
+            // finalizer snapshots the count and writes indirect arguments;
+            // relying on dispatch order alone is not a Metal memory barrier.
+            encoder.memoryBarrier(resources: [planarDATPairsBuf,
+                                               planarDATPairCountsBuf])
             dispatch1D(encoder, "dat_finalize_pairs", 1) { e in
                 e.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 0)
                 e.setBuffer(self.counters, offset: 0, index: 1)
@@ -3259,6 +3266,9 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
                            index: 3)
             }
+            encoder.memoryBarrier(resources: [planarDATPairsBuf,
+                                               planarDATPairCountsBuf,
+                                               planarDATArgsBuf])
         }
 
         func encodePlanarContacts(_ encoder: MTLComputeCommandEncoder,
@@ -3777,8 +3787,10 @@ public final class GPUSolver {
             encodeElementGrid(enc, clearFirst: true)
             try stage("dat-accepted-pairs")
             encodePlanarPairBuild(enc)
-            try stage("dat-incidence")
-            encodePlanarIncidence(enc)
+            if usePlanarBodyIncidence {
+                try stage("dat-incidence")
+                encodePlanarIncidence(enc)
+            }
             try stage("vt-ee-emit")
             encodePlanarContacts(
                 enc, pairs: planarDATPairsBuf,
@@ -4169,10 +4181,6 @@ public final class GPUSolver {
                 enc.setBuffer(nbr2Start, offset: 0, index: 12)
                 enc.setBuffer(nbr2Count, offset: 0, index: 13)
                 enc.setBuffer(nbr2List, offset: 0, index: 14)
-                enc.setBuffer(velLin, offset: 0, index: 15)
-                enc.setBuffer(shape, offset: 0, index: 16)
-                enc.setBuffer(clothGroupBuf, offset: 0, index: 17)
-                enc.setBuffer(clothVertFlag, offset: 0, index: 18)
                 enc.dispatchThreadgroups(indirectBuffer: ogcArgsBuf,
                                          indirectBufferOffset: 0,
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))

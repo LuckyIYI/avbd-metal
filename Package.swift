@@ -21,7 +21,7 @@ let package = Package(
         .target(
             name: "PhysicsAVBD",
             dependencies: ["SimCore"],
-            resources: [.copy("Shaders")]
+            resources: [.copy("Shaders"), .copy("Assets")]
         ),
         .target(
             name: "Robotics",

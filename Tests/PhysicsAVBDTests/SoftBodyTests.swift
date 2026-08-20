@@ -127,6 +127,8 @@ final class SoftBodyTests: XCTestCase {
         let scene = Demos.meshclothdrop(res: 10, scale: 1)
         XCTAssertGreaterThanOrEqual(scene.skinnedMeshes.count, 2)
         XCTAssertGreaterThan(scene.tris.count, 0)
+        XCTAssertGreaterThan(scene.settings.clothRenderScale, 0.5,
+                             "the rendered sheet should match its contact surface")
         for mesh in scene.skinnedMeshes {
             let bodies = Set(mesh.bodyIDs)
             let tets = scene.tets.filter {
@@ -143,9 +145,39 @@ final class SoftBodyTests: XCTestCase {
         XCTAssertTrue(scene.bodies.contains { !$0.isParticle && $0.density > 0 })
 
         let gpu = try GPUSolver(scene: scene)
-        XCTAssertNotNil(gpu.renderSkinnedSurface)
+        let renderSkin = try XCTUnwrap(gpu.renderSkinnedSurface)
+        XCTAssertEqual(renderSkin.triCount,
+                       scene.skinnedMeshes.reduce(0) { $0 + $1.triangles.count })
         XCTAssertGreaterThan(gpu.numEdges, 0,
                              "pinned cloth must keep EE contact edges")
+
+        // The bundled mesh is a smooth visual skin over the voxel FEM proxy.
+        // Rendering the proxy itself produces only axis-aligned faces.
+        let mesh = try XCTUnwrap(scene.skinnedMeshes.first)
+        // ModelIO welds the source OBJ's duplicate positions on import; no
+        // scene-level simplification is applied to the resulting 34,834
+        // unique vertices or 69,451 faces.
+        XCTAssertEqual(mesh.vertices.count, 34_834,
+                       "the demo must retain the complete imported Stanford Bunny")
+        XCTAssertEqual(mesh.triangles.count, 69_451)
+        func restPosition(_ vertex: SceneSkinnedVertex) -> F3 {
+            let ids = [vertex.ids.0, vertex.ids.1, vertex.ids.2, vertex.ids.3]
+            return zip(ids, [vertex.weights.x, vertex.weights.y,
+                             vertex.weights.z, vertex.weights.w]).reduce(.zero) {
+                $0 + scene.bodies[$1.0].position * $1.1
+            }
+        }
+        let positions = mesh.vertices.map(restPosition)
+        var roundedFaces = 0
+        for tri in mesh.triangles {
+            let n = normalize(cross(positions[tri.1] - positions[tri.0],
+                                    positions[tri.2] - positions[tri.0]))
+            if max(abs(n.x), max(abs(n.y), abs(n.z))) < 0.995 {
+                roundedFaces += 1
+            }
+        }
+        XCTAssertGreaterThan(roundedFaces, mesh.triangles.count / 3,
+                             "the bundled skin must not expose the voxel/tet proxy")
         for _ in 0..<8 { gpu.step() }
         XCTAssertTrue(gpu.maxConstraintError().isFinite)
     }

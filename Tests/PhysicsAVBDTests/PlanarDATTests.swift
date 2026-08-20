@@ -681,6 +681,7 @@ final class PlanarDATTests: XCTestCase {
         var scene = Demos.twist(res: 20)
         scene.settings.iterations = 2
         let solver = try GPUSolver(scene: scene)
+        solver.planarDATBodyIncidenceForTesting = true
         for _ in 0..<12 { try solver.submitStep() }
         try solver.synchronize()
 
@@ -1142,7 +1143,9 @@ final class PlanarDATTests: XCTestCase {
     }
 
     func testAutomaticMixedScenePreservesNearbyBodiesCommonGravity() throws {
-        let scene = Demos.meshclothdrop(res: 18, scale: 2)
+        // Exercise the exact "Giant" preset: eight skinned volumetric bodies
+        // are the configuration that exposed the aerial locking regression.
+        let scene = Demos.meshclothdrop(res: 22, scale: 8)
         let solver = try GPUSolver(scene: scene)
         XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .isotropicDAT)
         XCTAssertGreaterThanOrEqual(scene.skinnedMeshes.count, 2)
@@ -1152,6 +1155,36 @@ final class PlanarDATTests: XCTestCase {
             bodyIDs.reduce(F3.zero) {
                 $0 + positionAt($1)
             } / Float(bodyIDs.count)
+        }
+
+        func collisionBounds(_ bodyIDs: [Int]) -> (lo: F3, hi: F3) {
+            var lo = F3(repeating: Float.greatestFiniteMagnitude)
+            var hi = F3(repeating: -Float.greatestFiniteMagnitude)
+            for id in bodyIDs {
+                let body = scene.bodies[id]
+                let radius = body.size.x * 0.5
+                lo = min(lo, body.position - F3(repeating: radius))
+                hi = max(hi, body.position + F3(repeating: radius))
+            }
+            return (lo, hi)
+        }
+
+        func separated(_ a: (lo: F3, hi: F3),
+                       _ b: (lo: F3, hi: F3)) -> Bool {
+            a.hi.x < b.lo.x || b.hi.x < a.lo.x
+                || a.hi.y < b.lo.y || b.hi.y < a.lo.y
+                || a.hi.z < b.lo.z || b.hi.z < a.lo.z
+        }
+
+        let initialBounds = scene.skinnedMeshes.map {
+            collisionBounds($0.bodyIDs)
+        }
+        for a in initialBounds.indices {
+            for b in (a + 1)..<initialBounds.count {
+                XCTAssertTrue(
+                    separated(initialBounds[a], initialBounds[b]),
+                    "generated skinned-body collision proxies must not overlap at spawn")
+            }
         }
 
         var closest = (0, 1)
@@ -1178,9 +1211,23 @@ final class PlanarDATTests: XCTestCase {
             scene.bodies[$0].position
         }
 
-        for _ in 0..<20 {
+        var meshOwner: [UInt32: Int] = [:]
+        for (owner, mesh) in scene.skinnedMeshes.enumerated() {
+            for id in mesh.bodyIDs { meshOwner[UInt32(id)] = owner }
+        }
+        for _ in 0..<24 {
             try solver.submitStep()
             try solver.synchronize()
+            let contacts = solver.prevSoftContacts.contents().bindMemory(
+                to: SoftContactGPU.self, capacity: solver.maxSoft)
+            for i in 0..<min(solver.lastNumSoft, solver.maxSoft) {
+                let ids = contacts[i].ids
+                let owners = Set([ids.x, ids.y, ids.z, ids.w]
+                    .compactMap { meshOwner[$0] })
+                XCTAssertLessThanOrEqual(
+                    owners.count, 1,
+                    "separated skinned bodies must not create aerial soft contacts")
+            }
         }
 
         let finalPositions = sharedPositions(solver)
@@ -1192,11 +1239,11 @@ final class PlanarDATTests: XCTestCase {
             F3(finalPositions[$0].x, finalPositions[$0].y,
                finalPositions[$0].z)
         }
-        XCTAssertLessThan(a1.z, a0.z - 0.25)
-        XCTAssertLessThan(b1.z, b0.z - 0.25)
+        XCTAssertLessThan(a1.z, a0.z - 0.65)
+        XCTAssertLessThan(b1.z, b0.z - 0.65)
         let initialSeparation = length(a0 - b0)
         let finalSeparation = length(a1 - b1)
-        XCTAssertGreaterThan(finalSeparation, initialSeparation * 0.9)
+        XCTAssertGreaterThan(finalSeparation, initialSeparation * 0.97)
         XCTAssertNil(solver.runtimeFailure)
     }
 

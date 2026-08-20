@@ -261,7 +261,7 @@ extension Demos {
         let (source, sourceKey) = loadDefaultSkinMeshWithKey(meshPath: meshPath)
         let n = max(1, count)
         let bodyHeight: Float = n > 8 ? 1.12 : 1.35
-        let visualLimit = n > 12 ? 1600 : 2800
+        let visualLimit = n > 12 ? 8_000 : 40_000
         let voxelLimit = n > 12 ? 6500 : 9000
         let template = cachedSkinnedSoftMeshTemplate(mesh: source,
                                                      meshKey: sourceKey,
@@ -368,6 +368,12 @@ extension Demos {
                                 hardRods: true,
                                 membraneMu: membraneMu,
                                 membraneBend: bend)
+        // Render the sheet at the same top surface used by rigid-vs-cloth
+        // equilibrium. A flat centerline renderer makes correctly separated
+        // rigid bodies look as if they hover above the cloth.
+        let visualElementMargin = min(0.01, max(0.002, 0.5 * r))
+        s.settings.clothRenderScale = max(
+            0, min(1, (r - visualElementMargin) / (0.95 * r)))
 
         for (i, j) in [(0, 0), (0, n - 1), (n - 1, 0), (n - 1, n - 1)] {
             let node = grid[i][j]
@@ -384,7 +390,10 @@ extension Demos {
         default: softCount = 12
         }
         let softRes = max(8, min(14, res / 2))
-        let softLimit = softCount > 6 ? 1400 : 2200
+        // The visual surface is skinned independently from the inexpensive
+        // voxel/tet collision proxy. Keeping the complete imported surface
+        // here does not increase the solver's particle/tet count.
+        let softLimit = 40_000
         let voxelLimit = softCount > 6 ? 6500 : 9000
         let template = cachedSkinnedSoftMeshTemplate(mesh: source,
                                                      meshKey: sourceKey,
@@ -393,16 +402,32 @@ extension Demos {
                                                      visualVertexLimit: softLimit,
                                                      voxelVertexLimit: voxelLimit,
                                                      minTetElements: 600)
+        var templateMin = F3(repeating: Float.greatestFiniteMagnitude)
+        var templateMax = F3(repeating: -Float.greatestFiniteMagnitude)
+        for p in template.nodePositions {
+            templateMin = min(templateMin, p)
+            templateMax = max(templateMax, p)
+        }
+        let templateExtent = templateMax - templateMin
+        let particleDiameter = 2 * template.spacing * 0.32
+        // A fixed lattice ignored the actual proxy extent, particle radii, and
+        // jitter envelope, allowing adjacent volumetric bodies to start inside
+        // each other's soft-contact band. Derive spacing from the proxy itself.
+        let horizontalJitterSpan: Float = 0.08
+        let softStride = max(
+            0.72,
+            max(templateExtent.x, templateExtent.y)
+                + particleDiameter + horizontalJitterSpan + 0.04)
         let dropZ = pinZ + 2.2
         var rng = SplitMix64(seed: 0x5eed_4017)
         let cols = max(1, Int(ceil(sqrt(Double(softCount)))))
         for i in 0..<softCount {
             let gx = Float(i % cols) - Float(cols - 1) * 0.5
             let gy = Float(i / cols) - Float((softCount + cols - 1) / cols - 1) * 0.5
-            let jitter = F3((rng.nextFloat() - 0.5) * 0.25,
-                            (rng.nextFloat() - 0.5) * 0.25,
+            let jitter = F3((rng.nextFloat() - 0.5) * horizontalJitterSpan,
+                            (rng.nextFloat() - 0.5) * horizontalJitterSpan,
                             Float(i % 3) * 0.22)
-            let center = F3(gx * 0.72, gy * 0.72, dropZ) + jitter
+            let center = F3(gx * softStride, gy * softStride, dropZ) + jitter
             _ = instantiateSkinnedSoftMesh(&s, template: template, center: center,
                                            mu: stiffness,
                                            lambda: 10 * stiffness,
@@ -708,80 +733,30 @@ extension Demos {
                                 bodyIDs: bodyIDs)
     }
 
-    private static func proceduralBunnySurface(res: Int) -> SurfaceMesh {
-        func ellipsoid(_ p: F3, _ c: F3, _ r: F3) -> Bool {
-            let d = (p - c) / r
-            return dot(d, d) <= 1
-        }
-        func bunny(_ p: F3) -> Bool {
-            ellipsoid(p, F3(0.00, 0, 0.52), F3(0.62, 0.46, 0.44)) ||
-            ellipsoid(p, F3(0.52, 0, 1.00), F3(0.30, 0.26, 0.27)) ||
-            ellipsoid(p, F3(0.46, 0.14, 1.42), F3(0.11, 0.08, 0.34)) ||
-            ellipsoid(p, F3(0.46, -0.14, 1.42), F3(0.11, 0.08, 0.34)) ||
-            ellipsoid(p, F3(-0.60, 0, 0.42), F3(0.16, 0.16, 0.16)) ||
-            ellipsoid(p, F3(0.30, 0.26, 0.16), F3(0.30, 0.13, 0.14)) ||
-            ellipsoid(p, F3(0.30, -0.26, 0.16), F3(0.30, 0.13, 0.14))
-        }
-        let h = 1.8 / Float(max(8, res))
-        let origin = F3(-1.0, -0.7, 0.0)
-        let nx = Int(2.0 / h), ny = Int(1.4 / h), nz = Int(1.9 / h)
-        var occ = Set<SIMD3<Int>>()
-        for i in 0..<nx {
-            for j in 0..<ny {
-                for k in 0..<nz {
-                    let p = origin + (F3(Float(i), Float(j), Float(k))
-                                      + F3(repeating: 0.5)) * h
-                    if bunny(p) { occ.insert(SIMD3(i, j, k)) }
-                }
-            }
-        }
-        occ = largestComponent(occ)
-        var verts: [F3] = []
-        var vmap: [SIMD3<Int>: Int] = [:]
-        var tris: [(Int, Int, Int)] = []
-        func v(_ q: SIMD3<Int>) -> Int {
-            if let id = vmap[q] { return id }
-            let p = origin + F3(Float(q.x), Float(q.y), Float(q.z)) * h
-            let id = verts.count
-            vmap[q] = id
-            verts.append(p)
-            return id
-        }
-        let faces: [(SIMD3<Int>, [SIMD3<Int>])] = [
-            (SIMD3(-1, 0, 0), [SIMD3(0,0,0), SIMD3(0,0,1), SIMD3(0,1,1), SIMD3(0,1,0)]),
-            (SIMD3(1, 0, 0), [SIMD3(1,0,0), SIMD3(1,1,0), SIMD3(1,1,1), SIMD3(1,0,1)]),
-            (SIMD3(0, -1, 0), [SIMD3(0,0,0), SIMD3(1,0,0), SIMD3(1,0,1), SIMD3(0,0,1)]),
-            (SIMD3(0, 1, 0), [SIMD3(0,1,0), SIMD3(0,1,1), SIMD3(1,1,1), SIMD3(1,1,0)]),
-            (SIMD3(0, 0, -1), [SIMD3(0,0,0), SIMD3(0,1,0), SIMD3(1,1,0), SIMD3(1,0,0)]),
-            (SIMD3(0, 0, 1), [SIMD3(0,0,1), SIMD3(1,0,1), SIMD3(1,1,1), SIMD3(0,1,1)])
-        ]
-        for c in occ {
-            for (d, corners) in faces where !occ.contains(c &+ d) {
-                let ids = corners.map { v(c &+ $0) }
-                tris.append((ids[0], ids[1], ids[2]))
-                tris.append((ids[0], ids[2], ids[3]))
-            }
-        }
-        return SurfaceMesh(vertices: verts, normals: [], triangles: tris)
-    }
-
-    private static func loadDefaultSkinMesh(meshPath: String?) -> SurfaceMesh {
-        loadDefaultSkinMeshWithKey(meshPath: meshPath).0
-    }
-
     private static func loadDefaultSkinMeshWithKey(meshPath: String?) -> (SurfaceMesh, String) {
         let envPath = ProcessInfo.processInfo.environment["AVBD_SKIN_MESH"]
-        let path = meshPath ?? envPath
-        if let path {
+        if let path = meshPath ?? envPath {
             let key = skinMeshFileKey(path)
             let mesh = SkinnedSoftMeshCache.shared.mesh(for: key) {
-                (try? SurfaceMesh.load(path: path)) ?? proceduralBunnySurface(res: 22)
+                guard let loaded = try? SurfaceMesh.load(path: path) else {
+                    preconditionFailure("unable to load AVBD skin mesh at \(path)")
+                }
+                return loaded
             }
             return (mesh, key)
         }
-        let key = "procedural-bunny:22"
+
+        guard let url = Bundle.module.url(forResource: "stanford-bunny",
+                                          withExtension: "obj",
+                                          subdirectory: "Assets") else {
+            preconditionFailure("bundled Stanford Bunny asset is missing")
+        }
+        let key = "stanford-bunny:1eb35d1e21ce99e5ce911353b6be278990713448dd9e8f5c9387f9de39b32205"
         let mesh = SkinnedSoftMeshCache.shared.mesh(for: key) {
-            proceduralBunnySurface(res: 22)
+            guard let loaded = try? SurfaceMesh.load(path: url.path) else {
+                preconditionFailure("bundled Stanford Bunny asset is unreadable")
+            }
+            return loaded
         }
         return (mesh, key)
     }

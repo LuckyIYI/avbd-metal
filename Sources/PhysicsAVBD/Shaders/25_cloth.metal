@@ -374,25 +374,6 @@ inline void best4Insert(thread Best4& b, uint t, float d2) {
     b.id[i] = t; b.d2[i] = d2;
 }
 
-// OGC's isotropic bound is expressed in world-space displacement. Applying
-// it to two separate volumetric components that are co-moving under gravity
-// consumes their clearance even though their relative configuration is
-// unchanged, producing artificial aerial drag. Keep the conservative bound
-// for approaching solid pairs and for pairs already inside the speculative
-// force band; otherwise their normal contact tracker is sufficient until a
-// relative approach begins. Cloth-involving pairs retain the original bound.
-inline bool ogcNeedsCrossSolidBound(float3 delta, float3 relativeVelocity,
-                                    float combinedRadius,
-                                    constant SimParams& P) {
-    if (!finite3(delta) || !finite3(relativeVelocity)) return true;
-    float closing = dot(delta, relativeVelocity);
-    if (closing < 0.0f) return true;
-    float inflate = min(length(relativeVelocity) * P.dt,
-                        0.3f * P.surfaceContactCellSize);
-    float reach = combinedRadius + P.elemMargin + inflate;
-    return dot(delta, delta) <= reach * reach;
-}
-
 kernel void vt_emit(
     device const float4* posLin     [[buffer(0)]],
     device const float4* shape      [[buffer(1)]],
@@ -466,30 +447,14 @@ kernel void vt_emit(
                 float3 q_ = closestPtTriangle(pv, posLin[tid_.x].xyz,          \
                                               posLin[tid_.y].xyz,              \
                                               posLin[tid_.z].xyz, ba_);        \
-                float3 delta_ = pv - q_;                                      \
-                float d2_ = dot(delta_, delta_);                              \
+                float d2_ = distance_squared(pv, q_);                          \
                 if (d2_ < best.d2[3]                                           \
                     && !nbrContains(nbrList, ns, ne, tid_.x)                   \
                     && !nbrContains(nbrList, ns, ne, tid_.y)                   \
                     && !nbrContains(nbrList, ns, ne, tid_.z)) {                \
                     best4Insert(best, t_, d2_);                                \
                 }                                                              \
-                uint gt_ = clothGroup[tid_.x];                                \
-                bool solidT_ = gt_ != 0u && gt_ != gv                         \
-                    && clothGroup[tid_.y] == gt_                              \
-                    && clothGroup[tid_.z] == gt_                              \
-                    && clothVert[tid_.x] == 0u                                \
-                    && clothVert[tid_.y] == 0u                                \
-                    && clothVert[tid_.z] == 0u;                               \
-                float3 velT_ = ba_.x * velLin[tid_.x].xyz                     \
-                    + ba_.y * velLin[tid_.y].xyz                              \
-                    + ba_.z * velLin[tid_.z].xyz;                             \
-                float rt_ = max(fabs(shape[tid_.x].w),                        \
-                    max(fabs(shape[tid_.y].w), fabs(shape[tid_.z].w)));       \
-                bool boundPair_ = !(solidV && solidT_)                        \
-                    || ogcNeedsCrossSolidBound(                               \
-                        delta_, velV - velT_, rv + rt_, P);                   \
-                if (boundPair_ && d2_ < boundsCap2                            \
+                if (d2_ < boundsCap2                                           \
                     && !nbrContains(nbr2List, n2s, n2e, tid_.x)                \
                     && !nbrContains(nbr2List, n2s, n2e, tid_.y)                \
                     && !nbrContains(nbr2List, n2s, n2e, tid_.z)) {             \
@@ -749,8 +714,7 @@ kernel void ee_emit(
                 eeClosestSegSeg(a0, a1, b0_, b1_, s_, t_);                     \
                 float3 cA_ = a0 + (a1 - a0) * s_;                              \
                 float3 cB_ = b0_ + (b1_ - b0_) * t_;                           \
-                float3 delta_ = cA_ - cB_;                                    \
-                float d2_ = dot(delta_, delta_);                              \
+                float d2_ = distance_squared(cA_, cB_);                        \
                 if (d2_ < best.d2[3]                                           \
                     && !nbrContains(nbrList, nsx, nex, eB_.x)                  \
                     && !nbrContains(nbrList, nsx, nex, eB_.y)                  \
@@ -758,19 +722,7 @@ kernel void ee_emit(
                     && !nbrContains(nbrList, nsy, ney, eB_.y)) {               \
                     best4Insert(best, e_, d2_);                                \
                 }                                                              \
-                uint gB_ = clothGroup[eB_.x];                                 \
-                bool solidB_ = gB_ != 0u && gB_ != gA                         \
-                    && clothGroup[eB_.y] == gB_                               \
-                    && clothVert[eB_.x] == 0u                                 \
-                    && clothVert[eB_.y] == 0u;                                \
-                float3 velB_ = (velLin[eB_.x].xyz                             \
-                    + velLin[eB_.y].xyz) * 0.5f;                              \
-                float rB_ = max(fabs(shape[eB_.x].w),                         \
-                                 fabs(shape[eB_.y].w));                        \
-                bool boundPair_ = !(solidA && solidB_)                        \
-                    || ogcNeedsCrossSolidBound(                               \
-                        delta_, velA - velB_, rA + rB_, P);                   \
-                if (boundPair_ && d2_ < boundsCap2                            \
+                if (d2_ < boundsCap2                                           \
                     && !nbrContains(nbr2List, n2sx, n2ex, eB_.x)               \
                     && !nbrContains(nbr2List, n2sx, n2ex, eB_.y)) {            \
                     uint db_ = as_type<uint>(d2_);                             \
@@ -933,17 +885,11 @@ kernel void ogc_bounds_refresh(
     device const uint* nbr2Start    [[buffer(12)]],
     device const uint* nbr2Count    [[buffer(13)]],
     device const uint* nbr2List     [[buffer(14)]],
-    device const float4* velLin     [[buffer(15)]],
-    device const float4* shape      [[buffer(16)]],
-    device const uint* clothGroup   [[buffer(17)]],
-    device const uint* clothVert    [[buffer(18)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numParticles) return;
     uint v = particleIdx[gid];
     float3 pv = posLin[v].xyz;
-    uint gv = clothGroup[v];
-    bool solidV = gv != 0u && clothVert[v] == 0u;
     uint n2s = nbr2Start[v], n2e = n2s + nbr2Count[v];
     float dmin2 = 3.0e38f;
     uint4 tracked = vtTrack[v];
@@ -957,21 +903,7 @@ kernel void ogc_bounds_refresh(
         float3 ba;
         float3 q = closestPtTriangle(pv, posLin[tid.x].xyz, posLin[tid.y].xyz,
                                      posLin[tid.z].xyz, ba);
-        float3 delta = pv - q;
-        uint gt = clothGroup[tid.x];
-        bool solidT = gt != 0u && gt != gv
-            && clothGroup[tid.y] == gt && clothGroup[tid.z] == gt
-            && clothVert[tid.x] == 0u && clothVert[tid.y] == 0u
-            && clothVert[tid.z] == 0u;
-        float3 velT = ba.x * velLin[tid.x].xyz
-            + ba.y * velLin[tid.y].xyz + ba.z * velLin[tid.z].xyz;
-        float rt = max(fabs(shape[tid.x].w),
-                       max(fabs(shape[tid.y].w), fabs(shape[tid.z].w)));
-        if (!(solidV && solidT)
-            || ogcNeedsCrossSolidBound(
-                delta, velLin[v].xyz - velT, fabs(shape[v].w) + rt, P)) {
-            dmin2 = min(dmin2, dot(delta, delta));
-        }
+        dmin2 = min(dmin2, distance_squared(pv, q));
     }
     uint es = vertEdgeStart[v], ec = min(vertEdgeCount[v], 6u);
     for (uint k = es; k < es + ec; k++) {
@@ -988,20 +920,7 @@ kernel void ogc_bounds_refresh(
         eeClosestSegSeg(a0, a1, b0, b1, s, t);
         float3 cA = a0 + (a1 - a0) * s;
         float3 cB = b0 + (b1 - b0) * t;
-        float3 delta = cA - cB;
-        uint gA = clothGroup[em.x], gB = clothGroup[eo.x];
-        bool solidA = gA != 0u && clothGroup[em.y] == gA
-            && clothVert[em.x] == 0u && clothVert[em.y] == 0u;
-        bool solidB = gB != 0u && gB != gA && clothGroup[eo.y] == gB
-            && clothVert[eo.x] == 0u && clothVert[eo.y] == 0u;
-        float3 velA = mix(velLin[em.x].xyz, velLin[em.y].xyz, s);
-        float3 velB = mix(velLin[eo.x].xyz, velLin[eo.y].xyz, t);
-        float rA = max(fabs(shape[em.x].w), fabs(shape[em.y].w));
-        float rB = max(fabs(shape[eo.x].w), fabs(shape[eo.y].w));
-        if (!(solidA && solidB)
-            || ogcNeedsCrossSolidBound(delta, velA - velB, rA + rB, P)) {
-            dmin2 = min(dmin2, dot(delta, delta));
-        }
+        dmin2 = min(dmin2, distance_squared(cA, cB));
     }
     bounds[v] = as_type<uint>(dmin2);
     ogcPrev[v] = posLin[v];
