@@ -253,6 +253,7 @@ public final class GPUSolver {
         "build_instances",
         "color_count",
         "color_iterate",
+        "color_repair_greedy",
         "color_scan",
         "color_scatter",
         "color_validate",
@@ -3867,7 +3868,8 @@ public final class GPUSolver {
         if usesDynamicColoring {
             try stage("coloring")
             var src = colorsA, dst = colorsB
-            for pass in 0..<20 {
+            let parallelColorPasses = 20
+            for pass in 0..<parallelColorPasses {
                 dispatch1D(enc, "color_iterate", numBodies) { e in
                     e.setBuffer(self.posLin, offset: 0, index: 0)
                     e.setBuffer(self.joints, offset: 0, index: 1)
@@ -3890,6 +3892,31 @@ public final class GPUSolver {
                 swap(&src, &dst)
             }
             let finalColors = src
+            // Ordered parallel relaxation is fast on the warm-started graph,
+            // but a newly formed long contact chain can need one hop per
+            // pass. If the last parallel pass still changed anything, finish
+            // with an exact in-place serial greedy sweep on the GPU. This is
+            // rare after settling and guarantees that validation never sees
+            // an arbitrary iteration-limit artifact.
+            var finalPass = UInt32(parallelColorPasses - 1)
+            dispatch1D(enc, "color_repair_greedy", 1) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.joints, offset: 0, index: 1)
+                e.setBuffer(self.springs, offset: 0, index: 2)
+                e.setBuffer(self.manifolds, offset: 0, index: 3)
+                e.setBuffer(self.adjStart, offset: 0, index: 4)
+                e.setBuffer(self.degrees, offset: 0, index: 5)
+                e.setBuffer(self.adjList, offset: 0, index: 6)
+                e.setBuffer(finalColors, offset: 0, index: 7)
+                e.setBuffer(self.changedFlag, offset: 0, index: 8)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 9)
+                e.setBuffer(self.tets, offset: 0, index: 10)
+                e.setBuffer(self.softContacts, offset: 0, index: 11)
+                e.setBuffer(self.membranes, offset: 0, index: 12)
+                e.setBuffer(self.bends, offset: 0, index: 13)
+                e.setBytes(&finalPass, length: 4, index: 14)
+            }
             dispatch1D(enc, "color_validate", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.joints, offset: 0, index: 1)

@@ -386,6 +386,61 @@ kernel void color_iterate(
     }
 }
 
+// Complete an unfinished parallel coloring deterministically. A synchronous
+// ordered relaxation can require one pass per graph hop (a tall stack is the
+// canonical case), so the bounded parallel phase above is only an optimizer.
+// This single-thread greedy sweep is conditional on the final pass changing
+// and provides the exact correctness boundary before color_validate.
+kernel void color_repair_greedy(
+    device const float4* posLin     [[buffer(0)]],
+    device const JointGPU* joints   [[buffer(1)]],
+    device const SpringGPU* springs [[buffer(2)]],
+    device const ManifoldGPU* manifolds [[buffer(3)]],
+    device const uint* adjStart     [[buffer(4)]],
+    device const uint* adjCount     [[buffer(5)]],
+    device const uint* adjList      [[buffer(6)]],
+    device uint* colors             [[buffer(7)]],
+    device const atomic_uint* changedFlag [[buffer(8)]],
+    constant SimParams& P           [[buffer(9)]],
+    device const TetGPU* tets       [[buffer(10)]],
+    device const SoftContactGPU* soft [[buffer(11)]],
+    device const MembraneGPU* membranes [[buffer(12)]],
+    device const BendGPU* bends     [[buffer(13)]],
+    constant uint& finalPass        [[buffer(14)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid != 0u ||
+        atomic_load_explicit(&changedFlag[finalPass],
+                             memory_order_relaxed) == 0u) return;
+
+    for (uint self = 0; self < P.numBodies; self++) {
+        if (posLin[self].w <= 0.0f) {
+            colors[self] = 0u;
+            continue;
+        }
+        uint maskLo = 0u, maskHi = 0u;
+        uint allLo = 0u, allHi = 0u;
+        bool conflict = false;
+        uint s = adjStart[self], e = s + adjCount[self];
+        for (uint k = s; k < e; k++) {
+            neighborColors(joints, springs, manifolds, tets, soft,
+                           membranes, bends, posLin, colors,
+                           adjList[k], self, colors[self], maskLo, maskHi,
+                           allLo, allHi, conflict);
+        }
+        uint freeLo = ~maskLo;
+        if (freeLo != 0u) {
+            colors[self] = ctz(freeLo);
+        } else {
+            uint freeHi = ~maskHi;
+            // Keeping the last color when all 64 are occupied deliberately
+            // leaves a conflict for color_validate to report fail-closed.
+            colors[self] = freeHi != 0u
+                ? 32u + ctz(freeHi) : uint(MAX_COLORS - 1);
+        }
+    }
+}
+
 // Verify the final dynamic palette instead of trusting a fixed iteration
 // count. Each conflicting edge is reported once by its larger body id. A
 // conflict means same-color primal updates would race and the frame is not a
