@@ -153,10 +153,21 @@ extension Demos {
                                            surfaceBand: surfaceBand)
         }
         var cells = voxel.0
+        let (_, origin, spacing) = voxel
+        // The visual surface must be embedded inside the tetrahedral cage.
+        // A center-distance surface raster can omit the cell containing a
+        // vertex near a cell corner, which forces extrapolating barycentric
+        // weights and makes a volume-preserving cage look like a collapsing
+        // shell. Include each visual vertex's containing voxel explicitly,
+        // then seal enclosed gaps in imperfect scan meshes before tetrahedralizing.
+        for p in visual.vertices {
+            let q = floor((p - origin) / spacing)
+            cells.insert(SIMD3(Int(q.x), Int(q.y), Int(q.z)))
+        }
+        cells = fillEnclosedCells(in: cells)
         if cells.count * 5 < targetTets {
             cells = expandedCells(cells, targetCount: (targetTets + 4) / 5)
         }
-        let (_, origin, spacing) = voxel
         var tmp = PhysicsScene(name: "skin-template")
         let nodes = addSoftVoxelCells(&tmp, cells: cells, origin: origin,
                                       spacing: spacing, mu: 1,
@@ -543,6 +554,54 @@ extension Demos {
             frontier = next.sorted { ($0.x, $0.y, $0.z) < ($1.x, $1.y, $1.z) }
         }
         return out
+    }
+
+    private static func fillEnclosedCells(
+        in cells: Set<SIMD3<Int>>
+    ) -> Set<SIMD3<Int>> {
+        guard let first = cells.first else { return cells }
+        var mn = first
+        var mx = first
+        for cell in cells {
+            mn = SIMD3(Swift.min(mn.x, cell.x), Swift.min(mn.y, cell.y),
+                       Swift.min(mn.z, cell.z))
+            mx = SIMD3(Swift.max(mx.x, cell.x), Swift.max(mx.y, cell.y),
+                       Swift.max(mx.z, cell.z))
+        }
+        let lo = mn &- SIMD3(repeating: 1)
+        let hi = mx &+ SIMD3(repeating: 1)
+        let directions = [
+            SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0),
+            SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)
+        ]
+        var exterior: Set<SIMD3<Int>> = [lo]
+        var queue = [lo]
+        var head = 0
+        while head < queue.count {
+            let cell = queue[head]
+            head += 1
+            for direction in directions {
+                let next = cell &+ direction
+                guard next.x >= lo.x, next.x <= hi.x,
+                      next.y >= lo.y, next.y <= hi.y,
+                      next.z >= lo.z, next.z <= hi.z,
+                      !cells.contains(next), exterior.insert(next).inserted else {
+                    continue
+                }
+                queue.append(next)
+            }
+        }
+
+        var filled = cells
+        for x in mn.x...mx.x {
+            for y in mn.y...mx.y {
+                for z in mn.z...mx.z {
+                    let cell = SIMD3(x, y, z)
+                    if !exterior.contains(cell) { filled.insert(cell) }
+                }
+            }
+        }
+        return filled
     }
 
     private static func addOpenBox(_ s: inout PhysicsScene,
