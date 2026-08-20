@@ -81,7 +81,32 @@ extension Demos {
                                           mu: Float = 2500,
                                           lambda: Float? = nil,
                                           massScale: Float = 28,
-                                          friction: Float = 0.8) -> [Int] {
+                                          friction: Float = 0.8)
+        -> [Int] {
+        addSkinnedSoftMesh(
+            &s, mesh: input, center: center, height: height, res: res,
+            visualVertexLimit: visualVertexLimit,
+            voxelVertexLimit: voxelVertexLimit,
+            minTetElements: minTetElements, mu: mu, lambda: lambda,
+            massScale: massScale, friction: friction,
+            selfCollisionEnabled: false)
+    }
+
+    @discardableResult
+    public static func addSkinnedSoftMesh(_ s: inout PhysicsScene,
+                                          mesh input: SurfaceMesh,
+                                          center: F3,
+                                          height: Float = 1.7,
+                                          res: Int = 8,
+                                          visualVertexLimit: Int = 1400,
+                                          voxelVertexLimit: Int = 6000,
+                                          minTetElements: Int = 600,
+                                          mu: Float = 2500,
+                                          lambda: Float? = nil,
+                                          massScale: Float = 28,
+                                          friction: Float = 0.8,
+                                          selfCollisionEnabled: Bool)
+        -> [Int] {
         let template = makeSkinnedSoftMeshTemplate(mesh: input, height: height,
                                                    res: res,
                                                    visualVertexLimit: visualVertexLimit,
@@ -90,7 +115,9 @@ extension Demos {
         return instantiateSkinnedSoftMesh(&s, template: template, center: center,
                                           mu: mu, lambda: lambda ?? 10 * mu,
                                           massScale: massScale,
-                                          friction: friction)
+                                          friction: friction,
+                                          selfCollisionEnabled:
+                                            selfCollisionEnabled)
     }
 
     private static func makeSkinnedSoftMeshTemplate(mesh input: SurfaceMesh,
@@ -183,7 +210,9 @@ extension Demos {
                                                    mu: Float,
                                                    lambda: Float,
                                                    massScale: Float,
-                                                   friction: Float) -> [Int] {
+                                                   friction: Float,
+                                                   selfCollisionEnabled: Bool = false)
+        -> [Int] {
         let mass = massScale * template.spacing * template.spacing * template.spacing
         var bodyIDs: [Int] = []
         bodyIDs.reserveCapacity(template.nodePositions.count)
@@ -196,7 +225,8 @@ extension Demos {
         for ids in template.tetIDs {
             s.addTet(SceneTet(ids: (bodyIDs[ids.0], bodyIDs[ids.1],
                                     bodyIDs[ids.2], bodyIDs[ids.3]),
-                              mu: mu, lambda: lambda))
+                              mu: mu, lambda: lambda,
+                              selfCollisionEnabled: selfCollisionEnabled))
         }
         for (a, b) in template.jointPairs {
             s.addJoint(SceneJoint(bodyA: bodyIDs[a], bodyB: bodyIDs[b],

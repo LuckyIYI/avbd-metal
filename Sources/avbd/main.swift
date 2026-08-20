@@ -12,9 +12,11 @@ import simd
 // Usage:
 //   avbd run <demo> [--frames N] [--iterations N] [--cpu] [--json] [--scale N]
 //            [--dt T] [--watch BODY] [--stats-every N]
-//            [--truncation planar|isotropic]
+//            [--truncation automatic|planar|isotropic]
+//            [--tet-inversion-prevention]
 //   avbd bench <demo> [--frames N] [--scale N] [--iterations N]
-//            [--truncation planar|isotropic]
+//            [--truncation automatic|planar|isotropic]
+//            [--tet-inversion-prevention]
 //   avbd list
 //   avbd parity <demo> [--frames N]
 
@@ -102,7 +104,8 @@ struct Options {
     var gaitSwingHeight: Float = 0.016
     var gaitPlacementHorizon: Float = 0.35
     var gaitMaximumPlacement: Float = 0.045
-    var surfaceTruncationMode: GPUSolver.SurfaceTruncationMode = .planarDAT
+    var surfaceTruncationSelection: GPUSolver.SurfaceTruncationSelection = .automatic
+    var tetInversionPrevention = false
 }
 
 private func truncationName(
@@ -111,6 +114,18 @@ private func truncationName(
     switch mode {
     case .planarDAT: return "planar"
     case .isotropicDAT: return "isotropic"
+    }
+}
+
+private func truncationDescription(
+    requested: GPUSolver.SurfaceTruncationSelection,
+    solver: GPUSolver
+) -> String {
+    switch requested {
+    case .automatic:
+        return "automatic→\(truncationName(solver.effectiveSurfaceTruncationMode))"
+    case .explicit(let mode):
+        return truncationName(mode)
     }
 }
 
@@ -1013,10 +1028,12 @@ func parseOptions(
         case "--dt": o.dt = float(after: args[i])
         case "--truncation":
             switch value(after: args[i]) {
-            case "planar": o.surfaceTruncationMode = .planarDAT
-            case "isotropic": o.surfaceTruncationMode = .isotropicDAT
-            default: fail("--truncation must be planar or isotropic")
+            case "automatic", "auto": o.surfaceTruncationSelection = .automatic
+            case "planar": o.surfaceTruncationSelection = .explicit(.planarDAT)
+            case "isotropic": o.surfaceTruncationSelection = .explicit(.isotropicDAT)
+            default: fail("--truncation must be automatic, planar, or isotropic")
             }
+        case "--tet-inversion-prevention": o.tetInversionPrevention = true
         case "--cpu": o.useCPU = true
         case "--json": o.json = true
         case "--watch": o.watch = integer(after: args[i])
@@ -4162,7 +4179,8 @@ case "run":
         }
     } else {
         let solver = try GPUSolver(scene: scene)
-        solver.surfaceTruncationMode = o.surfaceTruncationMode
+        solver.surfaceTruncationSelection = o.surfaceTruncationSelection
+        solver.tetInversionPreventionEnabled = o.tetInversionPrevention
         let t0 = Date()
         for f in 0..<o.frames {
             try solver.submitStep()
@@ -4207,7 +4225,8 @@ case "rodexp":
         scene.settings.rodDecayPow = decay
         if let it = o.iterations { scene.settings.iterations = it }
         let solver = try GPUSolver(scene: scene)
-        solver.surfaceTruncationMode = o.surfaceTruncationMode
+        solver.surfaceTruncationSelection = o.surfaceTruncationSelection
+        solver.tetInversionPreventionEnabled = o.tetInversionPrevention
         var windowMax: [Float] = []
         var cur: Float = 0
         var worstStretch: Float = 0
@@ -4248,8 +4267,9 @@ case "profile":
     let o = parseOptions(Array(args.dropFirst(2)))
     let scene = makeScene(args[1], o)
     let solver = try GPUSolver(scene: scene)
-    solver.surfaceTruncationMode = o.surfaceTruncationMode
-    print("truncation \(truncationName(o.surfaceTruncationMode))  bodies \(scene.bodies.count)  tris \(scene.tris.count)+\(solver.tetBoundaryTris.count)b  springs \(scene.springs.count)  joints \(scene.joints.count)  colors \(solver.staticUsedColors)  persistent-capacity \(solver.persistentCapacity)")
+    solver.surfaceTruncationSelection = o.surfaceTruncationSelection
+    solver.tetInversionPreventionEnabled = o.tetInversionPrevention
+    print("truncation \(truncationDescription(requested: o.surfaceTruncationSelection, solver: solver))  bodies \(scene.bodies.count)  tris \(scene.tris.count)+\(solver.tetBoundaryTris.count)b  springs \(scene.springs.count)  joints \(scene.joints.count)  colors \(solver.staticUsedColors)  persistent-capacity \(solver.persistentCapacity)")
     for _ in 0..<30 { try solver.submitStep() } // warm up
     try solver.synchronize()
     solver.profiling = true
@@ -4278,8 +4298,9 @@ case "clothgate":
     let o = parseOptions(Array(args.dropFirst(2)))
     let scene = makeScene(args[1], o)
     let solver = try GPUSolver(scene: scene)
-    solver.surfaceTruncationMode = o.surfaceTruncationMode
-    print("truncation \(truncationName(o.surfaceTruncationMode))  bodies \(scene.bodies.count)  tris \(scene.tris.count)  persistent-capacity \(solver.persistentCapacity)")
+    solver.surfaceTruncationSelection = o.surfaceTruncationSelection
+    solver.tetInversionPreventionEnabled = o.tetInversionPrevention
+    print("truncation \(truncationDescription(requested: o.surfaceTruncationSelection, solver: solver))  bodies \(scene.bodies.count)  tris \(scene.tris.count)  persistent-capacity \(solver.persistentCapacity)")
     var worstGap: Float = .greatestFiniteMagnitude
     var worstStretch: Float = 0
     var ke: Float = 0
@@ -4427,7 +4448,8 @@ case "bench":
     let o = parseOptions(Array(args.dropFirst(2)))
     let scene = makeScene(args[1], o)
     let solver = try GPUSolver(scene: scene)
-    solver.surfaceTruncationMode = o.surfaceTruncationMode
+    solver.surfaceTruncationSelection = o.surfaceTruncationSelection
+    solver.tetInversionPreventionEnabled = o.tetInversionPrevention
     // warmup
     for _ in 0..<10 { try solver.submitStep() }
     try solver.synchronize()
@@ -4459,7 +4481,7 @@ case "bench":
     print(String(format: "  cpu encode: %.3f ms/frame", encodeS * 1000 / Double(o.frames)))
     print(String(format: "%@: %d bodies, %d iterations, %.3f ms/frame (%.1f FPS)",
                  scene.name, scene.bodies.count, scene.settings.iterations, ms, 1000 / ms))
-    print("  truncation \(truncationName(o.surfaceTruncationMode)); "
+    print("  truncation \(truncationDescription(requested: o.surfaceTruncationSelection, solver: solver)); "
         + "DAT pairs \(solver.lastPlanarDATPairs) "
         + "(VT \(solver.lastPlanarDATVertexTrianglePairs), "
         + "EE \(solver.lastPlanarDATEdgeEdgePairs)); "
@@ -4484,7 +4506,8 @@ case "parity":
     let scene = makeScene(args[1], o)
     let cpu = scene.makeCPUSolver()
     let gpu = try GPUSolver(scene: scene)
-    gpu.surfaceTruncationMode = o.surfaceTruncationMode
+    gpu.surfaceTruncationSelection = o.surfaceTruncationSelection
+    gpu.tetInversionPreventionEnabled = o.tetInversionPrevention
     var maxDiff: Float = 0
     for f in 0..<o.frames {
         cpu.step()

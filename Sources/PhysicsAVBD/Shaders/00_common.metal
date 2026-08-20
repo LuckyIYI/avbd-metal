@@ -284,6 +284,7 @@ struct SimParams {
     float planarDATQueryRadius;
     float planarDATRelaxation;
     float surfaceContactCellSize; // legacy OGC velocity-inflation reference
+    uint tetInversionPreventionEnabled; // independent signed-volume extension
 };
 
 inline float combine_friction(float a, float b, uint mode) {
@@ -355,7 +356,7 @@ struct SpringGPU {
 // Stable Neo-Hookean tetrahedron (Smith et al. 2018) on 3-DOF particles.
 struct TetGPU {
     uint4 ids;          // 4 particle body indices
-    float4 r0;          // DmInv row 0; w = rest volume
+    float4 r0;          // DmInv row 0; w = signed 6x rest volume
     float4 r1;          // DmInv row 1; w = mu  * volume
     float4 r2;          // DmInv row 2; w = lambda * volume
 };
@@ -443,9 +444,13 @@ struct ManifoldGPU {
 #define CTR_DAT_GRID_OVERFLOW 10   // element AABB exceeded supported span
 #define CTR_DAT_INVALID_ANCHOR 11  // coincident/non-finite fixed pair anchor
 #define CTR_DAT_TRUNCATIONS 12     // particles directionally/cap truncated
-#define CTR_COLOR_BASE 13          // MAX_COLORS entries
-#define CTR_SCATTER_BASE (13 + MAX_COLORS) // MAX_COLORS scatter cursors
-#define CTR_TOTAL (13 + 2 * MAX_COLORS)
+#define CTR_DAT_VT_DEGENERATE 13   // coincident V-T fixed anchors
+#define CTR_DAT_EE_DEGENERATE 14   // coincident/parallel E-E fixed anchors
+#define CTR_DAT_NONFINITE 15       // non-finite query/reduction/apply values
+#define CTR_DAT_TET_DEGENERATE 16  // collapsed/inverted tet anchor
+#define CTR_COLOR_BASE 17          // MAX_COLORS entries
+#define CTR_SCATTER_BASE (17 + MAX_COLORS) // MAX_COLORS scatter cursors
+#define CTR_TOTAL (17 + 2 * MAX_COLORS)
 
 #define SURFACE_TRUNCATION_ISOTROPIC 1u
 #define SURFACE_TRUNCATION_PLANAR_DAT 2u

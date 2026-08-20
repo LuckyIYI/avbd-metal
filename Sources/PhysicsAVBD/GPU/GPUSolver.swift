@@ -16,11 +16,22 @@ import SimCore
 //   6. BDF1 velocity finalize
 public final class GPUSolver {
     /// Collision-safe displacement limiter for deformable surface V-T/E-E
-    /// motion. Planar-DAT is the production default; isotropicDAT remains an
-    /// exact in-process A/B and compatibility path.
+    /// motion. Automatic selection uses Planar-DAT for shell-only scenes and
+    /// opt-in volumetric self-collision. Ordinary closed tet bodies retain the
+    /// lower-overhead isotropic OGC bound, including mixed shell + tet scenes.
+    /// The explicit modes are stable in-process A/B paths.
     public enum SurfaceTruncationMode: UInt32, Sendable {
         case isotropicDAT = 1
         case planarDAT = 2
+    }
+
+    /// How a scene chooses its concrete surface limiter. This is separate
+    /// from `SurfaceTruncationMode` so adding automatic policy does not add a
+    /// case to the established public enum and break exhaustive client
+    /// switches.
+    public enum SurfaceTruncationSelection: Sendable, Equatable {
+        case automatic
+        case explicit(SurfaceTruncationMode)
     }
 
     private static let jointMotorModeMask: UInt32 = 3 << 4
@@ -40,6 +51,8 @@ public final class GPUSolver {
     let numJoints: Int
     let numSprings: Int
     let numTets: Int
+    let hasAuthoredSurfaceTriangles: Bool
+    let hasVolumetricSelfCollision: Bool
     let maxPairs: Int
     let mapCapacity: Int
     let gridHashSize: Int
@@ -58,7 +71,35 @@ public final class GPUSolver {
     var isotropicElemCellSize: Float = 1
     var planarDATElemCellSize: Float = 1
 
-    public var surfaceTruncationMode: SurfaceTruncationMode = .planarDAT
+    public var surfaceTruncationSelection: SurfaceTruncationSelection = .automatic
+
+    /// Optional signed-volume limiter for tetrahedra. This is deliberately
+    /// independent of surface Planar-DAT: Newton applies Planar-DAT to
+    /// particle-surface V-T/E-E motion but does not enable the paper's
+    /// underspecified tet-inversion extension. Keeping this opt-in prevents a
+    /// mixed shell scene from silently changing its volumetric material path.
+    public var tetInversionPreventionEnabled = false
+
+    /// Backward-compatible explicit mode API. Assigning this property opts
+    /// out of automatic selection; reading it returns the effective mode.
+    public var surfaceTruncationMode: SurfaceTruncationMode {
+        get { effectiveSurfaceTruncationMode }
+        set { surfaceTruncationSelection = .explicit(newValue) }
+    }
+
+    /// Concrete surface limiter selected for the current scene. Selection is
+    /// structural rather than demo-name based, so imported scenes receive the
+    /// same policy as built-ins with equivalent topology.
+    public var effectiveSurfaceTruncationMode: SurfaceTruncationMode {
+        switch surfaceTruncationSelection {
+        case .automatic:
+            return hasVolumetricSelfCollision
+                || (hasAuthoredSurfaceTriangles && numTets == 0)
+                ? .planarDAT : .isotropicDAT
+        case .explicit(let mode):
+            return mode
+        }
+    }
 
     enum PlanarDATPassSite: Equatable {
         case predictor
@@ -144,12 +185,21 @@ public final class GPUSolver {
     // element candidate sets, plus the topology they propagate through.
     var vtTrackBuf, eeTrackBuf, triAdjBuf: MTLBuffer
     var clothVertFlag: MTLBuffer
+    /// Per-particle policy for collision with non-adjacent primitives in the
+    /// same connected deformable component. Thin shells enable this by
+    /// construction; tet bodies opt in through SceneTet.
+    var softSelfCollisionFlag: MTLBuffer
     var boundsBuf, ogcPrevBuf, ogcArgsBuf: MTLBuffer
     // Full compact V-T/E-E safety neighborhood used by Planar-DAT. Contact
     // emission consumes the same stream, so safety and force generation
     // cannot silently disagree about which nearby primitives exist.
     var planarDATPairsBuf, planarDATPairCountsBuf: MTLBuffer
     var planarDATTBuf, planarDATArgsBuf: MTLBuffer
+    // Accepted-pose Planar pairs indexed by participating particle. The
+    // fixed pair set is reused after every VBD color; this CSR prevents each
+    // color from rescanning the complete global pair stream.
+    var planarDATBodyCountBuf, planarDATBodyStartBuf: MTLBuffer
+    var planarDATBodyCursorBuf, planarDATBodyPairsBuf: MTLBuffer
     var nbr2Start, nbr2Count, nbr2List: MTLBuffer
     var vertEdgeStart, vertEdgeCount, vertEdgeList: MTLBuffer
     public private(set) var surfaceTriCount: Int = 0
@@ -207,14 +257,20 @@ public final class GPUSolver {
         "color_scatter",
         "color_validate",
         "dat_apply",
+        "dat_apply_color",
+        "dat_apply_tet_inversion",
         "dat_build_ee_pairs",
         "dat_build_vt_pairs",
         "dat_clear_element_grid",
         "dat_clear_pair_counts",
         "dat_emit_contacts",
         "dat_finalize_pairs",
+        "dat_incidence_count",
+        "dat_incidence_scatter",
         "dat_reanchor",
         "dat_reduce",
+        "dat_reduce_incident_color",
+        "dat_reduce_tet_inversion",
         "dat_restore_failed_surface",
         "diag_clear",
         "diag_error",
@@ -259,6 +315,10 @@ public final class GPUSolver {
     public private(set) var lastPlanarDATVertexTrianglePairs: Int = 0
     public private(set) var lastPlanarDATEdgeEdgePairs: Int = 0
     public private(set) var lastPlanarDATTruncations: Int = 0
+    public private(set) var lastPlanarDATVertexTriangleDegeneracies: Int = 0
+    public private(set) var lastPlanarDATEdgeEdgeDegeneracies: Int = 0
+    public private(set) var lastPlanarDATNonfiniteValues: Int = 0
+    public private(set) var lastPlanarDATTetDegeneracies: Int = 0
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
@@ -290,6 +350,10 @@ public final class GPUSolver {
         self.numJoints = scene.joints.count
         self.numSprings = scene.springs.count
         self.numTets = scene.tets.count
+        self.hasAuthoredSurfaceTriangles = !scene.tris.isEmpty
+        self.hasVolumetricSelfCollision = scene.tets.contains {
+            $0.selfCollisionEnabled
+        }
         let enabledColliderCount = scene.colliders.lazy.filter(\.collisionEnabled).count
         // Floor of 4096: small scenes are cheap (688B/slot) but elongated
         // shapes (jenga blocks) legitimately exceed 16 candidates/body, and
@@ -414,6 +478,7 @@ public final class GPUSolver {
         globalIdx = try makeBuf(numColliders * 4, "globalIdx")
         hashedRigidIdx = try makeBuf(numColliders * 4, "hashedRigidIdx")
         clothVertFlag = try makeBuf(nb * 4, "clothVertFlag")
+        softSelfCollisionFlag = try makeBuf(nb * 4, "softSelfCollisionFlag")
         boundsBuf = try makeBuf(nb * 4, "ogcBounds")
         ogcPrevBuf = try makeBuf(nb * 16, "ogcPrev")
         ogcArgsBuf = try makeBuf(3 * 4, "ogcArgs")
@@ -425,6 +490,11 @@ public final class GPUSolver {
             to: UInt32.self, capacity: nb
         ).initialize(repeating: Float(1).bitPattern, count: nb)
         planarDATArgsBuf = try makeBuf(3 * 4, "planarDATArgs")
+        planarDATBodyCountBuf = try makeBuf(nb * 4, "planarDATBodyCount")
+        planarDATBodyStartBuf = try makeBuf(nb * 4, "planarDATBodyStart")
+        planarDATBodyCursorBuf = try makeBuf(nb * 4, "planarDATBodyCursor")
+        planarDATBodyPairsBuf = try makeBuf(
+            maxPlanarDATPairs * 4 * 4, "planarDATBodyPairs")
         // 2-ring CSR sized after derivation below (~19/vertex upper bound)
         nbr2Start = try makeBuf(nb * 4, "nbr2Start")
         nbr2Count = try makeBuf(nb * 4, "nbr2Count")
@@ -600,11 +670,25 @@ public final class GPUSolver {
         public static func planarDATInvalidAnchor(
             frame: Int, offendingPairs: Int
         ) -> Self {
-            .commandExecution(
+            planarDATInvalidAnchor(
+                frame: frame, offendingPairs: offendingPairs,
+                vertexTriangle: 0, edgeEdge: 0, tet: 0, nonfinite: 0)
+        }
+
+        public static func planarDATInvalidAnchor(
+            frame: Int, offendingPairs: Int,
+            vertexTriangle: Int, edgeEdge: Int,
+            tet: Int, nonfinite: Int
+        ) -> Self {
+            let breakdown = "V-T coincident \(vertexTriangle), "
+                + "E-E degenerate \(edgeEdge), tet degenerate \(tet), "
+                + "non-finite \(nonfinite)"
+            return .commandExecution(
                 operation: "Planar-DAT safety validation", frame: frame,
                 status: 0, domain: planarDATFailureDomain,
                 code: planarDATInvalidAnchorCode,
-                message: "\(offendingPairs) Planar-DAT pairs had a coincident or non-finite collision anchor")
+                message: "\(offendingPairs) Planar-DAT anchors were invalid "
+                    + "(\(breakdown))")
         }
 
         public var errorDescription: String? {
@@ -1103,14 +1187,15 @@ public final class GPUSolver {
             let d0 = scene.bodies[t.ids.1].position - x0
             let d1 = scene.bodies[t.ids.2].position - x0
             let d2 = scene.bodies[t.ids.3].position - x0
-            let vol = abs(dot(d0, cross(d1, d2))) / 6
+            let signedSixVolume = dot(d0, cross(d1, d2))
+            let vol = abs(signedSixVolume) / 6
             let Dm = simd_float3x3(columns: (d0, d1, d2))
             let DmInv = Dm.inverse
             // rows of DmInv
             let r0 = F3(DmInv.columns.0.x, DmInv.columns.1.x, DmInv.columns.2.x)
             let r1 = F3(DmInv.columns.0.y, DmInv.columns.1.y, DmInv.columns.2.y)
             let r2 = F3(DmInv.columns.0.z, DmInv.columns.1.z, DmInv.columns.2.z)
-            g.r0 = SIMD4(r0, vol)
+            g.r0 = SIMD4(r0, signedSixVolume)
             g.r1 = SIMD4(r1, t.mu * vol)
             g.r2 = SIMD4(r2, t.lambda * vol)
             tp[i] = g
@@ -1357,7 +1442,10 @@ public final class GPUSolver {
         // broadphase in addition to V-T/E-E element contacts.
         let groupP = clothGroupBuf.contents().bindMemory(to: UInt32.self,
                                                          capacity: numBodies)
+        let selfCollisionP = softSelfCollisionFlag.contents().bindMemory(
+            to: UInt32.self, capacity: numBodies)
         for i in 0..<numBodies { groupP[i] = 0 }
+        for i in 0..<numBodies { selfCollisionP[i] = 0 }
         if !collTris.isEmpty {
             var parent: [Int: Int] = [:]
             func findCollisionRoot(_ x: Int) -> Int {
@@ -1373,6 +1461,21 @@ public final class GPUSolver {
                 parent[findCollisionRoot(b)] = r
                 parent[findCollisionRoot(c)] = r
             }
+            // Thin shells self-collide by default. Volumetric bodies do not:
+            // they already have internal elasticity and inversion protection,
+            // and their dense boundary-vs-boundary stream is useful only for
+            // assets that explicitly author self-collision. Inter-component
+            // soft contact remains unconditional in the pair kernels.
+            var selfCollisionRoots = Set<Int>()
+            for tri in scene.tris {
+                selfCollisionRoots.insert(findCollisionRoot(tri.ids.0))
+            }
+            for tet in scene.tets where tet.selfCollisionEnabled {
+                for id in [tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3]
+                    where parent[id] != nil {
+                    selfCollisionRoots.insert(findCollisionRoot(id))
+                }
+            }
             var groupIndex: [Int: UInt32] = [:]
             for (a, b, c) in collTris {
                 let root = findCollisionRoot(a)
@@ -1383,6 +1486,11 @@ public final class GPUSolver {
                 if scene.bodies[a].isParticle { groupP[a] = g }
                 if scene.bodies[b].isParticle { groupP[b] = g }
                 if scene.bodies[c].isParticle { groupP[c] = g }
+                let selfCollision = selfCollisionRoots.contains(root)
+                    ? UInt32(1) : UInt32(0)
+                if scene.bodies[a].isParticle { selfCollisionP[a] = selfCollision }
+                if scene.bodies[b].isParticle { selfCollisionP[b] = selfCollision }
+                if scene.bodies[c].isParticle { selfCollisionP[c] = selfCollision }
             }
             params.numSoftGroups = UInt32(groupIndex.count)
         }
@@ -1969,21 +2077,25 @@ public final class GPUSolver {
         params.collisionMargin = max(settings.collisionMargin, 0)
         params.rigidLinearDamping = max(settings.rigidLinearDamping, 0)
         params.rigidAngularDamping = max(settings.rigidAngularDamping, 0)
+        let effectiveTruncationMode = effectiveSurfaceTruncationMode
         params.surfaceTruncationMode = numParticles > 0
-            ? surfaceTruncationMode.rawValue : 0
+            ? effectiveTruncationMode.rawValue : 0
+        params.tetInversionPreventionEnabled =
+            effectiveTruncationMode == .planarDAT
+                && tetInversionPreventionEnabled ? 1 : 0
         params.maxPlanarDATPairs = UInt32(max(0, min(
             maxPlanarDATPairs,
             planarDATPairCapacityForTesting ?? maxPlanarDATPairs)))
-        params.numEdges = UInt32(surfaceTruncationMode == .planarDAT
+        params.numEdges = UInt32(effectiveTruncationMode == .planarDAT
             ? numPlanarDATEdges : numEdges)
-        params.elemCellSize = surfaceTruncationMode == .planarDAT
+        params.elemCellSize = effectiveTruncationMode == .planarDAT
             ? planarDATElemCellSize : isotropicElemCellSize
-        let selectedSoftCapacity = surfaceTruncationMode == .planarDAT
+        let selectedSoftCapacity = effectiveTruncationMode == .planarDAT
             ? maxSoft : maxIsotropicSoft
         params.maxSoft = UInt32(max(
             0, min(selectedSoftCapacity,
                    planarDATSoftCapacityForTesting ?? selectedSoftCapacity)))
-        params.softMapCapacity = UInt32(surfaceTruncationMode == .planarDAT
+        params.softMapCapacity = UInt32(effectiveTruncationMode == .planarDAT
             ? softMapCapacity : isotropicSoftMapCapacity)
 
         if let env = ProcessInfo.processInfo.environment["AVBD_ROD_DECAY"],
@@ -2089,6 +2201,7 @@ public final class GPUSolver {
     var deniedEncoderStageForTesting: String?
     var planarDATPairCapacityForTesting: Int?
     var planarDATSoftCapacityForTesting: Int?
+    var planarDATBodyIncidenceForTesting = false
     var planarDATPassObserverForTesting: ((PlanarDATPassSite) -> Void)?
     var completionFailureForTesting: ((String, Int) -> RuntimeFailure?)?
     var inflightCountForTesting: Int { inflight.count }
@@ -2672,6 +2785,14 @@ public final class GPUSolver {
         let planarDATInvalidAnchors = Int(
             ctr[GPUCounters.planarDATInvalidAnchors])
         let planarDATTruncations = Int(ctr[GPUCounters.planarDATTruncations])
+        let planarDATVTDegeneracies = Int(
+            ctr[GPUCounters.planarDATVertexTriangleDegeneracies])
+        let planarDATEEDegeneracies = Int(
+            ctr[GPUCounters.planarDATEdgeEdgeDegeneracies])
+        let planarDATNonfinite = Int(
+            ctr[GPUCounters.planarDATNonfiniteValues])
+        let planarDATTetDegeneracies = Int(
+            ctr[GPUCounters.planarDATTetDegeneracies])
 
         statsLock.lock()
         lastPairCandidates = pairCandidates
@@ -2682,6 +2803,10 @@ public final class GPUSolver {
         lastPlanarDATVertexTrianglePairs = planarDATVT
         lastPlanarDATEdgeEdgePairs = planarDATEE
         lastPlanarDATTruncations = planarDATTruncations
+        lastPlanarDATVertexTriangleDegeneracies = planarDATVTDegeneracies
+        lastPlanarDATEdgeEdgeDegeneracies = planarDATEEDegeneracies
+        lastPlanarDATNonfiniteValues = planarDATNonfinite
+        lastPlanarDATTetDegeneracies = planarDATTetDegeneracies
         if submission.usesDynamicColoring {
             var counts = [Int]()
             counts.reserveCapacity(AVBD_MAX_COLORS)
@@ -2719,7 +2844,11 @@ public final class GPUSolver {
         if planarDATInvalidAnchors > 0 {
             throw latch(.planarDATInvalidAnchor(
                 frame: submission.frame,
-                offendingPairs: planarDATInvalidAnchors))
+                offendingPairs: planarDATInvalidAnchors,
+                vertexTriangle: planarDATVTDegeneracies,
+                edgeEdge: planarDATEEDegeneracies,
+                tet: planarDATTetDegeneracies,
+                nonfinite: planarDATNonfinite))
         }
         if colorConflicts > 0 {
             throw latch(.unresolvedColoring(
@@ -3014,6 +3143,15 @@ public final class GPUSolver {
         var nExcl = numExclusions
         let isPlanarDAT = P.surfaceTruncationMode
             == SurfaceTruncationMode.planarDAT.rawValue
+        // Both kernels implement the same fixed-plane reduction. A global
+        // pair-parallel pass is cheaper for the 2-3 color palettes typical
+        // of thin shells; a body-incidence pass avoids rereading the stream
+        // across the 5-7 colors required by tetrahedral element cliques.
+        // Select from solver structure rather than demo names.
+        let usePlanarBodyIncidence = (staticUsedColors > 4
+            || planarDATBodyIncidenceForTesting)
+            && ProcessInfo.processInfo.environment[
+                "AVBD_DAT_GLOBAL_COLOR"] == nil
 
         func encodeElementGrid(_ encoder: MTLComputeCommandEncoder,
                                clearFirst: Bool) {
@@ -3075,7 +3213,8 @@ public final class GPUSolver {
                 encoder.setBuffer(self.nbrList, offset: 0, index: 8)
                 encoder.setBuffer(self.shape, offset: 0, index: 9)
                 encoder.setBuffer(self.clothGroupBuf, offset: 0, index: 10)
-                encoder.setBuffer(self.clothVertFlag, offset: 0, index: 11)
+                encoder.setBuffer(self.softSelfCollisionFlag, offset: 0,
+                                  index: 11)
                 encoder.setBuffer(self.planarDATPairsBuf, offset: 0, index: 12)
                 encoder.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 13)
                 encoder.setBuffer(self.counters, offset: 0, index: 14)
@@ -3101,7 +3240,8 @@ public final class GPUSolver {
                 encoder.setBuffer(self.nbrList, offset: 0, index: 8)
                 encoder.setBuffer(self.shape, offset: 0, index: 9)
                 encoder.setBuffer(self.clothGroupBuf, offset: 0, index: 10)
-                encoder.setBuffer(self.clothVertFlag, offset: 0, index: 11)
+                encoder.setBuffer(self.softSelfCollisionFlag, offset: 0,
+                                  index: 11)
                 encoder.setBuffer(self.planarDATPairsBuf, offset: 0, index: 12)
                 encoder.setBuffer(self.planarDATPairCountsBuf, offset: 0, index: 13)
                 encoder.setBuffer(self.counters, offset: 0, index: 14)
@@ -3159,6 +3299,48 @@ public final class GPUSolver {
                                                depth: 1))
         }
 
+        func encodePlanarIncidence(_ encoder: MTLComputeCommandEncoder) {
+            var bodyCount = UInt32(numBodies)
+            dispatch1D(encoder, "adj_clear_degrees", numBodies) { e in
+                e.setBuffer(self.planarDATBodyCountBuf, offset: 0, index: 0)
+                e.setBytes(&bodyCount, length: 4, index: 1)
+            }
+            encoder.setComputePipelineState(ps("dat_incidence_count"))
+            encoder.setBuffer(planarDATPairsBuf, offset: 0, index: 0)
+            encoder.setBuffer(planarDATPairCountsBuf, offset: 0, index: 1)
+            encoder.setBuffer(planarDATBodyCountBuf, offset: 0, index: 2)
+            encoder.setBuffer(trisBuf, offset: 0, index: 3)
+            encoder.setBuffer(edgesBuf, offset: 0, index: 4)
+            encoder.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                             index: 5)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: planarDATArgsBuf,
+                indirectBufferOffset: 0,
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                               depth: 1))
+            encodeScan(encoder, input: planarDATBodyCountBuf,
+                       output: planarDATBodyStartBuf, count: numBodies)
+            dispatch1D(encoder, "adj_copy_cursor", numBodies) { e in
+                e.setBuffer(self.planarDATBodyStartBuf, offset: 0, index: 0)
+                e.setBuffer(self.planarDATBodyCursorBuf, offset: 0, index: 1)
+                e.setBytes(&bodyCount, length: 4, index: 2)
+            }
+            encoder.setComputePipelineState(ps("dat_incidence_scatter"))
+            encoder.setBuffer(planarDATPairsBuf, offset: 0, index: 0)
+            encoder.setBuffer(planarDATPairCountsBuf, offset: 0, index: 1)
+            encoder.setBuffer(planarDATBodyCursorBuf, offset: 0, index: 2)
+            encoder.setBuffer(planarDATBodyPairsBuf, offset: 0, index: 3)
+            encoder.setBuffer(trisBuf, offset: 0, index: 4)
+            encoder.setBuffer(edgesBuf, offset: 0, index: 5)
+            encoder.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                             index: 6)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: planarDATArgsBuf,
+                indirectBufferOffset: 0,
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                               depth: 1))
+        }
+
         func encodeSoftContactMap(_ encoder: MTLComputeCommandEncoder) {
             dispatch1D(encoder, "soft_finalize", 1) { e in
                 e.setBuffer(self.counters, offset: 0, index: 0)
@@ -3186,8 +3368,11 @@ public final class GPUSolver {
 
         func encodePlanarPass(_ encoder: MTLComputeCommandEncoder,
                               pairs: MTLBuffer,
-                              pairCounts: MTLBuffer) {
-            let reducePSO = ps("dat_reduce")
+                              pairCounts: MTLBuffer,
+                              activeColor: Int? = nil) {
+            let reducePSO = ps(activeColor == nil
+                || !usePlanarBodyIncidence
+                ? "dat_reduce" : "dat_reduce_incident_color")
             encoder.setComputePipelineState(reducePSO)
             encoder.setBuffer(pairs, offset: 0, index: 0)
             encoder.setBuffer(posLin, offset: 0, index: 1)
@@ -3199,12 +3384,61 @@ public final class GPUSolver {
             encoder.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
                              index: 7)
             encoder.setBuffer(counters, offset: 0, index: 8)
-            encoder.dispatchThreadgroups(
-                indirectBuffer: planarDATArgsBuf,
-                indirectBufferOffset: 0,
-                threadsPerThreadgroup: MTLSize(width: 64, height: 1,
-                                               depth: 1))
-            dispatch1D(encoder, "dat_apply", numParticles) { e in
+            if let activeColor {
+                var color = UInt32(activeColor)
+                if usePlanarBodyIncidence {
+                    encoder.setBuffer(self.colorList, offset: 0, index: 9)
+                    encoder.setBuffer(self.colorStart, offset: 0, index: 10)
+                    encoder.setBytes(&color, length: 4, index: 11)
+                    encoder.setBuffer(self.planarDATBodyStartBuf, offset: 0,
+                                      index: 12)
+                    encoder.setBuffer(self.planarDATBodyCountBuf, offset: 0,
+                                      index: 13)
+                    encoder.setBuffer(self.planarDATBodyPairsBuf, offset: 0,
+                                      index: 14)
+                    let threads = self.lastColorCounts[activeColor] * 8
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: (threads + 63) / 64,
+                                height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                                       depth: 1))
+                } else {
+                    encoder.setBuffer(colorsA, offset: 0, index: 9)
+                    encoder.setBytes(&color, length: 4, index: 10)
+                    encoder.dispatchThreadgroups(
+                        indirectBuffer: planarDATArgsBuf,
+                        indirectBufferOffset: 0,
+                        threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                                       depth: 1))
+                }
+                encoder.setComputePipelineState(ps("dat_apply_color"))
+                encoder.setBuffer(self.posLin, offset: 0, index: 0)
+                encoder.setBuffer(self.ogcPrevBuf, offset: 0, index: 1)
+                encoder.setBuffer(self.colorList, offset: 0, index: 2)
+                encoder.setBuffer(self.colorStart, offset: 0, index: 3)
+                encoder.setBuffer(self.clothGroupBuf, offset: 0, index: 4)
+                encoder.setBuffer(self.planarDATTBuf, offset: 0, index: 5)
+                encoder.setBuffer(pairCounts, offset: 0, index: 6)
+                encoder.setBuffer(self.counters, offset: 0, index: 7)
+                encoder.setBytes(&P,
+                                 length: MemoryLayout<SimParamsGPU>.stride,
+                                 index: 8)
+                encoder.setBytes(&color, length: 4, index: 9)
+                encoder.dispatchThreadgroups(
+                    indirectBuffer: self.colorArgs,
+                    indirectBufferOffset: activeColor * 12,
+                    threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                                   depth: 1))
+            } else {
+                encoder.setBuffer(colorsA, offset: 0, index: 9)
+                var fullPass = UInt32.max
+                encoder.setBytes(&fullPass, length: 4, index: 10)
+                encoder.dispatchThreadgroups(
+                    indirectBuffer: planarDATArgsBuf,
+                    indirectBufferOffset: 0,
+                    threadsPerThreadgroup: MTLSize(width: 64, height: 1,
+                                                   depth: 1))
+                dispatch1D(encoder, "dat_apply", numParticles) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.ogcPrevBuf, offset: 0, index: 1)
                 e.setBuffer(self.particleIdxBuf, offset: 0, index: 2)
@@ -3213,6 +3447,31 @@ public final class GPUSolver {
                 e.setBuffer(self.counters, offset: 0, index: 5)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
                            index: 6)
+                }
+            }
+        }
+
+        func encodeTetPredictorInversion(
+            _ encoder: MTLComputeCommandEncoder
+        ) {
+            guard numTets > 0 else { return }
+            dispatch1D(encoder, "dat_reduce_tet_inversion", numTets) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.initLin, offset: 0, index: 1)
+                e.setBuffer(self.tets, offset: 0, index: 2)
+                e.setBuffer(self.planarDATTBuf, offset: 0, index: 3)
+                e.setBuffer(self.counters, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 5)
+            }
+            dispatch1D(encoder, "dat_apply_tet_inversion", numBodies) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.initLin, offset: 0, index: 1)
+                e.setBuffer(self.shape, offset: 0, index: 2)
+                e.setBuffer(self.planarDATTBuf, offset: 0, index: 3)
+                e.setBuffer(self.counters, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 5)
             }
         }
 
@@ -3492,6 +3751,14 @@ public final class GPUSolver {
         }
 
         if isPlanarDAT {
+            // The predictor moves all tet vertices concurrently, so protect
+            // signed volume with exact cubic trajectory isolation before the
+            // surface pair pass. Colored VBD updates use a cheaper affine
+            // signed-volume line limit because one tet vertex moves at a
+            // time under the static topology coloring.
+            if P.tetInversionPreventionEnabled != 0 {
+                encodeTetPredictorInversion(enc)
+            }
             // Start from the exact rq neighborhood. Since the predictor caps
             // each side to R=0.5*gamma*rq, a pair outside this query cannot
             // close its positive gap before the accepted-pose query below.
@@ -3510,6 +3777,8 @@ public final class GPUSolver {
             encodeElementGrid(enc, clearFirst: true)
             try stage("dat-accepted-pairs")
             encodePlanarPairBuild(enc)
+            try stage("dat-incidence")
+            encodePlanarIncidence(enc)
             try stage("vt-ee-emit")
             encodePlanarContacts(
                 enc, pairs: planarDATPairsBuf,
@@ -3834,11 +4103,12 @@ public final class GPUSolver {
                     planarDATPassObserverForTesting?(passSite)
                     encodePlanarPass(
                         enc, pairs: planarDATPairsBuf,
-                        pairCounts: planarDATPairCountsBuf)
+                        pairCounts: planarDATPairCountsBuf,
+                        activeColor: c)
                     if c + 1 < colorBound {
-                        // DAT reuses the low slots through index 8. Restore
-                        // every overwritten primal binding before the next
-                        // color; the higher bindings and cIdx stay intact.
+                        // Body-local DAT reuses the primal slots through 14.
+                        // Restore every overwritten binding before the next
+                        // color; cIdx and the higher bindings stay intact.
                         enc.setComputePipelineState(primalPSO)
                         enc.setBuffer(posLin, offset: 0, index: 0)
                         enc.setBuffer(posAng, offset: 0, index: 1)
@@ -3849,6 +4119,12 @@ public final class GPUSolver {
                         enc.setBuffer(props, offset: 0, index: 6)
                         enc.setBuffer(joints, offset: 0, index: 7)
                         enc.setBuffer(springs, offset: 0, index: 8)
+                        enc.setBuffer(manifolds, offset: 0, index: 9)
+                        enc.setBuffer(adjStart, offset: 0, index: 10)
+                        enc.setBuffer(degrees, offset: 0, index: 11)
+                        enc.setBuffer(adjList, offset: 0, index: 12)
+                        enc.setBuffer(colorList, offset: 0, index: 13)
+                        enc.setBuffer(colorStart, offset: 0, index: 14)
                     }
                 }
             }
@@ -3893,6 +4169,10 @@ public final class GPUSolver {
                 enc.setBuffer(nbr2Start, offset: 0, index: 12)
                 enc.setBuffer(nbr2Count, offset: 0, index: 13)
                 enc.setBuffer(nbr2List, offset: 0, index: 14)
+                enc.setBuffer(velLin, offset: 0, index: 15)
+                enc.setBuffer(shape, offset: 0, index: 16)
+                enc.setBuffer(clothGroupBuf, offset: 0, index: 17)
+                enc.setBuffer(clothVertFlag, offset: 0, index: 18)
                 enc.dispatchThreadgroups(indirectBuffer: ogcArgsBuf,
                                          indirectBufferOffset: 0,
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
@@ -3902,10 +4182,10 @@ public final class GPUSolver {
         }
         try stage("finalize")
         if isPlanarDAT {
-            dispatch1D(enc, "dat_restore_failed_surface", numParticles) { e in
+            dispatch1D(enc, "dat_restore_failed_surface", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.initLin, offset: 0, index: 1)
-                e.setBuffer(self.particleIdxBuf, offset: 0, index: 2)
+                e.setBuffer(self.shape, offset: 0, index: 2)
                 e.setBuffer(self.counters, offset: 0, index: 3)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
                            index: 4)
