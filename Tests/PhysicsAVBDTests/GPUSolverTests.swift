@@ -325,6 +325,20 @@ final class GPUSolverTests: XCTestCase {
         }
     }
 
+    func testLargeUIStackRepairsDynamicColoringAcrossContactChanges() throws {
+        var scene = try XCTUnwrap(Demos.make("stack", scale: 4))
+        _ = scene.addDragSlot()
+        let solver = try makeGPU(scene)
+
+        for _ in 0..<120 {
+            try solver.submitStep()
+            try solver.synchronize()
+        }
+
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertLessThan(solver.lastMaxColorUsed, AVBD_MAX_COLORS)
+    }
+
     func testStaticColorPaletteExhaustionFailsDuringInitialization() throws {
         var scene = PhysicsScene(name: "static-color-capacity")
         scene.settings.gravity = 0

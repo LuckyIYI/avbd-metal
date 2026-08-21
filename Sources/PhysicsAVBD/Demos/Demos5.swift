@@ -80,7 +80,8 @@ extension Demos {
                              nx: Int, ny: Int, nz: Int, spacing: Float,
                              mu: Float = 3000, lambda: Float = 30000,
                              massPerNode: Float = 0.05,
-                             friction: Float = 0.8) -> [Int] {
+                             friction: Float = 0.8,
+                             selfCollisionEnabled: Bool = false) -> [Int] {
         var ids = [[[Int]]](repeating: [[Int]](repeating: [Int](repeating: -1, count: nz),
                                                count: ny), count: nx)
         let half = F3(Float(nx - 1), Float(ny - 1), Float(nz - 1)) * spacing / 2
@@ -97,7 +98,8 @@ extension Demos {
             }
         }
         func tet(_ a: Int, _ b: Int, _ c: Int, _ d: Int) {
-            s.addTet(SceneTet(ids: (a, b, c, d), mu: mu, lambda: lambda))
+            s.addTet(SceneTet(ids: (a, b, c, d), mu: mu, lambda: lambda,
+                              selfCollisionEnabled: selfCollisionEnabled))
         }
         for i in 0..<(nx - 1) {
             for j in 0..<(ny - 1) {

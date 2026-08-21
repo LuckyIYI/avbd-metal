@@ -75,7 +75,7 @@ EXPECTED_TARGET_TYPES = {
 
 EXPECTED_RESOURCES = {
     **{name: frozenset() for name in EXPECTED_TARGET_DEPENDENCIES},
-    "PhysicsAVBD": frozenset({"copy:Shaders"}),
+    "PhysicsAVBD": frozenset({"copy:Shaders", "copy:Assets"}),
     "Robotics": frozenset({"copy:Assets"}),
 }
 
@@ -479,9 +479,10 @@ def verify_resource_layout(root: Path | str) -> None:
     root = Path(root).resolve()
     sources = root / "Sources"
     shader_root = sources / "PhysicsAVBD" / "Shaders"
-    asset_root = sources / "Robotics" / "Assets"
+    physics_asset_root = sources / "PhysicsAVBD" / "Assets"
+    robotics_asset_root = sources / "Robotics" / "Assets"
 
-    for resource_root in (shader_root, asset_root):
+    for resource_root in (shader_root, physics_asset_root, robotics_asset_root):
         if not resource_root.is_dir():
             raise VerificationError(
                 f"missing owned resource directory {resource_root.relative_to(root)}"
@@ -508,10 +509,13 @@ def verify_resource_layout(root: Path | str) -> None:
                 f"{path.relative_to(root)}: shader resources belong to "
                 "Sources/PhysicsAVBD/Shaders"
             )
-        if in_asset_directory and not _is_beneath(path, asset_root):
+        if in_asset_directory and not (
+            _is_beneath(path, physics_asset_root)
+            or _is_beneath(path, robotics_asset_root)
+        ):
             raise VerificationError(
-                f"{path.relative_to(root)}: simulator/robot assets belong to "
-                "Sources/Robotics/Assets"
+                f"{path.relative_to(root)}: runtime assets belong to their owning "
+                "target's Assets directory"
             )
 
 

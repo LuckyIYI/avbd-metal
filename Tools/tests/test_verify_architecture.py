@@ -64,7 +64,7 @@ def valid_manifest() -> dict[str, object]:
         target(
             "PhysicsAVBD",
             [target_dependency("SimCore")],
-            resources=[resource("Shaders")],
+            resources=[resource("Shaders"), resource("Assets")],
         ),
         target(
             "Robotics",
@@ -164,6 +164,7 @@ def create_valid_sources(root: Path) -> None:
         "\n".join(f"import {name}" for name in architecture.LAYER_TARGETS) + "\n",
     )
     write(root, "Sources/PhysicsAVBD/Shaders/solver.metal", "kernel void solve() {}\n")
+    write(root, "Sources/PhysicsAVBD/Assets/bunny.obj", "o bunny\n")
     write(root, "Sources/Robotics/Assets/robot.xml", "<mujoco/>\n")
 
 
@@ -215,12 +216,10 @@ class ManifestVerificationTests(unittest.TestCase):
 
     def test_wrong_resource_owner_is_rejected_in_manifest(self) -> None:
         manifest = valid_manifest()
-        robotics = find_target(manifest, "Robotics")
-        robotics["resources"] = []
         physics = find_target(manifest, "PhysicsAVBD")
         resources = physics["resources"]
         assert isinstance(resources, list)
-        resources.append(resource("Assets"))
+        resources.append(resource("Models"))
 
         with self.assertRaisesRegex(
             architecture.VerificationError, r"target PhysicsAVBD resources"
@@ -409,7 +408,7 @@ class SourceAndResourceVerificationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             architecture.VerificationError,
-            r"RL/Assets/robot.xml: simulator/robot assets belong to",
+            r"RL/Assets/robot.xml: runtime assets belong to",
         ):
             architecture.verify_resource_layout(self.root)
 

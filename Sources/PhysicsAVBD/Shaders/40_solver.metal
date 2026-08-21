@@ -386,6 +386,61 @@ kernel void color_iterate(
     }
 }
 
+// Complete an unfinished parallel coloring deterministically. A synchronous
+// ordered relaxation can require one pass per graph hop (a tall stack is the
+// canonical case), so the bounded parallel phase above is only an optimizer.
+// This single-thread greedy sweep is conditional on the final pass changing
+// and provides the exact correctness boundary before color_validate.
+kernel void color_repair_greedy(
+    device const float4* posLin     [[buffer(0)]],
+    device const JointGPU* joints   [[buffer(1)]],
+    device const SpringGPU* springs [[buffer(2)]],
+    device const ManifoldGPU* manifolds [[buffer(3)]],
+    device const uint* adjStart     [[buffer(4)]],
+    device const uint* adjCount     [[buffer(5)]],
+    device const uint* adjList      [[buffer(6)]],
+    device uint* colors             [[buffer(7)]],
+    device const atomic_uint* changedFlag [[buffer(8)]],
+    constant SimParams& P           [[buffer(9)]],
+    device const TetGPU* tets       [[buffer(10)]],
+    device const SoftContactGPU* soft [[buffer(11)]],
+    device const MembraneGPU* membranes [[buffer(12)]],
+    device const BendGPU* bends     [[buffer(13)]],
+    constant uint& finalPass        [[buffer(14)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid != 0u ||
+        atomic_load_explicit(&changedFlag[finalPass],
+                             memory_order_relaxed) == 0u) return;
+
+    for (uint self = 0; self < P.numBodies; self++) {
+        if (posLin[self].w <= 0.0f) {
+            colors[self] = 0u;
+            continue;
+        }
+        uint maskLo = 0u, maskHi = 0u;
+        uint allLo = 0u, allHi = 0u;
+        bool conflict = false;
+        uint s = adjStart[self], e = s + adjCount[self];
+        for (uint k = s; k < e; k++) {
+            neighborColors(joints, springs, manifolds, tets, soft,
+                           membranes, bends, posLin, colors,
+                           adjList[k], self, colors[self], maskLo, maskHi,
+                           allLo, allHi, conflict);
+        }
+        uint freeLo = ~maskLo;
+        if (freeLo != 0u) {
+            colors[self] = ctz(freeLo);
+        } else {
+            uint freeHi = ~maskHi;
+            // Keeping the last color when all 64 are occupied deliberately
+            // leaves a conflict for color_validate to report fail-closed.
+            colors[self] = freeHi != 0u
+                ? 32u + ctz(freeHi) : uint(MAX_COLORS - 1);
+        }
+    }
+}
+
 // Verify the final dynamic palette instead of trusting a fixed iteration
 // count. Each conflicting edge is reported once by its larger body id. A
 // conflict means same-color primal updates would race and the frame is not a
@@ -964,6 +1019,63 @@ inline void stampTet(device const TetGPU& t, uint self,
     acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(g, g), lamV));
 }
 
+// Exact signed-J line limit for a colored tet update. Graph coloring gives
+// every vertex of one tet a distinct color, so only `self` moves during this
+// call and J is affine in dx. This is much cheaper than rescanning every tet
+// after every color and closes the inversion gap left by surface-only DAT.
+inline float tetInversionSafeFraction(
+    device const TetGPU& t, uint self,
+    device const float4* posLin, float3 dx, float gamma,
+    device atomic_uint* counters)
+{
+    float3 x0 = posLin[t.ids.x].xyz;
+    float3 d0 = posLin[t.ids.y].xyz - x0;
+    float3 d1 = posLin[t.ids.z].xyz - x0;
+    float3 d2 = posLin[t.ids.w].xyz - x0;
+    float restSixVolume = t.r0.w;
+    float restSign = restSixVolume < 0.0f ? -1.0f : 1.0f;
+    float currentSixVolume = dot(d0, cross(d1, d2));
+    float3 g1 = cross(d1, d2);
+    float3 g2 = cross(d2, d0);
+    float3 g3 = cross(d0, d1);
+    float3 g;
+    if (self == t.ids.y)      g = g1;
+    else if (self == t.ids.z) g = g2;
+    else if (self == t.ids.w) g = g3;
+    else                      g = -(g1 + g2 + g3);
+    float signedVolume = restSign * currentSixVolume;
+    float q = restSign * dot(g, dx);
+    if (!finite_bits(restSixVolume) || abs(restSixVolume) < 1.0e-20f
+        || !finite_bits(signedVolume) || !finite3(g) || !finite_bits(q)) {
+        atomic_fetch_add_explicit(&counters[CTR_DAT_INVALID_ANCHOR], 1u,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&counters[CTR_DAT_NONFINITE], 1u,
+                                  memory_order_relaxed);
+        return 0.0f;
+    }
+    // Match the predictor's positive-volume floor. A shared threshold keeps
+    // accepted prediction and colored local solves on the same side of the
+    // inversion boundary.
+    if (signedVolume <= 0.0f) {
+        atomic_fetch_add_explicit(&counters[CTR_DAT_INVALID_ANCHOR], 1u,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&counters[CTR_DAT_TET_DEGENERATE], 1u,
+                                  memory_order_relaxed);
+        return 0.0f;
+    }
+    float minVolume = abs(restSixVolume) * 1.0e-4f;
+    if (signedVolume <= minVolume) {
+        // Positive, highly compressed tets are recoverable. Permit an
+        // expanding color update, but never let this update compress them
+        // farther. Predictor telemetry records that the conditioning floor
+        // was active without turning it into a terminal collision failure.
+        return q > 0.0f ? 1.0f : 0.0f;
+    }
+    if (q >= 0.0f || signedVolume + q > minVolume) return 1.0f;
+    float hit = (signedVolume - minVolume) / (-q);
+    return clamp(min(gamma * hit, hit - 1.0e-3f), 0.0f, 1.0f);
+}
+
 // StVK triangle membrane with a Gauss-Newton per-vertex Hessian.
 //   Psi = mu ||E||_F^2 + lambda/2 tr(E)^2,  E = (F^T F - I)/2  (2x2)
 // Forces are exact (P = F S, S = 2 mu E + lambda tr(E) I); the Hessian
@@ -1357,6 +1469,20 @@ static inline void primal_one(
     float maxLin = 0.35f * fabs(shape[body].w);
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
+    if (shape[body].w < 0.0f
+        && P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        && P.tetInversionPreventionEnabled != 0u) {
+        float tetT = 1.0f;
+        for (uint k = as; k < ae; ++k) {
+            uint entry = adjList[k];
+            if ((entry >> ADJ_KIND_SHIFT) == FK_TET) {
+                tetT = min(tetT, tetInversionSafeFraction(
+                    tets[entry & ADJ_INDEX_MASK], body, posLin, dxLin,
+                    P.planarDATRelaxation, ogcCounters));
+            }
+        }
+        dxLin *= tetT;
+    }
     float ang2 = dot(dxAng, dxAng);
     const float maxAng = 0.5f;              // ~29 deg per iteration
     if (ang2 > maxAng * maxAng) dxAng *= maxAng * rsqrt(ang2);
@@ -1534,6 +1660,20 @@ kernel void primal_particles_split(
     float maxLin = 0.35f * fabs(shape[body].w);
     float lin2 = dot(dxLin, dxLin);
     if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
+    if (!rigid
+        && P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        && P.tetInversionPreventionEnabled != 0u) {
+        float tetT = 1.0f;
+        for (uint k = 0u; k < cnt; ++k) {
+            uint entry = adjList[as + k];
+            if ((entry >> ADJ_KIND_SHIFT) == FK_TET) {
+                tetT = min(tetT, tetInversionSafeFraction(
+                    tets[entry & ADJ_INDEX_MASK], body, posLin, dxLin,
+                    P.planarDATRelaxation, ogcCounters));
+            }
+        }
+        dxLin *= tetT;
+    }
     if (!rigid && P.numTris > 0u
         && P.surfaceTruncationMode == SURFACE_TRUNCATION_ISOTROPIC) {
         dxLin = ogcTruncate(dxLin, pl.xyz, ogcPrev[body].xyz,

@@ -69,6 +69,29 @@ final class PlanarDATTests: XCTestCase {
         return (scene, target.triangle, source.vertices)
     }
 
+    private func highColorPlanarScene() -> PhysicsScene {
+        var scene = PhysicsScene(name: "high-color-planar-incidence")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 1
+        let positions = [
+            F3(0, 0, 0), F3(1, 0, 0), F3(0, 1, 0), F3(0, 0, 1),
+            F3(2, 2, 2),
+        ]
+        let ids = positions.map {
+            scene.addParticle(radius: 0.01, mass: 1, friction: 0,
+                              position: $0)
+        }
+        scene.addTet(SceneTet(
+            ids: (ids[0], ids[1], ids[2], ids[3]),
+            mu: 100, lambda: 1_000, selfCollisionEnabled: true))
+        for id in ids.prefix(4) {
+            scene.addSpring(SceneSpring(
+                bodyA: id, bodyB: ids[4], rA: .zero, rB: .zero,
+                stiffness: 1))
+        }
+        return scene
+    }
+
     private func sharedPositions(_ solver: GPUSolver) -> UnsafeMutablePointer<SIMD4<Float>> {
         solver.posLin.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: solver.numBodies)
@@ -279,7 +302,7 @@ final class PlanarDATTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(solver.lastPlanarDATTruncations, 3)
     }
 
-    func testSameConnectedSolidVertexTrianglePairsAreSafetyOnly() throws {
+    func testDisabledSameComponentSelfCollisionIsExcluded() throws {
         let fixture = twoTriangleScene(
             sourceHeight: 0.03, sourceVelocity: .zero)
         let solver = try GPUSolver(scene: fixture.scene)
@@ -289,23 +312,40 @@ final class PlanarDATTests: XCTestCase {
         // connected volumetric solid rather than two cloth components.
         let groups = solver.clothGroupBuf.contents().bindMemory(
             to: UInt32.self, capacity: solver.numBodies)
-        let cloth = solver.clothVertFlag.contents().bindMemory(
+        let selfCollision = solver.softSelfCollisionFlag.contents().bindMemory(
             to: UInt32.self, capacity: solver.numBodies)
         let target = fixture.scene.tris[fixture.target].ids
         for vertex in fixture.source + [target.0, target.1, target.2] {
             groups[vertex] = 7
-            cloth[vertex] = 0
+            selfCollision[vertex] = 0
+        }
+
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertTrue(planarPairs(solver).isEmpty)
+        XCTAssertEqual(solver.lastPlanarDATPairs, 0)
+    }
+
+    func testEnabledSameComponentUsesSharedForceAndSafetyPair() throws {
+        let fixture = twoTriangleScene(
+            sourceHeight: 0.03, sourceVelocity: .zero)
+        let solver = try GPUSolver(scene: fixture.scene)
+        let groups = solver.clothGroupBuf.contents().bindMemory(
+            to: UInt32.self, capacity: solver.numBodies)
+        let selfCollision = solver.softSelfCollisionFlag.contents().bindMemory(
+            to: UInt32.self, capacity: solver.numBodies)
+        let target = fixture.scene.tris[fixture.target].ids
+        for vertex in fixture.source + [target.0, target.1, target.2] {
+            groups[vertex] = 7
+            selfCollision[vertex] = 1
         }
 
         try solver.submitStep()
         try solver.synchronize()
         let pairs = planarPairs(solver).filter { $0.x == 0 }
-        XCTAssertFalse(
-            pairs.isEmpty,
-            "expected same-solid V-T safety pairs; peak=\(solver.lastPlanarDATPairs) "
-                + "VT=\(solver.lastPlanarDATVertexTrianglePairs)")
-        XCTAssertTrue(pairs.allSatisfy { $0.w == 1 },
-                      "same-solid V-T pairs must truncate without OGC force")
+        XCTAssertFalse(pairs.isEmpty)
+        XCTAssertTrue(pairs.allSatisfy { $0.w == 3 },
+                      "enabled self-contact must feed both OGC and DAT")
     }
 
     func testFullPairStreamKeepsSixVertexTrianglePairsForOneVertex() throws {
@@ -629,7 +669,7 @@ final class PlanarDATTests: XCTestCase {
                 return XCTFail("unexpected error: \(error)")
             }
             XCTAssertEqual(frame, 1)
-            XCTAssertTrue(message.contains("Planar-DAT pairs"))
+            XCTAssertTrue(message.contains("non-finite"))
         }
 
         let positions = sharedPositions(solver)
@@ -660,10 +700,60 @@ final class PlanarDATTests: XCTestCase {
         XCTAssertEqual(observed, expected)
     }
 
+    func testAcceptedPairIncidenceMatchesExactParticipants() throws {
+        var scene = Demos.twist(res: 20)
+        scene.settings.iterations = 2
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertFalse(
+            solver.hasPlanarDATBodyIncidenceStorage,
+            "a low-color shell must not allocate the full incidence list")
+        XCTAssertEqual(solver.planarDATBodyPairsBuf.length, 16)
+        try solver.enablePlanarDATBodyIncidenceForTesting()
+        XCTAssertTrue(solver.hasPlanarDATBodyIncidenceStorage)
+        XCTAssertEqual(
+            solver.planarDATBodyPairsBuf.length,
+            solver.maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
+        for _ in 0..<12 { try solver.submitStep() }
+        try solver.synchronize()
+
+        let pairs = planarPairs(solver)
+        let triangles = solver.trisBuf.contents().bindMemory(
+            to: SIMD4<UInt32>.self, capacity: max(1, solver.numTris))
+        let edges = solver.edgesBuf.contents().bindMemory(
+            to: SIMD2<UInt32>.self,
+            capacity: max(1, solver.numPlanarDATEdges))
+        var expected = [[UInt32]](repeating: [], count: solver.numBodies)
+        for (index, pair) in pairs.enumerated() where pair.w & 1 != 0 {
+            let ids: [UInt32]
+            if pair.x == 0 {
+                let tri = triangles[Int(pair.z)]
+                ids = [pair.y, tri.x, tri.y, tri.z]
+            } else {
+                let a = edges[Int(pair.y)], b = edges[Int(pair.z)]
+                ids = [a.x, a.y, b.x, b.y]
+            }
+            for id in ids { expected[Int(id)].append(UInt32(index)) }
+        }
+        let counts = solver.planarDATBodyCountBuf.contents().bindMemory(
+            to: UInt32.self, capacity: solver.numBodies)
+        let starts = solver.planarDATBodyStartBuf.contents().bindMemory(
+            to: UInt32.self, capacity: solver.numBodies)
+        let list = solver.planarDATBodyPairsBuf.contents().bindMemory(
+            to: UInt32.self, capacity: 4 * solver.maxPlanarDATPairs)
+        for body in 0..<solver.numBodies {
+            let count = Int(counts[body])
+            let start = Int(starts[body])
+            let actual = Array(UnsafeBufferPointer(
+                start: list + start, count: count)).sorted()
+            XCTAssertEqual(actual, expected[body].sorted(), "body \(body)")
+        }
+    }
+
     func testPerColorDATRestoresAllPrimalBindings() throws {
         var scene = Demos.clothfold(res: 36)
         scene.settings.iterations = 10
         let solver = try GPUSolver(scene: scene)
+        try solver.enablePlanarDATBodyIncidenceForTesting()
         XCTAssertGreaterThanOrEqual(solver.staticUsedColors, 2)
 
         try solver.submitStep()
@@ -884,7 +974,7 @@ final class PlanarDATTests: XCTestCase {
         XCTAssertGreaterThan(positions[source.vertices[1]].z, 0.01)
     }
 
-    func testIntersectingEdgeAnchorFailsClosed() throws {
+    func testIntersectingEdgeAnchorUsesConservativeFallback() throws {
         var scene = PhysicsScene(name: "planar-dat-invalid-ee-anchor")
         scene.settings.dt = 1
         scene.settings.gravity = 0
@@ -900,20 +990,323 @@ final class PlanarDATTests: XCTestCase {
         solver.params.planarDATQueryRadius = 0.3
 
         try solver.submitStep()
-        XCTAssertThrowsError(try solver.synchronize()) { error in
-            guard case let GPUSolver.RuntimeFailure.commandExecution(
-                _, frame, _, domain, code, message) = error,
-                  domain == GPUSolver.RuntimeFailure.planarDATFailureDomain,
-                  code == GPUSolver.RuntimeFailure.planarDATInvalidAnchorCode else {
-                return XCTFail("unexpected error: \(error)")
-            }
-            XCTAssertEqual(frame, 1)
-            XCTAssertTrue(message.contains("Planar-DAT pairs"))
-        }
+        try solver.synchronize()
         let positions = sharedPositions(solver)
         for v in source.vertices {
             XCTAssertEqual(positions[v].z, 0, accuracy: 1e-6)
         }
+        XCTAssertGreaterThan(solver.lastPlanarDATEdgeEdgeDegeneracies, 0)
+        XCTAssertEqual(solver.lastPlanarDATNonfiniteValues, 0)
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
+    func testTetPredictorCannotInvertSignedVolume() throws {
+        var scene = PhysicsScene(name: "planar-dat-tet-predictor")
+        scene.settings.dt = 1
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        let p0 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 0, 0))
+        let p1 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(1, 0, 0))
+        let p2 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 1, 0))
+        let p3 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 0, 1), velocity: F3(0, 0, -2))
+        scene.addTet(SceneTet(
+            ids: (p0, p1, p2, p3), mu: 100, lambda: 1_000))
+        let solver = try GPUSolver(scene: scene)
+        solver.surfaceTruncationMode = .planarDAT
+        solver.tetInversionPreventionEnabled = true
+
+        try solver.submitStep()
+        try solver.synchronize()
+
+        let positions = sharedPositions(solver)
+        let a = position(positions, UInt32(p0))
+        let b = position(positions, UInt32(p1))
+        let c = position(positions, UInt32(p2))
+        let d = position(positions, UInt32(p3))
+        let signedSixVolume = dot(b - a, cross(c - a, d - a))
+        XCTAssertGreaterThan(signedSixVolume, 1e-5)
+        XCTAssertGreaterThan(positions[p3].z, 0)
+        XCTAssertGreaterThan(solver.lastPlanarDATTruncations, 0)
+        XCTAssertEqual(solver.lastPlanarDATTetDegeneracies, 0)
+    }
+
+    func testTetPredictorCannotFlattenAndRecoverWithinOneStep() throws {
+        var scene = PhysicsScene(name: "planar-dat-tet-midstep-flatten")
+        scene.settings.dt = 1
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        let p0 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 0, 0))
+        let p1 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(1, 0, 0), velocity: F3(-2, 0, 0))
+        let p2 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 1, 0), velocity: F3(0, -2, 0))
+        let p3 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 0, 1))
+        scene.addTet(SceneTet(
+            ids: (p0, p1, p2, p3), mu: 100, lambda: 1_000))
+        let solver = try GPUSolver(scene: scene)
+        solver.surfaceTruncationMode = .planarDAT
+        solver.tetInversionPreventionEnabled = true
+
+        // The unconstrained endpoint has positive signed volume again:
+        // V(t) = (1 - 2t)^2. Endpoint-only and fixed-face tests miss the
+        // zero-volume event at t=.5; the cubic predictor guard must not.
+        try solver.submitStep()
+        try solver.synchronize()
+
+        let positions = sharedPositions(solver)
+        let a = position(positions, UInt32(p0))
+        let b = position(positions, UInt32(p1))
+        let c = position(positions, UInt32(p2))
+        let d = position(positions, UInt32(p3))
+        let signedSixVolume = dot(b - a, cross(c - a, d - a))
+        XCTAssertGreaterThan(signedSixVolume, 1e-4)
+        XCTAssertGreaterThan(positions[p1].x, 0)
+        XCTAssertGreaterThan(positions[p2].y, 0)
+        XCTAssertGreaterThan(solver.lastPlanarDATTruncations, 0)
+        XCTAssertEqual(solver.lastPlanarDATTetDegeneracies, 0)
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
+    func testPositiveCompressedTetFreezesCompressionWithoutStopping() throws {
+        var scene = PhysicsScene(name: "planar-dat-positive-compressed-tet")
+        scene.settings.dt = 1
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        let p0 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 0, 0))
+        let p1 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(1, 0, 0))
+        let p2 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 1, 0))
+        let p3 = scene.addParticle(
+            radius: 0.01, mass: 1, friction: 0,
+            position: F3(0, 0, 1))
+        scene.addTet(SceneTet(
+            ids: (p0, p1, p2, p3), mu: 100, lambda: 1_000))
+        let solver = try GPUSolver(scene: scene)
+        solver.surfaceTruncationMode = .planarDAT
+        solver.tetInversionPreventionEnabled = true
+        let compressedZ: Float = 5e-5
+        solver.setBodyStates([
+            .init(body: p3, position: F3(0, 0, compressedZ),
+                  rotation: identity, linearVelocity: F3(0, 0, -1))
+        ])
+
+        try solver.submitStep()
+        try solver.synchronize()
+
+        let positions = sharedPositions(solver)
+        XCTAssertEqual(positions[p3].z, compressedZ, accuracy: 1e-7)
+        XCTAssertGreaterThan(solver.lastPlanarDATTetDegeneracies, 0)
+        XCTAssertEqual(solver.lastPlanarDATNonfiniteValues, 0)
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
+    func testAutomaticModeUsesTopologyRatherThanSceneName() throws {
+        let shell = twoTriangleScene(
+            sourceHeight: 0.2, sourceVelocity: .zero)
+        let shellSolver = try GPUSolver(scene: shell.scene)
+        XCTAssertEqual(shellSolver.surfaceTruncationSelection, .automatic)
+        XCTAssertEqual(shellSolver.effectiveSurfaceTruncationMode, .planarDAT)
+
+        var volume = PhysicsScene(name: "arbitrary-imported-volume")
+        let ids = [
+            volume.addParticle(radius: 0.01, mass: 1, friction: 0,
+                               position: F3(0, 0, 0)),
+            volume.addParticle(radius: 0.01, mass: 1, friction: 0,
+                               position: F3(1, 0, 0)),
+            volume.addParticle(radius: 0.01, mass: 1, friction: 0,
+                               position: F3(0, 1, 0)),
+            volume.addParticle(radius: 0.01, mass: 1, friction: 0,
+                               position: F3(0, 0, 1)),
+        ]
+        volume.addTet(SceneTet(
+            ids: (ids[0], ids[1], ids[2], ids[3]),
+            mu: 100, lambda: 1_000))
+        let volumeSolver = try GPUSolver(scene: volume)
+        XCTAssertEqual(volumeSolver.effectiveSurfaceTruncationMode,
+                       .isotropicDAT)
+
+        var mixed = volume
+        _ = addTriangle(
+            &mixed, F3(2, 0, 0), F3(3, 0, 0), F3(2, 1, 0), mass: 1)
+        let mixedSolver = try GPUSolver(scene: mixed)
+        XCTAssertEqual(mixedSolver.effectiveSurfaceTruncationMode,
+                       .isotropicDAT)
+
+        var selfCollidingVolume = volume
+        selfCollidingVolume.tets[0].selfCollisionEnabled = true
+        let selfCollisionSolver = try GPUSolver(scene: selfCollidingVolume)
+        XCTAssertEqual(selfCollisionSolver.effectiveSurfaceTruncationMode,
+                       .planarDAT)
+    }
+
+    func testAutomaticHighColorPlanarSceneAllocatesIncidenceStorage() throws {
+        let solver = try GPUSolver(scene: highColorPlanarScene())
+        XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .planarDAT)
+        XCTAssertEqual(solver.staticUsedColors, 5)
+        XCTAssertTrue(
+            solver.hasPlanarDATBodyIncidenceStorage,
+            "a high-color Planar scene should retain the optimized incidence reducer")
+        XCTAssertEqual(
+            solver.planarDATBodyPairsBuf.length,
+            solver.maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
+    }
+
+    func testHighColorIncidenceAllocationFailureFallsBackToGlobalReducer() throws {
+        let solver = try GPUSolver(
+            scene: highColorPlanarScene(),
+            optionalPlanarDATBodyPairAllocator: { _, _ in nil })
+        XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .planarDAT)
+        XCTAssertEqual(solver.staticUsedColors, 5)
+        XCTAssertFalse(solver.hasPlanarDATBodyIncidenceStorage)
+        XCTAssertEqual(solver.planarDATBodyPairsBuf.length, 16)
+
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
+    func testAutomaticGiantBedKeepsVolumetricPathStable() throws {
+        let solver = try GPUSolver(scene: Demos.make("bed", scale: 8)!)
+        XCTAssertEqual(solver.surfaceTruncationSelection, .automatic)
+        XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .isotropicDAT)
+        XCTAssertFalse(solver.tetInversionPreventionEnabled)
+        XCTAssertFalse(
+            solver.hasPlanarDATBodyIncidenceStorage,
+            "automatic isotropic volumes must not allocate Planar incidence storage")
+        XCTAssertEqual(solver.planarDATBodyPairsBuf.length, 16)
+
+        for _ in 0..<20 {
+            try solver.submitStep()
+            try solver.synchronize()
+        }
+
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertEqual(solver.lastPlanarDATTetDegeneracies, 0)
+    }
+
+    func testAutomaticMixedScenePreservesNearbyBodiesCommonGravity() throws {
+        // Exercise the exact "Giant" preset: eight skinned volumetric bodies
+        // are the configuration that exposed the aerial locking regression.
+        let scene = Demos.meshclothdrop(res: 22, scale: 8)
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .isotropicDAT)
+        XCTAssertGreaterThanOrEqual(scene.skinnedMeshes.count, 2)
+
+        func center(_ bodyIDs: [Int],
+                    _ positionAt: (Int) -> F3) -> F3 {
+            bodyIDs.reduce(F3.zero) {
+                $0 + positionAt($1)
+            } / Float(bodyIDs.count)
+        }
+
+        func collisionBounds(_ bodyIDs: [Int]) -> (lo: F3, hi: F3) {
+            var lo = F3(repeating: Float.greatestFiniteMagnitude)
+            var hi = F3(repeating: -Float.greatestFiniteMagnitude)
+            for id in bodyIDs {
+                let body = scene.bodies[id]
+                let radius = body.size.x * 0.5
+                lo = min(lo, body.position - F3(repeating: radius))
+                hi = max(hi, body.position + F3(repeating: radius))
+            }
+            return (lo, hi)
+        }
+
+        func separated(_ a: (lo: F3, hi: F3),
+                       _ b: (lo: F3, hi: F3)) -> Bool {
+            a.hi.x < b.lo.x || b.hi.x < a.lo.x
+                || a.hi.y < b.lo.y || b.hi.y < a.lo.y
+                || a.hi.z < b.lo.z || b.hi.z < a.lo.z
+        }
+
+        let initialBounds = scene.skinnedMeshes.map {
+            collisionBounds($0.bodyIDs)
+        }
+        for a in initialBounds.indices {
+            for b in (a + 1)..<initialBounds.count {
+                XCTAssertTrue(
+                    separated(initialBounds[a], initialBounds[b]),
+                    "generated skinned-body collision proxies must not overlap at spawn")
+            }
+        }
+
+        var closest = (0, 1)
+        var closestDistance = Float.greatestFiniteMagnitude
+        for a in 0..<scene.skinnedMeshes.count {
+            let ca = center(scene.skinnedMeshes[a].bodyIDs) {
+                scene.bodies[$0].position
+            }
+            for b in (a + 1)..<scene.skinnedMeshes.count {
+                let cb = center(scene.skinnedMeshes[b].bodyIDs) {
+                    scene.bodies[$0].position
+                }
+                let d = length(F3(ca.x - cb.x, ca.y - cb.y, 0))
+                if d < closestDistance {
+                    closest = (a, b)
+                    closestDistance = d
+                }
+            }
+        }
+        let a0 = center(scene.skinnedMeshes[closest.0].bodyIDs) {
+            scene.bodies[$0].position
+        }
+        let b0 = center(scene.skinnedMeshes[closest.1].bodyIDs) {
+            scene.bodies[$0].position
+        }
+
+        var meshOwner: [UInt32: Int] = [:]
+        for (owner, mesh) in scene.skinnedMeshes.enumerated() {
+            for id in mesh.bodyIDs { meshOwner[UInt32(id)] = owner }
+        }
+        for _ in 0..<24 {
+            try solver.submitStep()
+            try solver.synchronize()
+            let contacts = solver.prevSoftContacts.contents().bindMemory(
+                to: SoftContactGPU.self, capacity: solver.maxSoft)
+            for i in 0..<min(solver.lastNumSoft, solver.maxSoft) {
+                let ids = contacts[i].ids
+                let owners = Set([ids.x, ids.y, ids.z, ids.w]
+                    .compactMap { meshOwner[$0] })
+                XCTAssertLessThanOrEqual(
+                    owners.count, 1,
+                    "separated skinned bodies must not create aerial soft contacts")
+            }
+        }
+
+        let finalPositions = sharedPositions(solver)
+        let a1 = center(scene.skinnedMeshes[closest.0].bodyIDs) {
+            F3(finalPositions[$0].x, finalPositions[$0].y,
+               finalPositions[$0].z)
+        }
+        let b1 = center(scene.skinnedMeshes[closest.1].bodyIDs) {
+            F3(finalPositions[$0].x, finalPositions[$0].y,
+               finalPositions[$0].z)
+        }
+        XCTAssertLessThan(a1.z, a0.z - 0.65)
+        XCTAssertLessThan(b1.z, b0.z - 0.65)
+        let initialSeparation = length(a0 - b0)
+        let finalSeparation = length(a1 - b1)
+        XCTAssertGreaterThan(finalSeparation, initialSeparation * 0.97)
+        XCTAssertNil(solver.runtimeFailure)
     }
 
     func testElementSpanOverflowFreezesAndThrows() throws {
@@ -1000,7 +1393,9 @@ final class PlanarDATTests: XCTestCase {
     }
 
     func testSoftContactOverflowRestoresStepStartPoseBeforeTypedFailure() throws {
-        let startZ: Float = 0.05
+        // Stay strictly inside the force band. The old exactly-on-radius
+        // fixture depended on floating-point rounding of the query cutoff.
+        let startZ: Float = 0.04
         let velocity = F3(0.1, 0, 0)
         let fixture = twoTriangleScene(
             sourceHeight: startZ,

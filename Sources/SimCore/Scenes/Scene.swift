@@ -338,11 +338,24 @@ public struct SceneTet {
     public var ids: (Int, Int, Int, Int)
     public var mu: Float
     public var lambda: Float
+    /// Whether non-adjacent boundary primitives in this connected tet body
+    /// may collide with one another. Inter-body soft contact is always
+    /// enabled. Keeping volumetric self-contact explicit avoids spending the
+    /// surface collision budget on ordinary local volume deformation, while
+    /// still allowing foldable or hollow tet assets to opt in.
+    public var selfCollisionEnabled: Bool
 
     public init(ids: (Int, Int, Int, Int), mu: Float, lambda: Float) {
+        self.init(ids: ids, mu: mu, lambda: lambda,
+                  selfCollisionEnabled: false)
+    }
+
+    public init(ids: (Int, Int, Int, Int), mu: Float, lambda: Float,
+                selfCollisionEnabled: Bool) {
         self.ids = ids
         self.mu = mu
         self.lambda = lambda
+        self.selfCollisionEnabled = selfCollisionEnabled
     }
 }
 

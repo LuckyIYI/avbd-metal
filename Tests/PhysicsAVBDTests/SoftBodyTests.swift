@@ -127,6 +127,8 @@ final class SoftBodyTests: XCTestCase {
         let scene = Demos.meshclothdrop(res: 10, scale: 1)
         XCTAssertGreaterThanOrEqual(scene.skinnedMeshes.count, 2)
         XCTAssertGreaterThan(scene.tris.count, 0)
+        XCTAssertGreaterThan(scene.settings.clothRenderScale, 0.5,
+                             "the rendered sheet should match its contact surface")
         for mesh in scene.skinnedMeshes {
             let bodies = Set(mesh.bodyIDs)
             let tets = scene.tets.filter {
@@ -143,9 +145,39 @@ final class SoftBodyTests: XCTestCase {
         XCTAssertTrue(scene.bodies.contains { !$0.isParticle && $0.density > 0 })
 
         let gpu = try GPUSolver(scene: scene)
-        XCTAssertNotNil(gpu.renderSkinnedSurface)
+        let renderSkin = try XCTUnwrap(gpu.renderSkinnedSurface)
+        XCTAssertEqual(renderSkin.triCount,
+                       scene.skinnedMeshes.reduce(0) { $0 + $1.triangles.count })
         XCTAssertGreaterThan(gpu.numEdges, 0,
                              "pinned cloth must keep EE contact edges")
+
+        // The bundled mesh is a smooth visual skin over the voxel FEM proxy.
+        // Rendering the proxy itself produces only axis-aligned faces.
+        let mesh = try XCTUnwrap(scene.skinnedMeshes.first)
+        // ModelIO welds the source OBJ's duplicate positions on import; no
+        // scene-level simplification is applied to the resulting 34,834
+        // unique vertices or 69,451 faces.
+        XCTAssertEqual(mesh.vertices.count, 34_834,
+                       "the demo must retain the complete imported Stanford Bunny")
+        XCTAssertEqual(mesh.triangles.count, 69_451)
+        func restPosition(_ vertex: SceneSkinnedVertex) -> F3 {
+            let ids = [vertex.ids.0, vertex.ids.1, vertex.ids.2, vertex.ids.3]
+            return zip(ids, [vertex.weights.x, vertex.weights.y,
+                             vertex.weights.z, vertex.weights.w]).reduce(.zero) {
+                $0 + scene.bodies[$1.0].position * $1.1
+            }
+        }
+        let positions = mesh.vertices.map(restPosition)
+        var roundedFaces = 0
+        for tri in mesh.triangles {
+            let n = normalize(cross(positions[tri.1] - positions[tri.0],
+                                    positions[tri.2] - positions[tri.0]))
+            if max(abs(n.x), max(abs(n.y), abs(n.z))) < 0.995 {
+                roundedFaces += 1
+            }
+        }
+        XCTAssertGreaterThan(roundedFaces, mesh.triangles.count / 3,
+                             "the bundled skin must not expose the voxel/tet proxy")
         for _ in 0..<8 { gpu.step() }
         XCTAssertTrue(gpu.maxConstraintError().isFinite)
     }
@@ -184,6 +216,140 @@ final class SoftBodyTests: XCTestCase {
                               "skinned bunnies \(i) and \(j) must not overlap at init")
             }
         }
+    }
+
+    func testSkinnedBunnyCageContainsSkinAndPreservesVolume() throws {
+        let scene = try XCTUnwrap(Demos.make("skinnedbunny", scale: 1))
+        let skin = try XCTUnwrap(scene.skinnedMeshes.first)
+        let bodySet = Set(skin.bodyIDs)
+        let tets = scene.tets.filter {
+            bodySet.contains($0.ids.0) && bodySet.contains($0.ids.1)
+                && bodySet.contains($0.ids.2) && bodySet.contains($0.ids.3)
+        }
+        XCTAssertFalse(tets.isEmpty)
+        XCTAssertEqual(tets.count % 5, 0,
+                       "the voxel cage uses five tetrahedra per occupied cell")
+        func volume(_ tet: SceneTet, _ position: (Int) -> F3) -> Float {
+            let a = position(tet.ids.0)
+            return abs(dot(position(tet.ids.1) - a,
+                           cross(position(tet.ids.2) - a,
+                                 position(tet.ids.3) - a))) / 6
+        }
+        let restVolume = tets.reduce(Float.zero) {
+            $0 + volume($1) { scene.bodies[$0].position }
+        }
+        XCTAssertGreaterThan(restVolume, 0)
+        let firstCellBodies = Set(tets.prefix(5).flatMap {
+            [$0.ids.0, $0.ids.1, $0.ids.2, $0.ids.3]
+        })
+        let firstCellPositions = firstCellBodies.map { scene.bodies[$0].position }
+        let firstCellMin = firstCellPositions.reduce(F3(repeating: .greatestFiniteMagnitude), min)
+        let firstCellMax = firstCellPositions.reduce(F3(repeating: -.greatestFiniteMagnitude), max)
+        let firstCellExtent = firstCellMax - firstCellMin
+        let voxelSpacing = max(firstCellExtent.x,
+                               max(firstCellExtent.y, firstCellExtent.z))
+        let cellMins = stride(from: 0, to: tets.count, by: 5).map { start -> F3 in
+            tets[start..<min(start + 5, tets.count)].flatMap {
+                [$0.ids.0, $0.ids.1, $0.ids.2, $0.ids.3]
+            }.reduce(F3(repeating: .greatestFiniteMagnitude)) {
+                min($0, scene.bodies[$1].position)
+            }
+        }
+        let cellOrigin = cellMins.reduce(F3(repeating: .greatestFiniteMagnitude), min)
+        let occupiedCells = Set(cellMins.map { p in
+            let q = (p - cellOrigin) / voxelSpacing
+            return SIMD3(Int(q.x.rounded()), Int(q.y.rounded()), Int(q.z.rounded()))
+        })
+        XCTAssertEqual(occupiedCells.count, tets.count / 5)
+        let maxCell = occupiedCells.reduce(SIMD3<Int>(repeating: 0)) {
+            SIMD3(Swift.max($0.x, $1.x), Swift.max($0.y, $1.y),
+                  Swift.max($0.z, $1.z))
+        }
+        var outside = Set<SIMD3<Int>>()
+        var queue = [SIMD3(-1, -1, -1)]
+        outside.insert(queue[0])
+        var head = 0
+        while head < queue.count {
+            let c = queue[head]
+            head += 1
+            for d in [SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0),
+                      SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)] {
+                let n = c &+ d
+                guard n.x >= -1, n.y >= -1, n.z >= -1,
+                      n.x <= maxCell.x + 1, n.y <= maxCell.y + 1,
+                      n.z <= maxCell.z + 1,
+                      !occupiedCells.contains(n), outside.insert(n).inserted else { continue }
+                queue.append(n)
+            }
+        }
+        var cavities = 0
+        for x in 0...maxCell.x {
+            for y in 0...maxCell.y {
+                for z in 0...maxCell.z {
+                    let c = SIMD3(x, y, z)
+                    if !occupiedCells.contains(c) && !outside.contains(c) { cavities += 1 }
+                }
+            }
+        }
+        XCTAssertEqual(cavities, 0,
+                       "a volumetric bunny cage must not be a hollow tet shell")
+        var minimumWeight: Float = 1
+        var maximumWeight: Float = 0
+        var maximumWeightSumError: Float = 0
+        for vertex in skin.vertices {
+            let w = vertex.weights
+            minimumWeight = min(minimumWeight,
+                                min(min(w.x, w.y), min(w.z, w.w)))
+            maximumWeight = max(maximumWeight,
+                                max(max(w.x, w.y), max(w.z, w.w)))
+            maximumWeightSumError = max(
+                maximumWeightSumError, abs(w.x + w.y + w.z + w.w - 1))
+        }
+        XCTAssertGreaterThanOrEqual(
+            minimumWeight, -1e-4,
+            "the rendered skin must be contained by its tetrahedral cage")
+        XCTAssertLessThanOrEqual(
+            maximumWeight, 1.0001,
+            "contained skin bindings must not extrapolate outside a tet")
+        XCTAssertLessThanOrEqual(maximumWeightSumError, 1e-4)
+        func surfaceVolume(_ positions: [F3]) -> Float {
+            let center = positions.reduce(F3.zero, +) / Float(positions.count)
+            return abs(skin.triangles.reduce(Float.zero) {
+                $0 + dot(positions[$1.0] - center,
+                         cross(positions[$1.1] - center,
+                               positions[$1.2] - center)) / 6
+            })
+        }
+        let restSkinPositions = skin.vertices.map { vertex -> F3 in
+            let ids = [vertex.ids.0, vertex.ids.1, vertex.ids.2, vertex.ids.3]
+            let weights = [vertex.weights.x, vertex.weights.y,
+                           vertex.weights.z, vertex.weights.w]
+            return zip(ids, weights).reduce(.zero) {
+                $0 + scene.bodies[$1.0].position * $1.1
+            }
+        }
+        let restSkinVolume = surfaceVolume(restSkinPositions)
+        XCTAssertGreaterThan(restSkinVolume, 0)
+
+        let gpu = try GPUSolver(scene: scene)
+        for _ in 0..<300 { gpu.step() }
+        try gpu.synchronize()
+        let currentVolume = tets.reduce(Float.zero) {
+            $0 + volume($1) { gpu.bodyPosition($0) }
+        }
+        let currentSkinPositions = skin.vertices.map { vertex -> F3 in
+            let ids = [vertex.ids.0, vertex.ids.1, vertex.ids.2, vertex.ids.3]
+            let weights = [vertex.weights.x, vertex.weights.y,
+                           vertex.weights.z, vertex.weights.w]
+            return zip(ids, weights).reduce(.zero) {
+                $0 + gpu.bodyPosition($1.0) * $1.1
+            }
+        }
+        let currentSkinVolume = surfaceVolume(currentSkinPositions)
+        XCTAssertGreaterThan(currentVolume / restVolume, 0.98,
+                             "the bunny's FEM cage must preserve tet volume")
+        XCTAssertGreaterThan(currentSkinVolume / restSkinVolume, 0.95,
+                             "the visible bunny must follow the volumetric cage, not collapse like a shell")
     }
 
     func testSoftBlocksDontInterpenetrate() throws {

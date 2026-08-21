@@ -70,6 +70,9 @@ public struct SimParamsGPU {
     /// Planar-DAT broadphase cell so changing safety-query geometry cannot
     /// silently widen the force model.
     public var surfaceContactCellSize: Float = 1
+    /// Independent opt-in for the experimental signed-volume limiter. The
+    /// Planar-DAT paper/Newton surface path does not require this extension.
+    public var tetInversionPreventionEnabled: UInt32 = 0
 }
 
 extension SimParamsGPU: Equatable {}
@@ -93,7 +96,7 @@ public struct JointGPU {
 
 public struct TetGPU {
     public var ids: SIMD4<UInt32> = .zero
-    public var r0: SIMD4<Float> = .zero
+    public var r0: SIMD4<Float> = .zero // DmInv row 0; w = signed 6x rest volume
     public var r1: SIMD4<Float> = .zero
     public var r2: SIMD4<Float> = .zero
 }
@@ -190,6 +193,11 @@ public enum GPUCounters {
     public static let planarDATGridOverflows = 10
     public static let planarDATInvalidAnchors = 11
     public static let planarDATTruncations = 12
-    public static let colorBase = 13
-    public static let total = 13 + 2 * AVBD_MAX_COLORS
+    /// Diagnostic partition of `planarDATInvalidAnchors`.
+    public static let planarDATVertexTriangleDegeneracies = 13
+    public static let planarDATEdgeEdgeDegeneracies = 14
+    public static let planarDATNonfiniteValues = 15
+    public static let planarDATTetDegeneracies = 16
+    public static let colorBase = 17
+    public static let total = 17 + 2 * AVBD_MAX_COLORS
 }

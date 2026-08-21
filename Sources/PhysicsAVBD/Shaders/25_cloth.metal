@@ -197,6 +197,8 @@ kernel void el_count(
         && (!finite3(lo) || !finite3(hi))) {
         atomic_fetch_add_explicit(&counters[CTR_DAT_INVALID_ANCHOR], 1u,
                                   memory_order_relaxed);
+        atomic_fetch_add_explicit(&counters[CTR_DAT_NONFINITE], 1u,
+                                  memory_order_relaxed);
         return;
     }
     int3 c0 = cellCoord(lo, P.elemCellSize);
