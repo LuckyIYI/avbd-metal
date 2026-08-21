@@ -1,0 +1,50 @@
+{
+  "identifier": "arachne15-goal-v1",
+  "presentation": {
+    "cameraPresets": [
+      {"anchor": "robot", "azimuth": -1.5707964, "distance": 3, "elevation": 0.3, "id": "follow", "label": "Follow Robot", "offset": [0, 0, 0.22], "target": [0, 0, 0]},
+      {"anchor": "goal", "azimuth": -1.5707964, "distance": 5, "elevation": 0.4, "id": "goal", "label": "Show Goal", "offset": [0, 0, 0.18], "target": [0, 0, 0]}
+    ],
+    "controls": [
+      {"defaultValue": 0, "format": "%+.0f°", "id": "goalBearing", "kind": "slider", "label": "Goal bearing", "maximum": 180, "minimum": -180, "step": 5},
+      {"defaultValue": 1.5, "format": "%.2f m", "id": "goalDistance", "kind": "slider", "label": "Goal distance", "maximum": 2, "minimum": 0.6, "step": 0.05},
+      {"arguments": {"bearingDegrees": "goalBearing", "distance": "goalDistance"}, "command": "set-goal", "id": "applyGoal", "kind": "button", "label": "Apply Goal & Reset"},
+      {"command": "randomize-goal", "id": "randomGoal", "kind": "button", "label": "Random Goal"},
+      {"defaultValue": 2.5, "format": "%.1f m/s", "id": "projectileSpeed", "kind": "slider", "label": "Box speed", "maximum": 6, "minimum": 0.5, "step": 0.25},
+      {"arguments": {"speed": "projectileSpeed"}, "command": "throw-projectile", "id": "throwProjectile", "kind": "button", "label": "Throw Box"}
+    ],
+    "metrics": [
+      {"format": "%.3f", "id": "goal", "label": "Goal remaining", "source": "task/goal-distance", "unit": "m"},
+      {"format": "%.3f", "id": "speed", "label": "Planar speed", "source": "task/planar-speed", "unit": "m/s"},
+      {"format": "%.3f", "id": "yaw", "label": "Yaw rate", "source": "task/yaw-rate", "unit": "rad/s"},
+      {"format": "%.0f", "id": "step", "label": "Control step", "source": "replay/control-step"}
+    ]
+  },
+  "runtime": {"files": {"deploymentManifest": "deployment-manifest.json", "metadata": "metadata.json", "policy": "policy.safetensors", "trainingState": "training-state.json"}, "kind": "avbd-vector-ppo-v1"},
+  "schemaVersion": 1,
+  "simulation": {
+    "controlDecimation": 10,
+    "includeInteractiveRobustnessProbes": true,
+    "maxEpisodeSteps": 1000,
+    "options": {
+      "armatureScaleLower": 0.8, "armatureScaleUpper": 1.2, "commandProgressRewardWeight": 20, "commandResamplingSteps": 500,
+      "frictionScaleLower": 0.75, "frictionScaleUpper": 1.25, "goalBoundaryCommandSpeed": 0.02, "goalCommandSpeed": 0.15,
+      "goalDwellSteps": 15, "goalProgressRewardWeight": 4, "goalRadius": 0.12, "goalSlowdownDistance": 0.5,
+      "goalStableRewardWeight": 1, "goalSuccessBonus": 8, "inertiaScaleLower": 0.9, "inertiaScaleUpper": 1.1,
+      "initialRollPitchRange": 0.02, "initialYawRange": 3.1415925, "massScaleLower": 0.9, "massScaleUpper": 1.1,
+      "maximumActionLatencySteps": 2, "maximumForwardVelocity": 0.25, "maximumGoalArrivalSpeed": 0.08,
+      "maximumGoalDirectionAngle": 3.1415925, "maximumGoalDistance": 2, "maximumLateralVelocity": 0.12,
+      "maximumYawRate": 0.8, "minimumForwardVelocity": 0.05, "minimumGoalDistance": 0.6,
+      "motorDampingScaleLower": 0.8, "motorDampingScaleUpper": 1.2, "motorStiffnessScaleLower": 0.85,
+      "motorStiffnessScaleUpper": 1.15, "motorTorqueScaleLower": 0.85, "motorTorqueScaleUpper": 1.05,
+      "observationNoise": 1, "pointGoal": 1, "solverIterations": 20, "standingCommandProbability": 0,
+      "validationCollisionProfile": 0, "velocityErrorPenaltyWeight": 5, "yawErrorPenaltyWeight": 5
+    },
+    "seed": 21001,
+    "simulationStepSeconds": 0.002,
+    "task": "arachne15-goal-v0",
+    "taskRevision": 2000006
+  },
+  "summary": "Accepted Arachne-15 point-goal policy packaged with the exact replay task and declarative goal and disturbance controls.",
+  "title": "Arachne-15 Goal"
+}

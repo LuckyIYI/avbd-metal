@@ -1372,10 +1372,13 @@ public enum VectorPolicyRequalification {
         ])
         let topLevel = try manager.contentsOfDirectory(
             atPath: bundle.path)
-        guard Set(topLevel) == expectedTopLevel else {
+        let actualTopLevel = Set(topLevel)
+        guard actualTopLevel == expectedTopLevel
+                || actualTopLevel
+                    == expectedTopLevel.union([PolicyBundleManifest.fileName]) else {
             throw invalid("schema-v2 bundle has missing or extra top-level entries")
         }
-        for name in expectedTopLevel {
+        for name in actualTopLevel {
             let url = bundle.appendingPathComponent(name)
             let values = try url.resourceValues(
                 forKeys: [

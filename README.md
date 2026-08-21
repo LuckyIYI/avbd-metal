@@ -36,7 +36,7 @@ crossing protection with boundary release, runtime shader concatenation
 | `RL` | Vector task contracts, task registry, rewards, and the current AVBD-backed environments |
 | `MLXRL` | MLX learning, checkpoint/evidence formats, policy runtime, and research pipelines |
 | `avbd` | CLI: `run`, `bench`, `parity`, `profile` (per-kernel GPU timings), `clothgate` (gap/stretch/KE gates), `rodexp` |
-| `AVBDApp` | macOS app: viewer, demos, Robotics Lab |
+| `AVBDApp` | macOS app: physics playground and data-driven Policy Replay bundle viewer |
 | `AVBDTests` | Cross-layer and MLX integration tests; lower layers also have dependency-limited test targets |
 
 The production dependency graph is intentionally small: `SimCore` is the
@@ -53,10 +53,13 @@ The vector RL path is task-agnostic and runs the simulator and MLX learner on
 Apple silicon. Built-in tasks include Cartesian Push-T, randomized articulated
 arm Push-T, the full seven-axis Panda port of ManiSkill PushT-v1, the imported
 19-DoF Unitree H1 tasks aligned to Isaac Lab, the printable 16-DoF Arachne-15
-spider, and earlier native humanoid research tasks. Policy Replay is narrower:
-it exposes only compatible packaged examples. Exact release status,
-fingerprints, and qualification evidence live in
-[the checkpoint catalog](checkpoints/README.md).
+spider, and earlier native humanoid research tasks. Policy Replay loads
+portable bundle directories whose manifest owns the policy runtime, exact
+simulation configuration, cameras, controls, and metrics. The app has no
+policy-specific page switch: choose **Import Bundle** to add an unverified
+bundle, or package it through the independent release index to advertise a
+qualified release. The currently supported runtime ABIs and exact release
+evidence are documented with [the policy bundles](checkpoints/README.md).
 The Arachne-15 CAD, hardware, and device-qualification workspace is maintained
 as a separate project; this repository contains only its reviewed simulator
 runtime snapshot and sealed policy releases.
@@ -88,6 +91,8 @@ make ml-tool
 # independent Sim2Sim reference.
 make app-ml
 AVBD_POLICY_REPLAY=1 open AVBD.app
+# Or import a bundle directory directly while developing:
+AVBD_POLICY_BUNDLE=/absolute/path/to/my-policy-bundle open AVBD.app
 ```
 
 ## Quick start
