@@ -25,6 +25,7 @@ artifacts/
 /Robots/Arachne15/
 checkpoints/*
 !checkpoints/README.md
+!checkpoints/policy-release-index.json
 !checkpoints/external/
 checkpoints/external/*
 !checkpoints/external/unitree-h1/
@@ -32,6 +33,7 @@ checkpoints/external/unitree-h1/*
 !checkpoints/external/unitree-h1/LICENSE
 !checkpoints/external/unitree-h1/manifest.json
 !checkpoints/external/unitree-h1/policy.safetensors
+!checkpoints/external/unitree-h1/policy-bundle.json
 !checkpoints/humanoid-isaac-flat-v0/
 checkpoints/humanoid-isaac-flat-v0/*
 !checkpoints/humanoid-isaac-flat-v0/metadata.json
@@ -58,6 +60,7 @@ checkpoints/humanoid-isaac-flat-v2/*
 !checkpoints/humanoid-isaac-flat-v2/policy.safetensors
 !checkpoints/humanoid-isaac-flat-v2/training-state.json
 !checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json
+!checkpoints/humanoid-isaac-flat-v2/policy-bundle.json
 !checkpoints/humanoid-isaac-flat-v2/requalification-manifest.json
 !checkpoints/humanoid-isaac-flat-v2/qualification/
 checkpoints/humanoid-isaac-flat-v2/qualification/*
@@ -90,6 +93,7 @@ checkpoints/arachne15-velocity-v1/*
 !checkpoints/arachne15-velocity-v1/policy.safetensors
 !checkpoints/arachne15-velocity-v1/training-state.json
 !checkpoints/arachne15-velocity-v1/deployment-manifest.json
+!checkpoints/arachne15-velocity-v1/policy-bundle.json
 !checkpoints/arachne15-velocity-v1/requalification-manifest.json
 !checkpoints/arachne15-velocity-v1/qualification/
 checkpoints/arachne15-velocity-v1/qualification/*
@@ -113,6 +117,7 @@ checkpoints/arachne15-goal-v1/*
 !checkpoints/arachne15-goal-v1/policy.safetensors
 !checkpoints/arachne15-goal-v1/training-state.json
 !checkpoints/arachne15-goal-v1/deployment-manifest.json
+!checkpoints/arachne15-goal-v1/policy-bundle.json
 !checkpoints/arachne15-goal-v1/requalification-manifest.json
 !checkpoints/arachne15-goal-v1/qualification/
 checkpoints/arachne15-goal-v1/qualification/*

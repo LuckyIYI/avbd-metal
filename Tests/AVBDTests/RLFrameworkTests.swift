@@ -8,6 +8,21 @@ import MLX
 @testable import RL
 @testable import MLXRL
 
+private func trackedPolicyRelease(
+    root: URL, identifier: String
+) throws -> PolicyBundleReleaseIndex.Release {
+    let index = try PolicyBundleReleaseIndex.load(from:
+        root.appendingPathComponent(
+            "checkpoints/policy-release-index.json"))
+    guard let release = index.releases.first(where: {
+        $0.bundleIdentifier == identifier
+    }) else {
+        throw PolicyBundleError.invalid(
+            "tracked release '\(identifier)' is missing")
+    }
+    return release
+}
+
 private final class TestVectorPolicyInference: VectorPolicyInferencing {
     let observationDimension: Int
     let actionDimension: Int
@@ -545,8 +560,8 @@ final class RLFrameworkTests: XCTestCase {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
-        let acceptedGoal = try XCTUnwrap(PolicyReplayCatalog.entry(
-            selectionID: "arachne15-goal-v1"))
+        let acceptedGoal = try trackedPolicyRelease(
+            root: packageRoot, identifier: "arachne15-goal-v1")
         XCTAssertEqual(acceptedGoal.qualification, .accepted)
         let fingerprint = try XCTUnwrap(
             acceptedGoal.expectedCheckpointFingerprint)
@@ -1008,8 +1023,8 @@ final class RLFrameworkTests: XCTestCase {
         let unpinnedCandidate = try UnitreeH1RecurrentPolicy(
             directory: policyDirectory)
         XCTAssertEqual(unpinnedCandidate.trust, .unverifiedCandidate)
-        let identity = try XCTUnwrap(PolicyReplayCatalog.entry(
-            selectionID: "unitree-h1-sim2sim-v0")?
+        let identity = try XCTUnwrap(try trackedPolicyRelease(
+            root: repository, identifier: "unitree-h1-sim2sim-v0")
             .unitreeH1ReleaseIdentity)
         let session = try UnitreeH1Sim2SimSession(
             policyDirectory: policyDirectory,
@@ -1124,8 +1139,8 @@ final class RLFrameworkTests: XCTestCase {
         try replacement.write(
             to: copy.appendingPathComponent("manifest.json"), options: .atomic)
 
-        let identity = try XCTUnwrap(PolicyReplayCatalog.entry(
-            selectionID: "unitree-h1-sim2sim-v0")?
+        let identity = try XCTUnwrap(try trackedPolicyRelease(
+            root: repository, identifier: "unitree-h1-sim2sim-v0")
             .unitreeH1ReleaseIdentity)
         XCTAssertThrowsError(try UnitreeH1RecurrentPolicy(
             directory: copy.path,

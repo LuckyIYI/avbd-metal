@@ -52,7 +52,7 @@ public struct PushTWorldModelConfiguration: Codable, Equatable, Sendable {
     }
 }
 
-/// Stateful LeWM + CEM planner for interactive use (the Robotics Lab).
+/// Stateful LeWM + CEM planner for interactive research clients.
 public final class LeWMPlanner {
     let model: LeWorldModel
     var mu: MLXArray
@@ -1069,7 +1069,7 @@ extension PushTPipeline {
     }
 }
 
-/// Interactive runner for the BC policy (Robotics Lab policy mode).
+/// Interactive runner for the BC policy.
 public final class BCPolicyRunner {
     let policy: BCPolicy
     var prevFrame: MLXArray? = nil
@@ -1090,7 +1090,7 @@ public final class BCPolicyRunner {
         }
     }
 
-    /// Throwing interactive entry point used by Robotics Lab.
+    /// Throwing interactive entry point used by research clients.
     public func actionChecked(_ env: PushTEnv) throws -> SIMD2<Float>? {
         let cur = try PushTPipeline.obsArrayChecked(env, env.obsRes)
         let prev = prevFrame ?? cur

@@ -1,0 +1,80 @@
+{
+  "identifier": "humanoid-isaac-flat-v2",
+  "presentation": {
+    "cameraPresets": [
+      {
+        "anchor": "robot",
+        "azimuth": -1.5707964,
+        "distance": 8,
+        "elevation": 0.12,
+        "id": "follow",
+        "label": "Follow Robot",
+        "offset": [0, 0, 0.9],
+        "target": [0, 0, 0]
+      },
+      {
+        "anchor": "course",
+        "azimuth": -1.5707964,
+        "distance": 11,
+        "elevation": 0.2,
+        "id": "course",
+        "label": "Show Course",
+        "offset": [0, 0, 0.8],
+        "target": [0, 0, 0]
+      }
+    ],
+    "controls": [
+      {
+        "defaultValue": 6,
+        "format": "%.1f m/s",
+        "id": "projectileSpeed",
+        "kind": "slider",
+        "label": "Box speed",
+        "maximum": 12,
+        "minimum": 1,
+        "step": 0.5
+      },
+      {
+        "arguments": {"speed": "projectileSpeed"},
+        "command": "throw-projectile",
+        "id": "throwProjectile",
+        "kind": "button",
+        "label": "Throw Box"
+      }
+    ],
+    "metrics": [
+      {"format": "%.3f", "id": "height", "label": "Height", "source": "task/root-height", "unit": "m"},
+      {"format": "%.3f", "id": "speed", "label": "Planar speed", "source": "task/planar-speed", "unit": "m/s"},
+      {"format": "%.3f", "id": "command", "label": "Forward command", "source": "task/command-forward", "unit": "m/s"},
+      {"format": "%.0f", "id": "step", "label": "Control step", "source": "replay/control-step"}
+    ]
+  },
+  "runtime": {
+    "files": {
+      "deploymentManifest": "deployment-manifest.json",
+      "metadata": "metadata.json",
+      "policy": "policy.safetensors",
+      "trainingState": "training-state.json"
+    },
+    "kind": "avbd-vector-ppo-v1"
+  },
+  "schemaVersion": 1,
+  "simulation": {
+    "controlDecimation": 4,
+    "includeInteractiveRobustnessProbes": true,
+    "maxEpisodeSteps": 1000,
+    "options": {
+      "commandResamplingSteps": 500,
+      "initialYawRange": 3.1415925,
+      "observationNoise": 1,
+      "solverIterations": 20,
+      "standingCommandProbability": 0.02
+    },
+    "seed": 21001,
+    "simulationStepSeconds": 0.005,
+    "task": "humanoid-isaac-flat-v0",
+    "taskRevision": 2000011
+  },
+  "summary": "Accepted native MLX H1 locomotion policy replayed on the exact simulator task and control contract sealed with this bundle.",
+  "title": "H1 Flat"
+}

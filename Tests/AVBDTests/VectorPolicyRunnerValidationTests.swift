@@ -3,6 +3,17 @@ import XCTest
 @testable import MLXRL
 
 final class VectorPolicyRunnerValidationTests: XCTestCase {
+    private func trackedRelease(
+        root: URL, identifier: String
+    ) throws -> PolicyBundleReleaseIndex.Release {
+        let index = try PolicyBundleReleaseIndex.load(from:
+            root.appendingPathComponent(
+                "checkpoints/policy-release-index.json"))
+        return try XCTUnwrap(index.releases.first {
+            $0.bundleIdentifier == identifier
+        })
+    }
+
     private func metadata(
         observationDimension: Int = 3,
         actionDimension: Int = 2,
@@ -255,12 +266,12 @@ final class VectorPolicyRunnerValidationTests: XCTestCase {
         bytes.append(0x0a)
         try bytes.write(to: directory.appendingPathComponent(
             VectorPolicyDeploymentBundle.manifestFileName))
-        let entry = try XCTUnwrap(PolicyReplayCatalog.entry(
-            selectionID: "humanoid-isaac-flat-v2"))
+        let entry = try trackedRelease(
+            root: packageRoot, identifier: "humanoid-isaac-flat-v2")
 
         XCTAssertThrowsError(try VectorPolicyDeploymentRuntime(
             bundleDirectory: directory.path,
-            expectedTask: entry.taskID,
+            expectedTask: "humanoid-isaac-flat-v0",
             expectedTaskRevision: entry.expectedTaskRevision,
             expectedCheckpointFingerprint:
                 entry.expectedCheckpointFingerprint,
@@ -313,5 +324,46 @@ final class VectorPolicyRunnerValidationTests: XCTestCase {
                 metadataData: metadataData,
                 policyData: policyData,
                 trainingStateData: trainingStateData))
+    }
+
+    func testPackagedPolicyBundlesConstructGeneratedReplayPages() throws {
+        guard ProcessInfo.processInfo.environment[
+            "AVBD_MLX_INTEGRATION_TESTS"] == "1" else {
+            throw XCTSkip("requires an Xcode-packaged MLX default.metallib")
+        }
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let checkpointRoot = packageRoot.appendingPathComponent(
+            "checkpoints", isDirectory: true)
+        let index = try PolicyBundleReleaseIndex.load(from:
+            checkpointRoot.appendingPathComponent(
+                "policy-release-index.json"))
+
+        for relative in [
+            "humanoid-isaac-flat-v2",
+            "arachne15-velocity-v1",
+            "arachne15-goal-v1",
+            "external/unitree-h1",
+        ] {
+            let bundle = try PolicyBundleLoader.load(directory:
+                checkpointRoot.appendingPathComponent(
+                    relative, isDirectory: true))
+            let release = try XCTUnwrap(index.release(for: bundle))
+            let session = try PolicyBundleReplayFactory.make(
+                bundle: bundle, release: release)
+            try session.step()
+            for camera in bundle.manifest.presentation.cameraPresets {
+                XCTAssertNotNil(
+                    session.anchor(named: camera.anchor),
+                    "\(bundle.manifest.identifier): \(camera.anchor)")
+            }
+            for metric in bundle.manifest.presentation.metrics {
+                XCTAssertNotNil(
+                    session.values[metric.source],
+                    "\(bundle.manifest.identifier): \(metric.source)")
+            }
+        }
     }
 }

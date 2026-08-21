@@ -2,7 +2,7 @@ import Metal
 import MetalKit
 
 /// What the renderer needs from a driving model — lets the same renderer
-/// serve both the physics playground and the Robotics Lab.
+/// serve both the physics playground and portable Policy Replay pages.
 @MainActor
 protocol RenderableModel {
     /// Stable routing key for screenshots/video. SwiftUI may instantiate and

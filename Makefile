@@ -112,7 +112,7 @@ ml-tool:
 # App with working MLX policy mode (xcodebuild; SwiftPM cannot build MLX shaders).
 # Accepted policy evidence is verified before any checkpoint enters the bundle.
 # Historical/development actors remain repository-only; release packaging
-# contains only catalog entries with accepted or external-parity evidence.
+# contains only bundles with accepted or external-parity release-index evidence.
 app-ml: verify-policy-evidence
 	xcodebuild -scheme avbd -configuration Release -destination 'platform=macOS' \
 	  -derivedDataPath .xcbuild \
@@ -143,13 +143,16 @@ app-ml: verify-policy-evidence
 	  cp -R .xcbuild/Build/Products/Release/$(PHYSICS_RESOURCE_BUNDLE) \
 	    .xcbuild/Build/Products/Release/$(ROBOTICS_RESOURCE_BUNDLE) \
 	    "$$staged_app/Contents/Resources/"; \
-	  cp checkpoints/README.md "$$staged_app/Contents/Resources/checkpoints/"; \
+	  cp checkpoints/README.md checkpoints/policy-release-index.json \
+	    "$$staged_app/Contents/Resources/checkpoints/"; \
 	  cp checkpoints/external/unitree-h1/LICENSE \
 	  checkpoints/external/unitree-h1/manifest.json \
+	  checkpoints/external/unitree-h1/policy-bundle.json \
 	  checkpoints/external/unitree-h1/policy.safetensors \
 	  "$$staged_app/Contents/Resources/checkpoints/external/unitree-h1/"; \
 	  cp checkpoints/humanoid-isaac-flat-v2/deployment-manifest.json \
 	  checkpoints/humanoid-isaac-flat-v2/metadata.json \
+	  checkpoints/humanoid-isaac-flat-v2/policy-bundle.json \
 	  checkpoints/humanoid-isaac-flat-v2/policy.safetensors \
 	  checkpoints/humanoid-isaac-flat-v2/requalification-manifest.json \
 	  checkpoints/humanoid-isaac-flat-v2/training-state.json \
@@ -162,6 +165,7 @@ app-ml: verify-policy-evidence
 	  "$$staged_app/Contents/Resources/checkpoints/humanoid-isaac-flat-v2/qualification/"; \
 	  cp checkpoints/arachne15-velocity-v1/deployment-manifest.json \
 	  checkpoints/arachne15-velocity-v1/metadata.json \
+	  checkpoints/arachne15-velocity-v1/policy-bundle.json \
 	  checkpoints/arachne15-velocity-v1/policy.safetensors \
 	  checkpoints/arachne15-velocity-v1/requalification-manifest.json \
 	  checkpoints/arachne15-velocity-v1/training-state.json \
@@ -180,6 +184,7 @@ app-ml: verify-policy-evidence
 	  "$$staged_app/Contents/Resources/checkpoints/arachne15-velocity-v1/qualification/validation-collision/"; \
 	  cp checkpoints/arachne15-goal-v1/deployment-manifest.json \
 	  checkpoints/arachne15-goal-v1/metadata.json \
+	  checkpoints/arachne15-goal-v1/policy-bundle.json \
 	  checkpoints/arachne15-goal-v1/policy.safetensors \
 	  checkpoints/arachne15-goal-v1/requalification-manifest.json \
 	  checkpoints/arachne15-goal-v1/training-state.json \
@@ -276,7 +281,7 @@ verify-arachne-policy: ml-tool
 	  --frames 500 --json
 
 # Rebuild every accepted result from its raw, immutable evidence without MLX.
-# The verifier discovers accepted entries from PolicyReplayCatalog and fails
+# The verifier discovers accepted entries from policy-release-index.json and fails
 # closed when a future evidence shape has not been added to the contract.
 verify-policy-evidence:
 	python3 Tools/verify_policy_evidence.py
