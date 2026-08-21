@@ -328,8 +328,20 @@ public final class GPUSolver {
     public private(set) var frameIndex: Int = 0
     /// Legacy position-servo targets advanced each step as `(joint, rad/s)`.
     private var rateMotors: [(Int, Float)] = []
-    public init(scene: PhysicsScene, device: MTLDevice? = nil,
-                maxPairsPerBody: Int = 16) throws {
+    public convenience init(scene: PhysicsScene, device: MTLDevice? = nil,
+                            maxPairsPerBody: Int = 16) throws {
+        try self.init(
+            scene: scene, device: device, maxPairsPerBody: maxPairsPerBody,
+            optionalPlanarDATBodyPairAllocator: nil)
+    }
+
+    init(
+        scene: PhysicsScene,
+        device: MTLDevice? = nil,
+        maxPairsPerBody: Int = 16,
+        optionalPlanarDATBodyPairAllocator:
+            ((MTLDevice, Int) -> MTLBuffer?)?
+    ) throws {
         precondition(scene.settings.collisionMargin >= 0
             && scene.settings.collisionMargin.isFinite,
             "collision margin must be finite and nonnegative")
@@ -597,11 +609,23 @@ public final class GPUSolver {
 
         try buildPipelines()
         try upload(scene: scene)
+        // This CSR is only a high-color optimization. If Metal cannot
+        // reserve it, retain the placeholder and use the global reducer.
         if effectiveSurfaceTruncationMode == .planarDAT,
            staticUsedColors > 4,
            ProcessInfo.processInfo.environment["AVBD_DAT_GLOBAL_COLOR"] == nil {
-            planarDATBodyPairsBuf = try makeBuf(
-                planarDATBodyPairStorageBytes, "planarDATBodyPairs")
+            let bodyPairBuffer: MTLBuffer?
+            if let allocator = optionalPlanarDATBodyPairAllocator {
+                bodyPairBuffer = allocator(dev, planarDATBodyPairStorageBytes)
+            } else {
+                bodyPairBuffer = dev.makeBuffer(
+                    length: planarDATBodyPairStorageBytes,
+                    options: .storageModeShared)
+            }
+            if let bodyPairBuffer {
+                bodyPairBuffer.label = "planarDATBodyPairs"
+                planarDATBodyPairsBuf = bodyPairBuffer
+            }
         }
         self.spinners = scene.spinners
         // expose spinner angular velocity to the contact solver so friction

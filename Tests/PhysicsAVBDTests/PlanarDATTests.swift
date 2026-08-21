@@ -69,6 +69,29 @@ final class PlanarDATTests: XCTestCase {
         return (scene, target.triangle, source.vertices)
     }
 
+    private func highColorPlanarScene() -> PhysicsScene {
+        var scene = PhysicsScene(name: "high-color-planar-incidence")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 1
+        let positions = [
+            F3(0, 0, 0), F3(1, 0, 0), F3(0, 1, 0), F3(0, 0, 1),
+            F3(2, 2, 2),
+        ]
+        let ids = positions.map {
+            scene.addParticle(radius: 0.01, mass: 1, friction: 0,
+                              position: $0)
+        }
+        scene.addTet(SceneTet(
+            ids: (ids[0], ids[1], ids[2], ids[3]),
+            mu: 100, lambda: 1_000, selfCollisionEnabled: true))
+        for id in ids.prefix(4) {
+            scene.addSpring(SceneSpring(
+                bodyA: id, bodyB: ids[4], rA: .zero, rB: .zero,
+                stiffness: 1))
+        }
+        return scene
+    }
+
     private func sharedPositions(_ solver: GPUSolver) -> UnsafeMutablePointer<SIMD4<Float>> {
         solver.posLin.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: solver.numBodies)
@@ -1136,25 +1159,7 @@ final class PlanarDATTests: XCTestCase {
     }
 
     func testAutomaticHighColorPlanarSceneAllocatesIncidenceStorage() throws {
-        var scene = PhysicsScene(name: "high-color-planar-incidence")
-        let positions = [
-            F3(0, 0, 0), F3(1, 0, 0), F3(0, 1, 0), F3(0, 0, 1),
-            F3(2, 2, 2),
-        ]
-        let ids = positions.map {
-            scene.addParticle(radius: 0.01, mass: 1, friction: 0,
-                              position: $0)
-        }
-        scene.addTet(SceneTet(
-            ids: (ids[0], ids[1], ids[2], ids[3]),
-            mu: 100, lambda: 1_000, selfCollisionEnabled: true))
-        for id in ids.prefix(4) {
-            scene.addSpring(SceneSpring(
-                bodyA: id, bodyB: ids[4], rA: .zero, rB: .zero,
-                stiffness: 1))
-        }
-
-        let solver = try GPUSolver(scene: scene)
+        let solver = try GPUSolver(scene: highColorPlanarScene())
         XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .planarDAT)
         XCTAssertEqual(solver.staticUsedColors, 5)
         XCTAssertTrue(
@@ -1163,6 +1168,21 @@ final class PlanarDATTests: XCTestCase {
         XCTAssertEqual(
             solver.planarDATBodyPairsBuf.length,
             solver.maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
+    }
+
+    func testHighColorIncidenceAllocationFailureFallsBackToGlobalReducer() throws {
+        let solver = try GPUSolver(
+            scene: highColorPlanarScene(),
+            optionalPlanarDATBodyPairAllocator: { _, _ in nil })
+        XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .planarDAT)
+        XCTAssertEqual(solver.staticUsedColors, 5)
+        XCTAssertFalse(solver.hasPlanarDATBodyIncidenceStorage)
+        XCTAssertEqual(solver.planarDATBodyPairsBuf.length, 16)
+
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertNil(solver.runtimeFailure)
     }
 
     func testAutomaticGiantBedKeepsVolumetricPathStable() throws {
