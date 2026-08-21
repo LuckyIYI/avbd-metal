@@ -65,7 +65,8 @@ public enum PolicyBundleReplayFactory {
                     + "'\(camera.anchor)'")
         }
         for metric in presentation.metrics
-            where !capabilities.values.contains(metric.source) {
+            where !capabilities.values.contains(metric.source)
+                && !isDynamicStepMetricSource(metric.source) {
             throw PolicyBundleError.invalid(
                 "metric '\(metric.id)' uses unsupported source "
                     + "'\(metric.source)'")
@@ -78,6 +79,41 @@ public enum PolicyBundleReplayFactory {
                         + "'\(command)'")
             }
         }
+    }
+
+    /// Step-metric names are produced dynamically by `RLStepBatch`, so a
+    /// task cannot enumerate them before its first transition. Keep their
+    /// namespace data-driven while rejecting empty or malformed paths.
+    static func isDynamicStepMetricSource(_ source: String) -> Bool {
+        let prefix = "metric/"
+        guard source.hasPrefix(prefix) else { return false }
+        let suffix = source.dropFirst(prefix.count)
+        let components = suffix.split(
+            separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty }) else { return false }
+        return suffix.utf8.allSatisfy { byte in
+            (byte >= 48 && byte <= 57)
+                || (byte >= 65 && byte <= 90)
+                || (byte >= 97 && byte <= 122)
+                || byte == 45 || byte == 46 || byte == 47 || byte == 95
+        }
+    }
+
+    /// Resolve the declarative camera target. `target` is an absolute point
+    /// for the world anchor and an anchor-relative vector otherwise; `offset`
+    /// is applied in both cases.
+    package static func cameraTarget(
+        preset: PolicyBundleManifest.CameraPreset,
+        anchorValue: F3?
+    ) -> F3? {
+        let target = F3(
+            preset.target[0], preset.target[1], preset.target[2])
+        let offset = F3(
+            preset.offset[0], preset.offset[1], preset.offset[2])
+        if preset.anchor == "world" { return target + offset }
+        guard let anchorValue else { return nil }
+        return anchorValue + target + offset
     }
 }
 

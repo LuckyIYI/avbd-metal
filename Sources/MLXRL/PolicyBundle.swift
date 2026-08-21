@@ -107,7 +107,8 @@ public struct PolicyBundleManifest: Codable, Sendable, Equatable {
     public struct CameraPreset: Codable, Sendable, Equatable, Identifiable {
         public var id: String
         public var label: String
-        /// Named task/session anchor. `world` uses `target` directly.
+        /// Named task/session anchor. `world` uses `target` as an absolute
+        /// point; other anchors add `target` as an anchor-relative vector.
         public var anchor: String
         public var target: [Float]
         public var offset: [Float]
@@ -246,6 +247,10 @@ public enum PolicyBundleLoader {
         }
         let manifestURL = root.appendingPathComponent(
             PolicyBundleManifest.fileName, isDirectory: false)
+        // Inspect the complete tree before opening any attacker-controlled
+        // path. In particular, policy-bundle.json itself must not be a
+        // symlink to a file, device, or stream outside the selected bundle.
+        try validateTree(root)
         let data = try Data(contentsOf: manifestURL)
         try validateManifestJSONShape(data)
         let manifest: PolicyBundleManifest
@@ -256,7 +261,6 @@ public enum PolicyBundleLoader {
             throw PolicyBundleError.invalid(
                 "cannot decode \(PolicyBundleManifest.fileName): \(error)")
         }
-        try validateTree(root)
         try validate(manifest, root: root)
         try validateRuntimeContract(manifest, root: root)
         return LoadedPolicyBundle(
@@ -512,6 +516,10 @@ public enum PolicyBundleLoader {
             guard policyManifest.format == "avbd-unitree-h1-lstm-v1",
                   simulation.task == "unitree-h1-sim2sim-v0",
                   simulation.taskRevision == 1,
+                  // This ABI currently owns an interactive projectile. Do
+                  // not accept a supposedly exact manifest that disables it
+                  // while reconstructing a different scene at runtime.
+                  simulation.includeInteractiveRobustnessProbes,
                   Set(simulation.options.keys) == expectedOptions,
                   solverIterations.map({ $0 > 0 }) == true,
                   policyManifest.weightsFile

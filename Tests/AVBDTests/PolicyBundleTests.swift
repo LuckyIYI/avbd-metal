@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import SimCore
 import RL
 @testable import MLXRL
 
@@ -132,6 +133,22 @@ final class PolicyBundleTests: XCTestCase {
         XCTAssertThrowsError(try PolicyBundleLoader.load(directory: temporary))
     }
 
+    func testManifestSymlinkFailsBeforeManifestRead() throws {
+        let source = root.appendingPathComponent(
+            "checkpoints/external/unitree-h1", isDirectory: true)
+        let temporary = try copyToTemporary(source)
+        let parent = temporary.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let manifestURL = temporary.appendingPathComponent(
+            PolicyBundleManifest.fileName)
+        let outside = parent.appendingPathComponent("outside-manifest.json")
+        try FileManager.default.moveItem(at: manifestURL, to: outside)
+        try FileManager.default.createSymbolicLink(
+            at: manifestURL, withDestinationURL: outside)
+
+        XCTAssertThrowsError(try PolicyBundleLoader.load(directory: temporary))
+    }
+
     func testSymlinkedBundleRootFailsClosed() throws {
         let source = root.appendingPathComponent(
             "checkpoints/external/unitree-h1", isDirectory: true)
@@ -193,6 +210,15 @@ final class PolicyBundleTests: XCTestCase {
             bundle.manifest.presentation, capabilities: capabilities))
 
         var presentation = bundle.manifest.presentation
+        presentation.metrics[0].source =
+            "metric/reward/tracking_linear_velocity"
+        XCTAssertNoThrow(try PolicyBundleReplayFactory.validatePresentation(
+            presentation, capabilities: capabilities))
+        presentation.metrics[0].source = "metric/"
+        XCTAssertThrowsError(try PolicyBundleReplayFactory.validatePresentation(
+            presentation, capabilities: capabilities))
+
+        presentation = bundle.manifest.presentation
         presentation.cameraPresets[0].anchor = "unknown"
         XCTAssertThrowsError(try PolicyBundleReplayFactory.validatePresentation(
             presentation, capabilities: capabilities))
@@ -204,6 +230,43 @@ final class PolicyBundleTests: XCTestCase {
         presentation.metrics[0].source = "task/private-value"
         XCTAssertThrowsError(try PolicyBundleReplayFactory.validatePresentation(
             presentation, capabilities: capabilities))
+    }
+
+    func testCameraTargetUsesWorldAndAnchorRelativeManifestData() {
+        let world = PolicyBundleManifest.CameraPreset(
+            id: "world", label: "World", anchor: "world",
+            target: [4, 5, 6], offset: [0.5, -1, 2], distance: 3,
+            azimuth: 0, elevation: 0)
+        XCTAssertEqual(
+            PolicyBundleReplayFactory.cameraTarget(
+                preset: world, anchorValue: F3(100, 100, 100)),
+            F3(4.5, 4, 8))
+
+        var relative = world
+        relative.anchor = "robot"
+        XCTAssertEqual(
+            PolicyBundleReplayFactory.cameraTarget(
+                preset: relative, anchorValue: F3(10, 20, 30)),
+            F3(14.5, 24, 38))
+        XCTAssertNil(PolicyBundleReplayFactory.cameraTarget(
+            preset: relative, anchorValue: nil))
+    }
+
+    func testUnitreeRuntimeRejectsIgnoredRobustnessProbeSetting() throws {
+        let source = root.appendingPathComponent(
+            "checkpoints/external/unitree-h1", isDirectory: true)
+        let temporary = try copyToTemporary(source)
+        defer { try? FileManager.default.removeItem(
+            at: temporary.deletingLastPathComponent()) }
+        let manifestURL = temporary.appendingPathComponent(
+            PolicyBundleManifest.fileName)
+        var manifest = try JSONDecoder().decode(
+            PolicyBundleManifest.self, from: Data(contentsOf: manifestURL))
+        manifest.simulation.includeInteractiveRobustnessProbes = false
+        try JSONEncoder().encode(manifest).write(
+            to: manifestURL, options: .atomic)
+
+        XCTAssertThrowsError(try PolicyBundleLoader.load(directory: temporary))
     }
 
     func testAppSourceHasNoPolicyOrTaskSpecificReplaySwitches() throws {

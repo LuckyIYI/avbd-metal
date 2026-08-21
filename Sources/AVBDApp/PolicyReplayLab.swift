@@ -72,9 +72,9 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
 
     var cameraTarget: F3 {
         guard let camera = selectedCamera else { return .zero }
-        let declared = F3(camera.target[0], camera.target[1], camera.target[2])
-        let anchor = session?.anchor(named: camera.anchor) ?? declared
-        return anchor + F3(camera.offset[0], camera.offset[1], camera.offset[2])
+        return PolicyBundleReplayFactory.cameraTarget(
+            preset: camera,
+            anchorValue: session?.anchor(named: camera.anchor)) ?? .zero
     }
 
     init() {

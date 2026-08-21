@@ -63,7 +63,10 @@ metadata.
 - `avbd-vector-ppo-v1` uses the four canonical files shown above. It can replay
   any registered task that implements `RLReplayTask`.
 - `unitree-h1-recurrent-v1` uses `manifest.json`, `policy.safetensors`, and
-  `LICENSE` through roles `manifest`, `policy`, and `license`.
+  `LICENSE` through roles `manifest`, `policy`, and `license`. This ABI
+  currently requires `includeInteractiveRobustnessProbes: true`; manifests
+  that claim a different scene are rejected instead of being silently
+  reconstructed with a projectile.
 
 A new policy for a supported runtime and replay task requires only a new
 bundle. A new network execution format or simulator/task ABI requires a new
@@ -72,9 +75,10 @@ versioned runtime adapter, but does not require a new app page.
 ## Presentation data
 
 Camera presets select a named task/runtime anchor such as `robot`, `course`,
-`goal`, or `world`, then apply a target offset and orbit parameters. The app
-always provides shared play, pause, step, reset, playback-rate, and camera
-interaction.
+`goal`, or `world`. For `world`, `target` is the absolute look-at point. For
+other anchors, `target` is an anchor-relative vector. `offset` is then applied
+in both cases before the orbit parameters. The app always provides shared
+play, pause, step, reset, playback-rate, and camera interaction.
 
 Controls are ordered and have unique IDs:
 
