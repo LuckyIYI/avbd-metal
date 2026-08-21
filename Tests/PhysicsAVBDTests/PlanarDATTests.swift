@@ -681,7 +681,15 @@ final class PlanarDATTests: XCTestCase {
         var scene = Demos.twist(res: 20)
         scene.settings.iterations = 2
         let solver = try GPUSolver(scene: scene)
-        solver.planarDATBodyIncidenceForTesting = true
+        XCTAssertFalse(
+            solver.hasPlanarDATBodyIncidenceStorage,
+            "a low-color shell must not allocate the full incidence list")
+        XCTAssertEqual(solver.planarDATBodyPairsBuf.length, 16)
+        try solver.enablePlanarDATBodyIncidenceForTesting()
+        XCTAssertTrue(solver.hasPlanarDATBodyIncidenceStorage)
+        XCTAssertEqual(
+            solver.planarDATBodyPairsBuf.length,
+            solver.maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
         for _ in 0..<12 { try solver.submitStep() }
         try solver.synchronize()
 
@@ -722,7 +730,7 @@ final class PlanarDATTests: XCTestCase {
         var scene = Demos.clothfold(res: 36)
         scene.settings.iterations = 10
         let solver = try GPUSolver(scene: scene)
-        solver.planarDATBodyIncidenceForTesting = true
+        try solver.enablePlanarDATBodyIncidenceForTesting()
         XCTAssertGreaterThanOrEqual(solver.staticUsedColors, 2)
 
         try solver.submitStep()
@@ -1127,11 +1135,45 @@ final class PlanarDATTests: XCTestCase {
                        .planarDAT)
     }
 
+    func testAutomaticHighColorPlanarSceneAllocatesIncidenceStorage() throws {
+        var scene = PhysicsScene(name: "high-color-planar-incidence")
+        let positions = [
+            F3(0, 0, 0), F3(1, 0, 0), F3(0, 1, 0), F3(0, 0, 1),
+            F3(2, 2, 2),
+        ]
+        let ids = positions.map {
+            scene.addParticle(radius: 0.01, mass: 1, friction: 0,
+                              position: $0)
+        }
+        scene.addTet(SceneTet(
+            ids: (ids[0], ids[1], ids[2], ids[3]),
+            mu: 100, lambda: 1_000, selfCollisionEnabled: true))
+        for id in ids.prefix(4) {
+            scene.addSpring(SceneSpring(
+                bodyA: id, bodyB: ids[4], rA: .zero, rB: .zero,
+                stiffness: 1))
+        }
+
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .planarDAT)
+        XCTAssertEqual(solver.staticUsedColors, 5)
+        XCTAssertTrue(
+            solver.hasPlanarDATBodyIncidenceStorage,
+            "a high-color Planar scene should retain the optimized incidence reducer")
+        XCTAssertEqual(
+            solver.planarDATBodyPairsBuf.length,
+            solver.maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
+    }
+
     func testAutomaticGiantBedKeepsVolumetricPathStable() throws {
         let solver = try GPUSolver(scene: Demos.make("bed", scale: 8)!)
         XCTAssertEqual(solver.surfaceTruncationSelection, .automatic)
         XCTAssertEqual(solver.effectiveSurfaceTruncationMode, .isotropicDAT)
         XCTAssertFalse(solver.tetInversionPreventionEnabled)
+        XCTAssertFalse(
+            solver.hasPlanarDATBodyIncidenceStorage,
+            "automatic isotropic volumes must not allocate Planar incidence storage")
+        XCTAssertEqual(solver.planarDATBodyPairsBuf.length, 16)
 
         for _ in 0..<20 {
             try solver.submitStep()

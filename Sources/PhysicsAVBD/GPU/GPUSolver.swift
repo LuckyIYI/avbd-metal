@@ -197,7 +197,10 @@ public final class GPUSolver {
     var planarDATTBuf, planarDATArgsBuf: MTLBuffer
     // Accepted-pose Planar pairs indexed by participating particle. The
     // fixed pair set is reused after every VBD color; this CSR prevents each
-    // color from rescanning the complete global pair stream.
+    // color from rescanning the complete global pair stream. Its pair-index
+    // list is intentionally a placeholder unless the initial scene selects
+    // the high-color incidence path; low-color/global/isotropic scenes must
+    // not pay for a second full Planar pair stream.
     var planarDATBodyCountBuf, planarDATBodyStartBuf: MTLBuffer
     var planarDATBodyCursorBuf, planarDATBodyPairsBuf: MTLBuffer
     var nbr2Start, nbr2Count, nbr2List: MTLBuffer
@@ -494,8 +497,7 @@ public final class GPUSolver {
         planarDATBodyCountBuf = try makeBuf(nb * 4, "planarDATBodyCount")
         planarDATBodyStartBuf = try makeBuf(nb * 4, "planarDATBodyStart")
         planarDATBodyCursorBuf = try makeBuf(nb * 4, "planarDATBodyCursor")
-        planarDATBodyPairsBuf = try makeBuf(
-            maxPlanarDATPairs * 4 * 4, "planarDATBodyPairs")
+        planarDATBodyPairsBuf = try makeBuf(0, "planarDATBodyPairs")
         // 2-ring CSR sized after derivation below (~19/vertex upper bound)
         nbr2Start = try makeBuf(nb * 4, "nbr2Start")
         nbr2Count = try makeBuf(nb * 4, "nbr2Count")
@@ -595,6 +597,12 @@ public final class GPUSolver {
 
         try buildPipelines()
         try upload(scene: scene)
+        if effectiveSurfaceTruncationMode == .planarDAT,
+           staticUsedColors > 4,
+           ProcessInfo.processInfo.environment["AVBD_DAT_GLOBAL_COLOR"] == nil {
+            planarDATBodyPairsBuf = try makeBuf(
+                planarDATBodyPairStorageBytes, "planarDATBodyPairs")
+        }
         self.spinners = scene.spinners
         // expose spinner angular velocity to the contact solver so friction
         // sees the kinematic surface motion
@@ -2207,6 +2215,34 @@ public final class GPUSolver {
     var completionFailureForTesting: ((String, Int) -> RuntimeFailure?)?
     var inflightCountForTesting: Int { inflight.count }
 
+    private var planarDATBodyPairStorageBytes: Int {
+        max(16, maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
+    }
+
+    /// Whether the optional per-body incidence list can represent the full
+    /// accepted Planar pair stream. A missing list is never a correctness
+    /// failure: encoding falls back to the global pair reducer.
+    var hasPlanarDATBodyIncidenceStorage: Bool {
+        numTris > 0
+            && planarDATBodyPairsBuf.length >= planarDATBodyPairStorageBytes
+    }
+
+    /// Focused tests may force the incidence reducer on ordinary low-color
+    /// shells, but must explicitly opt into its otherwise-unneeded storage.
+    func enablePlanarDATBodyIncidenceForTesting() throws {
+        if !hasPlanarDATBodyIncidenceStorage {
+            guard let buffer = device.makeBuffer(
+                length: planarDATBodyPairStorageBytes,
+                options: .storageModeShared
+            ) else {
+                throw AVBDError.allocFailed("planarDATBodyPairs")
+            }
+            buffer.label = "planarDATBodyPairs"
+            planarDATBodyPairsBuf = buffer
+        }
+        planarDATBodyIncidenceForTesting = true
+    }
+
     func motorTargetForTesting(_ joint: Int) -> Float {
         sync()
         let values = joints.contents().bindMemory(
@@ -3151,6 +3187,7 @@ public final class GPUSolver {
         // Select from solver structure rather than demo names.
         let usePlanarBodyIncidence = (staticUsedColors > 4
             || planarDATBodyIncidenceForTesting)
+            && hasPlanarDATBodyIncidenceStorage
             && ProcessInfo.processInfo.environment[
                 "AVBD_DAT_GLOBAL_COLOR"] == nil
 
