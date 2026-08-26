@@ -4,8 +4,8 @@
 This check deliberately does not import MLX or execute a policy. It verifies the
 immutable boundary around an already evaluated policy instead:
 
-* accepted and external-parity entries are discovered from
-  ``PolicyReplayCatalog.swift``;
+* accepted and external-parity entries are discovered from the portable
+  ``checkpoints/policy-release-index.json`` and their policy bundles;
 * tracked checkpoint identity is recomputed from the exact replay-semantic files;
 * evaluation reports must match checkpoint task/revision/configuration/lineage;
 * checkpoint robustness aggregates are rebuilt from their raw reports with the
@@ -15,7 +15,7 @@ immutable boundary around an already evaluated policy instead:
   otherwise unallowlisted checkpoint payloads.
 
 An accepted evidence shape that this verifier does not understand fails closed,
-so extending the release catalog requires extending this contract as well.
+so extending the release index requires extending this contract as well.
 """
 
 from __future__ import annotations
@@ -96,6 +96,9 @@ H1_REQUALIFICATION_MANIFEST_SHA256 = (
 )
 H1_AGGREGATE_SHA256 = (
     "b1b5975c59147878358fd90e224180172a3df890b2306f352ab37c84d43e2c8c"
+)
+H1_POLICY_BUNDLE_SHA256 = (
+    "b8a8036565ae8fea3c774969915b257da52d42980eb662a51f0c5996f388892f"
 )
 H1_REPORT_RESULTS = {
     51_001: (506,
@@ -223,6 +226,8 @@ ARACHNE_QUALIFICATION_PROFILE = {
                 "2dd66c4d70bd34a72050b3c938b74f7361066c1ac1a935bfe797c68add00131a",
         },
         "candidateFiles": {
+            "policy-bundle.json":
+                "70257f2ebea4993e8cdee47b7f36c0ae9d339d6b9625c0b3baa0a9e52a2e4cd6",
             "deployment-manifest.json":
                 "7295cf74dc9576a8b2bce74eeae0beb2932af96c5ff0617b0b99b82796b5039c",
             "metadata.json":
@@ -295,6 +300,8 @@ ARACHNE_QUALIFICATION_PROFILE = {
                 "8286ef59443b9b00c110064b938e897dec556582de1bd017871329e2e47dc087",
         },
         "candidateFiles": {
+            "policy-bundle.json":
+                "22da5ca2b9d0bcb5388d1af90597460e45b3612f853b993bb1848fd80d088627",
             "deployment-manifest.json":
                 "e7d747a41b3f724940bbe42d92dc38de8798dafbc7d39909e4ad1cf10ae1e127",
             "metadata.json":
@@ -343,13 +350,15 @@ class VerificationError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class CatalogEntry:
+class ReleaseEntry:
     selection_id: str
     task_id: str
     runtime: str
     qualification: str
     checkpoint_relative_directory: str
     evidence_relative_path: str
+    acceptance_aggregate_relative_path: str | None = None
+    deployment_manifest_relative_path: str | None = None
     expected_task_revision: int | None = None
     expected_checkpoint_fingerprint: str | None = None
     expected_deployment_manifest_sha256: str | None = None
@@ -363,7 +372,7 @@ class CatalogEntry:
 
 @dataclass(frozen=True)
 class CheckpointContext:
-    entry: CatalogEntry
+    entry: ReleaseEntry
     directory: Path
     metadata: dict[str, Any]
     training_state: dict[str, Any]
@@ -610,198 +619,159 @@ def assert_json_equal(actual: Any, expected: Any, label: str) -> None:
     raise VerificationError(f"{label}: unsupported reconstructed value {expected!r}")
 
 
-def matching_delimiter(source: str, start: int, opening: str, closing: str) -> int:
-    require(source[start] == opening, "internal delimiter parser error")
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(source)):
-        character = source[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-            continue
-        if character == '"':
-            in_string = True
-        elif character == opening:
-            depth += 1
-        elif character == closing:
-            depth -= 1
-            if depth == 0:
-                return index
-    raise VerificationError(f"unterminated {opening} in PolicyReplayCatalog")
-
-
-def argument_expression(entry: str, name: str) -> str:
-    match = re.search(rf"\b{re.escape(name)}\s*:\s*", entry)
-    require(match is not None, f"catalog entry is missing {name}")
-    start = match.end()
-    stack: list[str] = []
-    pairs = {"(": ")", "[": "]", "{": "}"}
-    in_string = False
-    escaped = False
-    for index in range(start, len(entry)):
-        character = entry[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-            continue
-        if character == '"':
-            in_string = True
-        elif character in pairs:
-            stack.append(pairs[character])
-        elif stack and character == stack[-1]:
-            stack.pop()
-        elif character == "," and not stack:
-            return entry[start:index].strip()
-    return entry[start:].rstrip().rstrip(")").strip()
-
-
-def swift_string(expression: str, label: str) -> str | None:
-    if expression == "nil":
-        return None
-    literals = list(re.finditer(r'"(?:\\.|[^"\\])*"', expression))
-    require(bool(literals), f"{label} is not a static Swift string")
-    remainder = expression
-    for match in reversed(literals):
-        remainder = remainder[:match.start()] + remainder[match.end():]
-    require(re.fullmatch(r"[+\s]*", remainder) is not None,
-            f"{label} must use only static string literals")
-    try:
-        return "".join(json.loads(match.group(0)) for match in literals)
-    except json.JSONDecodeError as error:
-        raise VerificationError(f"cannot decode {label}: {error}") from error
-
-
-def swift_int(expression: str, label: str) -> int:
-    compact = expression.replace("_", "").strip()
-    require(re.fullmatch(r"-?\d+", compact) is not None,
-            f"{label} must be a static Swift integer")
-    return int(compact)
-
-
-def swift_initializer_arguments(expression: str, label: str) -> str:
-    match = re.match(r"\s*\.init\s*\(", expression, re.DOTALL)
-    require(match is not None, f"{label} must be a literal .init(...)")
-    body = expression[match.end():].rstrip()
-    # argument_expression removes the outer entry's trailing parenthesis and,
-    # for a final nested initializer, may remove its adjacent close as well.
-    if body.endswith(")"):
-        body = body[:-1].rstrip()
-    return body
-
-
-def catalog_entries(root: Path) -> tuple[list[CatalogEntry], list[CatalogEntry]]:
-    path = root / "Sources/MLXRL/PolicyReplayCatalog.swift"
-    try:
-        source = path.read_text(encoding="utf-8")
-    except OSError as error:
-        raise VerificationError(f"cannot read {path}: {error}") from error
-    declaration = source.find("public static let entries")
-    require(declaration >= 0, "PolicyReplayCatalog.entries is missing")
-    assignment = source.find("=", declaration)
-    closure_start = source.find("{", assignment)
-    require(assignment >= 0 and closure_start >= 0,
-            "PolicyReplayCatalog.entries is not an initialized closure")
-    inner_declaration = re.search(
-        r"\blet\s+entries\s*:\s*\[PolicyReplayCatalogEntry\]\s*=",
-        source[closure_start:],
-    )
-    require(inner_declaration is not None,
-            "PolicyReplayCatalog.entries closure has no literal entries array")
-    inner_assignment = closure_start + inner_declaration.end() - 1
-    array_start = source.find("[", inner_assignment + 1)
-    require(array_start >= 0,
-            "PolicyReplayCatalog.entries inner assignment is not an array")
-    array_end = matching_delimiter(source, array_start, "[", "]")
-    body = source[array_start + 1:array_end]
-
-    blocks: list[str] = []
-    cursor = 0
-    while True:
-        match = re.search(r"\.init\s*\(", body[cursor:])
-        if match is None:
-            break
-        open_paren = cursor + match.end() - 1
-        close_paren = matching_delimiter(body, open_paren, "(", ")")
-        blocks.append(body[open_paren + 1:close_paren])
-        cursor = close_paren + 1
-    require(bool(blocks), "PolicyReplayCatalog contains no literal entries")
-
-    accepted: list[CatalogEntry] = []
-    external_parity: list[CatalogEntry] = []
+def release_entries(root: Path) -> tuple[list[ReleaseEntry], list[ReleaseEntry]]:
+    """Load the sealed release index and exact portable bundle manifests."""
+    index_path = root / "checkpoints/policy-release-index.json"
+    index = load_json(index_path)
+    require_exact_keys(index, {"schemaVersion", "releases"}, str(index_path))
+    require(index.get("schemaVersion") == 1,
+            f"{index_path}: unsupported release index schema")
+    releases = index.get("releases")
+    require(isinstance(releases, list) and releases,
+            f"{index_path}: releases must be a nonempty array")
+    accepted: list[ReleaseEntry] = []
+    external_parity: list[ReleaseEntry] = []
     all_selection_ids: set[str] = set()
-    for block in blocks:
-        selection_id = swift_string(
-            argument_expression(block, "selectionID"), "selectionID")
-        require(selection_id is not None and selection_id not in all_selection_ids,
+    for release in releases:
+        require(isinstance(release, dict),
+                f"{index_path}: release entries must be objects")
+        selection_id = release.get("bundleIdentifier")
+        checkpoint = release.get("bundleRelativeDirectory")
+        evidence = release.get("evidenceRelativePath")
+        qualification = release.get("qualification")
+        manifest_sha = release.get("bundleManifestSHA256")
+        expected_revision = release.get("expectedTaskRevision")
+        require(isinstance(selection_id, str)
+                and selection_id not in all_selection_ids,
                 f"invalid or duplicate Policy Replay selection {selection_id!r}")
         all_selection_ids.add(selection_id)
-        qualification = argument_expression(block, "qualification")
-        if qualification not in {".accepted", ".externalParityVerified"}:
-            continue
-        task_id = swift_string(argument_expression(block, "taskID"), "taskID")
-        checkpoint = swift_string(
-            argument_expression(block, "checkpointRelativeDirectory"),
-            "checkpointRelativeDirectory",
-        )
-        evidence = swift_string(
-            argument_expression(block, "evidenceRelativePath"),
-            "evidenceRelativePath",
-        )
-        runtime = argument_expression(block, "runtime")
-        require(task_id is not None and checkpoint is not None and evidence is not None,
-                f"qualified selection {selection_id} must name task, checkpoint and evidence")
-        if qualification == ".accepted":
-            require(runtime == ".nativeMLX",
-                    f"accepted selection {selection_id} uses unsupported runtime {runtime}")
-            expected_revision = swift_int(
-                argument_expression(block, "expectedTaskRevision"),
-                f"{selection_id} expectedTaskRevision")
-            expected_fingerprint = swift_string(
-                argument_expression(block, "expectedCheckpointFingerprint"),
-                f"{selection_id} expectedCheckpointFingerprint")
-            expected_manifest = swift_string(
-                argument_expression(block,
-                                    "expectedDeploymentManifestSHA256"),
-                f"{selection_id} expectedDeploymentManifestSHA256")
-            require(expected_fingerprint is not None
+        require(isinstance(checkpoint, str) and checkpoint
+                and isinstance(evidence, str) and evidence
+                and not Path(checkpoint).is_absolute()
+                and all(part not in {"", ".", ".."}
+                        for part in Path(checkpoint).parts)
+                and not Path(evidence).is_absolute()
+                and all(part not in {"", ".", ".."}
+                        for part in Path(evidence).parts)
+                and type(expected_revision) is int and expected_revision > 0
+                and isinstance(manifest_sha, str)
+                and SHA256_PATTERN.fullmatch(manifest_sha),
+                f"{selection_id}: release locator or identity is invalid")
+        bundle_directory = repository_path(
+            root, f"checkpoints/{checkpoint}", f"{selection_id} bundle")
+        bundle_manifest_path = sealed_bundle_file(
+            bundle_directory, "policy-bundle.json",
+            f"{selection_id} portable manifest")
+        require(sha256_file(bundle_manifest_path) == manifest_sha,
+                f"{selection_id}: portable bundle manifest digest mismatch")
+        bundle = load_json(bundle_manifest_path)
+        require_exact_keys(bundle, {
+            "schemaVersion", "identifier", "title", "summary", "runtime",
+            "simulation", "presentation",
+        }, str(bundle_manifest_path))
+        require(bundle.get("schemaVersion") == 1
+                and bundle.get("identifier") == selection_id,
+                f"{selection_id}: portable manifest identity changed")
+        simulation = bundle.get("simulation")
+        runtime_manifest = bundle.get("runtime")
+        require_exact_keys(runtime_manifest, {"kind", "files"},
+                           f"{selection_id} runtime")
+        require_exact_keys(simulation, {
+            "task", "taskRevision", "seed", "maxEpisodeSteps",
+            "simulationStepSeconds", "controlDecimation",
+            "includeInteractiveRobustnessProbes", "options",
+        }, f"{selection_id} simulation")
+        require_exact_keys(bundle.get("presentation"), {
+            "cameraPresets", "controls", "metrics",
+        }, f"{selection_id} presentation")
+        require(isinstance(simulation, dict)
+                and simulation.get("taskRevision") == expected_revision
+                and isinstance(runtime_manifest, dict),
+                f"{selection_id}: portable simulation/runtime is invalid")
+        task_id = simulation.get("task")
+        runtime_kind = runtime_manifest.get("kind")
+        require(isinstance(task_id, str) and task_id,
+                f"{selection_id}: portable task id is invalid")
+        if qualification == "accepted":
+            require_exact_keys(release, {
+                "bundleIdentifier", "bundleRelativeDirectory",
+                "bundleManifestSHA256", "qualification",
+                "evidenceRelativePath", "acceptanceAggregateRelativePath",
+                "deploymentManifestRelativePath", "expectedTaskRevision",
+                "expectedCheckpointFingerprint",
+                "expectedDeploymentManifestSHA256",
+            }, f"{selection_id} release")
+            runtime = ".nativeMLX"
+            require(runtime_kind == "avbd-vector-ppo-v1",
+                    f"accepted selection {selection_id} uses unsupported runtime")
+            require_exact_keys(runtime_manifest.get("files"), {
+                "metadata", "policy", "trainingState", "deploymentManifest",
+            }, f"{selection_id} runtime files")
+            require(runtime_manifest["files"] == {
+                "metadata": "metadata.json",
+                "policy": "policy.safetensors",
+                "trainingState": "training-state.json",
+                "deploymentManifest": "deployment-manifest.json",
+            }, f"{selection_id}: native runtime file mapping changed")
+            expected_fingerprint = release.get("expectedCheckpointFingerprint")
+            expected_manifest = release.get(
+                "expectedDeploymentManifestSHA256")
+            aggregate_path = release.get("acceptanceAggregateRelativePath")
+            deployment_path = release.get("deploymentManifestRelativePath")
+            require(isinstance(expected_fingerprint, str)
                     and SHA256_PATTERN.fullmatch(expected_fingerprint)
-                    and expected_manifest is not None
-                    and SHA256_PATTERN.fullmatch(expected_manifest),
+                    and isinstance(expected_manifest, str)
+                    and SHA256_PATTERN.fullmatch(expected_manifest)
+                    and isinstance(aggregate_path, str) and aggregate_path
+                    and isinstance(deployment_path, str)
+                    and deployment_path
+                        == f"checkpoints/{checkpoint}/deployment-manifest.json",
                     f"{selection_id}: accepted runtime identity is invalid")
-            entry = CatalogEntry(
+            entry = ReleaseEntry(
                 selection_id=selection_id, task_id=task_id, runtime=runtime,
-                qualification=qualification,
+                qualification=".accepted",
                 checkpoint_relative_directory=checkpoint,
                 evidence_relative_path=evidence,
+                acceptance_aggregate_relative_path=aggregate_path,
+                deployment_manifest_relative_path=deployment_path,
                 expected_task_revision=expected_revision,
                 expected_checkpoint_fingerprint=expected_fingerprint,
                 expected_deployment_manifest_sha256=expected_manifest)
             accepted.append(entry)
-        else:
-            require(runtime == ".unitreeRecurrentMLX",
-                    f"external-parity selection {selection_id} uses unsupported runtime {runtime}")
-            identity = swift_initializer_arguments(
-                argument_expression(block, "unitreeH1ReleaseIdentity"),
-                f"{selection_id} unitreeH1ReleaseIdentity")
+        elif qualification == "externalParityVerified":
+            require_exact_keys(release, {
+                "bundleIdentifier", "bundleRelativeDirectory",
+                "bundleManifestSHA256", "qualification",
+                "evidenceRelativePath", "expectedTaskRevision",
+                "unitreeH1ReleaseIdentity",
+            }, f"{selection_id} release")
+            runtime = ".unitreeRecurrentMLX"
+            require(runtime_kind == "unitree-h1-recurrent-v1",
+                    f"external-parity selection {selection_id} uses unsupported runtime")
+            require_exact_keys(runtime_manifest.get("files"), {
+                "manifest", "policy", "license",
+            }, f"{selection_id} runtime files")
+            require(runtime_manifest["files"] == {
+                "manifest": "manifest.json",
+                "policy": "policy.safetensors",
+                "license": "LICENSE",
+            }, f"{selection_id}: external runtime file mapping changed")
+            identity = release.get("unitreeH1ReleaseIdentity")
+            require(isinstance(identity, dict),
+                    f"{selection_id}: Unitree release identity is missing")
+            require_exact_keys(identity, {
+                "manifestSHA256", "sourceRevision",
+                "sourceCheckpointSHA256", "weightsSHA256", "licenseSHA256",
+                "goldenSequenceSHA256",
+            }, f"{selection_id} external identity")
             def identity_string(name: str) -> str:
-                value = swift_string(argument_expression(identity, name),
-                                     f"{selection_id} {name}")
-                require(value is not None,
+                value = identity.get(name)
+                require(isinstance(value, str) and value,
                         f"{selection_id}: {name} may not be nil")
                 return value
-            entry = CatalogEntry(
+            entry = ReleaseEntry(
                 selection_id=selection_id, task_id=task_id, runtime=runtime,
-                qualification=qualification,
+                qualification=".externalParityVerified",
                 checkpoint_relative_directory=checkpoint,
                 evidence_relative_path=evidence,
                 unitree_manifest_sha256=identity_string("manifestSHA256"),
@@ -813,8 +783,11 @@ def catalog_entries(root: Path) -> tuple[list[CatalogEntry], list[CatalogEntry]]
                 unitree_golden_sequence_sha256=identity_string(
                     "goldenSequenceSHA256"))
             external_parity.append(entry)
+        else:
+            raise VerificationError(
+                f"{selection_id}: unsupported release qualification {qualification!r}")
     require(bool(accepted) or bool(external_parity),
-            "PolicyReplayCatalog contains no verified policy evidence")
+            "policy release index contains no verified policy evidence")
     return accepted, external_parity
 
 
@@ -831,7 +804,7 @@ def require_numeric_matrix(value: Any, rows: int, columns: int,
                 f"{label}[{row_index}]: values must be finite numbers")
 
 
-def verify_external_parity(root: Path, entry: CatalogEntry) -> None:
+def verify_external_parity(root: Path, entry: ReleaseEntry) -> None:
     require(entry.selection_id == UNITREE_H1_SELECTION,
             f"{entry.selection_id}: unsupported external parity contract")
     require(entry.task_id == UNITREE_H1_SELECTION,
@@ -848,7 +821,7 @@ def verify_external_parity(root: Path, entry: CatalogEntry) -> None:
             and entry.unitree_license_sha256 == UNITREE_H1_LICENSE_SHA256
             and entry.unitree_golden_sequence_sha256
                 == UNITREE_H1_GOLDEN_SEQUENCE_SHA256,
-            "Unitree catalog runtime identity differs from the sealed release")
+            "Unitree release-index identity differs from the sealed release")
     directory = repository_path(
         root, f"checkpoints/{entry.checkpoint_relative_directory}",
         f"{entry.selection_id} checkpoint",
@@ -1020,7 +993,7 @@ def verify_deployment_manifest(context: CheckpointContext,
         assert_json_equal(manifest, expected, str(path))
 
 
-def verify_checkpoint(root: Path, entry: CatalogEntry) -> CheckpointContext:
+def verify_checkpoint(root: Path, entry: ReleaseEntry) -> CheckpointContext:
     directory = repository_path(
         root, f"checkpoints/{entry.checkpoint_relative_directory}",
         f"{entry.selection_id} checkpoint",
@@ -1030,7 +1003,7 @@ def verify_checkpoint(root: Path, entry: CatalogEntry) -> CheckpointContext:
     metadata = load_json(directory / "metadata.json")
     state = load_json(directory / "training-state.json")
     require(metadata.get("task") == entry.task_id,
-            f"{entry.selection_id}: checkpoint task differs from catalog")
+            f"{entry.selection_id}: checkpoint task differs from release index")
     require(type(metadata.get("taskRevision")) is int,
             f"{entry.selection_id}: checkpoint taskRevision is missing")
     require(isinstance(metadata.get("taskConfiguration"), dict),
@@ -1044,6 +1017,9 @@ def verify_checkpoint(root: Path, entry: CatalogEntry) -> CheckpointContext:
             "the sealed checkpoint")
     deployment_path = directory / "deployment-manifest.json"
     require(entry.expected_deployment_manifest_sha256 is not None
+            and entry.deployment_manifest_relative_path
+                == f"checkpoints/{entry.checkpoint_relative_directory}/"
+                    "deployment-manifest.json"
             and deployment_path.is_file()
             and sha256_file(deployment_path)
                 == entry.expected_deployment_manifest_sha256,
@@ -1150,7 +1126,7 @@ def require_evaluation_report(report: dict[str, Any], context: CheckpointContext
             and report["provenanceVersion"] >= 3,
             f"{label}: accepted evidence requires provenanceVersion >= 3")
     require(report.get("task") == context.entry.task_id,
-            f"{label}: task differs from catalog")
+            f"{label}: task differs from release index")
     require(type(report.get("taskRevision")) is int,
             f"{label}: taskRevision is missing")
     require(report["taskRevision"] == metadata["taskRevision"],
@@ -1477,7 +1453,7 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
     require(context.entry.selection_id == H1_REQUALIFIED_SELECTION,
             "internal H1 requalification selection mismatch")
     require(context.entry.task_id == H1_TASK,
-            f"{context.entry.selection_id}: catalog task changed")
+            f"{context.entry.selection_id}: release-index task changed")
     require(context.entry.checkpoint_relative_directory
             == H1_REQUALIFIED_SELECTION,
             f"{context.entry.selection_id}: checkpoint directory changed")
@@ -1493,7 +1469,7 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
     expected_top_level = {
         "metadata.json", "policy.safetensors", "training-state.json",
         "deployment-manifest.json", "requalification-manifest.json",
-        "qualification",
+        "policy-bundle.json", "qualification",
     }
     require({path.name for path in context.directory.iterdir()}
             == expected_top_level,
@@ -1506,6 +1482,7 @@ def verify_h1_requalification(root: Path, context: CheckpointContext,
         "policy.safetensors": H1_POLICY_SHA256,
         "training-state.json": H1_TRAINING_STATE_SHA256,
         "deployment-manifest.json": H1_DEPLOYMENT_MANIFEST_SHA256,
+        "policy-bundle.json": H1_POLICY_BUNDLE_SHA256,
         "requalification-manifest.json":
             H1_REQUALIFICATION_MANIFEST_SHA256,
     }
@@ -1848,7 +1825,7 @@ def verify_schema2_requalification(
             and context.directory == expected_checkpoint
             and not (root / "checkpoints"
                      / profile["checkpointRelativeDirectory"]).is_symlink(),
-            f"{context.entry.selection_id}: published catalog identity changed")
+            f"{context.entry.selection_id}: published release identity changed")
     verify_pinned_file_tree(
         context.directory, arachne_candidate_files(profile),
         f"{context.entry.selection_id} candidate",
@@ -2156,7 +2133,7 @@ def verify_schema2_requalification(
     expected_top_level = {
         "metadata.json", "policy.safetensors", "training-state.json",
         "deployment-manifest.json", "requalification-manifest.json",
-        "qualification",
+        "policy-bundle.json", "qualification",
     }
     require({path.name for path in context.directory.iterdir()}
             == expected_top_level,
@@ -2173,7 +2150,7 @@ def verify_schema2_requalification(
 
 def verify(root: Path) -> tuple[int, int, int, int]:
     root = root.resolve()
-    accepted, external_parity = catalog_entries(root)
+    accepted, external_parity = release_entries(root)
     aggregate_paths: set[Path] = set()
     report_count = 0
     for entry in accepted:
@@ -2188,12 +2165,23 @@ def verify(root: Path) -> tuple[int, int, int, int]:
         if entry.selection_id == H1_REQUALIFIED_SELECTION:
             aggregate_path = verify_h1_requalification(
                 root, context, evidence_path)
+            require(entry.acceptance_aggregate_relative_path is not None
+                    and aggregate_path == repository_path(
+                        root, entry.acceptance_aggregate_relative_path,
+                        f"{entry.selection_id} acceptance aggregate"),
+                    f"{entry.selection_id}: release aggregate path changed")
             aggregate_paths.add(aggregate_path.resolve())
             report_count += verify_aggregate(aggregate_path, context)
             continue
         if evidence.get("schemaVersion") == 2:
             suite_aggregates, suite_reports = verify_schema2_requalification(
                 root, context, evidence_path)
+            require(entry.acceptance_aggregate_relative_path is not None
+                    and repository_path(
+                        root, entry.acceptance_aggregate_relative_path,
+                        f"{entry.selection_id} acceptance aggregate")
+                        in suite_aggregates,
+                    f"{entry.selection_id}: release aggregate path changed")
             aggregate_paths.update(path.resolve() for path in suite_aggregates)
             report_count += suite_reports
             continue
@@ -2225,7 +2213,7 @@ def verify_app_checkpoint_package(root: Path, checkpoint_root: Path) -> None:
 
     Historical and development checkpoints remain useful in a repository
     checkout, but shipping them would make the runtime package broader than
-    the fail-closed replay catalog.  This exact inventory also catches a
+    the fail-closed release index. This exact inventory also catches a
     missing evidence file or an accidental recursive copy of ignored runs.
     """
     require(not checkpoint_root.is_symlink(),
@@ -2236,6 +2224,7 @@ def verify_app_checkpoint_package(root: Path, checkpoint_root: Path) -> None:
     h1_files = {
         "deployment-manifest.json",
         "metadata.json",
+        "policy-bundle.json",
         "policy.safetensors",
         "requalification-manifest.json",
         "training-state.json",
@@ -2245,8 +2234,13 @@ def verify_app_checkpoint_package(root: Path, checkpoint_root: Path) -> None:
         "qualification/eval-seed-51003.json",
         "qualification/eval-seed-51004.json",
     }
-    unitree_files = {"LICENSE", "manifest.json", "policy.safetensors"}
-    expected_files = {Path("README.md")}
+    unitree_files = {
+        "LICENSE", "manifest.json", "policy-bundle.json",
+        "policy.safetensors",
+    }
+    expected_files = {
+        Path("README.md"), Path("policy-release-index.json"),
+    }
     expected_files.update(
         Path(H1_REQUALIFIED_SELECTION) / relative for relative in h1_files)
     expected_files.update(
@@ -2317,7 +2311,7 @@ def main() -> int:
         return 1
     print(
         "verified policy evidence: "
-        f"{accepted} accepted catalog entries, "
+        f"{accepted} accepted release entries, "
         f"{external_parity} external parity entries, "
         f"{aggregates} robustness aggregates, "
         f"{reports} evaluation reports"

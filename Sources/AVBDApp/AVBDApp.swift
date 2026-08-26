@@ -32,8 +32,8 @@ struct AVBDApp: App {
 
 struct ContentView: View {
     @ObservedObject var model: SimulationModel
-    @StateObject var robotics = RoboticsModel()
-    @State private var selectedTab = ProcessInfo.processInfo.environment["AVBD_POLICY_REPLAY"] == nil ? 0 : 2
+    @State private var selectedTab = ProcessInfo.processInfo.environment[
+        "AVBD_POLICY_REPLAY"] == nil ? 0 : 1
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -46,12 +46,9 @@ struct ContentView: View {
             }
             .tabItem { Text("Playground") }
             .tag(0)
-            RoboticsLabView(model: robotics)
-                .tabItem { Text("Robotics Lab") }
-                .tag(1)
             PolicyReplayLabView()
                 .tabItem { Text("Policy Replay") }
-                .tag(2)
+                .tag(1)
         }
     }
 

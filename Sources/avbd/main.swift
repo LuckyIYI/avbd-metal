@@ -1763,11 +1763,23 @@ case "eval-arachne-classical":
 case "sim2sim-h1":
     let o = parseOptions(Array(args.dropFirst(1)))
     let policyDirectory = o.checkpoint ?? "checkpoints/external/unitree-h1"
-    let expectedReleaseIdentity = o.checkpoint == nil
-        ? PolicyReplayCatalog.entry(
-            selectionID: "unitree-h1-sim2sim-v0")?
-            .unitreeH1ReleaseIdentity
-        : nil
+    let expectedReleaseIdentity: UnitreeH1ReleaseIdentity?
+    if o.checkpoint == nil {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let index = try PolicyBundleReleaseIndex.load(
+            from: root.appendingPathComponent(
+                "checkpoints/policy-release-index.json"))
+        let bundle = try PolicyBundleLoader.load(
+            directory: root.appendingPathComponent(policyDirectory))
+        guard let release = index.release(for: bundle),
+              let identity = release.unitreeH1ReleaseIdentity else {
+            throw RLEnvironmentError.invalidConfiguration(
+                "default Unitree bundle is not authenticated by the release index")
+        }
+        expectedReleaseIdentity = identity
+    } else {
+        expectedReleaseIdentity = nil
+    }
     let command = SIMD3<Float>(
         o.taskOptions["forward"] ?? 0.5,
         o.taskOptions["lateral"] ?? 0,
