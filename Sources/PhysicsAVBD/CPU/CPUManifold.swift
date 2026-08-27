@@ -205,6 +205,13 @@ public final class CPUManifold: CPUForce {
                 contacts[i].penalty[2] = min(contacts[i].penalty[2] + solver.betaLin * abs(C[2]),
                                              AVBDConstants.penaltyMaxTangent)
                 contacts[i].stick = length(SIMD2<Float>(C[1], C[2])) < AVBDConstants.stickThresh
+            } else {
+                // Sliding drops the anchor (same fix as the GPU dual update
+                // in 40_solver.metal, where the full story is written up):
+                // leaving `stick` set here kept the warm-started anchors
+                // across a slide, turning kinetic friction into an elastic
+                // tether back to the first touchdown point.
+                contacts[i].stick = false
             }
         }
     }

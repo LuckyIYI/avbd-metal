@@ -1839,6 +1839,19 @@ static inline void dual_manifold_one(
             pen.y = min(pen.y + P.betaLin * fabs(C.y), PENALTY_MAX_T);
             pen.z = min(pen.z + P.betaLin * fabs(C.z), PENALTY_MAX_T);
             m.contacts[i].rB.w = length(C.yz) < STICK_THRESH ? 1.0f : 0.0f;
+        } else {
+            // SLIDING DROPS THE ANCHOR. This flag was only ever updated in
+            // the in-cone branch above, so a contact that stuck once and
+            // then started sliding kept its original anchors for ever: the
+            // tangential constraint accumulated the WHOLE slide (12 cm,
+            // measured), the applied force stayed cone-capped so pushing
+            // still worked - and when the push stopped, that capped force
+            // crept the body all the way back to its stale anchor. Every
+            // grounded object was elastically tethered to wherever it first
+            // touched down. Invisible to any task that LIFTS objects
+            // (breaking contact resets anchors); fatal to planar pushing,
+            // and to any pushing data collected for training.
+            m.contacts[i].rB.w = 0.0f;
         }
         m.contacts[i].penalty = float4(pen, 0);
     }
