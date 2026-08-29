@@ -165,6 +165,14 @@ public final class GPUSolver {
     var hashedIdx, globalIdx, hashedRigidIdx: MTLBuffer
     var cellCount, cellStart, cellBodies, cellRigid: MTLBuffer
     var bodyCellSlot: MTLBuffer
+    public let usesRigidColliderHierarchy: Bool
+    public let rigidBroadphaseProxyCount: Int
+    public let rigidBroadphaseBVHNodeCount: Int
+    var broadphaseProxyOwner, broadphaseProxyLocalPosition: MTLBuffer
+    var broadphaseProxyShape, broadphaseProxyGroup: MTLBuffer
+    var broadphaseProxySharedCollision, broadphaseProxyShapeType: MTLBuffer
+    var broadphaseProxyRoot, broadphaseBVHNodes: MTLBuffer
+    var broadphaseProxyPairs: MTLBuffer
     /// Per-producer candidate counts and exclusive offsets. Pair emission is
     /// count/scan/scatter instead of atomic append so manifold identity and
     /// contact accumulation order are reproducible across Metal schedules.
@@ -205,11 +213,17 @@ public final class GPUSolver {
     let skinnedVertexCount: Int
     let skinnedTriCount: Int
     var skinBindingBuf, skinVertexBuf, skinTriBuf: MTLBuffer
-    // Visual-only rigid CAD meshes are expanded to triangle corners once.
-    // Each corner carries its body id and is transformed from live solver
+    // Visual-only rigid CAD meshes use shared vertices + UInt32 indices.
+    // Each vertex carries its body id and is transformed from live solver
     // state in the renderer; it never enters collision or solver topology.
+    // `rigidMeshVertexCount` retains the legacy expanded-corner count/API.
     let rigidMeshVertexCount: Int
+    let rigidMeshUniqueVertexCount: Int
+    let rigidMeshIndexCount: Int
     var rigidMeshVertexBuf: MTLBuffer
+    var rigidMeshIndexBuf: MTLBuffer
+    private var rigidMeshExpandedVertexBuf: MTLBuffer?
+    private let rigidMeshCompatibilityBufferLock = NSLock()
     // Voronoi temporal tracking: per-vertex / per-edge persistent closest-
     // element candidate sets, plus the topology they propagate through.
     var vtTrackBuf, eeTrackBuf, triAdjBuf: MTLBuffer
@@ -346,6 +360,11 @@ public final class GPUSolver {
         "warmstart_bodies",
         "warmstart_joints",
     ]
+    static let requiredHierarchyKernelNames: Set<String> = [
+        "bp_count_hierarchy_pairs",
+        "bp_emit_hierarchy_pairs",
+        "bp_finalize_hierarchy_pairs",
+    ]
 
     // Cached per-frame color counts (read back once per step)
     public internal(set) var lastColorCounts: [Int] = []
@@ -451,6 +470,149 @@ public final class GPUSolver {
         var debugTriangleVertexCount = 0
         var debugEdgeVertexCount = 0
         var visualTriangleVertexCount = 0
+    }
+
+    private struct BroadphaseGroupKey: Hashable, Comparable {
+        var body: Int
+        var group: UInt32
+        var shared: Bool
+
+        static func < (lhs: Self, rhs: Self) -> Bool {
+            if lhs.body != rhs.body { return lhs.body < rhs.body }
+            if lhs.group != rhs.group { return lhs.group < rhs.group }
+            return !lhs.shared && rhs.shared
+        }
+    }
+
+    private struct RigidBroadphaseHierarchyUpload {
+        var owners: [UInt32] = []
+        var localPositions: [SIMD4<Float>] = []
+        var shapes: [SIMD4<Float>] = []
+        var groups: [UInt32] = []
+        var sharedCollision: [UInt32] = []
+        var shapeTypes: [UInt32] = []
+        var roots: [UInt32] = []
+        var nodes: [ColliderBVHNodeGPU] = []
+    }
+
+    /// Build one balanced body-local sphere BVH per collision domain. This is
+    /// used only by rigid-only scenes; deformable RT queries retain their
+    /// proven collider-level spatial grid. Single-collider bodies stay as
+    /// one-leaf proxies, while decomposed bodies broad-phase once and expand
+    /// only overlapping BVH leaves.
+    private static func makeRigidBroadphaseHierarchy(
+        scene: PhysicsScene, convexUpload: ConvexGPUUpload
+    ) -> RigidBroadphaseHierarchyUpload? {
+        guard scene.tris.isEmpty, scene.tets.isEmpty else { return nil }
+
+        func radius(collider index: Int) -> Float {
+            let collider = scene.colliders[index]
+            if convexUpload.colliderAssetIDs[index] != UInt32.max {
+                return convexUpload.colliderRadii[index]
+            }
+            switch collider.shape {
+            case .sphere: return collider.size.x * 0.5
+            case .torus: return collider.size.x + collider.size.y
+            case .capsule: return collider.size.x * 0.5 + collider.size.y
+            case .box: return simd_length(collider.size * 0.5)
+            }
+        }
+
+        var groups: [BroadphaseGroupKey: [Int]] = [:]
+        for (index, collider) in scene.colliders.enumerated()
+            where collider.collisionEnabled {
+            let key = BroadphaseGroupKey(
+                body: collider.body, group: collider.collisionGroup,
+                shared: collider.collidesWithSharedGeometry)
+            groups[key, default: []].append(index)
+        }
+        guard groups.values.contains(where: { $0.count > 1 }) else {
+            return nil
+        }
+
+        var upload = RigidBroadphaseHierarchyUpload()
+        for key in groups.keys.sorted() {
+            let colliders = groups[key]!.sorted()
+
+            func build(_ leaves: [Int]) -> UInt32 {
+                if leaves.count == 1 {
+                    let collider = leaves[0]
+                    var node = ColliderBVHNodeGPU()
+                    node.centerRadius = SIMD4(
+                        convexUpload.colliderLocalPositions[collider],
+                        radius(collider: collider))
+                    let hull = convexUpload.colliderAssetIDs[collider]
+                        != UInt32.max
+                    node.links = SIMD4(
+                        UInt32.max, UInt32.max, UInt32(collider),
+                        1 | (hull ? 2 : 0))
+                    upload.nodes.append(node)
+                    return UInt32(upload.nodes.count - 1)
+                }
+
+                var lo = F3(repeating: .infinity)
+                var hi = F3(repeating: -.infinity)
+                for collider in leaves {
+                    let center = convexUpload.colliderLocalPositions[collider]
+                    lo = simd_min(lo, center)
+                    hi = simd_max(hi, center)
+                }
+                let extent = hi - lo
+                let axis = extent.x >= extent.y && extent.x >= extent.z ? 0
+                    : (extent.y >= extent.z ? 1 : 2)
+                let ordered = leaves.sorted {
+                    let a = convexUpload.colliderLocalPositions[$0][axis]
+                    let b = convexUpload.colliderLocalPositions[$1][axis]
+                    return a == b ? $0 < $1 : a < b
+                }
+                let middle = ordered.count / 2
+                let left = build(Array(ordered[..<middle]))
+                let right = build(Array(ordered[middle...]))
+                let leftNode = upload.nodes[Int(left)]
+                let rightNode = upload.nodes[Int(right)]
+                let leftCenter = F3(leftNode.centerRadius.x,
+                                    leftNode.centerRadius.y,
+                                    leftNode.centerRadius.z)
+                let rightCenter = F3(rightNode.centerRadius.x,
+                                     rightNode.centerRadius.y,
+                                     rightNode.centerRadius.z)
+                let leftRadius = leftNode.centerRadius.w
+                let rightRadius = rightNode.centerRadius.w
+                let boundsLo = simd_min(
+                    leftCenter - F3(repeating: leftRadius),
+                    rightCenter - F3(repeating: rightRadius))
+                let boundsHi = simd_max(
+                    leftCenter + F3(repeating: leftRadius),
+                    rightCenter + F3(repeating: rightRadius))
+                let center = (boundsLo + boundsHi) * 0.5
+                let combinedRadius = max(
+                    simd_length(leftCenter - center) + leftRadius,
+                    simd_length(rightCenter - center) + rightRadius)
+                var node = ColliderBVHNodeGPU()
+                node.centerRadius = SIMD4(center, combinedRadius)
+                node.links = SIMD4(
+                    left, right, UInt32.max,
+                    (leftNode.links.w | rightNode.links.w) & 2)
+                upload.nodes.append(node)
+                return UInt32(upload.nodes.count - 1)
+            }
+
+            let root = build(colliders)
+            let rootNode = upload.nodes[Int(root)]
+            let particle = scene.bodies[key.body].isParticle
+            upload.owners.append(UInt32(key.body))
+            upload.localPositions.append(SIMD4(
+                rootNode.centerRadius.x, rootNode.centerRadius.y,
+                rootNode.centerRadius.z, 0))
+            upload.shapes.append(SIMD4(
+                0, 0, 0,
+                particle ? -rootNode.centerRadius.w : rootNode.centerRadius.w))
+            upload.groups.append(key.group)
+            upload.sharedCollision.append(key.shared ? 1 : 0)
+            upload.shapeTypes.append((rootNode.links.w & 2) != 0 ? 4 : 0)
+            upload.roots.append(root)
+        }
+        return upload
     }
 
     /// Expand one compact convex instance into the body-local corner format
@@ -689,6 +851,24 @@ public final class GPUSolver {
         return true
     }
 
+    /// Stable bucket key for legacy inline hulls. Exact Float bitwise equality
+    /// is still checked within each bucket, so hash collisions cannot alias
+    /// geometry while repeated robot hulls avoid a linear scan of all uploads.
+    private static func legacyConvexVertexHash(_ vertices: [F3]) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ value: UInt32) {
+            hash ^= UInt64(value)
+            hash &*= 0x100000001b3
+        }
+        mix(UInt32(vertices.count))
+        for vertex in vertices {
+            mix(vertex.x.bitPattern)
+            mix(vertex.y.bitPattern)
+            mix(vertex.z.bitPattern)
+        }
+        return hash
+    }
+
     private static func makeConvexGPUUpload(
         scene: PhysicsScene
     ) throws -> ConvexGPUUpload {
@@ -700,6 +880,8 @@ public final class GPUSolver {
             colliderLocalPositions: scene.colliders.map(\.localPosition),
             colliderRadii: [Float](repeating: 0,
                                    count: scene.colliders.count))
+        var recordBySourceAssetID: [Int: Int] = [:]
+        var legacyRecordBuckets: [UInt64: [Int]] = [:]
 
         func checkedBounds(_ vertices: [F3], asset: String) throws
             -> (F3, F3) {
@@ -813,12 +995,8 @@ public final class GPUSolver {
                         collider: colliderIndex, asset: sourceAssetID)
                 }
                 let asset = scene.convexAssets[sourceAssetID]
-                if let existing = upload.records.first(where: {
-                    guard let otherID = $0.sourceAssetID else { return false }
-                    return scene.convexAssets[otherID].stableID == asset.stableID
-                        && scene.convexAssets[otherID] == asset
-                }) {
-                    record = existing
+                if let recordIndex = recordBySourceAssetID[sourceAssetID] {
+                    record = upload.records[recordIndex]
                 } else {
                     let checked = try checkedBounds(
                         asset.vertices, asset: asset.stableID)
@@ -827,14 +1005,20 @@ public final class GPUSolver {
                         vertices: asset.vertices, triangles: asset.triangles,
                         boundsMin: checked.0, boundsMax: checked.1,
                         volume: asset.volume, stableID: asset.stableID)
+                    recordBySourceAssetID[sourceAssetID] =
+                        upload.records.count - 1
                 }
             } else if !collider.convexHullVertices.isEmpty {
                 let vertices = collider.convexHullVertices
-                if let existing = upload.records.first(where: {
-                    guard let legacy = $0.legacyVertices else { return false }
+                let vertexHash = legacyConvexVertexHash(vertices)
+                let recordIndex = legacyRecordBuckets[vertexHash]?.first {
+                    guard let legacy = upload.records[$0].legacyVertices else {
+                        return false
+                    }
                     return sameLegacyVertices(legacy, vertices)
-                }) {
-                    record = existing
+                }
+                if let recordIndex {
+                    record = upload.records[recordIndex]
                 } else {
                     let checked = try checkedBounds(
                         vertices, asset: "legacy collider \(colliderIndex)")
@@ -852,6 +1036,8 @@ public final class GPUSolver {
                         vertices: vertices, triangles: triangles,
                         boundsMin: checked.0, boundsMax: checked.1,
                         volume: 0, stableID: "legacy collider \(colliderIndex)")
+                    legacyRecordBuckets[vertexHash, default: []].append(
+                        upload.records.count - 1)
                     let delta = record.sourceCenter
                     if simd_length_squared(delta) > 0 {
                         // `appendRecord` centers every support range. Apply
@@ -961,6 +1147,13 @@ public final class GPUSolver {
         self.queue = q
 
         let convexUpload = try Self.makeConvexGPUUpload(scene: scene)
+        let rigidHierarchy = Self.makeRigidBroadphaseHierarchy(
+            scene: scene, convexUpload: convexUpload)
+        self.usesRigidColliderHierarchy = rigidHierarchy != nil
+        self.rigidBroadphaseProxyCount = rigidHierarchy?.owners.count ?? 0
+        self.rigidBroadphaseBVHNodeCount = rigidHierarchy?.nodes.count ?? 0
+        let broadphaseItemCount = rigidHierarchy?.owners.count
+            ?? scene.colliders.count
         self.settings = scene.settings
         self.numBodies = scene.bodies.count
         self.numColliders = scene.colliders.count
@@ -1002,8 +1195,10 @@ public final class GPUSolver {
         // while only three exact USD hulls per environment are active.
         self.maxPairs = max(4096, enabledColliderCount * maxPairsPerBody)
         self.mapCapacity = Self.nextPow2(2 * maxPairs)
+        let broadphaseGridItemCount = rigidHierarchy?.owners.count
+            ?? enabledColliderCount
         self.gridHashSize = Self.nextPow2(
-            max(64, 2 * max(1, enabledColliderCount)))
+            max(64, 2 * max(1, broadphaseGridItemCount)))
         // Tet BOUNDARY faces are collision triangles too: soft-soft contact
         // is element-based (soft V-V sphere pairs are banned at broadphase),
         // so without them tet bodies would pass through each other and
@@ -1017,6 +1212,10 @@ public final class GPUSolver {
         self.rigidMeshVertexCount = scene.rigidMeshes.reduce(0) {
             $0 + 3 * $1.triangles.count
         } + convexUpload.visualTriangleVertexCount
+        self.rigidMeshUniqueVertexCount = scene.rigidMeshes.reduce(0) {
+            $0 + $1.vertices.count
+        } + convexUpload.visualTriangleVertexCount
+        self.rigidMeshIndexCount = rigidMeshVertexCount
         // Derive the actual surface and unique edge counts instead of relying
         // on the old triangle heuristic, which under-allocated disconnected
         // and open meshes.
@@ -1166,6 +1365,34 @@ public final class GPUSolver {
         convexEdges = try makeBuf(
             max(1, convexUpload.edges.count) * MemoryLayout<ConvexEdgeGPU>.stride,
             "convexEdges")
+        broadphaseProxyOwner = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * 4,
+            "broadphaseProxyOwner")
+        broadphaseProxyLocalPosition = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * 16,
+            "broadphaseProxyLocalPosition")
+        broadphaseProxyShape = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * 16,
+            "broadphaseProxyShape")
+        broadphaseProxyGroup = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * 4,
+            "broadphaseProxyGroup")
+        broadphaseProxySharedCollision = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * 4,
+            "broadphaseProxySharedCollision")
+        broadphaseProxyShapeType = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * 4,
+            "broadphaseProxyShapeType")
+        broadphaseProxyRoot = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * 4,
+            "broadphaseProxyRoot")
+        broadphaseBVHNodes = try makeBuf(
+            max(1, rigidBroadphaseBVHNodeCount)
+                * MemoryLayout<ColliderBVHNodeGPU>.stride,
+            "broadphaseBVHNodes")
+        broadphaseProxyPairs = try makeBuf(
+            usesRigidColliderHierarchy ? maxPairs * 8 : 16,
+            "broadphaseProxyPairs")
         joints = try makeBuf(max(1, numJoints) * MemoryLayout<JointGPU>.stride, "joints")
         springs = try makeBuf(max(1, numSprings) * MemoryLayout<SpringGPU>.stride, "springs")
         tets = try makeBuf(max(1, numTets) * MemoryLayout<TetGPU>.stride, "tets")
@@ -1218,10 +1445,14 @@ public final class GPUSolver {
         cellCount = try makeBuf(gridHashSize * 4, "cellCount")
         cellRigid = try makeBuf(gridHashSize * 4, "cellRigid")
         cellStart = try makeBuf(gridHashSize * 4, "cellStart")
-        cellBodies = try makeBuf(numColliders * 4, "cellBodies")
-        bodyCellSlot = try makeBuf(numColliders * 8, "bodyCellSlot")
-        pairCount = try makeBuf(numColliders * 4, "pairCount")
-        pairStart = try makeBuf(numColliders * 4, "pairStart")
+        cellBodies = try makeBuf(max(1, broadphaseItemCount) * 4,
+                                 "cellBodies")
+        bodyCellSlot = try makeBuf(max(1, broadphaseItemCount) * 8,
+                                   "bodyCellSlot")
+        pairCount = try makeBuf(max(maxPairs, broadphaseItemCount) * 4,
+                                "pairCount")
+        pairStart = try makeBuf(max(maxPairs, broadphaseItemCount) * 4,
+                                "pairStart")
         pairs = try makeBuf(maxPairs * 8, "pairs")
         exclusions = try makeBuf(max(1, scene.joints.count + scene.springs.count
                                      + scene.collisionExclusions.count) * 8,
@@ -1280,8 +1511,12 @@ public final class GPUSolver {
                                     "skinVertices")
         skinTriBuf = try makeBuf(max(1, skinnedTriCount) * 12, "skinTris")
         rigidMeshVertexBuf = try makeBuf(
-            max(1, rigidMeshVertexCount) * MemoryLayout<RigidMeshVertexGPU>.stride,
+            max(1, rigidMeshUniqueVertexCount)
+                * MemoryLayout<RigidMeshVertexGPU>.stride,
             "rigidMeshVertices")
+        rigidMeshIndexBuf = try makeBuf(
+            max(1, rigidMeshIndexCount) * MemoryLayout<UInt32>.stride,
+            "rigidMeshIndices")
         vtTrackBuf = try makeBuf(nb * 16, "vtTrack")
         eeTrackBuf = try makeBuf(max(1, maxEdges) * 16, "eeTrack")
         triAdjBuf = try makeBuf(max(1, numTris) * 16, "triAdj")
@@ -1314,7 +1549,10 @@ public final class GPUSolver {
         diag = try makeBuf(4, "diag")
 
         try buildPipelines()
-        try upload(scene: scene, convexUpload: convexUpload)
+        try upload(
+            scene: scene, convexUpload: convexUpload,
+            rigidHierarchy: rigidHierarchy,
+            broadphaseItemCount: broadphaseItemCount)
         // This CSR is only a high-color optimization. If Metal cannot
         // reserve it, retain the placeholder and use the global reducer.
         if effectiveSurfaceTruncationMode == .planarDAT,
@@ -1516,19 +1754,38 @@ public final class GPUSolver {
 
     private func buildPipelines() throws {
         let lib: MTLLibrary
+        let hierarchyLib: MTLLibrary?
         do {
             lib = try Self.makeLibrary(device: device)
+            hierarchyLib = usesRigidColliderHierarchy
+                ? try Self.makeHierarchyLibrary(device: device) : nil
         } catch let error as AVBDError {
             throw error
         } catch {
             throw AVBDError.shaderCompile(error.localizedDescription)
         }
         shaderLib = lib
-        for name in lib.functionNames {
-            guard let fn = lib.makeFunction(name: name) else { continue }
-            pso[name] = try device.makeComputePipelineState(function: fn)
+        for library in [lib] + [hierarchyLib].compactMap({ $0 }) {
+            for name in library.functionNames {
+                guard let fn = library.makeFunction(name: name) else { continue }
+                pso[name] = try device.makeComputePipelineState(function: fn)
+            }
+        }
+        if hasPotentialRigidConvexPair {
+            let optimized = try Self.makeOptimizedConvexLibrary(device: device)
+            for name in ["np_collide", "np_collide_convex"] {
+                guard let fn = optimized.makeFunction(name: name) else {
+                    throw AVBDError.kernelMissing(name)
+                }
+                pso[name] = try device.makeComputePipelineState(function: fn)
+            }
         }
         try Self.validateRequiredKernelNames(Set(pso.keys))
+        if usesRigidColliderHierarchy,
+           let missing = Self.requiredHierarchyKernelNames
+                .subtracting(pso.keys).min() {
+            throw AVBDError.kernelMissing(missing)
+        }
     }
     var shaderLib: MTLLibrary?
 
@@ -1568,8 +1825,11 @@ public final class GPUSolver {
         packagedResourceBundle ?? Bundle.module
     }
 
-    /// Concatenates the bundled .metal sources (filename order) and compiles.
-    static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
+    private static let hierarchyShaderName = "21_hierarchy_broadphase.metal"
+    private static let optimizedConvexShaderName =
+        "31_optimized_convex_narrowphase.metal"
+
+    private static func shaderResourceURLs() throws -> [URL] {
         let resources = physicsResourceBundle
         var urls = (resources.urls(forResourcesWithExtension: "metal", subdirectory: nil) ?? [])
         if urls.isEmpty {   // .copy resource rule keeps the Shaders/ subdir
@@ -1578,6 +1838,12 @@ public final class GPUSolver {
         }
         urls.sort { $0.lastPathComponent < $1.lastPathComponent }
         try validateShaderResourceURLs(urls)
+        return urls
+    }
+
+    private static func compileLibrary(
+        device: MTLDevice, urls: [URL], preamble: String = ""
+    ) throws -> MTLLibrary {
         var source = ""
         for url in urls {
             var text = try String(contentsOf: url, encoding: .utf8)
@@ -1586,7 +1852,8 @@ public final class GPUSolver {
             text = text.replacingOccurrences(of: "using namespace metal;", with: "")
             source += text + "\n"
         }
-        source = "#include <metal_stdlib>\nusing namespace metal;\n" + source
+        source = "#include <metal_stdlib>\nusing namespace metal;\n"
+            + preamble + source
         let options = MTLCompileOptions()
         let fastMath = ProcessInfo.processInfo.environment["AVBD_SAFE_MATH"] == nil
         if #available(macOS 15.0, iOS 18.0, *) {
@@ -1595,6 +1862,49 @@ public final class GPUSolver {
             options.fastMathEnabled = fastMath
         }
         return try device.makeLibrary(source: source, options: options)
+    }
+
+    /// Concatenates the established bundled sources in filename order. The
+    /// optional compound hierarchy is deliberately excluded: adding kernels
+    /// to this Metal translation unit measurably perturbs fast-math codegen
+    /// for long-horizon analytic scenes even when they are never dispatched.
+    static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
+        let urls = try shaderResourceURLs().filter {
+            $0.lastPathComponent != hierarchyShaderName
+                && $0.lastPathComponent != optimizedConvexShaderName
+        }
+        return try compileLibrary(device: device, urls: urls)
+    }
+
+    /// Compile the compound hierarchy with common ABI declarations in its
+    /// own translation unit so it cannot alter the compatibility pipelines.
+    private static func makeHierarchyLibrary(
+        device: MTLDevice
+    ) throws -> MTLLibrary {
+        let all = try shaderResourceURLs()
+        let wanted = Set(["00_common.metal", hierarchyShaderName])
+        let urls = all.filter { wanted.contains($0.lastPathComponent) }
+        guard urls.count == wanted.count else {
+            throw AVBDError.shaderCompile(
+                "compound hierarchy Metal resources are incomplete")
+        }
+        return try compileLibrary(device: device, urls: urls)
+    }
+
+    /// Only mixed support-map scenes compile the optimized generic passes.
+    /// The established translation unit still provides the same entry points
+    /// as a fallback, while this scene-local library replaces just those two
+    /// PSOs without changing analytic compatibility code generation.
+    private static func makeOptimizedConvexLibrary(
+        device: MTLDevice
+    ) throws -> MTLLibrary {
+        let urls = try shaderResourceURLs().filter {
+            $0.lastPathComponent != hierarchyShaderName
+                && $0.lastPathComponent != "30_narrowphase.metal"
+        }
+        return try compileLibrary(
+            device: device, urls: urls,
+            preamble: "#define AVBD_OPTIMIZED_CONVEX 1\n")
     }
 
     /// Boundary faces of the tet meshes (faces used by exactly one tet),
@@ -1627,7 +1937,9 @@ public final class GPUSolver {
     // MARK: - Scene upload
 
     private func upload(
-        scene: PhysicsScene, convexUpload: ConvexGPUUpload
+        scene: PhysicsScene, convexUpload: ConvexGPUUpload,
+        rigidHierarchy: RigidBroadphaseHierarchyUpload?,
+        broadphaseItemCount: Int
     ) throws {
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -1735,6 +2047,28 @@ public final class GPUSolver {
         uploadArray(convexUpload.faceVertexIndices,
                     to: convexFaceVertexIndices)
         uploadArray(convexUpload.edges, to: convexEdges)
+        if let rigidHierarchy {
+            uploadArray(rigidHierarchy.owners, to: broadphaseProxyOwner)
+            uploadArray(rigidHierarchy.localPositions,
+                        to: broadphaseProxyLocalPosition)
+            uploadArray(rigidHierarchy.shapes, to: broadphaseProxyShape)
+            uploadArray(rigidHierarchy.groups, to: broadphaseProxyGroup)
+            uploadArray(rigidHierarchy.sharedCollision,
+                        to: broadphaseProxySharedCollision)
+            uploadArray(rigidHierarchy.shapeTypes,
+                        to: broadphaseProxyShapeType)
+            uploadArray(rigidHierarchy.roots, to: broadphaseProxyRoot)
+            uploadArray(rigidHierarchy.nodes, to: broadphaseBVHNodes)
+        } else {
+            for buffer in [
+                broadphaseProxyOwner, broadphaseProxyLocalPosition,
+                broadphaseProxyShape, broadphaseProxyGroup,
+                broadphaseProxySharedCollision, broadphaseProxyShapeType,
+                broadphaseProxyRoot, broadphaseBVHNodes,
+            ] {
+                memset(buffer.contents(), 0, buffer.length)
+            }
+        }
         func radius(of c: SceneCollider, at index: Int) -> Float {
             if convexUpload.colliderAssetIDs[index] != UInt32.max {
                 return convexUpload.colliderRadii[index]
@@ -1755,10 +2089,6 @@ public final class GPUSolver {
             }
             let cap = min(
                 0.25, max(4 * settings.collisionMargin, 3 * radius))
-            // The exact shader predicate adds one skin/speculative reach per
-            // pair. Assigning the full reach to every hull endpoint is a
-            // conservative cell-size bound for both mixed and hull/hull
-            // pairs; it affects no analytic endpoint.
             return radius + settings.collisionMargin + cap
         }
         var radii: [Float] = []
@@ -1791,8 +2121,41 @@ public final class GPUSolver {
             if particle { flags |= 0x10 }
             if c.usesWorldSpaceRoundAnchor { flags |= 0x20 }
             ct[i] = flags
-            if c.collisionEnabled && scene.bodies[c.body].isDynamic {
+            if rigidHierarchy == nil, c.collisionEnabled,
+               scene.bodies[c.body].isDynamic {
                 radii.append(broadphaseCellRadius(r, collider: i))
+            }
+        }
+
+        let broadphaseOwners: [UInt32]
+        let broadphaseShapes: [SIMD4<Float>]
+        let broadphaseGroups: [UInt32]
+        let broadphaseShapeTypes: [UInt32]
+        if let rigidHierarchy {
+            broadphaseOwners = rigidHierarchy.owners
+            broadphaseShapes = rigidHierarchy.shapes
+            broadphaseGroups = rigidHierarchy.groups
+            broadphaseShapeTypes = rigidHierarchy.shapeTypes
+        } else {
+            broadphaseOwners = scene.colliders.map { UInt32($0.body) }
+            broadphaseShapes = (0..<numColliders).map { cs[$0] }
+            broadphaseGroups = scene.colliders.map(\.collisionGroup)
+            broadphaseShapeTypes = (0..<numColliders).map { ct[$0] }
+        }
+        func broadphaseItemCellRadius(_ index: Int) -> Float {
+            let radius = abs(broadphaseShapes[index].w)
+            guard (broadphaseShapeTypes[index] & 0xF) == 4 else {
+                return radius
+            }
+            let cap = min(
+                0.25, max(4 * settings.collisionMargin, 3 * radius))
+            return radius + settings.collisionMargin + cap
+        }
+        if rigidHierarchy != nil {
+            radii.reserveCapacity(broadphaseItemCount)
+            for index in 0..<broadphaseItemCount
+                where scene.bodies[Int(broadphaseOwners[index])].isDynamic {
+                radii.append(broadphaseItemCellRadius(index))
             }
         }
 
@@ -1806,19 +2169,29 @@ public final class GPUSolver {
         var globals: [UInt32] = []
         // Only oversized bodies go to the brute-forced global list; normal
         // sized statics live in the spatial hash like everything else.
-        let hasIsolatedGroups = scene.colliders.contains {
-            $0.collisionEnabled && $0.collisionGroup != 0
-        }
-        for (i, c) in scene.colliders.enumerated() {
-            guard c.collisionEnabled else { continue }
-            // Shared-domain geometry must be visible to every isolated hash
-            // domain, so keep it in the normally tiny global list.
-            if broadphaseCellRadius(radius(of: c, at: i), collider: i)
-                    > threshold
-                || (hasIsolatedGroups && c.collisionGroup == 0) {
-                globals.append(UInt32(i))
-            } else {
-                hashed.append(UInt32(i))
+        if rigidHierarchy != nil {
+            let hasIsolatedGroups = broadphaseGroups.contains { $0 != 0 }
+            for i in 0..<broadphaseItemCount {
+                if broadphaseItemCellRadius(i) > threshold
+                    || (hasIsolatedGroups && broadphaseGroups[i] == 0) {
+                    globals.append(UInt32(i))
+                } else {
+                    hashed.append(UInt32(i))
+                }
+            }
+        } else {
+            let hasIsolatedGroups = scene.colliders.contains {
+                $0.collisionEnabled && $0.collisionGroup != 0
+            }
+            for (i, c) in scene.colliders.enumerated() {
+                guard c.collisionEnabled else { continue }
+                if broadphaseCellRadius(radius(of: c, at: i), collider: i)
+                        > threshold
+                    || (hasIsolatedGroups && c.collisionGroup == 0) {
+                    globals.append(UInt32(i))
+                } else {
+                    hashed.append(UInt32(i))
+                }
             }
         }
         // Cell size: 2x the max hashed radius (sphere-bound broadphase).
@@ -1828,9 +2201,15 @@ public final class GPUSolver {
         // contention in bp_count + thousands-long cell lists in pair gen).
         var maxHashedRadius: Float = 0.05
         for i in hashed {
-            maxHashedRadius = max(
-                maxHashedRadius,
-                broadphaseCellRadius(abs(cs[Int(i)].w), collider: Int(i)))
+            if rigidHierarchy != nil {
+                maxHashedRadius = max(maxHashedRadius,
+                                      broadphaseItemCellRadius(Int(i)))
+            } else {
+                maxHashedRadius = max(
+                    maxHashedRadius,
+                    broadphaseCellRadius(
+                        abs(cs[Int(i)].w), collider: Int(i)))
+            }
         }
 
         hashedIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashed.count))
@@ -2666,9 +3045,11 @@ public final class GPUSolver {
                     .update(from: skinCorners, count: skinCorners.count)
             }
         }
-        if rigidMeshVertexCount > 0 {
-            var corners: [RigidMeshVertexGPU] = []
-            corners.reserveCapacity(rigidMeshVertexCount)
+        if rigidMeshIndexCount > 0 {
+            var vertices: [RigidMeshVertexGPU] = []
+            var indices: [UInt32] = []
+            vertices.reserveCapacity(rigidMeshUniqueVertexCount)
+            indices.reserveCapacity(rigidMeshIndexCount)
             for mesh in scene.rigidMeshes {
                 precondition(scene.bodies.indices.contains(mesh.body),
                              "rigid mesh owner out of range")
@@ -2676,19 +3057,23 @@ public final class GPUSolver {
                              "rigid mesh normal count mismatch")
                 let bodyBits = Float(bitPattern: UInt32(mesh.body))
                 let color = SIMD4(mesh.color, 1)
+                let vertexBase = UInt32(vertices.count)
+                for index in mesh.vertices.indices {
+                    var vertex = RigidMeshVertexGPU()
+                    let position = mesh.localPosition
+                        + mesh.localRotation.act(mesh.vertices[index])
+                    let normal = normalize(
+                        mesh.localRotation.act(mesh.normals[index]))
+                    vertex.positionBody = SIMD4(position, bodyBits)
+                    vertex.normal = SIMD4(normal, 0)
+                    vertex.color = color
+                    vertices.append(vertex)
+                }
                 for triangle in mesh.triangles {
                     for index in [triangle.0, triangle.1, triangle.2] {
                         precondition(mesh.vertices.indices.contains(index),
                                      "rigid mesh triangle index out of range")
-                        var corner = RigidMeshVertexGPU()
-                        let position = mesh.localPosition
-                            + mesh.localRotation.act(mesh.vertices[index])
-                        let normal = normalize(
-                            mesh.localRotation.act(mesh.normals[index]))
-                        corner.positionBody = SIMD4(position, bodyBits)
-                        corner.normal = SIMD4(normal, 0)
-                        corner.color = color
-                        corners.append(corner)
+                        indices.append(vertexBase + UInt32(index))
                     }
                 }
             }
@@ -2698,17 +3083,25 @@ public final class GPUSolver {
                     preconditionFailure(
                         "opaque convex visual references missing geometry")
                 }
+                let vertexBase = vertices.count
                 let appended = Self.appendConvexTriangleVertices(
                     geometry: convexUpload.debugGeometries[
                         Int(instance.geometry)],
-                    instance: instance, to: &corners)
+                    instance: instance, to: &vertices)
                 precondition(appended,
                              "validated opaque convex geometry is invalid")
+                indices.append(contentsOf: (vertexBase..<vertices.count).map {
+                    UInt32($0)
+                })
             }
-            precondition(corners.count == rigidMeshVertexCount)
+            precondition(vertices.count == rigidMeshUniqueVertexCount)
+            precondition(indices.count == rigidMeshIndexCount)
             rigidMeshVertexBuf.contents().bindMemory(
-                to: RigidMeshVertexGPU.self, capacity: corners.count)
-                .update(from: corners, count: corners.count)
+                to: RigidMeshVertexGPU.self, capacity: vertices.count)
+                .update(from: vertices, count: vertices.count)
+            rigidMeshIndexBuf.contents().bindMemory(
+                to: UInt32.self, capacity: indices.count)
+                .update(from: indices, count: indices.count)
         }
         let flags = surfacedFlags.contents().bindMemory(to: UInt32.self,
                                                         capacity: numBodies)
@@ -2845,11 +3238,11 @@ public final class GPUSolver {
         params.numHashed = UInt32(hashed.count)
         params.numGlobals = UInt32(globals.count)
         let hashedRigid = hashed.filter {
-            !scene.bodies[scene.colliders[Int($0)].body].isParticle
+            !scene.bodies[Int(broadphaseOwners[Int($0)])].isParticle
         }
         params.numHashedRigid = UInt32(hashedRigid.count)
         let rigidGroups = Array(Set(hashedRigid.map {
-            scene.colliders[Int($0)].collisionGroup
+            broadphaseGroups[Int($0)]
         })).sorted()
         var hashedRigidMetadata = hashedRigid
         hashedRigidMetadata.append(UInt32(rigidGroups.count))
@@ -4386,6 +4779,20 @@ public final class GPUSolver {
         }
 
         // Broadphase
+        let bpShape = usesRigidColliderHierarchy
+            ? broadphaseProxyShape : colliderShape
+        let bpOwner = usesRigidColliderHierarchy
+            ? broadphaseProxyOwner : colliderOwner
+        let bpLocalPosition = usesRigidColliderHierarchy
+            ? broadphaseProxyLocalPosition : colliderLocalPosition
+        let bpGroup = usesRigidColliderHierarchy
+            ? broadphaseProxyGroup : colliderGroup
+        let bpSharedCollision = usesRigidColliderHierarchy
+            ? broadphaseProxySharedCollision : colliderSharedCollision
+        let bpShapeType = usesRigidColliderHierarchy
+            ? broadphaseProxyShapeType : colliderShapeType
+        let broadphasePairOutput = usesRigidColliderHierarchy
+            ? broadphaseProxyPairs : pairs
         if profiling { try stage("bp-count") }
         dispatch1D(enc, "bp_count", Int(P.numHashed)) { e in
             e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -4393,12 +4800,12 @@ public final class GPUSolver {
             e.setBuffer(self.cellCount, offset: 0, index: 2)
             e.setBuffer(self.bodyCellSlot, offset: 0, index: 3)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
-            e.setBuffer(self.colliderShape, offset: 0, index: 5)
+            e.setBuffer(bpShape, offset: 0, index: 5)
             e.setBuffer(self.cellRigid, offset: 0, index: 6)
-            e.setBuffer(self.colliderOwner, offset: 0, index: 7)
-            e.setBuffer(self.colliderLocalPosition, offset: 0, index: 8)
+            e.setBuffer(bpOwner, offset: 0, index: 7)
+            e.setBuffer(bpLocalPosition, offset: 0, index: 8)
             e.setBuffer(self.posAng, offset: 0, index: 9)
-            e.setBuffer(self.colliderGroup, offset: 0, index: 10)
+            e.setBuffer(bpGroup, offset: 0, index: 10)
         }
         if profiling { try stage("bp-scan") }
         encodeScan(enc, input: cellCount, output: cellStart, count: gridHashSize)
@@ -4433,7 +4840,7 @@ public final class GPUSolver {
         if pairProducerCount > 0 {
             dispatch1D(enc, "bp_count_pairs_deterministic", pairProducerCount) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
-                e.setBuffer(self.colliderShape, offset: 0, index: 1)
+                e.setBuffer(bpShape, offset: 0, index: 1)
                 e.setBuffer(self.hashedIdx, offset: 0, index: 2)
                 e.setBuffer(self.cellStart, offset: 0, index: 3)
                 e.setBuffer(self.cellCount, offset: 0, index: 4)
@@ -4442,23 +4849,22 @@ public final class GPUSolver {
                 e.setBuffer(self.exclusions, offset: 0, index: 7)
                 e.setBytes(&nExcl, length: 4, index: 8)
                 e.setBuffer(self.pairCount, offset: 0, index: 9)
-                e.setBuffer(self.pairs, offset: 0, index: 10)
+                e.setBuffer(broadphasePairOutput, offset: 0, index: 10)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
                 e.setBuffer(self.clothGroupBuf, offset: 0, index: 12)
                 e.setBuffer(self.cellRigid, offset: 0, index: 13)
-                e.setBuffer(self.colliderOwner, offset: 0, index: 14)
-                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 15)
+                e.setBuffer(bpOwner, offset: 0, index: 14)
+                e.setBuffer(bpLocalPosition, offset: 0, index: 15)
                 e.setBuffer(self.posAng, offset: 0, index: 16)
-                e.setBuffer(self.colliderGroup, offset: 0, index: 17)
-                e.setBuffer(
-                    self.colliderSharedCollision, offset: 0, index: 18)
-                e.setBuffer(self.colliderShapeType, offset: 0, index: 19)
+                e.setBuffer(bpGroup, offset: 0, index: 17)
+                e.setBuffer(bpSharedCollision, offset: 0, index: 18)
+                e.setBuffer(bpShapeType, offset: 0, index: 19)
             }
             encodeScan(enc, input: pairCount, output: pairStart,
                        count: pairProducerCount)
             dispatch1D(enc, "bp_emit_pairs_deterministic", pairProducerCount) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
-                e.setBuffer(self.colliderShape, offset: 0, index: 1)
+                e.setBuffer(bpShape, offset: 0, index: 1)
                 e.setBuffer(self.hashedIdx, offset: 0, index: 2)
                 e.setBuffer(self.cellStart, offset: 0, index: 3)
                 e.setBuffer(self.cellCount, offset: 0, index: 4)
@@ -4467,17 +4873,16 @@ public final class GPUSolver {
                 e.setBuffer(self.exclusions, offset: 0, index: 7)
                 e.setBytes(&nExcl, length: 4, index: 8)
                 e.setBuffer(self.pairStart, offset: 0, index: 9)
-                e.setBuffer(self.pairs, offset: 0, index: 10)
+                e.setBuffer(broadphasePairOutput, offset: 0, index: 10)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 11)
                 e.setBuffer(self.clothGroupBuf, offset: 0, index: 12)
                 e.setBuffer(self.cellRigid, offset: 0, index: 13)
-                e.setBuffer(self.colliderOwner, offset: 0, index: 14)
-                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 15)
+                e.setBuffer(bpOwner, offset: 0, index: 14)
+                e.setBuffer(bpLocalPosition, offset: 0, index: 15)
                 e.setBuffer(self.posAng, offset: 0, index: 16)
-                e.setBuffer(self.colliderGroup, offset: 0, index: 17)
-                e.setBuffer(
-                    self.colliderSharedCollision, offset: 0, index: 18)
-                e.setBuffer(self.colliderShapeType, offset: 0, index: 19)
+                e.setBuffer(bpGroup, offset: 0, index: 17)
+                e.setBuffer(bpSharedCollision, offset: 0, index: 18)
+                e.setBuffer(bpShapeType, offset: 0, index: 19)
             }
         }
         dispatch1D(enc, "bp_finalize_deterministic_pairs", 1) { e in
@@ -4486,6 +4891,52 @@ public final class GPUSolver {
             e.setBuffer(self.counters, offset: 0, index: 2)
             e.setBuffer(self.dispatchArgs, offset: 0, index: 3)
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
+        }
+        if usesRigidColliderHierarchy {
+            dispatch1D(enc, "bp_count_hierarchy_pairs", maxPairs) { e in
+                e.setBuffer(self.broadphaseProxyPairs, offset: 0, index: 0)
+                e.setBuffer(self.counters, offset: 0, index: 1)
+                e.setBuffer(self.pairCount, offset: 0, index: 2)
+                e.setBuffer(self.broadphaseProxyOwner, offset: 0, index: 3)
+                e.setBuffer(self.broadphaseProxyRoot, offset: 0, index: 4)
+                e.setBuffer(self.broadphaseBVHNodes, offset: 0, index: 5)
+                e.setBuffer(self.posLin, offset: 0, index: 6)
+                e.setBuffer(self.posAng, offset: 0, index: 7)
+                e.setBuffer(self.colliderShape, offset: 0, index: 8)
+                e.setBuffer(self.colliderOwner, offset: 0, index: 9)
+                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 10)
+                e.setBuffer(self.colliderShapeType, offset: 0, index: 11)
+                e.setBuffer(self.pairs, offset: 0, index: 12)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 13)
+            }
+            encodeScan(enc, input: pairCount, output: pairStart,
+                       count: maxPairs)
+            dispatch1D(enc, "bp_emit_hierarchy_pairs", maxPairs) { e in
+                e.setBuffer(self.broadphaseProxyPairs, offset: 0, index: 0)
+                e.setBuffer(self.counters, offset: 0, index: 1)
+                e.setBuffer(self.pairStart, offset: 0, index: 2)
+                e.setBuffer(self.broadphaseProxyOwner, offset: 0, index: 3)
+                e.setBuffer(self.broadphaseProxyRoot, offset: 0, index: 4)
+                e.setBuffer(self.broadphaseBVHNodes, offset: 0, index: 5)
+                e.setBuffer(self.posLin, offset: 0, index: 6)
+                e.setBuffer(self.posAng, offset: 0, index: 7)
+                e.setBuffer(self.colliderShape, offset: 0, index: 8)
+                e.setBuffer(self.colliderOwner, offset: 0, index: 9)
+                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 10)
+                e.setBuffer(self.colliderShapeType, offset: 0, index: 11)
+                e.setBuffer(self.pairs, offset: 0, index: 12)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 13)
+            }
+            dispatch1D(enc, "bp_finalize_hierarchy_pairs", 1) { e in
+                e.setBuffer(self.pairCount, offset: 0, index: 0)
+                e.setBuffer(self.pairStart, offset: 0, index: 1)
+                e.setBuffer(self.counters, offset: 0, index: 2)
+                e.setBuffer(self.dispatchArgs, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
+            }
         }
 
         try stage("narrowphase")
@@ -5643,14 +6094,68 @@ public final class GPUSolver {
         return (skinTriBuf, skinnedTriCount, skinVertexBuf)
     }
 
-    /// Visual-only CAD triangles attached to live rigid bodies. Positions and
-    /// normals are local to each owning body's inertial frame.
+    /// Indexed visual-only CAD triangles attached to live rigid bodies.
+    /// Positions and normals are local to each owning body's inertial frame.
+    public var renderIndexedRigidMeshSurface: (
+        vertices: MTLBuffer, indices: MTLBuffer, indexCount: Int,
+        positions: MTLBuffer, rotations: MTLBuffer
+    )? {
+        guard rigidMeshIndexCount > 0 else { return nil }
+        return (rigidMeshVertexBuf, rigidMeshIndexBuf, rigidMeshIndexCount,
+                posLin, posAng)
+    }
+
+    /// Legacy expanded-corner view. New renderers should consume
+    /// `renderIndexedRigidMeshSurface`; this buffer is materialized only when
+    /// an older client asks for it, so headless and built-in rendering retain
+    /// the indexed memory footprint.
     public var renderRigidMeshSurface: (
         vertices: MTLBuffer, vertexCount: Int,
         positions: MTLBuffer, rotations: MTLBuffer
     )? {
         guard rigidMeshVertexCount > 0 else { return nil }
-        return (rigidMeshVertexBuf, rigidMeshVertexCount, posLin, posAng)
+        rigidMeshCompatibilityBufferLock.lock()
+        defer { rigidMeshCompatibilityBufferLock.unlock() }
+        if rigidMeshExpandedVertexBuf == nil {
+            let stride = MemoryLayout<RigidMeshVertexGPU>.stride
+            guard let expanded = device.makeBuffer(
+                length: rigidMeshVertexCount * stride,
+                options: .storageModeShared) else {
+                return nil
+            }
+            expanded.label = "rigidMeshExpandedCompatibilityVertices"
+            let source = rigidMeshVertexBuf.contents().bindMemory(
+                to: RigidMeshVertexGPU.self,
+                capacity: rigidMeshUniqueVertexCount)
+            let indices = rigidMeshIndexBuf.contents().bindMemory(
+                to: UInt32.self, capacity: rigidMeshIndexCount)
+            let destination = expanded.contents().bindMemory(
+                to: RigidMeshVertexGPU.self, capacity: rigidMeshVertexCount)
+            for index in 0..<rigidMeshIndexCount {
+                let sourceIndex = Int(indices[index])
+                precondition(sourceIndex < rigidMeshUniqueVertexCount,
+                             "rigid mesh index exceeds vertex storage")
+                destination[index] = source[sourceIndex]
+            }
+            rigidMeshExpandedVertexBuf = expanded
+        }
+        return (rigidMeshExpandedVertexBuf!, rigidMeshVertexCount,
+                posLin, posAng)
+    }
+
+    /// Resident visual geometry bytes, excluding the optional legacy expanded
+    /// view. Useful for deterministic memory regression tests and telemetry.
+    public var indexedRigidMeshStorageByteCount: Int {
+        guard rigidMeshIndexCount > 0 else { return 0 }
+        return rigidMeshUniqueVertexCount
+            * MemoryLayout<RigidMeshVertexGPU>.stride
+            + rigidMeshIndexCount * MemoryLayout<UInt32>.stride
+    }
+
+    public var materializedLegacyRigidMeshByteCount: Int {
+        rigidMeshCompatibilityBufferLock.lock()
+        defer { rigidMeshCompatibilityBufferLock.unlock() }
+        return rigidMeshExpandedVertexBuf?.length ?? 0
     }
 
     private func materializeConvexDebugGeometry()

@@ -176,6 +176,10 @@ public struct ConvexHullGPU {
     /// authored/cooked face limit and remains a shader implementation detail.
     public static let maximumClipWorkspaceVertices = 32
 
+    /// Optional supporting-edge manifold enrichment is bounded per pair.
+    /// The certified MPR/face witness remains the fallback above this budget.
+    public static let maximumSupportingEdgePairTests = 1_024
+
     /// vertexStart, vertexCount, faceStart, faceCount
     public var verticesFaces: SIMD4<UInt32> = .zero
     /// edgeStart, edgeCount, faceLoopStart, faceLoopCount
@@ -198,6 +202,16 @@ public struct ConvexFaceGPU {
 public struct ConvexEdgeGPU {
     /// vertex0, vertex1, face0, face1 (UInt32.max for an invalid boundary).
     public var endpointsFaces: SIMD4<UInt32> = .zero
+}
+
+/// One node of the immutable body-local broadphase hierarchy. Bounds are
+/// spheres so live rigid transforms require only one rotation/translation.
+/// links: left node, right node, leaf collider, flags (bit 0 leaf, bit 1 hull).
+public struct ColliderBVHNodeGPU {
+    public var centerRadius: SIMD4<Float> = .zero
+    public var links: SIMD4<UInt32> = .zero
+
+    public init() {}
 }
 
 public struct ManifoldGPU {

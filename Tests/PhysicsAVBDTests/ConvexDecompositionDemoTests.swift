@@ -20,7 +20,17 @@ struct ConvexDecompositionDemoTests {
         let dynamicU = scene.bodies[3]
         #expect(abs((dynamicU.mass ?? 0) - 10.50422) < 1e-3)
         #expect(length((dynamicU.diagonalInertia ?? .zero)
-            - F3(9.03712, 18.03782, 10.75140)) < 2e-3)
+            - F3(9.03712, 10.75140, 18.03782)) < 2e-3)
+        let dynamicVisual = scene.rigidMeshes.first { $0.body == 3 }!
+        let authoredDynamicRotation = Quat(
+            angle: 0.28, axis: normalize(F3(0.3, 1, 0.2)))
+        #expect(length(dynamicU.position
+            + dynamicU.rotation.act(dynamicVisual.localPosition)
+            - F3(2.0, -0.15, 4.8)) < 2e-5)
+        let reconstructedSourceRotation = (
+            dynamicU.rotation * dynamicVisual.localRotation).normalized
+        #expect(abs(dot(reconstructedSourceRotation.vector,
+                        authoredDynamicRotation.vector)) > 0.99999)
         let staticVisual = scene.rigidMeshes[0]
         let staticU = scene.bodies[staticVisual.body]
         #expect(length(staticU.position

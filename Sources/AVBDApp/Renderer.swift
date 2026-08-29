@@ -1249,14 +1249,16 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: skin.triCount * 3)
             }
-            if let mesh = solver.renderRigidMeshSurface {
+            if let mesh = solver.renderIndexedRigidMeshSurface {
                 enc.setRenderPipelineState(rigidMeshShadow)
                 enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
                 enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: mesh.vertexCount)
+                enc.drawIndexedPrimitives(
+                    type: .triangle, indexCount: mesh.indexCount,
+                    indexType: .uint32, indexBuffer: mesh.indices,
+                    indexBufferOffset: 0)
             }
             enc.endEncoding()
         }
@@ -1315,14 +1317,16 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: skin.triCount * 3)
             }
-            if let mesh = solver.renderRigidMeshSurface {
+            if let mesh = solver.renderIndexedRigidMeshSurface {
                 enc.setRenderPipelineState(rigidMeshPre)
                 enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: mesh.vertexCount)
+                enc.drawIndexedPrimitives(
+                    type: .triangle, indexCount: mesh.indexCount,
+                    indexType: .uint32, indexBuffer: mesh.indices,
+                    indexBufferOffset: 0)
             }
             enc.endEncoding()
         }
@@ -1459,7 +1463,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: skin.triCount * 3)
         }
-        if let mesh = solver.renderRigidMeshSurface {
+        if let mesh = solver.renderIndexedRigidMeshSurface {
             enc.setRenderPipelineState(rigidMeshP)
             enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1468,8 +1472,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.setFragmentTexture(shadowTex, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: mesh.vertexCount)
+            enc.drawIndexedPrimitives(
+                type: .triangle, indexCount: mesh.indexCount,
+                indexType: .uint32, indexBuffer: mesh.indices,
+                indexBufferOffset: 0)
         }
         if model.showConvexCollisionGeometry,
            let debug = solver.renderConvexCollisionSurface {

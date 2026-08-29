@@ -95,7 +95,7 @@ final class ClassicRigidBodiesDemoTests: XCTestCase {
 
     func testDynamicClassicMeshesSettleOnTableWithoutRuntimeFailure() throws {
         try requireMetal()
-        var scene = Demos.classicRigidBodies()
+        let scene = Demos.classicRigidBodies()
         let instances = zip(
             Demos.classicRigidBodySpecs, scene.rigidMeshes
         ).map { (spec: $0.0, body: $0.1.body) }
@@ -110,11 +110,12 @@ final class ClassicRigidBodiesDemoTests: XCTestCase {
         let tableTopZ = Demos.classicRigidTableTopPosition.z
             + Demos.classicRigidTableTopSize.z * 0.5
 
-        // The structure test above loads and checks every detailed surface.
-        // Removing only visual triangles keeps this sustained physics gate from
-        // repeatedly uploading the very large Dragon/Armadillo render meshes.
-        scene.rigidMeshes.removeAll(keepingCapacity: false)
+        // Keep the detailed meshes attached: indexed upload is part of the
+        // sustained end-to-end scene contract and no longer carries the old
+        // 30+ MiB expanded-corner penalty.
         let solver = try GPUSolver(scene: scene)
+        XCTAssertNotNil(solver.renderIndexedRigidMeshSurface)
+        XCTAssertEqual(solver.materializedLegacyRigidMeshByteCount, 0)
         var tableContacts = Set<Int>()
         for frame in 0..<720 {
             try solver.submitStep()
@@ -163,6 +164,24 @@ final class ClassicRigidBodiesDemoTests: XCTestCase {
             XCTAssertLessThan(length(solver.bodyAngularVelocity(body)), 0.8,
                               "\(spec.assetName) kept spinning")
         }
+    }
+
+    func testClassicVisualsUseIndexedStorageWithoutLegacyExpansion() throws {
+        try requireMetal()
+        let solver = try GPUSolver(scene: Demos.classicRigidBodies())
+        let indexed = try XCTUnwrap(solver.renderIndexedRigidMeshSurface)
+        XCTAssertEqual(indexed.indexCount, solver.rigidMeshVertexCount)
+        XCTAssertEqual(solver.materializedLegacyRigidMeshByteCount, 0)
+
+        let expandedBytes = solver.rigidMeshVertexCount
+            * MemoryLayout<RigidMeshVertexGPU>.stride
+        XCTAssertGreaterThan(expandedBytes, 25 * 1_024 * 1_024)
+        XCTAssertLessThan(solver.indexedRigidMeshStorageByteCount,
+                          expandedBytes / 3)
+        XCTAssertLessThan(solver.indexedRigidMeshStorageByteCount,
+                          10 * 1_024 * 1_024)
+        XCTAssertEqual(solver.materializedLegacyRigidMeshByteCount, 0,
+            "the built-in indexed path must not allocate compatibility corners")
     }
 
     private func requireMetal() throws {

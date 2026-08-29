@@ -584,6 +584,9 @@ public struct PhysicsScene {
     public var colliders: [SceneCollider] = []
     /// Immutable cooked convex geometry shared by collider instances.
     public private(set) var convexAssets: [ConvexHullAsset] = []
+    /// Digest-to-index accelerator for immutable registered geometry. Exact
+    /// digest-preimage equality still closes the collision boundary.
+    private var convexAssetIndexByDigest: [String: Int] = [:]
     public var joints: [SceneJoint] = []
     public var springs: [SceneSpring] = []
     public var tets: [SceneTet] = []
@@ -763,15 +766,15 @@ public struct PhysicsScene {
     /// only as a fast lookup; equality closes the hash-collision boundary.
     @discardableResult
     public mutating func registerConvexAsset(_ asset: ConvexHullAsset) -> Int {
-        if let existing = convexAssets.firstIndex(where: {
-            $0.digest == asset.digest
-        }) {
+        if let existing = convexAssetIndexByDigest[asset.digest] {
             precondition(convexAssets[existing].hasSameDigestGeometry(as: asset),
                 "convex asset digest collision")
             return existing
         }
         convexAssets.append(asset)
-        return convexAssets.count - 1
+        let index = convexAssets.count - 1
+        convexAssetIndexByDigest[asset.digest] = index
+        return index
     }
 
     /// Attach a validated shared convex hull to a rigid body. Asset vertices

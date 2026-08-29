@@ -170,9 +170,7 @@ final class ConvexGPURuntimeTests: XCTestCase {
             -0.035863057, -0.30239967, -0.01683997, 0.9523574))
         let hullPose = ConvexNarrowPhase.Pose(
             position: capturedHullColliderPosition,
-            orientation: hullBodyRotation * sourceHull.localRotation)
-        let hullBodyPosition = capturedHullColliderPosition
-            - hullBodyRotation.act(sourceHull.localPosition)
+            orientation: hullBodyRotation)
         let options = ConvexNarrowPhase.Options(
             contactThreshold: source.settings.collisionMargin)
 
@@ -214,12 +212,10 @@ final class ConvexGPURuntimeTests: XCTestCase {
         let hull = scene.addBody(
             size: source.bodies[sourceHull.body].size,
             density: 1, friction: 0.7,
-            position: hullBodyPosition, rotation: hullBodyRotation,
+            position: capturedHullColliderPosition,
+            rotation: hullBodyRotation,
             collisionEnabled: false)
-        _ = scene.addConvexCollider(
-            body: hull, asset: asset,
-            localPosition: sourceHull.localPosition,
-            localRotation: sourceHull.localRotation)
+        _ = scene.addConvexCollider(body: hull, asset: asset)
 
         let solver = try GPUSolver(scene: scene)
         try solver.submitStep()
@@ -554,6 +550,86 @@ final class ConvexGPURuntimeTests: XCTestCase {
             stableID: "hull-" + digest.prefix(16))
     }
 
+    /// Maximum-topology convex polyhedron under the public 64-vertex contract:
+    /// a 62-gon bipyramid has 124 triangular faces and 186 manifold edges.
+    private func maximumEdgeBipyramidAsset() throws -> ConvexHullAsset {
+        let ringCount = 62
+        var rawVertices: [F3] = []
+        rawVertices.reserveCapacity(ringCount + 2)
+        for index in 0..<ringCount {
+            let angle = 2 * Float.pi * Float(index) / Float(ringCount)
+            rawVertices.append(F3(
+                0.5 * cos(angle), 0.5 * sin(angle), 0))
+        }
+        let top = UInt32(rawVertices.count)
+        rawVertices.append(F3(0, 0, 0.5))
+        let bottom = UInt32(rawVertices.count)
+        rawVertices.append(F3(0, 0, -0.5))
+
+        var rawTriangles: [SIMD3<UInt32>] = []
+        rawTriangles.reserveCapacity(2 * ringCount)
+        for index in 0..<ringCount {
+            let current = UInt32(index)
+            let next = UInt32((index + 1) % ringCount)
+            rawTriangles.append(SIMD3(top, current, next))
+            rawTriangles.append(SIMD3(bottom, next, current))
+        }
+        let ordered = rawVertices.indices.sorted {
+            let a = rawVertices[$0], b = rawVertices[$1]
+            if a.x != b.x { return a.x < b.x }
+            if a.y != b.y { return a.y < b.y }
+            return a.z < b.z
+        }
+        let vertices = ordered.map { rawVertices[$0] }
+        var remap = [UInt32](repeating: 0, count: rawVertices.count)
+        for (canonical, source) in ordered.enumerated() {
+            remap[source] = UInt32(canonical)
+        }
+        func triangleLess(
+            _ a: SIMD3<UInt32>, _ b: SIMD3<UInt32>
+        ) -> Bool {
+            if a.x != b.x { return a.x < b.x }
+            if a.y != b.y { return a.y < b.y }
+            return a.z < b.z
+        }
+        let triangles = rawTriangles.map { triangle -> SIMD3<UInt32> in
+            let remapped = SIMD3(
+                remap[Int(triangle.x)], remap[Int(triangle.y)],
+                remap[Int(triangle.z)])
+            return [
+                remapped,
+                SIMD3(remapped.y, remapped.z, remapped.x),
+                SIMD3(remapped.z, remapped.x, remapped.y),
+            ].min(by: triangleLess)!
+        }.sorted(by: triangleLess)
+        var incident: [EdgeKey: [UInt32]] = [:]
+        for (face, triangle) in triangles.enumerated() {
+            for edge in [EdgeKey(triangle.x, triangle.y),
+                         EdgeKey(triangle.y, triangle.z),
+                         EdgeKey(triangle.z, triangle.x)] {
+                incident[edge, default: []].append(UInt32(face))
+            }
+        }
+        let edges = incident.keys.sorted().map { edge in
+            let faces = incident[edge]!.sorted()
+            return ConvexHullEdge(
+                vertexA: edge.a, vertexB: edge.b,
+                faceA: faces[0], faceB: faces[1])
+        }
+        let lo = vertices.reduce(F3(repeating: .infinity), simd.min)
+        let hi = vertices.reduce(F3(repeating: -.infinity), simd.max)
+        let polygonArea = Float(ringCount) * 0.125
+            * sin(2 * Float.pi / Float(ringCount))
+        let volume = polygonArea / 3
+        let digest = ConvexHullAsset.geometryDigest(
+            vertices: vertices, triangles: triangles)
+        return try ConvexHullAsset(
+            vertices: vertices, triangles: triangles, edges: edges,
+            boundsMin: lo, boundsMax: hi, boundingRadius: 0.5,
+            volume: volume, centroid: .zero, digest: digest,
+            stableID: "hull-" + digest.prefix(16))
+    }
+
     private struct ManifoldSnapshot: Equatable {
         var bodyA: Int
         var bodyB: Int
@@ -807,9 +883,17 @@ final class ConvexGPURuntimeTests: XCTestCase {
             "collision debug remains enabled-collider-only")
         XCTAssertEqual(solver.convexDebugEdgeVertexCount, 12)
         XCTAssertEqual(solver.materializedConvexDebugByteCount, 0)
+        XCTAssertEqual(solver.rigidMeshUniqueVertexCount, 48,
+            "faceted inline/convex visuals intentionally keep split normals")
+        let indexed = try XCTUnwrap(solver.renderIndexedRigidMeshSurface)
+        XCTAssertEqual(indexed.indexCount, 48)
+        XCTAssertEqual(solver.materializedLegacyRigidMeshByteCount, 0)
 
         let surface = try XCTUnwrap(solver.renderRigidMeshSurface)
         XCTAssertEqual(surface.vertexCount, 48)
+        XCTAssertEqual(
+            solver.materializedLegacyRigidMeshByteCount,
+            48 * MemoryLayout<RigidMeshVertexGPU>.stride)
         XCTAssertEqual(solver.materializedConvexDebugByteCount, 0,
             "requesting opaque visuals must not materialize debug buffers")
         let vertices = surface.vertices.contents().bindMemory(
@@ -1127,6 +1211,236 @@ final class ConvexGPURuntimeTests: XCTestCase {
             runs.append(snapshots)
         }
         XCTAssertEqual(runs[0], runs[1])
+    }
+
+    func testMaximumTopologyHullKeepsEdgeExpansionBounded() throws {
+        try requireMetal()
+        let asset = try maximumEdgeBipyramidAsset()
+        XCTAssertEqual(asset.vertices.count, 64)
+        XCTAssertEqual(asset.triangles.count, 124)
+        XCTAssertEqual(asset.edges.count, 186)
+
+        var scene = PhysicsScene(name: "maximum-edge-hull")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        scene.settings.collisionMargin = 0.02
+        let base = scene.addBody(
+            size: F3(repeating: 1), density: 0, friction: 0.6,
+            position: .zero, collisionEnabled: false)
+        _ = scene.addConvexCollider(body: base, asset: asset)
+        let moving = scene.addBody(
+            size: F3(repeating: 1), density: 0, friction: 0.6,
+            position: F3(0.82, 0.03, 0.02),
+            rotation: Quat(
+                angle: 0.37, axis: normalize(F3(0.2, 0.7, 0.4))),
+            mass: 1, diagonalInertia: F3(repeating: 0.2),
+            collisionEnabled: false)
+        _ = scene.addConvexCollider(body: moving, asset: asset)
+
+        let solver = try GPUSolver(scene: scene)
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertGreaterThan(solver.lastPairCandidates, 0)
+        XCTAssertLessThanOrEqual(
+            solver.lastConvexEdgePairTests,
+            solver.lastPairCandidates
+                * ConvexHullGPU.maximumSupportingEdgePairTests)
+        XCTAssertTrue(manifoldSnapshots(solver).allSatisfy(\.finite))
+    }
+
+    func testRigidColliderHierarchyPrunesManyPartBodyPair() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "many-part-bvh")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        scene.settings.collisionMargin = 0.01
+        let asset = try cubeAsset()
+        let base = scene.addBody(
+            size: F3(12, 12, 1), density: 0, friction: 0.7,
+            position: .zero, collisionEnabled: false)
+        let moving = scene.addBody(
+            size: F3(12, 12, 1), density: 0, friction: 0.7,
+            position: F3(0, 0, 0.9), mass: 1,
+            diagonalInertia: F3(repeating: 10), collisionEnabled: false)
+        for y in 0..<8 {
+            for x in 0..<8 {
+                let local = F3(
+                    (Float(x) - 3.5) * 1.25,
+                    (Float(y) - 3.5) * 1.25, 0)
+                _ = scene.addConvexCollider(
+                    body: base, asset: asset, localPosition: local)
+                _ = scene.addConvexCollider(
+                    body: moving, asset: asset, localPosition: local)
+            }
+        }
+
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertTrue(solver.usesRigidColliderHierarchy)
+        XCTAssertTrue(GPUSolver.requiredHierarchyKernelNames
+            .isSubset(of: solver.pso.keys))
+        XCTAssertEqual(solver.rigidBroadphaseProxyCount, 2)
+        XCTAssertEqual(solver.rigidBroadphaseBVHNodeCount, 254)
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertGreaterThan(solver.lastPairCandidates, 0)
+        XCTAssertLessThan(solver.lastPairCandidates, 1_024,
+            "BVH leaf pruning must stay far below the 64×64 child product")
+        XCTAssertTrue(solver.activeRigidContactPairs().contains {
+            Set([$0.0, $0.1]) == Set([base, moving])
+        })
+        XCTAssertTrue(manifoldSnapshots(solver).allSatisfy(\.finite))
+    }
+
+    func testRigidColliderHierarchySupportsBodyAcrossCompoundSeam() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "compound-bvh-seam-support")
+        scene.settings.dt = 1 / 120
+        scene.settings.gravity = -9.81
+        scene.settings.iterations = 20
+        scene.settings.collisionMargin = 0.01
+        let asset = try cubeAsset()
+        let table = scene.addBody(
+            size: F3(2, 1, 1), density: 0, friction: 1,
+            position: F3(0, 0, -0.5), collisionEnabled: false)
+        _ = scene.addConvexCollider(
+            body: table, asset: asset, friction: 1,
+            localPosition: F3(-0.5, 0, 0))
+        _ = scene.addConvexCollider(
+            body: table, asset: asset, friction: 1,
+            localPosition: F3(0.5, 0, 0))
+        let falling = scene.addBody(
+            size: F3(repeating: 1), density: 0, friction: 1,
+            position: F3(0, 0, 1.6), mass: 1,
+            diagonalInertia: F3(repeating: 1 / 6),
+            collisionEnabled: false)
+        _ = scene.addConvexCollider(body: falling, asset: asset, friction: 1)
+
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertTrue(solver.usesRigidColliderHierarchy)
+        for _ in 0..<300 { solver.step() }
+        let state = solver.bodyStates([falling])[0]
+
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertTrue(state.position.x.isFinite && state.position.z.isFinite)
+        XCTAssertEqual(state.position.z, 0.5, accuracy: 0.08)
+        XCTAssertLessThan(abs(state.position.x), 0.08)
+        XCTAssertLessThan(abs(state.rotation.imag.x), 0.08)
+        XCTAssertLessThan(abs(state.rotation.imag.y), 0.08)
+        XCTAssertTrue(solver.activeRigidContactPairs().contains {
+            Set([$0.0, $0.1]) == Set([table, falling])
+        })
+        XCTAssertTrue(manifoldSnapshots(solver).allSatisfy(\.finite))
+    }
+
+    func testDeterministicCPUAndGPUConvexParityCorpus() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "convex-parity-corpus")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        scene.settings.collisionMargin = 0.01
+        let asset = try cubeAsset()
+        var expected: [(UInt64, Bool, Float)] = []
+        var seed: UInt64 = 0xA17E_C0DE_5EED
+        func randomUnit() -> Float {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1
+            return Float((seed >> 40) & 0xFFFFFF) / Float(0xFFFFFF)
+        }
+        func pairKey(_ a: Int, _ b: Int) -> UInt64 {
+            UInt64(min(a, b)) << 32 | UInt64(max(a, b))
+        }
+
+        for index in 0..<24 {
+            let group = UInt32(index + 1)
+            let origin = F3(Float(index) * 4, 0, 0)
+            let yawA = (randomUnit() - 0.5) * 2.5
+            let yawB = (randomUnit() - 0.5) * 2.5
+            let rotationA = Quat(angle: yawA, axis: F3(0, 0, 1))
+            let rotationB = Quat(angle: yawB, axis: F3(0, 0, 1))
+            let delta: Float = [-0.05, 0.005, 0.06][index % 3]
+            let otherKind = index % 4
+            let nominalDistance: Float
+            let cpuShapeB: ConvexNarrowPhase.Shape
+            switch otherKind {
+            case 0:
+                nominalDistance = 0.95
+                cpuShapeB = .box(halfExtents: F3(repeating: 0.45))
+            case 1:
+                nominalDistance = 1.0
+                cpuShapeB = .sphere(radius: 0.5)
+            case 2:
+                nominalDistance = 1.2
+                cpuShapeB = .capsule(radius: 0.25, halfHeight: 0.45)
+            default:
+                nominalDistance = 1.0
+                cpuShapeB = .convexHull(vertices: asset.vertices)
+            }
+            let positionB = origin + F3(0, 0, nominalDistance + delta)
+            let cpu = ConvexNarrowPhase.query(
+                shapeA: .convexHull(vertices: asset.vertices),
+                poseA: .init(position: origin, orientation: rotationA),
+                shapeB: cpuShapeB,
+                poseB: .init(position: positionB, orientation: rotationB),
+                options: .init(contactThreshold: scene.settings.collisionMargin))
+            guard case let .success(manifold) = cpu else {
+                return XCTFail("CPU corpus query \(index) failed: \(cpu)")
+            }
+
+            let bodyA = scene.addBody(
+                size: F3(repeating: 1), density: 0, friction: 0.6,
+                position: origin, rotation: rotationA,
+                collisionEnabled: false)
+            _ = scene.addConvexCollider(
+                body: bodyA, asset: asset, collisionGroup: group,
+                collidesWithSharedGeometry: false)
+            let bodyB = scene.addBody(
+                size: F3(repeating: 1), density: 0, friction: 0.6,
+                position: positionB, rotation: rotationB, mass: 1,
+                diagonalInertia: F3(repeating: 0.2),
+                collisionEnabled: false)
+            switch otherKind {
+            case 0:
+                _ = scene.addCollider(
+                    body: bodyB, size: F3(repeating: 0.9), shape: .box,
+                    collisionGroup: group,
+                    collidesWithSharedGeometry: false)
+            case 1:
+                _ = scene.addCollider(
+                    body: bodyB, size: F3(repeating: 1), shape: .sphere,
+                    collisionGroup: group,
+                    collidesWithSharedGeometry: false)
+            case 2:
+                _ = scene.addCollider(
+                    body: bodyB, size: F3(0.9, 0.25, 0), shape: .capsule,
+                    collisionGroup: group,
+                    collidesWithSharedGeometry: false)
+            default:
+                _ = scene.addConvexCollider(
+                    body: bodyB, asset: asset, collisionGroup: group,
+                    collidesWithSharedGeometry: false)
+            }
+            expected.append((
+                pairKey(bodyA, bodyB),
+                manifold.signedDistance <= scene.settings.collisionMargin,
+                manifold.signedDistance))
+        }
+
+        let solver = try GPUSolver(scene: scene)
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertNil(solver.runtimeFailure)
+        let active = Set(solver.activeRigidContactPairs().map {
+            pairKey($0.0, $0.1)
+        })
+        XCTAssertTrue(expected.contains(where: \.1))
+        XCTAssertTrue(expected.contains { !$0.1 })
+        for (key, shouldContact, distance) in expected {
+            XCTAssertEqual(active.contains(key), shouldContact,
+                "CPU/GPU admission mismatch at signed distance \(distance)")
+        }
     }
 
     func testReorderedClippedPatchWarmStartUsesBothAnchors() throws {

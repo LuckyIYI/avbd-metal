@@ -12,6 +12,13 @@ extension Demos {
         let compound = loadConvexDecompositionAsset()
         let visual = loadConvexDecompositionVisual()
         let repetitions = max(1, min(scale, 8))
+        let massProperties: ConvexCompoundMassProperties
+        do {
+            massProperties = try compound.massProperties()
+        } catch {
+            preconditionFailure(
+                "bundled concave-U mass properties are invalid: \(error)")
+        }
 
         var scene = PhysicsScene(name: "convexdecomp")
         scene.settings.iterations = 14
@@ -28,30 +35,41 @@ extension Demos {
         ) -> Int {
             let bounds = convexCompoundBounds(compound)
             let size = bounds.max - bounds.min
-            let properties = convexCompoundMassProperties(compound)
             let density: Float = dynamic ? 1.5 : 0
-            let mass: Float? = dynamic ? properties.volume * density : nil
+            let mass: Float? = dynamic ? massProperties.volume * density : nil
             let diagonalInertia: F3? = dynamic
-                ? properties.diagonalInertiaAtUnitDensity * density : nil
+                ? massProperties.principalInertiaAtUnitDensity * density : nil
             let normalizedRotation = rotation.normalized
-            // SceneBody.position is the inertial COM. Keep the authored mesh
-            // origin fixed in world space by shifting every attached geometry
-            // back by the same aggregate volume centroid.
-            let localGeometryOffset = -properties.centerOfMass
+            let principalToSource = massProperties.principalRotation
+            let sourceToPrincipal = principalToSource.inverse.normalized
+            // SceneBody.position is the inertial COM and its rotation is the
+            // principal frame. Keep the authored mesh origin fixed in world
+            // space by applying the inverse COM/principal transform to every
+            // attached collider and visual.
+            let bodyPosition = dynamic
+                ? position + normalizedRotation.act(massProperties.centerOfMass)
+                : position
+            let bodyRotation = dynamic
+                ? (normalizedRotation * principalToSource).normalized
+                : normalizedRotation
+            let localGeometryOffset = dynamic
+                ? sourceToPrincipal.act(-massProperties.centerOfMass) : .zero
+            let localGeometryRotation = dynamic
+                ? sourceToPrincipal : Quat(real: 1, imag: .zero)
             let body = scene.addBody(
                 size: size, density: density, friction: 0.72,
-                position: position
-                    + normalizedRotation.act(properties.centerOfMass),
-                rotation: normalizedRotation,
+                position: bodyPosition, rotation: bodyRotation,
                 mass: mass, diagonalInertia: diagonalInertia,
                 collisionEnabled: false)
             _ = scene.addConvexCompound(
                 body: body, asset: compound, friction: 0.72,
                 localPosition: localGeometryOffset,
+                localRotation: localGeometryRotation,
                 collisionEnabled: true, isRendered: false)
             scene.addRigidMesh(SceneRigidMesh(
                 body: body, mesh: visual,
-                localPosition: localGeometryOffset, color: color))
+                localPosition: localGeometryOffset,
+                localRotation: localGeometryRotation, color: color))
             return body
         }
 
@@ -128,53 +146,4 @@ extension Demos {
         return (lo, hi)
     }
 
-    /// Exact diagonal volume moments of the cooked closed hulls in their
-    /// shared source frame. This demo asset is axis-aligned and symmetric, so
-    /// its source axes are principal axes; generic importers should continue
-    /// to author the body's full principal-frame mass properties explicitly.
-    private static func convexCompoundMassProperties(
-        _ compound: ConvexCompoundAsset
-    ) -> (volume: Float, centerOfMass: F3,
-          diagonalInertiaAtUnitDensity: F3) {
-        typealias D3 = SIMD3<Double>
-        var volume = 0.0
-        var firstMoment = D3.zero
-        var squaredMoment = D3.zero
-        for part in compound.parts {
-            for triangle in part.triangles {
-                let a = D3(part.vertices[Int(triangle.x)])
-                let b = D3(part.vertices[Int(triangle.y)])
-                let c = D3(part.vertices[Int(triangle.z)])
-                let tetraVolume = simd_dot(a, simd_cross(b, c)) / 6
-                volume += tetraVolume
-                firstMoment += tetraVolume * (a + b + c) / 4
-                squaredMoment += tetraVolume * D3(
-                    a.x * a.x + b.x * b.x + c.x * c.x
-                        + a.x * b.x + a.x * c.x + b.x * c.x,
-                    a.y * a.y + b.y * b.y + c.y * c.y
-                        + a.y * b.y + a.y * c.y + b.y * c.y,
-                    a.z * a.z + b.z * b.z + c.z * c.z
-                        + a.z * b.z + a.z * c.z + b.z * c.z) / 10
-            }
-        }
-        precondition(volume > 0 && volume.isFinite,
-                     "convex demo compound has invalid signed volume")
-        let center = firstMoment / volume
-        let inertiaAtOrigin = D3(
-            squaredMoment.y + squaredMoment.z,
-            squaredMoment.x + squaredMoment.z,
-            squaredMoment.x + squaredMoment.y)
-        let inertiaAtCenter = inertiaAtOrigin - volume * D3(
-            center.y * center.y + center.z * center.z,
-            center.x * center.x + center.z * center.z,
-            center.x * center.x + center.y * center.y)
-        precondition(inertiaAtCenter.x > 0 && inertiaAtCenter.y > 0
-            && inertiaAtCenter.z > 0,
-            "convex demo compound has invalid inertia")
-        return (
-            Float(volume),
-            F3(Float(center.x), Float(center.y), Float(center.z)),
-            F3(Float(inertiaAtCenter.x), Float(inertiaAtCenter.y),
-               Float(inertiaAtCenter.z)))
-    }
 }
