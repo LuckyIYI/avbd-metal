@@ -161,6 +161,45 @@ public struct ContactGPU {
     public var penalty: SIMD4<Float> = .zero
 }
 
+/// Immutable, deduplicated convex support-map payload. Vertex positions live
+/// in the existing `convexHullVertices` float4 buffer so the legacy
+/// `colliderHullRange` ABI remains valid while asset-backed colliders share
+/// one cooked range.
+public struct ConvexHullGPU {
+    /// Maximum polygon loop accepted from either a cooked asset or the legacy
+    /// inline-hull reconstruction path. Keep this in sync with SimCore's
+    /// public asset contract.
+    public static let maximumSourceFaceVertices = 16
+
+    /// Per-thread Sutherland-Hodgman workspace. Clipping a valid source face
+    /// can temporarily add vertices, so this is deliberately larger than the
+    /// authored/cooked face limit and remains a shader implementation detail.
+    public static let maximumClipWorkspaceVertices = 32
+
+    /// vertexStart, vertexCount, faceStart, faceCount
+    public var verticesFaces: SIMD4<UInt32> = .zero
+    /// edgeStart, edgeCount, faceLoopStart, faceLoopCount
+    public var edgesLoops: SIMD4<UInt32> = .zero
+    /// Centered local AABB minimum; w is the centered support radius.
+    public var boundsMinRadius: SIMD4<Float> = .zero
+    /// Centered local AABB maximum; w is positive hull volume.
+    public var boundsMaxVolume: SIMD4<Float> = .zero
+}
+
+/// One canonical polygon face in a cooked convex asset.
+public struct ConvexFaceGPU {
+    /// Outward local plane: dot(normal, point) <= distance.
+    public var plane: SIMD4<Float> = .zero
+    /// loopStart, loopCount, stable face index, reserved.
+    public var loop: SIMD4<UInt32> = .zero
+}
+
+/// One unique undirected hull edge and its adjacent polygon faces.
+public struct ConvexEdgeGPU {
+    /// vertex0, vertex1, face0, face1 (UInt32.max for an invalid boundary).
+    public var endpointsFaces: SIMD4<UInt32> = .zero
+}
+
 public struct ManifoldGPU {
     public var header: SIMD4<UInt32> = .zero  // bodyA, bodyB, numContacts, active
     public var colliderPair: SIMD4<UInt32> = .zero // collision-geom identity
@@ -199,5 +238,12 @@ public enum GPUCounters {
     public static let planarDATNonfiniteValues = 15
     public static let planarDATTetDegeneracies = 16
     public static let colorBase = 17
-    public static let total = 17 + 2 * AVBD_MAX_COLORS
+    /// A support-mapped query could not produce a trustworthy separation or
+    /// penetration witness. Such a frame is restored and retired as failed.
+    public static let convexQueryFailures = 17 + 2 * AVBD_MAX_COLORS
+    /// Exact rigid-triangle narrow-phase candidates after spatial lookup.
+    public static let rigidTriangleCandidates = 18 + 2 * AVBD_MAX_COLORS
+    /// Supporting edge pairs considered by generic convex manifold builds.
+    public static let convexEdgePairTests = 19 + 2 * AVBD_MAX_COLORS
+    public static let total = 20 + 2 * AVBD_MAX_COLORS
 }

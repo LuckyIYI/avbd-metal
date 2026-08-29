@@ -2116,10 +2116,19 @@ kernel void finalize_velocities(
     constant SimParams& P           [[buffer(7)]],
     device const float4* shape      [[buffer(8)]],
     device const float* gravityScale [[buffer(9)]],
+    device const atomic_uint* convexQueryPoison [[buffer(10)]],
+    constant uint& checkConvexPoison [[buffer(11)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
     prevVelLin[gid] = velLin[gid];
+    if (checkConvexPoison != 0u && posLin[gid].w > 0.0f
+        && atomic_load_explicit(convexQueryPoison,
+                                memory_order_relaxed) > 0u) {
+        velLin[gid] = float4(0.0f);
+        velAng[gid] = float4(0.0f);
+        return;
+    }
     if (posLin[gid].w > 0.0f) {
         float3 oldV = velLin[gid].xyz;
         float3 v = (posLin[gid].xyz - initLin[gid].xyz) / P.dt;

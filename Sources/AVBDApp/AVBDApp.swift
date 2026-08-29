@@ -137,6 +137,11 @@ struct ContentView: View {
 
                 GroupBox("Display") {
                     Toggle("Color by graph color", isOn: $model.colorByGraphColor)
+                    Toggle("Collision hulls",
+                           isOn: $model.showConvexCollisionGeometry)
+                    Toggle("Hull wireframe",
+                           isOn: $model.convexCollisionWireframe)
+                        .disabled(!model.showConvexCollisionGeometry)
                 }
 
                 Text(model.statsText)

@@ -19,6 +19,7 @@ public struct DemoParam: Identifiable {
 public enum Demos {
     public static var all: [String] {
         ["gaudifunicular", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+         "convexdecomp",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
          "wreckingball", "trebuchet", "rubegoldberg",
@@ -117,6 +118,7 @@ public enum Demos {
         case "pyramid": return pyramid(base: 8 * s)
         case "pendulum": return pendulum(links: 20 * s, massRatio: 100)
         case "boxpile": return boxpile(count: 200 * s * s)
+        case "convexdecomp": return convexDecomposition(scale: s)
         case "cardhouse": return cardhouse(levels: 3 + s)
         case "fracture": return fractureWall(width: 10 * s, height: 8 * s)
         case "bridge": return bridge(planks: 16 * s, drops: 4 * s)

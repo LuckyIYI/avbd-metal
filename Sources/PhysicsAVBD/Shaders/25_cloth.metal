@@ -14,7 +14,6 @@ using namespace metal;
 // ============================================================================
 
 #define VT_MAX_PER_VERTEX 4u
-#define RT_MAX_PER_TRI 4u
 #define EE_MAX_PER_EDGE 4u
 #define ELEM_EDGE_BIT 0x80000000u
 // E-E contacts only when both closest points are interior (endpoints are
@@ -927,9 +926,11 @@ kernel void ogc_bounds_refresh(
 }
 
 // ----------------------------------------------------------------------------
-// Rigid feature points vs triangle: box corners, sphere center, capsule ends.
-// One thread per TRIANGLE scanning the BODY grid (radius widened to cover the
-// triangle's own extent) plus the global (oversized/static) list.
+// Rigid collider vs deformable triangle. Broad-phase lists contain COLLIDER
+// indices, while the emitted four-slot stencil contains BODY indices. Keeping
+// that boundary explicit is essential for offset/compound colliders: geometry,
+// material, filtering, and persistence belong to the collider; mass, velocity,
+// exclusions, and the solver anchor belong to its owner body.
 // ----------------------------------------------------------------------------
 struct RTFeature {
     float3 world;       // feature point, world space
@@ -937,26 +938,80 @@ struct RTFeature {
     uint id;            // stable feature index for persistence
 };
 
-// Collect candidate feature points of body `o` that could touch a triangle
-// with bounding sphere (center m, radius rT). Returns count (<= 4).
+// The implementations live later in the concatenated 30_narrowphase source.
+// Forward declarations let RT share the exact same bounded support queries
+// rather than maintaining a subtly different convex implementation.
+inline float3 npcSafeNormalize(float3 v, float3 fallback);
+inline NPCResult npcMPR(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices);
+inline NPCResult npcMPRWithEnlarge(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    float enlarge);
+inline bool npcCorrectedMPRIsConsistent(
+    thread const NPCResult& result);
+inline NPCResult npcGJK(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    float maxDistance,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices);
+
+inline float3 rtColliderCenter(
+    device const float4* posLin,
+    device const float4* posAng,
+    device const uint* colliderOwner,
+    device const float4* colliderLocalPosition,
+    uint collider)
+{
+    uint owner = colliderOwner[collider];
+    return posLin[owner].xyz
+        + q_rotate(posAng[owner], colliderLocalPosition[collider].xyz);
+}
+
+inline float4 rtColliderRotation(
+    device const float4* posAng,
+    device const uint* colliderOwner,
+    device const float4* colliderLocalRotation,
+    uint collider)
+{
+    return q_mul(posAng[colliderOwner[collider]],
+                 colliderLocalRotation[collider]);
+}
+
+// Collect the established analytic feature set of collider `collider` that
+// could touch a triangle with bounding sphere (center m, radius rT). Cooked
+// hulls take the support-query path below and torus remains explicitly absent.
 inline int rtFeatures(device const float4* posLin, device const float4* posAng,
-                      device const float4* shape, device const uint* shapeType,
-                      uint o, float3 m, float rT, float collisionMargin,
+                      device const float4* colliderShape,
+                      device const uint* colliderShapeType,
+                      device const uint* colliderOwner,
+                      device const float4* colliderLocalPosition,
+                      device const float4* colliderLocalRotation,
+                      uint collider, float3 m, float rT,
+                      float collisionMargin,
                       thread RTFeature* out)
 {
-    uint st = shapeType[o] & SHAPE_KIND_MASK;
-    float3 p = posLin[o].xyz;
-    float4 q = posAng[o];
+    uint st = colliderShapeType[collider] & SHAPE_KIND_MASK;
+    float3 p = rtColliderCenter(posLin, posAng, colliderOwner,
+                                colliderLocalPosition, collider);
+    float4 q = rtColliderRotation(posAng, colliderOwner,
+                                  colliderLocalRotation, collider);
     int n = 0;
     if (st == 1) {                          // sphere
         out[0].world = p;
-        out[0].radius = shape[o].x * 0.5f;
+        out[0].radius = colliderShape[collider].x * 0.5f;
         out[0].id = 8;
         return 1;
     }
     if (st == 3) {                          // capsule: 3 spheres along the axis
-        float half_ = shape[o].x * 0.5f;
-        float r = shape[o].y;
+        float half_ = colliderShape[collider].x * 0.5f;
+        float r = colliderShape[collider].y;
         float3 ax = q_rotate(q, float3(0, 0, 1));
         for (int i = -1; i <= 1; i++) {
             float3 w = p + ax * (half_ * float(i));
@@ -968,47 +1023,122 @@ inline int rtFeatures(device const float4* posLin, device const float4* posAng,
         }
         return n;
     }
-    if (st == 2) return 0;                  // torus: node contacts cover it
-    // box: 8 corners, pre-culled by distance to the triangle bound
-    float3 h3 = shape[o].xyz * 0.5f;
+    if (st == 2 || st == 4) return 0;       // torus unsupported; hull is generic
+    // Box: retain every conservatively qualifying corner. The caller performs
+    // the exact point/triangle test for all eight in stable feature order;
+    // softEmit owns raw-demand accounting and fails closed on capacity instead
+    // of letting an arbitrary four-corner staging cap drop the real contact.
+    float3 h3 = colliderShape[collider].xyz * 0.5f;
     for (uint i = 0; i < 8; i++) {
         float3 local = float3(i & 1 ? h3.x : -h3.x,
                               i & 2 ? h3.y : -h3.y,
                               i & 4 ? h3.z : -h3.z);
         float3 w = xform(p, q, local);
         if (distance(w, m) > rT + 4.0f * collisionMargin) continue;
-        if (n < 4) {
-            out[n].world = w;
-            out[n].radius = 0.0f;
-            out[n].id = i;
-            n++;
-        }
+        out[n].world = w;
+        out[n].radius = 0.0f;
+        out[n].id = i;
+        n++;
     }
     return n;
+}
+
+inline NPCShape rtConvexShape(
+    device const float4* posLin,
+    device const float4* posAng,
+    device const float4* colliderShape,
+    device const uint* colliderShapeType,
+    device const uint* colliderOwner,
+    device const float4* colliderLocalPosition,
+    device const float4* colliderLocalRotation,
+    uint collider)
+{
+    NPCShape shape;
+    shape.collider = collider;
+    shape.kind = colliderShapeType[collider] & SHAPE_KIND_MASK;
+    shape.center = rtColliderCenter(posLin, posAng, colliderOwner,
+                                    colliderLocalPosition, collider);
+    shape.rotation = rtColliderRotation(posAng, colliderOwner,
+                                        colliderLocalRotation, collider);
+    shape.dimensions = colliderShape[collider];
+    return shape;
+}
+
+inline NPCShape rtTrianglePrism(float3 a, float3 b, float3 c,
+                                float halfThickness)
+{
+    NPCShape shape;
+    shape.collider = WORLD_BODY;
+    shape.kind = 5u;
+    // Kind 5 uses all three position fields for the exact authored vertices.
+    // Its interior point is computed only after these have been translated
+    // into the shared query's small A-local frame.
+    shape.center = a;
+    shape.rotation = float4(b, halfThickness);
+    float3 centroid = a + ((b - a) + (c - a)) / 3.0f;
+    shape.dimensions = float4(
+        c, max(distance(centroid, a),
+               max(distance(centroid, b), distance(centroid, c)))
+               + halfThickness);
+    return shape;
+}
+
+#define RT_DIRECT_RIGID_THRESHOLD 8u
+
+// Reuse the rigid broadphase grid without consuming three more argument-table
+// slots in the already-full RT kernel. `globalAndSpatial` keeps its authored
+// global collider prefix; starts/counts/bodies are packed immediately behind
+// that immutable prefix for this frame.
+kernel void rt_pack_spatial_index(
+    device const uint* cellStart   [[buffer(0)]],
+    device const uint* cellCount   [[buffer(1)]],
+    device const uint* cellBodies  [[buffer(2)]],
+    device uint* globalAndSpatial  [[buffer(3)]],
+    constant SimParams& P          [[buffer(4)]],
+    uint gid                       [[thread_position_in_grid]])
+{
+    uint base = P.numGlobals;
+    if (gid < P.gridHashSize) {
+        globalAndSpatial[base + gid] = cellStart[gid];
+        globalAndSpatial[base + P.gridHashSize + gid] = cellCount[gid];
+    }
+    if (gid < P.numHashed) {
+        globalAndSpatial[base + 2u * P.gridHashSize + gid] = cellBodies[gid];
+    }
 }
 
 kernel void rt_emit(
     device const float4* posLin     [[buffer(0)]],
     device const float4* posAng     [[buffer(1)]],
-    device const float4* shape      [[buffer(2)]],
+    device const float4* bodyShape  [[buffer(2)]],
     device const float4* props      [[buffer(3)]],
     device const float4* velLin     [[buffer(4)]],
-    device const uint* shapeType    [[buffer(5)]],
+    device const uint* colliderShapeType [[buffer(5)]],
     device const uint4* tris        [[buffer(6)]],
-    device const uint* cellStart    [[buffer(7)]],   // BODY grid
-    device const uint* cellCount    [[buffer(8)]],
-    device const uint* cellBodies   [[buffer(9)]],
-    device const uint* globalIdx    [[buffer(10)]],
-    device const uint2* exclusions  [[buffer(11)]],
-    constant uint& numExclusions    [[buffer(12)]],
-    device SoftContactGPU* soft     [[buffer(13)]],
-    device atomic_uint* counters    [[buffer(14)]],
-    device const SoftContactGPU* prevSoft [[buffer(15)]],
-    device const atomic_uint* mapKeyA [[buffer(16)]],
-    device const uint* mapKeyB      [[buffer(17)]],
-    device const uint* mapVal       [[buffer(18)]],
-    constant SimParams& P           [[buffer(19)]],
-    device const uint* hashedRigidIdx [[buffer(20)]],
+    device const uint* globalIdx    [[buffer(7)]],
+    device const uint2* exclusions  [[buffer(8)]],
+    constant uint& numExclusions    [[buffer(9)]],
+    device SoftContactGPU* soft     [[buffer(10)]],
+    device atomic_uint* counters    [[buffer(11)]],
+    device const SoftContactGPU* prevSoft [[buffer(12)]],
+    device const atomic_uint* mapKeyA [[buffer(13)]],
+    device const uint* mapKeyB      [[buffer(14)]],
+    device const uint* mapVal       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const uint* hashedRigidIdx [[buffer(17)]],
+    device const float4* colliderShape [[buffer(18)]],
+    device const uint* colliderOwner [[buffer(19)]],
+    device const float4* colliderLocalPosition [[buffer(20)]],
+    device const float4* colliderLocalRotation [[buffer(21)]],
+    device const float2* colliderFriction [[buffer(22)]],
+    device const uint* colliderGroup [[buffer(23)]],
+    device const uint* colliderSharedCollision [[buffer(24)]],
+    device const uint2* colliderHullRange [[buffer(25)]],
+    device const float4* convexHullVertices [[buffer(26)]],
+    device const float4* velAng     [[buffer(27)]],
+    device const uint* surfaceCollisionGroup [[buffer(28)]],
+    device const uint* surfaceSharedCollision [[buffer(29)]],
+    device atomic_uint* convexQueryPoison [[buffer(30)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numTris) return;
@@ -1017,54 +1147,224 @@ kernel void rt_emit(
     float3 b = posLin[tid.y].xyz;
     float3 c = posLin[tid.z].xyz;
     float3 m = (a + b + c) / 3.0f;
-    float rt_ = max(fabs(shape[tid.x].w),
-                    max(fabs(shape[tid.y].w), fabs(shape[tid.z].w)));
+    float rt_ = max(fabs(bodyShape[tid.x].w),
+                    max(fabs(bodyShape[tid.y].w),
+                        fabs(bodyShape[tid.z].w)));
     float rT = max(distance(m, a), max(distance(m, b), distance(m, c))) + rt_;
     float3 triN = cross(b - a, c - a);
     float tnLen = length(triN);
-    if (tnLen < 1e-12f) return;
+    if (!finite3(a) || !finite3(b) || !finite3(c)
+        || !finite3(triN) || !finite_bits(tnLen) || tnLen < 1e-12f) {
+        // No support query has occurred. A finite-degenerate surface keeps
+        // the established skip semantics; unrelated analytic/far/excluded
+        // rigid geometry must not be mislabeled as a ConvexQuery failure.
+        return;
+    }
     triN /= tnLen;
+    bool triangleDynamic = posLin[tid.x].w > 0.0f
+        || posLin[tid.y].w > 0.0f || posLin[tid.z].w > 0.0f;
     float3 velT = (velLin[tid.x].xyz + velLin[tid.y].xyz + velLin[tid.z].xyz) / 3.0f;
+    uint candidateTests = 0u;
 
-    // one thread owns each triangle: the cap is thread-local
-    uint emitted = 0;
-
-    // process one candidate rigid body against this triangle
-    #define RT_TEST_BODY(o)                                                    \
+    // Process one candidate collider against this triangle. There is no
+    // thread-local contact cap: softEmit records exact raw demand before
+    // capacity clipping, so overload reaches the solver's sticky typed failure
+    // instead of silently dropping the fifth compound part.
+    #define RT_TEST_COLLIDER(COLLIDER)                                         \
     {                                                                          \
-        float rb = fabs(shape[o].w);                                           \
+        candidateTests++;                                                      \
+        uint collider_ = (COLLIDER);                                           \
+        uint owner_ = colliderOwner[collider_];                                \
+        uint group_ = colliderGroup[collider_];                                \
+        bool domainOK_ = colliderDomainsCompatible(                            \
+            group_, surfaceCollisionGroup[tid.x],                              \
+            colliderSharedCollision[collider_],                                \
+            surfaceSharedCollision[tid.x]);                                    \
+        float3 center_ = rtColliderCenter(                                     \
+            posLin, posAng, colliderOwner, colliderLocalPosition, collider_);  \
+        float rb = fabs(colliderShape[collider_].w);                           \
+        float3 centerVelocity_ = velLin[owner_].xyz                            \
+            + cross(velAng[owner_].xyz, center_ - posLin[owner_].xyz);         \
+        float inflate_ = min(length(centerVelocity_ - velT) * P.dt,            \
+                             0.5f * rT);                                       \
+        /* The exact RT tests admit their element margin plus bounded       */\
+        /* velocity inflation. Every earlier cull must cover that same      */\
+        /* speculative band, while retaining the wider authored rigid skin. */\
+        float outerSkin_ = max(P.collisionMargin, P.elemMargin + inflate_);    \
         /* surface-distance gate: center-distance is meaningless for huge   */\
         /* statics (the ground passes always and pays 8 corner tests/tri)   */\
-        bool nearO = distance(posLin[o].xyz, m) <= rT + rb + P.collisionMargin; \
-        if (nearO && (shapeType[o] & SHAPE_KIND_MASK) == 0u) {                 \
-            float3 lm = q_rotate(q_conj(posAng[o]), m - posLin[o].xyz);        \
-            float3 dq2 = max(fabs(lm) - shape[o].xyz * 0.5f, 0.0f);            \
-            nearO = length(dq2) <= rT + P.collisionMargin + 0.05f;              \
+        bool nearO = domainOK_ && (posLin[owner_].w > 0.0f                   \
+                || triangleDynamic)                                           \
+            && owner_ != tid.x && owner_ != tid.y                             \
+            && owner_ != tid.z                                                 \
+            && distance(center_, m) <= rT + rb + outerSkin_;                  \
+        float4 colliderQ_ = rtColliderRotation(                                \
+            posAng, colliderOwner, colliderLocalRotation, collider_);          \
+        uint colliderKind_ = colliderShapeType[collider_] & SHAPE_KIND_MASK;   \
+        if (nearO && colliderKind_ == 0u) {                                    \
+            float3 lm = q_rotate(q_conj(colliderQ_), m - center_);             \
+            float3 dq2 = max(fabs(lm)                                          \
+                           - colliderShape[collider_].xyz * 0.5f, 0.0f);       \
+            nearO = length(dq2) <= rT + outerSkin_ + 0.05f;                    \
         }                                                                      \
         if (nearO) {                                                           \
             bool excl = pairExcluded(exclusions, numExclusions,                \
-                                     min(o, tid.x), max(o, tid.x))             \
+                                     min(owner_, tid.x), max(owner_, tid.x))   \
                      || pairExcluded(exclusions, numExclusions,                \
-                                     min(o, tid.y), max(o, tid.y))             \
+                                     min(owner_, tid.y), max(owner_, tid.y))   \
                      || pairExcluded(exclusions, numExclusions,                \
-                                     min(o, tid.z), max(o, tid.z));            \
+                                     min(owner_, tid.z), max(owner_, tid.z));  \
             if (!excl) {                                                       \
-                RTFeature feats[4];                                            \
-                int nf = rtFeatures(posLin, posAng, shape, shapeType,          \
-                                    o, m, rT, P.collisionMargin, feats);       \
-                for (int fi = 0; fi < nf && emitted < RT_MAX_PER_TRI; fi++) {  \
+                if (colliderKind_ == 4u) {                                     \
+                    NPCShape convex_ = rtConvexShape(                          \
+                        posLin, posAng, colliderShape, colliderShapeType,      \
+                        colliderOwner, colliderLocalPosition,                  \
+                        colliderLocalRotation, collider_);                     \
+                    float prismThickness_ = max(rt_,                           \
+                        1.0e-6f * max(1.0f, rT));                              \
+                    NPCShape triangle_ = rtTrianglePrism(                      \
+                        a, b, c, prismThickness_);                             \
+                    NPCResult hit_ = npcMPR(                                   \
+                        convex_, triangle_, colliderHullRange,                 \
+                        convexHullVertices);                                   \
+                    bool mprHit_ = hit_.valid && hit_.overlap                  \
+                        && npcCorrectedMPRIsConsistent(hit_);                   \
+                    bool queryOK_ = mprHit_;                                   \
+                    float detect_ = P.elemMargin + inflate_;                   \
+                    if (!mprHit_) {                                            \
+                        hit_ = npcGJK(convex_, triangle_, detect_,             \
+                                      colliderHullRange, convexHullVertices);  \
+                        queryOK_ = hit_.valid && !hit_.overlap;                \
+                        if (!queryOK_) {                                       \
+                            float failedUpper_ = hit_.signedDistance;          \
+                            NPCResult swapped_ = npcMPR(                       \
+                                triangle_, convex_, colliderHullRange,         \
+                                convexHullVertices);                           \
+                            bool recovered_ = false;                           \
+                            if (swapped_.valid && swapped_.overlap) {          \
+                                NPCResult mapped_ = swapped_;                  \
+                                mapped_.pointA = swapped_.pointB;              \
+                                mapped_.pointB = swapped_.pointA;              \
+                                mapped_.normalAB = -swapped_.normalAB;         \
+                                mapped_.featureA = swapped_.featureB;          \
+                                mapped_.featureB = swapped_.featureA;          \
+                                if (npcCorrectedMPRIsConsistent(mapped_)) {     \
+                                    hit_ = mapped_;                            \
+                                    recovered_ = true;                         \
+                                }                                              \
+                            }                                                  \
+                            if (!recovered_) {                                 \
+                                float adaptiveEnlarge_ = min(                  \
+                                    2.0f * detect_ + 1.0e-4f,                  \
+                                    max(1.0e-3f,                               \
+                                        2.0f * failedUpper_ + 1.0e-4f));       \
+                                if (finite_bits(failedUpper_)                  \
+                                    && failedUpper_ >= 0.0f                    \
+                                    && adaptiveEnlarge_                        \
+                                        > failedUpper_ + 5.0e-5f) {           \
+                                    NPCResult retry_ = npcMPRWithEnlarge(      \
+                                        convex_, triangle_,                   \
+                                        colliderHullRange,                    \
+                                        convexHullVertices,                   \
+                                        adaptiveEnlarge_);                     \
+                                    if (npcCorrectedMPRIsConsistent(retry_)) {  \
+                                        hit_ = retry_;                         \
+                                        recovered_ = true;                     \
+                                    }                                          \
+                                }                                              \
+                            }                                                  \
+                            queryOK_ = recovered_;                             \
+                            mprHit_ = recovered_;                              \
+                            if (!recovered_)                                   \
+                                latchConvexQueryFailure(                       \
+                                    counters, convexQueryPoison);              \
+                        }                                                      \
+                    }                                                          \
+                    bool finiteHit_ = finite3(hit_.pointA)                     \
+                        && finite3(hit_.pointB) && finite3(hit_.normalAB)       \
+                        && finite_bits(hit_.signedDistance);                   \
+                    if (queryOK_ && !finiteHit_) {                             \
+                        latchConvexQueryFailure(                               \
+                            counters, convexQueryPoison);                      \
+                        queryOK_ = false;                                      \
+                    }                                                          \
+                    if (queryOK_ && hit_.signedDistance <= detect_) {          \
+                        float3 bary_;                                          \
+                        float3 q_ = closestPtTriangle(                         \
+                            hit_.pointA, a, b, c, bary_);                      \
+                        uint keyA_ = (SC_RT << 28)                             \
+                            | (collider_ & 0x0FFFFFFFu);                       \
+                        uint keyB_ = (gid << 8)                                \
+                            | (hit_.featureA & 0xFFu);                         \
+                        float proposed_ = dot(center_ - q_, triN) >= 0.0f      \
+                            ? 1.0f : -1.0f;                                   \
+                        bool interior_ = bary_.x > 0.02f && bary_.y > 0.02f    \
+                            && bary_.z > 0.02f;                               \
+                        float sMem_ = interior_                                \
+                            ? softPrevSide(prevSoft, mapKeyA, mapKeyB,         \
+                                           mapVal, P, keyA_, keyB_, proposed_) \
+                            : proposed_;                                       \
+                        float3 nGeo_ = -hit_.normalAB;                         \
+                        float side_ = dot(nGeo_, triN) >= 0.0f ? 1.0f : -1.0f; \
+                        float3 n_; float g_;                                   \
+                        bool physicalOverlap_ = mprHit_                        \
+                            && hit_.signedDistance <= 0.0f;                    \
+                        if (physicalOverlap_ && interior_) {                   \
+                            n_ = sMem_ * triN;                                 \
+                            g_ = min(hit_.signedDistance, 0.0f);               \
+                        } else if (side_ == sMem_) {                           \
+                            n_ = nGeo_;                                        \
+                            g_ = hit_.signedDistance;                          \
+                        } else {                                               \
+                            n_ = sMem_ * triN;                                 \
+                            g_ = -hit_.signedDistance;                         \
+                        }                                                      \
+                        n_ = npcSafeNormalize(n_, sMem_ * triN);               \
+                        float fricT_ = (props[tid.x].w + props[tid.y].w        \
+                                        + props[tid.z].w) / 3.0f;             \
+                        float friction_ = sqrt(max(                            \
+                            colliderFriction[collider_].x * fricT_, 0.0f));   \
+                        float minMass_ = posLin[owner_].w > 0.0f               \
+                            ? posLin[owner_].w : FLT_MAX;                      \
+                        float mA_ = posLin[tid.x].w, mB_ = posLin[tid.y].w,    \
+                              mC_ = posLin[tid.z].w;                           \
+                        if (mA_ > 0.0f) minMass_ = min(minMass_, mA_);         \
+                        if (mB_ > 0.0f) minMass_ = min(minMass_, mB_);         \
+                        if (mC_ > 0.0f) minMass_ = min(minMass_, mC_);         \
+                        if (minMass_ < FLT_MAX) {                              \
+                            float3 anchor_ = q_rotate(q_conj(posAng[owner_]),  \
+                                hit_.pointA - posLin[owner_].xyz);             \
+                            softEmit(soft, counters, prevSoft, mapKeyA,        \
+                                     mapKeyB, mapVal, P,                       \
+                                     uint4(owner_, tid.x, tid.y, tid.z),       \
+                                     float4(1.0f, -bary_.x, -bary_.y,         \
+                                            -bary_.z),                         \
+                                     n_, friction_, anchor_,                  \
+                                     g_ + P.elemMargin, 0.0f,                 \
+                                     softLambdaCap(P, minMass_), minMass_,    \
+                                     SC_RT, true, false, sMem_ < 0.0f,        \
+                                     keyA_, keyB_);                            \
+                        }                                                      \
+                    }                                                          \
+                } else {                                                       \
+                RTFeature feats[8];                                            \
+                int nf = rtFeatures(                                           \
+                    posLin, posAng, colliderShape, colliderShapeType,          \
+                    colliderOwner, colliderLocalPosition,                     \
+                    colliderLocalRotation, collider_, m, rT,                  \
+                    P.collisionMargin, feats);                                \
+                for (int fi = 0; fi < nf; fi++) {                              \
                     float3 bary;                                               \
                     float3 q = closestPtTriangle(feats[fi].world, a, b, c, bary); \
                     float3 d = feats[fi].world - q;                            \
                     float dist = length(d);                                    \
                     float hSum = rt_ + feats[fi].radius;                       \
-                    float inflate = min(length(velLin[o].xyz - velT) * P.dt,   \
-                                        0.5f * rT);                            \
-                    if (dist - hSum > P.elemMargin + inflate) continue;        \
+                    if (dist - hSum > P.elemMargin + inflate_) continue;       \
                     float side = dot(d, triN) >= 0.0f ? 1.0f : -1.0f;          \
-                    uint keyA = (SC_RT << 28) | o;                             \
-                    uint keyB = gid * 16u + feats[fi].id;                      \
-                    float proposed = dot(posLin[o].xyz - q, triN) >= 0.0f      \
+                    uint keyA = (SC_RT << 28)                                  \
+                        | (collider_ & 0x0FFFFFFFu);                           \
+                    uint keyB = (gid << 8) | (feats[fi].id & 0xFFu);          \
+                    float proposed = dot(center_ - q, triN) >= 0.0f            \
                                    ? 1.0f : -1.0f;                             \
                     bool interior = bary.x > 0.02f && bary.y > 0.02f           \
                                  && bary.z > 0.02f;                            \
@@ -1077,63 +1377,112 @@ kernel void rt_emit(
                     else { n = sMem * triN; g = -dist; }                       \
                     float fricT = (props[tid.x].w + props[tid.y].w             \
                                    + props[tid.z].w) / 3.0f;                   \
-                    float friction = sqrt(max(props[o].w * fricT, 0.0f));      \
-                    float minMass = posLin[o].w > 0.0f ? posLin[o].w : FLT_MAX; \
+                    float friction = sqrt(max(                                 \
+                        colliderFriction[collider_].x * fricT, 0.0f));         \
+                    float minMass = posLin[owner_].w > 0.0f                    \
+                        ? posLin[owner_].w : FLT_MAX;                          \
                     float mA = posLin[tid.x].w, mB = posLin[tid.y].w,          \
                           mC = posLin[tid.z].w;                                \
                     if (mA > 0.0f) minMass = min(minMass, mA);                 \
                     if (mB > 0.0f) minMass = min(minMass, mB);                 \
                     if (mC > 0.0f) minMass = min(minMass, mC);                 \
                     if (minMass == FLT_MAX) continue;                          \
-                    uint st = shapeType[o] & SHAPE_KIND_MASK;                  \
-                    bool roundA = st != 0;                                     \
-                    float3 anchor = roundA ? (feats[fi].world - posLin[o].xyz) \
-                        : q_rotate(q_conj(posAng[o]), feats[fi].world - posLin[o].xyz); \
+                    bool roundA = (colliderShapeType[collider_]                \
+                        & COLLIDER_WORLD_ROUND_ANCHOR) != 0u;                  \
+                    float3 anchor = roundA                                     \
+                        ? (feats[fi].world - posLin[owner_].xyz)               \
+                        : q_rotate(q_conj(posAng[owner_]),                     \
+                                   feats[fi].world - posLin[owner_].xyz);      \
                     softEmit(soft, counters, prevSoft, mapKeyA, mapKeyB, mapVal, P, \
-                             uint4(o, tid.x, tid.y, tid.z),                    \
+                             uint4(owner_, tid.x, tid.y, tid.z),               \
                              float4(1.0f, -bary.x, -bary.y, -bary.z),          \
                              n, friction, anchor,                              \
                              g - hSum + P.elemMargin,                          \
                              hSum - P.elemMargin,                              \
                              softLambdaCap(P, minMass), minMass,               \
                              SC_RT, true, roundA, sMem < 0.0f, keyA, keyB);    \
-                    emitted++;                                                 \
+                }                                                              \
                 }                                                              \
             }                                                                  \
         }                                                                      \
     }
 
-    // hashed bodies. With only a handful of rigids hashed, the grid sweep is
-    // pure overhead (27+ empty-cell probes per triangle): test them directly.
-    if (P.numHashedRigid > 0 && P.numHashedRigid <= 8) {
-        for (uint ri = 0; ri < P.numHashedRigid && emitted < RT_MAX_PER_TRI; ri++) {
-            uint o = hashedRigidIdx[ri];
-            RT_TEST_BODY(o)
+    if (P.numHashedRigid <= RT_DIRECT_RIGID_THRESHOLD) {
+        // Direct traversal wins for tiny sets and provides a simple reference
+        // path for the spatial-counter tests below.
+        for (uint ri = 0; ri < P.numHashedRigid; ri++) {
+            uint collider = hashedRigidIdx[ri];
+            RT_TEST_COLLIDER(collider)
         }
-    } else if (P.numHashedRigid > 0) {
-        // widen the scan so big-body centers further than one cell are still
-        // reached (cellSize = 2x max hashed radius; triangles add rT)
-        int R = clamp(int(ceil((rT + 0.5f * P.cellSize) / P.cellSize)), 1, 4);
-        int3 cc = cellCoord(m, P.cellSize);
-        for (int dz = -R; dz <= R && emitted < RT_MAX_PER_TRI; dz++)
-        for (int dy = -R; dy <= R && emitted < RT_MAX_PER_TRI; dy++)
-        for (int dx = -R; dx <= R && emitted < RT_MAX_PER_TRI; dx++) {
-            uint h = cellHash(cc + int3(dx, dy, dz), P.gridHashSize);
-            uint s = cellStart[h], e = s + cellCount[h];
-            for (uint k = s; k < e && emitted < RT_MAX_PER_TRI; k++) {
-                uint o = cellBodies[k];
-                if (shape[o].w < 0.0f) continue;    // particles: V-T covers
-                RT_TEST_BODY(o)
+    } else {
+        uint packedBase = P.numGlobals;
+        device const uint* rtCellStart = globalIdx + packedBase;
+        device const uint* rtCellCount = rtCellStart + P.gridHashSize;
+        device const uint* rtCellBodies = rtCellCount + P.gridHashSize;
+        uint rigidGroupCount = hashedRigidIdx[P.numHashedRigid];
+        device const uint* rigidGroups =
+            hashedRigidIdx + P.numHashedRigid + 1u;
+        uint surfaceGroup = surfaceCollisionGroup[tid.x];
+        uint surfaceShared = surfaceSharedCollision[tid.x];
+        uint queryGroupCount = surfaceGroup == 0u
+            ? rigidGroupCount : (surfaceShared != 0u ? 2u : 1u);
+
+        // A hashed rigid's raw support radius cannot exceed half the host's
+        // conservative cell size. Candidate velocity is not known until a
+        // bucket has been visited, so cover the exact per-candidate inflation
+        // cap here. RT_TEST_COLLIDER then tightens this to the actual speed.
+        float gridOuterSkin = max(
+            P.collisionMargin, P.elemMargin + 0.5f * rT);
+        float reach = 0.5f * P.cellSize + rt_ + gridOuterSkin;
+        float3 triangleMin = min(a, min(b, c)) - reach;
+        float3 triangleMax = max(a, max(b, c)) + reach;
+        int3 lo = cellCoord(triangleMin, P.cellSize);
+        int3 hi = cellCoord(triangleMax, P.cellSize);
+
+        for (uint queryIndex = 0u; queryIndex < queryGroupCount;
+             queryIndex++) {
+            uint queryGroup = surfaceGroup == 0u
+                ? rigidGroups[queryIndex]
+                : (queryIndex == 0u ? surfaceGroup : 0u);
+            for (int z = lo.z; z <= hi.z; z++)
+            for (int y = lo.y; y <= hi.y; y++)
+            for (int x = lo.x; x <= hi.x; x++) {
+                int3 queryCell = int3(x, y, z);
+                uint hash = cellHash(
+                    queryCell, queryGroup, P.gridHashSize);
+                uint start = rtCellStart[hash];
+                uint end = start + rtCellCount[hash];
+                for (uint slot = start; slot < end; slot++) {
+                    uint collider = rtCellBodies[slot];
+                    uint owner = colliderOwner[collider];
+                    // Hash buckets can alias both cells and collision groups.
+                    // Rechecking the authored key makes each rigid appear
+                    // exactly once across this triangle's query volume.
+                    if (bodyShape[owner].w < 0.0f
+                        || colliderGroup[collider] != queryGroup) continue;
+                    float3 center = rtColliderCenter(
+                        posLin, posAng, colliderOwner,
+                        colliderLocalPosition, collider);
+                    if (any(cellCoord(center, P.cellSize) != queryCell))
+                        continue;
+                    RT_TEST_COLLIDER(collider)
+                }
             }
         }
     }
     // globals (oversized/static)
-    for (uint gI = 0; gI < P.numGlobals && emitted < RT_MAX_PER_TRI; gI++) {
-        uint o = globalIdx[gI];
-        if (shape[o].w < 0.0f) continue;
-        RT_TEST_BODY(o)
+    for (uint gI = 0; gI < P.numGlobals; gI++) {
+        uint collider = globalIdx[gI];
+        uint owner = colliderOwner[collider];
+        if (bodyShape[owner].w < 0.0f) continue;
+        RT_TEST_COLLIDER(collider)
     }
-    #undef RT_TEST_BODY
+    #undef RT_TEST_COLLIDER
+    if (candidateTests > 0u) {
+        atomic_fetch_add_explicit(
+            &counters[CTR_RT_CANDIDATES], candidateTests,
+            memory_order_relaxed);
+    }
 }
 
 // ----------------------------------------------------------------------------

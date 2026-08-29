@@ -33,6 +33,8 @@ final class SimulationModel: ObservableObject, RenderableModel {
     }
     @Published var running = true
     @Published var colorByGraphColor = false
+    @Published var showConvexCollisionGeometry = false
+    @Published var convexCollisionWireframe = true
 
     // Live-tunable solver settings
     @Published var iterations: Double = 10 { didSet { push() } }
@@ -173,6 +175,9 @@ final class SimulationModel: ObservableObject, RenderableModel {
             statsText = String(
                 format: "%d bodies   %.2f ms/step   %d pairs   %d colors",
                 solver.bodyCount, msEMA, solver.lastNumPairs, colors)
+            if solver.uniqueConvexAssetCount > 0 {
+                statsText += "   \(solver.uniqueConvexAssetCount) shared hulls"
+            }
 
         }
     }

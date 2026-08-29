@@ -64,13 +64,14 @@ public struct SurfaceMesh {
                 let pPtr = UnsafeRawPointer(posBytes.advanced(by: i * posLayout.stride
                                                               + posAttr.offset))
                     .bindMemory(to: Float.self, capacity: 3)
-                vertices.append(orient(F3(pPtr[0], pPtr[1], pPtr[2]), upAxis: upAxis))
+                vertices.append(orientMeshPoint(
+                    F3(pPtr[0], pPtr[1], pPtr[2]), upAxis: upAxis))
                 if let normAttr, let normLayout, let normBytes {
                     let nPtr = UnsafeRawPointer(normBytes.advanced(by: i * normLayout.stride
                                                                    + normAttr.offset))
                         .bindMemory(to: Float.self, capacity: 3)
-                    normals.append(safeNormalize(orient(F3(nPtr[0], nPtr[1], nPtr[2]),
-                                                       upAxis: upAxis)))
+                    normals.append(safeNormalize(orientMeshPoint(
+                        F3(nPtr[0], nPtr[1], nPtr[2]), upAxis: upAxis)))
                 } else {
                     normals.append(.zero)
                 }
@@ -368,11 +369,11 @@ public struct SurfaceMesh {
     }
 }
 
-private func orient(_ p: F3, upAxis: MeshUpAxis) -> F3 {
+func orientMeshPoint(_ p: F3, upAxis: MeshUpAxis) -> F3 {
     switch upAxis {
     case .z: return p
     case .y: return F3(p.x, -p.z, p.y)
-    case .x: return F3(-p.y, p.z, p.x)
+    case .x: return F3(p.y, p.z, p.x)
     }
 }
 

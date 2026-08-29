@@ -53,6 +53,30 @@ inline float3 bpColliderCenter(device const float4* posLin,
         + q_rotate(posAng[body], colliderLocalPosition[collider].xyz);
 }
 
+inline bool bpIsSupportMappedHull(uint shapeType) {
+    return (shapeType & SHAPE_KIND_MASK) == 4u;
+}
+
+// Preserve the established raw sphere-bound predicate for every analytic
+// pair. Generic support maps additionally need the same bounded skin and
+// speculative reach used by their exact MPR/GJK narrow phase; applying that
+// reach per pair avoids inflating analytic-only candidate streams.
+inline float bpPairRadius(float signedRadiusA, float signedRadiusB,
+                          uint shapeTypeA, uint shapeTypeB,
+                          constant SimParams& P) {
+    float radiusA = fabs(signedRadiusA);
+    float radiusB = fabs(signedRadiusB);
+    float radius = radiusA + radiusB;
+    if (bpIsSupportMappedHull(shapeTypeA)
+        || bpIsSupportMappedHull(shapeTypeB)) {
+        float speculativeCap = min(0.25f,
+            max(4.0f * P.collisionMargin,
+                3.0f * min(radiusA, radiusB)));
+        radius += P.collisionMargin + speculativeCap;
+    }
+    return radius;
+}
+
 kernel void bp_clear_cells(
     device atomic_uint* cellCount   [[buffer(0)]],
     constant uint& hashSize         [[buffer(1)]],
@@ -301,6 +325,7 @@ inline uint bpProcessProducer(
     device const float4* posAng,
     device const uint* colliderGroup,
     device const uint* colliderSharedCollision,
+    device const uint* colliderShapeType,
     constant SimParams& P,
     uint producer,
     bool emit,
@@ -314,7 +339,6 @@ inline uint bpProcessProducer(
         uint collisionGroupA = colliderGroup[a];
         float3 pa = bpColliderCenter(posLin, posAng, colliderOwner,
                                      colliderLocalPosition, a);
-        float ra = fabs(shape[a].w);
         bool aDyn = posLin[ownerA].w > 0.0f;
         uint ga = clothGroup[ownerA];
         bool scanCells = !(ga != 0 && P.numHashedRigid == 0);
@@ -346,11 +370,12 @@ inline uint bpProcessProducer(
                     if (ownerA == ownerB) continue;
                     if (!aDyn && posLin[ownerB].w <= 0.0f) continue;
                     if (ga != 0 && clothGroup[ownerB] != 0) continue;
-                    float rb = fabs(shape[b].w);
                     float3 pb = bpColliderCenter(posLin, posAng, colliderOwner,
                                                  colliderLocalPosition, b);
                     float3 dp = pa - pb;
-                    float r = ra + rb;
+                    float r = bpPairRadius(
+                        shape[a].w, shape[b].w,
+                        colliderShapeType[a], colliderShapeType[b], P);
                     if (dot(dp, dp) > r * r) continue;
                     uint ownerLo = min(ownerA, ownerB);
                     uint ownerHi = max(ownerA, ownerB);
@@ -372,11 +397,12 @@ inline uint bpProcessProducer(
             if (ownerA == ownerB) continue;
             if (!aDyn && posLin[ownerB].w <= 0.0f) continue;
             if (ga != 0 && clothGroup[ownerB] == ga) continue;
-            float rb = fabs(shape[b].w);
             float3 pb = bpColliderCenter(posLin, posAng, colliderOwner,
                                          colliderLocalPosition, b);
             float3 dp = pa - pb;
-            float r = ra + rb;
+            float r = bpPairRadius(
+                shape[a].w, shape[b].w,
+                colliderShapeType[a], colliderShapeType[b], P);
             if (dot(dp, dp) > r * r) continue;
             uint ownerLo = min(ownerA, ownerB), ownerHi = max(ownerA, ownerB);
             if (pairExcluded(exclusions, numExclusions, ownerLo, ownerHi)) continue;
@@ -393,7 +419,6 @@ inline uint bpProcessProducer(
         uint collisionGroupA = colliderGroup[a];
         float3 pa = bpColliderCenter(posLin, posAng, colliderOwner,
                                      colliderLocalPosition, a);
-        float ra = fabs(shape[a].w);
         bool aDyn = posLin[ownerA].w > 0.0f;
         uint ga = clothGroup[ownerA];
         for (uint g = globalProducer + 1; g < P.numGlobals; g++) {
@@ -406,11 +431,12 @@ inline uint bpProcessProducer(
             if (ownerA == ownerB) continue;
             if (!aDyn && posLin[ownerB].w <= 0.0f) continue;
             if (ga != 0 && clothGroup[ownerB] == ga) continue;
-            float rb = fabs(shape[b].w);
             float3 pb = bpColliderCenter(posLin, posAng, colliderOwner,
                                          colliderLocalPosition, b);
             float3 dp = pa - pb;
-            float r = ra + rb;
+            float r = bpPairRadius(
+                shape[a].w, shape[b].w,
+                colliderShapeType[a], colliderShapeType[b], P);
             if (dot(dp, dp) > r * r) continue;
             uint ownerLo = min(ownerA, ownerB), ownerHi = max(ownerA, ownerB);
             if (pairExcluded(exclusions, numExclusions, ownerLo, ownerHi)) continue;
@@ -443,6 +469,7 @@ kernel void bp_count_pairs_deterministic(
     device const float4* posAng     [[buffer(16)]],
     device const uint* colliderGroup [[buffer(17)]],
     device const uint* colliderSharedCollision [[buffer(18)]],
+    device const uint* colliderShapeType [[buffer(19)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numHashed + P.numGlobals) return;
@@ -450,7 +477,7 @@ kernel void bp_count_pairs_deterministic(
         posLin, shape, hashedIdx, cellStart, cellCount, cellBodies,
         globalIdx, exclusions, numExclusions, clothGroup, cellRigid,
         colliderOwner, colliderLocalPosition, posAng, colliderGroup,
-        colliderSharedCollision,
+        colliderSharedCollision, colliderShapeType,
         P, gid, false, 0, pairs);
 }
 
@@ -474,6 +501,7 @@ kernel void bp_emit_pairs_deterministic(
     device const float4* posAng     [[buffer(16)]],
     device const uint* colliderGroup [[buffer(17)]],
     device const uint* colliderSharedCollision [[buffer(18)]],
+    device const uint* colliderShapeType [[buffer(19)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numHashed + P.numGlobals) return;
@@ -481,7 +509,7 @@ kernel void bp_emit_pairs_deterministic(
         posLin, shape, hashedIdx, cellStart, cellCount, cellBodies,
         globalIdx, exclusions, numExclusions, clothGroup, cellRigid,
         colliderOwner, colliderLocalPosition, posAng, colliderGroup,
-        colliderSharedCollision, P, gid, true,
+        colliderSharedCollision, colliderShapeType, P, gid, true,
         pairStarts[gid], pairs);
 }
 

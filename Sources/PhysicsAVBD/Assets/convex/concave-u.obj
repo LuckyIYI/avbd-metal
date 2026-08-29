@@ -1,0 +1,65 @@
+# Authored connected, watertight concave U prism (meters, Z-up).
+# The front/back caps are explicitly triangulated; cooking must decompose this
+# single geometric component rather than relying on OBJ groups or seams.
+o concave_u
+# Front boundary (y = -0.5), counter-clockwise in X/Z.
+v -1.5 -0.5 -1.5
+v 1.5 -0.5 -1.5
+v 1.5 -0.5 -0.5
+v 1.5 -0.5 1.5
+v 0.5 -0.5 1.5
+v 0.5 -0.5 -0.5
+v -0.5 -0.5 -0.5
+v -0.5 -0.5 1.5
+v -1.5 -0.5 1.5
+v -1.5 -0.5 -0.5
+# Back boundary (y = 0.5).
+v -1.5 0.5 -1.5
+v 1.5 0.5 -1.5
+v 1.5 0.5 -0.5
+v 1.5 0.5 1.5
+v 0.5 0.5 1.5
+v 0.5 0.5 -0.5
+v -0.5 0.5 -0.5
+v -0.5 0.5 1.5
+v -1.5 0.5 1.5
+v -1.5 0.5 -0.5
+# Front cap (-Y).
+f 1 2 3
+f 1 3 6
+f 1 6 7
+f 1 7 10
+f 3 4 5
+f 3 5 6
+f 10 7 8
+f 10 8 9
+# Back cap (+Y), reversed winding.
+f 11 13 12
+f 11 16 13
+f 11 17 16
+f 11 20 17
+f 13 15 14
+f 13 16 15
+f 20 18 17
+f 20 19 18
+# Ten boundary quads, wound outward.
+f 1 11 12
+f 1 12 2
+f 2 12 13
+f 2 13 3
+f 3 13 14
+f 3 14 4
+f 4 14 15
+f 4 15 5
+f 5 15 16
+f 5 16 6
+f 6 16 17
+f 6 17 7
+f 7 17 18
+f 7 18 8
+f 8 18 19
+f 8 19 9
+f 9 19 20
+f 9 20 10
+f 10 20 11
+f 10 11 1

@@ -48,6 +48,10 @@ public final class GPUSolver {
     let numBodies: Int
     let numColliders: Int
     let numConvexHullVertices: Int
+    public let uniqueConvexAssetCount: Int
+    public let convexColliderCount: Int
+    private let enabledConvexColliderCount: Int
+    private let hasPotentialRigidConvexPair: Bool
     let numJoints: Int
     let numSprings: Int
     let numTets: Int
@@ -124,6 +128,25 @@ public final class GPUSolver {
     var colliderRenderColor: MTLBuffer
     var colliderFriction: MTLBuffer
     var colliderHullRange, convexHullVertices: MTLBuffer
+    var colliderConvexAssetID: MTLBuffer
+    var convexHullHeaders, convexFaces: MTLBuffer
+    var convexFaceVertexIndices, convexEdges: MTLBuffer
+    /// Exact `(featureA, featureB)` identity is double-buffered beside, not
+    /// inside, `ManifoldGPU`, preserving the established 704-byte hot ABI.
+    var contactFeatures, prevContactFeatures: MTLBuffer
+    /// Convex geometry stays compact (one source mesh per unique asset plus
+    /// one small instance record per collider) during simulation/training.
+    /// Collision-debug `RigidMeshVertexGPU` streams are materialized lazily
+    /// only if a renderer explicitly requests the diagnostic surface. Opaque
+    /// `isRendered` hulls join the ordinary rigid-mesh stream below; the
+    /// collision-only default therefore keeps the headless path compact.
+    private let convexDebugGeometries: [ConvexDebugGeometry]
+    private let convexDebugInstances: [ConvexGeometryInstance]
+    private let convexDebugBufferLock = NSLock()
+    private var convexDebugTriangleVertexBuffer: MTLBuffer?
+    private var convexDebugEdgeVertexBuffer: MTLBuffer?
+    public let convexDebugTriangleVertexCount: Int
+    public let convexDebugEdgeVertexCount: Int
 
     // Constraints
     var joints: MTLBuffer
@@ -171,6 +194,12 @@ public final class GPUSolver {
     var renderBodyIdxBuf: MTLBuffer
     public private(set) var renderRigidBodyCount: Int = 0
     var clothGroupBuf: MTLBuffer
+    /// Authored Scene collision domain for each deformable-surface body.
+    /// This is intentionally separate from clothGroupBuf, which identifies
+    /// connected topology for soft self-collision and has different semantics.
+    var surfaceCollisionGroupBuf, surfaceSharedCollisionBuf: MTLBuffer
+    private let surfaceCollisionGroups: [UInt32]
+    private let surfaceSharedCollision: [UInt32]
     // Visual-only tetrahedral skinning buffers. These draw arbitrary mesh
     // surfaces embedded in tets; collisions still use `trisBuf`.
     let skinnedVertexCount: Int
@@ -223,6 +252,10 @@ public final class GPUSolver {
 
     // Control
     var counters: MTLBuffer
+    /// Solver-lifetime GPU poison. Unlike per-frame counters this is never
+    /// cleared, so already-queued successors also roll back after a support
+    /// query failure in an earlier command buffer.
+    var convexQueryPoison: MTLBuffer
     /// Frame-owned readback slots. The solver permits at most two in-flight
     /// submissions, so parity selects a slot only after its previous owner
     /// has been retired by throttling.
@@ -260,6 +293,8 @@ public final class GPUSolver {
         "color_scan",
         "color_scatter",
         "color_validate",
+        "convex_query_fail_for_testing",
+        "convex_restore_failed_frame",
         "dat_apply",
         "dat_apply_color",
         "dat_apply_tet_inversion",
@@ -284,6 +319,8 @@ public final class GPUSolver {
         "el_scatter",
         "finalize_velocities",
         "np_collide",
+        "np_collide_analytic_compat",
+        "np_collide_convex",
         "ogc_bounds_refresh",
         "ogc_refresh_args",
         "pm_clear",
@@ -291,6 +328,7 @@ public final class GPUSolver {
         "primal_particles_split",
         "primal_solve",
         "pusht_obs",
+        "rt_pack_spatial_index",
         "rt_emit",
         "scan_add_offsets",
         "scan_block_sums",
@@ -315,6 +353,8 @@ public final class GPUSolver {
     public private(set) var lastPairCandidates: Int = 0
     public private(set) var lastNumSoft: Int = 0
     public private(set) var lastSoftCandidates: Int = 0
+    public private(set) var lastRigidTriangleCandidates: Int = 0
+    public private(set) var lastConvexEdgePairTests: Int = 0
     public private(set) var lastPlanarDATPairs: Int = 0
     public private(set) var lastPlanarDATVertexTrianglePairs: Int = 0
     public private(set) var lastPlanarDATEdgeEdgePairs: Int = 0
@@ -328,6 +368,569 @@ public final class GPUSolver {
     public private(set) var frameIndex: Int = 0
     /// Legacy position-servo targets advanced each step as `(joint, rad/s)`.
     private var rateMotors: [(Int, Float)] = []
+
+    public enum ConvexCollisionError: Error, Equatable,
+        CustomStringConvertible {
+        case invalidAssetReference(collider: Int, asset: Int)
+        case conflictingAssetSources(collider: Int)
+        case invalidAssetGeometry(asset: String, reason: String)
+        case unsupportedTorusHull(colliderA: Int, colliderB: Int)
+
+        public var description: String {
+            switch self {
+            case .invalidAssetReference(let collider, let asset):
+                return "convex collider \(collider) references missing asset \(asset)"
+            case .conflictingAssetSources(let collider):
+                return "convex collider \(collider) defines both an asset reference and inline vertices"
+            case .invalidAssetGeometry(let asset, let reason):
+                return "convex asset \(asset) is invalid: \(reason)"
+            case .unsupportedTorusHull(let a, let b):
+                return "convex hull collider \(a) cannot collide with non-convex torus collider \(b)"
+            }
+        }
+    }
+
+    public enum SurfaceCollisionDomainError: Error, Equatable,
+        CustomStringConvertible {
+        case ambiguousBody(body: Int, colliders: [Int])
+        case inconsistentTriangle(triangle: Int, vertices: [Int])
+
+        public var description: String {
+            switch self {
+            case .ambiguousBody(let body, let colliders):
+                return "deformable surface body \(body) has conflicting "
+                    + "collision domains across colliders \(colliders)"
+            case .inconsistentTriangle(let triangle, let vertices):
+                return "deformable collision triangle \(triangle) has "
+                    + "inconsistent collision domains across vertices "
+                    + "\(vertices)"
+            }
+        }
+    }
+
+    private struct ConvexUploadRecord {
+        var sourceAssetID: Int?
+        var legacyVertices: [F3]?
+        var gpuID: UInt32
+        var range: SIMD2<UInt32>
+        var centeredVertices: [F3]
+        var triangles: [SIMD3<UInt32>]
+        var edges: [SIMD2<UInt32>]
+        var sourceCenter: F3
+        var radius: Float
+    }
+
+    private struct ConvexDebugGeometry {
+        var vertices: [F3]
+        var triangles: [SIMD3<UInt32>]
+        var edges: [SIMD2<UInt32>]
+    }
+
+    private struct ConvexGeometryInstance {
+        var geometry: UInt32
+        var body: UInt32
+        var localPosition: F3
+        var localRotation: Quat
+        var color: F3
+    }
+
+    private struct ConvexGPUUpload {
+        var colliderAssetIDs: [UInt32]
+        var colliderRanges: [SIMD2<UInt32>]
+        var colliderLocalPositions: [F3]
+        var colliderRadii: [Float]
+        var vertices: [SIMD4<Float>] = []
+        var hulls: [ConvexHullGPU] = []
+        var faces: [ConvexFaceGPU] = []
+        var faceVertexIndices: [UInt32] = []
+        var edges: [ConvexEdgeGPU] = []
+        var records: [ConvexUploadRecord] = []
+        var debugGeometries: [ConvexDebugGeometry] = []
+        var debugInstances: [ConvexGeometryInstance] = []
+        var visualInstances: [ConvexGeometryInstance] = []
+        var debugTriangleVertexCount = 0
+        var debugEdgeVertexCount = 0
+        var visualTriangleVertexCount = 0
+    }
+
+    /// Expand one compact convex instance into the body-local corner format
+    /// shared by authored rigid meshes, opaque convex visuals, and the lazy
+    /// collision-debug overlay. The support vertices have already been
+    /// centered, so `instance.localPosition` carries the compensating source
+    /// translation and must be applied exactly once here.
+    private static func appendConvexTriangleVertices(
+        geometry: ConvexDebugGeometry,
+        instance: ConvexGeometryInstance,
+        to output: inout [RigidMeshVertexGPU]
+    ) -> Bool {
+        let bodyBits = Float(bitPattern: instance.body)
+        func makeVertex(_ local: F3, normal: F3) -> RigidMeshVertexGPU {
+            var result = RigidMeshVertexGPU()
+            let bodyLocal = instance.localPosition
+                + instance.localRotation.act(local)
+            result.positionBody = SIMD4(bodyLocal, bodyBits)
+            result.normal = SIMD4(instance.localRotation.act(normal), 0)
+            result.color = SIMD4(instance.color, 1)
+            return result
+        }
+
+        for triangle in geometry.triangles {
+            guard Int(triangle.x) < geometry.vertices.count,
+                  Int(triangle.y) < geometry.vertices.count,
+                  Int(triangle.z) < geometry.vertices.count else {
+                return false
+            }
+            let a = geometry.vertices[Int(triangle.x)]
+            let b = geometry.vertices[Int(triangle.y)]
+            let c = geometry.vertices[Int(triangle.z)]
+            let crossValue = simd_cross(b - a, c - a)
+            let length = simd_length(crossValue)
+            guard length.isFinite && length > 1e-12 else { return false }
+            let normal = crossValue / length
+            output.append(makeVertex(a, normal: normal))
+            output.append(makeVertex(b, normal: normal))
+            output.append(makeVertex(c, normal: normal))
+        }
+        return true
+    }
+
+    private struct ConvexEdgeKey: Hashable {
+        var a: UInt32
+        var b: UInt32
+
+        init(_ u: UInt32, _ v: UInt32) {
+            a = min(u, v)
+            b = max(u, v)
+        }
+    }
+
+    private struct ConvexPlaneGroup {
+        var normal: F3
+        var distance: Float
+        var triangles: [SIMD3<UInt32>]
+    }
+
+    private struct ConvexPolygonFace {
+        var normal: F3
+        var distance: Float
+        var vertices: [UInt32]
+    }
+
+    private struct ConvexPolygonEdge {
+        var endpoints: SIMD2<UInt32>
+        var faces: SIMD2<UInt32>
+    }
+
+    /// Merge the canonical triangle soup into maximal coplanar polygons. The
+    /// cooker intentionally stores triangles as its interchange topology,
+    /// while the contact generator needs polygon boundaries so a broad square
+    /// face yields four well-spread contacts instead of one triangle's three.
+    /// Grouping and loop tracing are deterministic because the source arrays,
+    /// edge keys, and adjacency choices are all canonically ordered.
+    private static func makeConvexPolygonTopology(
+        vertices: [F3], triangles: [SIMD3<UInt32>], stableID: String
+    ) throws -> (faces: [ConvexPolygonFace], edges: [ConvexPolygonEdge]) {
+        guard !triangles.isEmpty else { return ([], []) }
+
+        let lo = vertices.reduce(F3(repeating: .infinity), simd.min)
+        let hi = vertices.reduce(F3(repeating: -.infinity), simd.max)
+        let scale = max(simd_length(hi - lo), 1e-4)
+        let planeTolerance = max(scale * 2e-6, 1e-7)
+        let normalTolerance: Float = 5e-5
+        var groups: [ConvexPlaneGroup] = []
+        groups.reserveCapacity(triangles.count)
+
+        for (triangleIndex, triangle) in triangles.enumerated() {
+            let ids = [triangle.x, triangle.y, triangle.z]
+            guard ids.allSatisfy({ Int($0) < vertices.count }) else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID,
+                    reason: "triangle \(triangleIndex) references a missing vertex")
+            }
+            let a = vertices[Int(triangle.x)]
+            let b = vertices[Int(triangle.y)]
+            let c = vertices[Int(triangle.z)]
+            let crossValue = simd_cross(b - a, c - a)
+            let crossLength = simd_length(crossValue)
+            guard crossLength.isFinite && crossLength > 1e-12 else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID,
+                    reason: "triangle \(triangleIndex) is degenerate")
+            }
+            let normal = crossValue / crossLength
+            let distance = simd_dot(normal, a)
+            if let groupIndex = groups.firstIndex(where: {
+                simd_dot($0.normal, normal) > 0
+                    && simd_length(simd_cross($0.normal, normal))
+                        <= normalTolerance
+                    && abs($0.distance - distance) <= planeTolerance
+            }) {
+                groups[groupIndex].triangles.append(triangle)
+            } else {
+                groups.append(ConvexPlaneGroup(
+                    normal: normal, distance: distance,
+                    triangles: [triangle]))
+            }
+        }
+
+        var faces: [ConvexPolygonFace] = []
+        faces.reserveCapacity(groups.count)
+        for (groupIndex, group) in groups.enumerated() {
+            var counts: [ConvexEdgeKey: Int] = [:]
+            for triangle in group.triangles {
+                for (u, v) in [(triangle.x, triangle.y),
+                               (triangle.y, triangle.z),
+                               (triangle.z, triangle.x)] {
+                    counts[ConvexEdgeKey(u, v), default: 0] += 1
+                }
+            }
+            var boundary: [ConvexEdgeKey] = []
+            boundary.reserveCapacity(counts.count)
+            for (key, count) in counts where count == 1 {
+                boundary.append(key)
+            }
+            boundary.sort {
+                $0.a == $1.a ? $0.b < $1.b : $0.a < $1.a
+            }
+            guard boundary.count >= 3 else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID,
+                    reason: "coplanar face \(groupIndex) has no closed boundary")
+            }
+
+            var adjacency: [UInt32: [UInt32]] = [:]
+            for edge in boundary {
+                adjacency[edge.a, default: []].append(edge.b)
+                adjacency[edge.b, default: []].append(edge.a)
+            }
+            for key in adjacency.keys {
+                adjacency[key]!.sort()
+            }
+            guard adjacency.values.allSatisfy({ $0.count == 2 }),
+                  let start = adjacency.keys.min(),
+                  let first = adjacency[start]?.first else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID,
+                    reason: "coplanar face \(groupIndex) is not one convex loop")
+            }
+
+            var loop = [start]
+            loop.reserveCapacity(boundary.count)
+            var previous = start
+            var current = first
+            while current != start && loop.count <= boundary.count {
+                loop.append(current)
+                guard let neighbours = adjacency[current],
+                      let next = neighbours.first(where: { $0 != previous }) else {
+                    break
+                }
+                previous = current
+                current = next
+            }
+            guard current == start, loop.count == boundary.count,
+                  Set(loop).count == boundary.count else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID,
+                    reason: "coplanar face \(groupIndex) boundary is disconnected")
+            }
+
+            var areaNormal = F3.zero
+            for index in loop.indices {
+                let next = loop[(index + 1) % loop.count]
+                areaNormal += simd_cross(vertices[Int(loop[index])],
+                                         vertices[Int(next)])
+            }
+            if simd_dot(areaNormal, group.normal) < 0 {
+                loop = [loop[0]] + loop.dropFirst().reversed()
+            }
+            guard loop.count <= ConvexHullGPU.maximumSourceFaceVertices else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID,
+                    reason: "coplanar face \(groupIndex) has \(loop.count) vertices; runtime assets support at most \(ConvexHullGPU.maximumSourceFaceVertices)")
+            }
+            faces.append(ConvexPolygonFace(
+                normal: group.normal, distance: group.distance,
+                vertices: loop))
+        }
+
+        var incident: [ConvexEdgeKey: [UInt32]] = [:]
+        for (faceIndex, face) in faces.enumerated() {
+            for index in face.vertices.indices {
+                let next = face.vertices[(index + 1) % face.vertices.count]
+                incident[ConvexEdgeKey(face.vertices[index], next), default: []]
+                    .append(UInt32(faceIndex))
+            }
+        }
+        let edgeKeys = incident.keys.sorted {
+            $0.a == $1.a ? $0.b < $1.b : $0.a < $1.a
+        }
+        var edges: [ConvexPolygonEdge] = []
+        edges.reserveCapacity(edgeKeys.count)
+        for edge in edgeKeys {
+            guard let adjacent = incident[edge]?.sorted(), adjacent.count == 2 else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID,
+                    reason: "polygon edge \(edge.a)-\(edge.b) is not manifold")
+            }
+            edges.append(ConvexPolygonEdge(
+                endpoints: SIMD2(edge.a, edge.b),
+                faces: SIMD2(adjacent[0], adjacent[1])))
+        }
+        return (faces, edges)
+    }
+
+    private static func sameLegacyVertices(_ a: [F3], _ b: [F3]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (x, y) in zip(a, b) {
+            guard x.x.bitPattern == y.x.bitPattern,
+                  x.y.bitPattern == y.y.bitPattern,
+                  x.z.bitPattern == y.z.bitPattern else { return false }
+        }
+        return true
+    }
+
+    private static func makeConvexGPUUpload(
+        scene: PhysicsScene
+    ) throws -> ConvexGPUUpload {
+        var upload = ConvexGPUUpload(
+            colliderAssetIDs: [UInt32](repeating: .max,
+                                       count: scene.colliders.count),
+            colliderRanges: [SIMD2<UInt32>](repeating: .zero,
+                                            count: scene.colliders.count),
+            colliderLocalPositions: scene.colliders.map(\.localPosition),
+            colliderRadii: [Float](repeating: 0,
+                                   count: scene.colliders.count))
+
+        func checkedBounds(_ vertices: [F3], asset: String) throws
+            -> (F3, F3) {
+            guard vertices.count >= 4 else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: asset, reason: "requires at least four vertices")
+            }
+            var lo = F3(repeating: Float.greatestFiniteMagnitude)
+            var hi = F3(repeating: -Float.greatestFiniteMagnitude)
+            for vertex in vertices {
+                guard vertex.x.isFinite && vertex.y.isFinite
+                        && vertex.z.isFinite else {
+                    throw ConvexCollisionError.invalidAssetGeometry(
+                        asset: asset, reason: "contains a non-finite vertex")
+                }
+                lo = simd.min(lo, vertex)
+                hi = simd.max(hi, vertex)
+            }
+            return (lo, hi)
+        }
+
+        func appendRecord(
+            sourceAssetID: Int?, legacyVertices: [F3]?, vertices: [F3],
+            triangles: [SIMD3<UInt32>], boundsMin: F3, boundsMax: F3,
+            volume: Float, stableID: String
+        ) throws -> ConvexUploadRecord {
+            // MPR's portal origin must be strictly inside each convex shape.
+            // A hull AABB midpoint is not generally inside an asymmetric
+            // hull (the canonical simplex tetrahedron is a counterexample).
+            // The mean of every validated vertex is a strict positive convex
+            // combination, so it is inside every full-dimensional hull. Do
+            // not trust a serialized mass centroid for this geometric role:
+            // its validation tolerance need not prove strict containment.
+            let center = stableConvexSupportCenter(vertices)
+            guard center.x.isFinite, center.y.isFinite, center.z.isFinite else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID, reason: "has a non-finite support center")
+            }
+            let centered = vertices.map { $0 - center }
+            let radius = centered.reduce(Float.zero) {
+                max($0, simd_length($1))
+            }
+            guard radius.isFinite && radius > 0 else {
+                throw ConvexCollisionError.invalidAssetGeometry(
+                    asset: stableID, reason: "has zero or non-finite radius")
+            }
+            let vertexStart = UInt32(upload.vertices.count)
+            upload.vertices.append(contentsOf: centered.map { SIMD4($0, 0) })
+            let faceStart = UInt32(upload.faces.count)
+            let loopStart = UInt32(upload.faceVertexIndices.count)
+            let edgeStart = UInt32(upload.edges.count)
+            let topology = try makeConvexPolygonTopology(
+                vertices: centered, triangles: triangles, stableID: stableID)
+
+            for (faceIndex, polygon) in topology.faces.enumerated() {
+                var face = ConvexFaceGPU()
+                face.plane = SIMD4(polygon.normal, polygon.distance)
+                face.loop = SIMD4(
+                    UInt32(upload.faceVertexIndices.count),
+                    UInt32(polygon.vertices.count),
+                    UInt32(faceIndex), 0)
+                upload.faces.append(face)
+                upload.faceVertexIndices.append(contentsOf: polygon.vertices)
+            }
+            for polygonEdge in topology.edges {
+                var edge = ConvexEdgeGPU()
+                edge.endpointsFaces = SIMD4(
+                    polygonEdge.endpoints.x, polygonEdge.endpoints.y,
+                    polygonEdge.faces.x, polygonEdge.faces.y)
+                upload.edges.append(edge)
+            }
+
+            var header = ConvexHullGPU()
+            header.verticesFaces = SIMD4(
+                vertexStart, UInt32(centered.count), faceStart,
+                UInt32(upload.faces.count) - faceStart)
+            header.edgesLoops = SIMD4(
+                edgeStart, UInt32(upload.edges.count) - edgeStart, loopStart,
+                UInt32(upload.faceVertexIndices.count) - loopStart)
+            header.boundsMinRadius = SIMD4(boundsMin - center, radius)
+            header.boundsMaxVolume = SIMD4(boundsMax - center, volume)
+            let gpuID = UInt32(upload.hulls.count)
+            upload.hulls.append(header)
+            let record = ConvexUploadRecord(
+                sourceAssetID: sourceAssetID,
+                legacyVertices: legacyVertices,
+                gpuID: gpuID,
+                range: SIMD2(vertexStart, UInt32(centered.count)),
+                centeredVertices: centered,
+                triangles: triangles,
+                edges: topology.edges.map(\.endpoints),
+                sourceCenter: center,
+                radius: radius)
+            upload.records.append(record)
+            upload.debugGeometries.append(ConvexDebugGeometry(
+                vertices: centered, triangles: triangles,
+                edges: topology.edges.map(\.endpoints)))
+            return record
+        }
+
+        for (colliderIndex, collider) in scene.colliders.enumerated() {
+            if collider.convexAssetID != nil
+                && !collider.convexHullVertices.isEmpty {
+                throw ConvexCollisionError.conflictingAssetSources(
+                    collider: colliderIndex)
+            }
+            let record: ConvexUploadRecord
+            if let sourceAssetID = collider.convexAssetID {
+                guard scene.convexAssets.indices.contains(sourceAssetID) else {
+                    throw ConvexCollisionError.invalidAssetReference(
+                        collider: colliderIndex, asset: sourceAssetID)
+                }
+                let asset = scene.convexAssets[sourceAssetID]
+                if let existing = upload.records.first(where: {
+                    guard let otherID = $0.sourceAssetID else { return false }
+                    return scene.convexAssets[otherID].stableID == asset.stableID
+                        && scene.convexAssets[otherID] == asset
+                }) {
+                    record = existing
+                } else {
+                    let checked = try checkedBounds(
+                        asset.vertices, asset: asset.stableID)
+                    record = try appendRecord(
+                        sourceAssetID: sourceAssetID, legacyVertices: nil,
+                        vertices: asset.vertices, triangles: asset.triangles,
+                        boundsMin: checked.0, boundsMax: checked.1,
+                        volume: asset.volume, stableID: asset.stableID)
+                }
+            } else if !collider.convexHullVertices.isEmpty {
+                let vertices = collider.convexHullVertices
+                if let existing = upload.records.first(where: {
+                    guard let legacy = $0.legacyVertices else { return false }
+                    return sameLegacyVertices(legacy, vertices)
+                }) {
+                    record = existing
+                } else {
+                    let checked = try checkedBounds(
+                        vertices, asset: "legacy collider \(colliderIndex)")
+                    let triangles: [SIMD3<UInt32>]
+                    do {
+                        triangles = try ConvexHullTopologyBuilder.triangulate(
+                            vertices: vertices)
+                    } catch let failure as ConvexHullTopologyBuilder.Failure {
+                        throw ConvexCollisionError.invalidAssetGeometry(
+                            asset: "legacy collider \(colliderIndex)",
+                            reason: failure.reason)
+                    }
+                    record = try appendRecord(
+                        sourceAssetID: nil, legacyVertices: vertices,
+                        vertices: vertices, triangles: triangles,
+                        boundsMin: checked.0, boundsMax: checked.1,
+                        volume: 0, stableID: "legacy collider \(colliderIndex)")
+                    let delta = record.sourceCenter
+                    if simd_length_squared(delta) > 0 {
+                        // `appendRecord` centers every support range. Apply
+                        // the inverse translation here so legacy world poses
+                        // remain byte-for-byte compatible.
+                        upload.colliderLocalPositions[colliderIndex] +=
+                            collider.localRotation.act(delta)
+                    }
+                }
+            } else {
+                continue
+            }
+
+            upload.colliderAssetIDs[colliderIndex] = record.gpuID
+            upload.colliderRanges[colliderIndex] = record.range
+            upload.colliderRadii[colliderIndex] = record.radius
+            if collider.convexAssetID != nil {
+                upload.colliderLocalPositions[colliderIndex] +=
+                    collider.localRotation.act(record.sourceCenter)
+            } else if record.legacyVertices != nil
+                        && simd_length_squared(record.sourceCenter) > 0 {
+                // Also apply the shift for a deduplicated legacy record.
+                upload.colliderLocalPositions[colliderIndex] =
+                    collider.localPosition
+                    + collider.localRotation.act(record.sourceCenter)
+            }
+
+            if collider.isRendered && !record.triangles.isEmpty {
+                // Match compound parts by owning body instead of by unique
+                // hull id, so a decomposed visual reads as one object. An
+                // authored collider color remains authoritative.
+                let hue = Float(UInt32(collider.body) % 7) / 7
+                let fallback = F3(0.25 + 0.65 * hue,
+                                  0.8 - 0.45 * hue,
+                                  0.95 - 0.35 * hue)
+                upload.visualInstances.append(ConvexGeometryInstance(
+                    geometry: record.gpuID, body: UInt32(collider.body),
+                    localPosition: upload.colliderLocalPositions[colliderIndex],
+                    localRotation: collider.localRotation,
+                    color: collider.renderColor ?? fallback))
+                upload.visualTriangleVertexCount +=
+                    3 * record.triangles.count
+            }
+
+            guard collider.collisionEnabled,
+                  !record.triangles.isEmpty else { continue }
+            let hue = Float(record.gpuID % 7) / 7
+            let color = F3(0.25 + 0.65 * hue,
+                           0.8 - 0.45 * hue,
+                           0.95 - 0.35 * hue)
+            upload.debugInstances.append(ConvexGeometryInstance(
+                geometry: record.gpuID, body: UInt32(collider.body),
+                localPosition: upload.colliderLocalPositions[colliderIndex],
+                localRotation: collider.localRotation, color: color))
+            upload.debugTriangleVertexCount += 3 * record.triangles.count
+            upload.debugEdgeVertexCount += 2 * record.edges.count
+        }
+
+        let hullColliders = scene.colliders.indices.filter {
+            scene.colliders[$0].collisionEnabled
+                && upload.colliderAssetIDs[$0] != UInt32.max
+        }
+        let torusColliders = scene.colliders.indices.filter {
+            scene.colliders[$0].collisionEnabled
+                && upload.colliderAssetIDs[$0] == UInt32.max
+                && scene.colliders[$0].shape == .torus
+        }
+        for hull in hullColliders {
+            for torus in torusColliders {
+                if scene.canPotentiallyCollide(
+                    colliderA: hull, colliderB: torus) {
+                    throw ConvexCollisionError.unsupportedTorusHull(
+                        colliderA: hull, colliderB: torus)
+                }
+            }
+        }
+        return upload
+    }
+
     public convenience init(scene: PhysicsScene, device: MTLDevice? = nil,
                             maxPairsPerBody: Int = 16) throws {
         try self.init(
@@ -357,12 +960,30 @@ public final class GPUSolver {
         guard let q = dev.makeCommandQueue() else { throw AVBDError.noDevice }
         self.queue = q
 
+        let convexUpload = try Self.makeConvexGPUUpload(scene: scene)
         self.settings = scene.settings
         self.numBodies = scene.bodies.count
         self.numColliders = scene.colliders.count
-        self.numConvexHullVertices = scene.colliders.reduce(0) {
-            $0 + $1.convexHullVertices.count
+        self.numConvexHullVertices = convexUpload.vertices.count
+        self.uniqueConvexAssetCount = convexUpload.hulls.count
+        self.convexColliderCount = convexUpload.colliderAssetIDs.reduce(0) {
+            $0 + ($1 == UInt32.max ? 0 : 1)
         }
+        let enabledConvexColliders = scene.colliders.indices.filter {
+            scene.colliders[$0].collisionEnabled
+                && convexUpload.colliderAssetIDs[$0] != UInt32.max
+        }
+        self.enabledConvexColliderCount = enabledConvexColliders.count
+        self.hasPotentialRigidConvexPair = enabledConvexColliders.contains { hull in
+            scene.colliders.indices.contains { other in
+                scene.canPotentiallyCollide(colliderA: hull, colliderB: other)
+            }
+        }
+        self.convexDebugGeometries = convexUpload.debugGeometries
+        self.convexDebugInstances = convexUpload.debugInstances
+        self.convexDebugTriangleVertexCount =
+            convexUpload.debugTriangleVertexCount
+        self.convexDebugEdgeVertexCount = convexUpload.debugEdgeVertexCount
         self.numJoints = scene.joints.count
         self.numSprings = scene.springs.count
         self.numTets = scene.tets.count
@@ -395,11 +1016,57 @@ public final class GPUSolver {
         self.skinnedTriCount = scene.skinnedMeshes.reduce(0) { $0 + $1.triangles.count }
         self.rigidMeshVertexCount = scene.rigidMeshes.reduce(0) {
             $0 + 3 * $1.triangles.count
-        }
+        } + convexUpload.visualTriangleVertexCount
         // Derive the actual surface and unique edge counts instead of relying
         // on the old triangle heuristic, which under-allocated disconnected
         // and open meshes.
         let collisionTriangles = scene.tris.map(\.ids) + tetBoundaryTris
+        // A deformable face has one collision-domain contract. Scene stores
+        // domains on colliders, so derive the surface-body value from each
+        // particle's enabled collider and reject ambiguous authoring instead
+        // of silently substituting the unrelated connected-component id.
+        var collidersByBody = [[Int]](repeating: [], count: numBodies)
+        for (collider, value) in scene.colliders.enumerated()
+            where value.collisionEnabled {
+            collidersByBody[value.body].append(collider)
+        }
+        var surfaceCollisionGroups = [UInt32](repeating: 0, count: numBodies)
+        var surfaceSharedCollision = [UInt32](repeating: 1, count: numBodies)
+        let collisionSurfaceBodies = Set(collisionTriangles.flatMap {
+            [$0.0, $0.1, $0.2]
+        })
+        for body in collisionSurfaceBodies.sorted() {
+            let attached = collidersByBody[body]
+            guard let firstCollider = attached.first else { continue }
+            let first = scene.colliders[firstCollider]
+            let conflicts = attached.filter {
+                let collider = scene.colliders[$0]
+                return collider.collisionGroup != first.collisionGroup
+                    || collider.collidesWithSharedGeometry
+                        != first.collidesWithSharedGeometry
+            }
+            if !conflicts.isEmpty {
+                throw SurfaceCollisionDomainError.ambiguousBody(
+                    body: body, colliders: attached)
+            }
+            surfaceCollisionGroups[body] = first.collisionGroup
+            surfaceSharedCollision[body] = first.collidesWithSharedGeometry
+                ? 1 : 0
+        }
+        for (triangle, ids) in collisionTriangles.enumerated() {
+            let vertices = [ids.0, ids.1, ids.2]
+            let group = surfaceCollisionGroups[ids.0]
+            let shared = surfaceSharedCollision[ids.0]
+            if vertices.dropFirst().contains(where: {
+                surfaceCollisionGroups[$0] != group
+                    || surfaceSharedCollision[$0] != shared
+            }) {
+                throw SurfaceCollisionDomainError.inconsistentTriangle(
+                    triangle: triangle, vertices: vertices)
+            }
+        }
+        self.surfaceCollisionGroups = surfaceCollisionGroups
+        self.surfaceSharedCollision = surfaceSharedCollision
         var surfaceParticles = Set<Int>()
         for (a, b, c) in collisionTriangles {
             if scene.bodies[a].isParticle { surfaceParticles.insert(a) }
@@ -483,16 +1150,50 @@ public final class GPUSolver {
         convexHullVertices = try makeBuf(
             max(1, numConvexHullVertices) * MemoryLayout<SIMD4<Float>>.stride,
             "convexHullVertices")
-
+        colliderConvexAssetID = try makeBuf(
+            numColliders * MemoryLayout<UInt32>.stride,
+            "colliderConvexAssetID")
+        convexHullHeaders = try makeBuf(
+            max(1, convexUpload.hulls.count) * MemoryLayout<ConvexHullGPU>.stride,
+            "convexHullHeaders")
+        convexFaces = try makeBuf(
+            max(1, convexUpload.faces.count) * MemoryLayout<ConvexFaceGPU>.stride,
+            "convexFaces")
+        convexFaceVertexIndices = try makeBuf(
+            max(1, convexUpload.faceVertexIndices.count)
+                * MemoryLayout<UInt32>.stride,
+            "convexFaceVertexIndices")
+        convexEdges = try makeBuf(
+            max(1, convexUpload.edges.count) * MemoryLayout<ConvexEdgeGPU>.stride,
+            "convexEdges")
         joints = try makeBuf(max(1, numJoints) * MemoryLayout<JointGPU>.stride, "joints")
         springs = try makeBuf(max(1, numSprings) * MemoryLayout<SpringGPU>.stride, "springs")
         tets = try makeBuf(max(1, numTets) * MemoryLayout<TetGPU>.stride, "tets")
         manifolds = try makeBuf(maxPairs * MemoryLayout<ManifoldGPU>.stride, "manifolds")
         prevManifolds = try makeBuf(maxPairs * MemoryLayout<ManifoldGPU>.stride, "prevManifolds")
+        // Analytic manifolds store their feature id in ContactGPU and never
+        // access these generic-convex exact keys. Keep bindable placeholders
+        // for Metal's fixed ABI instead of charging every analytic scene for
+        // two max-pair-sized arrays.
+        let exactFeatureSlots = hasPotentialRigidConvexPair
+            ? maxPairs * AVBD_MAX_CONTACTS : 1
+        contactFeatures = try makeBuf(
+            exactFeatureSlots * MemoryLayout<SIMD2<UInt32>>.stride,
+            "contactFeatures")
+        prevContactFeatures = try makeBuf(
+            exactFeatureSlots * MemoryLayout<SIMD2<UInt32>>.stride,
+            "prevContactFeatures")
 
         hashedIdx = try makeBuf(numColliders * 4, "hashedIdx")
-        globalIdx = try makeBuf(numColliders * 4, "globalIdx")
-        hashedRigidIdx = try makeBuf(numColliders * 4, "hashedRigidIdx")
+        // The prefix remains the authored global list. RT temporarily packs
+        // the already-built rigid grid behind it each frame so it can reuse
+        // broadphase spatial locality without adding Metal argument slots.
+        globalIdx = try makeBuf(
+            (numColliders + 2 * gridHashSize) * 4, "globalIdx")
+        // [rigid collider ids..., group count, sorted unique group ids...]
+        // lets group-zero deformable surfaces visit all authored domains.
+        hashedRigidIdx = try makeBuf((2 * numColliders + 1) * 4,
+                                     "hashedRigidIdx")
         clothVertFlag = try makeBuf(nb * 4, "clothVertFlag")
         softSelfCollisionFlag = try makeBuf(nb * 4, "softSelfCollisionFlag")
         boundsBuf = try makeBuf(nb * 4, "ogcBounds")
@@ -569,6 +1270,10 @@ public final class GPUSolver {
         renderTriBuf = try makeBuf(max(1, 8 * numTris + 4 * numTets) * 12, "renderTris")
         renderBodyIdxBuf = try makeBuf(max(1, numColliders) * 4, "renderColliderIdx")
         clothGroupBuf = try makeBuf(nb * 4, "clothGroup")
+        surfaceCollisionGroupBuf = try makeBuf(nb * 4,
+                                               "surfaceCollisionGroup")
+        surfaceSharedCollisionBuf = try makeBuf(nb * 4,
+                                                "surfaceSharedCollision")
         skinBindingBuf = try makeBuf(max(1, skinnedVertexCount) * MemoryLayout<SkinBindingGPU>.stride,
                                      "skinBindings")
         skinVertexBuf = try makeBuf(max(1, skinnedVertexCount) * MemoryLayout<SkinVertexGPU>.stride,
@@ -597,6 +1302,7 @@ public final class GPUSolver {
         changedFlag = try makeBuf(24 * 4, "changedFlag")  // per-pass slots
 
         counters = try makeBuf(GPUCounters.total * 4, "counters")
+        convexQueryPoison = try makeBuf(4, "convexQueryPoison")
         counterReadbacks = try (0..<2).map {
             try makeBuf(GPUCounters.total * 4, "counterReadback[\($0)]")
         }
@@ -608,7 +1314,7 @@ public final class GPUSolver {
         diag = try makeBuf(4, "diag")
 
         try buildPipelines()
-        try upload(scene: scene)
+        try upload(scene: scene, convexUpload: convexUpload)
         // This CSR is only a high-color optimization. If Metal cannot
         // reserve it, retain the placeholder and use the global reducer.
         if effectiveSurfaceTruncationMode == .planarDAT,
@@ -679,6 +1385,8 @@ public final class GPUSolver {
         static let planarDATPairCapacityCode = 1
         static let planarDATElementGridSpanCode = 2
         static let planarDATInvalidAnchorCode = 3
+        static let convexQueryFailureDomain = "PhysicsAVBD.ConvexQuery"
+        static let convexQueryInconclusiveCode = 1
 
         public static func planarDATPairCapacity(
             frame: Int, required: Int, capacity: Int
@@ -724,6 +1432,17 @@ public final class GPUSolver {
                     + "(\(breakdown))")
         }
 
+        public static func convexQueryInconclusive(
+            frame: Int, offendingQueries: Int
+        ) -> Self {
+            .commandExecution(
+                operation: "convex narrowphase safety validation", frame: frame,
+                status: 0, domain: convexQueryFailureDomain,
+                code: convexQueryInconclusiveCode,
+                message: "\(offendingQueries) support-mapped convex queries "
+                    + "failed to produce a trustworthy collision witness")
+        }
+
         public var errorDescription: String? {
             switch self {
             case .commandBufferCreation(let operation, let frame):
@@ -732,7 +1451,8 @@ public final class GPUSolver {
                 return "\(operation) frame \(frame): encoder creation failed at \(stage)"
             case .commandExecution(let operation, let frame, let status,
                                    let domain, let code, let message):
-                if domain == Self.planarDATFailureDomain {
+                if domain == Self.planarDATFailureDomain
+                    || domain == Self.convexQueryFailureDomain {
                     return "physics frame \(frame): \(message)"
                 }
                 let detail = domain.isEmpty ? message
@@ -840,9 +1560,17 @@ public final class GPUSolver {
         return nil
     }
 
+    /// Resource lookup shared by shaders and demos. The packaged bundle check
+    /// must precede SwiftPM's generated accessor because that accessor embeds
+    /// an absolute development-build fallback that is invalid after an app is
+    /// relocated.
+    static var physicsResourceBundle: Bundle {
+        packagedResourceBundle ?? Bundle.module
+    }
+
     /// Concatenates the bundled .metal sources (filename order) and compiles.
     static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
-        let resources = packagedResourceBundle ?? Bundle.module
+        let resources = physicsResourceBundle
         var urls = (resources.urls(forResourcesWithExtension: "metal", subdirectory: nil) ?? [])
         if urls.isEmpty {   // .copy resource rule keeps the Shaders/ subdir
             urls = resources.urls(forResourcesWithExtension: "metal",
@@ -898,7 +1626,9 @@ public final class GPUSolver {
 
     // MARK: - Scene upload
 
-    private func upload(scene: PhysicsScene) throws {
+    private func upload(
+        scene: PhysicsScene, convexUpload: ConvexGPUUpload
+    ) throws {
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let vl = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -988,11 +1718,26 @@ public final class GPUSolver {
             to: SIMD2<Float>.self, capacity: numColliders)
         let chr = colliderHullRange.contents().bindMemory(
             to: SIMD2<UInt32>.self, capacity: numColliders)
-        let chv = convexHullVertices.contents().bindMemory(
-            to: SIMD4<Float>.self, capacity: max(1, numConvexHullVertices))
-        func radius(of c: SceneCollider) -> Float {
-            if !c.convexHullVertices.isEmpty {
-                return c.convexHullVertices.reduce(0) { max($0, length($1)) }
+        func uploadArray<T>(_ values: [T], to buffer: MTLBuffer) {
+            guard !values.isEmpty else {
+                memset(buffer.contents(), 0, buffer.length)
+                return
+            }
+            _ = values.withUnsafeBytes { bytes in
+                memcpy(buffer.contents(), bytes.baseAddress!, bytes.count)
+            }
+        }
+        uploadArray(convexUpload.vertices, to: convexHullVertices)
+        uploadArray(convexUpload.colliderAssetIDs,
+                    to: colliderConvexAssetID)
+        uploadArray(convexUpload.hulls, to: convexHullHeaders)
+        uploadArray(convexUpload.faces, to: convexFaces)
+        uploadArray(convexUpload.faceVertexIndices,
+                    to: convexFaceVertexIndices)
+        uploadArray(convexUpload.edges, to: convexEdges)
+        func radius(of c: SceneCollider, at index: Int) -> Float {
+            if convexUpload.colliderAssetIDs[index] != UInt32.max {
+                return convexUpload.colliderRadii[index]
             }
             switch c.shape {
             case .sphere: return c.size.x / 2
@@ -1001,36 +1746,39 @@ public final class GPUSolver {
             case .box: return length(c.size * 0.5)
             }
         }
+        func broadphaseCellRadius(_ radius: Float, collider index: Int)
+            -> Float {
+            guard convexUpload.colliderAssetIDs[index] != UInt32.max else {
+                // Preserve origin/main partitioning and cell size exactly for
+                // analytic-only scenes.
+                return radius
+            }
+            let cap = min(
+                0.25, max(4 * settings.collisionMargin, 3 * radius))
+            // The exact shader predicate adds one skin/speculative reach per
+            // pair. Assigning the full reach to every hull endpoint is a
+            // conservative cell-size bound for both mixed and hull/hull
+            // pairs; it affects no analytic endpoint.
+            return radius + settings.collisionMargin + cap
+        }
         var radii: [Float] = []
         radii.reserveCapacity(numColliders)
-        var hullVertexOffset = 0
         for (i, c) in scene.colliders.enumerated() {
             precondition(scene.bodies.indices.contains(c.body),
                          "collider owner out of range")
-            let r = radius(of: c)
+            let r = radius(of: c, at: i)
             let particle = scene.bodies[c.body].isParticle
             co[i] = UInt32(c.body)
             cg[i] = c.collisionGroup
             csc[i] = c.collidesWithSharedGeometry ? 1 : 0
             cs[i] = SIMD4(c.size, particle ? -r : r)
-            cp[i] = SIMD4(c.localPosition, c.friction)
+            cp[i] = SIMD4(convexUpload.colliderLocalPositions[i], c.friction)
             cq[i] = SIMD4(c.localRotation.imag, c.localRotation.real)
             crc[i] = c.renderColor.map { SIMD4($0, 1) } ?? .zero
             cf[i] = SIMD2(c.friction, c.dynamicFriction)
-            if c.convexHullVertices.isEmpty {
-                chr[i] = .zero
-            } else {
-                precondition(c.convexHullVertices.count <= 64,
-                             "Metal convex contact supports at most 64 vertices")
-                chr[i] = SIMD2(UInt32(hullVertexOffset),
-                               UInt32(c.convexHullVertices.count))
-                for vertex in c.convexHullVertices {
-                    chv[hullVertexOffset] = SIMD4(vertex, 0)
-                    hullVertexOffset += 1
-                }
-            }
+            chr[i] = convexUpload.colliderRanges[i]
             var flags: UInt32
-            if !c.convexHullVertices.isEmpty {
+            if convexUpload.colliderAssetIDs[i] != UInt32.max {
                 flags = 4
             } else {
                 switch c.shape {
@@ -1044,10 +1792,9 @@ public final class GPUSolver {
             if c.usesWorldSpaceRoundAnchor { flags |= 0x20 }
             ct[i] = flags
             if c.collisionEnabled && scene.bodies[c.body].isDynamic {
-                radii.append(r)
+                radii.append(broadphaseCellRadius(r, collider: i))
             }
         }
-        precondition(hullVertexOffset == numConvexHullVertices)
 
         // Partition collision primitives into hashed vs global sets. Globals:
         // primitives far larger than the median dynamic radius.
@@ -1066,7 +1813,8 @@ public final class GPUSolver {
             guard c.collisionEnabled else { continue }
             // Shared-domain geometry must be visible to every isolated hash
             // domain, so keep it in the normally tiny global list.
-            if radius(of: c) > threshold
+            if broadphaseCellRadius(radius(of: c, at: i), collider: i)
+                    > threshold
                 || (hasIsolatedGroups && c.collisionGroup == 0) {
                 globals.append(UInt32(i))
             } else {
@@ -1080,7 +1828,9 @@ public final class GPUSolver {
         // contention in bp_count + thousands-long cell lists in pair gen).
         var maxHashedRadius: Float = 0.05
         for i in hashed {
-            maxHashedRadius = max(maxHashedRadius, abs(cs[Int(i)].w))
+            maxHashedRadius = max(
+                maxHashedRadius,
+                broadphaseCellRadius(abs(cs[Int(i)].w), collider: Int(i)))
         }
 
         hashedIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashed.count))
@@ -1475,10 +2225,18 @@ public final class GPUSolver {
         // broadphase in addition to V-T/E-E element contacts.
         let groupP = clothGroupBuf.contents().bindMemory(to: UInt32.self,
                                                          capacity: numBodies)
+        let surfaceGroupP = surfaceCollisionGroupBuf.contents().bindMemory(
+            to: UInt32.self, capacity: numBodies)
+        let surfaceSharedP = surfaceSharedCollisionBuf.contents().bindMemory(
+            to: UInt32.self, capacity: numBodies)
         let selfCollisionP = softSelfCollisionFlag.contents().bindMemory(
             to: UInt32.self, capacity: numBodies)
-        for i in 0..<numBodies { groupP[i] = 0 }
-        for i in 0..<numBodies { selfCollisionP[i] = 0 }
+        for i in 0..<numBodies {
+            groupP[i] = 0
+            surfaceGroupP[i] = surfaceCollisionGroups[i]
+            surfaceSharedP[i] = surfaceSharedCollision[i]
+            selfCollisionP[i] = 0
+        }
         if !collTris.isEmpty {
             var parent: [Int: Int] = [:]
             func findCollisionRoot(_ x: Int) -> Int {
@@ -1934,6 +2692,19 @@ public final class GPUSolver {
                     }
                 }
             }
+            for instance in convexUpload.visualInstances {
+                guard convexUpload.debugGeometries.indices.contains(
+                        Int(instance.geometry)) else {
+                    preconditionFailure(
+                        "opaque convex visual references missing geometry")
+                }
+                let appended = Self.appendConvexTriangleVertices(
+                    geometry: convexUpload.debugGeometries[
+                        Int(instance.geometry)],
+                    instance: instance, to: &corners)
+                precondition(appended,
+                             "validated opaque convex geometry is invalid")
+            }
             precondition(corners.count == rigidMeshVertexCount)
             rigidMeshVertexBuf.contents().bindMemory(
                 to: RigidMeshVertexGPU.self, capacity: corners.count)
@@ -1944,7 +2715,8 @@ public final class GPUSolver {
         var renderColliderIDs: [UInt32] = []
         renderColliderIDs.reserveCapacity(numColliders)
         for (i, c) in scene.colliders.enumerated()
-            where c.isRendered && flags[c.body] == 0 {
+            where c.isRendered && flags[c.body] == 0
+                && convexUpload.colliderAssetIDs[i] == UInt32.max {
             renderColliderIDs.append(UInt32(i))
         }
         renderRigidBodyCount = renderColliderIDs.count
@@ -2051,8 +2823,11 @@ public final class GPUSolver {
         // Clear manifolds + map
         memset(manifolds.contents(), 0, manifolds.length)
         memset(prevManifolds.contents(), 0, prevManifolds.length)
+        memset(contactFeatures.contents(), 0, contactFeatures.length)
+        memset(prevContactFeatures.contents(), 0, prevContactFeatures.length)
         memset(mapKeyA.contents(), 0, mapKeyA.length)
         memset(counters.contents(), 0, counters.length)
+        memset(convexQueryPoison.contents(), 0, convexQueryPoison.length)
         memset(softContacts.contents(), 0, softContacts.length)
         memset(prevSoftContacts.contents(), 0, prevSoftContacts.length)
         memset(softMapKeyA.contents(), 0, softMapKeyA.length)
@@ -2073,8 +2848,16 @@ public final class GPUSolver {
             !scene.bodies[scene.colliders[Int($0)].body].isParticle
         }
         params.numHashedRigid = UInt32(hashedRigid.count)
-        hashedRigidIdx.contents().bindMemory(to: UInt32.self, capacity: max(1, hashedRigid.count))
-            .update(from: hashedRigid.isEmpty ? [0] : hashedRigid, count: max(1, hashedRigid.count))
+        let rigidGroups = Array(Set(hashedRigid.map {
+            scene.colliders[Int($0)].collisionGroup
+        })).sorted()
+        var hashedRigidMetadata = hashedRigid
+        hashedRigidMetadata.append(UInt32(rigidGroups.count))
+        hashedRigidMetadata.append(contentsOf: rigidGroups)
+        hashedRigidIdx.contents().bindMemory(
+            to: UInt32.self, capacity: hashedRigidMetadata.count)
+            .update(from: hashedRigidMetadata,
+                    count: hashedRigidMetadata.count)
         // Anti-tunneling: cap speed so nothing crosses the thinnest static
         // geometry in one frame. Heuristic: a couple of cells per step.
         params.maxSpeed = max(30, 1.5 * params.cellSize / settings.dt * 0.5)
@@ -2236,8 +3019,19 @@ public final class GPUSolver {
     var planarDATSoftCapacityForTesting: Int?
     var planarDATBodyIncidenceForTesting = false
     var planarDATPassObserverForTesting: ((PlanarDATPassSite) -> Void)?
+    var convexQueryFailureForTesting = false
+    /// Once an injected failure has been submitted, queued successors must
+    /// continue consulting the solver-lifetime poison even in an analytic
+    /// scene. Ordinary analytic solvers leave this false for their lifetime.
+    private var convexSafetyPathActivated = false
     var completionFailureForTesting: ((String, Int) -> RuntimeFailure?)?
     var inflightCountForTesting: Int { inflight.count }
+    var convexFeatureStorageByteCountForTesting: Int {
+        contactFeatures.length + prevContactFeatures.length
+    }
+    var usesHullFreeAnalyticCompatibilityKernelForTesting: Bool {
+        !hasPotentialRigidConvexPair
+    }
 
     private var planarDATBodyPairStorageBytes: Int {
         max(16, maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
@@ -2459,13 +3253,24 @@ public final class GPUSolver {
         // point at these slots until the next narrow phase; a zero contact
         // count makes that lookup deliberately cold without rebuilding the
         // global map or disturbing other vectorized environments.
-        for buffer in [manifolds, prevManifolds] {
+        for (buffer, features) in [
+            (manifolds, contactFeatures),
+            (prevManifolds, prevContactFeatures),
+        ] {
             let mp = buffer.contents().bindMemory(
                 to: ManifoldGPU.self, capacity: maxPairs)
+            let fp: UnsafeMutablePointer<SIMD2<UInt32>>? =
+                hasPotentialRigidConvexPair
+                ? features.contents().bindMemory(
+                    to: SIMD2<UInt32>.self,
+                    capacity: maxPairs * AVBD_MAX_CONTACTS)
+                : nil
             for i in 0..<maxPairs {
                 if resetBodies.contains(mp[i].header.x)
                     || resetBodies.contains(mp[i].header.y) {
                     mp[i] = ManifoldGPU()
+                    fp?.advanced(by: i * AVBD_MAX_CONTACTS).initialize(
+                        repeating: .zero, count: AVBD_MAX_CONTACTS)
                 }
             }
         }
@@ -2854,12 +3659,20 @@ public final class GPUSolver {
             ctr[GPUCounters.planarDATNonfiniteValues])
         let planarDATTetDegeneracies = Int(
             ctr[GPUCounters.planarDATTetDegeneracies])
+        let convexQueryFailures = Int(
+            ctr[GPUCounters.convexQueryFailures])
+        let rigidTriangleCandidates = Int(
+            ctr[GPUCounters.rigidTriangleCandidates])
+        let convexEdgePairTests = Int(
+            ctr[GPUCounters.convexEdgePairTests])
 
         statsLock.lock()
         lastPairCandidates = pairCandidates
         lastNumPairs = pairs
         lastSoftCandidates = softCandidates
         lastNumSoft = soft
+        lastRigidTriangleCandidates = rigidTriangleCandidates
+        lastConvexEdgePairTests = convexEdgePairTests
         lastPlanarDATPairs = planarDATPairs
         lastPlanarDATVertexTrianglePairs = planarDATVT
         lastPlanarDATEdgeEdgePairs = planarDATEE
@@ -2910,6 +3723,11 @@ public final class GPUSolver {
                 edgeEdge: planarDATEEDegeneracies,
                 tet: planarDATTetDegeneracies,
                 nonfinite: planarDATNonfinite))
+        }
+        if convexQueryFailures > 0 {
+            throw latch(.convexQueryInconclusive(
+                frame: submission.frame,
+                offendingQueries: convexQueryFailures))
         }
         if colorConflicts > 0 {
             throw latch(.unresolvedColoring(
@@ -2966,6 +3784,8 @@ public final class GPUSolver {
         fileprivate var springs: Data
         fileprivate var manifolds: Data
         fileprivate var prevManifolds: Data
+        fileprivate var contactFeatures: Data
+        fileprivate var prevContactFeatures: Data
         fileprivate var mapKeyA: Data
         fileprivate var mapKeyB: Data
         fileprivate var mapVal: Data
@@ -2978,6 +3798,8 @@ public final class GPUSolver {
         fileprivate var lastPairCandidates: Int
         fileprivate var lastNumSoft: Int
         fileprivate var lastSoftCandidates: Int
+        fileprivate var lastRigidTriangleCandidates: Int
+        fileprivate var lastConvexEdgePairTests: Int
         fileprivate var lastMaxColorUsed: Int
     }
 
@@ -2991,7 +3813,9 @@ public final class GPUSolver {
         statsLock.lock()
         let statistics = (
             lastColorCounts, lastNumPairs, lastPairCandidates,
-            lastNumSoft, lastSoftCandidates, lastMaxColorUsed)
+            lastNumSoft, lastSoftCandidates,
+            lastRigidTriangleCandidates, lastConvexEdgePairTests,
+            lastMaxColorUsed)
         statsLock.unlock()
         return RigidSpeculationSnapshot(
             posLin: copy(posLin), posAng: copy(posAng),
@@ -3000,7 +3824,10 @@ public final class GPUSolver {
             velLin: copy(velLin), velAng: copy(velAng),
             prevVelLin: copy(prevVelLin), joints: copy(joints),
             springs: copy(springs), manifolds: copy(manifolds),
-            prevManifolds: copy(prevManifolds), mapKeyA: copy(mapKeyA),
+            prevManifolds: copy(prevManifolds),
+            contactFeatures: copy(contactFeatures),
+            prevContactFeatures: copy(prevContactFeatures),
+            mapKeyA: copy(mapKeyA),
             mapKeyB: copy(mapKeyB), mapVal: copy(mapVal),
             colorsA: copy(colorsA), colorsB: copy(colorsB),
             counters: copy(counters), frameIndex: frameIndex,
@@ -3008,7 +3835,9 @@ public final class GPUSolver {
             lastPairCandidates: statistics.2,
             lastNumSoft: statistics.3,
             lastSoftCandidates: statistics.4,
-            lastMaxColorUsed: statistics.5)
+            lastRigidTriangleCandidates: statistics.5,
+            lastConvexEdgePairTests: statistics.6,
+            lastMaxColorUsed: statistics.7)
     }
 
     package func restoreRigidSpeculationSnapshot(
@@ -3038,6 +3867,8 @@ public final class GPUSolver {
         restore(snapshot.springs, to: springs)
         restore(snapshot.manifolds, to: manifolds)
         restore(snapshot.prevManifolds, to: prevManifolds)
+        restore(snapshot.contactFeatures, to: contactFeatures)
+        restore(snapshot.prevContactFeatures, to: prevContactFeatures)
         restore(snapshot.mapKeyA, to: mapKeyA)
         restore(snapshot.mapKeyB, to: mapKeyB)
         restore(snapshot.mapVal, to: mapVal)
@@ -3051,6 +3882,8 @@ public final class GPUSolver {
         lastPairCandidates = snapshot.lastPairCandidates
         lastNumSoft = snapshot.lastNumSoft
         lastSoftCandidates = snapshot.lastSoftCandidates
+        lastRigidTriangleCandidates = snapshot.lastRigidTriangleCandidates
+        lastConvexEdgePairTests = snapshot.lastConvexEdgePairTests
         lastMaxColorUsed = snapshot.lastMaxColorUsed
         statsLock.unlock()
     }
@@ -3138,6 +3971,11 @@ public final class GPUSolver {
     private func encodeAndSubmitStep() throws {
         syncParams()
         let submittedFrame = frameIndex + 1
+        if convexQueryFailureForTesting {
+            convexSafetyPathActivated = true
+        }
+        let checksConvexQuerySafety = enabledConvexColliderCount > 0
+            || convexSafetyPathActivated
 
         // ---- Command buffer 1: collision + warm start + adjacency + coloring
         guard let cmd1 = makeRuntimeCommandBuffer() else {
@@ -3579,6 +4417,17 @@ public final class GPUSolver {
             e.setBuffer(self.cellBodies, offset: 0, index: 2)
             e.setBytes(&hashSize32, length: 4, index: 3)
         }
+        if numTris > 0 && P.numHashedRigid > 8 {
+            dispatch1D(enc, "rt_pack_spatial_index",
+                       max(gridHashSize, Int(P.numHashed))) { e in
+                e.setBuffer(self.cellStart, offset: 0, index: 0)
+                e.setBuffer(self.cellCount, offset: 0, index: 1)
+                e.setBuffer(self.cellBodies, offset: 0, index: 2)
+                e.setBuffer(self.globalIdx, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
+            }
+        }
         if profiling { try stage("bp-pairs") }
         let pairProducerCount = Int(P.numHashed + P.numGlobals)
         if pairProducerCount > 0 {
@@ -3603,6 +4452,7 @@ public final class GPUSolver {
                 e.setBuffer(self.colliderGroup, offset: 0, index: 17)
                 e.setBuffer(
                     self.colliderSharedCollision, offset: 0, index: 18)
+                e.setBuffer(self.colliderShapeType, offset: 0, index: 19)
             }
             encodeScan(enc, input: pairCount, output: pairStart,
                        count: pairProducerCount)
@@ -3627,6 +4477,7 @@ public final class GPUSolver {
                 e.setBuffer(self.colliderGroup, offset: 0, index: 17)
                 e.setBuffer(
                     self.colliderSharedCollision, offset: 0, index: 18)
+                e.setBuffer(self.colliderShapeType, offset: 0, index: 19)
             }
         }
         dispatch1D(enc, "bp_finalize_deterministic_pairs", 1) { e in
@@ -3638,8 +4489,13 @@ public final class GPUSolver {
         }
 
         try stage("narrowphase")
-        // Narrowphase (warm-start from prev manifolds + map)
-        dispatchIndirect(enc, "np_collide", argsOffset: 0) { e in
+        // Hull-free scenes retain the exact established 22-buffer analytic
+        // kernel: wrapping its body in the expanded generic template changes
+        // Metal fast-math codegen enough to regress the gear train. Mixed
+        // scenes use the generic split below; its analytic specialization
+        // skips hull pairs and its convex specialization skips analytic pairs,
+        // so each stable pair/manifold slot still has exactly one writer.
+        func bindNarrowphase(_ e: MTLComputeCommandEncoder) {
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.posAng, offset: 0, index: 1)
             e.setBuffer(self.colliderShape, offset: 0, index: 2)
@@ -3662,6 +4518,57 @@ public final class GPUSolver {
             e.setBuffer(self.colliderHullRange, offset: 0, index: 19)
             e.setBuffer(self.convexHullVertices, offset: 0, index: 20)
             e.setBuffer(self.colliderFriction, offset: 0, index: 21)
+            e.setBuffer(self.colliderConvexAssetID, offset: 0, index: 22)
+            e.setBuffer(self.convexHullHeaders, offset: 0, index: 23)
+            e.setBuffer(self.convexFaces, offset: 0, index: 24)
+            e.setBuffer(self.convexFaceVertexIndices, offset: 0, index: 25)
+            e.setBuffer(self.convexEdges, offset: 0, index: 26)
+            e.setBuffer(self.contactFeatures, offset: 0, index: 27)
+            e.setBuffer(self.prevContactFeatures, offset: 0, index: 28)
+            e.setBuffer(self.convexQueryPoison, offset: 0, index: 29)
+        }
+        if usesHullFreeAnalyticCompatibilityKernelForTesting {
+            dispatchIndirect(
+                enc, "np_collide_analytic_compat", argsOffset: 0
+            ) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.posAng, offset: 0, index: 1)
+                e.setBuffer(self.colliderShape, offset: 0, index: 2)
+                e.setBuffer(self.props, offset: 0, index: 3)
+                e.setBuffer(self.pairs, offset: 0, index: 4)
+                e.setBuffer(self.counters, offset: 0, index: 5)
+                e.setBuffer(self.manifolds, offset: 0, index: 6)
+                e.setBuffer(self.prevManifolds, offset: 0, index: 7)
+                e.setBuffer(self.mapKeyA, offset: 0, index: 8)
+                e.setBuffer(self.mapKeyB, offset: 0, index: 9)
+                e.setBuffer(self.mapVal, offset: 0, index: 10)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 11)
+                e.setBuffer(self.colliderShapeType, offset: 0, index: 12)
+                e.setBuffer(self.spinVel, offset: 0, index: 13)
+                e.setBuffer(self.velLin, offset: 0, index: 14)
+                e.setBuffer(self.velAng, offset: 0, index: 15)
+                e.setBuffer(self.colliderOwner, offset: 0, index: 16)
+                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 17)
+                e.setBuffer(self.colliderLocalRotation, offset: 0, index: 18)
+                e.setBuffer(self.colliderHullRange, offset: 0, index: 19)
+                e.setBuffer(self.convexHullVertices, offset: 0, index: 20)
+                e.setBuffer(self.colliderFriction, offset: 0, index: 21)
+            }
+        } else {
+            dispatchIndirect(
+                enc, "np_collide", argsOffset: 0, bindNarrowphase)
+            dispatchIndirect(
+                enc, "np_collide_convex", argsOffset: 0,
+                bindNarrowphase)
+        }
+        if convexQueryFailureForTesting {
+            dispatch1D(enc, "convex_query_fail_for_testing", 1) { e in
+                e.setBuffer(self.counters, offset: 0, index: 0)
+                e.setBuffer(self.colliderHullRange, offset: 0, index: 1)
+                e.setBuffer(self.convexHullVertices, offset: 0, index: 2)
+                e.setBuffer(self.convexQueryPoison, offset: 0, index: 3)
+            }
         }
 
         try stage("persistence-map")
@@ -3768,22 +4675,35 @@ public final class GPUSolver {
                 e.setBuffer(self.shape, offset: 0, index: 2)
                 e.setBuffer(self.props, offset: 0, index: 3)
                 e.setBuffer(self.velLin, offset: 0, index: 4)
-                e.setBuffer(self.shapeType, offset: 0, index: 5)
+                e.setBuffer(self.colliderShapeType, offset: 0, index: 5)
                 e.setBuffer(self.trisBuf, offset: 0, index: 6)
-                e.setBuffer(self.cellStart, offset: 0, index: 7)
-                e.setBuffer(self.cellCount, offset: 0, index: 8)
-                e.setBuffer(self.cellBodies, offset: 0, index: 9)
-                e.setBuffer(self.globalIdx, offset: 0, index: 10)
-                e.setBuffer(self.exclusions, offset: 0, index: 11)
-                e.setBytes(&nExcl, length: 4, index: 12)
-                e.setBuffer(self.softContacts, offset: 0, index: 13)
-                e.setBuffer(self.counters, offset: 0, index: 14)
-                e.setBuffer(self.prevSoftContacts, offset: 0, index: 15)
-                e.setBuffer(self.softMapKeyA, offset: 0, index: 16)
-                e.setBuffer(self.softMapKeyB, offset: 0, index: 17)
-                e.setBuffer(self.softMapVal, offset: 0, index: 18)
-                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 19)
-                e.setBuffer(self.hashedRigidIdx, offset: 0, index: 20)
+                e.setBuffer(self.globalIdx, offset: 0, index: 7)
+                e.setBuffer(self.exclusions, offset: 0, index: 8)
+                e.setBytes(&nExcl, length: 4, index: 9)
+                e.setBuffer(self.softContacts, offset: 0, index: 10)
+                e.setBuffer(self.counters, offset: 0, index: 11)
+                e.setBuffer(self.prevSoftContacts, offset: 0, index: 12)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 13)
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 14)
+                e.setBuffer(self.softMapVal, offset: 0, index: 15)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
+                e.setBuffer(self.hashedRigidIdx, offset: 0, index: 17)
+                e.setBuffer(self.colliderShape, offset: 0, index: 18)
+                e.setBuffer(self.colliderOwner, offset: 0, index: 19)
+                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 20)
+                e.setBuffer(self.colliderLocalRotation, offset: 0, index: 21)
+                e.setBuffer(self.colliderFriction, offset: 0, index: 22)
+                e.setBuffer(self.colliderGroup, offset: 0, index: 23)
+                e.setBuffer(
+                    self.colliderSharedCollision, offset: 0, index: 24)
+                e.setBuffer(self.colliderHullRange, offset: 0, index: 25)
+                e.setBuffer(self.convexHullVertices, offset: 0, index: 26)
+                e.setBuffer(self.velAng, offset: 0, index: 27)
+                e.setBuffer(self.surfaceCollisionGroupBuf, offset: 0,
+                            index: 28)
+                e.setBuffer(self.surfaceSharedCollisionBuf, offset: 0,
+                            index: 29)
+                e.setBuffer(self.convexQueryPoison, offset: 0, index: 30)
             }
             }
             if !isPlanarDAT {
@@ -4277,6 +5197,17 @@ public final class GPUSolver {
 
         }
         try stage("finalize")
+        if checksConvexQuerySafety {
+            dispatch1D(enc, "convex_restore_failed_frame", numBodies) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.posAng, offset: 0, index: 1)
+                e.setBuffer(self.initLin, offset: 0, index: 2)
+                e.setBuffer(self.initAng, offset: 0, index: 3)
+                e.setBuffer(self.convexQueryPoison, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 5)
+            }
+        }
         if isPlanarDAT {
             dispatch1D(enc, "dat_restore_failed_surface", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -4298,6 +5229,9 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
             e.setBuffer(self.shape, offset: 0, index: 8)
             e.setBuffer(self.gravityScale, offset: 0, index: 9)
+            e.setBuffer(self.convexQueryPoison, offset: 0, index: 10)
+            var checkConvexPoison: UInt32 = checksConvexQuerySafety ? 1 : 0
+            e.setBytes(&checkConvexPoison, length: 4, index: 11)
         }
         enc.endEncoding()
         var visc = settings.clothViscosity
@@ -4372,6 +5306,7 @@ public final class GPUSolver {
         // Buffer identity is a submitted-frame contract even if retirement
         // later discovers a terminal Metal or capacity failure.
         swap(&manifolds, &prevManifolds)
+        swap(&contactFeatures, &prevContactFeatures)
         if numTris > 0 { swap(&softContacts, &prevSoftContacts) }
 
         if profiling {
@@ -4716,6 +5651,103 @@ public final class GPUSolver {
     )? {
         guard rigidMeshVertexCount > 0 else { return nil }
         return (rigidMeshVertexBuf, rigidMeshVertexCount, posLin, posAng)
+    }
+
+    private func materializeConvexDebugGeometry()
+        -> (triangles: MTLBuffer, edges: MTLBuffer)? {
+        convexDebugBufferLock.lock()
+        defer { convexDebugBufferLock.unlock() }
+        if let triangles = convexDebugTriangleVertexBuffer,
+           let edges = convexDebugEdgeVertexBuffer {
+            return (triangles, edges)
+        }
+
+        var triangleVertices: [RigidMeshVertexGPU] = []
+        var edgeVertices: [RigidMeshVertexGPU] = []
+        triangleVertices.reserveCapacity(convexDebugTriangleVertexCount)
+        edgeVertices.reserveCapacity(convexDebugEdgeVertexCount)
+
+        for instance in convexDebugInstances {
+            guard convexDebugGeometries.indices.contains(
+                    Int(instance.geometry)) else { return nil }
+            let geometry = convexDebugGeometries[Int(instance.geometry)]
+            let bodyBits = Float(bitPattern: instance.body)
+            func makeVertex(_ local: F3, normal: F3) -> RigidMeshVertexGPU {
+                var result = RigidMeshVertexGPU()
+                let bodyLocal = instance.localPosition
+                    + instance.localRotation.act(local)
+                result.positionBody = SIMD4(bodyLocal, bodyBits)
+                result.normal = SIMD4(instance.localRotation.act(normal), 0)
+                result.color = SIMD4(instance.color, 1)
+                return result
+            }
+            guard Self.appendConvexTriangleVertices(
+                    geometry: geometry, instance: instance,
+                    to: &triangleVertices) else { return nil }
+            for edge in geometry.edges {
+                guard Int(edge.x) < geometry.vertices.count,
+                      Int(edge.y) < geometry.vertices.count else { return nil }
+                edgeVertices.append(makeVertex(
+                    geometry.vertices[Int(edge.x)], normal: F3(0, 0, 1)))
+                edgeVertices.append(makeVertex(
+                    geometry.vertices[Int(edge.y)], normal: F3(0, 0, 1)))
+            }
+        }
+        guard triangleVertices.count == convexDebugTriangleVertexCount,
+              edgeVertices.count == convexDebugEdgeVertexCount else {
+            return nil
+        }
+
+        let stride = MemoryLayout<RigidMeshVertexGPU>.stride
+        guard let triangleBuffer = device.makeBuffer(
+                length: max(1, triangleVertices.count) * stride,
+                options: .storageModeShared),
+              let edgeBuffer = device.makeBuffer(
+                length: max(1, edgeVertices.count) * stride,
+                options: .storageModeShared) else { return nil }
+        triangleBuffer.label = "convexDebugTriangles.lazy"
+        edgeBuffer.label = "convexDebugEdges.lazy"
+        if !triangleVertices.isEmpty {
+            _ = triangleVertices.withUnsafeBytes { bytes in
+                memcpy(triangleBuffer.contents(), bytes.baseAddress!, bytes.count)
+            }
+        }
+        if !edgeVertices.isEmpty {
+            _ = edgeVertices.withUnsafeBytes { bytes in
+                memcpy(edgeBuffer.contents(), bytes.baseAddress!, bytes.count)
+            }
+        }
+        convexDebugTriangleVertexBuffer = triangleBuffer
+        convexDebugEdgeVertexBuffer = edgeBuffer
+        return (triangleBuffer, edgeBuffer)
+    }
+
+    /// Bytes of per-instance debug vertices currently resident on the GPU.
+    /// This remains zero in headless simulation/training until the render
+    /// surface below is explicitly requested.
+    public var materializedConvexDebugByteCount: Int {
+        convexDebugBufferLock.lock()
+        defer { convexDebugBufferLock.unlock() }
+        return (convexDebugTriangleVertexBuffer?.length ?? 0)
+            + (convexDebugEdgeVertexBuffer?.length ?? 0)
+    }
+
+    /// Collision-only convex geometry attached to live rigid poses. The
+    /// renderer may draw either filled triangles or boundary edges without a
+    /// CPU readback and without requiring the scene to also have a visual CAD
+    /// mesh. This surface is diagnostic only and never feeds solver topology.
+    public var renderConvexCollisionSurface: (
+        triangleVertices: MTLBuffer, triangleVertexCount: Int,
+        edgeVertices: MTLBuffer, edgeVertexCount: Int,
+        positions: MTLBuffer, rotations: MTLBuffer
+    )? {
+        guard convexDebugTriangleVertexCount > 0
+                || convexDebugEdgeVertexCount > 0 else { return nil }
+        guard let buffers = materializeConvexDebugGeometry() else { return nil }
+        return (
+            buffers.triangles, convexDebugTriangleVertexCount,
+            buffers.edges, convexDebugEdgeVertexCount,
+            posLin, posAng)
     }
 
     public var bodyCount: Int { numBodies }

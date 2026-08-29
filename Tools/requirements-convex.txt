@@ -1,0 +1,3 @@
+# Offline-only convex cooker dependencies. Runtime builds do not install these.
+coacd==1.0.11
+numpy==2.0.2

@@ -272,6 +272,142 @@ private func buildEdgeContact(_ bodyA: CPURigid, _ bodyB: CPURigid,
 }
 
 extension CPUManifold {
+    /// Collider-aware dispatch. Analytic pairs retain the established CPU
+    /// routines through world-pose proxies; any pair containing a cooked hull
+    /// uses the isolated support-map MPR/GJK reference implementation.
+    static func collideColliders(
+        solver: CPUSolver,
+        bodyA: CPURigid, colliderA: CPUCollider,
+        bodyB: CPURigid, colliderB: CPUCollider,
+        margin: Float,
+        _ contacts: inout [ContactPoint],
+        _ basisOut: inout (F3, F3, F3)
+    ) -> Result<Int, ConvexNarrowPhase.Failure> {
+        let hullA = colliderHullVertices(solver: solver, collider: colliderA)
+        let hullB = colliderHullVertices(solver: solver, collider: colliderB)
+
+        if hullA != nil || hullB != nil {
+            let poseA = colliderA.worldPose(bodyA)
+            let poseB = colliderB.worldPose(bodyB)
+            let shapeA = convexShape(colliderA, hullVertices: hullA)
+            let shapeB = convexShape(colliderB, hullVertices: hullB)
+            let result: Result<ConvexNarrowPhase.Manifold, ConvexNarrowPhase.Failure>
+            if let injected = solver.convexQueryFailureForTesting {
+                result = .failure(injected)
+            } else {
+                result = ConvexNarrowPhase.query(
+                    shapeA: shapeA,
+                    poseA: .init(position: poseA.position,
+                                 orientation: poseA.orientation),
+                    shapeB: shapeB,
+                    poseB: .init(position: poseB.position,
+                                 orientation: poseB.orientation),
+                    options: .init(contactThreshold: margin))
+            }
+
+            let manifold: ConvexNarrowPhase.Manifold
+            switch result {
+            case .success(let value):
+                manifold = value
+            case .failure(let failure):
+                return .failure(failure)
+            }
+            guard manifold.signedDistance <= margin else {
+                contacts.removeAll(keepingCapacity: true)
+                return .success(0)
+            }
+
+            // ConvexNarrowPhase reports A->B; the AVBD constraint basis uses B->A.
+            basisOut = orthonormalBasis(-manifold.normalAtoB)
+            contacts.removeAll(keepingCapacity: true)
+            contacts.reserveCapacity(manifold.contacts.count)
+            for source in manifold.contacts {
+                var contact = ContactPoint()
+                contact.featureKey = Int32(source.sortKey)
+                contact.rA = ownerAnchor(
+                    worldPoint: source.pointA, body: bodyA,
+                    collider: colliderA)
+                contact.rB = ownerAnchor(
+                    worldPoint: source.pointB, body: bodyB,
+                    collider: colliderB)
+                contacts.append(contact)
+            }
+            return .success(contacts.count)
+        }
+
+        let proxyA = proxyBody(for: colliderA, owner: bodyA)
+        let proxyB = proxyBody(for: colliderB, owner: bodyB)
+        let count = collide(
+            proxyA, proxyB, margin: margin,
+            &contacts, &basisOut)
+        for index in 0..<count {
+            let pointA = proxyAnchorWorld(proxyA, contacts[index].rA)
+            let pointB = proxyAnchorWorld(proxyB, contacts[index].rB)
+            contacts[index].rA = ownerAnchor(
+                worldPoint: pointA, body: bodyA, collider: colliderA)
+            contacts[index].rB = ownerAnchor(
+                worldPoint: pointB, body: bodyB, collider: colliderB)
+        }
+        return .success(count)
+    }
+
+    private static func colliderHullVertices(
+        solver: CPUSolver, collider: CPUCollider
+    ) -> [F3]? {
+        if let assetID = collider.convexAssetID {
+            precondition(solver.convexAssets.indices.contains(assetID),
+                         "CPU convex asset reference is out of range")
+            return solver.convexAssets[assetID].vertices
+        }
+        return collider.convexHullVertices.isEmpty
+            ? nil : collider.convexHullVertices
+    }
+
+    private static func convexShape(
+        _ collider: CPUCollider, hullVertices: [F3]?
+    ) -> ConvexNarrowPhase.Shape {
+        if let hullVertices { return .convexHull(vertices: hullVertices) }
+        switch collider.shape {
+        case .box:
+            return .box(halfExtents: collider.size * 0.5)
+        case .sphere:
+            return .sphere(radius: collider.size.x * 0.5)
+        case .capsule:
+            return .capsule(radius: collider.size.y,
+                            halfHeight: collider.size.x * 0.5)
+        case .torus:
+            return .torus(majorRadius: collider.size.x,
+                          minorRadius: collider.size.y)
+        }
+    }
+
+    private static func proxyBody(
+        for collider: CPUCollider, owner: CPURigid
+    ) -> CPURigid {
+        let pose = collider.worldPose(owner)
+        return CPURigid(
+            index: owner.index, size: collider.size,
+            density: 0, friction: collider.friction,
+            dynamicFriction: collider.dynamicFriction,
+            position: pose.position, rotation: pose.orientation,
+            shape: collider.shape)
+    }
+
+    private static func proxyAnchorWorld(_ proxy: CPURigid, _ anchor: F3) -> F3 {
+        proxy.shape == .box
+            ? transform(proxy.positionLin, proxy.positionAng, anchor)
+            : proxy.positionLin + anchor
+    }
+
+    private static func ownerAnchor(
+        worldPoint: F3, body: CPURigid, collider: CPUCollider
+    ) -> F3 {
+        if collider.usesWorldSpaceRoundAnchor {
+            return worldPoint - body.positionLin
+        }
+        return body.positionAng.inverse.act(worldPoint - body.positionLin)
+    }
+
     /// Shape-dispatching collision. Returns contact count; fills basis
     /// (rows n, t1, t2) with the normal pointing from B toward A.
     static func collide(_ bodyA: CPURigid, _ bodyB: CPURigid,
