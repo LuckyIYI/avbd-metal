@@ -12,7 +12,7 @@ package struct ClassicRigidBodySpec: Sendable {
 }
 
 extension Demos {
-    package static let classicRigidTableTopSize = F3(11, 6, 0.4)
+    package static let classicRigidTableTopSize = F3(8.6, 4.6, 0.34)
     package static let classicRigidTableTopPosition = F3(0, 0, 2.8)
 
     /// Metadata order matches `PhysicsScene.rigidMeshes` in
@@ -21,21 +21,21 @@ extension Demos {
     package static let classicRigidBodySpecs: [ClassicRigidBodySpec] = [
         ClassicRigidBodySpec(
             assetName: "stanford-bunny", isDynamic: true, targetMass: 1.8,
-            slot: F3(-3.8, -0.72, 0), yaw: 0.18,
+            slot: F3(-3.0, -0.52, 0), yaw: 0.18,
             color: F3(0.32, 0.52, 0.92)),
         // Stanford asks that the culturally significant Dragon not be
         // animated. It remains a collidable static display object here.
         ClassicRigidBodySpec(
             assetName: "stanford-dragon", isDynamic: false, targetMass: 0,
-            slot: F3(-1.35, 0.70, 0), yaw: -0.20,
+            slot: F3(-1.0, 0.50, 0), yaw: -0.20,
             color: F3(0.18, 0.68, 0.48)),
         ClassicRigidBodySpec(
             assetName: "stanford-armadillo", isDynamic: true, targetMass: 2.2,
-            slot: F3(1.35, -0.65, 0), yaw: 0.16,
+            slot: F3(1.0, -0.48, 0), yaw: 0.16,
             color: F3(0.88, 0.38, 0.20)),
         ClassicRigidBodySpec(
             assetName: "utah-teapot", isDynamic: true, targetMass: 1.6,
-            slot: F3(3.8, 0.68, 0), yaw: -0.24,
+            slot: F3(3.0, 0.50, 0), yaw: -0.24,
             color: F3(0.72, 0.34, 0.86)),
     ]
 
@@ -48,8 +48,8 @@ extension Demos {
         scene.settings.iterations = 18
         scene.settings.betaLin = 16_000
         scene.settings.collisionMargin = 0.008
-        scene.settings.cameraDistance = 13.5
-        scene.settings.cameraTargetZ = 3.45
+        scene.settings.cameraDistance = 11.2
+        scene.settings.cameraTargetZ = 3.35
         scene.settings.cameraAzimuth = 0.86
         scene.settings.cameraElevation = 0.34
         addGround(&scene, friction: 0.82)
