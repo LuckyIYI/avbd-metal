@@ -11,6 +11,10 @@ protocol RenderableModel {
     nonisolated var captureID: String { get }
     var solver: GPUSolver? { get }
     var colorByGraphColor: Bool { get }
+    /// Draw cooked collision hulls as an inspection overlay. These controls
+    /// are renderer-only and never mutate collider transforms or physics.
+    var showConvexCollisionGeometry: Bool { get }
+    var convexCollisionWireframe: Bool { get }
     var statsText: String { get }
     /// Increments only when the DEMO changes — reset/size/param rebuilds
     /// keep the user's camera.
@@ -20,6 +24,11 @@ protocol RenderableModel {
     /// model's existing status UI. Render failures are deliberately separate
     /// from GPUSolver's terminal physics health.
     func reportRenderFailure(_ message: String)
+}
+
+extension RenderableModel {
+    var showConvexCollisionGeometry: Bool { false }
+    var convexCollisionWireframe: Bool { true }
 }
 
 extension SimulationModel {
@@ -329,6 +338,16 @@ vertex VOut rigid_mesh_vertex(
     o.albedo = srgbToLin(v.color.rgb);
     o.flatShade = 0;
     return o;
+}
+
+fragment float4 convex_debug_fill_fragment(VOut in [[stage_in]])
+{
+    return float4(mix(in.albedo, float3(1.0), 0.12), 0.22);
+}
+
+fragment float4 convex_debug_wire_fragment(VOut in [[stage_in]])
+{
+    return float4(mix(in.albedo, float3(1.0), 0.58), 0.94);
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +817,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     var boxShadow, sphereShadow, torusShadow, capsuleShadow, softShadow,
         skinShadow, rigidMeshShadow: MTLRenderPipelineState!
     var skyP, floorP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
-    var depthState, noDepthState: MTLDepthStencilState!
+    var convexDebugFillP, convexDebugWireP: MTLRenderPipelineState!
+    var depthState, noDepthState, debugDepthState: MTLDepthStencilState!
 
     var posTex, normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
     var histTex, prevPosTex: MTLTexture?
@@ -867,7 +887,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
         func pipe(_ v: String, _ f: String, samples: Int = Renderer.sampleCount,
                   colorFormats: [MTLPixelFormat] = [Renderer.colorFormat],
-                  depth: MTLPixelFormat = .depth32Float) throws -> MTLRenderPipelineState {
+                  depth: MTLPixelFormat = .depth32Float,
+                  blending: Bool = false) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
             guard let vertex = lib.makeFunction(name: v) else {
                 throw RendererInitializationError.shaderFunction(v)
@@ -879,6 +900,15 @@ final class Renderer: NSObject, MTKViewDelegate {
             d.fragmentFunction = fragment
             for (i, fmt) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = fmt
+            }
+            if blending, let attachment = d.colorAttachments[0] {
+                attachment.isBlendingEnabled = true
+                attachment.rgbBlendOperation = .add
+                attachment.alphaBlendOperation = .add
+                attachment.sourceRGBBlendFactor = .sourceAlpha
+                attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+                attachment.sourceAlphaBlendFactor = .one
+                attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             }
             d.depthAttachmentPixelFormat = depth
             d.rasterSampleCount = samples
@@ -904,6 +934,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         softP = try pipe("soft_vertex", "soft_fragment")
         skinP = try pipe("skin_vertex", "soft_fragment")
         rigidMeshP = try pipe("rigid_mesh_vertex", "pbr_fragment")
+        convexDebugFillP = try pipe(
+            "rigid_mesh_vertex", "convex_debug_fill_fragment", blending: true)
+        convexDebugWireP = try pipe(
+            "rigid_mesh_vertex", "convex_debug_wire_fragment", blending: true)
         skyP = try pipe("fs_vertex", "sky_fragment")
         floorP = try pipe("floor_vertex", "floor_fragment")
 
@@ -947,6 +981,15 @@ final class Renderer: NSObject, MTKViewDelegate {
             throw RendererInitializationError.depthState("background")
         }
         self.noDepthState = noDepthState
+
+        let debugDepth = MTLDepthStencilDescriptor()
+        debugDepth.depthCompareFunction = .lessEqual
+        debugDepth.isDepthWriteEnabled = false
+        guard let debugDepthState = device.makeDepthStencilState(
+                descriptor: debugDepth) else {
+            throw RendererInitializationError.depthState("convex-debug")
+        }
+        self.debugDepthState = debugDepthState
 
     }
 
@@ -1206,14 +1249,16 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: skin.triCount * 3)
             }
-            if let mesh = solver.renderRigidMeshSurface {
+            if let mesh = solver.renderIndexedRigidMeshSurface {
                 enc.setRenderPipelineState(rigidMeshShadow)
                 enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
                 enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: mesh.vertexCount)
+                enc.drawIndexedPrimitives(
+                    type: .triangle, indexCount: mesh.indexCount,
+                    indexType: .uint32, indexBuffer: mesh.indices,
+                    indexBufferOffset: 0)
             }
             enc.endEncoding()
         }
@@ -1272,14 +1317,16 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: skin.triCount * 3)
             }
-            if let mesh = solver.renderRigidMeshSurface {
+            if let mesh = solver.renderIndexedRigidMeshSurface {
                 enc.setRenderPipelineState(rigidMeshPre)
                 enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: mesh.vertexCount)
+                enc.drawIndexedPrimitives(
+                    type: .triangle, indexCount: mesh.indexCount,
+                    indexType: .uint32, indexBuffer: mesh.indices,
+                    indexBufferOffset: 0)
             }
             enc.endEncoding()
         }
@@ -1416,7 +1463,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: skin.triCount * 3)
         }
-        if let mesh = solver.renderRigidMeshSurface {
+        if let mesh = solver.renderIndexedRigidMeshSurface {
             enc.setRenderPipelineState(rigidMeshP)
             enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1425,8 +1472,37 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.setFragmentTexture(shadowTex, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: mesh.vertexCount)
+            enc.drawIndexedPrimitives(
+                type: .triangle, indexCount: mesh.indexCount,
+                indexType: .uint32, indexBuffer: mesh.indices,
+                indexBufferOffset: 0)
+        }
+        if model.showConvexCollisionGeometry,
+           let debug = solver.renderConvexCollisionSurface {
+            enc.setDepthStencilState(debugDepthState)
+            // Pull the diagnostic surface very slightly toward the camera so
+            // coincident visual and collision meshes do not z-fight. This is
+            // render state only; collision geometry and poses are untouched.
+            enc.setDepthBias(-0.0002, slopeScale: -0.35, clamp: -0.002)
+            if debug.triangleVertexCount > 0 {
+                enc.setRenderPipelineState(convexDebugFillP)
+                enc.setVertexBuffer(debug.triangleVertices, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(debug.positions, offset: 0, index: 2)
+                enc.setVertexBuffer(debug.rotations, offset: 0, index: 3)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: debug.triangleVertexCount)
+            }
+            if model.convexCollisionWireframe, debug.edgeVertexCount > 0 {
+                enc.setRenderPipelineState(convexDebugWireP)
+                enc.setVertexBuffer(debug.edgeVertices, offset: 0, index: 0)
+                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setVertexBuffer(debug.positions, offset: 0, index: 2)
+                enc.setVertexBuffer(debug.rotations, offset: 0, index: 3)
+                enc.drawPrimitives(type: .line, vertexStart: 0,
+                                   vertexCount: debug.edgeVertexCount)
+            }
+            enc.setDepthBias(0, slopeScale: 0, clamp: 0)
         }
         enc.endEncoding()
 

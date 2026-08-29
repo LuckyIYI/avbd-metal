@@ -11,6 +11,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#if defined(AVBD_OPTIMIZED_CONVEX)
+#define NPC_MAX_POLY_EDGES 186
+#define NPC_MAX_EDGE_PAIR_TESTS 1024
+#endif
+
 // ============================================================================
 // Narrowphase: OBB-OBB SAT with reference-face clipping and edge-edge
 // closest points (port of avbd-demo3d collide.cpp). One thread per pair.
@@ -1548,6 +1553,60 @@ inline bool npcBestEdgeContact(
     NPCPolyEdge chosenB;
     alignment = -FLT_MAX;
 
+#if defined(AVBD_OPTIMIZED_CONVEX)
+    // Compact supporting edges once. The previous nested search revisited all
+    // E_b edges for every supporting E_a edge (up to 186² in one thread),
+    // although almost all failed the same support-plane predicate. If a very
+    // coarse shape still creates an excessive Cartesian product, retain the
+    // already-valid face/MPR manifold rather than spending unbounded time on
+    // optional edge enrichment.
+    ushort supportingA[NPC_MAX_POLY_EDGES];
+    ushort supportingB[NPC_MAX_POLY_EDGES];
+    uint supportingCountA = 0u;
+    uint supportingCountB = 0u;
+    for (uint indexA = 0u; indexA < countA; indexA++) {
+        NPCPolyEdge edgeA = npcPolyEdge(
+            a, indexA, colliderConvexAssetID, convexHulls,
+            convexEdges, convexHullVertices);
+        if (!edgeA.valid) continue;
+        float deficitA = max(fabs(supportA - dot(edgeA.a, normalAtoB)),
+                             fabs(supportA - dot(edgeA.b, normalAtoB)));
+        if (deficitA <= supportTolerance)
+            supportingA[supportingCountA++] = ushort(indexA);
+    }
+    for (uint indexB = 0u; indexB < countB; indexB++) {
+        NPCPolyEdge edgeB = npcPolyEdge(
+            b, indexB, colliderConvexAssetID, convexHulls,
+            convexEdges, convexHullVertices);
+        if (!edgeB.valid) continue;
+        float deficitB = max(fabs(dot(edgeB.a, normalAtoB) - supportB),
+                             fabs(dot(edgeB.b, normalAtoB) - supportB));
+        if (deficitB <= supportTolerance)
+            supportingB[supportingCountB++] = ushort(indexB);
+    }
+    uint supportingPairCount = supportingCountA * supportingCountB;
+    if (supportingPairCount == 0u
+        || supportingPairCount > NPC_MAX_EDGE_PAIR_TESTS) return false;
+    edgePairTests += supportingPairCount;
+
+    for (uint candidateA = 0u; candidateA < supportingCountA; candidateA++) {
+        uint indexA = uint(supportingA[candidateA]);
+        NPCPolyEdge edgeA = npcPolyEdge(
+            a, indexA, colliderConvexAssetID, convexHulls,
+            convexEdges, convexHullVertices);
+        float deficitA = max(fabs(supportA - dot(edgeA.a, normalAtoB)),
+                             fabs(supportA - dot(edgeA.b, normalAtoB)));
+        float3 directionA = normalize(edgeA.b - edgeA.a);
+        for (uint candidateB = 0u; candidateB < supportingCountB;
+             candidateB++) {
+            uint indexB = uint(supportingB[candidateB]);
+            NPCPolyEdge edgeB = npcPolyEdge(
+                b, indexB, colliderConvexAssetID, convexHulls,
+                convexEdges, convexHullVertices);
+            float deficitB = max(fabs(dot(edgeB.a, normalAtoB) - supportB),
+                                 fabs(dot(edgeB.b, normalAtoB) - supportB));
+            float3 directionB = normalize(edgeB.b - edgeB.a);
+#else
     for (uint indexA = 0u; indexA < countA; indexA++) {
         NPCPolyEdge edgeA = npcPolyEdge(
             a, indexA, colliderConvexAssetID, convexHulls,
@@ -1567,6 +1626,7 @@ inline bool npcBestEdgeContact(
                                  fabs(dot(edgeB.b, normalAtoB) - supportB));
             if (deficitB > supportTolerance) continue;
             float3 directionB = normalize(edgeB.b - edgeB.a);
+#endif
             float3 crossDirection = cross(directionA, directionB);
             float crossLengthSquared = dot(crossDirection, crossDirection);
             if (crossLengthSquared <= 1.0e-10f) continue;
@@ -1846,6 +1906,21 @@ inline void npCollidePass(
 
     uint2 pair = pairs[gid];
     uint ia = pair.x, ib = pair.y;
+
+#if defined(AVBD_OPTIMIZED_CONVEX)
+    // Both specializations consume the same deterministic pair stream, but
+    // only one owns each manifold slot. Reject the other pass before loading
+    // owners, body poses, velocities, collider transforms, or constructing
+    // OBBs. Mixed scenes therefore pay two tiny kind checks per pair rather
+    // than duplicating the full common narrow-phase prologue.
+    uint stA = shapeType[ia] & SHAPE_KIND_MASK;
+    uint stB = shapeType[ib] & SHAPE_KIND_MASK;
+    bool hullA = stA == 4;
+    bool hullB = stB == 4;
+    bool hullPair = hullA || hullB;
+    if (CONVEX_PASS != hullPair) return;
+#endif
+
     uint ba = colliderOwner[ia], bb = colliderOwner[ib];
 
     float4 bodyPA4 = posLin[ba];
@@ -1876,19 +1951,25 @@ inline void npCollidePass(
     outM.colliderPair = uint4(ia, ib, 0, 0);
 
     // --- shape type dispatch (0 box, 1 sphere, 2 torus, 3 capsule) ---
+#if !defined(AVBD_OPTIMIZED_CONVEX)
     uint stA = shapeType[ia] & SHAPE_KIND_MASK;
     uint stB = shapeType[ib] & SHAPE_KIND_MASK;
+#endif
     bool sphA = stA == 1;
     bool sphB = stB == 1;
     bool torA = stA == 2;
     bool torB = stB == 2;
     bool capA = stA == 3;
     bool capB = stB == 3;
+#if !defined(AVBD_OPTIMIZED_CONVEX)
     bool hullA = stA == 4;
     bool hullB = stB == 4;
 
     if (hullA || hullB) {
         if (!CONVEX_PASS) return;
+#else
+    if (hullPair) {
+#endif
         NPCShape convexA;
         convexA.collider = ia;
         convexA.kind = stA;
@@ -2134,8 +2215,9 @@ inline void npCollidePass(
     // The convex specialization visits the shared pair stream so manifold
     // indices remain stable, but analytic pairs belong exclusively to the
     // legacy specialized kernel above.
+#if !defined(AVBD_OPTIMIZED_CONVEX)
     if (CONVEX_PASS) return;
-
+#endif
 
     // capsule pairs not involving a torus: single-contact closest-point
     if ((capA || capB) && !torA && !torB) {
@@ -3041,3 +3123,4 @@ kernel void convex_restore_failed_frame(
     posLin[gid] = float4(initLin[gid].xyz, posLin[gid].w);
     posAng[gid] = initAng[gid];
 }
+

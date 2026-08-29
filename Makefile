@@ -9,6 +9,7 @@ ROBOTICS_RESOURCE_BUNDLE := avbd-metal_Robotics.bundle
 
 .PHONY: build test verify-core verify-mlx-rl verify-release app cli bench clean clean-all ml-tool \
 	app-ml ios-ml verify-arachne-assets \
+	verify-convex-assets \
 	verify-arachne-policy verify-policy-evidence verify-panda-provenance \
 	verify-h1-provenance verify-architecture
 
@@ -20,7 +21,8 @@ test:
 
 # Local core merge gate: every checked-in generated/provenance contract plus
 # the complete SwiftPM suite. None of these checks needs network access.
-verify-core: verify-architecture verify-arachne-assets verify-policy-evidence \
+verify-core: verify-architecture verify-arachne-assets verify-convex-assets \
+	verify-policy-evidence \
 	verify-panda-provenance verify-h1-provenance
 	swift test
 
@@ -28,6 +30,33 @@ verify-architecture:
 	python3 Tools/verify_architecture.py
 	PYTHONPYCACHEPREFIX=/tmp/avbd-architecture-pycache \
 	  python3 -m unittest Tools.tests.test_verify_architecture
+
+# Convex collision assets are cooked offline. Ordinary builds need neither
+# Python packages nor CoACD: the merge gate validates the canonical checked-in
+# bytes, provenance, topology, and the deterministic cooker contract.
+verify-convex-assets:
+	PYTHONPYCACHEPREFIX=/tmp/avbd-convex-pycache \
+	  python3 -S -m unittest Tools.tests.test_cook_convex_asset
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/concave-u.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/convex/concave-u.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/concave-u.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/stanford-bunny.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/stanford-bunny.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/stanford-bunny.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/stanford-dragon.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/stanford-dragon.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/stanford-dragon.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/stanford-armadillo.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/stanford-armadillo.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/stanford-armadillo.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/utah-teapot.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/utah-teapot.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/utah-teapot.debug.obj
 
 # Xcode-package the MLX/RL tests, then run their bundle serially so the MLX
 # opt-in reaches XCTest (xcodebuild filters custom environment variables).
@@ -67,6 +96,7 @@ app: build
 	  cp -R .build/release/$(PHYSICS_RESOURCE_BUNDLE) \
 	    .build/release/$(ROBOTICS_RESOURCE_BUNDLE) \
 	    "$$staged_app/Contents/Resources/"; \
+	  cp THIRD_PARTY_NOTICES.md "$$staged_app/Contents/Resources/"; \
 	  printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -83,6 +113,7 @@ app: build
 	  test -x "$$staged_app/Contents/MacOS/AVBDApp"; \
 	  test -d "$$staged_app/Contents/Resources/$(PHYSICS_RESOURCE_BUNDLE)"; \
 	  test -d "$$staged_app/Contents/Resources/$(ROBOTICS_RESOURCE_BUNDLE)"; \
+	  test -s "$$staged_app/Contents/Resources/THIRD_PARTY_NOTICES.md"; \
 	  plutil -lint "$$staged_app/Contents/Info.plist" >/dev/null; \
 	  codesign --force --deep --sign - "$$staged_app"; \
 	  codesign --verify --deep --strict "$$staged_app"; \
@@ -143,6 +174,7 @@ app-ml: verify-policy-evidence
 	  cp -R .xcbuild/Build/Products/Release/$(PHYSICS_RESOURCE_BUNDLE) \
 	    .xcbuild/Build/Products/Release/$(ROBOTICS_RESOURCE_BUNDLE) \
 	    "$$staged_app/Contents/Resources/"; \
+	  cp THIRD_PARTY_NOTICES.md "$$staged_app/Contents/Resources/"; \
 	  cp checkpoints/README.md checkpoints/policy-release-index.json \
 	    "$$staged_app/Contents/Resources/checkpoints/"; \
 	  cp checkpoints/external/unitree-h1/LICENSE \
@@ -223,6 +255,7 @@ app-ml: verify-policy-evidence
 	  test -x "$$staged_app/Contents/MacOS/avbd"; \
 	  test -d "$$staged_app/Contents/Resources/$(PHYSICS_RESOURCE_BUNDLE)"; \
 	  test -d "$$staged_app/Contents/Resources/$(ROBOTICS_RESOURCE_BUNDLE)"; \
+	  test -s "$$staged_app/Contents/Resources/THIRD_PARTY_NOTICES.md"; \
 	  plutil -lint "$$staged_app/Contents/Info.plist" >/dev/null; \
 	  codesign --force --deep --sign - "$$staged_app"; \
 	  codesign --verify --deep --strict "$$staged_app"; \
