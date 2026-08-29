@@ -41,6 +41,22 @@ verify-convex-assets:
 	  --verify Sources/PhysicsAVBD/Assets/convex/concave-u.avbdconvex.json \
 	  --input Sources/PhysicsAVBD/Assets/convex/concave-u.obj \
 	  --debug-obj Sources/PhysicsAVBD/Assets/convex/concave-u.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/stanford-bunny.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/stanford-bunny.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/stanford-bunny.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/stanford-dragon.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/stanford-dragon.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/stanford-dragon.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/stanford-armadillo.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/stanford-armadillo.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/stanford-armadillo.debug.obj
+	python3 -S Tools/cook_convex_asset.py \
+	  --verify Sources/PhysicsAVBD/Assets/convex/classic/utah-teapot.avbdconvex.json \
+	  --input Sources/PhysicsAVBD/Assets/classic/utah-teapot.obj \
+	  --debug-obj Sources/PhysicsAVBD/Assets/convex/classic/utah-teapot.debug.obj
 
 # Xcode-package the MLX/RL tests, then run their bundle serially so the MLX
 # opt-in reaches XCTest (xcodebuild filters custom environment variables).

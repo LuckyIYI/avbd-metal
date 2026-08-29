@@ -1238,6 +1238,335 @@ public struct ConvexCompoundAsset: Codable, Equatable, Sendable {
     }
 }
 
+/// Homogeneous volume mass properties of a cooked convex compound.
+///
+/// The tensor and moments are expressed at `centerOfMass` in the compound's
+/// source frame and assume unit density. `principalRotation` maps vectors from
+/// the returned principal-inertia frame into that source frame. A rigid body
+/// can therefore use `principalInertiaAtUnitDensity * density` directly while
+/// attaching source-frame geometry with the inverse rotation and translated
+/// center of mass.
+public struct ConvexCompoundMassProperties: Sendable {
+    public let volume: Float
+    public let centerOfMass: F3
+    public let inertiaTensorAtUnitDensity: simd_float3x3
+    public let principalInertiaAtUnitDensity: F3
+    public let principalRotation: Quat
+
+    public init(
+        volume: Float,
+        centerOfMass: F3,
+        inertiaTensorAtUnitDensity: simd_float3x3,
+        principalInertiaAtUnitDensity: F3,
+        principalRotation: Quat
+    ) {
+        self.volume = volume
+        self.centerOfMass = centerOfMass
+        self.inertiaTensorAtUnitDensity = inertiaTensorAtUnitDensity
+        self.principalInertiaAtUnitDensity = principalInertiaAtUnitDensity
+        self.principalRotation = principalRotation.normalized
+    }
+}
+
+public extension ConvexCompoundAsset {
+    /// Integrate the exact closed tetrahedra of every cooked hull, then
+    /// deterministically diagonalize the complete source-frame inertia tensor.
+    ///
+    /// Cooked parts are integrated independently and added. If a decomposition
+    /// intentionally contains overlapping parts, their overlap contributes once
+    /// per part; this is the conventional compound approximation used for its
+    /// inertial model and does not alter collision geometry.
+    func massProperties() throws -> ConvexCompoundMassProperties {
+        try validate()
+        typealias D3 = SIMD3<Double>
+
+        let lower = parts.reduce(F3(repeating: .infinity)) {
+            simd_min($0, $1.boundsMin)
+        }
+        let upper = parts.reduce(F3(repeating: -.infinity)) {
+            simd_max($0, $1.boundsMax)
+        }
+        let reference = D3((lower + upper) * 0.5)
+
+        var volume = 0.0
+        var firstMoment = D3.zero
+        var xx = 0.0
+        var yy = 0.0
+        var zz = 0.0
+        var xy = 0.0
+        var xz = 0.0
+        var yz = 0.0
+
+        for part in parts {
+            for triangle in part.triangles {
+                let a = D3(part.vertices[Int(triangle.x)]) - reference
+                let b = D3(part.vertices[Int(triangle.y)]) - reference
+                let c = D3(part.vertices[Int(triangle.z)]) - reference
+                let tetraVolume = simd_dot(a, simd_cross(b, c)) / 6
+                volume += tetraVolume
+                firstMoment += tetraVolume * (a + b + c) / 4
+
+                func squaredMoment(_ u: Double, _ v: Double,
+                                   _ w: Double) -> Double {
+                    tetraVolume * (
+                        u * u + v * v + w * w
+                            + u * v + u * w + v * w
+                    ) / 10
+                }
+                func productMoment(
+                    _ ux: Double, _ uy: Double,
+                    _ vx: Double, _ vy: Double,
+                    _ wx: Double, _ wy: Double
+                ) -> Double {
+                    // Integral of x*y over a tetrahedron with its fourth
+                    // vertex at the local reference origin.
+                    tetraVolume * (
+                        (ux + vx + wx) * (uy + vy + wy)
+                            + ux * uy + vx * vy + wx * wy
+                    ) / 20
+                }
+
+                xx += squaredMoment(a.x, b.x, c.x)
+                yy += squaredMoment(a.y, b.y, c.y)
+                zz += squaredMoment(a.z, b.z, c.z)
+                xy += productMoment(a.x, a.y, b.x, b.y, c.x, c.y)
+                xz += productMoment(a.x, a.z, b.x, b.z, c.x, c.z)
+                yz += productMoment(a.y, a.z, b.y, b.z, c.y, c.z)
+            }
+        }
+
+        guard volume.isFinite, volume > 0 else {
+            throw ConvexAssetValidationError(
+                "convex compound has invalid integrated volume"
+            )
+        }
+        let localCenter = firstMoment / volume
+        let center = reference + localCenter
+
+        // Inertia about the integration reference, followed by the parallel-
+        // axis shift to the aggregate center of mass. Off-diagonal inertia
+        // entries are the negatives of the corresponding product moments.
+        var tensor = SymmetricDouble3(
+            xx: yy + zz,
+            yy: xx + zz,
+            zz: xx + yy,
+            xy: -xy,
+            xz: -xz,
+            yz: -yz
+        )
+        tensor.xx -= volume * (
+            localCenter.y * localCenter.y + localCenter.z * localCenter.z)
+        tensor.yy -= volume * (
+            localCenter.x * localCenter.x + localCenter.z * localCenter.z)
+        tensor.zz -= volume * (
+            localCenter.x * localCenter.x + localCenter.y * localCenter.y)
+        tensor.xy += volume * localCenter.x * localCenter.y
+        tensor.xz += volume * localCenter.x * localCenter.z
+        tensor.yz += volume * localCenter.y * localCenter.z
+
+        guard tensor.isFinite, center.x.isFinite, center.y.isFinite,
+              center.z.isFinite else {
+            throw ConvexAssetValidationError(
+                "convex compound has non-finite integrated mass properties"
+            )
+        }
+
+        let eigensystem = tensor.deterministicEigensystem()
+        let scale = max(
+            max(abs(tensor.xx), abs(tensor.yy)),
+            max(abs(tensor.zz), Double.leastNormalMagnitude)
+        )
+        guard eigensystem.values.x > scale * 1e-12,
+              eigensystem.values.y > scale * 1e-12,
+              eigensystem.values.z > scale * 1e-12 else {
+            throw ConvexAssetValidationError(
+                "convex compound inertia tensor is not positive definite"
+            )
+        }
+
+        let axis0 = F3(eigensystem.axes.0)
+        let axis1 = F3(eigensystem.axes.1)
+        let axis2 = F3(eigensystem.axes.2)
+        let sourceFromPrincipal = simd_float3x3(columns: (
+            axis0, axis1, axis2
+        ))
+        var rotation = Quat(sourceFromPrincipal).normalized
+        if rotation.real < 0 || (rotation.real == 0
+            && Self.lexicographicallyNegative(rotation.imag)) {
+            rotation = Quat(real: -rotation.real, imag: -rotation.imag)
+        }
+
+        let floatTensor = simd_float3x3(columns: (
+            F3(Float(tensor.xx), Float(tensor.xy), Float(tensor.xz)),
+            F3(Float(tensor.xy), Float(tensor.yy), Float(tensor.yz)),
+            F3(Float(tensor.xz), Float(tensor.yz), Float(tensor.zz))
+        ))
+        let floatPrincipal = F3(eigensystem.values)
+        let tensorIsFinite = (0..<3).allSatisfy { column in
+            (0..<3).allSatisfy { row in
+                floatTensor[column][row].isFinite
+            }
+        }
+        let triangleTolerance = max(
+            floatPrincipal.x, max(floatPrincipal.y, floatPrincipal.z)
+        ) * 1e-5
+        guard tensorIsFinite,
+              floatPrincipal.x.isFinite, floatPrincipal.y.isFinite,
+              floatPrincipal.z.isFinite,
+              floatPrincipal.x > 0, floatPrincipal.y > 0,
+              floatPrincipal.z > 0,
+              rotation.real.isFinite, rotation.imag.x.isFinite,
+              rotation.imag.y.isFinite, rotation.imag.z.isFinite,
+              floatPrincipal.x <= floatPrincipal.y + floatPrincipal.z
+                  + triangleTolerance,
+              floatPrincipal.y <= floatPrincipal.x + floatPrincipal.z
+                  + triangleTolerance,
+              floatPrincipal.z <= floatPrincipal.x + floatPrincipal.y
+                  + triangleTolerance else {
+            throw ConvexAssetValidationError(
+                "convex compound inertia is not a finite physical tensor"
+            )
+        }
+
+        let output = ConvexCompoundMassProperties(
+            volume: Float(volume),
+            centerOfMass: F3(center),
+            inertiaTensorAtUnitDensity: floatTensor,
+            principalInertiaAtUnitDensity: floatPrincipal,
+            principalRotation: rotation
+        )
+        guard output.volume.isFinite, output.volume > 0,
+              output.centerOfMass.x.isFinite,
+              output.centerOfMass.y.isFinite,
+              output.centerOfMass.z.isFinite,
+              output.principalInertiaAtUnitDensity.x.isFinite,
+              output.principalInertiaAtUnitDensity.y.isFinite,
+              output.principalInertiaAtUnitDensity.z.isFinite else {
+            throw ConvexAssetValidationError(
+                "convex compound mass properties exceed Float range"
+            )
+        }
+        return output
+    }
+
+    private static func lexicographicallyNegative(_ vector: F3) -> Bool {
+        if vector.x != 0 { return vector.x < 0 }
+        if vector.y != 0 { return vector.y < 0 }
+        return vector.z < 0
+    }
+}
+
+/// Small deterministic symmetric eigensolver used by convex mass integration.
+/// Double precision keeps translated CAD coordinates from contaminating the
+/// principal frame; the public result is converted to the simulator's Float
+/// representation only after integration and diagonalization are complete.
+private struct SymmetricDouble3 {
+    var xx: Double
+    var yy: Double
+    var zz: Double
+    var xy: Double
+    var xz: Double
+    var yz: Double
+
+    var isFinite: Bool {
+        xx.isFinite && yy.isFinite && zz.isFinite
+            && xy.isFinite && xz.isFinite && yz.isFinite
+    }
+
+    func deterministicEigensystem()
+        -> (values: SIMD3<Double>, axes: (SIMD3<Double>, SIMD3<Double>, SIMD3<Double>))
+    {
+        var a = [
+            [xx, xy, xz],
+            [xy, yy, yz],
+            [xz, yz, zz],
+        ]
+        var vectors = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        let pairs = [(0, 1), (0, 2), (1, 2)]
+        let tolerance = max(
+            max(abs(xx), abs(yy)),
+            max(abs(zz), Double.leastNormalMagnitude)
+        ) * 1e-14
+
+        for _ in 0..<48 {
+            var selected = pairs[0]
+            var magnitude = abs(a[selected.0][selected.1])
+            for pair in pairs.dropFirst() {
+                let candidate = abs(a[pair.0][pair.1])
+                if candidate > magnitude {
+                    selected = pair
+                    magnitude = candidate
+                }
+            }
+            if magnitude <= tolerance { break }
+
+            let p = selected.0
+            let q = selected.1
+            let apq = a[p][q]
+            let tau = (a[q][q] - a[p][p]) / (2 * apq)
+            let t = tau >= 0
+                ? 1 / (tau + sqrt(1 + tau * tau))
+                : -1 / (-tau + sqrt(1 + tau * tau))
+            let cosine = 1 / sqrt(1 + t * t)
+            let sine = t * cosine
+
+            let app = a[p][p]
+            let aqq = a[q][q]
+            a[p][p] = app - t * apq
+            a[q][q] = aqq + t * apq
+            a[p][q] = 0
+            a[q][p] = 0
+            for k in 0..<3 where k != p && k != q {
+                let akp = a[k][p]
+                let akq = a[k][q]
+                a[k][p] = cosine * akp - sine * akq
+                a[p][k] = a[k][p]
+                a[k][q] = cosine * akq + sine * akp
+                a[q][k] = a[k][q]
+            }
+            for k in 0..<3 {
+                let vkp = vectors[k][p]
+                let vkq = vectors[k][q]
+                vectors[k][p] = cosine * vkp - sine * vkq
+                vectors[k][q] = cosine * vkq + sine * vkp
+            }
+        }
+
+        let order = (0..<3).sorted {
+            if a[$0][$0] != a[$1][$1] { return a[$0][$0] < a[$1][$1] }
+            return $0 < $1
+        }
+        var axes = order.map { column in
+            SIMD3(vectors[0][column], vectors[1][column], vectors[2][column])
+        }
+        axes[0] = Self.canonicalized(axes[0])
+        axes[1] -= simd_dot(axes[1], axes[0]) * axes[0]
+        axes[1] = Self.canonicalized(axes[1])
+        // Constructing the final axis by cross product makes the frame exactly
+        // right-handed even when a repeated eigenvalue admits many bases.
+        axes[2] = simd_normalize(simd_cross(axes[0], axes[1]))
+        return (
+            SIMD3(a[order[0]][order[0]],
+                  a[order[1]][order[1]],
+                  a[order[2]][order[2]]),
+            (axes[0], axes[1], axes[2])
+        )
+    }
+
+    private static func canonicalized(_ vector: SIMD3<Double>) -> SIMD3<Double> {
+        var normalized = simd_normalize(vector)
+        var selected = 0
+        if abs(normalized.y) > abs(normalized.x) { selected = 1 }
+        if abs(normalized.z) > abs(normalized[selected]) { selected = 2 }
+        if normalized[selected] < 0 { normalized = -normalized }
+        return normalized
+    }
+}
+
 private extension Data {
     mutating func appendLittleEndian(_ value: UInt32) {
         var littleEndian = value.littleEndian

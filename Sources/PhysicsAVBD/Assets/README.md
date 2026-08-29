@@ -1,18 +1,17 @@
-# Stanford Bunny
+# PhysicsAVBD assets
 
-`stanford-bunny.obj` is the Stanford Bunny scan reconstructed with the zipper
-method by Greg Turk and Marc Levoy at the Stanford University Computer Graphics
-Laboratory. The bundled OBJ was supplied as a MeshLab conversion of
-`bun_zipper.obj` (35,947 vertices and 69,451 faces).
+`stanford-bunny.obj` is the original-scale, Y-up Stanford Bunny used by the
+skinned-soft-body demo. The `classic/` directory contains deterministic Z-up,
+meter-scale visual meshes for the rigid tabletop scene. Matching collision
+compounds and exact debug meshes live in `convex/classic/`; runtime builds load
+the checked-in compounds and never invoke CoACD.
 
-Upstream dataset and usage terms:
+See [`classic/PROVENANCE.md`](classic/PROVENANCE.md) for byte hashes, source
+URLs, conversion and normalization details, and cook parameters. See
+[`classic/NOTICE.md`](classic/NOTICE.md) before redistributing these assets.
 
-- https://graphics.stanford.edu/data/3Dscanrep/
-- https://graphics.stanford.edu/pub/3Dscanrep/bunny.tar.gz
-
-Stanford's repository explicitly permits unrestricted use of the Bunny and asks
-users to acknowledge the source. Stanford University and the original authors
-do not endorse this project.
-
-Bundled file SHA-256:
-`1eb35d1e21ce99e5ce911353b6be278990713448dd9e8f5c9387f9de39b32205`.
+The Stanford Bunny, Dragon, and Armadillo are research assets from the Stanford
+Computer Graphics Laboratory. Stanford permits research use and free
+redistribution with acknowledgement, but does **not** permit commercial use or
+inclusion in a product for sale without permission. They are not unrestricted
+or permissively licensed. The solid Utah Teapot source is released under CC0.

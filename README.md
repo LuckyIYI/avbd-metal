@@ -105,6 +105,7 @@ swift test --filter RLFrameworkTests          # vector RL contract + GAE
 make verify-release                           # full arm64 Mac release gate
 make app && open AVBD.app                     # interactive app
 .build/release/avbd run convexdecomp --frames 300 # cooked convex-compound demo
+.build/release/avbd run classicrigids --frames 720 # classic meshes on a primitive table
 .build/release/avbd run bed --frames 300
 .build/release/avbd profile clothfold --scale 16 --frames 80
 .build/release/avbd clothgate drape --frames 300

@@ -60,15 +60,19 @@ struct ContentView: View {
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
                         ForEach(Demos.all, id: \.self) {
-                            Text($0 == "gaudifunicular" ? "Gaudí Funicular" : $0)
+                            Text($0 == "gaudifunicular" ? "Gaudí Funicular"
+                                : $0 == "classicrigids" ? "Classic Rigid Bodies"
+                                : $0)
                         }
                     }
-                    Picker("Size", selection: $model.scale) {
-                        Text("Small").tag(1)
-                        Text("Medium").tag(2)
-                        Text("Large").tag(4)
-                        Text("Giant").tag(8)
-                        Text("Colossal").tag(16)
+                    if Demos.supportsScale(model.demoName) {
+                        Picker("Size", selection: $model.scale) {
+                            Text("Small").tag(1)
+                            Text("Medium").tag(2)
+                            Text("Large").tag(4)
+                            Text("Giant").tag(8)
+                            Text("Colossal").tag(16)
+                        }
                     }
                     HStack {
                         Button(model.running ? "Pause" : "Play") {

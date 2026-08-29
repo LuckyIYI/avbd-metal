@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -18,6 +20,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 import cook_convex_asset as cooker
+import normalize_classic_obj as normalizer
 
 
 TETRA_OBJ = b"""\
@@ -105,6 +108,46 @@ class FakeCoACD:
 
 
 class ConvexAssetCookerTests(unittest.TestCase):
+    def test_classic_normalization_is_byte_deterministic_and_grounded(self) -> None:
+        parsed = cooker.parse_obj(TRANSLATED_TETRA_OBJ, "translated.obj")
+        first, first_offset = normalizer.normalized_mesh(parsed, 0.5, "y")
+        second, second_offset = normalizer.normalized_mesh(parsed, 0.5, "y")
+        self.assertEqual(first, second)
+        self.assertEqual(first_offset, second_offset)
+        self.assertAlmostEqual(min(point[2] for point in first.vertices), 0.0)
+        self.assertAlmostEqual(
+            min(point[0] for point in first.vertices)
+            + max(point[0] for point in first.vertices),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            min(point[1] for point in first.vertices)
+            + max(point[1] for point in first.vertices),
+            0.0,
+        )
+        source_hash = hashlib.sha256(TRANSLATED_TETRA_OBJ).hexdigest()
+        encoded = normalizer.encode_obj(
+            first,
+            label="Fixture",
+            source_sha256=source_hash,
+            scale=0.5,
+            up_axis="y",
+            offset=first_offset,
+        )
+        self.assertEqual(
+            encoded,
+            normalizer.encode_obj(
+                second,
+                label="Fixture",
+                source_sha256=source_hash,
+                scale=0.5,
+                up_axis="y",
+                offset=second_offset,
+            ),
+        )
+        with self.assertRaisesRegex(cooker.CookError, "positive"):
+            normalizer.normalized_mesh(parsed, 0.0, "y")
+
     def test_explicit_hull_cook_is_byte_deterministic(self) -> None:
         first = cooker.cook_asset(TETRA_OBJ, "fixture/tetra.obj", method="hull")
         second = cooker.cook_asset(TETRA_OBJ, "fixture/tetra.obj", method="hull")
@@ -621,6 +664,199 @@ v 0 0 1
                 for triangle in part["triangles"]
             )
             self.assertFalse(inside, "decomposition filled the authored U cavity")
+
+    def test_checked_classic_fixtures_are_grounded_and_budgeted(self) -> None:
+        asset_root = TOOLS.parent / "Sources/PhysicsAVBD/Assets"
+        source_root = asset_root / "classic"
+        convex_root = asset_root / "convex/classic"
+        expected = {
+            "stanford-bunny": {
+                "parts": 21,
+                "cap": 32,
+                "threshold": 0.12,
+                "preprocess": ("on", 80),
+                "sourceSHA256": (
+                    "e0f8157b25b0a876583b0205655471dbec6b6c47a8434c967387500818d8db1c"
+                ),
+                "geometrySHA256": (
+                    "85823815aef140cba4079077b3d836eb552acbde10aa849a2b74cd8e62286667"
+                ),
+                "digest": (
+                    "bacac8091e9e1eabea1183d9abfa2cfd298d93331d26bc8a8abc2d0287cd22a1"
+                ),
+                "assetSHA256": (
+                    "ba14d9486477f261d5f36f24f9b421b12012ff696f1a87da6b12690c4c2c3c77"
+                ),
+                "debugSHA256": (
+                    "ced184df11ee24214040743e0d1f2f6452949073c83a3e3d778c0ab9ca5f7814"
+                ),
+                "volume": 0.05160232787602581,
+            },
+            "stanford-dragon": {
+                "parts": 39,
+                "cap": 48,
+                "threshold": 0.055,
+                "preprocess": ("on", 100),
+                "sourceSHA256": (
+                    "a86bf3b22d299d5baae35493d2ff56794bd8c4518044c6a66c09757d1c674252"
+                ),
+                "geometrySHA256": (
+                    "4149f1efb0e9f694ba73c77f988297155298f4fd85be2f3c2d0aba77ff494e2f"
+                ),
+                "digest": (
+                    "eefb3d70331ae9b87ecedc367ec5e60ba9f647ddd040933152c9b0180fe5caa7"
+                ),
+                "assetSHA256": (
+                    "a1df287ac6a7debecfac19487b678859db274430484515d86a4ac5044770ec31"
+                ),
+                "debugSHA256": (
+                    "1bca90b7d0177506e278256dbb6a947ef126e7cd746f1d03af6d5f181fef7d1f"
+                ),
+                "volume": 0.06522370866605343,
+            },
+            "stanford-armadillo": {
+                "parts": 21,
+                "cap": 32,
+                "threshold": 0.04,
+                "preprocess": ("auto", 80),
+                "sourceSHA256": (
+                    "ce9866e4804c4ffee0fef5043aaf0d5f14780b6a5c13e948d8254e34771fde1a"
+                ),
+                "geometrySHA256": (
+                    "0de8c05b4418d7f10c6c1fed728b754e294d41f7461195c65723c55bfb0f2cb3"
+                ),
+                "digest": (
+                    "7e730459134ab092c5e9872c3e5a9e1404f7b3af681bc3e0a670ad16bf31ec48"
+                ),
+                "assetSHA256": (
+                    "0a02f6acb74f17518f1fe73db4c0e8eb3849f509d95992935e0c71ac86f9eaa0"
+                ),
+                "debugSHA256": (
+                    "38199c3279bfce1b51a1a7c633f6eb98d953b966193c1a758e006b532fc294c2"
+                ),
+                "volume": 0.02764676432707347,
+            },
+            "utah-teapot": {
+                "parts": 14,
+                "cap": 24,
+                "threshold": 0.025,
+                "preprocess": ("auto", 80),
+                "sourceSHA256": (
+                    "83591f7524e6626da5dd019aa85f76782cb1f07b601440f61224c24821f5c6b7"
+                ),
+                "geometrySHA256": (
+                    "20b499947ac63e917605e8107990c9fb08449b2635fbbe5e5afda912fe21b8f1"
+                ),
+                "digest": (
+                    "77461425636283ed3a21e51dbe329feda1f28ff9aa34984d7662126f3767a1ba"
+                ),
+                "assetSHA256": (
+                    "c284d669a4fb8994839df4deef00b35d8a7db7fe42c1bc902733975e8816e8be"
+                ),
+                "debugSHA256": (
+                    "22e59f788d80c3c494f8d725123331bc5a2266a823b5b3ebd35a2ec959c13147"
+                ),
+                "volume": 0.15818233663594583,
+            },
+        }
+        total_parts = 0
+        for name, fixture in expected.items():
+            with self.subTest(asset=name):
+                source_path = source_root / f"{name}.obj"
+                asset_path = convex_root / f"{name}.avbdconvex.json"
+                debug_path = convex_root / f"{name}.debug.obj"
+                asset = cooker.verify_asset_file(
+                    asset_path, source_path, debug_path
+                )
+                parameters = asset["cooker"]["parameters"]
+                source = asset["source"]
+                self.assertEqual(len(asset["parts"]), fixture["parts"])
+                self.assertLess(len(asset["parts"]), fixture["cap"])
+                self.assertEqual(parameters["maxHulls"], fixture["cap"])
+                self.assertEqual(parameters["maxVerticesPerHull"], 24)
+                self.assertAlmostEqual(
+                    parameters["thresholdMeters"], fixture["threshold"], places=7
+                )
+                self.assertEqual(
+                    (
+                        parameters["coacdPreprocessMode"],
+                        parameters["coacdPreprocessResolution"],
+                    ),
+                    fixture["preprocess"],
+                )
+                self.assertEqual(source["bakedScale"], [1.0, 1.0, 1.0])
+                self.assertEqual(source["upAxis"], "z")
+                self.assertEqual(source["uri"], f"classic/{name}.obj")
+                self.assertEqual(source["sha256"], fixture["sourceSHA256"])
+                self.assertEqual(
+                    source["geometrySHA256"], fixture["geometrySHA256"]
+                )
+                self.assertEqual(asset["digest"], fixture["digest"])
+                self.assertEqual(
+                    hashlib.sha256(asset_path.read_bytes()).hexdigest(),
+                    fixture["assetSHA256"],
+                )
+                self.assertEqual(
+                    hashlib.sha256(debug_path.read_bytes()).hexdigest(),
+                    fixture["debugSHA256"],
+                )
+                self.assertLess(asset_path.stat().st_size, 256 * 1024)
+                self.assertLess(debug_path.stat().st_size, 128 * 1024)
+
+                mesh = cooker.parse_obj(source_path.read_bytes(), str(source_path))
+                bounds_min = [
+                    min(point[axis] for point in mesh.vertices)
+                    for axis in range(3)
+                ]
+                bounds_max = [
+                    max(point[axis] for point in mesh.vertices)
+                    for axis in range(3)
+                ]
+                self.assertAlmostEqual(bounds_min[2], 0.0, places=6)
+                self.assertAlmostEqual(bounds_min[0] + bounds_max[0], 0.0, places=6)
+                self.assertAlmostEqual(bounds_min[1] + bounds_max[1], 0.0, places=6)
+                self.assertGreater(bounds_max[2], 0.6)
+                self.assertLess(bounds_max[2], 0.8)
+
+                volume = sum(part["volume"] for part in asset["parts"])
+                self.assertAlmostEqual(volume, fixture["volume"], places=12)
+                self.assertTrue(math.isfinite(volume))
+                self.assertGreater(volume, 0.0)
+                compound_bounds_min = [
+                    min(part["boundsMin"][axis] for part in asset["parts"])
+                    for axis in range(3)
+                ]
+                compound_bounds_max = [
+                    max(part["boundsMax"][axis] for part in asset["parts"])
+                    for axis in range(3)
+                ]
+                center_of_mass = [
+                    sum(
+                        part["volume"] * part["centroid"][axis]
+                        for part in asset["parts"]
+                    ) / volume
+                    for axis in range(3)
+                ]
+                for axis in range(3):
+                    self.assertTrue(math.isfinite(center_of_mass[axis]))
+                    self.assertLessEqual(
+                        compound_bounds_min[axis], center_of_mass[axis]
+                    )
+                    self.assertGreaterEqual(
+                        compound_bounds_max[axis], center_of_mass[axis]
+                    )
+                self.assertTrue(all(
+                    4 <= len(part["vertices"]) <= 24
+                    and 4 <= len(part["triangles"])
+                    <= cooker.MAX_TRIANGLES_PER_HULL
+                    and part["volume"] > 0.0
+                    and part["boundingRadius"] > 0.0
+                    for part in asset["parts"]
+                ))
+                total_parts += len(asset["parts"])
+
+        self.assertEqual(total_parts, 95)
+        self.assertLessEqual(total_parts, 96)
 
 
 if __name__ == "__main__":

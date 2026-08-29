@@ -74,12 +74,41 @@ the following restrictions:
    misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.
 
+## Stanford 3D Scanning Repository models
+
+The bundled Stanford Bunny, Dragon, and Armadillo visual meshes, cooked
+collision compounds, and debug meshes are derivatives of scan reconstructions
+published by the Stanford University Computer Graphics Laboratory.
+
+Stanford permits research use and free redistribution with acknowledgement,
+but prohibits commercial use and inclusion in a product for sale without its
+permission, except for scholarly journals and books. These assets are not
+covered by this repository's software license. Exact source and derivative
+hashes are recorded in
+`Sources/PhysicsAVBD/Assets/classic/PROVENANCE.md`.
+
+Official terms and credits:
+<https://graphics.stanford.edu/data/3Dscanrep/>
+
+Stanford asks users to remember that the Dragon is a symbol of Chinese culture.
+The bundled model is used only as a passive, static tabletop object; AVBD does
+not author animation for it.
+
+## Solid Utah Teapot
+
+The bundled Utah Teapot is derived from the solid STL published by Nik Clark
+(`zzubnik`) under the Creative Commons CC0 1.0 Universal public-domain
+dedication.
+
+- Source: <https://commons.wikimedia.org/wiki/File:Utah_teapot_(solid).stl>
+- CC0 1.0: <https://creativecommons.org/publicdomain/zero/1.0/>
+
 ## CoACD
 
 `Tools/cook_convex_asset.py` can invoke an independently installed, exact-version
 CoACD Python package to generate offline convex compounds. CoACD is not vendored,
 linked into, or required by the simulator and app. The checked-in demonstration
-asset records CoACD `1.0.11`, its full parameters, seed, and source hash.
+assets record CoACD `1.0.11`, their full parameters, seed, and source hashes.
 
 Copyright (c) 2022 Xinyue Wei, Minghua Liu.
 
