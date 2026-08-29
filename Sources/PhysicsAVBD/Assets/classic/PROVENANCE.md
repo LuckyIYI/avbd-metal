@@ -193,5 +193,6 @@ expected compound digests. The full cook was then repeated into a temporary
 directory and both JSON and debug OBJ were byte-compared with the checked-in
 files.
 
-The Dragon has no rig, motion, or animation data. It is loaded only as a static
-visual mesh attached to a passive rigid body in the classic tabletop scene.
+The Dragon has no rig, motion, morph, or deformation data. In the classic
+tabletop scene it remains an intact rigid mesh; the simulator changes only its
+whole-body pose, like moving a physical reproduction of the scanned object.

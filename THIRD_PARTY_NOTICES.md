@@ -91,8 +91,9 @@ Official terms and credits:
 <https://graphics.stanford.edu/data/3Dscanrep/>
 
 Stanford asks users to remember that the Dragon is a symbol of Chinese culture.
-The bundled model is used only as a passive, static tabletop object; AVBD does
-not author animation for it.
+AVBD keeps the bundled model intact and undeformed. Its tabletop rigid-body
+demo changes only the object's whole-body pose under physics, analogous to
+moving a physical reproduction of the scanned object.
 
 ## Solid Utah Teapot
 

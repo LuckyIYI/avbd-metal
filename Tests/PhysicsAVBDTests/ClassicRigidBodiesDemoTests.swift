@@ -83,12 +83,13 @@ final class ClassicRigidBodiesDemoTests: XCTestCase {
 
         let dynamic = zip(Demos.classicRigidBodySpecs, scene.rigidMeshes)
             .filter { $0.0.isDynamic }
-        XCTAssertEqual(dynamic.count, 3)
+        XCTAssertEqual(dynamic.count, 4)
         let dragon = try XCTUnwrap(zip(
             Demos.classicRigidBodySpecs, scene.rigidMeshes
         ).first { $0.0.assetName == "stanford-dragon" })
-        XCTAssertFalse(scene.bodies[dragon.1.body].isDynamic,
-                       "the culturally restricted Stanford Dragon must stay static")
+        XCTAssertTrue(scene.bodies[dragon.1.body].isDynamic)
+        XCTAssertEqual(try XCTUnwrap(scene.bodies[dragon.1.body].mass),
+                       dragon.0.targetMass, accuracy: 1e-6)
         XCTAssertGreaterThanOrEqual(scene.convexAssets.count, 4)
     }
 
@@ -99,11 +100,9 @@ final class ClassicRigidBodiesDemoTests: XCTestCase {
             Demos.classicRigidBodySpecs, scene.rigidMeshes
         ).map { (spec: $0.0, body: $0.1.body) }
         let dynamic = instances.filter { $0.0.isDynamic }
-        let staticDragon = try XCTUnwrap(instances.first { !$0.0.isDynamic })
         let initialPositions = Dictionary(uniqueKeysWithValues: dynamic.map {
             ($0.body, scene.bodies[$0.body].position)
         })
-        let initialDragonPosition = scene.bodies[staticDragon.body].position
         let tableTopBody = try XCTUnwrap(scene.colliders.first { collider in
             collider.convexAssetID == nil
                 && length(collider.size - Demos.classicRigidTableTopSize) < 1e-6
@@ -164,12 +163,6 @@ final class ClassicRigidBodiesDemoTests: XCTestCase {
             XCTAssertLessThan(length(solver.bodyAngularVelocity(body)), 0.8,
                               "\(spec.assetName) kept spinning")
         }
-        XCTAssertEqual(
-            length(solver.bodyPosition(staticDragon.body)
-                - initialDragonPosition),
-            0, accuracy: 1e-7,
-            "Stanford Dragon must remain static"
-        )
     }
 
     private func requireMetal() throws {

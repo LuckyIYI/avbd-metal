@@ -23,10 +23,8 @@ extension Demos {
             assetName: "stanford-bunny", isDynamic: true, targetMass: 1.8,
             slot: F3(-3.0, -0.52, 0), yaw: 0.18,
             color: F3(0.32, 0.52, 0.92)),
-        // Stanford asks that the culturally significant Dragon not be
-        // animated. It remains a collidable static display object here.
         ClassicRigidBodySpec(
-            assetName: "stanford-dragon", isDynamic: false, targetMass: 0,
+            assetName: "stanford-dragon", isDynamic: true, targetMass: 2.6,
             slot: F3(-1.0, 0.50, 0), yaw: -0.20,
             color: F3(0.18, 0.68, 0.48)),
         ClassicRigidBodySpec(

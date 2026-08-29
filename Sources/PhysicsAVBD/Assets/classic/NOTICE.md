@@ -17,8 +17,9 @@ Official terms and credits:
 <https://graphics.stanford.edu/data/3Dscanrep/>
 
 Stanford also asks users to remember that the Dragon is a symbol of Chinese
-culture. AVBD presents it only as a passive, static visual/collision model in a
-tabletop physics scene. This repository does not author animation for it.
+culture. AVBD keeps its mesh intact and undeformed. In the tabletop rigid-body
+scene only the whole-body pose changes under physics, analogous to moving a
+physical reproduction of the scanned object.
 
 These restrictions apply to the original meshes and to the normalized visual
 meshes, cooked collision compounds, and debug meshes derived from them.
