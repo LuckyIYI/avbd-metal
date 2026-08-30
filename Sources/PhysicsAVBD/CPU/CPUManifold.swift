@@ -120,6 +120,7 @@ public final class CPUManifold: CPUForce {
         } else {
             count = Self.collide(
                 bodyA, bodyB, margin: solver.collisionMargin,
+                patchContacts: solver.spherePatchContacts,
                 &newContacts, &basis)
         }
 

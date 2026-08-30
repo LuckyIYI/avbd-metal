@@ -196,6 +196,8 @@ public final class CPUSolver {
     public var gravity: Float = -10.0
     public var iterations: Int = 10
     public var collisionMargin: Float = AVBDConstants.collisionMargin
+    /// See `SimSettings.spherePatchContacts`.
+    public var spherePatchContacts: Bool = false
     /// A numerical narrow-phase failure is terminal. The legacy nonthrowing
     /// `step()` API remains source-compatible and becomes a no-op after the
     /// first failure; callers that need immediate propagation use

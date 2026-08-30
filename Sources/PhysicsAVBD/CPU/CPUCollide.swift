@@ -412,6 +412,7 @@ extension CPUManifold {
     /// (rows n, t1, t2) with the normal pointing from B toward A.
     static func collide(_ bodyA: CPURigid, _ bodyB: CPURigid,
                         margin: Float = AVBDConstants.collisionMargin,
+                        patchContacts: Bool = false,
                         _ contacts: inout [ContactPoint],
                         _ basisOut: inout (F3, F3, F3)) -> Int {
         switch (bodyA.shape, bodyB.shape) {
@@ -421,11 +422,11 @@ extension CPUManifold {
         case (.sphere, .box):
             return collideSphereBox(
                 bodyA, bodyB, sphereIsA: true, margin: margin,
-                &contacts, &basisOut)
+                patchContacts: patchContacts, &contacts, &basisOut)
         case (.box, .sphere):
             return collideSphereBox(
                 bodyB, bodyA, sphereIsA: false, margin: margin,
-                &contacts, &basisOut)
+                patchContacts: patchContacts, &contacts, &basisOut)
         case (.box, .box):
             return collideBoxBox(bodyA, bodyB, &contacts, &basisOut)
         case (.torus, .sphere):
@@ -502,6 +503,7 @@ extension CPUManifold {
     /// sphere vs box; `sphereIsA` says whether the sphere is manifold body A.
     static func collideSphereBox(_ sphere: CPURigid, _ box: CPURigid,
                                  sphereIsA: Bool, margin: Float,
+                                 patchContacts: Bool = false,
                                  _ contacts: inout [ContactPoint],
                                  _ basisOut: inout (F3, F3, F3)) -> Int {
         contacts.removeAll(keepingCapacity: true)
@@ -538,19 +540,46 @@ extension CPUManifold {
         // Manifold normal must point B -> A
         let n = sphereIsA ? nW : -nW
         basisOut = orthonormalBasis(n)
-        var c = ContactPoint()
-        c.featureKey = 0
-        let xA = sphereIsA ? xSphere : qW
-        let xB = sphereIsA ? qW : xSphere
         let bodyA = sphereIsA ? sphere : box
         let bodyB = sphereIsA ? box : sphere
-        // sphere side: world offset; box side: material (local) anchor
-        c.rA = bodyA.shape == .sphere ? xA - bodyA.positionLin
-                                      : rotate(bodyA.positionAng.conjugate, xA - bodyA.positionLin)
-        c.rB = bodyB.shape == .sphere ? xB - bodyB.positionLin
-                                      : rotate(bodyB.positionAng.conjugate, xB - bodyB.positionLin)
-        contacts.append(c)
-        return 1
+        func append(_ xA: F3, _ xB: F3, _ key: Int32) {
+            var c = ContactPoint()
+            c.featureKey = key
+            // sphere side: world offset; box side: material (local) anchor
+            c.rA = bodyA.shape == .sphere ? xA - bodyA.positionLin
+                : rotate(bodyA.positionAng.conjugate, xA - bodyA.positionLin)
+            c.rB = bodyB.shape == .sphere ? xB - bodyB.positionLin
+                : rotate(bodyB.positionAng.conjugate, xB - bodyB.positionLin)
+            contacts.append(c)
+        }
+        append(sphereIsA ? xSphere : qW, sphereIsA ? qW : xSphere, 0)
+        // PAD PATCH (mirrors the GPU narrow phase): a sphere on a face is a
+        // point, and point friction cannot resist spin about its own
+        // normal, so a two-finger grasp holds the ball on an axle. A small
+        // ring of contacts on the face, each paired with the sphere surface
+        // point above it, gives friction the lever arms of a real pad.
+        var faceAxis = 0
+        if abs(nLocal.y) > abs(nLocal[faceAxis]) { faceAxis = 1 }
+        if abs(nLocal.z) > abs(nLocal[faceAxis]) { faceAxis = 2 }
+        if patchContacts, abs(nLocal[faceAxis]) > 0.99 {
+            let u = (faceAxis + 1) % 3, v = (faceAxis + 2) % 3
+            let rp = min(0.4 * r, 0.006)
+            let ring: [(Float, Float)] = [(1, 0), (-0.5, 0.866), (-0.5, -0.866)]
+            for (k, off) in ring.enumerated() {
+                var pl = qLocal
+                pl[u] = min(max(qLocal[u] + rp * off.0, -half[u]), half[u])
+                pl[v] = min(max(qLocal[v] + rp * off.1, -half[v]), half[v])
+                let pw = transform(box.positionLin, box.positionAng, pl)
+                let dpc = pw - sphere.positionLin
+                let lat = dpc - nW * dot(dpc, nW)
+                let rho2 = length_squared(lat)
+                if rho2 > 0.64 * r * r || rho2 < 1e-10 { continue }
+                let h = (max(r * r - rho2, 0)).squareRoot()
+                let xs = sphere.positionLin + lat - nW * h
+                append(sphereIsA ? xs : pw, sphereIsA ? pw : xs, Int32(k + 1))
+            }
+        }
+        return contacts.count
     }
 
     /// SAT OBB-OBB collision. Returns contact count; fills basis (rows n, t1, t2).
@@ -892,7 +921,10 @@ extension CPUManifold {
                 if dist - rc > margin { continue }
                 n = d / dist
             }
-            if found.contains(where: { length($0.q - q) < 0.3 * rc + 0.05 }) { continue }
+            // Scale-aware dedup: a flat 5 cm radius is longer than a
+            // short capsule, collapsing every seed onto one contact point.
+            let dedupR = 0.3 * rc + min(0.05, 0.25 * length(p1 - p0) / 2)
+            if found.contains(where: { length($0.q - q) < dedupR }) { continue }
             found.append((q, bw, n))
         }
         if found.isEmpty { return 0 }

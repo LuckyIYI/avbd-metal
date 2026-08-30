@@ -3284,6 +3284,7 @@ public final class GPUSolver {
         params.frame = UInt32(truncatingIfNeeded: frameIndex)
         params.frictionCombineMode = settings.frictionCombineMode.rawValue
         params.collisionMargin = max(settings.collisionMargin, 0)
+        params.spherePatchContacts = settings.spherePatchContacts ? 1 : 0
         params.rigidLinearDamping = max(settings.rigidLinearDamping, 0)
         params.rigidAngularDamping = max(settings.rigidAngularDamping, 0)
         let effectiveTruncationMode = effectiveSurfaceTruncationMode
@@ -6277,6 +6278,25 @@ public final class GPUSolver {
     /// the contact margin while carrying essentially no support force; the
     /// accumulated `-lambda.x` separates that state from a load-bearing
     /// contact without using geometric height heuristics.
+    /// Contact-point count per active rigid manifold. Companion to
+    /// `activeRigidContactNormalLoads()`: the aggregate normal load cannot
+    /// tell a one-point contact from a patch, but the difference decides
+    /// whether friction has any moment arm about the contact normal.
+    public func activeRigidContactCounts()
+        -> [(bodyA: Int, bodyB: Int, contacts: Int)] {
+        sync()
+        let manifolds = prevManifolds.contents().bindMemory(
+            to: ManifoldGPU.self, capacity: maxPairs)
+        var result = [(bodyA: Int, bodyB: Int, contacts: Int)]()
+        for index in 0..<lastNumPairs where manifolds[index].header.z > 0 {
+            result.append((
+                bodyA: Int(manifolds[index].header.x),
+                bodyB: Int(manifolds[index].header.y),
+                contacts: Int(manifolds[index].header.z)))
+        }
+        return result
+    }
+
     public func activeRigidContactNormalLoads()
         -> [(bodyA: Int, bodyB: Int, normalLoad: Float)] {
         sync()

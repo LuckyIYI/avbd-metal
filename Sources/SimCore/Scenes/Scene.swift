@@ -527,6 +527,18 @@ public struct SimSettings {
     /// visibly permits geometry to settle below the rendered surface.
     public var collisionMargin: Float = 0.01
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
+    /// Generate a small contact PATCH where a sphere meets a flat face,
+    /// instead of the single geometric contact point.
+    ///
+    /// A point contact carries no moment arm about its own normal, so a
+    /// sphere held between two pads is free to spin about the grasp axis
+    /// however high the friction is - a two-finger grasp behaves like an
+    /// axle. The patch models the flattening a real elastic pad undergoes.
+    ///
+    /// Off by default: it adds three contacts per sphere-face pair, which
+    /// changes the dynamics (and cost) of every existing sphere-footed rig.
+    /// Manipulation scenes that grasp balls want it on.
+    public var spherePatchContacts: Bool = false
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note
     // calls the higher, unit-split betas "a minor upgrade from the paper");

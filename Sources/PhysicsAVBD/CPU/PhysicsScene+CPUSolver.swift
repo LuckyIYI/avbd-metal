@@ -80,6 +80,7 @@ public extension PhysicsScene {
         solver.gamma = settings.gamma
         solver.lambdaMax = settings.lambdaMax
         solver.collisionMargin = max(settings.collisionMargin, 0)
+        solver.spherePatchContacts = settings.spherePatchContacts
         solver.frictionCombineMode = settings.frictionCombineMode
         solver.rigidLinearDamping = settings.rigidLinearDamping
         solver.rigidAngularDamping = settings.rigidAngularDamping
