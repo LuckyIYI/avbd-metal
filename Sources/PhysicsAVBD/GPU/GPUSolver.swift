@@ -52,6 +52,8 @@ public final class GPUSolver {
     public let convexColliderCount: Int
     private let enabledConvexColliderCount: Int
     private let hasPotentialRigidConvexPair: Bool
+    private let hasPotentialAnalyticSphereBoxPair: Bool
+    private let hasPotentialAnalyticCapsuleBoxPair: Bool
     let numJoints: Int
     let numSprings: Int
     let numTets: Int
@@ -335,6 +337,7 @@ public final class GPUSolver {
         "np_collide",
         "np_collide_analytic_compat",
         "np_collide_convex",
+        "np_collide_enhanced_analytic",
         "ogc_bounds_refresh",
         "ogc_refresh_args",
         "pm_clear",
@@ -1172,6 +1175,29 @@ public final class GPUSolver {
                 scene.canPotentiallyCollide(colliderA: hull, colliderB: other)
             }
         }
+        let analyticColliderIndices = scene.colliders.indices.filter {
+            scene.colliders[$0].collisionEnabled
+                && convexUpload.colliderAssetIDs[$0] == UInt32.max
+        }
+        func hasPotentialAnalyticPair(
+            _ first: BodyShape, _ second: BodyShape
+        ) -> Bool {
+            let firstIndices = analyticColliderIndices.filter {
+                scene.colliders[$0].shape == first
+            }
+            let secondIndices = analyticColliderIndices.filter {
+                scene.colliders[$0].shape == second
+            }
+            return firstIndices.contains { a in
+                secondIndices.contains { b in
+                    scene.canPotentiallyCollide(colliderA: a, colliderB: b)
+                }
+            }
+        }
+        self.hasPotentialAnalyticSphereBoxPair = hasPotentialAnalyticPair(
+            .sphere, .box)
+        self.hasPotentialAnalyticCapsuleBoxPair = hasPotentialAnalyticPair(
+            .capsule, .box)
         self.convexDebugGeometries = convexUpload.debugGeometries
         self.convexDebugInstances = convexUpload.debugInstances
         self.convexDebugTriangleVertexCount =
@@ -3426,6 +3452,11 @@ public final class GPUSolver {
     var usesHullFreeAnalyticCompatibilityKernelForTesting: Bool {
         !hasPotentialRigidConvexPair
     }
+    var usesEnhancedAnalyticNarrowPhaseForTesting: Bool {
+        hasPotentialAnalyticCapsuleBoxPair
+            || (settings.spherePatchContacts
+                && hasPotentialAnalyticSphereBoxPair)
+    }
 
     private var planarDATBodyPairStorageBytes: Int {
         max(16, maxPlanarDATPairs * 4 * MemoryLayout<UInt32>.stride)
@@ -4943,10 +4974,10 @@ public final class GPUSolver {
         try stage("narrowphase")
         // Hull-free scenes retain the exact established 22-buffer analytic
         // kernel: wrapping its body in the expanded generic template changes
-        // Metal fast-math codegen enough to regress the gear train. Mixed
-        // scenes use the generic split below; its analytic specialization
-        // skips hull pairs and its convex specialization skips analytic pairs,
-        // so each stable pair/manifold slot still has exactly one writer.
+        // Metal fast-math codegen enough to regress the gear train. Semantics
+        // added later run as a disjoint overlay over only the affected pair
+        // kinds, overwriting those stable manifold slots without perturbing
+        // any ordinary pair. Mixed hull scenes use the generic split below.
         func bindNarrowphase(_ e: MTLComputeCommandEncoder) {
             e.setBuffer(self.posLin, offset: 0, index: 0)
             e.setBuffer(self.posAng, offset: 0, index: 1)
@@ -5007,12 +5038,19 @@ public final class GPUSolver {
                 e.setBuffer(self.convexHullVertices, offset: 0, index: 20)
                 e.setBuffer(self.colliderFriction, offset: 0, index: 21)
             }
+            if usesEnhancedAnalyticNarrowPhaseForTesting {
+                dispatchIndirect(
+                    enc, "np_collide_enhanced_analytic", argsOffset: 0,
+                    bindNarrowphase)
+            }
         } else {
             dispatchIndirect(
                 enc, "np_collide", argsOffset: 0, bindNarrowphase)
-            dispatchIndirect(
-                enc, "np_collide_convex", argsOffset: 0,
-                bindNarrowphase)
+            if hasPotentialRigidConvexPair {
+                dispatchIndirect(
+                    enc, "np_collide_convex", argsOffset: 0,
+                    bindNarrowphase)
+            }
         }
         if convexQueryFailureForTesting {
             dispatch1D(enc, "convex_query_fail_for_testing", 1) { e in

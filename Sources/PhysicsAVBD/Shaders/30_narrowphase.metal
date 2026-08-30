@@ -1330,6 +1330,116 @@ inline NPCPolyFace npcBestPolyFace(
     return best;
 }
 
+// A smooth sphere resting on a broad convex face needs a small contact patch
+// for torsional friction, just like the specialized sphere-box path. Build
+// the ring only when the query normal selects an actual supporting face and
+// keep every sample inside that face. The ring models a tiny compliant
+// flattened footprint: all samples retain the exact witness's normal
+// separation so they carry load. Edge/vertex contacts remain a single exact
+// support witness.
+inline int npcBuildSphereFacePatch(
+    thread const NPCShape& a, thread const NPCShape& b,
+    thread const NPCResult& result, float3 normalAtoB,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexFaceGPU* convexFaces,
+    device const uint* convexFaceVertexIndices,
+    device const float4* convexHullVertices,
+    thread NPCManifoldContact* output)
+{
+    bool sphereIsA = a.kind == 1u && (b.kind == 0u || b.kind == 4u);
+    bool sphereIsB = b.kind == 1u && (a.kind == 0u || a.kind == 4u);
+    if (!sphereIsA && !sphereIsB) return 0;
+
+    NPCShape sphere = sphereIsA ? a : b;
+    NPCShape polyhedron = sphereIsA ? b : a;
+    float3 faceNormal = sphereIsA ? -normalAtoB : normalAtoB;
+    float alignment;
+    NPCPolyFace face = npcBestPolyFace(
+        polyhedron, faceNormal, colliderConvexAssetID,
+        convexHulls, convexFaces, alignment);
+    if (!face.valid || alignment < 0.99f) return 0;
+
+    output[0].pointA = result.pointA;
+    output[0].pointB = result.pointB;
+    output[0].features = uint2(result.featureA, result.featureB);
+    int count = 1;
+
+    float3 centroid = float3(0);
+    for (uint index = 0u; index < face.count; index++) {
+        uint feature;
+        centroid += npcPolyFaceVertex(
+            polyhedron, face, index, colliderConvexAssetID,
+            convexHulls, convexFaceVertexIndices, convexHullVertices,
+            feature);
+    }
+    centroid /= float(face.count);
+
+    float3 facePoint = sphereIsA ? result.pointB : result.pointA;
+    float3 sphereWitness = sphereIsA ? result.pointA : result.pointB;
+    float normalSeparation = dot(sphereWitness - facePoint, faceNormal);
+    facePoint -= faceNormal * (dot(faceNormal, facePoint) - face.distance);
+    float radius = sphere.dimensions.x * 0.5f;
+    if (!finite_bits(radius) || radius <= 0.0f) return 0;
+    float patchRadius = min(0.4f * radius, 0.006f);
+    float3 tangentU, tangentV;
+    orthonormal(faceNormal, tangentU, tangentV);
+    const float2 ring[3] = {
+        float2(1.0f, 0.0f),
+        float2(-0.5f, 0.8660254f),
+        float2(-0.5f, -0.8660254f),
+    };
+    float scale = max(fabs(polyhedron.dimensions.w), 1.0e-3f);
+    float insideTolerance = max(1.0e-10f, 1.0e-6f * scale * scale);
+    uint faceFeature = npcFaceFeature(polyhedron, face.localIndex);
+    uint sphereFeature = NPC_FEATURE_SMOOTH | 1u;
+
+    for (uint ringIndex = 0u; ringIndex < 3u; ringIndex++) {
+        float3 hullPoint = facePoint
+            + patchRadius * (ring[ringIndex].x * tangentU
+                             + ring[ringIndex].y * tangentV);
+        bool inside = true;
+        for (uint edge = 0u; edge < face.count; edge++) {
+            uint feature0, feature1;
+            float3 p0 = npcPolyFaceVertex(
+                polyhedron, face, edge, colliderConvexAssetID,
+                convexHulls, convexFaceVertexIndices, convexHullVertices,
+                feature0);
+            float3 p1 = npcPolyFaceVertex(
+                polyhedron, face, (edge + 1u) % face.count,
+                colliderConvexAssetID, convexHulls,
+                convexFaceVertexIndices, convexHullVertices, feature1);
+            float centroidSide = dot(cross(p1 - p0, centroid - p0), faceNormal);
+            float pointSide = dot(cross(p1 - p0, hullPoint - p0), faceNormal);
+            if ((centroidSide >= 0.0f && pointSide < -insideTolerance)
+                || (centroidSide < 0.0f && pointSide > insideTolerance)) {
+                inside = false;
+                break;
+            }
+        }
+        if (!inside) continue;
+
+        float3 centerToFace = hullPoint - sphere.center;
+        float3 lateral = centerToFace
+            - faceNormal * dot(centerToFace, faceNormal);
+        float rhoSquared = dot(lateral, lateral);
+        if (rhoSquared <= 1.0e-10f
+            || rhoSquared > 0.64f * radius * radius) continue;
+        float3 spherePoint = hullPoint + faceNormal * normalSeparation;
+        uint ringFeature = ringIndex + 1u;
+        uint2 features = sphereIsA
+            ? uint2(npcMixFeature(sphereFeature, ringFeature),
+                    npcMixFeature(faceFeature, ringFeature))
+            : uint2(npcMixFeature(faceFeature, ringFeature),
+                    npcMixFeature(sphereFeature, ringFeature));
+        output[count].pointA = sphereIsA ? spherePoint : hullPoint;
+        output[count].pointB = sphereIsA ? hullPoint : spherePoint;
+        output[count].features = features;
+        count++;
+    }
+    return count;
+}
+
 inline int npcClipPolygon(
     thread const NPCClipVertex* input, int inputCount,
     float3 planeNormal, float planeDistance, uint referenceFeature,
@@ -1807,7 +1917,7 @@ struct TorusHit {
 // not retain MPR/GJK, clipping workspaces, or convex-only buffer accesses in
 // its generated code. Both passes still consume the same deterministic pair
 // stream and address the same manifold slot by `gid`.
-template <bool CONVEX_PASS>
+template <bool CONVEX_PASS, bool ENHANCED_ANALYTIC_ONLY>
 inline void npCollidePass(
     device const float4* posLin,
     device const float4* posAng,
@@ -1846,6 +1956,19 @@ inline void npCollidePass(
 
     uint2 pair = pairs[gid];
     uint ia = pair.x, ib = pair.y;
+    if (ENHANCED_ANALYTIC_ONLY) {
+        // Keep the overlay at two kind loads for every unaffected pair. The
+        // expensive owner/pose/velocity/OBB prologue below runs only for the
+        // capsule-box and opt-in sphere-box slots that this pass owns.
+        uint earlyA = shapeType[ia] & SHAPE_KIND_MASK;
+        uint earlyB = shapeType[ib] & SHAPE_KIND_MASK;
+        bool capsuleBox = (earlyA == 3u && earlyB == 0u)
+            || (earlyB == 3u && earlyA == 0u);
+        bool patchedSphereBox = P.spherePatchContacts != 0u
+            && ((earlyA == 1u && earlyB == 0u)
+                || (earlyB == 1u && earlyA == 0u));
+        if (!capsuleBox && !patchedSphereBox) return;
+    }
     uint ba = colliderOwner[ia], bb = colliderOwner[ib];
 
     float4 bodyPA4 = posLin[ba];
@@ -2001,6 +2124,13 @@ inline void npCollidePass(
                 colliderConvexAssetID, convexHulls, convexFaces,
                 convexFaceVertexIndices, convexEdges, convexContacts,
                 convexEdgePairTests);
+        }
+        if (contactCount == 0 && P.spherePatchContacts != 0u) {
+            contactCount = npcBuildSphereFacePatch(
+                convexA, convexB, result, normalAtoB,
+                colliderConvexAssetID, convexHulls, convexFaces,
+                convexFaceVertexIndices, convexHullVertices,
+                convexContacts);
         }
         if (convexEdgePairTests > 0u) {
             atomic_fetch_add_explicit(
@@ -2641,15 +2771,17 @@ inline void npCollidePass(
             // a gripped ball spins freely about the grasp axis, so a two-
             // finger grasp behaves like an axle rather than a hold. Real
             // pads flatten into a patch; model it as a small ring of
-            // contacts on the face, each paired with the sphere surface
-            // point above it, so the ring engages the true curved surface
-            // rather than faking a flat.
+            // contacts on the face. The opt-in pad is a tiny compliant
+            // flattened footprint: every ring sample retains the exact
+            // witness's normal separation, so it carries normal load and
+            // supplies a torsional friction lever arm.
             int faceAxis = fabs(nLocal.x) > 0.9f ? 0
                          : (fabs(nLocal.y) > 0.9f ? 1 : 2);
             if (P.spherePatchContacts != 0u
                 && fabs(nLocal[faceAxis]) > 0.99f) {
                 int u = (faceAxis + 1) % 3, v = (faceAxis + 2) % 3;
                 float rp = min(0.4f * r, 0.006f);
+                float normalSeparation = dot(xSphere - qW, nW);
                 const float2 ring[3] = { float2(1.0f, 0.0f),
                                          float2(-0.5f, 0.866f),
                                          float2(-0.5f, -0.866f) };
@@ -2664,8 +2796,7 @@ inline void npCollidePass(
                     float3 lat = dpc - nW * dot(dpc, nW);
                     float rho2 = dot(lat, lat);
                     if (rho2 > 0.64f * r * r || rho2 < 1e-10f) continue;
-                    float h = sqrt(max(r * r - rho2, 0.0f));
-                    float3 xs = sphereC + lat - nW * h;
+                    float3 xs = pw + nW * normalSeparation;
                     contacts[count].xA = sIsA ? xs : pw;
                     contacts[count].xB = sIsA ? pw : xs;
                     contacts[count].feature = uint(count);
@@ -2983,7 +3114,55 @@ kernel void np_collide(
     device atomic_uint* convexQueryPoison [[buffer(29)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    npCollidePass<false>(
+    npCollidePass<false, false>(
+        posLin, posAng, shape, props, pairs, counters, manifolds,
+        prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
+        velLin, velAng, colliderOwner, colliderLocalPosition,
+        colliderLocalRotation, colliderHullRange, convexHullVertices,
+        colliderFriction, colliderConvexAssetID, convexHulls, convexFaces,
+        convexFaceVertexIndices, convexEdges, contactFeatures,
+        prevContactFeatures, convexQueryPoison, gid);
+}
+
+// The byte-frozen compatibility kernel owns every ordinary hull-free pair.
+// This disjoint overlay revisits only pairs whose semantics intentionally
+// changed, then overwrites that pair's stable manifold slot. Keeping the
+// overlay compile-time narrow prevents unrelated fast-math trajectories from
+// changing merely because a scene contains a capsule or enables sphere pads.
+kernel void np_collide_enhanced_analytic(
+    device const float4* posLin     [[buffer(0)]],
+    device const float4* posAng     [[buffer(1)]],
+    device const float4* shape      [[buffer(2)]],
+    device const float4* props      [[buffer(3)]],
+    device const uint2* pairs       [[buffer(4)]],
+    device atomic_uint* counters    [[buffer(5)]],
+    device ManifoldGPU* manifolds   [[buffer(6)]],
+    device const ManifoldGPU* prevManifolds [[buffer(7)]],
+    device const atomic_uint* mapKeyA [[buffer(8)]],
+    device const uint* mapKeyB      [[buffer(9)]],
+    device const uint* mapVal       [[buffer(10)]],
+    constant SimParams& P           [[buffer(11)]],
+    device const uint* shapeType    [[buffer(12)]],
+    device const float4* spinVel    [[buffer(13)]],
+    device const float4* velLin     [[buffer(14)]],
+    device const float4* velAng     [[buffer(15)]],
+    device const uint* colliderOwner [[buffer(16)]],
+    device const float4* colliderLocalPosition [[buffer(17)]],
+    device const float4* colliderLocalRotation [[buffer(18)]],
+    device const uint2* colliderHullRange [[buffer(19)]],
+    device const float4* convexHullVertices [[buffer(20)]],
+    device const float2* colliderFriction [[buffer(21)]],
+    device const uint* colliderConvexAssetID [[buffer(22)]],
+    device const ConvexHullGPU* convexHulls [[buffer(23)]],
+    device const ConvexFaceGPU* convexFaces [[buffer(24)]],
+    device const uint* convexFaceVertexIndices [[buffer(25)]],
+    device const ConvexEdgeGPU* convexEdges [[buffer(26)]],
+    device uint2* contactFeatures [[buffer(27)]],
+    device const uint2* prevContactFeatures [[buffer(28)]],
+    device atomic_uint* convexQueryPoison [[buffer(29)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    npCollidePass<false, true>(
         posLin, posAng, shape, props, pairs, counters, manifolds,
         prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
         velLin, velAng, colliderOwner, colliderLocalPosition,
@@ -3026,7 +3205,7 @@ kernel void np_collide_convex(
     device atomic_uint* convexQueryPoison [[buffer(29)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    npCollidePass<true>(
+    npCollidePass<true, false>(
         posLin, posAng, shape, props, pairs, counters, manifolds,
         prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
         velLin, velAng, colliderOwner, colliderLocalPosition,

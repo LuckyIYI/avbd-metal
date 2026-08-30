@@ -375,12 +375,7 @@ kernel void np_collide_analytic_compat(
                 }
                 bool dup = false;
                 for (int h = 0; h < nh; h++) {
-                    // Scale-aware: a flat 5 cm dedup radius is longer than
-                    // a short capsule, so every seed collapsed onto one
-                    // point and a small capsule rested on a single-point
-                    // axle instead of a line.
-                    if (distance(hits2[h].xA, q + n * rc)
-                        < 0.4f * rc + min(0.05f, 0.25f * half_)) { dup = true; break; }
+                    if (distance(hits2[h].xA, q + n * rc) < 0.4f * rc + 0.05f) { dup = true; break; }
                 }
                 if (dup) continue;
                 hits2[nh].xA = q + n * rc;
@@ -781,43 +776,6 @@ kernel void np_collide_analytic_compat(
             contacts[0].xB = sIsA ? qW : xSphere;
             contacts[0].feature = 0;
             count = 1;
-
-            // PAD PATCH. A sphere on a face is a mathematical point, and
-            // point friction cannot resist rotation about its own normal:
-            // a gripped ball spins freely about the grasp axis, so a two-
-            // finger grasp behaves like an axle rather than a hold. Real
-            // pads flatten into a patch; model it as a small ring of
-            // contacts on the face, each paired with the sphere surface
-            // point above it, so the ring engages the true curved surface
-            // rather than faking a flat.
-            int faceAxis = fabs(nLocal.x) > 0.9f ? 0
-                         : (fabs(nLocal.y) > 0.9f ? 1 : 2);
-            if (P.spherePatchContacts != 0u
-                && fabs(nLocal[faceAxis]) > 0.99f) {
-                int u = (faceAxis + 1) % 3, v = (faceAxis + 2) % 3;
-                float rp = min(0.4f * r, 0.006f);
-                const float2 ring[3] = { float2(1.0f, 0.0f),
-                                         float2(-0.5f, 0.866f),
-                                         float2(-0.5f, -0.866f) };
-                for (int k = 0; k < 3; k++) {
-                    float3 pl = qLocal;
-                    pl[u] = clamp(qLocal[u] + rp * ring[k].x,
-                                  -half3_[u], half3_[u]);
-                    pl[v] = clamp(qLocal[v] + rp * ring[k].y,
-                                  -half3_[v], half3_[v]);
-                    float3 pw = q_rotate(qBox, pl) + box.center;
-                    float3 dpc = pw - sphereC;
-                    float3 lat = dpc - nW * dot(dpc, nW);
-                    float rho2 = dot(lat, lat);
-                    if (rho2 > 0.64f * r * r || rho2 < 1e-10f) continue;
-                    float h = sqrt(max(r * r - rho2, 0.0f));
-                    float3 xs = sphereC + lat - nW * h;
-                    contacts[count].xA = sIsA ? xs : pw;
-                    contacts[count].xB = sIsA ? pw : xs;
-                    contacts[count].feature = uint(count);
-                    count++;
-                }
-            }
         }
 
         // shared tail: warm-start + write. Sphere anchors are stored as

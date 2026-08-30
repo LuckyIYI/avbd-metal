@@ -332,6 +332,13 @@ extension CPUManifold {
                     collider: colliderB)
                 contacts.append(contact)
             }
+            if solver.spherePatchContacts, contacts.count == 1 {
+                appendSphereHullFacePatch(
+                    manifold: manifold,
+                    bodyA: bodyA, colliderA: colliderA, hullA: hullA,
+                    bodyB: bodyB, colliderB: colliderB, hullB: hullB,
+                    contacts: &contacts)
+            }
             return .success(contacts.count)
         }
 
@@ -339,6 +346,7 @@ extension CPUManifold {
         let proxyB = proxyBody(for: colliderB, owner: bodyB)
         let count = collide(
             proxyA, proxyB, margin: margin,
+            patchContacts: solver.spherePatchContacts,
             &contacts, &basisOut)
         for index in 0..<count {
             let pointA = proxyAnchorWorld(proxyA, contacts[index].rA)
@@ -349,6 +357,153 @@ extension CPUManifold {
                 worldPoint: pointB, body: bodyB, collider: colliderB)
         }
         return .success(count)
+    }
+
+    /// A smooth sphere against a broad convex face has the same torsional-
+    /// friction problem as a sphere against an analytic box: one witness has
+    /// no lever arm about the face normal. Add a small three-point ring only
+    /// when the supporting hull feature is a genuine face and every generated
+    /// point remains inside its projected boundary. The ring models a tiny
+    /// compliant flattened footprint: all samples retain the exact witness's
+    /// normal separation so that they carry load, instead of placing nominal
+    /// contacts on the undeformed sphere above the face. Edge and vertex
+    /// contacts deliberately retain the exact single support witness.
+    private static func appendSphereHullFacePatch(
+        manifold: ConvexNarrowPhase.Manifold,
+        bodyA: CPURigid, colliderA: CPUCollider, hullA: [F3]?,
+        bodyB: CPURigid, colliderB: CPUCollider, hullB: [F3]?,
+        contacts: inout [ContactPoint]
+    ) {
+        let sphereIsA: Bool
+        let sphereBody: CPURigid
+        let sphereCollider: CPUCollider
+        let hullBody: CPURigid
+        let hullCollider: CPUCollider
+        let hullVertices: [F3]
+        if hullA == nil, colliderA.shape == .sphere, let hullB {
+            sphereIsA = true
+            sphereBody = bodyA
+            sphereCollider = colliderA
+            hullBody = bodyB
+            hullCollider = colliderB
+            hullVertices = hullB
+        } else if hullB == nil, colliderB.shape == .sphere, let hullA {
+            sphereIsA = false
+            sphereBody = bodyB
+            sphereCollider = colliderB
+            hullBody = bodyA
+            hullCollider = colliderA
+            hullVertices = hullA
+        } else {
+            return
+        }
+
+        let faceNormal = sphereIsA
+            ? -manifold.normalAtoB : manifold.normalAtoB // hull -> sphere
+        guard faceNormal.x.isFinite, faceNormal.y.isFinite,
+              faceNormal.z.isFinite,
+              length_squared(faceNormal) > 0.99 else { return }
+        let hullPose = hullCollider.worldPose(hullBody)
+        let worldVertices = hullVertices.map {
+            hullPose.position + hullPose.orientation.act($0)
+        }
+        guard let support = worldVertices.map({ dot($0, faceNormal) }).max()
+        else { return }
+        let hullScale = max(hullCollider.boundingRadius, 1.0e-3)
+        let faceTolerance = max(1.0e-5, hullScale * 1.0e-4)
+        let hullCrossTolerance = max(1.0e-14, hullScale * hullScale * 1.0e-8)
+        let insideTolerance = max(1.0e-10, hullScale * hullScale * 1.0e-6)
+        let faceVertices = worldVertices.filter {
+            support - dot($0, faceNormal) <= faceTolerance
+        }
+        guard faceVertices.count >= 3 else { return }
+
+        let basis = orthonormalBasis(faceNormal)
+        let tangentU = basis.1, tangentV = basis.2
+        let origin = faceVertices[0]
+        var projected = faceVertices.map {
+            SIMD2<Float>(dot($0 - origin, tangentU),
+                         dot($0 - origin, tangentV))
+        }
+        projected.sort {
+            $0.x < $1.x || ($0.x == $1.x && $0.y < $1.y)
+        }
+        func cross2(_ a: SIMD2<Float>, _ b: SIMD2<Float>,
+                    _ c: SIMD2<Float>) -> Float {
+            let ab = b - a, ac = c - a
+            return ab.x * ac.y - ab.y * ac.x
+        }
+        var lower: [SIMD2<Float>] = []
+        for point in projected {
+            while lower.count >= 2,
+                  cross2(lower[lower.count - 2], lower.last!, point)
+                    <= hullCrossTolerance {
+                lower.removeLast()
+            }
+            lower.append(point)
+        }
+        var upper: [SIMD2<Float>] = []
+        for point in projected.reversed() {
+            while upper.count >= 2,
+                  cross2(upper[upper.count - 2], upper.last!, point)
+                    <= hullCrossTolerance {
+                upper.removeLast()
+            }
+            upper.append(point)
+        }
+        let polygon = Array(lower.dropLast()) + Array(upper.dropLast())
+        guard polygon.count >= 3 else { return }
+
+        func isInside(_ point: SIMD2<Float>) -> Bool {
+            for index in polygon.indices {
+                let next = polygon[(index + 1) % polygon.count]
+                if cross2(polygon[index], next, point) < -insideTolerance {
+                    return false
+                }
+            }
+            return true
+        }
+
+        let sphereCenter = sphereCollider.worldPose(sphereBody).position
+        let radius = sphereCollider.size.x * 0.5
+        guard radius.isFinite, radius > 0 else { return }
+        let hullWitness = sphereIsA
+            ? manifold.contacts[0].pointB : manifold.contacts[0].pointA
+        let sphereWitness = sphereIsA
+            ? manifold.contacts[0].pointA : manifold.contacts[0].pointB
+        let normalSeparation = dot(
+            sphereWitness - hullWitness, faceNormal)
+        let facePoint = hullWitness
+            - faceNormal * (dot(hullWitness, faceNormal) - support)
+        let facePoint2 = SIMD2<Float>(
+            dot(facePoint - origin, tangentU),
+            dot(facePoint - origin, tangentV))
+        let patchRadius = min(0.4 * radius, 0.006)
+        let ring: [SIMD2<Float>] = [
+            .init(1, 0), .init(-0.5, 0.866), .init(-0.5, -0.866),
+        ]
+        for (index, offset) in ring.enumerated() {
+            let target2 = facePoint2 + patchRadius * offset
+            guard isInside(target2) else { continue }
+            let hullPoint = origin + tangentU * target2.x
+                + tangentV * target2.y
+            let centerToFace = hullPoint - sphereCenter
+            let lateral = centerToFace
+                - faceNormal * dot(centerToFace, faceNormal)
+            let rhoSquared = length_squared(lateral)
+            guard rhoSquared > 1.0e-10,
+                  rhoSquared <= 0.64 * radius * radius else { continue }
+            let spherePoint = hullPoint + faceNormal * normalSeparation
+            let pointA = sphereIsA ? spherePoint : hullPoint
+            let pointB = sphereIsA ? hullPoint : spherePoint
+            var contact = ContactPoint()
+            contact.featureKey = Int32(0x5100_0000 | (index + 1))
+            contact.rA = ownerAnchor(
+                worldPoint: pointA, body: bodyA, collider: colliderA)
+            contact.rB = ownerAnchor(
+                worldPoint: pointB, body: bodyB, collider: colliderB)
+            contacts.append(contact)
+        }
     }
 
     private static func colliderHullVertices(
@@ -556,14 +711,16 @@ extension CPUManifold {
         // PAD PATCH (mirrors the GPU narrow phase): a sphere on a face is a
         // point, and point friction cannot resist spin about its own
         // normal, so a two-finger grasp holds the ball on an axle. A small
-        // ring of contacts on the face, each paired with the sphere surface
-        // point above it, gives friction the lever arms of a real pad.
+        // ring of contacts on the face models a tiny compliant flattened
+        // footprint. Each sample keeps the exact witness's normal separation
+        // so it carries load and supplies a real torsional lever arm.
         var faceAxis = 0
         if abs(nLocal.y) > abs(nLocal[faceAxis]) { faceAxis = 1 }
         if abs(nLocal.z) > abs(nLocal[faceAxis]) { faceAxis = 2 }
         if patchContacts, abs(nLocal[faceAxis]) > 0.99 {
             let u = (faceAxis + 1) % 3, v = (faceAxis + 2) % 3
             let rp = min(0.4 * r, 0.006)
+            let normalSeparation = dot(xSphere - qW, nW)
             let ring: [(Float, Float)] = [(1, 0), (-0.5, 0.866), (-0.5, -0.866)]
             for (k, off) in ring.enumerated() {
                 var pl = qLocal
@@ -574,8 +731,7 @@ extension CPUManifold {
                 let lat = dpc - nW * dot(dpc, nW)
                 let rho2 = length_squared(lat)
                 if rho2 > 0.64 * r * r || rho2 < 1e-10 { continue }
-                let h = (max(r * r - rho2, 0)).squareRoot()
-                let xs = sphere.positionLin + lat - nW * h
+                let xs = pw + nW * normalSeparation
                 append(sphereIsA ? xs : pw, sphereIsA ? pw : xs, Int32(k + 1))
             }
         }

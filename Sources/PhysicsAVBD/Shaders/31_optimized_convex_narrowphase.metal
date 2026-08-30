@@ -1335,6 +1335,116 @@ inline NPCPolyFace npcBestPolyFace(
     return best;
 }
 
+// A smooth sphere resting on a broad convex face needs a small contact patch
+// for torsional friction, just like the specialized sphere-box path. Build
+// the ring only when the query normal selects an actual supporting face and
+// keep every sample inside that face. The ring models a tiny compliant
+// flattened footprint: all samples retain the exact witness's normal
+// separation so they carry load. Edge/vertex contacts remain a single exact
+// support witness.
+inline int npcBuildSphereFacePatch(
+    thread const NPCShape& a, thread const NPCShape& b,
+    thread const NPCResult& result, float3 normalAtoB,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexFaceGPU* convexFaces,
+    device const uint* convexFaceVertexIndices,
+    device const float4* convexHullVertices,
+    thread NPCManifoldContact* output)
+{
+    bool sphereIsA = a.kind == 1u && (b.kind == 0u || b.kind == 4u);
+    bool sphereIsB = b.kind == 1u && (a.kind == 0u || a.kind == 4u);
+    if (!sphereIsA && !sphereIsB) return 0;
+
+    NPCShape sphere = sphereIsA ? a : b;
+    NPCShape polyhedron = sphereIsA ? b : a;
+    float3 faceNormal = sphereIsA ? -normalAtoB : normalAtoB;
+    float alignment;
+    NPCPolyFace face = npcBestPolyFace(
+        polyhedron, faceNormal, colliderConvexAssetID,
+        convexHulls, convexFaces, alignment);
+    if (!face.valid || alignment < 0.99f) return 0;
+
+    output[0].pointA = result.pointA;
+    output[0].pointB = result.pointB;
+    output[0].features = uint2(result.featureA, result.featureB);
+    int count = 1;
+
+    float3 centroid = float3(0);
+    for (uint index = 0u; index < face.count; index++) {
+        uint feature;
+        centroid += npcPolyFaceVertex(
+            polyhedron, face, index, colliderConvexAssetID,
+            convexHulls, convexFaceVertexIndices, convexHullVertices,
+            feature);
+    }
+    centroid /= float(face.count);
+
+    float3 facePoint = sphereIsA ? result.pointB : result.pointA;
+    float3 sphereWitness = sphereIsA ? result.pointA : result.pointB;
+    float normalSeparation = dot(sphereWitness - facePoint, faceNormal);
+    facePoint -= faceNormal * (dot(faceNormal, facePoint) - face.distance);
+    float radius = sphere.dimensions.x * 0.5f;
+    if (!finite_bits(radius) || radius <= 0.0f) return 0;
+    float patchRadius = min(0.4f * radius, 0.006f);
+    float3 tangentU, tangentV;
+    orthonormal(faceNormal, tangentU, tangentV);
+    const float2 ring[3] = {
+        float2(1.0f, 0.0f),
+        float2(-0.5f, 0.8660254f),
+        float2(-0.5f, -0.8660254f),
+    };
+    float scale = max(fabs(polyhedron.dimensions.w), 1.0e-3f);
+    float insideTolerance = max(1.0e-10f, 1.0e-6f * scale * scale);
+    uint faceFeature = npcFaceFeature(polyhedron, face.localIndex);
+    uint sphereFeature = NPC_FEATURE_SMOOTH | 1u;
+
+    for (uint ringIndex = 0u; ringIndex < 3u; ringIndex++) {
+        float3 hullPoint = facePoint
+            + patchRadius * (ring[ringIndex].x * tangentU
+                             + ring[ringIndex].y * tangentV);
+        bool inside = true;
+        for (uint edge = 0u; edge < face.count; edge++) {
+            uint feature0, feature1;
+            float3 p0 = npcPolyFaceVertex(
+                polyhedron, face, edge, colliderConvexAssetID,
+                convexHulls, convexFaceVertexIndices, convexHullVertices,
+                feature0);
+            float3 p1 = npcPolyFaceVertex(
+                polyhedron, face, (edge + 1u) % face.count,
+                colliderConvexAssetID, convexHulls,
+                convexFaceVertexIndices, convexHullVertices, feature1);
+            float centroidSide = dot(cross(p1 - p0, centroid - p0), faceNormal);
+            float pointSide = dot(cross(p1 - p0, hullPoint - p0), faceNormal);
+            if ((centroidSide >= 0.0f && pointSide < -insideTolerance)
+                || (centroidSide < 0.0f && pointSide > insideTolerance)) {
+                inside = false;
+                break;
+            }
+        }
+        if (!inside) continue;
+
+        float3 centerToFace = hullPoint - sphere.center;
+        float3 lateral = centerToFace
+            - faceNormal * dot(centerToFace, faceNormal);
+        float rhoSquared = dot(lateral, lateral);
+        if (rhoSquared <= 1.0e-10f
+            || rhoSquared > 0.64f * radius * radius) continue;
+        float3 spherePoint = hullPoint + faceNormal * normalSeparation;
+        uint ringFeature = ringIndex + 1u;
+        uint2 features = sphereIsA
+            ? uint2(npcMixFeature(sphereFeature, ringFeature),
+                    npcMixFeature(faceFeature, ringFeature))
+            : uint2(npcMixFeature(faceFeature, ringFeature),
+                    npcMixFeature(sphereFeature, ringFeature));
+        output[count].pointA = sphereIsA ? spherePoint : hullPoint;
+        output[count].pointB = sphereIsA ? hullPoint : spherePoint;
+        output[count].features = features;
+        count++;
+    }
+    return count;
+}
+
 inline int npcClipPolygon(
     thread const NPCClipVertex* input, int inputCount,
     float3 planeNormal, float planeDistance, uint referenceFeature,
@@ -2083,6 +2193,13 @@ inline void npCollidePass(
                 convexFaceVertexIndices, convexEdges, convexContacts,
                 convexEdgePairTests);
         }
+        if (contactCount == 0 && P.spherePatchContacts != 0u) {
+            contactCount = npcBuildSphereFacePatch(
+                convexA, convexB, result, normalAtoB,
+                colliderConvexAssetID, convexHulls, convexFaces,
+                convexFaceVertexIndices, convexHullVertices,
+                convexContacts);
+        }
         if (convexEdgePairTests > 0u) {
             atomic_fetch_add_explicit(
                 &counters[CTR_CONVEX_EDGE_PAIRS], convexEdgePairTests,
@@ -2723,15 +2840,17 @@ inline void npCollidePass(
             // a gripped ball spins freely about the grasp axis, so a two-
             // finger grasp behaves like an axle rather than a hold. Real
             // pads flatten into a patch; model it as a small ring of
-            // contacts on the face, each paired with the sphere surface
-            // point above it, so the ring engages the true curved surface
-            // rather than faking a flat.
+            // contacts on the face. The opt-in pad is a tiny compliant
+            // flattened footprint: every ring sample retains the exact
+            // witness's normal separation, so it carries normal load and
+            // supplies a torsional friction lever arm.
             int faceAxis = fabs(nLocal.x) > 0.9f ? 0
                          : (fabs(nLocal.y) > 0.9f ? 1 : 2);
             if (P.spherePatchContacts != 0u
                 && fabs(nLocal[faceAxis]) > 0.99f) {
                 int u = (faceAxis + 1) % 3, v = (faceAxis + 2) % 3;
                 float rp = min(0.4f * r, 0.006f);
+                float normalSeparation = dot(xSphere - qW, nW);
                 const float2 ring[3] = { float2(1.0f, 0.0f),
                                          float2(-0.5f, 0.866f),
                                          float2(-0.5f, -0.866f) };
@@ -2746,8 +2865,7 @@ inline void npCollidePass(
                     float3 lat = dpc - nW * dot(dpc, nW);
                     float rho2 = dot(lat, lat);
                     if (rho2 > 0.64f * r * r || rho2 < 1e-10f) continue;
-                    float h = sqrt(max(r * r - rho2, 0.0f));
-                    float3 xs = sphereC + lat - nW * h;
+                    float3 xs = pw + nW * normalSeparation;
                     contacts[count].xA = sIsA ? xs : pw;
                     contacts[count].xB = sIsA ? pw : xs;
                     contacts[count].feature = uint(count);
@@ -3165,4 +3283,3 @@ kernel void convex_restore_failed_frame(
     posLin[gid] = float4(initLin[gid].xyz, posLin[gid].w);
     posAng[gid] = initAng[gid];
 }
-
