@@ -52,8 +52,8 @@ public final class GPUSolver {
     public let convexColliderCount: Int
     private let enabledConvexColliderCount: Int
     private let hasPotentialRigidConvexPair: Bool
-    private let hasPotentialAnalyticSphereBoxPair: Bool
     private let hasPotentialAnalyticCapsuleBoxPair: Bool
+    private let hasTorsionalFriction: Bool
     let numJoints: Int
     let numSprings: Int
     let numTets: Int
@@ -129,6 +129,8 @@ public final class GPUSolver {
     var colliderLocalPosition, colliderLocalRotation: MTLBuffer
     var colliderRenderColor: MTLBuffer
     var colliderFriction: MTLBuffer
+    var colliderTorsionalFriction: MTLBuffer
+    var torsionState, prevTorsionState: MTLBuffer
     var colliderHullRange, convexHullVertices: MTLBuffer
     var colliderConvexAssetID: MTLBuffer
     var convexHullHeaders, convexFaces: MTLBuffer
@@ -338,6 +340,9 @@ public final class GPUSolver {
         "np_collide_analytic_compat",
         "np_collide_convex",
         "np_collide_enhanced_analytic",
+        "prepare_torsional_friction",
+        "primal_torsional_friction",
+        "dual_torsional_friction",
         "ogc_bounds_refresh",
         "ogc_refresh_args",
         "pm_clear",
@@ -1194,10 +1199,18 @@ public final class GPUSolver {
                 }
             }
         }
-        self.hasPotentialAnalyticSphereBoxPair = hasPotentialAnalyticPair(
-            .sphere, .box)
         self.hasPotentialAnalyticCapsuleBoxPair = hasPotentialAnalyticPair(
             .capsule, .box)
+        let torsionalColliders = scene.colliders.indices.filter {
+            scene.colliders[$0].collisionEnabled
+                && scene.colliders[$0].torsionalFriction > 0
+        }
+        self.hasTorsionalFriction = torsionalColliders.contains { material in
+            scene.colliders.indices.contains { other in
+                scene.canPotentiallyCollide(
+                    colliderA: material, colliderB: other)
+            }
+        }
         self.convexDebugGeometries = convexUpload.debugGeometries
         self.convexDebugInstances = convexUpload.debugInstances
         self.convexDebugTriangleVertexCount =
@@ -1369,6 +1382,14 @@ public final class GPUSolver {
         colliderFriction = try makeBuf(
             numColliders * MemoryLayout<SIMD2<Float>>.stride,
             "colliderFriction")
+        colliderTorsionalFriction = try makeBuf(
+            numColliders * MemoryLayout<Float>.stride,
+            "colliderTorsionalFriction")
+        let torsionStateBytes = hasTorsionalFriction
+            ? maxPairs * MemoryLayout<SIMD4<Float>>.stride : 16
+        torsionState = try makeBuf(torsionStateBytes, "torsionState")
+        prevTorsionState = try makeBuf(
+            torsionStateBytes, "prevTorsionState")
         colliderHullRange = try makeBuf(
             numColliders * MemoryLayout<SIMD2<UInt32>>.stride,
             "colliderHullRange")
@@ -2054,6 +2075,8 @@ public final class GPUSolver {
                                                             capacity: numColliders)
         let cf = colliderFriction.contents().bindMemory(
             to: SIMD2<Float>.self, capacity: numColliders)
+        let ctf = colliderTorsionalFriction.contents().bindMemory(
+            to: Float.self, capacity: numColliders)
         let chr = colliderHullRange.contents().bindMemory(
             to: SIMD2<UInt32>.self, capacity: numColliders)
         func uploadArray<T>(_ values: [T], to buffer: MTLBuffer) {
@@ -2132,6 +2155,7 @@ public final class GPUSolver {
             cq[i] = SIMD4(c.localRotation.imag, c.localRotation.real)
             crc[i] = c.renderColor.map { SIMD4($0, 1) } ?? .zero
             cf[i] = SIMD2(c.friction, c.dynamicFriction)
+            ctf[i] = c.torsionalFriction
             chr[i] = convexUpload.colliderRanges[i]
             var flags: UInt32
             if convexUpload.colliderAssetIDs[i] != UInt32.max {
@@ -3242,6 +3266,8 @@ public final class GPUSolver {
         // Clear manifolds + map
         memset(manifolds.contents(), 0, manifolds.length)
         memset(prevManifolds.contents(), 0, prevManifolds.length)
+        memset(torsionState.contents(), 0, torsionState.length)
+        memset(prevTorsionState.contents(), 0, prevTorsionState.length)
         memset(contactFeatures.contents(), 0, contactFeatures.length)
         memset(prevContactFeatures.contents(), 0, prevContactFeatures.length)
         memset(mapKeyA.contents(), 0, mapKeyA.length)
@@ -3310,7 +3336,7 @@ public final class GPUSolver {
         params.frame = UInt32(truncatingIfNeeded: frameIndex)
         params.frictionCombineMode = settings.frictionCombineMode.rawValue
         params.collisionMargin = max(settings.collisionMargin, 0)
-        params.spherePatchContacts = settings.spherePatchContacts ? 1 : 0
+        params.contactMaterialReserved = 0
         params.rigidLinearDamping = max(settings.rigidLinearDamping, 0)
         params.rigidAngularDamping = max(settings.rigidAngularDamping, 0)
         let effectiveTruncationMode = effectiveSurfaceTruncationMode
@@ -3454,8 +3480,6 @@ public final class GPUSolver {
     }
     var usesEnhancedAnalyticNarrowPhaseForTesting: Bool {
         hasPotentialAnalyticCapsuleBoxPair
-            || (settings.spherePatchContacts
-                && hasPotentialAnalyticSphereBoxPair)
     }
 
     private var planarDATBodyPairStorageBytes: Int {
@@ -3678,12 +3702,17 @@ public final class GPUSolver {
         // point at these slots until the next narrow phase; a zero contact
         // count makes that lookup deliberately cold without rebuilding the
         // global map or disturbing other vectorized environments.
-        for (buffer, features) in [
-            (manifolds, contactFeatures),
-            (prevManifolds, prevContactFeatures),
+        for (buffer, features, torsion) in [
+            (manifolds, contactFeatures, torsionState),
+            (prevManifolds, prevContactFeatures, prevTorsionState),
         ] {
             let mp = buffer.contents().bindMemory(
                 to: ManifoldGPU.self, capacity: maxPairs)
+            let tp: UnsafeMutablePointer<SIMD4<Float>>? =
+                hasTorsionalFriction
+                ? torsion.contents().bindMemory(
+                    to: SIMD4<Float>.self, capacity: maxPairs)
+                : nil
             let fp: UnsafeMutablePointer<SIMD2<UInt32>>? =
                 hasPotentialRigidConvexPair
                 ? features.contents().bindMemory(
@@ -3694,6 +3723,7 @@ public final class GPUSolver {
                 if resetBodies.contains(mp[i].header.x)
                     || resetBodies.contains(mp[i].header.y) {
                     mp[i] = ManifoldGPU()
+                    tp?[i] = .zero
                     fp?.advanced(by: i * AVBD_MAX_CONTACTS).initialize(
                         repeating: .zero, count: AVBD_MAX_CONTACTS)
                 }
@@ -4209,6 +4239,8 @@ public final class GPUSolver {
         fileprivate var springs: Data
         fileprivate var manifolds: Data
         fileprivate var prevManifolds: Data
+        fileprivate var torsionState: Data
+        fileprivate var prevTorsionState: Data
         fileprivate var contactFeatures: Data
         fileprivate var prevContactFeatures: Data
         fileprivate var mapKeyA: Data
@@ -4250,6 +4282,8 @@ public final class GPUSolver {
             prevVelLin: copy(prevVelLin), joints: copy(joints),
             springs: copy(springs), manifolds: copy(manifolds),
             prevManifolds: copy(prevManifolds),
+            torsionState: copy(torsionState),
+            prevTorsionState: copy(prevTorsionState),
             contactFeatures: copy(contactFeatures),
             prevContactFeatures: copy(prevContactFeatures),
             mapKeyA: copy(mapKeyA),
@@ -4292,6 +4326,8 @@ public final class GPUSolver {
         restore(snapshot.springs, to: springs)
         restore(snapshot.manifolds, to: manifolds)
         restore(snapshot.prevManifolds, to: prevManifolds)
+        restore(snapshot.torsionState, to: torsionState)
+        restore(snapshot.prevTorsionState, to: prevTorsionState)
         restore(snapshot.contactFeatures, to: contactFeatures)
         restore(snapshot.prevContactFeatures, to: prevContactFeatures)
         restore(snapshot.mapKeyA, to: mapKeyA)
@@ -5061,6 +5097,27 @@ public final class GPUSolver {
             }
         }
 
+        if hasTorsionalFriction {
+            try stage("torsional-friction")
+            dispatchIndirect(
+                enc, "prepare_torsional_friction", argsOffset: 0
+            ) { e in
+                e.setBuffer(self.posLin, offset: 0, index: 0)
+                e.setBuffer(self.props, offset: 0, index: 1)
+                e.setBuffer(self.manifolds, offset: 0, index: 2)
+                e.setBuffer(self.prevManifolds, offset: 0, index: 3)
+                e.setBuffer(self.mapKeyA, offset: 0, index: 4)
+                e.setBuffer(self.mapKeyB, offset: 0, index: 5)
+                e.setBuffer(self.mapVal, offset: 0, index: 6)
+                e.setBuffer(
+                    self.colliderTorsionalFriction, offset: 0, index: 7)
+                e.setBuffer(self.torsionState, offset: 0, index: 8)
+                e.setBuffer(self.prevTorsionState, offset: 0, index: 9)
+                e.setBytes(
+                    &P, length: MemoryLayout<SimParamsGPU>.stride, index: 10)
+            }
+        }
+
         try stage("persistence-map")
         // Rebuild persistence map from THIS frame's manifolds (for next frame)
         dispatch1D(enc, "pm_clear", mapCapacity) { e in
@@ -5447,7 +5504,8 @@ public final class GPUSolver {
         let persistentRequested = ProcessInfo.processInfo.environment[
             "AVBD_PERSIST"] != nil
             && ProcessInfo.processInfo.environment["AVBD_NO_PERSIST"] == nil
-        if multiOK && !isPlanarDAT && numBodies <= 4096 {
+        if multiOK && !isPlanarDAT && !hasTorsionalFriction
+            && numBodies <= 4096 {
             let tgW = min(256, multiPSO.maxTotalThreadsPerThreadgroup)
             var ntg = UInt32(min(8, max(1, (numBodies + tgW - 1) / tgW + 1)))
             enc.setComputePipelineState(multiPSO)
@@ -5480,6 +5538,7 @@ public final class GPUSolver {
             enc.dispatchThreadgroups(MTLSize(width: Int(ntg), height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
         } else if persistentRequested && !isPlanarDAT
+                    && !hasTorsionalFriction
                     && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
             // small scene: the whole solve loop in ONE dispatch — hundreds
             // of per-dispatch launch/barrier latencies become threadgroup
@@ -5603,6 +5662,45 @@ public final class GPUSolver {
                         MTLSize(width: (splitSizes[c] + 63) / 64, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
                 }
+                if hasTorsionalFriction {
+                    // Torsional resistance is an optional material overlay,
+                    // not collision geometry. Keeping it in a separate PSO
+                    // leaves the established primal kernel byte-for-byte
+                    // untouched for ordinary zero-torsion scenes.
+                    enc.setComputePipelineState(
+                        ps("primal_torsional_friction"))
+                    enc.setBuffer(posLin, offset: 0, index: 0)
+                    enc.setBuffer(posAng, offset: 0, index: 1)
+                    enc.setBuffer(initLin, offset: 0, index: 2)
+                    enc.setBuffer(initAng, offset: 0, index: 3)
+                    enc.setBuffer(props, offset: 0, index: 4)
+                    enc.setBuffer(manifolds, offset: 0, index: 5)
+                    enc.setBuffer(torsionState, offset: 0, index: 6)
+                    enc.setBuffer(adjStart, offset: 0, index: 7)
+                    enc.setBuffer(degrees, offset: 0, index: 8)
+                    enc.setBuffer(adjList, offset: 0, index: 9)
+                    enc.setBuffer(colorList, offset: 0, index: 10)
+                    enc.setBuffer(colorStart, offset: 0, index: 11)
+                    enc.setBytes(&cIdx, length: 4, index: 12)
+                    enc.setBytes(
+                        &P, length: MemoryLayout<SimParamsGPU>.stride,
+                        index: 13)
+                    enc.setBuffer(shape, offset: 0, index: 14)
+                    if usesDynamicColoring {
+                        enc.dispatchThreadgroups(
+                            indirectBuffer: colorArgs,
+                            indirectBufferOffset: c * 12,
+                            threadsPerThreadgroup: MTLSize(
+                                width: 64, height: 1, depth: 1))
+                    } else {
+                        enc.dispatchThreadgroups(
+                            MTLSize(
+                                width: (splitSizes[c] + 63) / 64,
+                                height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(
+                                width: 64, height: 1, depth: 1))
+                    }
+                }
                 if isPlanarDAT {
                     // A VBD color is a Gauss-Seidel iteration in DAT's
                     // terminology: later colors must never observe a trial
@@ -5615,27 +5713,28 @@ public final class GPUSolver {
                         enc, pairs: planarDATPairsBuf,
                         pairCounts: planarDATPairCountsBuf,
                         activeColor: c)
-                    if c + 1 < colorBound {
-                        // Body-local DAT reuses the primal slots through 14.
-                        // Restore every overwritten binding before the next
-                        // color; cIdx and the higher bindings stay intact.
-                        enc.setComputePipelineState(primalPSO)
-                        enc.setBuffer(posLin, offset: 0, index: 0)
-                        enc.setBuffer(posAng, offset: 0, index: 1)
-                        enc.setBuffer(initLin, offset: 0, index: 2)
-                        enc.setBuffer(initAng, offset: 0, index: 3)
-                        enc.setBuffer(inertLin, offset: 0, index: 4)
-                        enc.setBuffer(inertAng, offset: 0, index: 5)
-                        enc.setBuffer(props, offset: 0, index: 6)
-                        enc.setBuffer(joints, offset: 0, index: 7)
-                        enc.setBuffer(springs, offset: 0, index: 8)
-                        enc.setBuffer(manifolds, offset: 0, index: 9)
-                        enc.setBuffer(adjStart, offset: 0, index: 10)
-                        enc.setBuffer(degrees, offset: 0, index: 11)
-                        enc.setBuffer(adjList, offset: 0, index: 12)
-                        enc.setBuffer(colorList, offset: 0, index: 13)
-                        enc.setBuffer(colorStart, offset: 0, index: 14)
-                    }
+                }
+                if (hasTorsionalFriction || isPlanarDAT)
+                    && c + 1 < colorBound {
+                    // Optional overlay kernels reuse primal slots through
+                    // 14. Restore every overwritten binding before the next
+                    // color; cIdx and the higher bindings stay intact.
+                    enc.setComputePipelineState(primalPSO)
+                    enc.setBuffer(posLin, offset: 0, index: 0)
+                    enc.setBuffer(posAng, offset: 0, index: 1)
+                    enc.setBuffer(initLin, offset: 0, index: 2)
+                    enc.setBuffer(initAng, offset: 0, index: 3)
+                    enc.setBuffer(inertLin, offset: 0, index: 4)
+                    enc.setBuffer(inertAng, offset: 0, index: 5)
+                    enc.setBuffer(props, offset: 0, index: 6)
+                    enc.setBuffer(joints, offset: 0, index: 7)
+                    enc.setBuffer(springs, offset: 0, index: 8)
+                    enc.setBuffer(manifolds, offset: 0, index: 9)
+                    enc.setBuffer(adjStart, offset: 0, index: 10)
+                    enc.setBuffer(degrees, offset: 0, index: 11)
+                    enc.setBuffer(adjList, offset: 0, index: 12)
+                    enc.setBuffer(colorList, offset: 0, index: 13)
+                    enc.setBuffer(colorStart, offset: 0, index: 14)
                 }
             }
             if profiling { try stage("solve-dual") }
@@ -5650,6 +5749,21 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
                 e.setBuffer(self.springs, offset: 0, index: 8)
                 e.setBuffer(self.softContacts, offset: 0, index: 9)
+            }
+            if hasTorsionalFriction {
+                dispatchIndirect(
+                    enc, "dual_torsional_friction", argsOffset: 0
+                ) { e in
+                    e.setBuffer(self.posLin, offset: 0, index: 0)
+                    e.setBuffer(self.posAng, offset: 0, index: 1)
+                    e.setBuffer(self.initLin, offset: 0, index: 2)
+                    e.setBuffer(self.initAng, offset: 0, index: 3)
+                    e.setBuffer(self.manifolds, offset: 0, index: 4)
+                    e.setBuffer(self.torsionState, offset: 0, index: 5)
+                    e.setBytes(
+                        &P, length: MemoryLayout<SimParamsGPU>.stride,
+                        index: 6)
+                }
             }
             // OGC conditional refresh (paper Alg 3): a one-thread kernel
             // turns the exceed counter into indirect dispatch args, so the
@@ -5796,6 +5910,9 @@ public final class GPUSolver {
         // Buffer identity is a submitted-frame contract even if retirement
         // later discovers a terminal Metal or capacity failure.
         swap(&manifolds, &prevManifolds)
+        if hasTorsionalFriction {
+            swap(&torsionState, &prevTorsionState)
+        }
         swap(&contactFeatures, &prevContactFeatures)
         if numTris > 0 { swap(&softContacts, &prevSoftContacts) }
 

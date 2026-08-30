@@ -13,6 +13,10 @@ public struct ContactPoint {
     public var penalty: F3 = .zero
     public var lambda: F3 = .zero
     public var stick: Bool = false
+    /// Aggregate solver-level twisting friction for this manifold. Only the
+    /// first contact stores it; collision geometry stays exact.
+    public var torsionLambda: Float = 0
+    public var torsionPenalty: Float = 0
 }
 
 public final class CPUManifold: CPUForce {
@@ -22,6 +26,9 @@ public final class CPUManifold: CPUForce {
     public var basis: (F3, F3, F3) = (.zero, .zero, .zero)
     public var staticFriction: Float = 0
     public var dynamicFriction: Float = 0
+    /// Effective torsional contact radius. The twisting-torque bound is
+    /// `normalLoad * torsionalFriction`.
+    public var torsionalFriction: Float = 0
     let colliderAIndex: Int?
     let colliderBIndex: Int?
     let colliderPairKey: UInt64?
@@ -92,12 +99,20 @@ public final class CPUManifold: CPUForce {
         let colliderB = collider(isA: false)
         let previousContacts = contacts
         let previousBasis = basis
+        let previousTorsionLambda = previousContacts.first?.torsionLambda ?? 0
+        let previousTorsionPenalty = previousContacts.first?.torsionPenalty ?? 0
         staticFriction = solver.frictionCombineMode.combine(
             colliderA?.friction ?? bodyA.friction,
             colliderB?.friction ?? bodyB.friction)
         dynamicFriction = solver.frictionCombineMode.combine(
             colliderA?.dynamicFriction ?? bodyA.dynamicFriction,
             colliderB?.dynamicFriction ?? bodyB.dynamicFriction)
+        // This coefficient has length units, so multiplicative friction
+        // combination would be dimensionally wrong. Match Newton XPBD's
+        // symmetric per-shape average for torsional/rolling materials.
+        torsionalFriction = 0.5 * (
+            (colliderA?.torsionalFriction ?? bodyA.torsionalFriction)
+            + (colliderB?.torsionalFriction ?? bodyB.torsionalFriction))
 
         var newContacts: [ContactPoint] = []
         let count: Int
@@ -120,7 +135,6 @@ public final class CPUManifold: CPUForce {
         } else {
             count = Self.collide(
                 bodyA, bodyB, margin: solver.collisionMargin,
-                patchContacts: solver.spherePatchContacts,
                 &newContacts, &basis)
         }
 
@@ -236,6 +250,43 @@ public final class CPUManifold: CPUForce {
                                              penaltyMin, penaltyMax)
         }
 
+        // Torsional friction is one aggregate material mode per manifold,
+        // independent of how many geometric witnesses its narrow phase
+        // emits. This avoids both sphere-specific fake contacts and torque
+        // multiplication when a face is tessellated into more points.
+        if !contacts.isEmpty, torsionalFriction > 0 {
+            var effectiveMoment = Float.greatestFiniteMagnitude
+            for candidate in [bodyA, bodyB] where candidate.mass > 0 {
+                let moment = min(candidate.moment.x,
+                                 min(candidate.moment.y, candidate.moment.z))
+                if moment > 0, moment.isFinite {
+                    effectiveMoment = min(effectiveMoment, moment)
+                }
+            }
+            if effectiveMoment == Float.greatestFiniteMagnitude {
+                effectiveMoment = 0
+            }
+            let floor = min(
+                AVBDConstants.penaltyMaxTangent,
+                max(AVBDConstants.penaltyMin,
+                    effectiveMoment / max(solver.dt * solver.dt, 1.0e-12)))
+            let normalCompatible = dot(previousBasis.0, basis.0) > 0.95
+            contacts[0].torsionLambda = normalCompatible
+                ? previousTorsionLambda * solver.alpha * solver.gamma : 0
+            contacts[0].torsionPenalty = simd_clamp(
+                (normalCompatible ? previousTorsionPenalty : 0) * solver.gamma,
+                floor, AVBDConstants.penaltyMaxTangent)
+            for index in contacts.indices.dropFirst() {
+                contacts[index].torsionLambda = 0
+                contacts[index].torsionPenalty = 0
+            }
+        } else {
+            for index in contacts.indices {
+                contacts[index].torsionLambda = 0
+                contacts[index].torsionPenalty = 0
+            }
+        }
+
         return .success(!contacts.isEmpty)
     }
 
@@ -264,6 +315,18 @@ public final class CPUManifold: CPUForce {
         return (F, C, frictionScale, staticBounds)
     }
 
+    private func torsionForceAndC(
+        _ contact: ContactPoint, normalForce: Float,
+        _ dqAAng: F3, _ dqBAng: F3
+    ) -> (torque: Float, C: Float, unconstrained: Float, bound: Float) {
+        let C = dot(basis.0, dqAAng - dqBAng)
+        let unconstrained = contact.torsionPenalty * C
+            + contact.torsionLambda
+        let bound = abs(normalForce) * torsionalFriction
+        return (simd_clamp(unconstrained, -bound, bound), C,
+                unconstrained, bound)
+    }
+
     override func updatePrimal(_ body: CPURigid, _ alpha: Float,
                                _ lhsLin: inout Mat3Rows, _ lhsAng: inout Mat3Rows, _ lhsCross: inout Mat3Rows,
                                _ rhsLin: inout F3, _ rhsAng: inout F3) {
@@ -273,11 +336,13 @@ public final class CPUManifold: CPUForce {
         let dqBLin = bodyB.positionLin - bodyB.initialLin
         let dqBAng = quatSub(bodyB.positionAng, bodyB.initialAng)
         let isA = body === bodyA
+        var totalNormalLoad: Float = 0
 
         for i in 0..<contacts.count {
             let rAW = anchorOffsetWorld(bodyA, contacts[i].rA, isA: true)
             let rBW = anchorOffsetWorld(bodyB, contacts[i].rB, isA: false)
             let (F, _, _, _) = forceAndC(i, alpha, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW)
+            totalNormalLoad += abs(F.x)
 
             let s: Float = isA ? 1 : -1
             let jLin = Mat3Rows(basis.0 * s, basis.1 * s, basis.2 * s)
@@ -295,6 +360,14 @@ public final class CPUManifold: CPUForce {
 
             rhsLin += jLinT.mul(F)
             rhsAng += jAngT.mul(F)
+
+        }
+        if let torsion = contacts.first, torsionalFriction > 0 {
+            let twist = torsionForceAndC(
+                torsion, normalForce: totalNormalLoad, dqAAng, dqBAng)
+            let jTwist = basis.0 * (isA ? 1 : -1)
+            lhsAng += outerRows(jTwist, jTwist) * torsion.torsionPenalty
+            rhsAng += jTwist * twist.torque
         }
     }
 
@@ -304,12 +377,14 @@ public final class CPUManifold: CPUForce {
         let dqAAng = quatSub(bodyA.positionAng, bodyA.initialAng)
         let dqBLin = bodyB.positionLin - bodyB.initialLin
         let dqBAng = quatSub(bodyB.positionAng, bodyB.initialAng)
+        var totalNormalLoad: Float = 0
 
         for i in 0..<contacts.count {
             let rAW = anchorOffsetWorld(bodyA, contacts[i].rA, isA: true)
             let rBW = anchorOffsetWorld(bodyB, contacts[i].rB, isA: false)
             let (F, C, frictionScale, bounds) =
                 forceAndC(i, alpha, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW)
+            totalNormalLoad += abs(F.x)
 
             var Fb = F
             Fb[0] = max(Fb[0], -solver.lambdaMax)
@@ -325,6 +400,17 @@ public final class CPUManifold: CPUForce {
                 contacts[i].penalty[2] = min(contacts[i].penalty[2] + solver.betaLin * abs(C[2]),
                                              AVBDConstants.penaltyMaxTangent)
                 contacts[i].stick = length(SIMD2<Float>(C[1], C[2])) < AVBDConstants.stickThresh
+            }
+        }
+        if !contacts.isEmpty, torsionalFriction > 0 {
+            let twist = torsionForceAndC(
+                contacts[0], normalForce: totalNormalLoad, dqAAng, dqBAng)
+            contacts[0].torsionLambda = twist.torque
+            if abs(twist.unconstrained) <= twist.bound {
+                contacts[0].torsionPenalty = min(
+                    contacts[0].torsionPenalty
+                        + solver.betaAng * abs(twist.C),
+                    AVBDConstants.penaltyMaxTangent)
             }
         }
     }

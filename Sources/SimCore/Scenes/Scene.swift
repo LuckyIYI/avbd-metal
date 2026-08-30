@@ -38,6 +38,10 @@ public struct SceneBody {
     /// for legacy scenes that author one Coulomb coefficient.
     public var friction: Float
     public var dynamicFriction: Float
+    /// Effective torsional contact radius in scene-length units. A positive
+    /// value bounds the contact-normal twisting torque by normal load times
+    /// this coefficient. Zero preserves ideal Coulomb point contact.
+    public var torsionalFriction: Float
     public var position: F3
     public var rotation: Quat
     public var velocity: F3
@@ -60,12 +64,15 @@ public struct SceneBody {
 
     @_disfavoredOverload
     public init(size: F3, density: Float, friction: Float,
-                dynamicFriction: Float? = nil, position: F3,
+                dynamicFriction: Float? = nil,
+                torsionalFriction: Float = 0, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
                 shape: BodyShape = .box, mass: Float? = nil,
                 diagonalInertia: F3? = nil, gravityScale: Float = 1) {
         precondition(gravityScale >= 0 && gravityScale.isFinite,
                      "gravity scale must be finite and nonnegative")
+        precondition(torsionalFriction >= 0 && torsionalFriction.isFinite,
+                     "torsional friction must be finite and nonnegative")
         precondition((mass == nil) == (diagonalInertia == nil),
                      "explicit mass and diagonal inertia must be supplied together")
         if let mass, let diagonalInertia {
@@ -83,6 +90,7 @@ public struct SceneBody {
         self.density = density
         self.friction = friction
         self.dynamicFriction = dynamicFriction ?? friction
+        self.torsionalFriction = torsionalFriction
         self.position = position
         self.rotation = rotation
         self.velocity = velocity
@@ -98,7 +106,8 @@ public struct SceneBody {
                 rotation: Quat = Quat(real: 1, imag: .zero),
                 velocity: F3 = .zero, shape: BodyShape = .box) {
         self.init(size: size, density: density, friction: friction,
-                  dynamicFriction: friction, position: position,
+                  dynamicFriction: friction, torsionalFriction: 0,
+                  position: position,
                   rotation: rotation, velocity: velocity, shape: shape,
                   mass: nil, diagonalInertia: nil, gravityScale: 1)
     }
@@ -116,6 +125,9 @@ public struct SceneCollider {
     public var size: F3
     public var friction: Float
     public var dynamicFriction: Float
+    /// Effective torsional contact radius in scene-length units. This is a
+    /// contact-law property, not extra collision geometry.
+    public var torsionalFriction: Float
     public var localPosition: F3
     public var localRotation: Quat
     public var shape: BodyShape
@@ -159,6 +171,7 @@ public struct SceneCollider {
 
     public init(body: Int, size: F3, friction: Float,
                 dynamicFriction: Float? = nil,
+                torsionalFriction: Float = 0,
                 localPosition: F3 = .zero,
                 localRotation: Quat = Quat(real: 1, imag: .zero),
                 shape: BodyShape = .box,
@@ -171,6 +184,8 @@ public struct SceneCollider {
                 isRendered: Bool = true,
                 renderColor: F3? = nil) {
         precondition(body >= 0, "collider requires a valid body owner")
+        precondition(torsionalFriction >= 0 && torsionalFriction.isFinite,
+                     "torsional friction must be finite and nonnegative")
         switch shape {
         case .sphere: self.size = F3(repeating: size.x)
         default: self.size = size
@@ -178,6 +193,7 @@ public struct SceneCollider {
         self.body = body
         self.friction = friction
         self.dynamicFriction = dynamicFriction ?? friction
+        self.torsionalFriction = torsionalFriction
         self.localPosition = localPosition
         self.localRotation = localRotation.normalized
         self.shape = shape
@@ -196,6 +212,7 @@ public struct SceneCollider {
     /// and pass an explicit scene-table index.
     public init(body: Int, size: F3, friction: Float,
                 dynamicFriction: Float? = nil,
+                torsionalFriction: Float = 0,
                 localPosition: F3 = .zero,
                 localRotation: Quat = Quat(real: 1, imag: .zero),
                 shape: BodyShape = .box,
@@ -209,6 +226,7 @@ public struct SceneCollider {
         self.init(
             body: body, size: size, friction: friction,
             dynamicFriction: dynamicFriction,
+            torsionalFriction: torsionalFriction,
             localPosition: localPosition, localRotation: localRotation,
             shape: shape, convexHullVertices: convexHullVertices,
             convexAssetID: nil, collisionGroup: collisionGroup,
@@ -527,18 +545,6 @@ public struct SimSettings {
     /// visibly permits geometry to settle below the rendered surface.
     public var collisionMargin: Float = 0.01
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
-    /// Generate a small contact PATCH where a sphere meets a flat face,
-    /// instead of the single geometric contact point.
-    ///
-    /// A point contact carries no moment arm about its own normal, so a
-    /// sphere held between two pads is free to spin about the grasp axis
-    /// however high the friction is - a two-finger grasp behaves like an
-    /// axle. The patch models the flattening a real elastic pad undergoes.
-    ///
-    /// Off by default: it adds three contacts per sphere-face pair, which
-    /// changes the dynamics (and cost) of every existing sphere-footed rig.
-    /// Manipulation scenes that grasp balls want it on.
-    public var spherePatchContacts: Bool = false
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note
     // calls the higher, unit-split betas "a minor upgrade from the paper");
@@ -671,7 +677,8 @@ public struct PhysicsScene {
     @discardableResult
     @_disfavoredOverload
     public mutating func addBody(size: F3, density: Float, friction: Float,
-                                 dynamicFriction: Float? = nil, position: F3,
+                                 dynamicFriction: Float? = nil,
+                                 torsionalFriction: Float = 0, position: F3,
                                  rotation: Quat = Quat(real: 1, imag: .zero),
                                  velocity: F3 = .zero, shape: BodyShape = .box,
                                  mass: Float? = nil,
@@ -681,6 +688,7 @@ public struct PhysicsScene {
                                  collisionEnabled: Bool = true) -> Int {
         bodies.append(SceneBody(size: size, density: density, friction: friction,
                                 dynamicFriction: dynamicFriction,
+                                torsionalFriction: torsionalFriction,
                                 position: position, rotation: rotation, velocity: velocity,
                                 shape: shape, mass: mass,
                                 diagonalInertia: diagonalInertia,
@@ -689,7 +697,8 @@ public struct PhysicsScene {
         if collisionEnabled {
             colliders.append(SceneCollider(
                 body: body, size: size, friction: friction,
-                dynamicFriction: dynamicFriction, shape: shape,
+                dynamicFriction: dynamicFriction,
+                torsionalFriction: torsionalFriction, shape: shape,
                 collisionGroup: collisionGroup,
                 usesWorldSpaceRoundAnchor: shape != .box))
         }
@@ -704,7 +713,8 @@ public struct PhysicsScene {
                                  velocity: F3 = .zero,
                                  shape: BodyShape = .box) -> Int {
         addBody(size: size, density: density, friction: friction,
-                dynamicFriction: friction, position: position,
+                dynamicFriction: friction, torsionalFriction: 0,
+                position: position,
                 rotation: rotation, velocity: velocity, shape: shape,
                 mass: nil, diagonalInertia: nil, gravityScale: 1,
                 collisionGroup: 0, collisionEnabled: true)
@@ -717,6 +727,7 @@ public struct PhysicsScene {
     public mutating func addCollider(body: Int, size: F3,
                                      friction: Float? = nil,
                                      dynamicFriction: Float? = nil,
+                                     torsionalFriction: Float? = nil,
                                      localPosition: F3 = .zero,
                                      localRotation: Quat = Quat(real: 1, imag: .zero),
                                      shape: BodyShape = .box,
@@ -737,6 +748,8 @@ public struct PhysicsScene {
             body: body, size: size, friction: friction ?? bodies[body].friction,
             dynamicFriction: dynamicFriction
                 ?? bodies[body].dynamicFriction,
+            torsionalFriction: torsionalFriction
+                ?? bodies[body].torsionalFriction,
             localPosition: localPosition, localRotation: localRotation,
             shape: shape, convexHullVertices: convexHullVertices,
             convexAssetID: convexAssetID,
@@ -754,6 +767,7 @@ public struct PhysicsScene {
     public mutating func addCollider(body: Int, size: F3,
                                      friction: Float? = nil,
                                      dynamicFriction: Float? = nil,
+                                     torsionalFriction: Float? = nil,
                                      localPosition: F3 = .zero,
                                      localRotation: Quat = Quat(real: 1, imag: .zero),
                                      shape: BodyShape = .box,
@@ -766,6 +780,7 @@ public struct PhysicsScene {
         addCollider(
             body: body, size: size, friction: friction,
             dynamicFriction: dynamicFriction,
+            torsionalFriction: torsionalFriction,
             localPosition: localPosition, localRotation: localRotation,
             shape: shape, convexHullVertices: convexHullVertices,
             convexAssetID: nil, collisionGroup: collisionGroup,
@@ -796,6 +811,7 @@ public struct PhysicsScene {
     public mutating func addConvexCollider(
         body: Int, asset: ConvexHullAsset, friction: Float? = nil,
         dynamicFriction: Float? = nil,
+        torsionalFriction: Float? = nil,
         localPosition: F3 = .zero,
         localRotation: Quat = Quat(real: 1, imag: .zero),
         collisionGroup: UInt32 = 0,
@@ -811,6 +827,7 @@ public struct PhysicsScene {
             body: body,
             size: geometryBounds.max - geometryBounds.min,
             friction: friction, dynamicFriction: dynamicFriction,
+            torsionalFriction: torsionalFriction,
             localPosition: localPosition, localRotation: localRotation,
             shape: .box, convexAssetID: assetID,
             collisionGroup: collisionGroup,
@@ -826,6 +843,7 @@ public struct PhysicsScene {
     public mutating func addConvexCompound(
         body: Int, asset: ConvexCompoundAsset, friction: Float? = nil,
         dynamicFriction: Float? = nil,
+        torsionalFriction: Float? = nil,
         localPosition: F3 = .zero,
         localRotation: Quat = Quat(real: 1, imag: .zero),
         collisionGroup: UInt32 = 0,
@@ -837,6 +855,7 @@ public struct PhysicsScene {
             addConvexCollider(
                 body: body, asset: part, friction: friction,
                 dynamicFriction: dynamicFriction,
+                torsionalFriction: torsionalFriction,
                 localPosition: localPosition, localRotation: localRotation,
                 collisionGroup: collisionGroup,
                 collidesWithSharedGeometry: collidesWithSharedGeometry,
@@ -855,6 +874,7 @@ public struct PhysicsScene {
     public mutating func addConvexCollider(
         body: Int, vertices: [F3], friction: Float? = nil,
         dynamicFriction: Float? = nil,
+        torsionalFriction: Float? = nil,
         localPosition: F3 = .zero,
         localRotation: Quat = Quat(real: 1, imag: .zero),
         collisionGroup: UInt32 = 0,
@@ -879,6 +899,7 @@ public struct PhysicsScene {
         return addCollider(
             body: body, size: hi - lo, friction: friction,
             dynamicFriction: dynamicFriction,
+            torsionalFriction: torsionalFriction,
             localPosition: localPosition + normalizedRotation.act(center),
             localRotation: normalizedRotation, shape: .box,
             convexHullVertices: centered,
@@ -889,27 +910,34 @@ public struct PhysicsScene {
 
     @discardableResult
     public mutating func addSphere(diameter: Float, density: Float, friction: Float,
+                                   torsionalFriction: Float = 0,
                                    position: F3, velocity: F3 = .zero) -> Int {
         addBody(size: F3(repeating: diameter), density: density, friction: friction,
+                torsionalFriction: torsionalFriction,
                 position: position, velocity: velocity, shape: .sphere)
     }
 
     @discardableResult
     public mutating func addCapsule(length: Float, radius: Float, density: Float,
-                                    friction: Float, position: F3,
+                                    friction: Float,
+                                    torsionalFriction: Float = 0, position: F3,
                                     rotation: Quat = Quat(real: 1, imag: .zero),
                                     velocity: F3 = .zero) -> Int {
         addBody(size: F3(length, radius, 0), density: density, friction: friction,
-                position: position, rotation: rotation, velocity: velocity, shape: .capsule)
+                torsionalFriction: torsionalFriction, position: position,
+                rotation: rotation, velocity: velocity, shape: .capsule)
     }
 
     @discardableResult
     public mutating func addTorus(major: Float, minor: Float, density: Float,
-                                  friction: Float, position: F3,
+                                  friction: Float,
+                                  torsionalFriction: Float = 0, position: F3,
                                   rotation: Quat = Quat(real: 1, imag: .zero),
                                   velocity: F3 = .zero) -> Int {
         addBody(size: F3(major, minor, 0), density: density, friction: friction,
-                position: position, rotation: rotation, velocity: velocity, shape: .torus)
+                torsionalFriction: torsionalFriction,
+                position: position, rotation: rotation, velocity: velocity,
+                shape: .torus)
     }
 
     public mutating func addJoint(_ j: SceneJoint) { joints.append(j) }

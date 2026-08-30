@@ -80,7 +80,6 @@ public extension PhysicsScene {
         solver.gamma = settings.gamma
         solver.lambdaMax = settings.lambdaMax
         solver.collisionMargin = max(settings.collisionMargin, 0)
-        solver.spherePatchContacts = settings.spherePatchContacts
         solver.frictionCombineMode = settings.frictionCombineMode
         solver.rigidLinearDamping = settings.rigidLinearDamping
         solver.rigidAngularDamping = settings.rigidAngularDamping
@@ -92,6 +91,7 @@ public extension PhysicsScene {
                 density: body.density,
                 friction: body.friction,
                 dynamicFriction: body.dynamicFriction,
+                torsionalFriction: body.torsionalFriction,
                 position: body.position,
                 rotation: body.rotation,
                 velocity: body.velocity,
@@ -107,6 +107,7 @@ public extension PhysicsScene {
                 body: collider.body, size: collider.size,
                 friction: collider.friction,
                 dynamicFriction: collider.dynamicFriction,
+                torsionalFriction: collider.torsionalFriction,
                 localPosition: collider.localPosition,
                 localRotation: collider.localRotation,
                 shape: collider.shape,

@@ -30,6 +30,7 @@ public final class CPURigid {
     public var moment: F3
     public var friction: Float
     public var dynamicFriction: Float
+    public var torsionalFriction: Float
     public var gravityScale: Float
     public var radius: Float
     public var shape: BodyShape
@@ -39,14 +40,18 @@ public final class CPURigid {
 
     @_disfavoredOverload
     public init(index: Int, size: F3, density: Float, friction: Float,
-                dynamicFriction: Float? = nil, position: F3,
+                dynamicFriction: Float? = nil,
+                torsionalFriction: Float = 0, position: F3,
                 rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
                 shape: BodyShape = .box, mass explicitMass: Float? = nil,
                 diagonalInertia: F3? = nil, gravityScale: Float = 1) {
+        precondition(torsionalFriction >= 0 && torsionalFriction.isFinite,
+                     "torsional friction must be finite and nonnegative")
         self.index = index
         self.size = size
         self.friction = friction
         self.dynamicFriction = dynamicFriction ?? friction
+        self.torsionalFriction = torsionalFriction
         self.gravityScale = gravityScale
         self.positionLin = position
         self.positionAng = rotation
@@ -102,6 +107,7 @@ public final class CPURigid {
                             shape: BodyShape = .box) {
         self.init(index: index, size: size, density: density,
                   friction: friction, dynamicFriction: friction,
+                  torsionalFriction: 0,
                   position: position, rotation: rotation, velocity: velocity,
                   shape: shape, mass: nil, diagonalInertia: nil,
                   gravityScale: 1)
@@ -124,6 +130,7 @@ struct CPUCollider {
     var size: F3
     var friction: Float
     var dynamicFriction: Float
+    var torsionalFriction: Float
     var localPosition: F3
     var localRotation: Quat
     var shape: BodyShape
@@ -196,8 +203,6 @@ public final class CPUSolver {
     public var gravity: Float = -10.0
     public var iterations: Int = 10
     public var collisionMargin: Float = AVBDConstants.collisionMargin
-    /// See `SimSettings.spherePatchContacts`.
-    public var spherePatchContacts: Bool = false
     /// A numerical narrow-phase failure is terminal. The legacy nonthrowing
     /// `step()` API remains source-compatible and becomes a no-op after the
     /// first failure; callers that need immediate propagation use
@@ -226,14 +231,16 @@ public final class CPUSolver {
     @discardableResult
     @_disfavoredOverload
     public func addBody(size: F3, density: Float, friction: Float,
-                        dynamicFriction: Float? = nil, position: F3,
+                        dynamicFriction: Float? = nil,
+                        torsionalFriction: Float = 0, position: F3,
                         rotation: Quat = Quat(real: 1, imag: .zero), velocity: F3 = .zero,
                         shape: BodyShape = .box, mass: Float? = nil,
                         diagonalInertia: F3? = nil,
                         gravityScale: Float = 1) -> CPURigid {
         addBodyImpl(
             size: size, density: density, friction: friction,
-            dynamicFriction: dynamicFriction, position: position,
+            dynamicFriction: dynamicFriction,
+            torsionalFriction: torsionalFriction, position: position,
             rotation: rotation, velocity: velocity, shape: shape,
             mass: mass, diagonalInertia: diagonalInertia,
             gravityScale: gravityScale, addImplicitCollider: true)
@@ -243,14 +250,16 @@ public final class CPUSolver {
     /// synthesize the legacy one-collider-per-body fallback.
     @discardableResult
     func addSceneBody(size: F3, density: Float, friction: Float,
-                      dynamicFriction: Float? = nil, position: F3,
+                      dynamicFriction: Float? = nil,
+                      torsionalFriction: Float = 0, position: F3,
                       rotation: Quat = Quat(real: 1, imag: .zero),
                       velocity: F3 = .zero, shape: BodyShape = .box,
                       mass: Float? = nil, diagonalInertia: F3? = nil,
                       gravityScale: Float = 1) -> CPURigid {
         addBodyImpl(
             size: size, density: density, friction: friction,
-            dynamicFriction: dynamicFriction, position: position,
+            dynamicFriction: dynamicFriction,
+            torsionalFriction: torsionalFriction, position: position,
             rotation: rotation, velocity: velocity, shape: shape,
             mass: mass, diagonalInertia: diagonalInertia,
             gravityScale: gravityScale, addImplicitCollider: false)
@@ -258,7 +267,8 @@ public final class CPUSolver {
 
     private func addBodyImpl(
         size: F3, density: Float, friction: Float,
-        dynamicFriction: Float?, position: F3, rotation: Quat,
+        dynamicFriction: Float?, torsionalFriction: Float,
+        position: F3, rotation: Quat,
         velocity: F3, shape: BodyShape, mass: Float?,
         diagonalInertia: F3?, gravityScale: Float,
         addImplicitCollider: Bool
@@ -266,6 +276,7 @@ public final class CPUSolver {
         let b = CPURigid(index: bodies.count, size: size, density: density,
                          friction: friction,
                          dynamicFriction: dynamicFriction,
+                         torsionalFriction: torsionalFriction,
                          position: position, rotation: rotation, velocity: velocity,
                          shape: shape, mass: mass,
                          diagonalInertia: diagonalInertia,
@@ -275,6 +286,7 @@ public final class CPUSolver {
             _ = addCollider(
                 body: b.index, size: size, friction: friction,
                 dynamicFriction: dynamicFriction ?? friction,
+                torsionalFriction: torsionalFriction,
                 shape: shape,
                 usesWorldSpaceRoundAnchor: shape != .box,
                 isLegacyImplicit: true)
@@ -290,7 +302,8 @@ public final class CPUSolver {
                         velocity: F3 = .zero,
                         shape: BodyShape = .box) -> CPURigid {
         addBody(size: size, density: density, friction: friction,
-                dynamicFriction: friction, position: position,
+                dynamicFriction: friction, torsionalFriction: 0,
+                position: position,
                 rotation: rotation, velocity: velocity, shape: shape,
                 mass: nil, diagonalInertia: nil, gravityScale: 1)
     }
@@ -299,6 +312,7 @@ public final class CPUSolver {
     func addCollider(
         body: Int, size: F3, friction: Float,
         dynamicFriction: Float,
+        torsionalFriction: Float = 0,
         localPosition: F3 = .zero,
         localRotation: Quat = Quat(real: 1, imag: .zero),
         shape: BodyShape = .box,
@@ -315,6 +329,8 @@ public final class CPUSolver {
                      "CPU convex asset out of range")
         precondition(convexAssetID == nil || convexHullVertices.isEmpty,
                      "CPU collider cannot use inline and shared hulls together")
+        precondition(torsionalFriction >= 0 && torsionalFriction.isFinite,
+                     "torsional friction must be finite and nonnegative")
 
         let boundsCenter: F3
         let radius: Float
@@ -348,6 +364,7 @@ public final class CPUSolver {
         colliders.append(CPUCollider(
             index: index, body: body, size: size,
             friction: friction, dynamicFriction: dynamicFriction,
+            torsionalFriction: torsionalFriction,
             localPosition: localPosition,
             localRotation: localRotation.normalized,
             shape: shape, convexHullVertices: convexHullVertices,
@@ -437,6 +454,7 @@ public final class CPUSolver {
             colliders[index].shape = body.shape
             colliders[index].friction = body.friction
             colliders[index].dynamicFriction = body.dynamicFriction
+            colliders[index].torsionalFriction = body.torsionalFriction
             colliders[index].usesWorldSpaceRoundAnchor = body.shape != .box
             colliders[index].localBoundsCenter = .zero
             switch body.shape {

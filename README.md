@@ -28,6 +28,16 @@ counting-sort spatial hash, CAS open-addressing persistence maps, sign-memory
 crossing protection with boundary release, runtime shader concatenation
 (`00_common` … `60_robotics`).
 
+Rigid contact materials keep geometry and constitutive response separate.
+`friction` / `dynamicFriction` bound tangential force; the optional
+`torsionalFriction` on a body or collider is an effective contact radius in
+scene-length units and bounds one aggregate manifold torque by
+`normalLoad * torsionalFriction`. The two shape values are averaged (matching
+[Newton XPBD's material rule](https://github.com/newton-physics/newton/blob/main/docs/solvers/index.rst)); zero is the source-compatible default. Enabling it
+does not manufacture sphere or capsule witnesses: a sphere on a plane remains
+one exact contact, a flat box keeps its clipped manifold, and both feed the
+same solver-level twist mode. Rolling friction is not yet implemented.
+
 ## Targets
 
 | Target | Purpose |

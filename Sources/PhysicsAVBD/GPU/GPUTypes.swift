@@ -55,7 +55,9 @@ public struct SimParamsGPU {
     public var frame: UInt32 = 0
     public var frictionCombineMode: UInt32 = 0
     public var collisionMargin: Float = 0.01
-    public var spherePatchContacts: UInt32 = 0
+    /// Retains the byte-frozen analytic-kernel parameter layout. The former
+    /// sphere-patch switch is intentionally not part of the public model.
+    public var contactMaterialReserved: UInt32 = 0
     public var rigidLinearDamping: Float = 0
     public var rigidAngularDamping: Float = 0
     /// 0 = disabled/no surface, 1 = legacy isotropic OGC bound,

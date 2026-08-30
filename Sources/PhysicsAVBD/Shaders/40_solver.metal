@@ -1151,6 +1151,76 @@ inline void stampBend(device const BendGPU& bd, uint self,
     acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(s * k * k)));
 }
 
+// Attach solver-level angular material state after narrow phase. This runs
+// only in scenes that author torsional friction, leaving collision geometry
+// and the byte-frozen analytic compatibility kernel untouched.
+kernel void prepare_torsional_friction(
+    device const float4* posLin [[buffer(0)]],
+    device const float4* props [[buffer(1)]],
+    device const ManifoldGPU* manifolds [[buffer(2)]],
+    device const ManifoldGPU* prevManifolds [[buffer(3)]],
+    device const atomic_uint* mapKeyA [[buffer(4)]],
+    device const uint* mapKeyB [[buffer(5)]],
+    device const uint* mapVal [[buffer(6)]],
+    device const float* colliderTorsionalFriction [[buffer(7)]],
+    device float4* torsionState [[buffer(8)]],
+    device const float4* prevTorsionState [[buffer(9)]],
+    constant SimParams& P [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= P.maxPairs) return;
+    device const ManifoldGPU& m = manifolds[gid];
+    uint contactCount = m.header.z;
+    if (contactCount == 0u) {
+        torsionState[gid] = float4(0.0f);
+        return;
+    }
+
+    uint ia = m.colliderPair.x, ib = m.colliderPair.y;
+    // Torsional coefficients have length units. Newton XPBD combines the two
+    // per-shape values by their symmetric average; multiplying them would
+    // produce length squared and is therefore not a valid combine rule.
+    float muTorsion = 0.5f * (
+        colliderTorsionalFriction[ia] + colliderTorsionalFriction[ib]);
+    if (!isfinite(muTorsion) || muTorsion <= 0.0f) {
+        torsionState[gid] = float4(0.0f);
+        return;
+    }
+
+    float lambda = 0.0f;
+    float penalty = 0.0f;
+    int prevIdx = pairMapFind(
+        mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
+    if (prevIdx >= 0) {
+        device const ManifoldGPU& previous = prevManifolds[prevIdx];
+        if (previous.header.z > 0u
+            && dot(previous.basisN.xyz, m.basisN.xyz) > 0.95f) {
+            lambda = prevTorsionState[prevIdx].y;
+            penalty = prevTorsionState[prevIdx].z;
+        }
+    }
+
+    uint a = m.header.x, b = m.header.y;
+    float minMoment = FLT_MAX;
+    if (posLin[a].w > 0.0f) {
+        minMoment = min(minMoment, min(props[a].x,
+                                       min(props[a].y, props[a].z)));
+    }
+    if (posLin[b].w > 0.0f) {
+        minMoment = min(minMoment, min(props[b].x,
+                                       min(props[b].y, props[b].z)));
+    }
+    float floor = PENALTY_MIN;
+    if (minMoment < FLT_MAX && minMoment > 0.0f) {
+        floor = min(PENALTY_MAX_T,
+                    max(PENALTY_MIN,
+                        minMoment / max(P.dt * P.dt, 1.0e-12f)));
+    }
+    torsionState[gid] = float4(
+        muTorsion, lambda * P.alpha * P.gamma,
+        clamp(penalty * P.gamma, floor, PENALTY_MAX_T), 0.0f);
+}
+
 // Shared contact force computation (Taylor series constraint, Sec 4 + Eq 13-15)
 inline float3 contactForceC(device const ManifoldGPU& m, uint ci,
                             float3 dqALin, float3 dqAAng, float3 dqBLin, float3 dqBAng,
@@ -1180,6 +1250,24 @@ inline float3 contactForceC(device const ManifoldGPU& m, uint ci,
     }
     Cout = C;
     return F;
+}
+
+// A real material footprint can resist twist independently of the number of
+// geometric witnesses. Represent that constitutive effect once per manifold
+// as a bounded angular constraint instead of fabricating extra sphere
+// witnesses or multiplying torque by contact count. The coefficient has
+// length units and bounds torque by total normal load times effective radius.
+inline float contactTorsionC(device const ManifoldGPU& m, float4 state,
+                             float normalForce,
+                             float3 dqAAng, float3 dqBAng,
+                             thread float& Cout,
+                             thread float& unconstrained,
+                             thread float& bound)
+{
+    Cout = state.w + dot(m.basisN.xyz, dqAAng - dqBAng);
+    unconstrained = state.z * Cout + state.y;
+    bound = fabs(normalForce) * max(state.x, 0.0f);
+    return clamp(unconstrained, -bound, bound);
 }
 
 inline void stampManifold(device const ManifoldGPU& m, uint self,
@@ -1226,6 +1314,102 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
         acc.rhsLin += m3_mul(jLinT, F);
         acc.rhsAng += m3_mul(jAngT, F);
     }
+}
+
+// Optional operator-split torsional material pass. It deliberately lives in
+// a separate kernel so the established AVBD primal kernels remain source- and
+// codegen-identical for the overwhelmingly common zero-torsion scene.
+inline void stampTorsionalManifold(
+    device const ManifoldGPU& m, float4 state, uint self,
+    device const float4* posLin, device const float4* posAng,
+    device const float4* initLin, device const float4* initAng,
+    float alpha, thread M3& lhsAng, thread float3& rhsAng)
+{
+    uint n = m.header.z;
+    if (n == 0u || state.x <= 0.0f) return;
+    uint a = m.header.x, b = m.header.y;
+    bool isA = self == a;
+    bool sphA = (m.header.w & 2u) != 0u;
+    bool sphB = (m.header.w & 4u) != 0u;
+    float3 dqALin = posLin[a].xyz - initLin[a].xyz;
+    float3 dqAAng = q_sub(posAng[a], initAng[a]);
+    float3 dqBLin = posLin[b].xyz - initLin[b].xyz;
+    float3 dqBAng = q_sub(posAng[b], initAng[b]);
+    float normalLoad = 0.0f;
+    for (uint i = 0u; i < n; ++i) {
+        float3 rAW = sphA ? m.contacts[i].rA.xyz
+            : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz
+            : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 C;
+        float frictionScale, bounds;
+        float3 F = contactForceC(
+            m, i, dqALin, dqAAng, dqBLin, dqBAng,
+            rAW, rBW, alpha, C, frictionScale, bounds);
+        normalLoad += fabs(F.x);
+    }
+    float Ct, rawTorque, torqueBound;
+    float torque = contactTorsionC(
+        m, state, normalLoad, dqAAng, dqBAng,
+        Ct, rawTorque, torqueBound);
+    float3 j = m.basisN.xyz * (isA ? 1.0f : -1.0f);
+    lhsAng = m3_add(lhsAng, m3_scale(m3_outer(j, j), state.z));
+    rhsAng += j * torque;
+}
+
+kernel void primal_torsional_friction(
+    device const float4* posLin [[buffer(0)]],
+    device float4* posAng [[buffer(1)]],
+    device const float4* initLin [[buffer(2)]],
+    device const float4* initAng [[buffer(3)]],
+    device const float4* props [[buffer(4)]],
+    device const ManifoldGPU* manifolds [[buffer(5)]],
+    device const float4* torsionState [[buffer(6)]],
+    device const uint* adjStart [[buffer(7)]],
+    device const uint* adjCount [[buffer(8)]],
+    device const uint* adjList [[buffer(9)]],
+    device const uint* colorList [[buffer(10)]],
+    device const uint* colorStart [[buffer(11)]],
+    constant uint& colorIndex [[buffer(12)]],
+    constant SimParams& P [[buffer(13)]],
+    device const float4* shape [[buffer(14)]],
+    uint tid [[thread_position_in_grid]])
+{
+    // colorArgs reserves eight lanes per body for the ordinary split primal.
+    // Torsion is one manifold mode, so lane zero handles its body's slice.
+    uint slot = tid >> 3u;
+    if ((tid & 7u) != 0u) return;
+    uint begin = colorStart[colorIndex];
+    uint end = colorStart[colorIndex + 1u];
+    if (begin + slot >= end) return;
+    uint body = colorList[begin + slot];
+    if (shape[body].w < 0.0f || posLin[body].w <= 0.0f) return;
+
+    float dt2 = P.dt * P.dt;
+    M3 lhsAng = m3_scale(
+        world_inertia(posAng[body], props[body].xyz), 1.0f / dt2);
+    float3 rhsAng = float3(0.0f);
+    uint start = adjStart[body];
+    uint count = adjCount[body];
+    for (uint k = 0u; k < count; ++k) {
+        uint entry = adjList[start + k];
+        if ((entry >> ADJ_KIND_SHIFT) != FK_MANIFOLD) continue;
+        uint index = entry & ADJ_INDEX_MASK;
+        stampTorsionalManifold(
+            manifolds[index], torsionState[index], body,
+            posLin, posAng, initLin, initAng, P.alpha, lhsAng, rhsAng);
+    }
+
+    float3 ignoredLin, dxAng;
+    solve6x6(m3_identity(), lhsAng, m3_zero(), float3(0.0f),
+             -rhsAng, ignoredLin, dxAng);
+    if (!finite3(dxAng)) return;
+    float angle2 = dot(dxAng, dxAng);
+    const float maxAngle = 0.5f;
+    if (angle2 > maxAngle * maxAngle) {
+        dxAng *= maxAngle * rsqrt(angle2);
+    }
+    posAng[body] = q_addw(posAng[body], dxAng);
 }
 
 // ----------------------------------------------------------------------------
@@ -1842,6 +2026,54 @@ static inline void dual_manifold_one(
         }
         m.contacts[i].penalty = float4(pen, 0);
     }
+}
+
+kernel void dual_torsional_friction(
+    device const float4* posLin [[buffer(0)]],
+    device const float4* posAng [[buffer(1)]],
+    device const float4* initLin [[buffer(2)]],
+    device const float4* initAng [[buffer(3)]],
+    device const ManifoldGPU* manifolds [[buffer(4)]],
+    device float4* torsionState [[buffer(5)]],
+    constant SimParams& P [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= P.maxPairs) return;
+    device const ManifoldGPU& m = manifolds[gid];
+    uint n = m.header.z;
+    float4 state = torsionState[gid];
+    if (n == 0u || state.x <= 0.0f) return;
+
+    uint a = m.header.x, b = m.header.y;
+    bool sphA = (m.header.w & 2u) != 0u;
+    bool sphB = (m.header.w & 4u) != 0u;
+    float3 dqALin = posLin[a].xyz - initLin[a].xyz;
+    float3 dqAAng = q_sub(posAng[a], initAng[a]);
+    float3 dqBLin = posLin[b].xyz - initLin[b].xyz;
+    float3 dqBAng = q_sub(posAng[b], initAng[b]);
+    float normalLoad = 0.0f;
+    for (uint i = 0u; i < n; ++i) {
+        float3 rAW = sphA ? m.contacts[i].rA.xyz
+            : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz
+            : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 C;
+        float frictionScale, bounds;
+        float3 F = contactForceC(
+            m, i, dqALin, dqAAng, dqBLin, dqBAng,
+            rAW, rBW, P.alpha, C, frictionScale, bounds);
+        normalLoad += fabs(F.x);
+    }
+
+    float Ct, rawTorque, torqueBound;
+    state.y = contactTorsionC(
+        m, state, normalLoad, dqAAng, dqBAng,
+        Ct, rawTorque, torqueBound);
+    if (fabs(rawTorque) <= torqueBound) {
+        state.z = min(
+            state.z + P.betaAng * fabs(Ct), PENALTY_MAX_T);
+    }
+    torsionState[gid] = state;
 }
 
 // Fused dual update: one dispatch covers joints then contact manifolds.
