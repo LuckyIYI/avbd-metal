@@ -276,6 +276,7 @@ struct SimParams {
     uint frame;             // frame counter (tracker reseed staggering)
     uint frictionCombineMode; // 0 geometric, 1 multiply, 2 min, 3 max, 4 average
     float collisionMargin;  // scene-scale rigid contact skin/margin (metres)
+    uint contactMaterialReserved; // keep frozen analytic SimParams ABI
     float rigidLinearDamping;  // isotropic viscous drag, per second
     float rigidAngularDamping;
     uint surfaceTruncationMode; // 0 off, 1 isotropic, 2 Planar-DAT

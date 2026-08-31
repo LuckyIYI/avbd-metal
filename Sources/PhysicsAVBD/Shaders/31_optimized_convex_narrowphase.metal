@@ -2311,7 +2311,12 @@ inline void npCollidePass(
                 }
                 bool dup = false;
                 for (int h = 0; h < nh; h++) {
-                    if (distance(hits2[h].xA, q + n * rc) < 0.4f * rc + 0.05f) { dup = true; break; }
+                    // Scale-aware: a flat 5 cm dedup radius is longer than
+                    // a short capsule, so every seed collapsed onto one
+                    // point and a small capsule rested on a single-point
+                    // axle instead of a line.
+                    if (distance(hits2[h].xA, q + n * rc)
+                        < 0.4f * rc + min(0.05f, 0.25f * half_)) { dup = true; break; }
                 }
                 if (dup) continue;
                 hits2[nh].xA = q + n * rc;
@@ -3123,4 +3128,3 @@ kernel void convex_restore_failed_frame(
     posLin[gid] = float4(initLin[gid].xyz, posLin[gid].w);
     posAng[gid] = initAng[gid];
 }
-

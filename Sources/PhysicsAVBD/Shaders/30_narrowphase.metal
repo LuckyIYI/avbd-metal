@@ -1807,7 +1807,7 @@ struct TorusHit {
 // not retain MPR/GJK, clipping workspaces, or convex-only buffer accesses in
 // its generated code. Both passes still consume the same deterministic pair
 // stream and address the same manifold slot by `gid`.
-template <bool CONVEX_PASS>
+template <bool CONVEX_PASS, bool ENHANCED_ANALYTIC_ONLY>
 inline void npCollidePass(
     device const float4* posLin,
     device const float4* posAng,
@@ -1846,6 +1846,16 @@ inline void npCollidePass(
 
     uint2 pair = pairs[gid];
     uint ia = pair.x, ib = pair.y;
+    if (ENHANCED_ANALYTIC_ONLY) {
+        // Keep the overlay at two kind loads for every unaffected pair. The
+        // expensive owner/pose/velocity/OBB prologue below runs only for the
+        // capsule-box slots that this pass owns.
+        uint earlyA = shapeType[ia] & SHAPE_KIND_MASK;
+        uint earlyB = shapeType[ib] & SHAPE_KIND_MASK;
+        bool capsuleBox = (earlyA == 3u && earlyB == 0u)
+            || (earlyB == 3u && earlyA == 0u);
+        if (!capsuleBox) return;
+    }
     uint ba = colliderOwner[ia], bb = colliderOwner[ib];
 
     float4 bodyPA4 = posLin[ba];
@@ -2229,7 +2239,12 @@ inline void npCollidePass(
                 }
                 bool dup = false;
                 for (int h = 0; h < nh; h++) {
-                    if (distance(hits2[h].xA, q + n * rc) < 0.4f * rc + 0.05f) { dup = true; break; }
+                    // Scale-aware: a flat 5 cm dedup radius is longer than
+                    // a short capsule, so every seed collapsed onto one
+                    // point and a small capsule rested on a single-point
+                    // axle instead of a line.
+                    if (distance(hits2[h].xA, q + n * rc)
+                        < 0.4f * rc + min(0.05f, 0.25f * half_)) { dup = true; break; }
                 }
                 if (dup) continue;
                 hits2[nh].xA = q + n * rc;
@@ -2941,7 +2956,55 @@ kernel void np_collide(
     device atomic_uint* convexQueryPoison [[buffer(29)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    npCollidePass<false>(
+    npCollidePass<false, false>(
+        posLin, posAng, shape, props, pairs, counters, manifolds,
+        prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
+        velLin, velAng, colliderOwner, colliderLocalPosition,
+        colliderLocalRotation, colliderHullRange, convexHullVertices,
+        colliderFriction, colliderConvexAssetID, convexHulls, convexFaces,
+        convexFaceVertexIndices, convexEdges, contactFeatures,
+        prevContactFeatures, convexQueryPoison, gid);
+}
+
+// The byte-frozen compatibility kernel owns every ordinary hull-free pair.
+// This disjoint overlay revisits only pairs whose semantics intentionally
+// changed, then overwrites that pair's stable manifold slot. Keeping the
+// overlay compile-time narrow prevents unrelated fast-math trajectories from
+// changing merely because a scene contains a capsule.
+kernel void np_collide_enhanced_analytic(
+    device const float4* posLin     [[buffer(0)]],
+    device const float4* posAng     [[buffer(1)]],
+    device const float4* shape      [[buffer(2)]],
+    device const float4* props      [[buffer(3)]],
+    device const uint2* pairs       [[buffer(4)]],
+    device atomic_uint* counters    [[buffer(5)]],
+    device ManifoldGPU* manifolds   [[buffer(6)]],
+    device const ManifoldGPU* prevManifolds [[buffer(7)]],
+    device const atomic_uint* mapKeyA [[buffer(8)]],
+    device const uint* mapKeyB      [[buffer(9)]],
+    device const uint* mapVal       [[buffer(10)]],
+    constant SimParams& P           [[buffer(11)]],
+    device const uint* shapeType    [[buffer(12)]],
+    device const float4* spinVel    [[buffer(13)]],
+    device const float4* velLin     [[buffer(14)]],
+    device const float4* velAng     [[buffer(15)]],
+    device const uint* colliderOwner [[buffer(16)]],
+    device const float4* colliderLocalPosition [[buffer(17)]],
+    device const float4* colliderLocalRotation [[buffer(18)]],
+    device const uint2* colliderHullRange [[buffer(19)]],
+    device const float4* convexHullVertices [[buffer(20)]],
+    device const float2* colliderFriction [[buffer(21)]],
+    device const uint* colliderConvexAssetID [[buffer(22)]],
+    device const ConvexHullGPU* convexHulls [[buffer(23)]],
+    device const ConvexFaceGPU* convexFaces [[buffer(24)]],
+    device const uint* convexFaceVertexIndices [[buffer(25)]],
+    device const ConvexEdgeGPU* convexEdges [[buffer(26)]],
+    device uint2* contactFeatures [[buffer(27)]],
+    device const uint2* prevContactFeatures [[buffer(28)]],
+    device atomic_uint* convexQueryPoison [[buffer(29)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    npCollidePass<false, true>(
         posLin, posAng, shape, props, pairs, counters, manifolds,
         prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
         velLin, velAng, colliderOwner, colliderLocalPosition,
@@ -2984,7 +3047,7 @@ kernel void np_collide_convex(
     device atomic_uint* convexQueryPoison [[buffer(29)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    npCollidePass<true>(
+    npCollidePass<true, false>(
         posLin, posAng, shape, props, pairs, counters, manifolds,
         prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
         velLin, velAng, colliderOwner, colliderLocalPosition,
