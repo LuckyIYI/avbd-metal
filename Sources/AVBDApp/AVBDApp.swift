@@ -63,7 +63,8 @@ struct ContentView: View {
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
                         ForEach(Demos.all, id: \.self) {
-                            Text($0 == "gaudifunicular" ? "Gaudí Funicular" : $0)
+                            Text($0 == "gaudifunicular" ? "Gaudí Funicular"
+                                 : $0 == "boxofboxes" ? "Box of Boxes" : $0)
                         }
                     }
                     Picker("Size", selection: $model.scale) {

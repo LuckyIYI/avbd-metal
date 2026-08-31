@@ -2,6 +2,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#define ORDERED_COLORING_BODY_LIMIT 1024u
+
 // ============================================================================
 // AVBD solver kernels: adjacency (CSR), coloring, warm start, primal update
 // (per color, 6x6 LDL in registers), dual update, velocity finalize.
@@ -254,14 +256,18 @@ inline uint otherBody(device const JointGPU* joints,
     uint kind = entry >> ADJ_KIND_SHIFT;
     uint idx = entry & ADJ_INDEX_MASK;
     uint a, b;
-    if (kind == FK_JOINT) { a = joints[idx].header.x; b = joints[idx].header.y; }
-    else if (kind == FK_SPRING) { a = springs[idx].header.x; b = springs[idx].header.y; }
-    else { a = manifolds[idx].header.x; b = manifolds[idx].header.y; }
+    if (kind == FK_JOINT) {
+        a = joints[idx].header.x; b = joints[idx].header.y;
+    } else if (kind == FK_SPRING) {
+        a = springs[idx].header.x; b = springs[idx].header.y;
+    } else {
+        a = manifolds[idx].header.x; b = manifolds[idx].header.y;
+    }
     return a == self ? b : a;
 }
 
-// Accumulate the neighbor-color masks for one adjacency entry; tets and
-// element contacts conflict with all other participating vertices.
+// Keep the established small-scene path unchanged. It supports every force
+// kind even though dynamic coloring currently runs only for rigid scenes.
 inline void neighborColors(device const JointGPU* joints,
                            device const SpringGPU* springs,
                            device const ManifoldGPU* manifolds,
@@ -287,7 +293,9 @@ inline void neighborColors(device const JointGPU* joints,
     } else if (kind == FK_SOFT) {
         uint4 ids = soft[idx].ids;
         for (uint k = 0; k < 4; k++) {
-            if (ids[k] != self && ids[k] != WORLD_BODY && n < 3) { nbs[n++] = ids[k]; }
+            if (ids[k] != self && ids[k] != WORLD_BODY && n < 3) {
+                nbs[n++] = ids[k];
+            }
         }
     } else if (kind == FK_MEMBRANE) {
         uint4 ids = membranes[idx].ids;
@@ -317,6 +325,48 @@ inline void neighborColors(device const JointGPU* joints,
     }
 }
 
+// Extract one compact opposite-body id per sorted rigid CSR entry. This pass
+// runs only for large rigid scenes, leaving the established adjacency and
+// coloring execution of existing scenes untouched.
+kernel void adj_extract_neighbors(
+    device const JointGPU* joints   [[buffer(0)]],
+    device const SpringGPU* springs [[buffer(1)]],
+    device const ManifoldGPU* manifolds [[buffer(2)]],
+    device const uint* adjStart     [[buffer(3)]],
+    device const uint* adjCount     [[buffer(4)]],
+    device const uint* adjList      [[buffer(5)]],
+    device uint* adjNeighbor        [[buffer(6)]],
+    constant uint& numBodies        [[buffer(7)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= numBodies) return;
+    uint s = adjStart[gid], e = s + adjCount[gid];
+    for (uint k = s; k < e; k++) {
+        adjNeighbor[k] = otherBody(joints, springs, manifolds,
+                                   adjList[k], gid);
+    }
+}
+
+// Dynamic coloring is used only for rigid scenes, whose forces all have two
+// endpoints. Large scenes read the extracted opposite endpoint stream instead
+// of randomly dereferencing 704-byte manifold records on every pass.
+inline void neighborColor(device const float4* posLin,
+                           device const uint* colorsIn,
+                           uint nb, uint self, uint myColor,
+                           thread uint& maskLo, thread uint& maskHi,
+                           thread uint& allLo, thread uint& allHi,
+                           thread bool& conflict) {
+    if (nb == WORLD_BODY || posLin[nb].w <= 0.0f) return;
+    uint nc = colorsIn[nb];
+    uint lo = nc < 32 ? (1u << nc) : 0;
+    uint hi = (nc >= 32 && nc < 64) ? (1u << (nc - 32)) : 0;
+    allLo |= lo; allHi |= hi;
+    if (nb < self) {
+        maskLo |= lo; maskHi |= hi;
+        if (nc == myColor) conflict = true;
+    }
+}
+
 kernel void color_iterate(
     device const float4* posLin     [[buffer(0)]],
     device const JointGPU* joints   [[buffer(1)]],
@@ -334,6 +384,7 @@ kernel void color_iterate(
     device const MembraneGPU* membranes [[buffer(13)]],
     device const BendGPU* bends     [[buffer(14)]],
     constant uint& passIdx          [[buffer(15)]],
+    device const uint* adjNeighbor  [[buffer(16)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -353,29 +404,42 @@ kernel void color_iterate(
     bool conflict = false;
 
     uint s = adjStart[gid], e = s + adjCount[gid];
+    bool orderedCompatibility = P.numBodies
+        <= ORDERED_COLORING_BODY_LIMIT;
     for (uint k = s; k < e; k++) {
-        neighborColors(joints, springs, manifolds, tets, soft, membranes, bends,
-                       posLin, colorsIn,
-                       adjList[k], gid, myColor,
-                       maskLo, maskHi, allLo, allHi, conflict);
+        if (orderedCompatibility) {
+            neighborColors(joints, springs, manifolds, tets, soft,
+                           membranes, bends, posLin, colorsIn, adjList[k],
+                           gid, myColor, maskLo, maskHi, allLo, allHi,
+                           conflict);
+        } else {
+            neighborColor(posLin, colorsIn, adjNeighbor[k], gid, myColor,
+                          maskLo, maskHi, allLo, allHi, conflict);
+        }
     }
 
     if (conflict) {
-        // smallest free color among smaller-index neighbors
-        uint freeLo = ~maskLo;
+        // Preserve the established small-scene ordering, while large graphs
+        // pick a color free across ALL current neighbors. Restricting the
+        // latter to smaller neighbors makes convergence travel one graph hop
+        // at a time.
+        uint freeLo = orderedCompatibility ? ~maskLo : ~allLo;
         uint newColor;
         if (freeLo != 0) newColor = ctz(freeLo);
         else {
-            uint freeHi = ~maskHi;
+            uint freeHi = orderedCompatibility ? ~maskHi : ~allHi;
             newColor = freeHi != 0 ? 32 + ctz(freeHi) : (MAX_COLORS - 1);
         }
         colorsOut[gid] = min(newColor, uint(MAX_COLORS - 1));
         atomic_fetch_or_explicit(&changedFlag[passIdx], 1u, memory_order_relaxed);
+    } else if (P.numBodies > ORDERED_COLORING_BODY_LIMIT) {
+        // Preserve valid warm-started colors. Recompacting every body every
+        // frame made dense contact graphs oscillate for all 20 passes and
+        // forced the serial fallback even when no contact changed.
+        colorsOut[gid] = myColor;
     } else {
-        // Compaction: take the smallest color free w.r.t. ALL dynamic
-        // neighbors when it is below the current one. Keeps the palette
-        // dense so the solver loop dispatches few colors; any transient
-        // conflict is fixed by the smaller-index rule next round.
+        // The existing demos below the scaling threshold retain their exact
+        // palette compaction and therefore their authored solve order.
         uint freeLo = ~allLo;
         uint best = freeLo != 0 ? ctz(freeLo)
                   : (~allHi != 0 ? 32 + ctz(~allHi) : myColor);
@@ -387,10 +451,9 @@ kernel void color_iterate(
 }
 
 // Complete an unfinished parallel coloring deterministically. A synchronous
-// ordered relaxation can require one pass per graph hop (a tall stack is the
-// canonical case), so the bounded parallel phase above is only an optimizer.
-// This single-thread greedy sweep is conditional on the final pass changing
-// and provides the exact correctness boundary before color_validate.
+// ordered relaxation can require one pass per graph hop, so the bounded
+// parallel phase is only an optimizer. This sweep runs only when the final
+// pass still changed; color_validate remains the exact correctness boundary.
 kernel void color_repair_greedy(
     device const float4* posLin     [[buffer(0)]],
     device const JointGPU* joints   [[buffer(1)]],
@@ -407,11 +470,12 @@ kernel void color_repair_greedy(
     device const MembraneGPU* membranes [[buffer(12)]],
     device const BendGPU* bends     [[buffer(13)]],
     constant uint& finalPass        [[buffer(14)]],
+    device const uint* adjNeighbor  [[buffer(15)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    if (gid != 0u ||
-        atomic_load_explicit(&changedFlag[finalPass],
-                             memory_order_relaxed) == 0u) return;
+    bool needsRepair = atomic_load_explicit(&changedFlag[finalPass],
+                                            memory_order_relaxed) != 0u;
+    if (gid != 0u || !needsRepair) return;
 
     for (uint self = 0; self < P.numBodies; self++) {
         if (posLin[self].w <= 0.0f) {
@@ -422,11 +486,19 @@ kernel void color_repair_greedy(
         uint allLo = 0u, allHi = 0u;
         bool conflict = false;
         uint s = adjStart[self], e = s + adjCount[self];
+        bool orderedCompatibility = P.numBodies
+            <= ORDERED_COLORING_BODY_LIMIT;
         for (uint k = s; k < e; k++) {
-            neighborColors(joints, springs, manifolds, tets, soft,
-                           membranes, bends, posLin, colors,
-                           adjList[k], self, colors[self], maskLo, maskHi,
-                           allLo, allHi, conflict);
+            if (orderedCompatibility) {
+                neighborColors(joints, springs, manifolds, tets, soft,
+                               membranes, bends, posLin, colors, adjList[k],
+                               self, colors[self], maskLo, maskHi, allLo,
+                               allHi, conflict);
+            } else {
+                neighborColor(posLin, colors, adjNeighbor[k], self,
+                              colors[self], maskLo, maskHi, allLo, allHi,
+                              conflict);
+            }
         }
         uint freeLo = ~maskLo;
         if (freeLo != 0u) {
@@ -460,16 +532,25 @@ kernel void color_validate(
     device const SoftContactGPU* soft [[buffer(11)]],
     device const MembraneGPU* membranes [[buffer(12)]],
     device const BendGPU* bends     [[buffer(13)]],
+    device const uint* adjNeighbor  [[buffer(14)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies || posLin[gid].w <= 0.0f) return;
     uint maskLo = 0, maskHi = 0, allLo = 0, allHi = 0;
     bool conflict = false;
     uint s = adjStart[gid], e = s + adjCount[gid];
+    bool orderedCompatibility = P.numBodies
+        <= ORDERED_COLORING_BODY_LIMIT;
     for (uint k = s; k < e; k++) {
-        neighborColors(joints, springs, manifolds, tets, soft, membranes,
-                       bends, posLin, colors, adjList[k], gid, colors[gid],
-                       maskLo, maskHi, allLo, allHi, conflict);
+        if (orderedCompatibility) {
+            neighborColors(joints, springs, manifolds, tets, soft,
+                           membranes, bends, posLin, colors, adjList[k], gid,
+                           colors[gid], maskLo, maskHi, allLo, allHi,
+                           conflict);
+        } else {
+            neighborColor(posLin, colors, adjNeighbor[k], gid, colors[gid],
+                          maskLo, maskHi, allLo, allHi, conflict);
+        }
     }
     if (conflict) {
         atomic_fetch_add_explicit(&counters[CTR_COLOR_CONFLICTS], 1u,

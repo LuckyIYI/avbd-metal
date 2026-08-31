@@ -38,6 +38,7 @@ public final class GPUSolver {
     private static let jointMotorModeImplicitPositionPD: UInt32 = 1 << 4
     private static let jointMotorModeExplicitTorquePD: UInt32 = 2 << 4
     private static let jointMotorModeVelocity: UInt32 = 3 << 4
+    private static let orderedColoringBodyLimit = 1_024
 
     public let device: MTLDevice
     let queue: MTLCommandQueue
@@ -217,7 +218,7 @@ public final class GPUSolver {
     var dynColorSrc: MTLBuffer?
 
     // Adjacency + coloring
-    var degrees, adjStart, adjCursor, adjList: MTLBuffer
+    var degrees, adjStart, adjCursor, adjList, adjNeighbor: MTLBuffer
     var colorsA, colorsB, bodySlot, colorStart, colorList: MTLBuffer
     var changedFlag: MTLBuffer
 
@@ -245,6 +246,7 @@ public final class GPUSolver {
         "adj_clear_degrees",
         "adj_copy_cursor",
         "adj_count",
+        "adj_extract_neighbors",
         "adj_scatter",
         "adj_sort",
         "bp_count",
@@ -587,8 +589,13 @@ public final class GPUSolver {
         degrees = try makeBuf(nb * 4, "degrees")
         adjStart = try makeBuf(nb * 4, "adjStart")
         adjCursor = try makeBuf(nb * 4, "adjCursor")
-        adjList = try makeBuf((2 * (numJoints + numSprings + maxPairs) + 4 * numTets
-                               + 4 * maxSoft + 3 * numTris + 4 * maxEdges) * 4, "adjList")
+        let adjacencyCapacity = 2 * (numJoints + numSprings + maxPairs)
+            + 4 * numTets + 4 * maxSoft + 3 * numTris + 4 * maxEdges
+        adjList = try makeBuf(adjacencyCapacity * 4, "adjList")
+        let compactNeighborCapacity = numTris == 0 && numTets == 0
+            && numBodies > Self.orderedColoringBodyLimit
+            ? adjacencyCapacity : 1
+        adjNeighbor = try makeBuf(compactNeighborCapacity * 4, "adjNeighbor")
         colorsA = try makeBuf(nb * 4, "colorsA")
         colorsB = try makeBuf(nb * 4, "colorsB")
         bodySlot = try makeBuf(nb * 4, "bodySlot")
@@ -3916,6 +3923,19 @@ public final class GPUSolver {
             e.setBuffer(self.adjList, offset: 0, index: 2)
             e.setBytes(&nb32, length: 4, index: 3)
         }
+        if usesDynamicColoring
+            && numBodies > Self.orderedColoringBodyLimit {
+            dispatch1D(enc, "adj_extract_neighbors", numBodies) { e in
+                e.setBuffer(self.joints, offset: 0, index: 0)
+                e.setBuffer(self.springs, offset: 0, index: 1)
+                e.setBuffer(self.manifolds, offset: 0, index: 2)
+                e.setBuffer(self.adjStart, offset: 0, index: 3)
+                e.setBuffer(self.degrees, offset: 0, index: 4)
+                e.setBuffer(self.adjList, offset: 0, index: 5)
+                e.setBuffer(self.adjNeighbor, offset: 0, index: 6)
+                e.setBytes(&nb32, length: 4, index: 7)
+            }
+        }
 
         // Coloring is scene-adaptive:
         // - Soft scenes (cloth/tets): STATIC topology palette from init,
@@ -3949,6 +3969,7 @@ public final class GPUSolver {
                     e.setBuffer(self.bends, offset: 0, index: 14)
                     var pi = UInt32(pass)
                     e.setBytes(&pi, length: 4, index: 15)
+                    e.setBuffer(self.adjNeighbor, offset: 0, index: 16)
                 }
                 swap(&src, &dst)
             }
@@ -3977,6 +3998,7 @@ public final class GPUSolver {
                 e.setBuffer(self.membranes, offset: 0, index: 12)
                 e.setBuffer(self.bends, offset: 0, index: 13)
                 e.setBytes(&finalPass, length: 4, index: 14)
+                e.setBuffer(self.adjNeighbor, offset: 0, index: 15)
             }
             dispatch1D(enc, "color_validate", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -3994,6 +4016,7 @@ public final class GPUSolver {
                 e.setBuffer(self.softContacts, offset: 0, index: 11)
                 e.setBuffer(self.membranes, offset: 0, index: 12)
                 e.setBuffer(self.bends, offset: 0, index: 13)
+                e.setBuffer(self.adjNeighbor, offset: 0, index: 14)
             }
             dispatch1D(enc, "color_count", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
