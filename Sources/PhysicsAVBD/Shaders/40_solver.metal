@@ -2261,6 +2261,11 @@ static inline void dual_manifold_one(
             pen.y = min(pen.y + P.betaLin * fabs(C.y), PENALTY_MAX_T);
             pen.z = min(pen.z + P.betaLin * fabs(C.z), PENALTY_MAX_T);
             m.contacts[i].rB.w = length(C.yz) < STICK_THRESH ? 1.0f : 0.0f;
+        } else {
+            // Sliding drops the anchor: without this, a once-stuck contact
+            // keeps its anchors through the whole slide and the stored
+            // tangential constraint hauls the body back when the push ends.
+            m.contacts[i].rB.w = 0.0f;
         }
         m.contacts[i].penalty = float4(pen, 0);
     }

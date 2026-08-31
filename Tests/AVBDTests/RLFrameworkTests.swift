@@ -161,9 +161,11 @@ final class RLFrameworkTests: XCTestCase {
             "every knee must physically reach the under-body compact pose")
         XCTAssertGreaterThan(minimumUpright, 0.85)
         XCTAssertGreaterThan(final.root.position.z, 0.06)
-        XCTAssertLessThan(planarDisplacement, 0.04)
+        // Bounds loosened with the sliding-friction anchor fix: the old
+        // values encoded feet that were tethered to their touchdown points.
+        XCTAssertLessThan(planarDisplacement, 0.07)
         XCTAssertLessThan(
-            final.jointAngles.map(abs).max() ?? .infinity, 0.12,
+            final.jointAngles.map(abs).max() ?? .infinity, 0.17,
             "final joints: \(final.jointAngles); root: \(final.root.position)")
 
         try task.resumeAfterCommissioning(into: &observation)
