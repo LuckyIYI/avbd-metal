@@ -285,12 +285,14 @@ public final class GPUSolver {
         "el_count",
         "el_scatter",
         "finalize_velocities",
+        "manifold_solver_pack",
         "np_collide",
         "ogc_bounds_refresh",
         "ogc_refresh_args",
         "pm_clear",
         "pm_insert",
         "primal_particles_split",
+        "primal_rigid_split",
         "primal_solve",
         "pusht_obs",
         "rt_emit",
@@ -3937,6 +3939,18 @@ public final class GPUSolver {
             }
         }
 
+        let noRSplit = ProcessInfo.processInfo.environment[
+            "AVBD_NO_RSPLIT"] != nil
+        let useCompactManifoldSolve = usesDynamicColoring
+            && numParticles == 0
+            && numBodies > Self.orderedColoringBodyLimit
+            && !noRSplit
+        let useWideRigidSplit = useCompactManifoldSolve
+            && ProcessInfo.processInfo.environment[
+                "AVBD_RIGID_SPLIT8"] == nil
+        var primalThreadsPerBody: UInt32 = usesDynamicColoring && noRSplit
+            ? 1 : (useWideRigidSplit ? 16 : 8)
+
         // Coloring is scene-adaptive:
         // - Soft scenes (cloth/tets): STATIC topology palette from init,
         //   Newton-style — contacts never constrain colors (same-color
@@ -4029,6 +4043,7 @@ public final class GPUSolver {
                 e.setBuffer(self.counters, offset: 0, index: 0)
                 e.setBuffer(self.colorStart, offset: 0, index: 1)
                 e.setBuffer(self.colorArgs, offset: 0, index: 2)
+                e.setBytes(&primalThreadsPerBody, length: 4, index: 3)
             }
             dispatch1D(enc, "color_scatter", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -4040,6 +4055,24 @@ public final class GPUSolver {
             }
             if finalColors !== colorsA {
                 dynColorSrc = finalColors
+            }
+        }
+        // Narrowphase is finished with prevManifolds at this point. Reuse
+        // that 704-byte/slot buffer for a 48-byte header stream followed by
+        // eight slot-major 64-byte contact streams. This gives the repeated
+        // solver passes a compact working set without another allocation.
+        let solverContactOffset = maxPairs * 48
+        var compactManifoldFlag: UInt32 = useCompactManifoldSolve ? 1 : 0
+        if useCompactManifoldSolve {
+            try stage("manifold-pack")
+            dispatchIndirect(enc, "manifold_solver_pack", argsOffset: 0) { e in
+                e.setBuffer(self.manifolds, offset: 0, index: 0)
+                e.setBuffer(self.prevManifolds, offset: 0, index: 1)
+                e.setBuffer(self.prevManifolds,
+                            offset: solverContactOffset, index: 2)
+                e.setBuffer(self.counters, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
             }
         }
         try stage("solver-iterations")
@@ -4138,16 +4171,24 @@ public final class GPUSolver {
         // Rigid scenes use the 8-lane cooperative split primal too: dense
         // piles average 12-27 manifolds/body and the one-thread-per-body
         // kernel was latency-bound walking them serially (boxpile x12
-        // solve-primal 9.5 ms). AVBD_NO_RSPLIT restores the old kernel
-        // (the x8 indirect args early-out harmlessly).
-        let noRSplit = ProcessInfo.processInfo.environment["AVBD_NO_RSPLIT"] != nil
-        let primalPSO = (usesDynamicColoring && noRSplit) ? ps("primal_solve")
-                                                          : ps("primal_particles_split")
+        // solve-primal 9.5 ms). AVBD_NO_RSPLIT restores the old kernel.
+        let primalPSO: MTLComputePipelineState
+        if usesDynamicColoring && noRSplit {
+            primalPSO = ps("primal_solve")
+        } else if useWideRigidSplit {
+            primalPSO = ps("primal_rigid_split")
+        } else {
+            primalPSO = ps("primal_particles_split")
+        }
         // static palettes have fixed per-color counts: dispatch directly
         // (8 lanes per body for the split kernel)
         let splitSizes: [Int] = usesDynamicColoring ? []
-            : (0..<staticUsedColors).map { lastColorCounts[$0] * 8 }
+            : (0..<staticUsedColors).map {
+                lastColorCounts[$0] * Int(primalThreadsPerBody)
+            }
         for it in 0..<settings.iterations {
+            var writeBackCompactManifoldFlag: UInt32 =
+                useCompactManifoldSolve && it + 1 == settings.iterations ? 1 : 0
             enc.setComputePipelineState(primalPSO)
             do {
                 // rebind each iteration (dual_all clobbers low indices), but
@@ -4176,6 +4217,12 @@ public final class GPUSolver {
                 enc.setBuffer(self.boundsBuf, offset: 0, index: 22)
                 enc.setBuffer(self.ogcPrevBuf, offset: 0, index: 23)
                 enc.setBuffer(self.counters, offset: 0, index: 24)
+                if primalThreadsPerBody > 1 {
+                    enc.setBuffer(self.prevManifolds, offset: 0, index: 25)
+                    enc.setBuffer(self.prevManifolds,
+                                  offset: solverContactOffset, index: 26)
+                    enc.setBytes(&compactManifoldFlag, length: 4, index: 27)
+                }
             }
             _ = it
             if profiling { try stage("solve-primal") ; enc.setComputePipelineState(primalPSO)
@@ -4203,6 +4250,12 @@ public final class GPUSolver {
                 enc.setBuffer(self.boundsBuf, offset: 0, index: 22)
                 enc.setBuffer(self.ogcPrevBuf, offset: 0, index: 23)
                 enc.setBuffer(self.counters, offset: 0, index: 24)
+                if primalThreadsPerBody > 1 {
+                    enc.setBuffer(self.prevManifolds, offset: 0, index: 25)
+                    enc.setBuffer(self.prevManifolds,
+                                  offset: solverContactOffset, index: 26)
+                    enc.setBytes(&compactManifoldFlag, length: 4, index: 27)
+                }
             }
             for c in 0..<colorBound {
                 var cIdx = UInt32(c)
@@ -4263,6 +4316,12 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
                 e.setBuffer(self.springs, offset: 0, index: 8)
                 e.setBuffer(self.softContacts, offset: 0, index: 9)
+                e.setBuffer(self.prevManifolds, offset: 0, index: 10)
+                e.setBuffer(self.prevManifolds,
+                            offset: solverContactOffset, index: 11)
+                e.setBytes(&compactManifoldFlag, length: 4, index: 12)
+                e.setBytes(&writeBackCompactManifoldFlag,
+                           length: 4, index: 13)
             }
             // OGC conditional refresh (paper Alg 3): a one-thread kernel
             // turns the exceed counter into indirect dispatch args, so the

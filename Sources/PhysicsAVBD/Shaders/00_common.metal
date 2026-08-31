@@ -430,6 +430,24 @@ struct ManifoldGPU {
     ContactGPU contacts[MAX_CONTACTS];
 };
 
+// Iterative-solver view of a rigid contact manifold. Persistence and
+// narrowphase need the fixed 8-contact, 704-byte record above; the solver
+// only needs active slots. Contacts are stored slot-major so a one-contact
+// manifold never pulls the seven reserved slots through cache. Four float4s
+// hold the 16 live scalar values without packed-vector alignment penalties.
+struct SolverManifoldGPU {
+    uint4 header;
+    float4 basisN;
+    float4 basisT1;
+};
+
+struct SolverContactGPU {
+    float4 rAStick;          // rA.xyz, stick
+    float4 rB_C0x;           // rB.xyz, C0.x
+    float4 C0yz_lambdaXY;    // C0.yz, lambda.xy
+    float4 lambdaZ_penalty;  // lambda.z, penalty.xyz
+};
+
 // Counters layout (single uint buffer)
 #define CTR_PAIRS 0
 #define CTR_SOFT 1                 // element (soft) contact count
