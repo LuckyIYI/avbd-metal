@@ -17,6 +17,8 @@ research playground built on top of it.
 | **Stable Neo-Hookean** (Smith et al. 2018) | Tet FEM material with per-vertex SPD Hessian |
 | **Bergou et al. 2006** | Quadratic bending; hinge K derived numerically from the intrinsic unfolded shape |
 | **IPC / Codimensional IPC** (Li et al.) | Lagged friction formulation; contact-radius framing |
+| **[Newton](https://github.com/newton-physics/newton) / Jitter Physics 2** | Convex support maps, MPR overlap, GJK separation, deterministic clipped contact manifolds, and persistent convex feature identities; analytic non-convex torus contact remains a separate path |
+| **[CoACD](https://github.com/SarahWeiii/CoACD)** | Optional offline decomposition of connected concave source meshes into validated, canonical, content-addressed convex compounds; ordinary builds consume only checked-in cooked assets |
 | Ericson, *Real-Time Collision Detection* | Closest-point primitives (point-triangle, segment-segment) |
 
 Engine techniques: scene-adaptive coloring (static topology palette for soft
@@ -36,7 +38,7 @@ crossing protection with boundary release, runtime shader concatenation
 | `RL` | Vector task contracts, task registry, rewards, and the current AVBD-backed environments |
 | `MLXRL` | MLX learning, checkpoint/evidence formats, policy runtime, and research pipelines |
 | `avbd` | CLI: `run`, `bench`, `parity`, `profile` (per-kernel GPU timings), `clothgate` (gap/stretch/KE gates), `rodexp` |
-| `AVBDApp` | macOS app: viewer, demos, Robotics Lab |
+| `AVBDApp` | macOS app: physics playground and data-driven Policy Replay bundle viewer |
 | `AVBDTests` | Cross-layer and MLX integration tests; lower layers also have dependency-limited test targets |
 
 The production dependency graph is intentionally small: `SimCore` is the
@@ -53,10 +55,13 @@ The vector RL path is task-agnostic and runs the simulator and MLX learner on
 Apple silicon. Built-in tasks include Cartesian Push-T, randomized articulated
 arm Push-T, the full seven-axis Panda port of ManiSkill PushT-v1, the imported
 19-DoF Unitree H1 tasks aligned to Isaac Lab, the printable 16-DoF Arachne-15
-spider, and earlier native humanoid research tasks. Policy Replay is narrower:
-it exposes only compatible packaged examples. Exact release status,
-fingerprints, and qualification evidence live in
-[the checkpoint catalog](checkpoints/README.md).
+spider, and earlier native humanoid research tasks. Policy Replay loads
+portable bundle directories whose manifest owns the policy runtime, exact
+simulation configuration, cameras, controls, and metrics. The app has no
+policy-specific page switch: choose **Import Bundle** to add an unverified
+bundle, or package it through the independent release index to advertise a
+qualified release. The currently supported runtime ABIs and exact release
+evidence are documented with [the policy bundles](checkpoints/README.md).
 The Arachne-15 CAD, hardware, and device-qualification workspace is maintained
 as a separate project; this repository contains only its reviewed simulator
 runtime snapshot and sealed policy releases.
@@ -88,6 +93,8 @@ make ml-tool
 # independent Sim2Sim reference.
 make app-ml
 AVBD_POLICY_REPLAY=1 open AVBD.app
+# Or import a bundle directory directly while developing:
+AVBD_POLICY_BUNDLE=/absolute/path/to/my-policy-bundle open AVBD.app
 ```
 
 ## Quick start
@@ -97,7 +104,42 @@ swift test                                    # full battery
 swift test --filter RLFrameworkTests          # vector RL contract + GAE
 make verify-release                           # full arm64 Mac release gate
 make app && open AVBD.app                     # interactive app
+.build/release/avbd run convexdecomp --frames 300 # cooked convex-compound demo
+.build/release/avbd run classicrigids --frames 720 # classic meshes on a primitive table
 .build/release/avbd run bed --frames 300
 .build/release/avbd profile clothfold --scale 16 --frames 80
 .build/release/avbd clothgate drape --frames 300
 ```
+
+## Convex mesh pipeline
+
+Concave triangle meshes are decomposed offline; simulator and app builds load
+only the validated, content-addressed result. CoACD is pinned to `1.0.11` and
+is never a runtime dependency.
+
+```bash
+python3 -m venv .venv-convex
+.venv-convex/bin/pip install -r Tools/requirements-convex.txt
+.venv-convex/bin/python Tools/cook_convex_asset.py \
+  --input model.obj --output model.avbdconvex.json \
+  --debug-obj model.convex-debug.obj --method coacd --seed 0 \
+  --up-axis y --scale 1 1 1
+python3 -S Tools/cook_convex_asset.py \
+  --verify model.avbdconvex.json --input model.obj \
+  --debug-obj model.convex-debug.obj
+```
+
+Load the result with `ConvexCompoundAsset.load(from:)`, create the owning body
+with its mass and inertia once, then call
+`PhysicsScene.addConvexCompound(body:asset:...)`. Replicas share the immutable
+hull table; compound parts add collision geometry, not mass. The current
+bounded runtime accepts up to 256 parts, 64 vertices per hull, and 16 vertices
+per maximal coplanar face. In the app, **Collision hulls** and **Hull
+wireframe** visualize the exact cooked parts independently of the visual mesh.
+Scale components are applied in source coordinates, then `--up-axis` is baked
+with a right-handed rotation into the runtime's Z-up frame. Load the visual
+mesh with the same source up-axis and apply the identical source-axis scale to
+its vertices; both paths then produce matching geometry. Hulls collide with
+hulls, boxes, spheres, capsules, and deformable triangle/tet surfaces. Torus is
+non-convex: any potentially colliding torus-hull pair is rejected explicitly
+when either CPU or GPU solver is constructed rather than silently omitted.

@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+// SPDX-License-Identifier: Apache-2.0
+//
+// The generic convex support-map, MPR, GJK simplex, and polygon-manifold path
+// in this file is an altered Metal implementation inspired by Newton commits
+// 37b75a212112cebc35bdbfb521357b8a2900d6be and
+// 8e2f385a3d17f27152479e77c5472d14f95ae09f. Newton's implementations derive
+// from Jitter Physics 2 (MIT), with MPR based on XenoCollide (zlib).
+// See THIRD_PARTY_NOTICES.md.
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -186,65 +196,6 @@ struct NPContact {
     uint feature;
 };
 
-struct NPConvexBoxCandidate {
-    float3 xHull;
-    float3 xBox;
-    float3 boxToHull;
-    float separation;
-    uint feature;
-};
-
-// Exact cooked convex vertex against an oriented terrain/projectile box.
-// For a point inside the box, project to its nearest exit face; outside,
-// clamp to the box and retain speculative contacts inside the velocity-aware
-// detection margin. H1 disables robot self-collision, so its ankle/torso
-// hulls only require this path against the flat box terrain (and optional box
-// projectiles). General convex-convex GJK/EPA remains a separate extension.
-inline bool npConvexVertexBoxCandidate(
-    float3 vertexWorld, uint feature,
-    thread const NPBox& box, float4 qBox,
-    float3 hullVelocityMinusBoxVelocity,
-    float hullRadius, float boxRadius,
-    constant SimParams& P,
-    thread NPConvexBoxCandidate& result)
-{
-    float4 qInv = q_conj(qBox);
-    float3 local = q_rotate(qInv, vertexWorld - box.center);
-    float3 clamped = clamp(local, -box.half3_, box.half3_);
-    float3 normalLocal;
-    float3 boxLocal;
-    float separation;
-    bool inside = all(local >= -box.half3_) && all(local <= box.half3_);
-    if (inside) {
-        float3 clearance = box.half3_ - fabs(local);
-        int axis = 0;
-        if (clearance.y < clearance[axis]) axis = 1;
-        if (clearance.z < clearance[axis]) axis = 2;
-        normalLocal = float3(0);
-        normalLocal[axis] = local[axis] >= 0.0f ? 1.0f : -1.0f;
-        boxLocal = local;
-        boxLocal[axis] = normalLocal[axis] * box.half3_[axis];
-        separation = -clearance[axis];
-    } else {
-        float3 delta = local - clamped;
-        float distance = length(delta);
-        if (distance < 1e-8f) return false;
-        normalLocal = delta / distance;
-        float3 normalWorld = q_rotate(qBox, normalLocal);
-        float detect = npDetectMargin(normalWorld,
-                                      hullVelocityMinusBoxVelocity, P,
-                                      hullRadius, boxRadius);
-        if (distance > detect) return false;
-        boxLocal = clamped;
-        separation = distance;
-    }
-    result.xHull = vertexWorld;
-    result.xBox = q_rotate(qBox, boxLocal) + box.center;
-    result.boxToHull = q_rotate(qBox, normalLocal);
-    result.separation = separation;
-    result.feature = (4u << 24) | (feature & 0x00FFFFFFu);
-    return true;
-}
 
 inline bool npAddContact(thread NPContact* contacts, thread int& count,
                          thread float3* midpoints,
@@ -260,6 +211,1523 @@ inline bool npAddContact(thread NPContact* contacts, thread int& count,
     midpoints[count] = mid;
     count++;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Generic convex support mapping + Newton-style MPR/GJK
+// ---------------------------------------------------------------------------
+
+// The generic path is deliberately entered only when at least one collider is
+// a cooked hull. Primitive-only pairs retain their established specialized
+// paths below. Torus is non-convex and is rejected during solver construction.
+inline float3 npcSafeNormalize(float3 v, float3 fallback) {
+    float l2 = dot(v, v);
+    if (!finite_bits(l2) || l2 <= 1.0e-20f) return fallback;
+    float3 n = v * rsqrt(l2);
+    return finite3(n) ? n : fallback;
+}
+
+inline NPCShapePoint npcShapeSupport(
+    thread const NPCShape& s,
+    float3 worldDirection,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    bool centeredBoxTies)
+{
+    NPCShapePoint result;
+    float3 direction = finite3(worldDirection)
+        ? worldDirection : float3(1, 0, 0);
+    result.feature = 0u;
+
+    // Ephemeral deformable triangle thickened into a finite triangular prism.
+    // Kind 5 stores its three authored vertices directly in center,
+    // rotation.xyz, and dimensions.xyz. The query computes its interior seed
+    // only after transforming those vertices into the small A-local frame;
+    // reconstructing C from a world-space centroid loses several Float ULPs.
+    if (s.kind == 5u) {
+        float3 vertices[3];
+        vertices[0] = s.center;
+        vertices[1] = s.rotation.xyz;
+        vertices[2] = s.dimensions.xyz;
+        float3 triNormal = npcSafeNormalize(
+            cross(vertices[1] - vertices[0], vertices[2] - vertices[0]),
+            float3(0, 0, 1));
+        uint best = 0u;
+        float bestDot = dot(vertices[0], direction);
+        for (uint i = 1u; i < 3u; i++) {
+            float candidate = dot(vertices[i], direction);
+            if (candidate > bestDot) {
+                bestDot = candidate;
+                best = i;
+            }
+        }
+        bool positiveSide = dot(direction, triNormal) >= 0.0f;
+        result.point = vertices[best] + triNormal
+            * ((positiveSide ? 1.0f : -1.0f) * fabs(s.rotation.w));
+        result.feature = (5u << 28) | best | (positiveSide ? 4u : 0u);
+        return result;
+    }
+
+    float3 localDirection = q_rotate(q_conj(s.rotation), direction);
+
+    if (s.kind == 4u) {
+        uint2 range = colliderHullRange[s.collider];
+        if (range.y == 0u) {
+            result.point = s.center;
+            result.feature = 0xFFFFFFFFu;
+            return result;
+        }
+        float bestDot = -FLT_MAX;
+        uint best = 0u;
+        // Full scan is Newton's deterministic correctness path. Canonical
+        // vertex order plus the strict comparison gives stable tie-breaking.
+        for (uint i = 0u; i < range.y; i++) {
+            float3 v = convexHullVertices[range.x + i].xyz;
+            float d = dot(v, localDirection);
+            if (d > bestDot) {
+                bestDot = d;
+                best = i;
+            }
+        }
+        result.point = s.center
+            + q_rotate(s.rotation, convexHullVertices[range.x + best].xyz);
+        result.feature = (4u << 28) | (best & 0x0FFFFFFFu);
+        return result;
+    }
+
+    if (s.kind == 0u) {
+        float directionScale = max(fabs(localDirection.x),
+            max(fabs(localDirection.y), fabs(localDirection.z)));
+        float deadband = 1.0e-10f * directionScale;
+        uint sx = localDirection.x >= -deadband ? 1u : 0u;
+        uint sy = localDirection.y >= -deadband ? 1u : 0u;
+        uint sz = localDirection.z >= -deadband ? 1u : 0u;
+        float3 sign = float3(sx != 0u ? 1.0f : -1.0f,
+                             sy != 0u ? 1.0f : -1.0f,
+                             sz != 0u ? 1.0f : -1.0f);
+        float3 local = sign * (s.dimensions.xyz * 0.5f);
+        if (centeredBoxTies) {
+            float3 contribution = fabs(localDirection)
+                * (s.dimensions.xyz * 0.5f);
+            float tie = 1.0e-6f
+                * (contribution.x + contribution.y + contribution.z);
+            if (contribution.x <= tie) local.x = 0.0f;
+            if (contribution.y <= tie) local.y = 0.0f;
+            if (contribution.z <= tie) local.z = 0.0f;
+        }
+        result.point = s.center + q_rotate(s.rotation, local);
+        result.feature = (1u << 28) | sx | (sy << 1) | (sz << 2);
+        return result;
+    }
+
+    float3 normal = npcSafeNormalize(direction, float3(1, 0, 0));
+    if (s.kind == 1u) {
+        result.point = s.center + normal * (s.dimensions.x * 0.5f);
+        result.feature = NPC_FEATURE_SMOOTH | 1u;
+        return result;
+    }
+
+    // Capsule: authored length is the center-line segment and the local axis
+    // is +Z, matching the existing specialized path.
+    float3 axis = q_rotate(s.rotation, float3(0, 0, 1));
+    bool upper = dot(direction, axis) >= 0.0f;
+    result.point = s.center
+        + axis * ((upper ? 1.0f : -1.0f) * s.dimensions.x * 0.5f)
+        + normal * s.dimensions.y;
+    result.feature = NPC_FEATURE_SMOOTH | 2u | (upper ? 0x100u : 0u);
+    return result;
+}
+
+inline NPCShapePoint npcShapeSupport(
+    thread const NPCShape& s,
+    float3 worldDirection,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices)
+{
+    return npcShapeSupport(
+        s, worldDirection, colliderHullRange, convexHullVertices, false);
+}
+
+// Every generic convex query is solved in one translation- and rotation-local
+// coordinate system. Rigid queries use shape A's authored local frame. An
+// ephemeral triangle has no quaternion in the shared ABI, so a triangle-first
+// swapped retry uses a vertex-A-relative, world-axis frame. In either case all
+// portal/simplex arithmetic remains close to zero and independent of the
+// absolute world origin.
+inline float4 npcAFrameRotation(thread const NPCShape& a) {
+    return a.kind == 5u ? float4(0, 0, 0, 1) : a.rotation;
+}
+
+inline float3 npcShapeInteriorCenter(thread const NPCShape& shape) {
+    if (shape.kind == 5u) {
+        // Base-relative summation retains the exact local vertex differences
+        // and makes the arithmetic mean a guaranteed point in the prism.
+        return shape.center
+            + ((shape.rotation.xyz - shape.center)
+               + (shape.dimensions.xyz - shape.center)) / 3.0f;
+    }
+    return shape.center;
+}
+
+inline NPCShape npcShapeInFrame(
+    thread const NPCShape& shape,
+    float3 origin,
+    float4 inverseFrameRotation)
+{
+    NPCShape local = shape;
+    if (shape.kind == 5u) {
+        // Kind 5 stores three positions rather than a quaternion. Transform
+        // each authored vertex independently into the query frame.
+        local.center = q_rotate(
+            inverseFrameRotation, shape.center - origin);
+        local.rotation = float4(
+            q_rotate(
+                inverseFrameRotation, shape.rotation.xyz - origin),
+            shape.rotation.w);
+        local.dimensions = float4(
+            q_rotate(
+                inverseFrameRotation, shape.dimensions.xyz - origin),
+            shape.dimensions.w);
+    } else {
+        local.center = q_rotate(
+            inverseFrameRotation, shape.center - origin);
+        local.rotation = q_mul(inverseFrameRotation, shape.rotation);
+    }
+    return local;
+}
+
+inline void npcMakeAFrame(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    thread NPCShape& localA,
+    thread NPCShape& localB,
+    thread float3& origin,
+    thread float4& frameRotation)
+{
+    origin = a.center;
+    frameRotation = npcAFrameRotation(a);
+    float4 inverseFrameRotation = q_conj(frameRotation);
+    localA = npcShapeInFrame(a, origin, inverseFrameRotation);
+    localB = npcShapeInFrame(b, origin, inverseFrameRotation);
+    // Avoid carrying quaternion round-off in the defining A frame.
+    localA.center = float3(0);
+    if (a.kind != 5u) localA.rotation = float4(0, 0, 0, 1);
+}
+
+inline NPCResult npcResultFromAFrame(
+    thread const NPCResult& local,
+    float3 origin,
+    float4 frameRotation)
+{
+    NPCResult world = local;
+    world.pointA = origin + q_rotate(frameRotation, local.pointA);
+    world.pointB = origin + q_rotate(frameRotation, local.pointB);
+    world.normalAB = q_rotate(frameRotation, local.normalAB);
+    return world;
+}
+
+inline NPCVertex npcMinkowskiSupport(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    float3 direction,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    float extend,
+    bool centeredBoxTies)
+{
+    NPCShapePoint pa = npcShapeSupport(
+        a, direction, colliderHullRange, convexHullVertices,
+        centeredBoxTies);
+    NPCShapePoint pb = npcShapeSupport(
+        b, -direction, colliderHullRange, convexHullVertices,
+        centeredBoxTies);
+    if (extend != 0.0f) {
+        float3 offset = npcSafeNormalize(direction, float3(1, 0, 0))
+            * (0.5f * extend);
+        pa.point += offset;
+        pb.point -= offset;
+    }
+    NPCVertex v;
+    v.pointA = pa.point;
+    v.pointB = pb.point;
+    v.w = pa.point - pb.point;
+    v.featureA = pa.feature;
+    v.featureB = pb.feature;
+    return v;
+}
+
+inline NPCVertex npcMinkowskiSupport(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    float3 direction,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices)
+{
+    return npcMinkowskiSupport(
+        a, b, direction, colliderHullRange, convexHullVertices, 0.0f, false);
+}
+
+inline void npcSwap(thread NPCVertex& a, thread NPCVertex& b) {
+    NPCVertex t = a;
+    a = b;
+    b = t;
+}
+
+// Port of Newton/Jitter's XenoCollide portal refinement. It supplies stable
+// penetration witnesses directly, avoiding EPA's unbounded face expansion.
+inline NPCResult npcMPRWithEnlargeLocal(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    float enlarge)
+{
+    float3 centerA = npcShapeInteriorCenter(a);
+    float3 centerB = npcShapeInteriorCenter(b);
+    NPCResult out;
+    out.overlap = false;
+    out.valid = false;
+    out.pointA = centerA;
+    out.pointB = centerB;
+    out.normalAB = npcSafeNormalize(centerB - centerA, float3(1, 0, 0));
+    out.signedDistance = 0.0f;
+    out.featureA = 0xFFFFFFFFu;
+    out.featureB = 0xFFFFFFFFu;
+
+    // These are Newton's absolute portal thresholds. Scaling them by the
+    // collider radius makes a 1000-unit hull accept centimeter-scale portal
+    // error and materially changes both witnesses and corrected distance.
+    const float numericEps = 1.0e-16f;
+    const float collideEps = 1.0e-5f;
+    // Newton deliberately moves the MPR/GJK switchover away from a resting
+    // zero-distance contact. MPR sees a tiny symmetric Minkowski inflation;
+    // witnesses and signed distance are corrected back to the true surfaces
+    // before returning. GJK remains completely uninflated.
+    NPCVertex v0;
+    v0.pointA = centerA;
+    v0.pointB = centerB;
+    v0.w = centerA - centerB;
+    v0.featureA = 0xFFFFFFFFu;
+    v0.featureB = 0xFFFFFFFFu;
+    if (dot(v0.w, v0.w) < numericEps) {
+        float bestDot = -FLT_MAX;
+        float3 bestDirection = float3(1, 0, 0);
+        for (int axis = 0; axis < 3; axis++) {
+            float3 direction = float3(0);
+            direction[axis] = 1.0f;
+            NPCVertex probe = npcMinkowskiSupport(
+                a, b, direction, colliderHullRange, convexHullVertices,
+                enlarge, true);
+            float candidate = dot(probe.w, direction);
+            if (candidate > bestDot) {
+                bestDot = candidate;
+                bestDirection = direction;
+            }
+        }
+        v0.w = bestDirection * 1.0e-5f;
+    }
+
+    float3 normal = -v0.w;
+    NPCVertex v1 = npcMinkowskiSupport(
+        a, b, normal, colliderHullRange, convexHullVertices, enlarge, true);
+    if (!finite3(v1.w) || dot(v1.w, normal) <= 0.0f) return out;
+
+    normal = cross(v1.w, v0.w);
+    if (dot(normal, normal) < numericEps * numericEps) {
+        normal = npcSafeNormalize(v1.w - v0.w, out.normalAB);
+        float penetration = dot(v1.w, normal);
+        if (!finite_bits(penetration)) return out;
+        out.overlap = true;
+        out.valid = true;
+        out.pointA = v1.pointA;
+        out.pointB = v1.pointB;
+        out.normalAB = normal;
+        out.signedDistance = -penetration + enlarge;
+        out.pointA -= normal * (0.5f * enlarge);
+        out.pointB += normal * (0.5f * enlarge);
+        out.featureA = v1.featureA;
+        out.featureB = v1.featureB;
+        return out;
+    }
+
+    NPCVertex v2 = npcMinkowskiSupport(
+        a, b, normal, colliderHullRange, convexHullVertices, enlarge, true);
+    if (!finite3(v2.w) || dot(v2.w, normal) <= 0.0f) return out;
+
+    normal = cross(v1.w - v0.w, v2.w - v0.w);
+    if (dot(normal, v0.w) > 0.0f) {
+        npcSwap(v1, v2);
+        normal = -normal;
+    }
+
+    NPCVertex v3;
+    bool havePortal = false;
+    for (int phase1 = 0; phase1 <= NPC_MPR_ITERATIONS; phase1++) {
+        if (!finite3(normal) || dot(normal, normal) < numericEps * numericEps)
+            return out;
+        v3 = npcMinkowskiSupport(
+            a, b, normal, colliderHullRange, convexHullVertices, enlarge, true);
+        if (!finite3(v3.w) || dot(v3.w, normal) <= 0.0f) return out;
+
+        float3 side = cross(v1.w, v3.w);
+        if (dot(side, v0.w) < 0.0f) {
+            v2 = v3;
+            normal = cross(v1.w - v0.w, v3.w - v0.w);
+            continue;
+        }
+        side = cross(v3.w, v2.w);
+        if (dot(side, v0.w) < 0.0f) {
+            v1 = v3;
+            normal = cross(v3.w - v0.w, v2.w - v0.w);
+            continue;
+        }
+        havePortal = true;
+        break;
+    }
+    if (!havePortal) return out;
+
+    bool hit = false;
+    for (int phase2 = 0; phase2 <= NPC_MPR_ITERATIONS; phase2++) {
+        float3 e12 = v2.w - v1.w;
+        float3 e13 = v3.w - v1.w;
+        normal = cross(e12, e13);
+        float normalSq = dot(normal, normal);
+        if (!finite_bits(normalSq) || normalSq < numericEps * numericEps)
+            return out;
+        if (!hit) hit = dot(normal, v1.w) >= 0.0f;
+
+        NPCVertex v4 = npcMinkowskiSupport(
+            a, b, normal, colliderHullRange, convexHullVertices, enlarge, true);
+        if (!finite3(v4.w)) return out;
+        float delta = dot(v4.w - v3.w, normal);
+        float penetrationRaw = dot(v4.w, normal);
+        bool converged = delta * delta
+                <= collideEps * collideEps * normalSq
+            || penetrationRaw <= 0.0f
+            || phase2 == NPC_MPR_ITERATIONS;
+        if (converged) {
+            if (!hit) return out;
+            float invNormal = rsqrt(normalSq);
+            float3 unitNormal = normal * invNormal;
+            float penetration = penetrationRaw * invNormal;
+            if (!finite3(unitNormal) || !finite_bits(penetration)) return out;
+
+            float3 temp = cross(v1.w, e12);
+            float gamma = dot(temp, unitNormal) * invNormal;
+            temp = cross(e13, v1.w);
+            float beta = dot(temp, unitNormal) * invNormal;
+            float alpha = 1.0f - gamma - beta;
+            if (!finite_bits(alpha) || !finite_bits(beta)
+                || !finite_bits(gamma)) return out;
+
+            out.overlap = true;
+            out.valid = true;
+            out.pointA = alpha * v1.pointA + beta * v2.pointA
+                + gamma * v3.pointA;
+            out.pointB = alpha * v1.pointB + beta * v2.pointB
+                + gamma * v3.pointB;
+            out.normalAB = unitNormal;
+            out.signedDistance = -penetration + enlarge;
+            out.pointA -= unitNormal * (0.5f * enlarge);
+            out.pointB += unitNormal * (0.5f * enlarge);
+            NPCVertex feature = npcMinkowskiSupport(
+                a, b, unitNormal, colliderHullRange, convexHullVertices,
+                enlarge, true);
+            out.featureA = feature.featureA;
+            out.featureB = feature.featureB;
+            out.valid = finite3(out.pointA) && finite3(out.pointB)
+                && finite3(out.normalAB) && finite_bits(out.signedDistance);
+            return out;
+        }
+
+        float3 side = cross(v4.w, v0.w);
+        if (dot(side, v1.w) >= 0.0f) {
+            if (dot(side, v2.w) >= 0.0f) v1 = v4;
+            else v3 = v4;
+        } else {
+            if (dot(side, v3.w) >= 0.0f) v2 = v4;
+            else v1 = v4;
+        }
+    }
+    return out;
+}
+
+inline bool npcCorrectedMPRInAFrameIsConsistent(
+    thread const NPCResult& result)
+{
+    if (!result.valid || !result.overlap || !finite3(result.pointA)
+        || !finite3(result.pointB) || !finite3(result.normalAB)
+        || !finite_bits(result.signedDistance)) return false;
+    // Five portal convergence epsilons covers the accumulated float error in
+    // the barycentric witness reconstruction without admitting a guessed
+    // normal/distance pair. This absolute tolerance is valid only here, where
+    // both corrected witnesses are still in the query's A-local frame.
+    const float tolerance = 5.0e-5f;
+    float normalSquared = dot(result.normalAB, result.normalAB);
+    if (!finite_bits(normalSquared)
+        || fabs(normalSquared - 1.0f) > tolerance) return false;
+    float3 delta = result.pointB - result.pointA;
+    float projectedResidual = fabs(
+        dot(delta, result.normalAB) - result.signedDistance);
+    float3 tangentResidual = delta
+        - result.normalAB * result.signedDistance;
+    return finite_bits(projectedResidual) && finite3(tangentResidual)
+        && projectedResidual <= tolerance
+        && length(tangentResidual) <= tolerance;
+}
+
+inline NPCResult npcMPRWithEnlarge(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    float enlarge)
+{
+    NPCShape localA;
+    NPCShape localB;
+    float3 origin;
+    float4 frameRotation;
+    npcMakeAFrame(a, b, localA, localB, origin, frameRotation);
+    NPCResult local = npcMPRWithEnlargeLocal(
+        localA, localB, colliderHullRange, convexHullVertices, enlarge);
+    if (local.valid && local.overlap
+        && !npcCorrectedMPRInAFrameIsConsistent(local)) {
+        // Never map an uncertified corrected witness to world space. At large
+        // origins the two accepted world witnesses may quantize to the same
+        // Float value, but signed distance remains the certified local value.
+        local.valid = false;
+    }
+    return npcResultFromAFrame(local, origin, frameRotation);
+}
+
+inline NPCResult npcMPR(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices)
+{
+    return npcMPRWithEnlarge(
+        a, b, colliderHullRange, convexHullVertices, 1.0e-4f);
+}
+
+inline bool npcCorrectedMPRIsConsistent(thread const NPCResult& result) {
+    if (!result.valid || !result.overlap || !finite3(result.pointA)
+        || !finite3(result.pointB) || !finite3(result.normalAB)
+        || !finite_bits(result.signedDistance)) return false;
+    // The corrected-witness residual was already certified before mapping out
+    // of the A-local query frame. Repeating that subtraction in world space
+    // would make validity depend on the world's Float ULP (for example 0.0625
+    // at x = 1e6), so mapped callers recheck only finite/unit invariants.
+    const float tolerance = 5.0e-5f;
+    float normalSquared = dot(result.normalAB, result.normalAB);
+    return finite_bits(normalSquared)
+        && fabs(normalSquared - 1.0f) <= tolerance;
+}
+
+struct NPCSimplex {
+    NPCVertex vertices[4];
+    float4 barycentric;
+    uint mask;
+};
+
+inline float npcDeterminant(float3 a, float3 b, float3 c, float3 d) {
+    return dot(b - a, cross(c - a, d - a));
+}
+
+inline void npcClosestSegment(
+    thread const NPCSimplex& simplex, int i0, int i1,
+    thread float3& closest, thread float4& barycentric, thread uint& mask)
+{
+    float3 a = simplex.vertices[i0].w;
+    float3 b = simplex.vertices[i1].w;
+    float3 edge = b - a;
+    float denom = dot(edge, edge);
+    bool degenerate = denom < 1.0e-8f;
+    float t = -dot(a, edge) / (degenerate ? 1.0e-8f : denom);
+    float lambda0 = 1.0f - t;
+    float lambda1 = t;
+    mask = (1u << uint(i0)) | (1u << uint(i1));
+    if (lambda0 < 0.0f || degenerate) {
+        lambda0 = 0.0f;
+        lambda1 = 1.0f;
+        mask = 1u << uint(i1);
+    } else if (lambda1 < 0.0f) {
+        lambda0 = 1.0f;
+        lambda1 = 0.0f;
+        mask = 1u << uint(i0);
+    }
+    barycentric = float4(0);
+    barycentric[i0] = lambda0;
+    barycentric[i1] = lambda1;
+    closest = a * barycentric[i0] + b * barycentric[i1];
+}
+
+inline void npcClosestTriangle(
+    thread const NPCSimplex& simplex, int i0, int i1, int i2,
+    thread float3& closest, thread float4& barycentric, thread uint& mask)
+{
+    float3 a = simplex.vertices[i0].w;
+    float3 b = simplex.vertices[i1].w;
+    float3 c = simplex.vertices[i2].w;
+    float3 u = a - b;
+    float3 w = a - c;
+    float3 normal = cross(u, w);
+    float denom = dot(normal, normal);
+    bool degenerate = denom < 1.0e-8f;
+    float inv = degenerate ? 0.0f : 1.0f / denom;
+    float lambda2 = dot(cross(u, a), normal) * inv;
+    float lambda1 = dot(cross(a, w), normal) * inv;
+    float lambda0 = 1.0f - lambda1 - lambda2;
+
+    float bestDistance = FLT_MAX;
+    mask = 0u;
+    barycentric = float4(0);
+    closest = float3(0);
+    if (lambda0 < 0.0f || degenerate) {
+        float3 p; float4 bc; uint m;
+        npcClosestSegment(simplex, i1, i2, p, bc, m);
+        float d = dot(p, p);
+        if (d < bestDistance) {
+            bestDistance = d; closest = p; barycentric = bc; mask = m;
+        }
+    }
+    if (lambda1 < 0.0f || degenerate) {
+        float3 p; float4 bc; uint m;
+        npcClosestSegment(simplex, i0, i2, p, bc, m);
+        float d = dot(p, p);
+        if (d < bestDistance) {
+            bestDistance = d; closest = p; barycentric = bc; mask = m;
+        }
+    }
+    if (lambda2 < 0.0f || degenerate) {
+        float3 p; float4 bc; uint m;
+        npcClosestSegment(simplex, i0, i1, p, bc, m);
+        float d = dot(p, p);
+        if (d < bestDistance) {
+            closest = p; barycentric = bc; mask = m;
+        }
+    }
+    if (mask != 0u) return;
+    barycentric[i0] = lambda0;
+    barycentric[i1] = lambda1;
+    barycentric[i2] = lambda2;
+    mask = (1u << uint(i0)) | (1u << uint(i1)) | (1u << uint(i2));
+    closest = lambda0 * a + lambda1 * b + lambda2 * c;
+}
+
+inline void npcClosestTetrahedron(
+    thread const NPCSimplex& simplex,
+    thread float3& closest, thread float4& barycentric, thread uint& mask)
+{
+    float3 v0 = simplex.vertices[0].w;
+    float3 v1 = simplex.vertices[1].w;
+    float3 v2 = simplex.vertices[2].w;
+    float3 v3 = simplex.vertices[3].w;
+    float det = npcDeterminant(v0, v1, v2, v3);
+    bool degenerate = fabs(det) < 1.0e-8f;
+    float inv = degenerate ? 0.0f : 1.0f / det;
+    float3 zero = float3(0);
+    float l0 = npcDeterminant(zero, v1, v2, v3) * inv;
+    float l1 = npcDeterminant(v0, zero, v2, v3) * inv;
+    float l2 = npcDeterminant(v0, v1, zero, v3) * inv;
+    float l3 = 1.0f - l0 - l1 - l2;
+
+    float bestDistance = FLT_MAX;
+    mask = 0u;
+    barycentric = float4(0);
+    closest = zero;
+    if (l0 < 0.0f || degenerate) {
+        float3 p; float4 bc; uint m;
+        npcClosestTriangle(simplex, 1, 2, 3, p, bc, m);
+        float d = dot(p, p);
+        if (d < bestDistance) {
+            bestDistance = d; closest = p; barycentric = bc; mask = m;
+        }
+    }
+    if (l1 < 0.0f || degenerate) {
+        float3 p; float4 bc; uint m;
+        npcClosestTriangle(simplex, 0, 2, 3, p, bc, m);
+        float d = dot(p, p);
+        if (d < bestDistance) {
+            bestDistance = d; closest = p; barycentric = bc; mask = m;
+        }
+    }
+    if (l2 < 0.0f || degenerate) {
+        float3 p; float4 bc; uint m;
+        npcClosestTriangle(simplex, 0, 1, 3, p, bc, m);
+        float d = dot(p, p);
+        if (d < bestDistance) {
+            bestDistance = d; closest = p; barycentric = bc; mask = m;
+        }
+    }
+    if (l3 < 0.0f || degenerate) {
+        float3 p; float4 bc; uint m;
+        npcClosestTriangle(simplex, 0, 1, 2, p, bc, m);
+        float d = dot(p, p);
+        if (d < bestDistance) {
+            closest = p; barycentric = bc; mask = m;
+        }
+    }
+    if (mask != 0u) return;
+    barycentric = float4(l0, l1, l2, l3);
+    mask = 15u;
+    closest = zero;
+}
+
+inline void npcSimplexWitness(
+    thread const NPCSimplex& simplex,
+    thread float3& pointA, thread float3& pointB)
+{
+    pointA = float3(0);
+    pointB = float3(0);
+    for (int i = 0; i < 4; i++) {
+        if ((simplex.mask & (1u << uint(i))) == 0u) continue;
+        pointA += simplex.vertices[i].pointA * simplex.barycentric[i];
+        pointB += simplex.vertices[i].pointB * simplex.barycentric[i];
+    }
+}
+
+// Newton's distance fallback after MPR rejects overlap. The duality-gap
+// convergence test and simplex reduction produce accurate speculative
+// witnesses without paying an EPA pass for separated pairs.
+inline NPCResult npcGJKWithIterationLimitLocal(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    float maxDistance,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    int iterationLimit)
+{
+    float3 centerA = npcShapeInteriorCenter(a);
+    float3 centerB = npcShapeInteriorCenter(b);
+    NPCResult out;
+    out.overlap = false;
+    out.valid = false;
+    out.pointA = centerA;
+    out.pointB = centerB;
+    out.normalAB = npcSafeNormalize(centerB - centerA, float3(1, 0, 0));
+    out.signedDistance = FLT_MAX;
+    out.featureA = 0xFFFFFFFFu;
+    out.featureB = 0xFFFFFFFFu;
+
+    NPCSimplex simplex;
+    simplex.barycentric = float4(0);
+    simplex.mask = 0u;
+    float3 v = centerA - centerB;
+    // Keep the distance solver's convergence and simplex-degeneracy
+    // thresholds aligned with Newton/Jitter and the Swift reference. The
+    // previous 1e-5 relative threshold was ten times stricter around
+    // unit-scale geometry and could cycle between nearly degenerate simplices
+    // until the bounded iteration budget expired.
+    float epsilon = 1.0e-4f;
+    float distSq = dot(v, v);
+    float3 lastDirection = out.normalAB;
+    bool converged = false;
+
+    for (int iteration = 0; iteration < iterationLimit; iteration++) {
+        if (!finite_bits(distSq)) return out;
+        if (distSq < epsilon * epsilon) {
+            out.overlap = true;
+            converged = true;
+            break;
+        }
+        float3 search = -v;
+        lastDirection = search;
+        NPCVertex support = npcMinkowskiSupport(
+            a, b, search, colliderHullRange, convexHullVertices);
+        if (!finite3(support.w)) return out;
+        if (maxDistance > 0.0f
+            && dot(v, support.w) > maxDistance * sqrt(distSq)) {
+            converged = true;
+            break;
+        }
+        float gap = dot(v, v - support.w);
+        if (gap <= 0.0f
+            || gap * gap < epsilon * epsilon * distSq) {
+            converged = true;
+            break;
+        }
+
+        bool duplicate = false;
+        for (int i = 0; i < 4; i++) {
+            if ((simplex.mask & (1u << uint(i))) == 0u) continue;
+            float3 d = simplex.vertices[i].w - support.w;
+            if (dot(d, d) < epsilon * epsilon) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            // Like the stationary reducer case below, a retained support
+            // duplicate proves numerical stalling but not separation. The
+            // witness upper bound and support-plane lower bound must classify
+            // the bounded contact query on the same (positive) side before a
+            // finite separated result is trustworthy.
+            float duplicateUpper = sqrt(max(distSq, 0.0f));
+            float duplicateProjection = dot(v, support.w);
+            bool duplicateSeparated = duplicateProjection
+                > epsilon * duplicateUpper;
+            if (maxDistance > 0.0f && duplicateUpper <= maxDistance
+                && duplicateSeparated) {
+                converged = true;
+                break;
+            }
+            // Invalid results carry only this conservative simplex-distance
+            // upper bound so the caller can size one certified MPR retry.
+            out.signedDistance = duplicateUpper;
+            return out;
+        }
+
+        uint previousMask = simplex.mask;
+        float3 previousClosest = v;
+        int indices[4];
+        int useCount = 0;
+        int freeSlot = 0;
+        for (int i = 0; i < 4; i++) {
+            if ((simplex.mask & (1u << uint(i))) != 0u)
+                indices[useCount++] = i;
+            else freeSlot = i;
+        }
+        indices[useCount++] = freeSlot;
+        simplex.vertices[freeSlot] = support;
+
+        float3 closest = float3(0);
+        float4 barycentric = float4(0);
+        uint mask = 0u;
+        if (useCount == 1) {
+            closest = support.w;
+            barycentric[freeSlot] = 1.0f;
+            mask = 1u << uint(freeSlot);
+        } else if (useCount == 2) {
+            npcClosestSegment(simplex, indices[0], indices[1],
+                              closest, barycentric, mask);
+        } else if (useCount == 3) {
+            npcClosestTriangle(simplex, indices[0], indices[1], indices[2],
+                               closest, barycentric, mask);
+        } else {
+            npcClosestTetrahedron(simplex, closest, barycentric, mask);
+        }
+        simplex.barycentric = barycentric;
+        simplex.mask = mask;
+        if (mask == 15u) {
+            out.overlap = true;
+            converged = true;
+            break;
+        }
+        // A support point can be outside the retained simplex and therefore
+        // evade the retained-vertex duplicate check. If adding that point is
+        // rejected by the simplex reducer and leaves both the simplex and its
+        // closest point unchanged, the deterministic query is at a fixed
+        // point. This establishes numerical stalling, not separation by
+        // itself. Admit only when the current witness is inside the caller's
+        // positive contact threshold and the Frank-Wolfe support plane gives
+        // a robustly positive lower bound. Threshold-straddling or exact
+        // distance queries remain fail-closed.
+        float3 closestDelta = closest - previousClosest;
+        bool stationary = mask == previousMask
+            && dot(closestDelta, closestDelta) <= 1.0e-16f;
+        float upperSquared = dot(closest, closest);
+        float upper = sqrt(max(upperSquared, 0.0f));
+        float supportProjection = dot(previousClosest, support.w);
+        bool robustlySeparated = supportProjection > epsilon * upper;
+        if (stationary && maxDistance > 0.0f
+            && upper <= maxDistance && robustlySeparated) {
+            v = closest;
+            distSq = upperSquared;
+            converged = true;
+            break;
+        }
+        v = closest;
+        distSq = dot(v, v);
+    }
+
+    // A finite last simplex is not evidence of separation. If the bounded
+    // loop used its entire budget without one of the explicit convergence
+    // conditions above, return invalid so callers fail the frame closed.
+    if (!converged) {
+        // Preserve the conservative simplex-distance upper bound for the
+        // caller's bounded retry; all witness fields remain invalid.
+        out.signedDistance = sqrt(max(distSq, 0.0f));
+        return out;
+    }
+
+    if (simplex.mask != 0u) {
+        npcSimplexWitness(simplex, out.pointA, out.pointB);
+    } else {
+        NPCVertex seed = npcMinkowskiSupport(
+            a, b, out.normalAB, colliderHullRange, convexHullVertices);
+        out.pointA = seed.pointA;
+        out.pointB = seed.pointB;
+    }
+    float3 delta = out.pointB - out.pointA;
+    float distanceSq = dot(delta, delta);
+    if (distanceSq > epsilon * epsilon) {
+        out.signedDistance = sqrt(distanceSq);
+        out.normalAB = delta / out.signedDistance;
+    } else {
+        float fallbackSq = dot(lastDirection, lastDirection);
+        out.signedDistance = sqrt(max(distSq, 0.0f));
+        float3 localNormal = fallbackSq > 1.0e-20f
+            ? lastDirection * rsqrt(fallbackSq) : float3(1, 0, 0);
+        out.normalAB = localNormal;
+    }
+    NPCVertex feature = npcMinkowskiSupport(
+        a, b, out.normalAB, colliderHullRange, convexHullVertices);
+    out.featureA = feature.featureA;
+    out.featureB = feature.featureB;
+    out.valid = finite3(out.pointA) && finite3(out.pointB)
+        && finite3(out.normalAB) && finite_bits(out.signedDistance);
+    return out;
+}
+
+inline NPCResult npcGJKWithIterationLimit(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    float maxDistance,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    int iterationLimit)
+{
+    NPCShape localA;
+    NPCShape localB;
+    float3 origin;
+    float4 frameRotation;
+    npcMakeAFrame(a, b, localA, localB, origin, frameRotation);
+    NPCResult local = npcGJKWithIterationLimitLocal(
+        localA, localB, maxDistance, colliderHullRange,
+        convexHullVertices, iterationLimit);
+    return npcResultFromAFrame(local, origin, frameRotation);
+}
+
+inline NPCResult npcGJK(
+    thread const NPCShape& a,
+    thread const NPCShape& b,
+    float maxDistance,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices)
+{
+    return npcGJKWithIterationLimit(
+        a, b, maxDistance, colliderHullRange, convexHullVertices,
+        NPC_GJK_ITERATIONS);
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic polyhedral manifold expansion
+// ---------------------------------------------------------------------------
+
+// MPR/GJK intentionally return one witness and the collision normal. For
+// polyhedra, expand that witness into the clipped reference/incident polygon
+// used by Newton/Jitter-style contact generation. The cooked face loops are
+// maximal coplanar polygons (the CPU uploader removes triangulation diagonals),
+// so a broad quad stays a broad four-point manifold.
+
+#define NPC_FEATURE_BOX_VERTEX  0x10000000u
+#define NPC_FEATURE_BOX_FACE    0x20000000u
+#define NPC_FEATURE_BOX_EDGE    0x30000000u
+#define NPC_FEATURE_HULL_VERTEX 0x40000000u
+#define NPC_FEATURE_HULL_FACE   0x50000000u
+#define NPC_FEATURE_HULL_EDGE   0x60000000u
+#define NPC_FEATURE_CLIPPED     0x70000000u
+
+struct NPCPolyFace {
+    bool valid;
+    bool hull;
+    uint localIndex;
+    uint loopStart;
+    uint count;
+    float3 normal;                  // world-space outward normal
+    float distance;                 // dot(normal, world face plane)
+};
+
+struct NPCPolyEdge {
+    bool valid;
+    uint localIndex;
+    float3 a;
+    float3 b;
+};
+
+struct NPCClipVertex {
+    float3 point;
+    uint incidentFeature;
+    uint referenceFeature;
+};
+
+struct NPCManifoldContact {
+    float3 pointA;
+    float3 pointB;
+    uint2 features;
+};
+
+inline uint npcMixFeature(uint a, uint b) {
+    uint lo = min(a, b);
+    uint hi = max(a, b);
+    uint h = lo * 0x9E3779B9u ^ hi * 0x85EBCA6Bu;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    return h;
+}
+
+inline uint npcFeaturePairHash(uint2 pair) {
+    uint h = pair.x * 0x9E3779B9u ^ pair.y * 0x85EBCA6Bu;
+    h ^= h >> 16;
+    return h;
+}
+
+inline float3 npcBoxLocalVertex(thread const NPCShape& shape, uint index) {
+    float3 halfExtent = shape.dimensions.xyz * 0.5f;
+    return float3((index & 1u) != 0u ? halfExtent.x : -halfExtent.x,
+                  (index & 2u) != 0u ? halfExtent.y : -halfExtent.y,
+                  (index & 4u) != 0u ? halfExtent.z : -halfExtent.z);
+}
+
+inline uint npcBoxFaceVertexIndex(uint face, uint index) {
+    // Every loop is counter-clockwise when viewed along its outward normal.
+    if (face == 0u) { // -X
+        uint ids[4] = { 0u, 4u, 6u, 2u };
+        return ids[index & 3u];
+    }
+    if (face == 1u) { // +X
+        uint ids[4] = { 1u, 3u, 7u, 5u };
+        return ids[index & 3u];
+    }
+    if (face == 2u) { // -Y
+        uint ids[4] = { 0u, 1u, 5u, 4u };
+        return ids[index & 3u];
+    }
+    if (face == 3u) { // +Y
+        uint ids[4] = { 2u, 6u, 7u, 3u };
+        return ids[index & 3u];
+    }
+    if (face == 4u) { // -Z
+        uint ids[4] = { 0u, 2u, 3u, 1u };
+        return ids[index & 3u];
+    }
+    uint ids[4] = { 4u, 5u, 7u, 6u }; // +Z
+    return ids[index & 3u];
+}
+
+inline float3 npcBoxFaceLocalNormal(uint face) {
+    if (face == 0u) return float3(-1, 0, 0);
+    if (face == 1u) return float3(1, 0, 0);
+    if (face == 2u) return float3(0, -1, 0);
+    if (face == 3u) return float3(0, 1, 0);
+    if (face == 4u) return float3(0, 0, -1);
+    return float3(0, 0, 1);
+}
+
+inline uint npcPolyFaceCount(
+    thread const NPCShape& shape,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls)
+{
+    if (shape.kind == 0u) return 6u;
+    if (shape.kind != 4u) return 0u;
+    uint asset = colliderConvexAssetID[shape.collider];
+    return asset == 0xFFFFFFFFu ? 0u : convexHulls[asset].verticesFaces.w;
+}
+
+inline NPCPolyFace npcPolyFace(
+    thread const NPCShape& shape, uint localFace,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexFaceGPU* convexFaces)
+{
+    NPCPolyFace result;
+    result.valid = false;
+    result.hull = shape.kind == 4u;
+    result.localIndex = localFace;
+    result.loopStart = 0u;
+    result.count = 0u;
+    result.normal = float3(1, 0, 0);
+    result.distance = 0.0f;
+    if (shape.kind == 0u) {
+        if (localFace >= 6u) return result;
+        float3 localNormal = npcBoxFaceLocalNormal(localFace);
+        uint vertexIndex = npcBoxFaceVertexIndex(localFace, 0u);
+        float3 point = shape.center
+            + q_rotate(shape.rotation, npcBoxLocalVertex(shape, vertexIndex));
+        result.valid = true;
+        result.count = 4u;
+        result.normal = q_rotate(shape.rotation, localNormal);
+        result.distance = dot(result.normal, point);
+        return result;
+    }
+    if (shape.kind != 4u) return result;
+    uint asset = colliderConvexAssetID[shape.collider];
+    if (asset == 0xFFFFFFFFu) return result;
+    ConvexHullGPU hull = convexHulls[asset];
+    if (localFace >= hull.verticesFaces.w) return result;
+    ConvexFaceGPU face = convexFaces[hull.verticesFaces.z + localFace];
+    result.valid = face.loop.y >= 3u
+        && face.loop.y <= NPC_MAX_FACE_VERTICES;
+    result.loopStart = face.loop.x;
+    result.count = face.loop.y;
+    result.localIndex = face.loop.z;
+    result.normal = q_rotate(shape.rotation, face.plane.xyz);
+    result.distance = face.plane.w + dot(result.normal, shape.center);
+    return result;
+}
+
+inline float3 npcPolyFaceVertex(
+    thread const NPCShape& shape, thread const NPCPolyFace& face, uint index,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const uint* convexFaceVertexIndices,
+    device const float4* convexHullVertices,
+    thread uint& feature)
+{
+    if (!face.hull) {
+        uint vertexIndex = npcBoxFaceVertexIndex(face.localIndex, index);
+        feature = NPC_FEATURE_BOX_VERTEX | vertexIndex;
+        return shape.center
+            + q_rotate(shape.rotation, npcBoxLocalVertex(shape, vertexIndex));
+    }
+    uint asset = colliderConvexAssetID[shape.collider];
+    ConvexHullGPU hull = convexHulls[asset];
+    uint localVertex = convexFaceVertexIndices[face.loopStart + index];
+    feature = NPC_FEATURE_HULL_VERTEX | (localVertex & 0x0FFFFFFFu);
+    return shape.center + q_rotate(shape.rotation,
+        convexHullVertices[hull.verticesFaces.x + localVertex].xyz);
+}
+
+inline uint npcFaceFeature(thread const NPCShape& shape, uint face) {
+    return (shape.kind == 4u ? NPC_FEATURE_HULL_FACE : NPC_FEATURE_BOX_FACE)
+        | (face & 0x0FFFFFFFu);
+}
+
+inline uint npcFaceEdgeFeature(
+    thread const NPCShape& shape, uint face, uint side)
+{
+    uint base = shape.kind == 4u ? NPC_FEATURE_HULL_EDGE
+        : NPC_FEATURE_BOX_EDGE;
+    return base | ((face & 0x3FFFu) << 14) | (side & 0x3FFFu);
+}
+
+inline NPCPolyFace npcBestPolyFace(
+    thread const NPCShape& shape, float3 direction,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexFaceGPU* convexFaces,
+    thread float& alignment)
+{
+    NPCPolyFace best;
+    best.valid = false;
+    alignment = -FLT_MAX;
+    uint count = npcPolyFaceCount(shape, colliderConvexAssetID, convexHulls);
+    for (uint index = 0u; index < count; index++) {
+        NPCPolyFace face = npcPolyFace(
+            shape, index, colliderConvexAssetID, convexHulls, convexFaces);
+        if (!face.valid) continue;
+        float value = dot(face.normal, direction);
+        if (!best.valid || value > alignment + 1.0e-7f
+            || (fabs(value - alignment) <= 1.0e-7f
+                && face.localIndex < best.localIndex)) {
+            best = face;
+            alignment = value;
+        }
+    }
+    return best;
+}
+
+inline int npcClipPolygon(
+    thread const NPCClipVertex* input, int inputCount,
+    float3 planeNormal, float planeDistance, uint referenceFeature,
+    thread NPCClipVertex* output)
+{
+    if (inputCount <= 0) return 0;
+    int outputCount = 0;
+    NPCClipVertex a = input[inputCount - 1];
+    float da = dot(planeNormal, a.point) - planeDistance;
+    for (int index = 0; index < inputCount; index++) {
+        NPCClipVertex b = input[index];
+        float db = dot(planeNormal, b.point) - planeDistance;
+        bool aInside = da <= PLANE_EPS;
+        bool bInside = db <= PLANE_EPS;
+        if (aInside != bInside && outputCount < NPC_MAX_FACE_VERTICES) {
+            float denominator = da - db;
+            float t = fabs(denominator) > SAT_EPS
+                ? clamp(da / denominator, 0.0f, 1.0f) : 0.0f;
+            NPCClipVertex clipped;
+            clipped.point = mix(a.point, b.point, t);
+            clipped.incidentFeature = NPC_FEATURE_CLIPPED
+                | (npcMixFeature(a.incidentFeature, b.incidentFeature)
+                    & 0x0FFFFFFFu);
+            clipped.referenceFeature = referenceFeature;
+            output[outputCount++] = clipped;
+        }
+        if (bInside && outputCount < NPC_MAX_FACE_VERTICES) {
+            output[outputCount++] = b;
+        }
+        a = b;
+        da = db;
+    }
+    return outputCount;
+}
+
+inline bool npcAddManifoldContact(
+    thread NPCManifoldContact* contacts, thread int& count,
+    float3 pointA, float3 pointB, uint2 features, float mergeDistanceSquared)
+{
+    float3 midpoint = (pointA + pointB) * 0.5f;
+    for (int index = 0; index < count; index++) {
+        float3 other = (contacts[index].pointA + contacts[index].pointB) * 0.5f;
+        if (distance_squared(midpoint, other) <= mergeDistanceSquared) {
+            // At a geometric duplicate retain the lexicographically smallest
+            // exact feature identity, independent of clipping traversal noise.
+            uint2 old = contacts[index].features;
+            if (features.x < old.x
+                || (features.x == old.x && features.y < old.y)) {
+                contacts[index].pointA = pointA;
+                contacts[index].pointB = pointB;
+                contacts[index].features = features;
+            }
+            return false;
+        }
+    }
+    if (count >= NPC_MAX_FACE_VERTICES) return false;
+    contacts[count].pointA = pointA;
+    contacts[count].pointB = pointB;
+    contacts[count].features = features;
+    count++;
+    return true;
+}
+
+inline int npcReduceManifold(
+    thread const NPCManifoldContact* candidates, int candidateCount,
+    float3 normalBToA, thread NPCManifoldContact* reduced)
+{
+    if (candidateCount <= MAX_CONTACTS) {
+        for (int index = 0; index < candidateCount; index++)
+            reduced[index] = candidates[index];
+        return candidateCount;
+    }
+
+    bool selected[NPC_MAX_FACE_VERTICES];
+    for (int index = 0; index < NPC_MAX_FACE_VERTICES; index++)
+        selected[index] = false;
+    int first = 0;
+    float deepest = FLT_MAX;
+    for (int index = 0; index < candidateCount; index++) {
+        float separation = dot(normalBToA,
+            candidates[index].pointA - candidates[index].pointB);
+        uint2 key = candidates[index].features;
+        uint2 old = candidates[first].features;
+        if (separation < deepest - 1.0e-7f
+            || (fabs(separation - deepest) <= 1.0e-7f
+                && (key.x < old.x || (key.x == old.x && key.y < old.y)))) {
+            first = index;
+            deepest = separation;
+        }
+    }
+    reduced[0] = candidates[first];
+    selected[first] = true;
+    int outputCount = 1;
+    while (outputCount < MAX_CONTACTS) {
+        int best = -1;
+        float bestSpread = -1.0f;
+        for (int candidate = 0; candidate < candidateCount; candidate++) {
+            if (selected[candidate]) continue;
+            float3 midpoint = (candidates[candidate].pointA
+                + candidates[candidate].pointB) * 0.5f;
+            float minimumSpread = FLT_MAX;
+            for (int chosen = 0; chosen < outputCount; chosen++) {
+                float3 other = (reduced[chosen].pointA
+                    + reduced[chosen].pointB) * 0.5f;
+                float3 delta = midpoint - other;
+                delta -= normalBToA * dot(normalBToA, delta);
+                minimumSpread = min(minimumSpread, dot(delta, delta));
+            }
+            uint2 key = candidates[candidate].features;
+            uint2 old = best >= 0 ? candidates[best].features
+                : uint2(0xFFFFFFFFu);
+            if (best < 0 || minimumSpread > bestSpread + 1.0e-10f
+                || (fabs(minimumSpread - bestSpread) <= 1.0e-10f
+                    && (key.x < old.x
+                        || (key.x == old.x && key.y < old.y)))) {
+                best = candidate;
+                bestSpread = minimumSpread;
+            }
+        }
+        if (best < 0) break;
+        reduced[outputCount++] = candidates[best];
+        selected[best] = true;
+    }
+    return outputCount;
+}
+
+inline uint npcPolyEdgeCount(
+    thread const NPCShape& shape,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls)
+{
+    if (shape.kind == 0u) return 12u;
+    if (shape.kind != 4u) return 0u;
+    uint asset = colliderConvexAssetID[shape.collider];
+    return asset == 0xFFFFFFFFu ? 0u : convexHulls[asset].edgesLoops.y;
+}
+
+inline uint2 npcBoxEdgeVertices(uint edge) {
+    uint pairs[24] = {
+        0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u,
+        0u, 2u, 1u, 3u, 4u, 6u, 5u, 7u,
+        0u, 4u, 1u, 5u, 2u, 6u, 3u, 7u
+    };
+    uint offset = min(edge, 11u) * 2u;
+    return uint2(pairs[offset], pairs[offset + 1u]);
+}
+
+inline NPCPolyEdge npcPolyEdge(
+    thread const NPCShape& shape, uint localEdge,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexEdgeGPU* convexEdges,
+    device const float4* convexHullVertices)
+{
+    NPCPolyEdge result;
+    result.valid = false;
+    result.localIndex = localEdge;
+    result.a = shape.center;
+    result.b = shape.center;
+    uint2 vertices;
+    uint vertexStart = 0u;
+    if (shape.kind == 0u) {
+        if (localEdge >= 12u) return result;
+        vertices = npcBoxEdgeVertices(localEdge);
+        result.a = shape.center
+            + q_rotate(shape.rotation, npcBoxLocalVertex(shape, vertices.x));
+        result.b = shape.center
+            + q_rotate(shape.rotation, npcBoxLocalVertex(shape, vertices.y));
+        result.valid = true;
+        return result;
+    }
+    if (shape.kind != 4u) return result;
+    uint asset = colliderConvexAssetID[shape.collider];
+    if (asset == 0xFFFFFFFFu) return result;
+    ConvexHullGPU hull = convexHulls[asset];
+    if (localEdge >= hull.edgesLoops.y) return result;
+    ConvexEdgeGPU edge = convexEdges[hull.edgesLoops.x + localEdge];
+    vertices = edge.endpointsFaces.xy;
+    vertexStart = hull.verticesFaces.x;
+    result.a = shape.center + q_rotate(shape.rotation,
+        convexHullVertices[vertexStart + vertices.x].xyz);
+    result.b = shape.center + q_rotate(shape.rotation,
+        convexHullVertices[vertexStart + vertices.y].xyz);
+    result.valid = finite3(result.a) && finite3(result.b)
+        && distance_squared(result.a, result.b) > 1.0e-16f;
+    return result;
+}
+
+inline bool npcBestEdgeContact(
+    thread const NPCShape& a, thread const NPCShape& b, float3 normalAtoB,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexEdgeGPU* convexEdges,
+    thread NPCManifoldContact& contact, thread float& alignment,
+    thread uint& edgePairTests)
+{
+    uint countA = npcPolyEdgeCount(a, colliderConvexAssetID, convexHulls);
+    uint countB = npcPolyEdgeCount(b, colliderConvexAssetID, convexHulls);
+    if (countA == 0u || countB == 0u) return false;
+    float supportA = dot(npcShapeSupport(
+        a, normalAtoB, colliderHullRange, convexHullVertices).point,
+        normalAtoB);
+    float supportB = dot(npcShapeSupport(
+        b, -normalAtoB, colliderHullRange, convexHullVertices).point,
+        normalAtoB);
+    float scale = max(1.0e-3f,
+        max(fabs(a.dimensions.w), fabs(b.dimensions.w)));
+    float supportTolerance = max(1.0e-5f, 0.005f * scale);
+    bool found = false;
+    float bestScore = -FLT_MAX;
+    uint bestA = 0u;
+    uint bestB = 0u;
+    NPCPolyEdge chosenA;
+    NPCPolyEdge chosenB;
+    alignment = -FLT_MAX;
+
+    for (uint indexA = 0u; indexA < countA; indexA++) {
+        NPCPolyEdge edgeA = npcPolyEdge(
+            a, indexA, colliderConvexAssetID, convexHulls,
+            convexEdges, convexHullVertices);
+        if (!edgeA.valid) continue;
+        float deficitA = max(fabs(supportA - dot(edgeA.a, normalAtoB)),
+                             fabs(supportA - dot(edgeA.b, normalAtoB)));
+        if (deficitA > supportTolerance) continue;
+        float3 directionA = normalize(edgeA.b - edgeA.a);
+        for (uint indexB = 0u; indexB < countB; indexB++) {
+            NPCPolyEdge edgeB = npcPolyEdge(
+                b, indexB, colliderConvexAssetID, convexHulls,
+                convexEdges, convexHullVertices);
+            if (!edgeB.valid) continue;
+            edgePairTests++;
+            float deficitB = max(fabs(dot(edgeB.a, normalAtoB) - supportB),
+                                 fabs(dot(edgeB.b, normalAtoB) - supportB));
+            if (deficitB > supportTolerance) continue;
+            float3 directionB = normalize(edgeB.b - edgeB.a);
+            float3 crossDirection = cross(directionA, directionB);
+            float crossLengthSquared = dot(crossDirection, crossDirection);
+            if (crossLengthSquared <= 1.0e-10f) continue;
+            float crossAlignment = fabs(dot(
+                crossDirection * rsqrt(crossLengthSquared), normalAtoB));
+            float score = crossAlignment
+                - (deficitA + deficitB) / max(scale, 1.0e-6f);
+            if (!found || score > bestScore + 1.0e-7f
+                || (fabs(score - bestScore) <= 1.0e-7f
+                    && (indexA < bestA
+                        || (indexA == bestA && indexB < bestB)))) {
+                found = true;
+                bestScore = score;
+                bestA = indexA;
+                bestB = indexB;
+                chosenA = edgeA;
+                chosenB = edgeB;
+                alignment = crossAlignment;
+            }
+        }
+    }
+    if (!found) return false;
+    npClosestSegSeg(chosenA.a, chosenA.b, chosenB.a, chosenB.b,
+                    contact.pointA, contact.pointB);
+    contact.features = uint2(
+        (a.kind == 4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)
+            | (bestA & 0x0FFFFFFFu),
+        (b.kind == 4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)
+            | (bestB & 0x0FFFFFFFu));
+    return finite3(contact.pointA) && finite3(contact.pointB);
+}
+
+inline int npcBuildPolyhedralManifold(
+    thread const NPCShape& a, thread const NPCShape& b,
+    float3 normalAtoB, float detectDistance,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexFaceGPU* convexFaces,
+    device const uint* convexFaceVertexIndices,
+    device const ConvexEdgeGPU* convexEdges,
+    thread NPCManifoldContact* output,
+    thread uint& edgePairTests)
+{
+    float alignmentA, alignmentB;
+    NPCPolyFace faceA = npcBestPolyFace(
+        a, normalAtoB, colliderConvexAssetID, convexHulls, convexFaces,
+        alignmentA);
+    NPCPolyFace faceB = npcBestPolyFace(
+        b, -normalAtoB, colliderConvexAssetID, convexHulls, convexFaces,
+        alignmentB);
+    if (!faceA.valid || !faceB.valid) return 0;
+
+    float faceAlignment = max(alignmentA, alignmentB);
+    NPCManifoldContact edgeContact;
+    float edgeAlignment = -FLT_MAX;
+    // A near-parallel face normal cannot lose to an edge cross-axis. Avoid the
+    // potentially O(Ea*Eb) supporting-edge search for the overwhelmingly
+    // common broad-face/resting case.
+    bool haveEdge = false;
+    if (faceAlignment < 0.985f) {
+        haveEdge = npcBestEdgeContact(
+            a, b, normalAtoB, colliderHullRange, convexHullVertices,
+            colliderConvexAssetID, convexHulls, convexEdges,
+            edgeContact, edgeAlignment, edgePairTests);
+    }
+    // A face wins ties by design. Edge contact is selected only when the MPR
+    // normal is materially better explained by a supporting edge cross-axis.
+    if (haveEdge && edgeAlignment > faceAlignment + 0.025f
+        && faceAlignment < 0.985f) {
+        output[0] = edgeContact;
+        return 1;
+    }
+
+    bool referenceIsA = alignmentA >= alignmentB - 1.0e-7f;
+    NPCShape referenceShape = referenceIsA ? a : b;
+    NPCShape incidentShape = referenceIsA ? b : a;
+    NPCPolyFace referenceFace = referenceIsA ? faceA : faceB;
+    float incidentAlignment;
+    NPCPolyFace incidentFace = npcBestPolyFace(
+        incidentShape, -referenceFace.normal,
+        colliderConvexAssetID, convexHulls, convexFaces, incidentAlignment);
+    if (!incidentFace.valid) {
+        if (haveEdge) { output[0] = edgeContact; return 1; }
+        return 0;
+    }
+
+    NPCClipVertex polygonA[NPC_MAX_FACE_VERTICES];
+    NPCClipVertex polygonB[NPC_MAX_FACE_VERTICES];
+    uint referenceFaceFeature = npcFaceFeature(
+        referenceShape, referenceFace.localIndex);
+    int polygonCount = int(incidentFace.count);
+    for (int index = 0; index < polygonCount; index++) {
+        uint vertexFeature;
+        polygonA[index].point = npcPolyFaceVertex(
+            incidentShape, incidentFace, uint(index),
+            colliderConvexAssetID, convexHulls, convexFaceVertexIndices,
+            convexHullVertices, vertexFeature);
+        polygonA[index].incidentFeature = vertexFeature;
+        polygonA[index].referenceFeature = referenceFaceFeature;
+    }
+
+    for (uint side = 0u; side < referenceFace.count; side++) {
+        uint ignoredFeature;
+        float3 p0 = npcPolyFaceVertex(
+            referenceShape, referenceFace, side,
+            colliderConvexAssetID, convexHulls, convexFaceVertexIndices,
+            convexHullVertices, ignoredFeature);
+        float3 p1 = npcPolyFaceVertex(
+            referenceShape, referenceFace,
+            (side + 1u) % referenceFace.count,
+            colliderConvexAssetID, convexHulls, convexFaceVertexIndices,
+            convexHullVertices, ignoredFeature);
+        float3 sideNormal = npcSafeNormalize(
+            cross(p1 - p0, referenceFace.normal), float3(1, 0, 0));
+        uint edgeFeature = npcFaceEdgeFeature(
+            referenceShape, referenceFace.localIndex, side);
+        if ((side & 1u) == 0u) {
+            polygonCount = npcClipPolygon(
+                polygonA, polygonCount, sideNormal, dot(sideNormal, p0),
+                edgeFeature, polygonB);
+        } else {
+            polygonCount = npcClipPolygon(
+                polygonB, polygonCount, sideNormal, dot(sideNormal, p0),
+                edgeFeature, polygonA);
+        }
+        if (polygonCount == 0) break;
+    }
+
+    thread NPCClipVertex* clipped = (referenceFace.count & 1u) == 0u
+        ? polygonA : polygonB;
+    NPCManifoldContact candidates[NPC_MAX_FACE_VERTICES];
+    int candidateCount = 0;
+    float scale = max(1.0e-3f,
+        max(fabs(a.dimensions.w), fabs(b.dimensions.w)));
+    float mergeDistance = max(1.0e-6f, scale * 2.0e-5f);
+    float faceSlop = detectDistance + max(PLANE_EPS, scale * 1.0e-5f);
+    for (int index = 0; index < polygonCount; index++) {
+        float3 incidentPoint = clipped[index].point;
+        float separation = dot(referenceFace.normal, incidentPoint)
+            - referenceFace.distance;
+        if (separation > faceSlop) continue;
+        float3 referencePoint = incidentPoint
+            - referenceFace.normal * separation;
+        float3 pointA = referenceIsA ? referencePoint : incidentPoint;
+        float3 pointB = referenceIsA ? incidentPoint : referencePoint;
+        uint2 features = referenceIsA
+            ? uint2(clipped[index].referenceFeature,
+                    clipped[index].incidentFeature)
+            : uint2(clipped[index].incidentFeature,
+                    clipped[index].referenceFeature);
+        npcAddManifoldContact(
+            candidates, candidateCount, pointA, pointB, features,
+            mergeDistance * mergeDistance);
+    }
+    if (candidateCount == 0) {
+        if (haveEdge) { output[0] = edgeContact; return 1; }
+        return 0;
+    }
+    return npcReduceManifold(candidates, candidateCount, -normalAtoB, output);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,30 +1802,44 @@ struct TorusHit {
     uint feature;
 };
 
-kernel void np_collide(
-    device const float4* posLin     [[buffer(0)]],
-    device const float4* posAng     [[buffer(1)]],
-    device const float4* shape      [[buffer(2)]],   // xyz size, w radius
-    device const float4* props      [[buffer(3)]],   // xyz moment, w friction
-    device const uint2* pairs       [[buffer(4)]],
-    device const atomic_uint* counters [[buffer(5)]],
-    device ManifoldGPU* manifolds   [[buffer(6)]],
-    device const ManifoldGPU* prevManifolds [[buffer(7)]],
-    device const atomic_uint* mapKeyA [[buffer(8)]],
-    device const uint* mapKeyB      [[buffer(9)]],
-    device const uint* mapVal       [[buffer(10)]],
-    constant SimParams& P           [[buffer(11)]],
-    device const uint* shapeType    [[buffer(12)]],
-    device const float4* spinVel    [[buffer(13)]],
-    device const float4* velLin     [[buffer(14)]],
-    device const float4* velAng     [[buffer(15)]],
-    device const uint* colliderOwner [[buffer(16)]],
-    device const float4* colliderLocalPosition [[buffer(17)]],
-    device const float4* colliderLocalRotation [[buffer(18)]],
-    device const uint2* colliderHullRange [[buffer(19)]],
-    device const float4* convexHullVertices [[buffer(20)]],
-    device const float2* colliderFriction [[buffer(21)]],
-    uint gid                        [[thread_position_in_grid]])
+// Compile the analytic and support-mapped paths as different Metal kernels.
+// `CONVEX_PASS` is a template constant, so the analytic specialization does
+// not retain MPR/GJK, clipping workspaces, or convex-only buffer accesses in
+// its generated code. Both passes still consume the same deterministic pair
+// stream and address the same manifold slot by `gid`.
+template <bool CONVEX_PASS>
+inline void npCollidePass(
+    device const float4* posLin,
+    device const float4* posAng,
+    device const float4* shape,      // xyz size, w radius
+    device const float4* props,      // xyz moment, w friction
+    device const uint2* pairs,
+    device atomic_uint* counters,
+    device ManifoldGPU* manifolds,
+    device const ManifoldGPU* prevManifolds,
+    device const atomic_uint* mapKeyA,
+    device const uint* mapKeyB,
+    device const uint* mapVal,
+    constant SimParams& P,
+    device const uint* shapeType,
+    device const float4* spinVel,
+    device const float4* velLin,
+    device const float4* velAng,
+    device const uint* colliderOwner,
+    device const float4* colliderLocalPosition,
+    device const float4* colliderLocalRotation,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices,
+    device const float2* colliderFriction,
+    device const uint* colliderConvexAssetID,
+    device const ConvexHullGPU* convexHulls,
+    device const ConvexFaceGPU* convexFaces,
+    device const uint* convexFaceVertexIndices,
+    device const ConvexEdgeGPU* convexEdges,
+    device uint2* contactFeatures,
+    device const uint2* prevContactFeatures,
+    device atomic_uint* convexQueryPoison,
+    uint gid)
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
     if (gid >= numPairs) return;
@@ -406,87 +1888,133 @@ kernel void np_collide(
     bool hullB = stB == 4;
 
     if (hullA || hullB) {
-        // The exact H1 contract only needs convex-vs-box. Refuse unsupported
-        // pairs explicitly instead of silently treating hull AABBs as boxes.
-        if ((hullA && hullB) || (hullA ? stB : stA) != 0) {
-            outM.header = uint4(ba, bb, 0, 0);
-            return;
-        }
-        bool hIsA = hullA;
-        uint ih = hIsA ? ia : ib;
-        float4 qH = hIsA ? qA : qB;
-        float3 pH = hIsA ? pA4.xyz : pB4.xyz;
-        thread const NPBox& box = hIsA ? B : A;
-        float4 qBox = hIsA ? qB : qA;
-        float3 relHullBox = hIsA ? (vA - vB) : (vB - vA);
-        float hullRadius = fabs(shape[ih].w);
-        float boxRadius = fabs(shape[hIsA ? ib : ia].w);
-        uint2 range = colliderHullRange[ih];
+        if (!CONVEX_PASS) return;
+        NPCShape convexA;
+        convexA.collider = ia;
+        convexA.kind = stA;
+        convexA.center = centerA;
+        convexA.rotation = qA;
+        convexA.dimensions = shape[ia];
+        NPCShape convexB;
+        convexB.collider = ib;
+        convexB.kind = stB;
+        convexB.center = centerB;
+        convexB.rotation = qB;
+        convexB.dimensions = shape[ib];
 
-        NPConvexBoxCandidate best;
-        bool haveBest = false;
-        for (uint vid = 0; vid < range.y; vid++) {
-            float3 localVertex = convexHullVertices[range.x + vid].xyz;
-            float3 worldVertex = pH + q_rotate(qH, localVertex);
-            NPConvexBoxCandidate candidate;
-            if (!npConvexVertexBoxCandidate(
-                    worldVertex, vid, box, qBox, relHullBox,
-                    hullRadius, boxRadius, P, candidate)) continue;
-            if (!haveBest
-                || candidate.separation < best.separation - 1e-8f
-                || (fabs(candidate.separation - best.separation) <= 1e-8f
-                    && candidate.feature < best.feature)) {
-                best = candidate;
-                haveBest = true;
-            }
+        NPCResult result = npcMPR(
+            convexA, convexB, colliderHullRange, convexHullVertices);
+        if (result.valid && result.overlap
+            && !npcCorrectedMPRIsConsistent(result)) {
+            // The bounded portal walk may return its last simplex at the
+            // iteration limit. Only admit that standard witness when the
+            // corrected undilated points, normal, and signed distance agree;
+            // otherwise continue through the certified GJK/retry boundary.
+            result.valid = false;
         }
-        if (!haveBest) {
-            outM.header = uint4(ba, bb, 0, 0);
-            return;
-        }
-
-        NPConvexBoxCandidate chosen[MAX_CONTACTS];
-        int count = 1;
-        chosen[0] = best;
-        float separationBand = 0.75f * P.collisionMargin;
-        while (count < MAX_CONTACTS) {
-            NPConvexBoxCandidate next;
-            bool haveNext = false;
-            float bestSpread = -1.0f;
-            for (uint vid = 0; vid < range.y; vid++) {
-                float3 localVertex = convexHullVertices[range.x + vid].xyz;
-                float3 worldVertex = pH + q_rotate(qH, localVertex);
-                NPConvexBoxCandidate candidate;
-                if (!npConvexVertexBoxCandidate(
-                        worldVertex, vid, box, qBox, relHullBox,
-                        hullRadius, boxRadius, P, candidate)) continue;
-                if (candidate.separation > best.separation + separationBand
-                    || dot(candidate.boxToHull, best.boxToHull) < 0.98f) continue;
-                bool duplicate = false;
-                float minSpread = FLT_MAX;
-                for (int j = 0; j < count; j++) {
-                    if (candidate.feature == chosen[j].feature) {
-                        duplicate = true;
-                        break;
+        if (!result.valid || !result.overlap) {
+            float maxDetect = P.collisionMargin
+                + npSpeculativeCap(shape[ia].w, shape[ib].w,
+                                   P.collisionMargin);
+            result = npcGJK(convexA, convexB, maxDetect,
+                            colliderHullRange, convexHullVertices);
+            // GJK is only the separated-distance fallback. It deliberately
+            // does not manufacture a penetration witness; if it discovers an
+            // overlap after MPR was inconclusive, dropping the pair would let
+            // bodies pass through one another. Latch the frame-wide failure so
+            // the host retires it as typed commandExecution and the finalizer
+            // restores every dynamic pose.
+            if (!result.valid || result.overlap) {
+                NPCResult failedGJK = result;
+                // MPR is geometrically symmetric but its finite portal walk
+                // is operand ordered. Retry the same Newton query with the
+                // operands reversed before changing its inflation, then map
+                // the finite witness back to the caller's A/B convention.
+                NPCResult swapped = npcMPR(
+                    convexB, convexA, colliderHullRange, convexHullVertices);
+                bool recovered = false;
+                if (swapped.valid && swapped.overlap) {
+                    NPCResult mapped = swapped;
+                    mapped.pointA = swapped.pointB;
+                    mapped.pointB = swapped.pointA;
+                    mapped.normalAB = -swapped.normalAB;
+                    mapped.featureA = swapped.featureB;
+                    mapped.featureB = swapped.featureA;
+                    if (npcCorrectedMPRIsConsistent(mapped)) {
+                        result = mapped;
+                        recovered = true;
                     }
-                    float3 d = candidate.xHull - chosen[j].xHull;
-                    d -= best.boxToHull * dot(best.boxToHull, d);
-                    minSpread = min(minSpread, dot(d, d));
                 }
-                if (duplicate) continue;
-                if (!haveNext || minSpread > bestSpread + 1e-10f
-                    || (fabs(minSpread - bestSpread) <= 1e-10f
-                        && candidate.feature < next.feature)) {
-                    next = candidate;
-                    bestSpread = minSpread;
-                    haveNext = true;
+                if (!recovered) {
+                    // The failed simplex distance is a conservative upper
+                    // bound on true separation. Twice that bound moves the
+                    // origin well inside the dilated CSO instead of starting
+                    // another portal walk at the same numerical boundary.
+                    // The speculative query band caps this one-shot retry;
+                    // witnesses are corrected to the undilated surfaces and
+                    // certified below before the normal distance gate runs.
+                    float adaptiveEnlarge = min(
+                        2.0f * maxDetect + 1.0e-4f,
+                        max(1.0e-3f,
+                            2.0f * failedGJK.signedDistance + 1.0e-4f));
+                    NPCResult retry = npcMPRWithEnlarge(
+                        convexA, convexB, colliderHullRange,
+                        convexHullVertices, adaptiveEnlarge);
+                    if (finite_bits(failedGJK.signedDistance)
+                        && failedGJK.signedDistance >= 0.0f
+                        && adaptiveEnlarge
+                            > failedGJK.signedDistance + 5.0e-5f
+                        && npcCorrectedMPRIsConsistent(retry)) {
+                        result = retry;
+                        recovered = true;
+                    }
+                }
+                if (!recovered) {
+                    latchConvexQueryFailure(counters, convexQueryPoison);
+                    outM.header = uint4(ba, bb, 0, 0);
+                    return;
                 }
             }
-            if (!haveNext || bestSpread < MERGE_DIST_SQ) break;
-            chosen[count++] = next;
         }
 
-        float3 normal = hIsA ? best.boxToHull : -best.boxToHull;
+        float3 normalAtoB = npcSafeNormalize(result.normalAB,
+            npcSafeNormalize(centerB - centerA, float3(0, 0, 1)));
+        float3 normal = -normalAtoB;            // solver convention B -> A
+        normal = npcSafeNormalize(normal,
+            npcSafeNormalize(centerA - centerB, float3(0, 0, 1)));
+        float detect = npDetectMargin(normal, vA - vB, P,
+                                      shape[ia].w, shape[ib].w);
+        if (result.signedDistance > detect) {
+            outM.header = uint4(ba, bb, 0, 0);
+            return;
+        }
+
+        NPCManifoldContact convexContacts[MAX_CONTACTS];
+        int contactCount = 0;
+        uint convexEdgePairTests = 0u;
+        bool polyA = stA == 0u || stA == 4u;
+        bool polyB = stB == 0u || stB == 4u;
+        if (polyA && polyB) {
+            contactCount = npcBuildPolyhedralManifold(
+                convexA, convexB, normalAtoB, detect,
+                colliderHullRange, convexHullVertices,
+                colliderConvexAssetID, convexHulls, convexFaces,
+                convexFaceVertexIndices, convexEdges, convexContacts,
+                convexEdgePairTests);
+        }
+        if (convexEdgePairTests > 0u) {
+            atomic_fetch_add_explicit(
+                &counters[CTR_CONVEX_EDGE_PAIRS], convexEdgePairTests,
+                memory_order_relaxed);
+        }
+        if (contactCount == 0) {
+            convexContacts[0].pointA = result.pointA;
+            convexContacts[0].pointB = result.pointB;
+            convexContacts[0].features = uint2(
+                result.featureA, result.featureB);
+            contactCount = 1;
+        }
+
         float3 t1, t2;
         orthonormal(normal, t1, t2);
         float staticFriction = combine_friction(
@@ -497,38 +2025,89 @@ kernel void np_collide(
             P.frictionCombineMode);
         int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal,
                                   P.mapCapacity, ia, ib);
-        outM.header = uint4(ba, bb, uint(count), 1);
+        bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        outM.header = uint4(ba, bb, uint(contactCount), flags);
         outM.basisN = float4(normal, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
+
         float4 qAc = q_conj(qBodyA);
         float4 qBc = q_conj(qBodyB);
-        float warm = P.alpha * P.gamma;
-        for (int i = 0; i < count; i++) {
-            float3 xA = hIsA ? chosen[i].xHull : chosen[i].xBox;
-            float3 xB = hIsA ? chosen[i].xBox : chosen[i].xHull;
-            float3 rA = q_rotate(qAc, xA - bodyPA4.xyz);
-            float3 rB = q_rotate(qBc, xB - bodyPB4.xyz);
+        uint matchedPrevious = 0u;
+        for (int contactIndex = 0; contactIndex < contactCount;
+             contactIndex++) {
+            float3 pointA = convexContacts[contactIndex].pointA;
+            float3 pointB = convexContacts[contactIndex].pointB;
+            uint2 featurePair = convexContacts[contactIndex].features;
+            float3 rA = roundA ? (pointA - bodyPA4.xyz)
+                : q_rotate(qAc, pointA - bodyPA4.xyz);
+            float3 rB = roundB ? (pointB - bodyPB4.xyz)
+                : q_rotate(qBc, pointB - bodyPB4.xyz);
             float3 lambda = float3(0);
             float3 penalty = float3(0);
             float stick = 0.0f;
+
             if (prevIdx >= 0) {
                 device const ManifoldGPU& previous = prevManifolds[prevIdx];
+                int best = -1;
                 for (uint j = 0; j < previous.header.z; j++) {
-                    if (as_type<uint>(previous.contacts[j].rA.w)
-                        == chosen[i].feature) {
-                        lambda = previous.contacts[j].lambda.xyz;
-                        penalty = previous.contacts[j].penalty.xyz;
-                        stick = previous.contacts[j].rB.w;
-                        if (stick != 0.0f) {
-                            rA = previous.contacts[j].rA.xyz;
-                            rB = previous.contacts[j].rB.xyz;
-                        }
+                    if ((matchedPrevious & (1u << j)) == 0u
+                        && all(prevContactFeatures[
+                            uint(prevIdx) * MAX_CONTACTS + j]
+                            == featurePair)) {
+                        best = int(j);
                         break;
                     }
                 }
+                // Smooth shapes and clipped edge transitions may legitimately
+                // change exact feature IDs. Use a one-to-one local-anchor
+                // fallback only while the manifold normal remains compatible.
+                if (best < 0 && dot(previous.basisN.xyz, normal) > 0.95f) {
+                    float threshold = 0.08f * max(
+                        fabs(shape[ia].w), fabs(shape[ib].w))
+                        + 2.0f * P.collisionMargin;
+                    float bestDistance = threshold;
+                    for (uint j = 0; j < previous.header.z; j++) {
+                        if ((matchedPrevious & (1u << j)) != 0u) continue;
+                        float distanceA = distance(
+                            previous.contacts[j].rA.xyz, rA);
+                        float distanceB = distance(
+                            previous.contacts[j].rB.xyz, rB);
+                        float anchorDistance = max(distanceA, distanceB);
+                        if (anchorDistance < bestDistance - 1.0e-7f
+                            || (fabs(anchorDistance - bestDistance) <= 1.0e-7f
+                                && int(j) < best)) {
+                            bestDistance = anchorDistance;
+                            best = int(j);
+                        }
+                    }
+                }
+                if (best >= 0) {
+                    matchedPrevious |= 1u << uint(best);
+                    device const ContactGPU& old = previous.contacts[best];
+                    lambda = old.lambda.xyz;
+                    penalty = old.penalty.xyz;
+                    float3 oldT1 = previous.basisT1.xyz;
+                    float3 oldT2 = cross(previous.basisN.xyz, oldT1);
+                    float3 worldTangent = oldT1 * lambda.y
+                        + oldT2 * lambda.z;
+                    lambda.y = dot(t1, worldTangent);
+                    lambda.z = dot(t2, worldTangent);
+                    if (!roundA && !roundB) {
+                        stick = old.rB.w;
+                        if (stick != 0.0f) {
+                            rA = old.rA.xyz;
+                            rB = old.rB.xyz;
+                        }
+                    }
+                }
             }
-            float3 xAw = xform(bodyPA4.xyz, qBodyA, rA);
-            float3 xBw = xform(bodyPB4.xyz, qBodyB, rB);
+
+            float3 xAw = roundA ? bodyPA4.xyz + rA
+                : xform(bodyPA4.xyz, qBodyA, rA);
+            float3 xBw = roundB ? bodyPB4.xyz + rB
+                : xform(bodyPB4.xyz, qBodyB, rB);
             float3 d = xAw - xBw;
             float3 C0 = float3(dot(normal, d) + P.collisionMargin,
                                dot(t1, d), dot(t2, d));
@@ -536,19 +2115,27 @@ kernel void np_collide(
                                       xAw - bodyPA4.xyz,
                                       xBw - bodyPB4.xyz,
                                       t1, t2, P.dt, P.alpha);
-            lambda *= warm;
+            lambda *= P.alpha * P.gamma;
             penalty = clamp(penalty * P.gamma,
                             npPenaltyFloor(posLin, ba, bb, P),
                             npPenaltyCeil());
-            outM.contacts[i].rA = float4(
-                rA, as_type<float>(chosen[i].feature));
-            outM.contacts[i].rB = float4(rB, stick);
-            outM.contacts[i].C0 = float4(C0, 0);
-            outM.contacts[i].lambda = float4(lambda, 0);
-            outM.contacts[i].penalty = float4(penalty, 0);
+            outM.contacts[contactIndex].rA = float4(
+                rA, float(npcFeaturePairHash(featurePair) & 0x00FFFFFFu));
+            outM.contacts[contactIndex].rB = float4(rB, stick);
+            outM.contacts[contactIndex].C0 = float4(C0, 0);
+            outM.contacts[contactIndex].lambda = float4(lambda, 0);
+            outM.contacts[contactIndex].penalty = float4(penalty, 0);
+            contactFeatures[gid * MAX_CONTACTS + uint(contactIndex)]
+                = featurePair;
         }
         return;
     }
+
+    // The convex specialization visits the shared pair stream so manifold
+    // indices remain stable, but analytic pairs belong exclusively to the
+    // legacy specialized kernel above.
+    if (CONVEX_PASS) return;
+
 
     // capsule pairs not involving a torus: single-contact closest-point
     if ((capA || capB) && !torA && !torB) {
@@ -1319,4 +2906,138 @@ kernel void np_collide(
         outM.contacts[i].lambda = float4(lambda, 0);
         outM.contacts[i].penalty = float4(penalty, 0);
     }
+}
+
+kernel void np_collide(
+    device const float4* posLin     [[buffer(0)]],
+    device const float4* posAng     [[buffer(1)]],
+    device const float4* shape      [[buffer(2)]],
+    device const float4* props      [[buffer(3)]],
+    device const uint2* pairs       [[buffer(4)]],
+    device atomic_uint* counters    [[buffer(5)]],
+    device ManifoldGPU* manifolds   [[buffer(6)]],
+    device const ManifoldGPU* prevManifolds [[buffer(7)]],
+    device const atomic_uint* mapKeyA [[buffer(8)]],
+    device const uint* mapKeyB      [[buffer(9)]],
+    device const uint* mapVal       [[buffer(10)]],
+    constant SimParams& P           [[buffer(11)]],
+    device const uint* shapeType    [[buffer(12)]],
+    device const float4* spinVel    [[buffer(13)]],
+    device const float4* velLin     [[buffer(14)]],
+    device const float4* velAng     [[buffer(15)]],
+    device const uint* colliderOwner [[buffer(16)]],
+    device const float4* colliderLocalPosition [[buffer(17)]],
+    device const float4* colliderLocalRotation [[buffer(18)]],
+    device const uint2* colliderHullRange [[buffer(19)]],
+    device const float4* convexHullVertices [[buffer(20)]],
+    device const float2* colliderFriction [[buffer(21)]],
+    device const uint* colliderConvexAssetID [[buffer(22)]],
+    device const ConvexHullGPU* convexHulls [[buffer(23)]],
+    device const ConvexFaceGPU* convexFaces [[buffer(24)]],
+    device const uint* convexFaceVertexIndices [[buffer(25)]],
+    device const ConvexEdgeGPU* convexEdges [[buffer(26)]],
+    device uint2* contactFeatures [[buffer(27)]],
+    device const uint2* prevContactFeatures [[buffer(28)]],
+    device atomic_uint* convexQueryPoison [[buffer(29)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    npCollidePass<false>(
+        posLin, posAng, shape, props, pairs, counters, manifolds,
+        prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
+        velLin, velAng, colliderOwner, colliderLocalPosition,
+        colliderLocalRotation, colliderHullRange, convexHullVertices,
+        colliderFriction, colliderConvexAssetID, convexHulls, convexFaces,
+        convexFaceVertexIndices, convexEdges, contactFeatures,
+        prevContactFeatures, convexQueryPoison, gid);
+}
+
+kernel void np_collide_convex(
+    device const float4* posLin     [[buffer(0)]],
+    device const float4* posAng     [[buffer(1)]],
+    device const float4* shape      [[buffer(2)]],
+    device const float4* props      [[buffer(3)]],
+    device const uint2* pairs       [[buffer(4)]],
+    device atomic_uint* counters    [[buffer(5)]],
+    device ManifoldGPU* manifolds   [[buffer(6)]],
+    device const ManifoldGPU* prevManifolds [[buffer(7)]],
+    device const atomic_uint* mapKeyA [[buffer(8)]],
+    device const uint* mapKeyB      [[buffer(9)]],
+    device const uint* mapVal       [[buffer(10)]],
+    constant SimParams& P           [[buffer(11)]],
+    device const uint* shapeType    [[buffer(12)]],
+    device const float4* spinVel    [[buffer(13)]],
+    device const float4* velLin     [[buffer(14)]],
+    device const float4* velAng     [[buffer(15)]],
+    device const uint* colliderOwner [[buffer(16)]],
+    device const float4* colliderLocalPosition [[buffer(17)]],
+    device const float4* colliderLocalRotation [[buffer(18)]],
+    device const uint2* colliderHullRange [[buffer(19)]],
+    device const float4* convexHullVertices [[buffer(20)]],
+    device const float2* colliderFriction [[buffer(21)]],
+    device const uint* colliderConvexAssetID [[buffer(22)]],
+    device const ConvexHullGPU* convexHulls [[buffer(23)]],
+    device const ConvexFaceGPU* convexFaces [[buffer(24)]],
+    device const uint* convexFaceVertexIndices [[buffer(25)]],
+    device const ConvexEdgeGPU* convexEdges [[buffer(26)]],
+    device uint2* contactFeatures [[buffer(27)]],
+    device const uint2* prevContactFeatures [[buffer(28)]],
+    device atomic_uint* convexQueryPoison [[buffer(29)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    npCollidePass<true>(
+        posLin, posAng, shape, props, pairs, counters, manifolds,
+        prevManifolds, mapKeyA, mapKeyB, mapVal, P, shapeType, spinVel,
+        velLin, velAng, colliderOwner, colliderLocalPosition,
+        colliderLocalRotation, colliderHullRange, convexHullVertices,
+        colliderFriction, colliderConvexAssetID, convexHulls, convexFaces,
+        convexFaceVertexIndices, convexEdges, contactFeatures,
+        prevContactFeatures, convexQueryPoison, gid);
+}
+
+// Test-only deterministic bounded-query regression. A zero-iteration budget
+// must return invalid (never a guessed finite separation), which then exercises
+// the same sticky counter, GPU restoration, and typed retirement path as a real
+// exhausted MPR/GJK query.
+kernel void convex_query_fail_for_testing(
+    device atomic_uint* counters [[buffer(0)]],
+    device const uint2* colliderHullRange [[buffer(1)]],
+    device const float4* convexHullVertices [[buffer(2)]],
+    device atomic_uint* convexQueryPoison [[buffer(3)]],
+    uint gid                     [[thread_position_in_grid]])
+{
+    if (gid == 0u) {
+        NPCShape a;
+        a.collider = 0u;
+        a.kind = 0u;
+        a.center = float3(0.0f);
+        a.rotation = float4(0, 0, 0, 1);
+        a.dimensions = float4(1, 1, 1, 1);
+        NPCShape b = a;
+        b.center = float3(2, 0, 0);
+        NPCResult exhausted = npcGJKWithIterationLimit(
+            a, b, 0.1f, colliderHullRange, convexHullVertices, 0);
+        if (!exhausted.valid) {
+            latchConvexQueryFailure(counters, convexQueryPoison);
+        }
+    }
+}
+
+// A support-query failure is terminal, but the host can only observe it after
+// command completion. Restore all dynamic bodies on the GPU before velocity
+// finalization so the failed frame is never externally visible in shared pose
+// buffers. Static and kinematic authored motion remains untouched.
+kernel void convex_restore_failed_frame(
+    device float4* posLin                  [[buffer(0)]],
+    device float4* posAng                  [[buffer(1)]],
+    device const float4* initLin           [[buffer(2)]],
+    device const float4* initAng           [[buffer(3)]],
+    device const atomic_uint* convexQueryPoison [[buffer(4)]],
+    constant SimParams& P                  [[buffer(5)]],
+    uint gid                               [[thread_position_in_grid]])
+{
+    if (gid >= P.numBodies || posLin[gid].w <= 0.0f) return;
+    if (atomic_load_explicit(convexQueryPoison,
+                             memory_order_relaxed) == 0u) return;
+    posLin[gid] = float4(initLin[gid].xyz, posLin[gid].w);
+    posAng[gid] = initAng[gid];
 }

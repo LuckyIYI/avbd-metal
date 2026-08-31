@@ -125,6 +125,11 @@ public struct SceneCollider {
     /// Keeping hull data on colliders (rather than inertial bodies) permits
     /// exact imported robot contact geometry without changing link mass.
     public var convexHullVertices: [F3]
+    /// Index into `PhysicsScene.convexAssets` for cooked, shared hull data.
+    /// The legacy inline vertices above remain source-compatible, while this
+    /// reference lets replicated bodies and compound parts share one immutable
+    /// vertex/topology payload instead of copying it into every collider.
+    public var convexAssetID: Int?
     /// Collision domain used by batched simulations. Group zero is shared
     /// geometry; nonzero groups collide with shared geometry and themselves,
     /// but never with a different nonzero group.
@@ -158,6 +163,7 @@ public struct SceneCollider {
                 localRotation: Quat = Quat(real: 1, imag: .zero),
                 shape: BodyShape = .box,
                 convexHullVertices: [F3] = [],
+                convexAssetID: Int?,
                 collisionGroup: UInt32 = 0,
                 collidesWithSharedGeometry: Bool = true,
                 collisionEnabled: Bool = true,
@@ -176,12 +182,40 @@ public struct SceneCollider {
         self.localRotation = localRotation.normalized
         self.shape = shape
         self.convexHullVertices = convexHullVertices
+        self.convexAssetID = convexAssetID
         self.collisionGroup = collisionGroup
         self.collidesWithSharedGeometry = collidesWithSharedGeometry
         self.collisionEnabled = collisionEnabled
         self.isRendered = isRendered
         self.usesWorldSpaceRoundAnchor = usesWorldSpaceRoundAnchor
         self.renderColor = renderColor
+    }
+
+    /// Source- and ABI-compatible initializer from before shared convex
+    /// assets were introduced. Asset-backed callers use the overload above
+    /// and pass an explicit scene-table index.
+    public init(body: Int, size: F3, friction: Float,
+                dynamicFriction: Float? = nil,
+                localPosition: F3 = .zero,
+                localRotation: Quat = Quat(real: 1, imag: .zero),
+                shape: BodyShape = .box,
+                convexHullVertices: [F3] = [],
+                collisionGroup: UInt32 = 0,
+                collidesWithSharedGeometry: Bool = true,
+                collisionEnabled: Bool = true,
+                usesWorldSpaceRoundAnchor: Bool = false,
+                isRendered: Bool = true,
+                renderColor: F3? = nil) {
+        self.init(
+            body: body, size: size, friction: friction,
+            dynamicFriction: dynamicFriction,
+            localPosition: localPosition, localRotation: localRotation,
+            shape: shape, convexHullVertices: convexHullVertices,
+            convexAssetID: nil, collisionGroup: collisionGroup,
+            collidesWithSharedGeometry: collidesWithSharedGeometry,
+            collisionEnabled: collisionEnabled,
+            usesWorldSpaceRoundAnchor: usesWorldSpaceRoundAnchor,
+            isRendered: isRendered, renderColor: renderColor)
     }
 }
 
@@ -548,6 +582,11 @@ public struct PhysicsScene {
     public var name: String
     public var bodies: [SceneBody] = []
     public var colliders: [SceneCollider] = []
+    /// Immutable cooked convex geometry shared by collider instances.
+    public private(set) var convexAssets: [ConvexHullAsset] = []
+    /// Digest-to-index accelerator for immutable registered geometry. Exact
+    /// digest-preimage equality still closes the collision boundary.
+    private var convexAssetIndexByDigest: [String: Int] = [:]
     public var joints: [SceneJoint] = []
     public var springs: [SceneSpring] = []
     public var tets: [SceneTet] = []
@@ -560,6 +599,61 @@ public struct PhysicsScene {
 
     public init(name: String) {
         self.name = name
+    }
+
+    /// Conservative, pose-independent collision eligibility shared by backend
+    /// preflight checks. Broad phases still apply their spatial tests later;
+    /// this predicate only removes pairs that can never produce a force.
+    package func canPotentiallyCollide(
+        colliderA aIndex: Int, colliderB bIndex: Int
+    ) -> Bool {
+        guard colliders.indices.contains(aIndex),
+              colliders.indices.contains(bIndex), aIndex != bIndex else {
+            return false
+        }
+        let a = colliders[aIndex]
+        let b = colliders[bIndex]
+        guard a.collisionEnabled, b.collisionEnabled,
+              bodies.indices.contains(a.body), bodies.indices.contains(b.body),
+              a.body != b.body,
+              bodies[a.body].isDynamic || bodies[b.body].isDynamic else {
+            return false
+        }
+        if a.collisionGroup != 0 && b.collisionGroup != 0
+            && a.collisionGroup != b.collisionGroup {
+            return false
+        }
+        if a.collisionGroup == 0 && b.collisionGroup != 0
+            && !b.collidesWithSharedGeometry {
+            return false
+        }
+        if b.collisionGroup == 0 && a.collisionGroup != 0
+            && !a.collidesWithSharedGeometry {
+            return false
+        }
+
+        let lower = min(a.body, b.body)
+        let upper = max(a.body, b.body)
+        if collisionExclusions.contains(where: {
+            min($0.bodyA, $0.bodyB) == lower
+                && max($0.bodyA, $0.bodyB) == upper
+        }) {
+            return false
+        }
+        if joints.contains(where: {
+            $0.bodyA >= 0
+                && min($0.bodyA, $0.bodyB) == lower
+                && max($0.bodyA, $0.bodyB) == upper
+        }) {
+            return false
+        }
+        if springs.contains(where: {
+            min($0.bodyA, $0.bodyB) == lower
+                && max($0.bodyA, $0.bodyB) == upper
+        }) {
+            return false
+        }
+        return true
     }
 
     @discardableResult
@@ -615,18 +709,25 @@ public struct PhysicsScene {
                                      localRotation: Quat = Quat(real: 1, imag: .zero),
                                      shape: BodyShape = .box,
                                      convexHullVertices: [F3] = [],
+                                     convexAssetID: Int?,
                                      collisionGroup: UInt32 = 0,
                                      collidesWithSharedGeometry: Bool = true,
                                      collisionEnabled: Bool = true,
                                      isRendered: Bool = true,
                                      renderColor: F3? = nil) -> Int {
         precondition(bodies.indices.contains(body), "collider owner out of range")
+        precondition(convexAssetID == nil
+            || convexAssets.indices.contains(convexAssetID!),
+            "convex collider asset out of range")
+        precondition(convexAssetID == nil || convexHullVertices.isEmpty,
+            "a collider cannot use both inline and shared convex geometry")
         colliders.append(SceneCollider(
             body: body, size: size, friction: friction ?? bodies[body].friction,
             dynamicFriction: dynamicFriction
                 ?? bodies[body].dynamicFriction,
             localPosition: localPosition, localRotation: localRotation,
             shape: shape, convexHullVertices: convexHullVertices,
+            convexAssetID: convexAssetID,
             collisionGroup: collisionGroup,
             collidesWithSharedGeometry: collidesWithSharedGeometry,
             collisionEnabled: collisionEnabled,
@@ -636,11 +737,108 @@ public struct PhysicsScene {
         return colliders.count - 1
     }
 
+    /// Compatibility overload retaining the original public function type.
+    @discardableResult
+    public mutating func addCollider(body: Int, size: F3,
+                                     friction: Float? = nil,
+                                     dynamicFriction: Float? = nil,
+                                     localPosition: F3 = .zero,
+                                     localRotation: Quat = Quat(real: 1, imag: .zero),
+                                     shape: BodyShape = .box,
+                                     convexHullVertices: [F3] = [],
+                                     collisionGroup: UInt32 = 0,
+                                     collidesWithSharedGeometry: Bool = true,
+                                     collisionEnabled: Bool = true,
+                                     isRendered: Bool = true,
+                                     renderColor: F3? = nil) -> Int {
+        addCollider(
+            body: body, size: size, friction: friction,
+            dynamicFriction: dynamicFriction,
+            localPosition: localPosition, localRotation: localRotation,
+            shape: shape, convexHullVertices: convexHullVertices,
+            convexAssetID: nil, collisionGroup: collisionGroup,
+            collidesWithSharedGeometry: collidesWithSharedGeometry,
+            collisionEnabled: collisionEnabled, isRendered: isRendered,
+            renderColor: renderColor)
+    }
+
+    /// Register immutable cooked hull geometry once. Stable identity is used
+    /// only as a fast lookup; equality closes the hash-collision boundary.
+    @discardableResult
+    public mutating func registerConvexAsset(_ asset: ConvexHullAsset) -> Int {
+        if let existing = convexAssetIndexByDigest[asset.digest] {
+            precondition(convexAssets[existing].hasSameDigestGeometry(as: asset),
+                "convex asset digest collision")
+            return existing
+        }
+        convexAssets.append(asset)
+        let index = convexAssets.count - 1
+        convexAssetIndexByDigest[asset.digest] = index
+        return index
+    }
+
+    /// Attach a validated shared convex hull to a rigid body. Asset vertices
+    /// remain in their source mesh frame; the runtime derives a centered
+    /// support representation without changing this authored transform.
+    @discardableResult
+    public mutating func addConvexCollider(
+        body: Int, asset: ConvexHullAsset, friction: Float? = nil,
+        dynamicFriction: Float? = nil,
+        localPosition: F3 = .zero,
+        localRotation: Quat = Quat(real: 1, imag: .zero),
+        collisionGroup: UInt32 = 0,
+        collidesWithSharedGeometry: Bool = true,
+        collisionEnabled: Bool = true,
+        isRendered: Bool = false,
+        renderColor: F3? = nil
+    ) -> Int {
+        let assetID = registerConvexAsset(asset)
+        let registeredAsset = convexAssets[assetID]
+        let geometryBounds = registeredAsset.geometryBounds()
+        return addCollider(
+            body: body,
+            size: geometryBounds.max - geometryBounds.min,
+            friction: friction, dynamicFriction: dynamicFriction,
+            localPosition: localPosition, localRotation: localRotation,
+            shape: .box, convexAssetID: assetID,
+            collisionGroup: collisionGroup,
+            collidesWithSharedGeometry: collidesWithSharedGeometry,
+            collisionEnabled: collisionEnabled, isRendered: isRendered,
+            renderColor: renderColor)
+    }
+
+    /// Attach every part of a cooked convex decomposition to one inertial
+    /// body. Parts preserve the caller's transform/material/filter contract;
+    /// no part contributes mass or inertia a second time.
+    @discardableResult
+    public mutating func addConvexCompound(
+        body: Int, asset: ConvexCompoundAsset, friction: Float? = nil,
+        dynamicFriction: Float? = nil,
+        localPosition: F3 = .zero,
+        localRotation: Quat = Quat(real: 1, imag: .zero),
+        collisionGroup: UInt32 = 0,
+        collidesWithSharedGeometry: Bool = true,
+        collisionEnabled: Bool = true,
+        isRendered: Bool = false
+    ) -> [Int] {
+        asset.parts.map { part in
+            addConvexCollider(
+                body: body, asset: part, friction: friction,
+                dynamicFriction: dynamicFriction,
+                localPosition: localPosition, localRotation: localRotation,
+                collisionGroup: collisionGroup,
+                collidesWithSharedGeometry: collidesWithSharedGeometry,
+                collisionEnabled: collisionEnabled,
+                isRendered: isRendered)
+        }
+    }
+
     /// Attach an authored convex hull to a rigid body. `vertices` are in the
     /// supplied collider frame and need not be centered; this method derives
     /// a tight AABB and shifts the collider origin without changing geometry.
-    /// The current GPU narrow phase supports convex-vs-box contact, covering
-    /// robot hulls against flat/boxed terrain and box projectiles.
+    /// This compatibility path stores centered inline vertices. New assets
+    /// should use `addConvexCollider(body:asset:...)` so replicas share one
+    /// validated topology payload.
     @discardableResult
     public mutating func addConvexCollider(
         body: Int, vertices: [F3], friction: Float? = nil,
@@ -665,11 +863,12 @@ public struct PhysicsScene {
         }
         let center = (lo + hi) * 0.5
         let centered = vertices.map { $0 - center }
+        let normalizedRotation = localRotation.normalized
         return addCollider(
             body: body, size: hi - lo, friction: friction,
             dynamicFriction: dynamicFriction,
-            localPosition: localPosition + localRotation.act(center),
-            localRotation: localRotation, shape: .box,
+            localPosition: localPosition + normalizedRotation.act(center),
+            localRotation: normalizedRotation, shape: .box,
             convexHullVertices: centered,
             collisionGroup: collisionGroup,
             collidesWithSharedGeometry: collidesWithSharedGeometry,

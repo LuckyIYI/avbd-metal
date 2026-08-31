@@ -1,9 +1,20 @@
-# Policy Replay checkpoint catalog
+# Portable Policy Replay bundles
 
-Policy Replay ships only maintained examples with an executable pretrained
-policy. Every native MLX checkpoint in this directory must reconstruct its
-serialized task exactly; `VectorPolicyCompatibilityTests` rejects missing,
-stale, extra, or deprecated task directories.
+Each selectable directory is a self-contained replay artifact with a
+`policy-bundle.json`. That manifest declares a versioned policy runtime, exact
+simulation task/configuration, cameras, controls, metrics, and every runtime
+file by a bundle-relative path. It may be copied outside this repository and
+imported through the app without editing Swift UI code. Imported bundles are
+always labeled unverified; only exact manifest bytes authenticated by
+`policy-release-index.json` inherit a packaged release's qualification.
+
+Schema v1 supports the generic AVBD vector-PPO deployment ABI and the converted
+Unitree H1 recurrent ABI. A new policy using either ABI and an existing replay
+task needs only a bundle. A genuinely new policy runtime or simulator task ABI
+requires an implementation in the app/runtime, but never a policy-specific UI
+page. Every native checkpoint must reconstruct its serialized task exactly;
+`PolicyBundleTests` and `VectorPolicyCompatibilityTests` enforce the boundary.
+The complete authoring contract is in [POLICY_BUNDLES.md](../POLICY_BUNDLES.md).
 
 Serialized `initializationCheckpoint` and `checkpointDirectory` values are
 immutable training provenance. They may name ignored `runs/` output or a
@@ -47,10 +58,6 @@ into named subdirectories and seal both in one requalification manifest.
   parent, and the same independent nominal/full-collision matrix and
   cross-suite degradation guard are sealed with the bundle. Fingerprint:
   `923e07c286f4fdb186b30a6fd95469e6848f4fec4ca1e3811320424b94c9dc02`.
-
-The imported GEAR-SONIC entry remains a visible development reference, and
-`Arachne Classical` remains a visible non-neural CPG/IK baseline with no
-checkpoint.
 
 ## Historical learned-policy evidence
 

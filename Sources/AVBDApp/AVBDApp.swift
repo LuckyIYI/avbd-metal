@@ -32,8 +32,8 @@ struct AVBDApp: App {
 
 struct ContentView: View {
     @ObservedObject var model: SimulationModel
-    @StateObject var robotics = RoboticsModel()
-    @State private var selectedTab = ProcessInfo.processInfo.environment["AVBD_POLICY_REPLAY"] == nil ? 0 : 2
+    @State private var selectedTab = ProcessInfo.processInfo.environment[
+        "AVBD_POLICY_REPLAY"] == nil ? 0 : 1
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -46,12 +46,9 @@ struct ContentView: View {
             }
             .tabItem { Text("Playground") }
             .tag(0)
-            RoboticsLabView(model: robotics)
-                .tabItem { Text("Robotics Lab") }
-                .tag(1)
             PolicyReplayLabView()
                 .tabItem { Text("Policy Replay") }
-                .tag(2)
+                .tag(1)
         }
     }
 
@@ -64,15 +61,19 @@ struct ContentView: View {
                     Picker("Scene", selection: $model.demoName) {
                         ForEach(Demos.all, id: \.self) {
                             Text($0 == "gaudifunicular" ? "Gaudí Funicular"
-                                 : $0 == "boxofboxes" ? "Box of Boxes" : $0)
+                                : $0 == "boxofboxes" ? "Box of Boxes"
+                                : $0 == "classicrigids" ? "Classic Rigid Bodies"
+                                : $0)
                         }
                     }
-                    Picker("Size", selection: $model.scale) {
-                        Text("Small").tag(1)
-                        Text("Medium").tag(2)
-                        Text("Large").tag(4)
-                        Text("Giant").tag(8)
-                        Text("Colossal").tag(16)
+                    if Demos.supportsScale(model.demoName) {
+                        Picker("Size", selection: $model.scale) {
+                            Text("Small").tag(1)
+                            Text("Medium").tag(2)
+                            Text("Large").tag(4)
+                            Text("Giant").tag(8)
+                            Text("Colossal").tag(16)
+                        }
                     }
                     HStack {
                         Button(model.running ? "Pause" : "Play") {
@@ -141,6 +142,11 @@ struct ContentView: View {
 
                 GroupBox("Display") {
                     Toggle("Color by graph color", isOn: $model.colorByGraphColor)
+                    Toggle("Collision hulls",
+                           isOn: $model.showConvexCollisionGeometry)
+                    Toggle("Hull wireframe",
+                           isOn: $model.convexCollisionWireframe)
+                        .disabled(!model.showConvexCollisionGeometry)
                 }
 
                 Text(model.statsText)

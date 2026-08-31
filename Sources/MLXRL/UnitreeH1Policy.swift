@@ -78,7 +78,7 @@ public struct UnitreeH1PolicyVerification: Sendable {
 
 public enum UnitreeH1PolicyTrust: String, Codable, Sendable, Equatable {
     /// Exact manifest bytes and every independently pinned release identity
-    /// match the code/catalog trust anchor supplied by the caller.
+    /// match the independent release-index trust anchor supplied by the caller.
     case knownReleaseVerified
     /// Golden vectors may still provide a useful candidate self-check, but
     /// they came from the same unanchored manifest and prove no provenance.

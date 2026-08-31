@@ -63,7 +63,7 @@ public final class CPUJoint: CPUForce {
         return quatSub((qA * restRel).normalized, bodyB.positionAng) * torqueArm
     }
 
-    override func initialize() -> Bool {
+    override func initialize() -> Result<Bool, CPUSolver.RuntimeFailure> {
         C0Lin = currentCLin()
         C0Ang = currentCAng()
 
@@ -78,7 +78,7 @@ public final class CPUJoint: CPUForce {
                                 F3(repeating: AVBDConstants.penaltyMax))
         penaltyLin = simd_min(penaltyLin, F3(repeating: stiffnessLin))
         penaltyAng = simd_min(penaltyAng, F3(repeating: stiffnessAng))
-        return !broken
+        return .success(!broken)
     }
 
     override func updatePrimal(_ body: CPURigid, _ alpha: Float,
@@ -187,8 +187,8 @@ public final class CPUSpring: CPUForce {
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)
     }
 
-    override func initialize() -> Bool {
-        guard hard, let bodyA, let bodyB else { return true }
+    override func initialize() -> Result<Bool, CPUSolver.RuntimeFailure> {
+        guard hard, let bodyA, let bodyB else { return .success(true) }
         let pA = transform(bodyA.positionLin, bodyA.positionAng, rA)
         let pB = transform(bodyB.positionLin, bodyB.positionAng, rB)
         C0 = length(pA - pB) - rest
@@ -196,7 +196,7 @@ public final class CPUSpring: CPUForce {
         penalty = min(simd_clamp(penalty * solver.gamma,
                                  AVBDConstants.penaltyMin, AVBDConstants.penaltyMax),
                       stiffness)
-        return true
+        return .success(true)
     }
 
     override func updateDual(_ alpha: Float) {

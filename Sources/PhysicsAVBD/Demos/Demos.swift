@@ -18,7 +18,8 @@ public struct DemoParam: Identifiable {
 
 public enum Demos {
     public static var all: [String] {
-        ["gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+        ["gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall",
+         "pyramid", "pendulum", "boxpile", "convexdecomp", "classicrigids",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
          "wreckingball", "trebuchet", "rubegoldberg",
@@ -26,6 +27,12 @@ public enum Demos {
          "softwheel", "android",
          "clothfold", "boxoncloth", "hammock", "drape", "multidrape",
          "clothcombo", "flagwhip", "ribbons", "twist", "bed"]
+    }
+
+    /// Whether the global stress-test size selector changes this demo.
+    /// Fixed showcases keep one copy of each expensive detailed visual mesh.
+    public static func supportsScale(_ name: String) -> Bool {
+        name != "classicrigids"
     }
 
     /// Tunable parameters per demo (empty = none). Keys are looked up in
@@ -74,9 +81,9 @@ public enum Demos {
         }
     }
 
-    /// Every demo scales for stress testing: 1 = small (original size),
-    /// 2 = medium, 4 = large, 8 = giant, 16 = colossal. `res` overrides
-    /// cloth resolution.
+    /// Scalable demos use 1 = small (original size), 2 = medium, 4 = large,
+    /// 8 = giant, and 16 = colossal. `res` overrides cloth resolution. Fixed
+    /// showcases report `supportsScale(_:) == false` and ignore `scale`.
     /// `params` carries the per-demo tunables (missing key or a value of
     /// -1 = scale-derived default).
     public static func make(_ name: String, scale: Int = 1, res: Int? = nil,
@@ -119,6 +126,8 @@ public enum Demos {
         case "pyramid": return pyramid(base: 8 * s)
         case "pendulum": return pendulum(links: 20 * s, massRatio: 100)
         case "boxpile": return boxpile(count: 200 * s * s)
+        case "convexdecomp": return convexDecomposition(scale: s)
+        case "classicrigids": return classicRigidBodies(scale: s)
         case "cardhouse": return cardhouse(levels: 3 + s)
         case "fracture": return fractureWall(width: 10 * s, height: 8 * s)
         case "bridge": return bridge(planks: 16 * s, drops: 4 * s)

@@ -1,0 +1,33 @@
+{
+  "identifier": "unitree-h1-sim2sim-v0",
+  "presentation": {
+    "cameraPresets": [
+      {"anchor": "robot", "azimuth": -1.5707964, "distance": 8, "elevation": 0.12, "id": "follow", "label": "Follow Robot", "offset": [0, 0, 0.9], "target": [0, 0, 0]},
+      {"anchor": "course", "azimuth": -1.5707964, "distance": 12, "elevation": 0.2, "id": "course", "label": "Show Course", "offset": [0, 0, 0.8], "target": [0, 0, 0]}
+    ],
+    "controls": [
+      {"defaultValue": 6, "format": "%.1f m/s", "id": "projectileSpeed", "kind": "slider", "label": "Box speed", "maximum": 12, "minimum": 1, "step": 0.5},
+      {"arguments": {"speed": "projectileSpeed"}, "command": "throw-projectile", "id": "throwProjectile", "kind": "button", "label": "Throw Box"}
+    ],
+    "metrics": [
+      {"format": "%.3f", "id": "height", "label": "Pelvis height", "source": "task/root-height", "unit": "m"},
+      {"format": "%.3f", "id": "speed", "label": "Planar speed", "source": "task/planar-speed", "unit": "m/s"},
+      {"format": "%.3f", "id": "upright", "label": "Upright", "source": "task/upright"},
+      {"format": "%.0f", "id": "step", "label": "Control step", "source": "replay/control-step"}
+    ]
+  },
+  "runtime": {"files": {"license": "LICENSE", "manifest": "manifest.json", "policy": "policy.safetensors"}, "kind": "unitree-h1-recurrent-v1"},
+  "schemaVersion": 1,
+  "simulation": {
+    "controlDecimation": 10,
+    "includeInteractiveRobustnessProbes": true,
+    "maxEpisodeSteps": 1000,
+    "options": {"commandX": 0.5, "commandY": 0, "commandYaw": 0, "solverIterations": 20},
+    "seed": 21001,
+    "simulationStepSeconds": 0.002,
+    "task": "unitree-h1-sim2sim-v0",
+    "taskRevision": 1
+  },
+  "summary": "Unitree RL Gym H1 recurrent policy converted to MLX and replayed with its complete source and control manifest.",
+  "title": "Unitree H1 Sim2Sim"
+}

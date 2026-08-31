@@ -99,6 +99,71 @@ final class UnitreeH1CollisionHullTests: XCTestCase {
         XCTAssertLessThanOrEqual(rms, 0.000227)
     }
 
+    func testGeneratedSupportCloudsReconstructDeterministicManifoldTopology()
+        throws
+    {
+        for (name, vertices) in generatedHulls {
+            let first = try ConvexHullTopologyBuilder.triangulate(
+                vertices: vertices)
+            let second = try ConvexHullTopologyBuilder.triangulate(
+                vertices: vertices)
+            XCTAssertEqual(first, second, "\(name) topology must be deterministic")
+            XCTAssertGreaterThanOrEqual(first.count, 4, name)
+            XCTAssertLessThanOrEqual(
+                first.count, ConvexAssetLimits.maximumTrianglesPerHull, name)
+
+            var edgeUses: [SIMD2<UInt32>: Int] = [:]
+            for triangle in first {
+                let ids = [triangle.x, triangle.y, triangle.z]
+                XCTAssertEqual(Set(ids).count, 3, name)
+                XCTAssertTrue(ids.allSatisfy { Int($0) < vertices.count }, name)
+                for (a, b) in [(triangle.x, triangle.y),
+                               (triangle.y, triangle.z),
+                               (triangle.z, triangle.x)] {
+                    let edge = SIMD2(min(a, b), max(a, b))
+                    edgeUses[edge, default: 0] += 1
+                }
+            }
+            XCTAssertTrue(
+                edgeUses.values.allSatisfy { $0 == 2 },
+                "\(name) must reconstruct a closed two-manifold boundary")
+        }
+    }
+
+    func testGeneratedSupportCloudsUploadAsLegacyGPUHulls() throws {
+        var scene = PhysicsScene(name: "unitree-h1-legacy-support-clouds")
+        scene.settings.gravity = 0
+        var expectedTriangleVertices = 0
+        for (index, entry) in generatedHulls.enumerated() {
+            let body = scene.addBody(
+                size: F3(repeating: 1), density: 0, friction: 0.8,
+                position: F3(Float(index) * 2, 0, 1),
+                collisionEnabled: false)
+            _ = scene.addConvexCollider(
+                body: body, vertices: entry.vertices,
+                collisionEnabled: true, isRendered: false)
+            expectedTriangleVertices += 3 * (try ConvexHullTopologyBuilder
+                .triangulate(vertices: entry.vertices)).count
+        }
+
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertEqual(solver.uniqueConvexAssetCount, generatedHulls.count)
+        XCTAssertEqual(solver.convexColliderCount, generatedHulls.count)
+        XCTAssertEqual(solver.numConvexHullVertices, 64 * generatedHulls.count)
+        XCTAssertEqual(
+            solver.convexDebugTriangleVertexCount, expectedTriangleVertices)
+        XCTAssertGreaterThan(solver.convexDebugEdgeVertexCount, 0)
+
+        let headers = solver.convexHullHeaders.contents().bindMemory(
+            to: ConvexHullGPU.self, capacity: generatedHulls.count)
+        for index in generatedHulls.indices {
+            XCTAssertGreaterThan(headers[index].verticesFaces.w, 0)
+            XCTAssertGreaterThan(headers[index].edgesLoops.y, 0)
+            XCTAssertGreaterThan(headers[index].edgesLoops.w, 0)
+        }
+        XCTAssertNotNil(solver.renderConvexCollisionSurface)
+    }
+
     func testPackagedProvenancePinsBSDSourceAndMeasuredErrors() throws {
         let url = try MJCFAsset.bundledResourceURL(
             resource: "COLLISION_HULLS_PROVENANCE", withExtension: "json",
@@ -153,6 +218,14 @@ final class UnitreeH1CollisionHullTests: XCTestCase {
             maximum = simd_max(maximum, vertex)
         }
         return (minimum, maximum)
+    }
+
+    private var generatedHulls: [(name: String, vertices: [F3])] {
+        [
+            ("left ankle", UnitreeH1CollisionHulls.leftAnkle),
+            ("right ankle", UnitreeH1CollisionHulls.rightAnkle),
+            ("torso", UnitreeH1CollisionHulls.torso),
+        ]
     }
 
     private func enabledGeneratedHullCount(

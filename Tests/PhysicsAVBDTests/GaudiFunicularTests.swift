@@ -155,6 +155,8 @@ final class GaudiFunicularTests: XCTestCase {
         let dynamic = scene.bodies.indices.filter { scene.bodies[$0].isDynamic }
         let masses = dynamic.map { authoredMass(scene.bodies[$0]) }
         let gpu = try GPUSolver(scene: scene)
+        XCTAssertFalse(gpu.usesRigidColliderHierarchy)
+        XCTAssertEqual(gpu.convexColliderCount, 0)
         var samples: [(ke: Float, peak: Float, error: Float,
                        joint: Float, contact: Float, pairs: Int)] = []
         var sawRopeRope = false

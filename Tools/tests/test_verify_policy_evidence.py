@@ -23,7 +23,7 @@ class MultiSuiteEvidenceVerifierTests(unittest.TestCase):
         return completed.stdout.strip()
 
     def context(self, bundle: Path) -> verifier.CheckpointContext:
-        entry = verifier.CatalogEntry(
+        entry = verifier.ReleaseEntry(
             selection_id="fixture", task_id="arachne15-velocity-v0",
             runtime="native", qualification="accepted",
             checkpoint_relative_directory="fixture",
@@ -95,7 +95,7 @@ class MultiSuiteEvidenceVerifierTests(unittest.TestCase):
         for task, profile in verifier.ARACHNE_QUALIFICATION_PROFILE.items():
             with self.subTest(task=task):
                 candidate_files = verifier.arachne_candidate_files(profile)
-                self.assertEqual(len(candidate_files), 15)
+                self.assertEqual(len(candidate_files), 16)
                 candidate = root / "checkpoints" / profile[
                     "checkpointRelativeDirectory"
                 ]
@@ -150,6 +150,9 @@ class MultiSuiteEvidenceVerifierTests(unittest.TestCase):
             packaged = Path(temporary) / "checkpoints"
             packaged.mkdir()
             shutil.copy2(source / "README.md", packaged / "README.md")
+            shutil.copy2(
+                source / "policy-release-index.json",
+                packaged / "policy-release-index.json")
             for relative in (
                 "humanoid-isaac-flat-v2",
                 "external/unitree-h1",

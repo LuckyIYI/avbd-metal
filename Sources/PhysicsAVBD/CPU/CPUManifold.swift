@@ -1,8 +1,9 @@
 import simd
 import SimCore
 
-// Contact manifold with friction (paper Sec 3.2-3.3) and OBB SAT collision
-// with feature-ID based warm-start persistence. CPU reference port.
+// Contact manifold with friction (paper Sec 3.2-3.3). Analytic contacts use
+// feature-ID persistence; clipped generic-convex patches use one-to-one local
+// anchor matching because their deterministic sort order is not an identity.
 
 public struct ContactPoint {
     public var featureKey: Int32 = 0
@@ -21,6 +22,9 @@ public final class CPUManifold: CPUForce {
     public var basis: (F3, F3, F3) = (.zero, .zero, .zero)
     public var staticFriction: Float = 0
     public var dynamicFriction: Float = 0
+    let colliderAIndex: Int?
+    let colliderBIndex: Int?
+    let colliderPairKey: UInt64?
     /// Compatibility alias for the original single Coulomb coefficient.
     /// Reads the static coefficient; writes update both coefficients so
     /// legacy callers retain their original single-material semantics.
@@ -33,51 +37,166 @@ public final class CPUManifold: CPUForce {
     }
 
     init(solver: CPUSolver, bodyA: CPURigid, bodyB: CPURigid) {
+        colliderAIndex = nil
+        colliderBIndex = nil
+        colliderPairKey = nil
         super.init(solver: solver, bodyA: bodyA, bodyB: bodyB)
     }
 
-    func anchorWorld(_ body: CPURigid, _ r: F3) -> F3 {
-        body.shape != .box ? body.positionLin + r
-                              : transform(body.positionLin, body.positionAng, r)
+    init(solver: CPUSolver, colliderA: Int, colliderB: Int, pairKey: UInt64) {
+        precondition(solver.colliders.indices.contains(colliderA)
+            && solver.colliders.indices.contains(colliderB))
+        let a = solver.colliders[colliderA]
+        let b = solver.colliders[colliderB]
+        colliderAIndex = colliderA
+        colliderBIndex = colliderB
+        colliderPairKey = pairKey
+        super.init(solver: solver,
+                   bodyA: solver.bodies[a.body], bodyB: solver.bodies[b.body])
     }
 
-    func anchorOffsetWorld(_ body: CPURigid, _ r: F3) -> F3 {
-        body.shape != .box ? r : rotate(body.positionAng, r)
+    private func collider(isA: Bool) -> CPUCollider? {
+        let index = isA ? colliderAIndex : colliderBIndex
+        guard let index else { return nil }
+        return solver.colliders[index]
+    }
+
+    func anchorWorld(_ body: CPURigid, _ r: F3, isA: Bool) -> F3 {
+        if let collider = collider(isA: isA) {
+            return collider.usesWorldSpaceRoundAnchor
+                ? body.positionLin + r
+                : transform(body.positionLin, body.positionAng, r)
+        }
+        return body.shape != .box
+            ? body.positionLin + r
+            : transform(body.positionLin, body.positionAng, r)
+    }
+
+    func anchorOffsetWorld(_ body: CPURigid, _ r: F3, isA: Bool) -> F3 {
+        if let collider = collider(isA: isA) {
+            return collider.usesWorldSpaceRoundAnchor ? r : rotate(body.positionAng, r)
+        }
+        return body.shape != .box ? r : rotate(body.positionAng, r)
     }
 
     func currentPenetration(_ i: Int) -> Float {
         guard let bodyA, let bodyB else { return 0 }
-        let xA = anchorWorld(bodyA, contacts[i].rA)
-        let xB = anchorWorld(bodyB, contacts[i].rB)
+        let xA = anchorWorld(bodyA, contacts[i].rA, isA: true)
+        let xB = anchorWorld(bodyB, contacts[i].rB, isA: false)
         return dot(basis.0, xA - xB) + solver.collisionMargin
     }
 
-    override func initialize() -> Bool {
-        guard let bodyA, let bodyB else { return false }
+    override func initialize() -> Result<Bool, CPUSolver.RuntimeFailure> {
+        guard let bodyA, let bodyB else { return .success(false) }
+        let colliderA = collider(isA: true)
+        let colliderB = collider(isA: false)
+        let previousContacts = contacts
+        let previousBasis = basis
         staticFriction = solver.frictionCombineMode.combine(
-            bodyA.friction, bodyB.friction)
+            colliderA?.friction ?? bodyA.friction,
+            colliderB?.friction ?? bodyB.friction)
         dynamicFriction = solver.frictionCombineMode.combine(
-            bodyA.dynamicFriction, bodyB.dynamicFriction)
+            colliderA?.dynamicFriction ?? bodyA.dynamicFriction,
+            colliderB?.dynamicFriction ?? bodyB.dynamicFriction)
 
         var newContacts: [ContactPoint] = []
-        let count = Self.collide(
-            bodyA, bodyB, margin: solver.collisionMargin,
-            &newContacts, &basis)
+        let count: Int
+        if let colliderA, let colliderB {
+            let query = Self.collideColliders(
+                solver: solver,
+                bodyA: bodyA, colliderA: colliderA,
+                bodyB: bodyB, colliderB: colliderB,
+                margin: solver.collisionMargin,
+                &newContacts, &basis)
+            switch query {
+            case .success(let value):
+                count = value
+            case .failure(let failure):
+                return .failure(.convexQuery(
+                    colliderA: colliderA.index,
+                    colliderB: colliderB.index,
+                    failure: failure))
+            }
+        } else {
+            count = Self.collide(
+                bodyA, bodyB, margin: solver.collisionMargin,
+                &newContacts, &basis)
+        }
 
-        // Merge old contact data via feature keys (warm-start persistence).
-        // Stick anchors are never restored for spheres: anchors rotate with
-        // the body, which is wrong for rolling contacts.
-        let anySphere = bodyA.shape != .box || bodyB.shape != .box
-        for i in 0..<count {
-            for old in contacts where old.featureKey == newContacts[i].featureKey {
+        // Merge old contact data for warm-start persistence. The analytic
+        // narrow phase has stable feature IDs. A clipped generic-convex
+        // manifold does not: a small rotation can reorder its world-space
+        // points without changing the physical patch. Match that path
+        // one-to-one by owner-local anchors while the normal is compatible,
+        // mirroring the GPU path, so sticky state cannot jump between points.
+        // Stick anchors are never restored for round shapes: their anchors are
+        // world-space offsets and must follow rolling contact.
+        let anyWorldSpaceRoundAnchor: Bool
+        let usesGenericConvexManifold: Bool
+        if let colliderA, let colliderB {
+            anyWorldSpaceRoundAnchor = colliderA.usesWorldSpaceRoundAnchor
+                || colliderB.usesWorldSpaceRoundAnchor
+            usesGenericConvexManifold = colliderA.hasConvexHull
+                || colliderB.hasConvexHull
+        } else {
+            anyWorldSpaceRoundAnchor = bodyA.shape != .box || bodyB.shape != .box
+            usesGenericConvexManifold = false
+        }
+
+        if usesGenericConvexManifold {
+            var matchedPrevious = Set<Int>()
+            let normalCompatible = dot(previousBasis.0, basis.0) > 0.95
+            let scale = max(colliderA?.boundingRadius ?? 0,
+                            colliderB?.boundingRadius ?? 0)
+            let matchRadius = 0.08 * scale + 2 * solver.collisionMargin
+            for i in 0..<count where normalCompatible {
                 let newRA = newContacts[i].rA
                 let newRB = newContacts[i].rB
-                newContacts[i] = old
-                if !old.stick || anySphere {
-                    newContacts[i].rA = newRA
-                    newContacts[i].rB = newRB
+                var bestIndex: Int?
+                var bestDistance = matchRadius
+                for oldIndex in previousContacts.indices
+                    where !matchedPrevious.contains(oldIndex) {
+                    let old = previousContacts[oldIndex]
+                    let anchorDistance = max(length(old.rA - newRA),
+                                             length(old.rB - newRB))
+                    if anchorDistance < bestDistance - 1.0e-7
+                        || (abs(anchorDistance - bestDistance) <= 1.0e-7
+                            && oldIndex < (bestIndex ?? .max)) {
+                        bestDistance = anchorDistance
+                        bestIndex = oldIndex
+                    }
                 }
-                break
+                guard let bestIndex else { continue }
+                matchedPrevious.insert(bestIndex)
+                let old = previousContacts[bestIndex]
+                var restored = old
+                restored.featureKey = newContacts[i].featureKey
+
+                // Tangential multipliers are coordinates in the old basis;
+                // rotate them into the current manifold basis before reuse.
+                let worldTangent = previousBasis.1 * old.lambda.y
+                    + previousBasis.2 * old.lambda.z
+                restored.lambda.y = dot(basis.1, worldTangent)
+                restored.lambda.z = dot(basis.2, worldTangent)
+                if !old.stick || anyWorldSpaceRoundAnchor {
+                    restored.rA = newRA
+                    restored.rB = newRB
+                }
+                newContacts[i] = restored
+            }
+        } else {
+            for i in 0..<count {
+                for old in previousContacts
+                    where old.featureKey == newContacts[i].featureKey {
+                    let newRA = newContacts[i].rA
+                    let newRB = newContacts[i].rB
+                    newContacts[i] = old
+                    if !old.stick || anyWorldSpaceRoundAnchor {
+                        newContacts[i].rA = newRA
+                        newContacts[i].rB = newRB
+                    }
+                    break
+                }
             }
         }
         contacts = newContacts
@@ -89,8 +208,8 @@ public final class CPUManifold: CPUForce {
             if solver.bodies[sp.body] === bodyB { wB = sp.axis * sp.omega }
         }
         for i in 0..<contacts.count {
-            let xA = anchorWorld(bodyA, contacts[i].rA)
-            let xB = anchorWorld(bodyB, contacts[i].rB)
+            let xA = anchorWorld(bodyA, contacts[i].rA, isA: true)
+            let xB = anchorWorld(bodyB, contacts[i].rB, isA: false)
             let d = xA - xB
             contacts[i].C0 = F3(dot(basis.0, d) + solver.collisionMargin,
                                 dot(basis.1, d), dot(basis.2, d))
@@ -116,7 +235,7 @@ public final class CPUManifold: CPUForce {
                                              penaltyMin, penaltyMax)
         }
 
-        return !contacts.isEmpty
+        return .success(!contacts.isEmpty)
     }
 
     /// Taylor-approximated constraint and clamped force for contact i (Sec 4).
@@ -155,8 +274,8 @@ public final class CPUManifold: CPUForce {
         let isA = body === bodyA
 
         for i in 0..<contacts.count {
-            let rAW = anchorOffsetWorld(bodyA, contacts[i].rA)
-            let rBW = anchorOffsetWorld(bodyB, contacts[i].rB)
+            let rAW = anchorOffsetWorld(bodyA, contacts[i].rA, isA: true)
+            let rBW = anchorOffsetWorld(bodyB, contacts[i].rB, isA: false)
             let (F, _, _, _) = forceAndC(i, alpha, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW)
 
             let s: Float = isA ? 1 : -1
@@ -186,8 +305,8 @@ public final class CPUManifold: CPUForce {
         let dqBAng = quatSub(bodyB.positionAng, bodyB.initialAng)
 
         for i in 0..<contacts.count {
-            let rAW = anchorOffsetWorld(bodyA, contacts[i].rA)
-            let rBW = anchorOffsetWorld(bodyB, contacts[i].rB)
+            let rAW = anchorOffsetWorld(bodyA, contacts[i].rA, isA: true)
+            let rBW = anchorOffsetWorld(bodyB, contacts[i].rB, isA: false)
             let (F, C, frictionScale, bounds) =
                 forceAndC(i, alpha, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW)
 

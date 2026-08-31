@@ -422,6 +422,70 @@ struct ContactGPU {
     float4 penalty;
 };
 
+// Immutable cooked convex support data. Asset-backed colliders point into
+// these arrays through colliderConvexAssetID; the vertex payload intentionally
+// remains in the legacy convexHullVertices buffer so bindings 19/20 stay
+// source- and binary-compatible.
+struct ConvexHullGPU {
+    uint4 verticesFaces;       // vertexStart, vertexCount, faceStart, faceCount
+    uint4 edgesLoops;          // edgeStart, edgeCount, loopStart, loopCount
+    float4 boundsMinRadius;    // centered local min.xyz, support radius
+    float4 boundsMaxVolume;    // centered local max.xyz, positive volume
+};
+
+struct ConvexFaceGPU {
+    float4 plane;              // outward n.xyz, d: dot(n,p) <= d
+    uint4 loop;                // loopStart, loopCount, stable face id, reserved
+};
+
+struct ConvexEdgeGPU {
+    uint4 endpointsFaces;      // vertex0, vertex1, adjacent face0, face1
+};
+
+// Shared bounded support-query ABI. The rigid narrow phase defines the
+// Newton/Jitter-inspired MPR/GJK implementation in 30_narrowphase.metal;
+// rigid-vs-deformable contact in 25_cloth.metal forward-declares and reuses
+// those exact helpers. Kind 5 is an ephemeral triangular prism encoded with
+// its three authored vertices in center, rotation.xyz, and dimensions.xyz;
+// rotation.w is half thickness. Its interior seed is computed only after the
+// vertices enter a translation-local query frame.
+struct NPCShape {
+    uint collider;
+    uint kind;
+    float3 center;
+    float4 rotation;
+    float4 dimensions;             // xyz authored size/kind-5 C, w support radius
+};
+
+struct NPCShapePoint {
+    float3 point;
+    uint feature;
+};
+
+struct NPCVertex {
+    float3 pointA;
+    float3 pointB;
+    float3 w;                       // A - B Minkowski point
+    uint featureA;
+    uint featureB;
+};
+
+struct NPCResult {
+    bool overlap;
+    bool valid;
+    float3 pointA;
+    float3 pointB;
+    float3 normalAB;                // A -> B
+    float signedDistance;           // negative inside, positive outside
+    uint featureA;
+    uint featureB;
+};
+
+#define NPC_FEATURE_SMOOTH 0xF0000000u
+#define NPC_MPR_ITERATIONS 30
+#define NPC_GJK_ITERATIONS 30
+#define NPC_MAX_FACE_VERTICES 32
+
 struct ManifoldGPU {
     uint4 header;       // bodyA, bodyB, numContacts, active
     uint4 colliderPair; // colliderA, colliderB (warm-start identity), pad
@@ -468,7 +532,22 @@ struct SolverContactGPU {
 #define CTR_DAT_TET_DEGENERATE 16  // collapsed/inverted tet anchor
 #define CTR_COLOR_BASE 17          // MAX_COLORS entries
 #define CTR_SCATTER_BASE (17 + MAX_COLORS) // MAX_COLORS scatter cursors
-#define CTR_TOTAL (17 + 2 * MAX_COLORS)
+#define CTR_CONVEX_QUERY_FAILURE (17 + 2 * MAX_COLORS)
+                                    // dropped/inconclusive convex overlap
+#define CTR_RT_CANDIDATES (18 + 2 * MAX_COLORS)
+                                    // exact rigid-triangle candidate tests
+#define CTR_CONVEX_EDGE_PAIRS (19 + 2 * MAX_COLORS)
+                                    // generic manifold edge-pair attempts
+#define CTR_TOTAL (20 + 2 * MAX_COLORS)
+
+inline void latchConvexQueryFailure(
+    device atomic_uint* counters,
+    device atomic_uint* poison)
+{
+    atomic_fetch_add_explicit(
+        &counters[CTR_CONVEX_QUERY_FAILURE], 1u, memory_order_relaxed);
+    atomic_store_explicit(poison, 1u, memory_order_relaxed);
+}
 
 #define SURFACE_TRUNCATION_ISOTROPIC 1u
 #define SURFACE_TRUNCATION_PLANAR_DAT 2u

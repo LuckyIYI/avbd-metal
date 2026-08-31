@@ -1,0 +1,46 @@
+{
+  "identifier": "arachne15-velocity-v1",
+  "presentation": {
+    "cameraPresets": [
+      {"anchor": "robot", "azimuth": -1.5707964, "distance": 2.8, "elevation": 0.28, "id": "follow", "label": "Follow Robot", "offset": [0, 0, 0.22], "target": [0, 0, 0]},
+      {"anchor": "world", "azimuth": -1.5707964, "distance": 5, "elevation": 0.45, "id": "course", "label": "Show Course", "offset": [1.5, 0, 0.2], "target": [0, 0, 0]}
+    ],
+    "controls": [
+      {"defaultValue": 2.5, "format": "%.1f m/s", "id": "projectileSpeed", "kind": "slider", "label": "Box speed", "maximum": 6, "minimum": 0.5, "step": 0.25},
+      {"arguments": {"speed": "projectileSpeed"}, "command": "throw-projectile", "id": "throwProjectile", "kind": "button", "label": "Throw Box"}
+    ],
+    "metrics": [
+      {"format": "%.3f", "id": "height", "label": "Body height", "source": "task/root-height", "unit": "m"},
+      {"format": "%.3f", "id": "speed", "label": "Planar speed", "source": "task/planar-speed", "unit": "m/s"},
+      {"format": "%.3f", "id": "command", "label": "Forward command", "source": "task/command-forward", "unit": "m/s"},
+      {"format": "%.0f", "id": "step", "label": "Control step", "source": "replay/control-step"}
+    ]
+  },
+  "runtime": {"files": {"deploymentManifest": "deployment-manifest.json", "metadata": "metadata.json", "policy": "policy.safetensors", "trainingState": "training-state.json"}, "kind": "avbd-vector-ppo-v1"},
+  "schemaVersion": 1,
+  "simulation": {
+    "controlDecimation": 10,
+    "includeInteractiveRobustnessProbes": true,
+    "maxEpisodeSteps": 500,
+    "options": {
+      "armatureScaleLower": 1, "armatureScaleUpper": 1, "commandProgressRewardWeight": 20, "commandResamplingSteps": 500,
+      "frictionScaleLower": 1, "frictionScaleUpper": 1, "goalBoundaryCommandSpeed": 0.02, "goalCommandSpeed": 0.15,
+      "goalDwellSteps": 15, "goalProgressRewardWeight": 4, "goalRadius": 0.12, "goalSlowdownDistance": 0.5,
+      "goalStableRewardWeight": 1, "goalSuccessBonus": 8, "inertiaScaleLower": 1, "inertiaScaleUpper": 1,
+      "initialRollPitchRange": 0, "initialYawRange": 0, "massScaleLower": 1, "massScaleUpper": 1,
+      "maximumActionLatencySteps": 0, "maximumForwardVelocity": 0.15, "maximumGoalArrivalSpeed": 0.08,
+      "maximumGoalDirectionAngle": 3.1415925, "maximumGoalDistance": 2, "maximumLateralVelocity": 0,
+      "maximumYawRate": 0, "minimumForwardVelocity": 0.15, "minimumGoalDistance": 0.6,
+      "motorDampingScaleLower": 1, "motorDampingScaleUpper": 1, "motorStiffnessScaleLower": 1,
+      "motorStiffnessScaleUpper": 1, "motorTorqueScaleLower": 1, "motorTorqueScaleUpper": 1,
+      "observationNoise": 0, "pointGoal": 0, "solverIterations": 20, "standingCommandProbability": 0,
+      "validationCollisionProfile": 0, "velocityErrorPenaltyWeight": 10, "yawErrorPenaltyWeight": 10
+    },
+    "seed": 21001,
+    "simulationStepSeconds": 0.002,
+    "task": "arachne15-velocity-v0",
+    "taskRevision": 2000006
+  },
+  "summary": "Accepted Arachne-15 straight-walk policy with its exact task, physics, checkpoint, camera, controls, and replay metrics.",
+  "title": "Arachne-15 Velocity"
+}
