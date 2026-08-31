@@ -394,6 +394,63 @@ final class TorsionalFrictionTests: XCTestCase {
             torsional.prevTorsionState.length)
     }
 
+    func testTorsionDoesNotAddPerColorOrPerIterationDispatches() throws {
+        try requireMetal()
+
+        func dispatches(_ coefficient: Float)
+            throws -> [GPUSolver.SolveDispatchForTesting] {
+            var (scene, _) = sphereBoxScene(
+                torsionalFriction: coefficient)
+            scene.settings.iterations = 4
+            let solver = try GPUSolver(scene: scene)
+            var result: [GPUSolver.SolveDispatchForTesting] = []
+            solver.solveDispatchObserverForTesting = { result.append($0) }
+            try solver.submitStep()
+            try solver.synchronize()
+            return result
+        }
+
+        let ordinary = try dispatches(0)
+        let torsional = try dispatches(torsionalRadius)
+        XCTAssertFalse(ordinary.isEmpty)
+        XCTAssertEqual(
+            torsional.count, ordinary.count,
+            "torsion must specialize existing solve passes, not append "
+                + "one dispatch per color and iteration")
+        XCTAssertTrue(torsional.contains(.primal(torsion: true)))
+        XCTAssertTrue(torsional.contains(.dual(torsion: true)))
+        XCTAssertFalse(torsional.contains(.primal(torsion: false)))
+        XCTAssertFalse(torsional.contains(.dual(torsion: false)))
+    }
+
+    func testPersistentSmallSceneKeepsSingleDispatchWithTorsion() throws {
+        try requireMetal()
+        var (scene, ball) = sphereBoxScene(
+            torsionalFriction: torsionalRadius)
+        scene.settings.iterations = 20
+        let solver = try GPUSolver(scene: scene)
+        solver.persistentSolveForTesting = true
+        var dispatches: [GPUSolver.SolveDispatchForTesting] = []
+        solver.solveDispatchObserverForTesting = { dispatches.append($0) }
+
+        for _ in 0..<180 { try solver.submitStep() }
+        try solver.synchronize()
+        solver.setBodyStates([.init(
+            body: ball, position: solver.bodyPosition(ball),
+            rotation: solver.bodyRotation(ball), linearVelocity: .zero,
+            angularVelocity: F3(0, 0, 20))])
+        dispatches.removeAll(keepingCapacity: true)
+        for _ in 0..<120 { try solver.submitStep() }
+        try solver.synchronize()
+
+        XCTAssertEqual(dispatches.count, 120)
+        XCTAssertTrue(dispatches.allSatisfy {
+            $0 == .persistent(torsion: true)
+        })
+        XCTAssertLessThan(abs(solver.bodyAngularVelocity(ball).z), 1)
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
     func testLegacyCPUImplicitColliderTracksTorsionalMaterialMutation() throws {
         let solver = CPUSolver()
         let ground = solver.addBody(

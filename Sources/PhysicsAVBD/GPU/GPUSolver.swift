@@ -341,8 +341,9 @@ public final class GPUSolver {
         "np_collide_convex",
         "np_collide_enhanced_analytic",
         "prepare_torsional_friction",
-        "primal_torsional_friction",
-        "dual_torsional_friction",
+        "primal_particles_split_torsion",
+        "primal_solve_torsion",
+        "dual_all_torsion",
         "ogc_bounds_refresh",
         "ogc_refresh_args",
         "pm_clear",
@@ -363,6 +364,7 @@ public final class GPUSolver {
         "softmap_clear",
         "softmap_insert",
         "solve_persistent",
+        "solve_persistent_torsion",
         "solve_persistent_multi",
         "vt_emit",
         "warmstart_bodies",
@@ -3465,6 +3467,13 @@ public final class GPUSolver {
     var planarDATSoftCapacityForTesting: Int?
     var planarDATBodyIncidenceForTesting = false
     var planarDATPassObserverForTesting: ((PlanarDATPassSite) -> Void)?
+    var persistentSolveForTesting = false
+    enum SolveDispatchForTesting: Equatable {
+        case primal(torsion: Bool)
+        case dual(torsion: Bool)
+        case persistent(torsion: Bool)
+    }
+    var solveDispatchObserverForTesting: ((SolveDispatchForTesting) -> Void)?
     var convexQueryFailureForTesting = false
     /// Once an injected failure has been submitted, queued successors must
     /// continue consulting the solver-lifetime poison even in an analytic
@@ -5487,7 +5496,8 @@ public final class GPUSolver {
             }
         }
         try stage("solver-iterations")
-        let persistPSO = ps("solve_persistent")
+        let persistPSO = ps(hasTorsionalFriction
+            ? "solve_persistent_torsion" : "solve_persistent")
         let multiPSO = ps("solve_persistent_multi")
         // Multi-threadgroup persistent path: whole solve in one dispatch of
         // a few co-resident threadgroups (device-scope spin barrier). Covers
@@ -5501,9 +5511,10 @@ public final class GPUSolver {
         // boundary made otherwise identical vectorized RL replicas diverge.
         // Keep the scalar persistent kernel as an explicit benchmark/debug
         // mode only; production simulation and replay must share one path.
-        let persistentRequested = ProcessInfo.processInfo.environment[
-            "AVBD_PERSIST"] != nil
-            && ProcessInfo.processInfo.environment["AVBD_NO_PERSIST"] == nil
+        let persistentRequested = persistentSolveForTesting
+            || (ProcessInfo.processInfo.environment["AVBD_PERSIST"] != nil
+                && ProcessInfo.processInfo.environment[
+                    "AVBD_NO_PERSIST"] == nil)
         if multiOK && !isPlanarDAT && !hasTorsionalFriction
             && numBodies <= 4096 {
             let tgW = min(256, multiPSO.maxTotalThreadsPerThreadgroup)
@@ -5538,7 +5549,6 @@ public final class GPUSolver {
             enc.dispatchThreadgroups(MTLSize(width: Int(ntg), height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
         } else if persistentRequested && !isPlanarDAT
-                    && !hasTorsionalFriction
                     && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
             // small scene: the whole solve loop in ONE dispatch — hundreds
             // of per-dispatch launch/barrier latencies become threadgroup
@@ -5566,12 +5576,17 @@ public final class GPUSolver {
             enc.setBuffer(softContacts, offset: 0, index: 19)
             enc.setBuffer(membranes, offset: 0, index: 20)
             enc.setBuffer(bends, offset: 0, index: 21)
+            if hasTorsionalFriction {
+                enc.setBuffer(torsionState, offset: 0, index: 25)
+            }
             enc.setBuffer(boundsBuf, offset: 0, index: 26)
             enc.setBuffer(ogcPrevBuf, offset: 0, index: 27)
             enc.setBuffer(counters, offset: 0, index: 28)
             let w = persistPSO.threadExecutionWidth
             let tg = min(persistPSO.maxTotalThreadsPerThreadgroup,
                          ((max(numBodies, 64) + w - 1) / w) * w)
+            solveDispatchObserverForTesting?(
+                .persistent(torsion: hasTorsionalFriction))
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
         } else {
@@ -5587,8 +5602,16 @@ public final class GPUSolver {
         // solve-primal 9.5 ms). AVBD_NO_RSPLIT restores the old kernel
         // (the x8 indirect args early-out harmlessly).
         let noRSplit = ProcessInfo.processInfo.environment["AVBD_NO_RSPLIT"] != nil
-        let primalPSO = (usesDynamicColoring && noRSplit) ? ps("primal_solve")
-                                                          : ps("primal_particles_split")
+        let primalName: String
+        if usesDynamicColoring && noRSplit {
+            primalName = hasTorsionalFriction
+                ? "primal_solve_torsion" : "primal_solve"
+        } else {
+            primalName = hasTorsionalFriction
+                ? "primal_particles_split_torsion"
+                : "primal_particles_split"
+        }
+        let primalPSO = ps(primalName)
         // static palettes have fixed per-color counts: dispatch directly
         // (8 lanes per body for the split kernel)
         let splitSizes: [Int] = usesDynamicColoring ? []
@@ -5622,6 +5645,9 @@ public final class GPUSolver {
                 enc.setBuffer(self.boundsBuf, offset: 0, index: 22)
                 enc.setBuffer(self.ogcPrevBuf, offset: 0, index: 23)
                 enc.setBuffer(self.counters, offset: 0, index: 24)
+                if hasTorsionalFriction {
+                    enc.setBuffer(self.torsionState, offset: 0, index: 25)
+                }
             }
             _ = it
             if profiling { try stage("solve-primal") ; enc.setComputePipelineState(primalPSO)
@@ -5649,10 +5675,15 @@ public final class GPUSolver {
                 enc.setBuffer(self.boundsBuf, offset: 0, index: 22)
                 enc.setBuffer(self.ogcPrevBuf, offset: 0, index: 23)
                 enc.setBuffer(self.counters, offset: 0, index: 24)
+                if hasTorsionalFriction {
+                    enc.setBuffer(self.torsionState, offset: 0, index: 25)
+                }
             }
             for c in 0..<colorBound {
                 var cIdx = UInt32(c)
                 enc.setBytes(&cIdx, length: 4, index: 15)
+                solveDispatchObserverForTesting?(
+                    .primal(torsion: hasTorsionalFriction))
                 if usesDynamicColoring {
                     enc.dispatchThreadgroups(indirectBuffer: colorArgs,
                                              indirectBufferOffset: c * 12,
@@ -5661,45 +5692,6 @@ public final class GPUSolver {
                     enc.dispatchThreadgroups(
                         MTLSize(width: (splitSizes[c] + 63) / 64, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
-                }
-                if hasTorsionalFriction {
-                    // Torsional resistance is an optional material overlay,
-                    // not collision geometry. Keeping it in a separate PSO
-                    // leaves the established primal kernel byte-for-byte
-                    // untouched for ordinary zero-torsion scenes.
-                    enc.setComputePipelineState(
-                        ps("primal_torsional_friction"))
-                    enc.setBuffer(posLin, offset: 0, index: 0)
-                    enc.setBuffer(posAng, offset: 0, index: 1)
-                    enc.setBuffer(initLin, offset: 0, index: 2)
-                    enc.setBuffer(initAng, offset: 0, index: 3)
-                    enc.setBuffer(props, offset: 0, index: 4)
-                    enc.setBuffer(manifolds, offset: 0, index: 5)
-                    enc.setBuffer(torsionState, offset: 0, index: 6)
-                    enc.setBuffer(adjStart, offset: 0, index: 7)
-                    enc.setBuffer(degrees, offset: 0, index: 8)
-                    enc.setBuffer(adjList, offset: 0, index: 9)
-                    enc.setBuffer(colorList, offset: 0, index: 10)
-                    enc.setBuffer(colorStart, offset: 0, index: 11)
-                    enc.setBytes(&cIdx, length: 4, index: 12)
-                    enc.setBytes(
-                        &P, length: MemoryLayout<SimParamsGPU>.stride,
-                        index: 13)
-                    enc.setBuffer(shape, offset: 0, index: 14)
-                    if usesDynamicColoring {
-                        enc.dispatchThreadgroups(
-                            indirectBuffer: colorArgs,
-                            indirectBufferOffset: c * 12,
-                            threadsPerThreadgroup: MTLSize(
-                                width: 64, height: 1, depth: 1))
-                    } else {
-                        enc.dispatchThreadgroups(
-                            MTLSize(
-                                width: (splitSizes[c] + 63) / 64,
-                                height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(
-                                width: 64, height: 1, depth: 1))
-                    }
                 }
                 if isPlanarDAT {
                     // A VBD color is a Gauss-Seidel iteration in DAT's
@@ -5714,11 +5706,9 @@ public final class GPUSolver {
                         pairCounts: planarDATPairCountsBuf,
                         activeColor: c)
                 }
-                if (hasTorsionalFriction || isPlanarDAT)
-                    && c + 1 < colorBound {
-                    // Optional overlay kernels reuse primal slots through
-                    // 14. Restore every overwritten binding before the next
-                    // color; cIdx and the higher bindings stay intact.
+                if isPlanarDAT && c + 1 < colorBound {
+                    // Planar-DAT overlay kernels reuse primal slots through
+                    // 14. Restore overwritten bindings before the next color.
                     enc.setComputePipelineState(primalPSO)
                     enc.setBuffer(posLin, offset: 0, index: 0)
                     enc.setBuffer(posAng, offset: 0, index: 1)
@@ -5738,7 +5728,11 @@ public final class GPUSolver {
                 }
             }
             if profiling { try stage("solve-dual") }
-            dispatchIndirect(enc, "dual_all", argsOffset: 6) { e in
+            let dualName = hasTorsionalFriction
+                ? "dual_all_torsion" : "dual_all"
+            solveDispatchObserverForTesting?(
+                .dual(torsion: hasTorsionalFriction))
+            dispatchIndirect(enc, dualName, argsOffset: 6) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.posAng, offset: 0, index: 1)
                 e.setBuffer(self.initLin, offset: 0, index: 2)
@@ -5749,20 +5743,8 @@ public final class GPUSolver {
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 7)
                 e.setBuffer(self.springs, offset: 0, index: 8)
                 e.setBuffer(self.softContacts, offset: 0, index: 9)
-            }
-            if hasTorsionalFriction {
-                dispatchIndirect(
-                    enc, "dual_torsional_friction", argsOffset: 0
-                ) { e in
-                    e.setBuffer(self.posLin, offset: 0, index: 0)
-                    e.setBuffer(self.posAng, offset: 0, index: 1)
-                    e.setBuffer(self.initLin, offset: 0, index: 2)
-                    e.setBuffer(self.initAng, offset: 0, index: 3)
-                    e.setBuffer(self.manifolds, offset: 0, index: 4)
-                    e.setBuffer(self.torsionState, offset: 0, index: 5)
-                    e.setBytes(
-                        &P, length: MemoryLayout<SimParamsGPU>.stride,
-                        index: 6)
+                if hasTorsionalFriction {
+                    e.setBuffer(self.torsionState, offset: 0, index: 10)
                 }
             }
             // OGC conditional refresh (paper Alg 3): a one-thread kernel

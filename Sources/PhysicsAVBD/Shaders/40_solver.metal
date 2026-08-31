@@ -1316,9 +1316,10 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
     }
 }
 
-// Optional operator-split torsional material pass. It deliberately lives in
-// a separate kernel so the established AVBD primal kernels remain source- and
-// codegen-identical for the overwhelmingly common zero-torsion scene.
+// Optional torsional material stamp. Torsion-enabled compatibility kernels
+// add this rank-1 angular mode to the same AVBD body system as contact. The
+// ordinary kernels below remain source- and codegen-identical for the common
+// zero-torsion scene.
 inline void stampTorsionalManifold(
     device const ManifoldGPU& m, float4 state, uint self,
     device const float4* posLin, device const float4* posAng,
@@ -1355,61 +1356,6 @@ inline void stampTorsionalManifold(
     float3 j = m.basisN.xyz * (isA ? 1.0f : -1.0f);
     lhsAng = m3_add(lhsAng, m3_scale(m3_outer(j, j), state.z));
     rhsAng += j * torque;
-}
-
-kernel void primal_torsional_friction(
-    device const float4* posLin [[buffer(0)]],
-    device float4* posAng [[buffer(1)]],
-    device const float4* initLin [[buffer(2)]],
-    device const float4* initAng [[buffer(3)]],
-    device const float4* props [[buffer(4)]],
-    device const ManifoldGPU* manifolds [[buffer(5)]],
-    device const float4* torsionState [[buffer(6)]],
-    device const uint* adjStart [[buffer(7)]],
-    device const uint* adjCount [[buffer(8)]],
-    device const uint* adjList [[buffer(9)]],
-    device const uint* colorList [[buffer(10)]],
-    device const uint* colorStart [[buffer(11)]],
-    constant uint& colorIndex [[buffer(12)]],
-    constant SimParams& P [[buffer(13)]],
-    device const float4* shape [[buffer(14)]],
-    uint tid [[thread_position_in_grid]])
-{
-    // colorArgs reserves eight lanes per body for the ordinary split primal.
-    // Torsion is one manifold mode, so lane zero handles its body's slice.
-    uint slot = tid >> 3u;
-    if ((tid & 7u) != 0u) return;
-    uint begin = colorStart[colorIndex];
-    uint end = colorStart[colorIndex + 1u];
-    if (begin + slot >= end) return;
-    uint body = colorList[begin + slot];
-    if (shape[body].w < 0.0f || posLin[body].w <= 0.0f) return;
-
-    float dt2 = P.dt * P.dt;
-    M3 lhsAng = m3_scale(
-        world_inertia(posAng[body], props[body].xyz), 1.0f / dt2);
-    float3 rhsAng = float3(0.0f);
-    uint start = adjStart[body];
-    uint count = adjCount[body];
-    for (uint k = 0u; k < count; ++k) {
-        uint entry = adjList[start + k];
-        if ((entry >> ADJ_KIND_SHIFT) != FK_MANIFOLD) continue;
-        uint index = entry & ADJ_INDEX_MASK;
-        stampTorsionalManifold(
-            manifolds[index], torsionState[index], body,
-            posLin, posAng, initLin, initAng, P.alpha, lhsAng, rhsAng);
-    }
-
-    float3 ignoredLin, dxAng;
-    solve6x6(m3_identity(), lhsAng, m3_zero(), float3(0.0f),
-             -rhsAng, ignoredLin, dxAng);
-    if (!finite3(dxAng)) return;
-    float angle2 = dot(dxAng, dxAng);
-    const float maxAngle = 0.5f;
-    if (angle2 > maxAngle * maxAngle) {
-        dxAng *= maxAngle * rsqrt(angle2);
-    }
-    posAng[body] = q_addw(posAng[body], dxAng);
 }
 
 // ----------------------------------------------------------------------------
@@ -1677,6 +1623,113 @@ static inline void primal_one(
     posAng[body] = q_addw(posAng[body], dxAng);
 }
 
+// Torsion-enabled compatibility specialization. Keep `primal_one` and the
+// zero-torsion entry points above/below unchanged: Metal fast-math codegen can
+// move a rigid scene into a different numerical basin after even an
+// unreachable branch is added to an established kernel.
+static inline void primal_one_torsion(
+    device float4* posLin,
+    device float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device const float4* inertLin,
+    device const float4* inertAng,
+    device const float4* props,
+    device const JointGPU* joints,
+    device const SpringGPU* springs,
+    device const ManifoldGPU* manifolds,
+    device const uint* adjStart,
+    device const uint* adjCount,
+    device const uint* adjList,
+    constant SimParams& P,
+    device const float4* shape,
+    device const TetGPU* tets,
+    device const SoftContactGPU* soft,
+    device const MembraneGPU* membranes,
+    device const BendGPU* bends,
+    device const uint* boundsBits,
+    device const float4* ogcPrev,
+    device atomic_uint* ogcCounters,
+    device const float4* torsionState,
+    uint body)
+{
+    float4 pl = posLin[body];
+    float mass = pl.w;
+    float dt2 = P.dt * P.dt;
+    float3 moment = props[body].xyz;
+
+    PrimalAccum acc;
+    acc.lhsLin = m3_diag(float3(mass / dt2));
+    M3 inertia = m3_scale(world_inertia(posAng[body], moment), 1.0f / dt2);
+    acc.lhsAng = inertia;
+    acc.lhsCross = m3_zero();
+    acc.rhsLin = (pl.xyz - inertLin[body].xyz) * (mass / dt2);
+    acc.rhsAng = m3_mul(inertia, q_sub(posAng[body], inertAng[body]));
+
+    uint as = adjStart[body], ae = as + adjCount[body];
+    for (uint k = as; k < ae; k++) {
+        uint entry = adjList[k];
+        uint kind = entry >> ADJ_KIND_SHIFT;
+        uint idx = entry & ADJ_INDEX_MASK;
+        if (kind == FK_JOINT) {
+            stampJoint(joints[idx], body, posLin, posAng, initAng,
+                       P.alpha, P.dt, acc);
+        } else if (kind == FK_SPRING) {
+            stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
+        } else if (kind == FK_TET) {
+            stampTet(tets[idx], body, posLin, acc);
+        } else if (kind == FK_SOFT) {
+            stampSoft(soft[idx], body, posLin, posAng, initLin, initAng,
+                      P.alpha, acc);
+        } else if (kind == FK_MEMBRANE) {
+            stampMembrane(membranes[idx], body, posLin, acc);
+        } else if (kind == FK_BEND) {
+            stampBend(bends[idx], body, posLin, acc);
+        } else {
+            stampManifold(manifolds[idx], body, posLin, posAng,
+                          initLin, initAng, P.alpha, acc);
+            stampTorsionalManifold(
+                manifolds[idx], torsionState[idx], body,
+                posLin, posAng, initLin, initAng, P.alpha,
+                acc.lhsAng, acc.rhsAng);
+        }
+    }
+
+    if (shape[body].w < 0.0f) {
+        acc.lhsAng = m3_identity();
+        acc.lhsCross = m3_zero();
+        acc.rhsAng = float3(0);
+    }
+
+    float3 dxLin = float3(0), dxAng = float3(0);
+    solve6x6(acc.lhsLin, acc.lhsAng, acc.lhsCross,
+             -acc.rhsLin, -acc.rhsAng, dxLin, dxAng);
+    if (!finite3(dxLin) || !finite3(dxAng)) return;
+
+    float maxLin = 0.35f * fabs(shape[body].w);
+    float lin2 = dot(dxLin, dxLin);
+    if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
+    if (shape[body].w < 0.0f
+        && P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        && P.tetInversionPreventionEnabled != 0u) {
+        float tetT = 1.0f;
+        for (uint k = as; k < ae; ++k) {
+            uint entry = adjList[k];
+            if ((entry >> ADJ_KIND_SHIFT) == FK_TET) {
+                tetT = min(tetT, tetInversionSafeFraction(
+                    tets[entry & ADJ_INDEX_MASK], body, posLin, dxLin,
+                    P.planarDATRelaxation, ogcCounters));
+            }
+        }
+        dxLin *= tetT;
+    }
+    float ang2 = dot(dxAng, dxAng);
+    const float maxAng = 0.5f;
+    if (ang2 > maxAng * maxAng) dxAng *= maxAng * rsqrt(ang2);
+    posLin[body] = float4(pl.xyz + dxLin, mass);
+    posAng[body] = q_addw(posAng[body], dxAng);
+}
+
 
 // ----------------------------------------------------------------------------
 // Dual update — one thread per joint, plus one per manifold.
@@ -1717,6 +1770,45 @@ kernel void primal_solve(
                joints, springs, manifolds, adjStart, adjCount, adjList,
                P, shape, tets, soft, membranes, bends, boundsBits, ogcPrev,
                ogcCounters, colorList[s + tid]);
+}
+
+kernel void primal_solve_torsion(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device const JointGPU* joints   [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    constant uint& colorIndex       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device const SoftContactGPU* soft [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(22)]],
+    device const float4* ogcPrev    [[buffer(23)]],
+    device atomic_uint* ogcCounters [[buffer(24)]],
+    device const float4* torsionState [[buffer(25)]],
+    uint tid                        [[thread_position_in_grid]])
+{
+    uint s = colorStart[colorIndex];
+    uint e = colorStart[colorIndex + 1];
+    if (s + tid >= e) return;
+    primal_one_torsion(
+        posLin, posAng, initLin, initAng, inertLin, inertAng, props,
+        joints, springs, manifolds, adjStart, adjCount, adjList,
+        P, shape, tets, soft, membranes, bends, boundsBits, ogcPrev,
+        ogcCounters, torsionState, colorList[s + tid]);
 }
 
 // Lane-split particle primal: 8 threads per body each stamp a slice of
@@ -1836,6 +1928,152 @@ kernel void primal_particles_split(
         if (ang2 > maxAng * maxAng) dxAng *= maxAng * rsqrt(ang2);
     } else {
         // direct 3x3 LDL solve (particles carry no angular block)
+        solve6x6(acc.lhsLin, m3_identity(), m3_zero(),
+                 -acc.rhsLin, float3(0), dxLin, dxAng);
+        if (!finite3(dxLin)) return;
+    }
+
+    float maxLin = 0.35f * fabs(shape[body].w);
+    float lin2 = dot(dxLin, dxLin);
+    if (lin2 > maxLin * maxLin) dxLin *= maxLin * rsqrt(lin2);
+    if (!rigid
+        && P.surfaceTruncationMode == SURFACE_TRUNCATION_PLANAR_DAT
+        && P.tetInversionPreventionEnabled != 0u) {
+        float tetT = 1.0f;
+        for (uint k = 0u; k < cnt; ++k) {
+            uint entry = adjList[as + k];
+            if ((entry >> ADJ_KIND_SHIFT) == FK_TET) {
+                tetT = min(tetT, tetInversionSafeFraction(
+                    tets[entry & ADJ_INDEX_MASK], body, posLin, dxLin,
+                    P.planarDATRelaxation, ogcCounters));
+            }
+        }
+        dxLin *= tetT;
+    }
+    if (!rigid && P.numTris > 0u
+        && P.surfaceTruncationMode == SURFACE_TRUNCATION_ISOTROPIC) {
+        dxLin = ogcTruncate(dxLin, pl.xyz, ogcPrev[body].xyz,
+                            boundsBits[body], -shape[body].w, ogcCounters);
+    }
+    posLin[body] = float4(pl.xyz + dxLin, mass);
+    if (rigid) posAng[body] = q_addw(posAng[body], dxAng);
+}
+
+// Fused torsion specialization of the cooperative primal. Its dispatch and
+// reduction topology exactly match `primal_particles_split`; the only added
+// work is one rank-1 angular stamp when a lane owns a manifold adjacency.
+kernel void primal_particles_split_torsion(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device const JointGPU* joints   [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    constant uint& colorIndex       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device const SoftContactGPU* soft [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(22)]],
+    device const float4* ogcPrev    [[buffer(23)]],
+    device atomic_uint* ogcCounters [[buffer(24)]],
+    device const float4* torsionState [[buffer(25)]],
+    uint tid                        [[thread_position_in_grid]])
+{
+    uint s = colorStart[colorIndex];
+    uint e = colorStart[colorIndex + 1];
+    uint slot = tid >> 3;
+    uint lane = tid & 7u;
+    if (s + slot >= e) return;
+    uint body = colorList[s + slot];
+    bool rigid = shape[body].w >= 0.0f;
+
+    PrimalAccum acc;
+    acc.lhsLin = m3_zero();
+    acc.lhsAng = m3_zero();
+    acc.lhsCross = m3_zero();
+    acc.rhsLin = float3(0);
+    acc.rhsAng = float3(0);
+
+    uint as = adjStart[body];
+    uint cnt = adjCount[body];
+    for (uint k = lane; k < cnt; k += 8) {
+        uint entry = adjList[as + k];
+        uint kind = entry >> ADJ_KIND_SHIFT;
+        uint idx = entry & ADJ_INDEX_MASK;
+        if (kind == FK_JOINT) {
+            stampJoint(joints[idx], body, posLin, posAng, initAng,
+                       P.alpha, P.dt, acc);
+        } else if (kind == FK_SPRING) {
+            stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
+        } else if (kind == FK_TET) {
+            stampTet(tets[idx], body, posLin, acc);
+        } else if (kind == FK_SOFT) {
+            stampSoft(soft[idx], body, posLin, posAng, initLin, initAng,
+                      P.alpha, acc);
+        } else if (kind == FK_MEMBRANE) {
+            stampMembrane(membranes[idx], body, posLin, acc);
+        } else if (kind == FK_BEND) {
+            stampBend(bends[idx], body, posLin, acc);
+        } else {
+            stampManifold(manifolds[idx], body, posLin, posAng,
+                          initLin, initAng, P.alpha, acc);
+            stampTorsionalManifold(
+                manifolds[idx], torsionState[idx], body,
+                posLin, posAng, initLin, initAng, P.alpha,
+                acc.lhsAng, acc.rhsAng);
+        }
+    }
+
+    for (ushort d = 4; d >= 1; d >>= 1) {
+        acc.lhsLin.r0 += simd_shuffle_xor(acc.lhsLin.r0, d);
+        acc.lhsLin.r1 += simd_shuffle_xor(acc.lhsLin.r1, d);
+        acc.lhsLin.r2 += simd_shuffle_xor(acc.lhsLin.r2, d);
+        acc.rhsLin    += simd_shuffle_xor(acc.rhsLin, d);
+        if (rigid) {
+            acc.lhsAng.r0   += simd_shuffle_xor(acc.lhsAng.r0, d);
+            acc.lhsAng.r1   += simd_shuffle_xor(acc.lhsAng.r1, d);
+            acc.lhsAng.r2   += simd_shuffle_xor(acc.lhsAng.r2, d);
+            acc.lhsCross.r0 += simd_shuffle_xor(acc.lhsCross.r0, d);
+            acc.lhsCross.r1 += simd_shuffle_xor(acc.lhsCross.r1, d);
+            acc.lhsCross.r2 += simd_shuffle_xor(acc.lhsCross.r2, d);
+            acc.rhsAng      += simd_shuffle_xor(acc.rhsAng, d);
+        }
+    }
+    if (lane != 0) return;
+
+    float4 pl = posLin[body];
+    float mass = pl.w;
+    float dt2 = P.dt * P.dt;
+    acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(mass / dt2)));
+    acc.rhsLin += (pl.xyz - inertLin[body].xyz) * (mass / dt2);
+
+    float3 dxLin = float3(0), dxAng = float3(0);
+    if (rigid) {
+        float3 moment = props[body].xyz;
+        M3 inertia = m3_scale(
+            world_inertia(posAng[body], moment), 1.0f / dt2);
+        acc.lhsAng = m3_add(acc.lhsAng, inertia);
+        acc.rhsAng += m3_mul(
+            inertia, q_sub(posAng[body], inertAng[body]));
+        solve6x6(acc.lhsLin, acc.lhsAng, acc.lhsCross,
+                 -acc.rhsLin, -acc.rhsAng, dxLin, dxAng);
+        if (!finite3(dxLin) || !finite3(dxAng)) return;
+        float ang2 = dot(dxAng, dxAng);
+        const float maxAng = 0.5f;
+        if (ang2 > maxAng * maxAng) dxAng *= maxAng * rsqrt(ang2);
+    } else {
         solve6x6(acc.lhsLin, m3_identity(), m3_zero(),
                  -acc.rhsLin, float3(0), dxLin, dxAng);
         if (!finite3(dxLin)) return;
@@ -2028,17 +2266,16 @@ static inline void dual_manifold_one(
     }
 }
 
-kernel void dual_torsional_friction(
-    device const float4* posLin [[buffer(0)]],
-    device const float4* posAng [[buffer(1)]],
-    device const float4* initLin [[buffer(2)]],
-    device const float4* initAng [[buffer(3)]],
-    device const ManifoldGPU* manifolds [[buffer(4)]],
-    device float4* torsionState [[buffer(5)]],
-    constant SimParams& P [[buffer(6)]],
-    uint gid [[thread_position_in_grid]])
+static inline void dual_torsion_one(
+    device const float4* posLin,
+    device const float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device const ManifoldGPU* manifolds,
+    device float4* torsionState,
+    constant SimParams& P,
+    uint gid)
 {
-    if (gid >= P.maxPairs) return;
     device const ManifoldGPU& m = manifolds[gid];
     uint n = m.header.z;
     float4 state = torsionState[gid];
@@ -2137,6 +2374,65 @@ kernel void dual_all(
     dual_soft_one(posLin, posAng, initLin, initAng, soft, P, sci);
 }
 
+// Torsion-enabled dual specialization. Manifold normal/tangent and twist
+// multipliers advance in the same dispatch and therefore share the same
+// iteration barrier.
+kernel void dual_all_torsion(
+    device const float4* posLin     [[buffer(0)]],
+    device const float4* posAng     [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device JointGPU* joints         [[buffer(4)]],
+    device ManifoldGPU* manifolds   [[buffer(5)]],
+    device const atomic_uint* counters [[buffer(6)]],
+    constant SimParams& P           [[buffer(7)]],
+    device SpringGPU* springs       [[buffer(8)]],
+    device SoftContactGPU* soft     [[buffer(9)]],
+    device float4* torsionState     [[buffer(10)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid < P.numJoints) {
+        dual_joint_one(posLin, posAng, joints, P, gid);
+        return;
+    }
+    uint si = gid - P.numJoints;
+    if (si < P.numSprings) {
+        device SpringGPU& sp = springs[si];
+        if (sp.header.z == 0) return;
+        uint a = sp.header.x, b = sp.header.y;
+        float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
+        float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
+        float C = length(pA - pB) - sp.rB.w - sp.dual.z * P.alpha;
+        float mA = posLin[a].w, mB = posLin[b].w;
+        float mMin = min(mA > 0.0f ? mA : FLT_MAX,
+                         mB > 0.0f ? mB : FLT_MAX);
+        float cap = min(P.lambdaMax, max(2.0f, 5.0e3f * mMin));
+        sp.dual.x = clamp(0.98f * sp.dual.x + sp.dual.y * C, 0.0f, cap);
+        if (C > 0.0f) {
+            sp.dual.y = min(sp.dual.y + C * P.betaLin,
+                            min(sp.rA.w, PENALTY_MAX));
+        }
+        return;
+    }
+    uint mi = si - P.numSprings;
+    uint numPairs = atomic_load_explicit(
+        &counters[CTR_PAIRS], memory_order_relaxed);
+    if (mi < numPairs) {
+        if (manifolds[mi].header.z == 0) return;
+        dual_manifold_one(
+            posLin, posAng, initLin, initAng, manifolds, P, mi);
+        dual_torsion_one(
+            posLin, posAng, initLin, initAng,
+            manifolds, torsionState, P, mi);
+        return;
+    }
+    uint sci = mi - numPairs;
+    uint numSoft = min(atomic_load_explicit(
+        &counters[CTR_SOFT], memory_order_relaxed), P.maxSoft);
+    if (sci >= numSoft) return;
+    dual_soft_one(posLin, posAng, initLin, initAng, soft, P, sci);
+}
+
 // Persistent solver for small scenes: ALL iterations x colors x dual updates
 // in a single dispatch of one threadgroup. Scenes with few bodies and many
 // iterations are dominated by per-dispatch launch/barrier latency (~40us
@@ -2220,6 +2516,107 @@ kernel void solve_persistent(
             } else {
                 uint sci = g - P.numJoints - P.numSprings - numPairs;
                 dual_soft_one(posLin, posAng, initLin, initAng, soft, P, sci);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+// Torsion-enabled small-scene specialization. Like `solve_persistent`, this
+// keeps all colors and dual updates in one command dispatch; twist is stamped
+// into the same body solve and advanced beside the manifold dual.
+kernel void solve_persistent_torsion(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device JointGPU* joints         [[buffer(7)]],
+    device SpringGPU* springs       [[buffer(8)]],
+    device ManifoldGPU* manifolds   [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    device const atomic_uint* counters [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device SoftContactGPU* soft     [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    device float4* torsionState         [[buffer(25)]],
+    device const uint* boundsBits   [[buffer(26)]],
+    device const float4* ogcPrev    [[buffer(27)]],
+    device atomic_uint* ogcCounters [[buffer(28)]],
+    uint tid                        [[thread_position_in_threadgroup]],
+    uint tgSize                     [[threads_per_threadgroup]])
+{
+    uint numPairs = atomic_load_explicit(
+        &counters[CTR_PAIRS], memory_order_relaxed);
+    uint numSoft = min(atomic_load_explicit(
+        &counters[CTR_SOFT], memory_order_relaxed), P.maxSoft);
+    uint dualTotal = P.numJoints + P.numSprings + numPairs + numSoft;
+    uint usedColors = colorStart[MAX_COLORS + 1];
+    for (uint iter = 0; iter < P.iterations; iter++) {
+        for (uint c = 0; c < usedColors; c++) {
+            uint s0 = colorStart[c];
+            uint e0 = colorStart[c + 1];
+            if (s0 == e0) continue;
+            for (uint i = s0 + tid; i < e0; i += tgSize) {
+                primal_one_torsion(
+                    posLin, posAng, initLin, initAng, inertLin, inertAng,
+                    props, joints, springs, manifolds,
+                    adjStart, adjCount, adjList, P, shape, tets, soft,
+                    membranes, bends, boundsBits, ogcPrev, ogcCounters,
+                    torsionState, colorList[i]);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        for (uint g = tid; g < dualTotal; g += tgSize) {
+            if (g < P.numJoints) {
+                if (joints[g].header.z == 0)
+                    dual_joint_one(posLin, posAng, joints, P, g);
+            } else if (g < P.numJoints + P.numSprings) {
+                device SpringGPU& sp = springs[g - P.numJoints];
+                if (sp.header.z != 0) {
+                    uint a = sp.header.x, b = sp.header.y;
+                    float3 pA = xform(
+                        posLin[a].xyz, posAng[a], sp.rA.xyz);
+                    float3 pB = xform(
+                        posLin[b].xyz, posAng[b], sp.rB.xyz);
+                    float C = length(pA - pB) - sp.rB.w
+                        - sp.dual.z * P.alpha;
+                    float mA = posLin[a].w, mB = posLin[b].w;
+                    float mMin = min(mA > 0.0f ? mA : FLT_MAX,
+                                     mB > 0.0f ? mB : FLT_MAX);
+                    float cap = min(
+                        P.lambdaMax, max(2.0f, 5.0e3f * mMin));
+                    sp.dual.x = clamp(
+                        0.98f * sp.dual.x + sp.dual.y * C, 0.0f, cap);
+                    if (C > 0.0f) {
+                        sp.dual.y = min(
+                            sp.dual.y + C * P.betaLin,
+                            min(sp.rA.w, PENALTY_MAX));
+                    }
+                }
+            } else if (g < P.numJoints + P.numSprings + numPairs) {
+                uint mi = g - P.numJoints - P.numSprings;
+                if (manifolds[mi].header.z != 0) {
+                    dual_manifold_one(
+                        posLin, posAng, initLin, initAng,
+                        manifolds, P, mi);
+                    dual_torsion_one(
+                        posLin, posAng, initLin, initAng,
+                        manifolds, torsionState, P, mi);
+                }
+            } else {
+                uint sci = g - P.numJoints - P.numSprings - numPairs;
+                dual_soft_one(
+                    posLin, posAng, initLin, initAng, soft, P, sci);
             }
         }
         threadgroup_barrier(mem_flags::mem_device);
