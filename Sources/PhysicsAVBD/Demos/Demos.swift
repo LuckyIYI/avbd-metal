@@ -18,7 +18,7 @@ public struct DemoParam: Identifiable {
 
 public enum Demos {
     public static var all: [String] {
-        ["gaudifunicular", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+        ["gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
          "convexdecomp", "classicrigids",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
@@ -82,8 +82,8 @@ public enum Demos {
     }
 
     /// Scalable demos use 1 = small (original size), 2 = medium, 4 = large,
-    /// and 8 = giant. `res` overrides cloth resolution. Fixed showcases report
-    /// `supportsScale(_:) == false` and ignore `scale` deliberately.
+    /// 8 = giant, and 16 = colossal. `res` overrides cloth resolution. Fixed
+    /// showcases report `supportsScale(_:) == false` and ignore `scale`.
     /// `params` carries the per-demo tunables (missing key or a value of
     /// -1 = scale-derived default).
     public static func make(_ name: String, scale: Int = 1, res: Int? = nil,
@@ -109,6 +109,7 @@ public enum Demos {
             slack: p("slack", 1.12),
             linearDamping: p("linearDamping", 1.8),
             angularDamping: p("angularDamping", 2.6))
+        case "boxofboxes": return boxOfBoxes(scale: s)
         case "stack": return stack(height: 10 * s)
         case "ratiostack": return ratiostack(levels: min(8, 3 + s))
         case "slopefriction": return slopefriction(count: 6 + 2 * s)
@@ -229,6 +230,49 @@ public enum Demos {
                           position: F3(0, 0, 0.5 + Float(i)))
         }
         return s
+    }
+
+    /// A dense lattice of identical dynamic cubes that reads as one larger
+    /// rectangular box. The app's Colossal tier (scale 16) is exactly
+    /// 50 x 50 x 80 = 200,000 cubes; lower tiers keep the same proportions.
+    public static func boxOfBoxes(scale: Int = 1) -> PhysicsScene {
+        let dimensions = boxOfBoxesDimensions(scale: scale)
+        let count = dimensions.x * dimensions.y * dimensions.z
+        let cubeSide: Float = 0.2
+
+        var s = PhysicsScene(name: "boxofboxes")
+        s.bodies.reserveCapacity(count + 1)
+        s.colliders.reserveCapacity(count + 1)
+        addGround(&s)
+
+        let xOrigin = -Float(dimensions.x - 1) * cubeSide / 2
+        let yOrigin = -Float(dimensions.y - 1) * cubeSide / 2
+        for z in 0..<dimensions.z {
+            let pz = (Float(z) + 0.5) * cubeSide
+            for y in 0..<dimensions.y {
+                let py = yOrigin + Float(y) * cubeSide
+                for x in 0..<dimensions.x {
+                    let px = xOrigin + Float(x) * cubeSide
+                    _ = s.addBody(
+                        size: F3(repeating: cubeSide), density: 1,
+                        friction: 0.65, position: F3(px, py, pz))
+                }
+            }
+        }
+
+        let width = Float(max(dimensions.x, dimensions.y)) * cubeSide
+        let height = Float(dimensions.z) * cubeSide
+        s.settings.cameraDistance = max(4, max(width, height) * 2.2)
+        s.settings.cameraTargetZ = height / 2
+        return s
+    }
+
+    static func boxOfBoxesDimensions(scale: Int) -> (x: Int, y: Int, z: Int) {
+        let scale = max(1, scale)
+        func scaled(_ colossalDimension: Int) -> Int {
+            max(1, Int((Float(colossalDimension) * Float(scale) / 16).rounded()))
+        }
+        return (scaled(50), scaled(50), scaled(80))
     }
 
     public static func wall(width: Int, height: Int) -> PhysicsScene {

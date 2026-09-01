@@ -62,6 +62,7 @@ struct ContentView: View {
                         ForEach(Demos.all, id: \.self) {
                             Text($0 == "gaudifunicular" ? "Gaudí Funicular"
                                 : $0 == "classicrigids" ? "Classic Rigid Bodies"
+                                : $0 == "boxofboxes" ? "Box of Boxes"
                                 : $0)
                         }
                     }

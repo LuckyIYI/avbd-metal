@@ -337,6 +337,24 @@ final class GPUSolverTests: XCTestCase {
 
         XCTAssertNil(solver.runtimeFailure)
         XCTAssertLessThan(solver.lastMaxColorUsed, AVBD_MAX_COLORS)
+        let colorChanges = solver.changedFlag.contents().bindMemory(
+            to: UInt32.self, capacity: 24)
+        XCTAssertEqual(
+            colorChanges[19], 0,
+            "a settled dense stack must not run the serial coloring fallback")
+    }
+
+    func testLargeBoxOfBoxesRunsCompactRigidSolve() throws {
+        var scene = Demos.boxOfBoxes(scale: 4)
+        scene.settings.iterations = 2
+        let solver = try makeGPU(scene)
+
+        XCTAssertGreaterThan(solver.bodyCount, 1_024)
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertGreaterThan(solver.lastNumPairs, 0)
     }
 
     func testStaticColorPaletteExhaustionFailsDuringInitialization() throws {

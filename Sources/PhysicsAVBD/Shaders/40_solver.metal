@@ -2,6 +2,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#define ORDERED_COLORING_BODY_LIMIT 1024u
+
 // ============================================================================
 // AVBD solver kernels: adjacency (CSR), coloring, warm start, primal update
 // (per color, 6x6 LDL in registers), dual update, velocity finalize.
@@ -254,14 +256,18 @@ inline uint otherBody(device const JointGPU* joints,
     uint kind = entry >> ADJ_KIND_SHIFT;
     uint idx = entry & ADJ_INDEX_MASK;
     uint a, b;
-    if (kind == FK_JOINT) { a = joints[idx].header.x; b = joints[idx].header.y; }
-    else if (kind == FK_SPRING) { a = springs[idx].header.x; b = springs[idx].header.y; }
-    else { a = manifolds[idx].header.x; b = manifolds[idx].header.y; }
+    if (kind == FK_JOINT) {
+        a = joints[idx].header.x; b = joints[idx].header.y;
+    } else if (kind == FK_SPRING) {
+        a = springs[idx].header.x; b = springs[idx].header.y;
+    } else {
+        a = manifolds[idx].header.x; b = manifolds[idx].header.y;
+    }
     return a == self ? b : a;
 }
 
-// Accumulate the neighbor-color masks for one adjacency entry; tets and
-// element contacts conflict with all other participating vertices.
+// Keep the established small-scene path unchanged. It supports every force
+// kind even though dynamic coloring currently runs only for rigid scenes.
 inline void neighborColors(device const JointGPU* joints,
                            device const SpringGPU* springs,
                            device const ManifoldGPU* manifolds,
@@ -287,7 +293,9 @@ inline void neighborColors(device const JointGPU* joints,
     } else if (kind == FK_SOFT) {
         uint4 ids = soft[idx].ids;
         for (uint k = 0; k < 4; k++) {
-            if (ids[k] != self && ids[k] != WORLD_BODY && n < 3) { nbs[n++] = ids[k]; }
+            if (ids[k] != self && ids[k] != WORLD_BODY && n < 3) {
+                nbs[n++] = ids[k];
+            }
         }
     } else if (kind == FK_MEMBRANE) {
         uint4 ids = membranes[idx].ids;
@@ -317,6 +325,48 @@ inline void neighborColors(device const JointGPU* joints,
     }
 }
 
+// Extract one compact opposite-body id per sorted rigid CSR entry. This pass
+// runs only for large rigid scenes, leaving the established adjacency and
+// coloring execution of existing scenes untouched.
+kernel void adj_extract_neighbors(
+    device const JointGPU* joints   [[buffer(0)]],
+    device const SpringGPU* springs [[buffer(1)]],
+    device const ManifoldGPU* manifolds [[buffer(2)]],
+    device const uint* adjStart     [[buffer(3)]],
+    device const uint* adjCount     [[buffer(4)]],
+    device const uint* adjList      [[buffer(5)]],
+    device uint* adjNeighbor        [[buffer(6)]],
+    constant uint& numBodies        [[buffer(7)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= numBodies) return;
+    uint s = adjStart[gid], e = s + adjCount[gid];
+    for (uint k = s; k < e; k++) {
+        adjNeighbor[k] = otherBody(joints, springs, manifolds,
+                                   adjList[k], gid);
+    }
+}
+
+// Dynamic coloring is used only for rigid scenes, whose forces all have two
+// endpoints. Large scenes read the extracted opposite endpoint stream instead
+// of randomly dereferencing 704-byte manifold records on every pass.
+inline void neighborColor(device const float4* posLin,
+                           device const uint* colorsIn,
+                           uint nb, uint self, uint myColor,
+                           thread uint& maskLo, thread uint& maskHi,
+                           thread uint& allLo, thread uint& allHi,
+                           thread bool& conflict) {
+    if (nb == WORLD_BODY || posLin[nb].w <= 0.0f) return;
+    uint nc = colorsIn[nb];
+    uint lo = nc < 32 ? (1u << nc) : 0;
+    uint hi = (nc >= 32 && nc < 64) ? (1u << (nc - 32)) : 0;
+    allLo |= lo; allHi |= hi;
+    if (nb < self) {
+        maskLo |= lo; maskHi |= hi;
+        if (nc == myColor) conflict = true;
+    }
+}
+
 kernel void color_iterate(
     device const float4* posLin     [[buffer(0)]],
     device const JointGPU* joints   [[buffer(1)]],
@@ -334,6 +384,7 @@ kernel void color_iterate(
     device const MembraneGPU* membranes [[buffer(13)]],
     device const BendGPU* bends     [[buffer(14)]],
     constant uint& passIdx          [[buffer(15)]],
+    device const uint* adjNeighbor  [[buffer(16)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -353,29 +404,42 @@ kernel void color_iterate(
     bool conflict = false;
 
     uint s = adjStart[gid], e = s + adjCount[gid];
+    bool orderedCompatibility = P.numBodies
+        <= ORDERED_COLORING_BODY_LIMIT;
     for (uint k = s; k < e; k++) {
-        neighborColors(joints, springs, manifolds, tets, soft, membranes, bends,
-                       posLin, colorsIn,
-                       adjList[k], gid, myColor,
-                       maskLo, maskHi, allLo, allHi, conflict);
+        if (orderedCompatibility) {
+            neighborColors(joints, springs, manifolds, tets, soft,
+                           membranes, bends, posLin, colorsIn, adjList[k],
+                           gid, myColor, maskLo, maskHi, allLo, allHi,
+                           conflict);
+        } else {
+            neighborColor(posLin, colorsIn, adjNeighbor[k], gid, myColor,
+                          maskLo, maskHi, allLo, allHi, conflict);
+        }
     }
 
     if (conflict) {
-        // smallest free color among smaller-index neighbors
-        uint freeLo = ~maskLo;
+        // Preserve the established small-scene ordering, while large graphs
+        // pick a color free across ALL current neighbors. Restricting the
+        // latter to smaller neighbors makes convergence travel one graph hop
+        // at a time.
+        uint freeLo = orderedCompatibility ? ~maskLo : ~allLo;
         uint newColor;
         if (freeLo != 0) newColor = ctz(freeLo);
         else {
-            uint freeHi = ~maskHi;
+            uint freeHi = orderedCompatibility ? ~maskHi : ~allHi;
             newColor = freeHi != 0 ? 32 + ctz(freeHi) : (MAX_COLORS - 1);
         }
         colorsOut[gid] = min(newColor, uint(MAX_COLORS - 1));
         atomic_fetch_or_explicit(&changedFlag[passIdx], 1u, memory_order_relaxed);
+    } else if (P.numBodies > ORDERED_COLORING_BODY_LIMIT) {
+        // Preserve valid warm-started colors. Recompacting every body every
+        // frame made dense contact graphs oscillate for all 20 passes and
+        // forced the serial fallback even when no contact changed.
+        colorsOut[gid] = myColor;
     } else {
-        // Compaction: take the smallest color free w.r.t. ALL dynamic
-        // neighbors when it is below the current one. Keeps the palette
-        // dense so the solver loop dispatches few colors; any transient
-        // conflict is fixed by the smaller-index rule next round.
+        // The existing demos below the scaling threshold retain their exact
+        // palette compaction and therefore their authored solve order.
         uint freeLo = ~allLo;
         uint best = freeLo != 0 ? ctz(freeLo)
                   : (~allHi != 0 ? 32 + ctz(~allHi) : myColor);
@@ -387,10 +451,9 @@ kernel void color_iterate(
 }
 
 // Complete an unfinished parallel coloring deterministically. A synchronous
-// ordered relaxation can require one pass per graph hop (a tall stack is the
-// canonical case), so the bounded parallel phase above is only an optimizer.
-// This single-thread greedy sweep is conditional on the final pass changing
-// and provides the exact correctness boundary before color_validate.
+// ordered relaxation can require one pass per graph hop, so the bounded
+// parallel phase is only an optimizer. This sweep runs only when the final
+// pass still changed; color_validate remains the exact correctness boundary.
 kernel void color_repair_greedy(
     device const float4* posLin     [[buffer(0)]],
     device const JointGPU* joints   [[buffer(1)]],
@@ -407,11 +470,12 @@ kernel void color_repair_greedy(
     device const MembraneGPU* membranes [[buffer(12)]],
     device const BendGPU* bends     [[buffer(13)]],
     constant uint& finalPass        [[buffer(14)]],
+    device const uint* adjNeighbor  [[buffer(15)]],
     uint gid                        [[thread_position_in_grid]])
 {
-    if (gid != 0u ||
-        atomic_load_explicit(&changedFlag[finalPass],
-                             memory_order_relaxed) == 0u) return;
+    bool needsRepair = atomic_load_explicit(&changedFlag[finalPass],
+                                            memory_order_relaxed) != 0u;
+    if (gid != 0u || !needsRepair) return;
 
     for (uint self = 0; self < P.numBodies; self++) {
         if (posLin[self].w <= 0.0f) {
@@ -422,11 +486,19 @@ kernel void color_repair_greedy(
         uint allLo = 0u, allHi = 0u;
         bool conflict = false;
         uint s = adjStart[self], e = s + adjCount[self];
+        bool orderedCompatibility = P.numBodies
+            <= ORDERED_COLORING_BODY_LIMIT;
         for (uint k = s; k < e; k++) {
-            neighborColors(joints, springs, manifolds, tets, soft,
-                           membranes, bends, posLin, colors,
-                           adjList[k], self, colors[self], maskLo, maskHi,
-                           allLo, allHi, conflict);
+            if (orderedCompatibility) {
+                neighborColors(joints, springs, manifolds, tets, soft,
+                               membranes, bends, posLin, colors, adjList[k],
+                               self, colors[self], maskLo, maskHi, allLo,
+                               allHi, conflict);
+            } else {
+                neighborColor(posLin, colors, adjNeighbor[k], self,
+                              colors[self], maskLo, maskHi, allLo, allHi,
+                              conflict);
+            }
         }
         uint freeLo = ~maskLo;
         if (freeLo != 0u) {
@@ -460,16 +532,25 @@ kernel void color_validate(
     device const SoftContactGPU* soft [[buffer(11)]],
     device const MembraneGPU* membranes [[buffer(12)]],
     device const BendGPU* bends     [[buffer(13)]],
+    device const uint* adjNeighbor  [[buffer(14)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies || posLin[gid].w <= 0.0f) return;
     uint maskLo = 0, maskHi = 0, allLo = 0, allHi = 0;
     bool conflict = false;
     uint s = adjStart[gid], e = s + adjCount[gid];
+    bool orderedCompatibility = P.numBodies
+        <= ORDERED_COLORING_BODY_LIMIT;
     for (uint k = s; k < e; k++) {
-        neighborColors(joints, springs, manifolds, tets, soft, membranes,
-                       bends, posLin, colors, adjList[k], gid, colors[gid],
-                       maskLo, maskHi, allLo, allHi, conflict);
+        if (orderedCompatibility) {
+            neighborColors(joints, springs, manifolds, tets, soft,
+                           membranes, bends, posLin, colors, adjList[k], gid,
+                           colors[gid], maskLo, maskHi, allLo, allHi,
+                           conflict);
+        } else {
+            neighborColor(posLin, colors, adjNeighbor[k], gid, colors[gid],
+                          maskLo, maskHi, allLo, allHi, conflict);
+        }
     }
     if (conflict) {
         atomic_fetch_add_explicit(&counters[CTR_COLOR_CONFLICTS], 1u,
@@ -497,6 +578,7 @@ kernel void color_scan(
     device atomic_uint* counters    [[buffer(0)]],
     device uint* colorStart         [[buffer(1)]],   // MAX_COLORS + 1
     device uint* dispatchArgs       [[buffer(2)]],   // MAX_COLORS * 3 uints
+    constant uint& threadsPerBody   [[buffer(3)]],
     uint tid                        [[thread_position_in_threadgroup]])
 {
     threadgroup uint counts[MAX_COLORS];
@@ -517,9 +599,8 @@ kernel void color_scan(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < MAX_COLORS) {
-        // x8: the dynamic primal runs the 8-lane cooperative split kernel;
-        // the one-thread-per-body fallback early-outs the excess groups
-        dispatchArgs[tid * 3 + 0] = (counts[tid] * 8 + 63) / 64;
+        dispatchArgs[tid * 3 + 0] =
+            (counts[tid] * threadsPerBody + 63) / 64;
         dispatchArgs[tid * 3 + 1] = 1;
         dispatchArgs[tid * 3 + 2] = 1;
     }
@@ -1270,6 +1351,125 @@ inline float contactTorsionC(device const ManifoldGPU& m, float4 state,
     return clamp(unconstrained, -bound, bound);
 }
 
+inline float3 solverContactC0(device const SolverContactGPU& c)
+{
+    return float3(c.rB_C0x.w, c.C0yz_lambdaXY.xy);
+}
+
+inline float3 solverContactLambda(device const SolverContactGPU& c)
+{
+    return float3(c.C0yz_lambdaXY.zw, c.lambdaZ_penalty.x);
+}
+
+inline float3 solverContactForceC(
+    device const SolverManifoldGPU& m,
+    device const SolverContactGPU& c,
+    float3 dqALin, float3 dqAAng, float3 dqBLin, float3 dqBAng,
+    float3 rAW, float3 rBW, float alpha,
+    thread float3& Cout, thread float& frictionScale, thread float& bounds)
+{
+    float3 nrm = m.basisN.xyz;
+    float3 t1 = m.basisT1.xyz;
+    float3 t2 = cross(nrm, t1);
+
+    float3 C = solverContactC0(c) * (1.0f - alpha);
+    C += float3(dot(nrm, dqALin), dot(t1, dqALin), dot(t2, dqALin));
+    C -= float3(dot(nrm, dqBLin), dot(t1, dqBLin), dot(t2, dqBLin));
+    C += float3(dot(cross(rAW, nrm), dqAAng), dot(cross(rAW, t1), dqAAng), dot(cross(rAW, t2), dqAAng));
+    C -= float3(dot(cross(rBW, nrm), dqBAng), dot(cross(rBW, t1), dqBAng), dot(cross(rBW, t2), dqBAng));
+
+    float3 F = c.lambdaZ_penalty.yzw * C + solverContactLambda(c);
+    F.x = min(F.x, 0.0f);
+    bounds = fabs(F.x) * m.basisT1.w;
+    frictionScale = length(F.yz);
+    if (frictionScale > bounds && frictionScale > 0.0f) {
+        float dynamicBounds = fabs(F.x) * m.basisN.w;
+        F.yz *= dynamicBounds / frictionScale;
+    }
+    Cout = C;
+    return F;
+}
+
+inline void stampSolverManifold(
+    device const SolverManifoldGPU* solveManifolds,
+    device const SolverContactGPU* solveContacts,
+    uint manifoldIndex, uint maxManifolds, uint self,
+    device const float4* posLin, device const float4* posAng,
+    device const float4* initLin, device const float4* initAng,
+    float alpha, thread PrimalAccum& acc)
+{
+    device const SolverManifoldGPU& m = solveManifolds[manifoldIndex];
+    uint a = m.header.x, b = m.header.y;
+    uint n = m.header.z;
+    bool isA = self == a;
+    bool sphA = (m.header.w & 2u) != 0;
+    bool sphB = (m.header.w & 4u) != 0;
+
+    float3 dqALin = posLin[a].xyz - initLin[a].xyz;
+    float3 dqAAng = q_sub(posAng[a], initAng[a]);
+    float3 dqBLin = posLin[b].xyz - initLin[b].xyz;
+    float3 dqBAng = q_sub(posAng[b], initAng[b]);
+
+    float3 nrm = m.basisN.xyz;
+    float3 t1 = m.basisT1.xyz;
+    float3 t2 = cross(nrm, t1);
+
+    for (uint i = 0; i < n; ++i) {
+        device const SolverContactGPU& c =
+            solveContacts[i * maxManifolds + manifoldIndex];
+        float3 rAW = sphA ? c.rAStick.xyz
+                          : q_rotate(posAng[a], c.rAStick.xyz);
+        float3 rBW = sphB ? c.rB_C0x.xyz
+                          : q_rotate(posAng[b], c.rB_C0x.xyz);
+
+        float3 C; float fs, bnd;
+        float3 F = solverContactForceC(
+            m, c, dqALin, dqAAng, dqBLin, dqBAng,
+            rAW, rBW, alpha, C, fs, bnd);
+
+        float s = isA ? 1.0f : -1.0f;
+        M3 jLin = M3{nrm * s, t1 * s, t2 * s};
+        float3 rW = isA ? rAW : rBW;
+        M3 jAng = M3{cross(rW, jLin.r0), cross(rW, jLin.r1), cross(rW, jLin.r2)};
+        M3 K = m3_diag(c.lambdaZ_penalty.yzw);
+        M3 jLinT = m3_transpose(jLin);
+        M3 jAngT = m3_transpose(jAng);
+        M3 jAngTk = m3_mulm(jAngT, K);
+
+        acc.lhsLin = m3_add(acc.lhsLin, m3_mulm(m3_mulm(jLinT, K), jLin));
+        acc.lhsAng = m3_add(acc.lhsAng, m3_mulm(jAngTk, jAng));
+        acc.lhsCross = m3_add(acc.lhsCross, m3_mulm(jAngTk, jLin));
+        acc.rhsLin += m3_mul(jLinT, F);
+        acc.rhsAng += m3_mul(jAngT, F);
+    }
+}
+
+kernel void manifold_solver_pack(
+    device const ManifoldGPU* manifolds [[buffer(0)]],
+    device SolverManifoldGPU* solveManifolds [[buffer(1)]],
+    device SolverContactGPU* solveContacts [[buffer(2)]],
+    device const atomic_uint* counters [[buffer(3)]],
+    constant SimParams& P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint numPairs = atomic_load_explicit(
+        &counters[CTR_PAIRS], memory_order_relaxed);
+    if (gid >= numPairs) return;
+    device const ManifoldGPU& src = manifolds[gid];
+    device SolverManifoldGPU& dst = solveManifolds[gid];
+    dst.header = src.header;
+    dst.basisN = src.basisN;
+    dst.basisT1 = src.basisT1;
+    for (uint i = 0; i < src.header.z; ++i) {
+        device const ContactGPU& sc = src.contacts[i];
+        device SolverContactGPU& dc = solveContacts[i * P.maxManifolds + gid];
+        dc.rAStick = float4(sc.rA.xyz, sc.rB.w);
+        dc.rB_C0x = float4(sc.rB.xyz, sc.C0.x);
+        dc.C0yz_lambdaXY = float4(sc.C0.yz, sc.lambda.xy);
+        dc.lambdaZ_penalty = float4(sc.lambda.z, sc.penalty.xyz);
+    }
+}
+
 inline void stampManifold(device const ManifoldGPU& m, uint self,
                           device const float4* posLin, device const float4* posAng,
                           device const float4* initLin, device const float4* initAng,
@@ -1811,45 +2011,48 @@ kernel void primal_solve_torsion(
         ogcCounters, torsionState, colorList[s + tid]);
 }
 
-// Lane-split particle primal: 8 threads per body each stamp a slice of
-// its adjacency, reduce the 3-DOF system via simd_shuffle_xor, lane 0
-// solves. Per-body serial stamping (~20-30 scattered gathers) left mid-
-// size cloth dispatches latency-bound at ~3% occupancy; the split gives
-// 8x the threads at 1/8 the serial depth. Rigid bodies in the color fall
-// back to the full per-body path on lane 0 (rare in soft scenes).
-kernel void primal_particles_split(
-    device float4* posLin           [[buffer(0)]],
-    device float4* posAng           [[buffer(1)]],
-    device const float4* initLin    [[buffer(2)]],
-    device const float4* initAng    [[buffer(3)]],
-    device const float4* inertLin   [[buffer(4)]],
-    device const float4* inertAng   [[buffer(5)]],
-    device const float4* props      [[buffer(6)]],
-    device const JointGPU* joints   [[buffer(7)]],
-    device const SpringGPU* springs [[buffer(8)]],
-    device const ManifoldGPU* manifolds [[buffer(9)]],
-    device const uint* adjStart     [[buffer(10)]],
-    device const uint* adjCount     [[buffer(11)]],
-    device const uint* adjList      [[buffer(12)]],
-    device const uint* colorList    [[buffer(13)]],
-    device const uint* colorStart   [[buffer(14)]],
-    constant uint& colorIndex       [[buffer(15)]],
-    constant SimParams& P           [[buffer(16)]],
-    device const float4* shape      [[buffer(17)]],
-    device const TetGPU* tets       [[buffer(18)]],
-    device const SoftContactGPU* soft [[buffer(19)]],
-    device const MembraneGPU* membranes [[buffer(20)]],
-    device const BendGPU* bends     [[buffer(21)]],
-    device const uint* boundsBits   [[buffer(22)]],
-    device const float4* ogcPrev    [[buffer(23)]],
-    device atomic_uint* ogcCounters [[buffer(24)]],
-    uint tid                        [[thread_position_in_grid]])
+// Lane-split primal: 8 threads/body for established mixed/soft scenes and
+// 16 for large compact rigid manifolds. Each lane stamps an adjacency slice,
+// the group reduces the system via simd_shuffle_xor, and lane 0 solves.
+// Per-body serial stamping (~20-30 scattered gathers) left contact-rich
+// dispatches latency-bound; cooperative stamping exposes those gathers.
+template <uint splitShift, uint splitWidth>
+static inline void primal_split_impl(
+    device float4* posLin,
+    device float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device const float4* inertLin,
+    device const float4* inertAng,
+    device const float4* props,
+    device const JointGPU* joints,
+    device const SpringGPU* springs,
+    device const ManifoldGPU* manifolds,
+    device const uint* adjStart,
+    device const uint* adjCount,
+    device const uint* adjList,
+    device const uint* colorList,
+    device const uint* colorStart,
+    constant uint& colorIndex,
+    constant SimParams& P,
+    device const float4* shape,
+    device const TetGPU* tets,
+    device const SoftContactGPU* soft,
+    device const MembraneGPU* membranes,
+    device const BendGPU* bends,
+    device const uint* boundsBits,
+    device const float4* ogcPrev,
+    device atomic_uint* ogcCounters,
+    device const SolverManifoldGPU* solveManifolds,
+    device const SolverContactGPU* solveContacts,
+    constant uint& useCompactManifolds,
+    uint tid)
 {
     uint s = colorStart[colorIndex];
     uint e = colorStart[colorIndex + 1];
-    uint slot = tid >> 3;
-    uint lane = tid & 7u;
-    if (s + slot >= e) return;              // uniform across the 8-lane group
+    uint slot = tid >> splitShift;
+    uint lane = tid & (splitWidth - 1u);
+    if (s + slot >= e) return;       // uniform across the cooperative group
     uint body = colorList[s + slot];
     // Rigids stamp cooperatively too: a box resting on high-res cloth
     // gathers THOUSANDS of contacts (rt corner-tri + particle np) in its
@@ -1866,7 +2069,7 @@ kernel void primal_particles_split(
 
     uint as = adjStart[body];
     uint cnt = adjCount[body];
-    for (uint k = lane; k < cnt; k += 8) {
+    for (uint k = lane; k < cnt; k += splitWidth) {
         uint entry = adjList[as + k];
         uint kind = entry >> ADJ_KIND_SHIFT;
         uint idx = entry & ADJ_INDEX_MASK;
@@ -1882,14 +2085,18 @@ kernel void primal_particles_split(
             stampMembrane(membranes[idx], body, posLin, acc);
         } else if (kind == FK_BEND) {
             stampBend(bends[idx], body, posLin, acc);
+        } else if (useCompactManifolds != 0u) {
+            stampSolverManifold(
+                solveManifolds, solveContacts, idx, P.maxManifolds, body,
+                posLin, posAng, initLin, initAng, P.alpha, acc);
         } else {
             stampManifold(manifolds[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
         }
     }
 
-    // reduce across the 8 lanes (consecutive lanes of one simdgroup):
+    // reduce across the consecutive lanes of one simdgroup:
     // particles need only the linear 3x3, rigids the full 6x6
-    for (ushort d = 4; d >= 1; d >>= 1) {
+    for (ushort d = ushort(splitWidth >> 1); d >= 1; d >>= 1) {
         acc.lhsLin.r0 += simd_shuffle_xor(acc.lhsLin.r0, d);
         acc.lhsLin.r1 += simd_shuffle_xor(acc.lhsLin.r1, d);
         acc.lhsLin.r2 += simd_shuffle_xor(acc.lhsLin.r2, d);
@@ -2105,6 +2312,58 @@ kernel void primal_particles_split_torsion(
     if (rigid) posAng[body] = q_addw(posAng[body], dxAng);
 }
 
+#define PRIMAL_SPLIT_KERNEL_ARGS \
+    device float4* posLin [[buffer(0)]], \
+    device float4* posAng [[buffer(1)]], \
+    device const float4* initLin [[buffer(2)]], \
+    device const float4* initAng [[buffer(3)]], \
+    device const float4* inertLin [[buffer(4)]], \
+    device const float4* inertAng [[buffer(5)]], \
+    device const float4* props [[buffer(6)]], \
+    device const JointGPU* joints [[buffer(7)]], \
+    device const SpringGPU* springs [[buffer(8)]], \
+    device const ManifoldGPU* manifolds [[buffer(9)]], \
+    device const uint* adjStart [[buffer(10)]], \
+    device const uint* adjCount [[buffer(11)]], \
+    device const uint* adjList [[buffer(12)]], \
+    device const uint* colorList [[buffer(13)]], \
+    device const uint* colorStart [[buffer(14)]], \
+    constant uint& colorIndex [[buffer(15)]], \
+    constant SimParams& P [[buffer(16)]], \
+    device const float4* shape [[buffer(17)]], \
+    device const TetGPU* tets [[buffer(18)]], \
+    device const SoftContactGPU* soft [[buffer(19)]], \
+    device const MembraneGPU* membranes [[buffer(20)]], \
+    device const BendGPU* bends [[buffer(21)]], \
+    device const uint* boundsBits [[buffer(22)]], \
+    device const float4* ogcPrev [[buffer(23)]], \
+    device atomic_uint* ogcCounters [[buffer(24)]], \
+    device const SolverManifoldGPU* solveManifolds [[buffer(25)]], \
+    device const SolverContactGPU* solveContacts [[buffer(26)]], \
+    constant uint& useCompactManifolds [[buffer(27)]], \
+    uint tid [[thread_position_in_grid]]
+
+#define CALL_PRIMAL_SPLIT(SHIFT, WIDTH) \
+    primal_split_impl<SHIFT, WIDTH>( \
+        posLin, posAng, initLin, initAng, inertLin, inertAng, props, \
+        joints, springs, manifolds, adjStart, adjCount, adjList, \
+        colorList, colorStart, colorIndex, P, shape, tets, soft, \
+        membranes, bends, boundsBits, ogcPrev, ogcCounters, \
+        solveManifolds, solveContacts, useCompactManifolds, tid)
+
+kernel void primal_particles_split(PRIMAL_SPLIT_KERNEL_ARGS)
+{
+    CALL_PRIMAL_SPLIT(3u, 8u);
+}
+
+kernel void primal_rigid_split(PRIMAL_SPLIT_KERNEL_ARGS)
+{
+    CALL_PRIMAL_SPLIT(4u, 16u);
+}
+
+#undef CALL_PRIMAL_SPLIT
+#undef PRIMAL_SPLIT_KERNEL_ARGS
+
 // Dual update for one element contact: bounded normal dual (cap scaled to
 // the participating masses at detection), friction-coned tangentials,
 // ramped penalties — the rigid-contact treatment on the 4-slot stencil.
@@ -2318,6 +2577,73 @@ static inline void dual_torsion_one(
     torsionState[gid] = state;
 }
 
+static inline void dual_solver_manifold_one(
+    device const float4* posLin,
+    device const float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device const SolverManifoldGPU* solveManifolds,
+    device SolverContactGPU* solveContacts,
+    device ManifoldGPU* manifolds,
+    bool writeBack,
+    constant SimParams& P,
+    uint gid)
+{
+    device const SolverManifoldGPU& m = solveManifolds[gid];
+    uint n = m.header.z;
+    if (n == 0) return;
+
+    uint a = m.header.x, b = m.header.y;
+    bool sphA = (m.header.w & 2u) != 0;
+    bool sphB = (m.header.w & 4u) != 0;
+    float3 dqALin = posLin[a].xyz - initLin[a].xyz;
+    float3 dqAAng = q_sub(posAng[a], initAng[a]);
+    float3 dqBLin = posLin[b].xyz - initLin[b].xyz;
+    float3 dqBAng = q_sub(posAng[b], initAng[b]);
+
+    float mA = posLin[a].w, mB = posLin[b].w;
+    float minMass = min(mA > 0.0f ? mA : FLT_MAX,
+                        mB > 0.0f ? mB : FLT_MAX);
+    float lamCap = min(P.lambdaMax, max(10.0f, 1.0e5f * minMass));
+
+    for (uint i = 0; i < n; ++i) {
+        device SolverContactGPU& c =
+            solveContacts[i * P.maxManifolds + gid];
+        float3 rAW = sphA ? c.rAStick.xyz
+                          : q_rotate(posAng[a], c.rAStick.xyz);
+        float3 rBW = sphB ? c.rB_C0x.xyz
+                          : q_rotate(posAng[b], c.rB_C0x.xyz);
+
+        float3 C; float fs, bnd;
+        float3 F = solverContactForceC(
+            m, c, dqALin, dqAAng, dqBLin, dqBAng,
+            rAW, rBW, P.alpha, C, fs, bnd);
+
+        F.x = max(F.x, -lamCap);
+        c.C0yz_lambdaXY.zw = F.xy;
+        c.lambdaZ_penalty.x = F.z;
+
+        float3 pen = c.lambdaZ_penalty.yzw;
+        if (F.x < 0.0f) {
+            pen.x = min(pen.x + P.betaLin * fabs(C.x), PENALTY_MAX);
+        }
+        if (fs <= bnd) {
+            pen.y = min(pen.y + P.betaLin * fabs(C.y), PENALTY_MAX_T);
+            pen.z = min(pen.z + P.betaLin * fabs(C.z), PENALTY_MAX_T);
+            c.rAStick.w = length(C.yz) < STICK_THRESH ? 1.0f : 0.0f;
+        } else {
+            c.rAStick.w = 0.0f;
+        }
+        c.lambdaZ_penalty.yzw = pen;
+        if (writeBack) {
+            device ContactGPU& dst = manifolds[gid].contacts[i];
+            dst.rB.w = c.rAStick.w;
+            dst.lambda.xyz = F;
+            dst.penalty.xyz = pen;
+        }
+    }
+}
+
 // Fused dual update: one dispatch covers joints then contact manifolds.
 // Small scenes with many iterations are dispatch-bound; merging the two
 // kernels halves the per-iteration barrier count.
@@ -2332,6 +2658,10 @@ kernel void dual_all(
     constant SimParams& P           [[buffer(7)]],
     device SpringGPU* springs       [[buffer(8)]],
     device SoftContactGPU* soft     [[buffer(9)]],
+    device const SolverManifoldGPU* solveManifolds [[buffer(10)]],
+    device SolverContactGPU* solveContacts [[buffer(11)]],
+    constant uint& useCompactManifolds [[buffer(12)]],
+    constant uint& writeBackCompactManifolds [[buffer(13)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid < P.numJoints) {
@@ -2368,8 +2698,16 @@ kernel void dual_all(
     uint mi = si - P.numSprings;
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
     if (mi < numPairs) {
-        if (manifolds[mi].header.z == 0) return;
-        dual_manifold_one(posLin, posAng, initLin, initAng, manifolds, P, mi);
+        if (useCompactManifolds != 0u) {
+            dual_solver_manifold_one(
+                posLin, posAng, initLin, initAng,
+                solveManifolds, solveContacts, manifolds,
+                writeBackCompactManifolds != 0u, P, mi);
+        } else {
+            if (manifolds[mi].header.z == 0) return;
+            dual_manifold_one(
+                posLin, posAng, initLin, initAng, manifolds, P, mi);
+        }
         return;
     }
     uint sci = mi - numPairs;

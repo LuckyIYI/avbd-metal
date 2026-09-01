@@ -150,11 +150,9 @@ final class SimulationModel: ObservableObject, RenderableModel {
         let dt = Double(solver.settings.dt)
         var steps = 0
         do {
+            let batchStart = CACurrentMediaTime()
             while stepAccumulator >= dt && steps < 4 {
-                let t0 = CACurrentMediaTime()
                 try solver.submitStep()
-                let ms = (CACurrentMediaTime() - t0) * 1000
-                msEMA = msEMA == 0 ? ms : msEMA * 0.95 + ms * 0.05
                 stepAccumulator -= dt
                 steps += 1
             }
@@ -162,6 +160,11 @@ final class SimulationModel: ObservableObject, RenderableModel {
             // submitted steps here is the explicit cross-queue boundary and
             // prevents rendering partially updated shared poses.
             try solver.synchronize()
+            if steps > 0 {
+                let ms = (CACurrentMediaTime() - batchStart) * 1000
+                    / Double(steps)
+                msEMA = msEMA == 0 ? ms : msEMA * 0.95 + ms * 0.05
+            }
         } catch {
             running = false
             statsText = "solver stopped: \(error.localizedDescription)"

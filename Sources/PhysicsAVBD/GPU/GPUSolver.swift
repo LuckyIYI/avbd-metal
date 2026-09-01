@@ -38,6 +38,7 @@ public final class GPUSolver {
     private static let jointMotorModeImplicitPositionPD: UInt32 = 1 << 4
     private static let jointMotorModeExplicitTorquePD: UInt32 = 2 << 4
     private static let jointMotorModeVelocity: UInt32 = 3 << 4
+    private static let orderedColoringBodyLimit = 1_024
 
     public let device: MTLDevice
     let queue: MTLCommandQueue
@@ -264,7 +265,7 @@ public final class GPUSolver {
     var dynColorSrc: MTLBuffer?
 
     // Adjacency + coloring
-    var degrees, adjStart, adjCursor, adjList: MTLBuffer
+    var degrees, adjStart, adjCursor, adjList, adjNeighbor: MTLBuffer
     var colorsA, colorsB, bodySlot, colorStart, colorList: MTLBuffer
     var changedFlag: MTLBuffer
 
@@ -296,6 +297,7 @@ public final class GPUSolver {
         "adj_clear_degrees",
         "adj_copy_cursor",
         "adj_count",
+        "adj_extract_neighbors",
         "adj_scatter",
         "adj_sort",
         "bp_count",
@@ -336,6 +338,7 @@ public final class GPUSolver {
         "el_count",
         "el_scatter",
         "finalize_velocities",
+        "manifold_solver_pack",
         "np_collide",
         "np_collide_analytic_compat",
         "np_collide_convex",
@@ -349,6 +352,7 @@ public final class GPUSolver {
         "pm_clear",
         "pm_insert",
         "primal_particles_split",
+        "primal_rigid_split",
         "primal_solve",
         "pusht_obs",
         "rt_pack_spatial_index",
@@ -1576,8 +1580,13 @@ public final class GPUSolver {
         degrees = try makeBuf(nb * 4, "degrees")
         adjStart = try makeBuf(nb * 4, "adjStart")
         adjCursor = try makeBuf(nb * 4, "adjCursor")
-        adjList = try makeBuf((2 * (numJoints + numSprings + maxPairs) + 4 * numTets
-                               + 4 * maxSoft + 3 * numTris + 4 * maxEdges) * 4, "adjList")
+        let adjacencyCapacity = 2 * (numJoints + numSprings + maxPairs)
+            + 4 * numTets + 4 * maxSoft + 3 * numTris + 4 * maxEdges
+        adjList = try makeBuf(adjacencyCapacity * 4, "adjList")
+        let compactNeighborCapacity = numTris == 0 && numTets == 0
+            && numBodies > Self.orderedColoringBodyLimit
+            ? adjacencyCapacity : 1
+        adjNeighbor = try makeBuf(compactNeighborCapacity * 4, "adjNeighbor")
         colorsA = try makeBuf(nb * 4, "colorsA")
         colorsB = try makeBuf(nb * 4, "colorsB")
         bodySlot = try makeBuf(nb * 4, "bodySlot")
@@ -5392,6 +5401,32 @@ public final class GPUSolver {
             e.setBuffer(self.adjList, offset: 0, index: 2)
             e.setBytes(&nb32, length: 4, index: 3)
         }
+        if usesDynamicColoring
+            && numBodies > Self.orderedColoringBodyLimit {
+            dispatch1D(enc, "adj_extract_neighbors", numBodies) { e in
+                e.setBuffer(self.joints, offset: 0, index: 0)
+                e.setBuffer(self.springs, offset: 0, index: 1)
+                e.setBuffer(self.manifolds, offset: 0, index: 2)
+                e.setBuffer(self.adjStart, offset: 0, index: 3)
+                e.setBuffer(self.degrees, offset: 0, index: 4)
+                e.setBuffer(self.adjList, offset: 0, index: 5)
+                e.setBuffer(self.adjNeighbor, offset: 0, index: 6)
+                e.setBytes(&nb32, length: 4, index: 7)
+            }
+        }
+
+        let noRSplit = ProcessInfo.processInfo.environment[
+            "AVBD_NO_RSPLIT"] != nil
+        let useCompactManifoldSolve = usesDynamicColoring
+            && numParticles == 0
+            && numBodies > Self.orderedColoringBodyLimit
+            && !hasTorsionalFriction
+            && !noRSplit
+        let useWideRigidSplit = useCompactManifoldSolve
+            && ProcessInfo.processInfo.environment[
+                "AVBD_RIGID_SPLIT8"] == nil
+        var primalThreadsPerBody: UInt32 = usesDynamicColoring && noRSplit
+            ? 1 : (useWideRigidSplit ? 16 : 8)
 
         // Coloring is scene-adaptive:
         // - Soft scenes (cloth/tets): STATIC topology palette from init,
@@ -5425,6 +5460,7 @@ public final class GPUSolver {
                     e.setBuffer(self.bends, offset: 0, index: 14)
                     var pi = UInt32(pass)
                     e.setBytes(&pi, length: 4, index: 15)
+                    e.setBuffer(self.adjNeighbor, offset: 0, index: 16)
                 }
                 swap(&src, &dst)
             }
@@ -5453,6 +5489,7 @@ public final class GPUSolver {
                 e.setBuffer(self.membranes, offset: 0, index: 12)
                 e.setBuffer(self.bends, offset: 0, index: 13)
                 e.setBytes(&finalPass, length: 4, index: 14)
+                e.setBuffer(self.adjNeighbor, offset: 0, index: 15)
             }
             dispatch1D(enc, "color_validate", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -5470,6 +5507,7 @@ public final class GPUSolver {
                 e.setBuffer(self.softContacts, offset: 0, index: 11)
                 e.setBuffer(self.membranes, offset: 0, index: 12)
                 e.setBuffer(self.bends, offset: 0, index: 13)
+                e.setBuffer(self.adjNeighbor, offset: 0, index: 14)
             }
             dispatch1D(enc, "color_count", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -5482,6 +5520,7 @@ public final class GPUSolver {
                 e.setBuffer(self.counters, offset: 0, index: 0)
                 e.setBuffer(self.colorStart, offset: 0, index: 1)
                 e.setBuffer(self.colorArgs, offset: 0, index: 2)
+                e.setBytes(&primalThreadsPerBody, length: 4, index: 3)
             }
             dispatch1D(enc, "color_scatter", numBodies) { e in
                 e.setBuffer(self.posLin, offset: 0, index: 0)
@@ -5493,6 +5532,24 @@ public final class GPUSolver {
             }
             if finalColors !== colorsA {
                 dynColorSrc = finalColors
+            }
+        }
+        // Narrowphase is finished with prevManifolds at this point. Reuse
+        // that 704-byte/slot buffer for a 48-byte header stream followed by
+        // eight slot-major 64-byte contact streams. This gives the repeated
+        // solver passes a compact working set without another allocation.
+        let solverContactOffset = maxPairs * 48
+        var compactManifoldFlag: UInt32 = useCompactManifoldSolve ? 1 : 0
+        if useCompactManifoldSolve {
+            try stage("manifold-pack")
+            dispatchIndirect(enc, "manifold_solver_pack", argsOffset: 0) { e in
+                e.setBuffer(self.manifolds, offset: 0, index: 0)
+                e.setBuffer(self.prevManifolds, offset: 0, index: 1)
+                e.setBuffer(self.prevManifolds,
+                            offset: solverContactOffset, index: 2)
+                e.setBuffer(self.counters, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
             }
         }
         try stage("solver-iterations")
@@ -5599,24 +5656,31 @@ public final class GPUSolver {
         // Rigid scenes use the 8-lane cooperative split primal too: dense
         // piles average 12-27 manifolds/body and the one-thread-per-body
         // kernel was latency-bound walking them serially (boxpile x12
-        // solve-primal 9.5 ms). AVBD_NO_RSPLIT restores the old kernel
-        // (the x8 indirect args early-out harmlessly).
-        let noRSplit = ProcessInfo.processInfo.environment["AVBD_NO_RSPLIT"] != nil
-        let primalName: String
-        if usesDynamicColoring && noRSplit {
-            primalName = hasTorsionalFriction
-                ? "primal_solve_torsion" : "primal_solve"
+        // solve-primal 9.5 ms). AVBD_NO_RSPLIT restores the old kernel.
+        // Compact manifolds and torsion use separate buffer layouts; torsion
+        // keeps the established 8-lane path while compact rigid scenes widen
+        // to 16 lanes.
+        let primalPSO: MTLComputePipelineState
+        if hasTorsionalFriction {
+            primalPSO = ps(usesDynamicColoring && noRSplit
+                ? "primal_solve_torsion"
+                : "primal_particles_split_torsion")
+        } else if usesDynamicColoring && noRSplit {
+            primalPSO = ps("primal_solve")
+        } else if useWideRigidSplit {
+            primalPSO = ps("primal_rigid_split")
         } else {
-            primalName = hasTorsionalFriction
-                ? "primal_particles_split_torsion"
-                : "primal_particles_split"
+            primalPSO = ps("primal_particles_split")
         }
-        let primalPSO = ps(primalName)
         // static palettes have fixed per-color counts: dispatch directly
         // (8 lanes per body for the split kernel)
         let splitSizes: [Int] = usesDynamicColoring ? []
-            : (0..<staticUsedColors).map { lastColorCounts[$0] * 8 }
+            : (0..<staticUsedColors).map {
+                lastColorCounts[$0] * Int(primalThreadsPerBody)
+            }
         for it in 0..<settings.iterations {
+            var writeBackCompactManifoldFlag: UInt32 =
+                useCompactManifoldSolve && it + 1 == settings.iterations ? 1 : 0
             enc.setComputePipelineState(primalPSO)
             do {
                 // rebind each iteration (dual_all clobbers low indices), but
@@ -5647,6 +5711,11 @@ public final class GPUSolver {
                 enc.setBuffer(self.counters, offset: 0, index: 24)
                 if hasTorsionalFriction {
                     enc.setBuffer(self.torsionState, offset: 0, index: 25)
+                } else if primalThreadsPerBody > 1 {
+                    enc.setBuffer(self.prevManifolds, offset: 0, index: 25)
+                    enc.setBuffer(self.prevManifolds,
+                                  offset: solverContactOffset, index: 26)
+                    enc.setBytes(&compactManifoldFlag, length: 4, index: 27)
                 }
             }
             _ = it
@@ -5677,6 +5746,11 @@ public final class GPUSolver {
                 enc.setBuffer(self.counters, offset: 0, index: 24)
                 if hasTorsionalFriction {
                     enc.setBuffer(self.torsionState, offset: 0, index: 25)
+                } else if primalThreadsPerBody > 1 {
+                    enc.setBuffer(self.prevManifolds, offset: 0, index: 25)
+                    enc.setBuffer(self.prevManifolds,
+                                  offset: solverContactOffset, index: 26)
+                    enc.setBytes(&compactManifoldFlag, length: 4, index: 27)
                 }
             }
             for c in 0..<colorBound {
@@ -5745,6 +5819,13 @@ public final class GPUSolver {
                 e.setBuffer(self.softContacts, offset: 0, index: 9)
                 if hasTorsionalFriction {
                     e.setBuffer(self.torsionState, offset: 0, index: 10)
+                } else {
+                    e.setBuffer(self.prevManifolds, offset: 0, index: 10)
+                    e.setBuffer(self.prevManifolds,
+                                offset: solverContactOffset, index: 11)
+                    e.setBytes(&compactManifoldFlag, length: 4, index: 12)
+                    e.setBytes(&writeBackCompactManifoldFlag,
+                               length: 4, index: 13)
                 }
             }
             // OGC conditional refresh (paper Alg 3): a one-thread kernel
