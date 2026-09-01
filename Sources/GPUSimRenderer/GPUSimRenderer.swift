@@ -530,6 +530,26 @@ inline float shadowVisibility(float3 world, float3 normal,
     float slope = min(2.0, sqrt(saturate(1.0 - geomNdL * geomNdL))
                            / max(geomNdL, 0.2));
     float receiverDepth = ndc.z - (U.shadowParams.x + U.shadowParams.y * slope);
+
+    // A PCF tap does not sample the receiver at this fragment's light-space
+    // XY: it samples a neighboring shadow texel.  Reusing the center depth
+    // for every tap compares a tilted receiver against the wrong point on
+    // its own plane.  The resulting 0/1 tap-count transitions are the broad,
+    // discrete diagonal bands visible on otherwise flat boxes.  Reconstruct
+    // dz/duv from screen derivatives and compare every tap against the depth
+    // of the receiver plane at that tap instead.
+    float3 shadowCoord = float3(uv, ndc.z);
+    float3 shadowDx = dfdx(shadowCoord);
+    float3 shadowDy = dfdy(shadowCoord);
+    float determinant = shadowDx.x * shadowDy.y
+                      - shadowDx.y * shadowDy.x;
+    float2 receiverDepthGradient = float2(0.0);
+    if (abs(determinant) > 1e-10) {
+        receiverDepthGradient = float2(
+            shadowDx.z * shadowDy.y - shadowDx.y * shadowDy.z,
+            shadowDx.x * shadowDy.z - shadowDx.z * shadowDy.x)
+            / determinant;
+    }
     float2 texel = 1.0 / float2(shadowTex.get_width(), shadowTex.get_height());
     constexpr sampler shadowSampler(coord::normalized, filter::linear,
                                     address::clamp_to_edge,
@@ -537,9 +557,11 @@ inline float shadowVisibility(float3 world, float3 normal,
     float visible = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
+            float2 tapOffset = float2(float(x), float(y)) * texel;
+            float tapReceiverDepth = receiverDepth
+                + dot(receiverDepthGradient, tapOffset);
             visible += shadowTex.sample_compare(
-                shadowSampler, uv + float2(float(x), float(y)) * texel,
-                receiverDepth);
+                shadowSampler, uv + tapOffset, tapReceiverDepth);
         }
     }
     // A small floor keeps shaded faces readable without washing out the
@@ -2050,6 +2072,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                         height: Double(GPUSimRenderer.shadowMapSize),
                                         znear: 0, zfar: 1))
             enc.setDepthStencilState(depthState)
+            // Offset caster depth in the shadow rasterizer as the primary
+            // self-shadow defense. Receiver bias alone cannot cover the
+            // sub-texel depth quantization of a sloped triangle consistently,
+            // which exposes the PCF tap count as broad tonal stripes.
+            enc.setDepthBias(1.0, slopeScale: 1.0, clamp: 0.001)
             var shadowU = U
             shadowU.viewProj = shadowVP
             if rigidCount > 0 {
