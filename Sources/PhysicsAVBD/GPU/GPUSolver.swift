@@ -3189,16 +3189,26 @@ public final class GPUSolver {
         var boundsAny = false
         for collider in scene.colliders where collider.isRendered {
             let size = collider.size
-            if size.x > 150 { continue }
             let body = scene.bodies[collider.body]
-            let r = max(size.x, max(size.y, size.z))
-            boundsLo = min(boundsLo, body.position - F3(repeating: r))
-            boundsHi = max(boundsHi, body.position + F3(repeating: r))
+            // Scenery must not inflate the light volume: a 3 m tabletop
+            // slab would triple the shadow extent (and its texel size) for
+            // content that lives in half a metre. Static colliders wider
+            // than 2 m are floors/walls; the interesting shadows come from
+            // everything else.
+            if !body.isDynamic && max(size.x, size.y) > 2.0 { continue }
+            let half: Float
+            switch collider.shape {
+            case .capsule: half = size.x * 0.5 + size.y
+            case .sphere: half = size.x * 0.5
+            default: half = 0.5 * max(size.x, max(size.y, size.z))
+            }
+            boundsLo = min(boundsLo, body.position - F3(repeating: half))
+            boundsHi = max(boundsHi, body.position + F3(repeating: half))
             boundsAny = true
         }
         renderedContentBounds = boundsAny
             ? ((boundsLo + boundsHi) * 0.5,
-               max(length(boundsHi - boundsLo) * 0.5 * 1.25, 0.5))
+               max(length(boundsHi - boundsLo) * 0.5 * 1.15, 0.5))
             : nil
         renderBodyIdxBuf.contents().bindMemory(to: UInt32.self,
                                                capacity: max(1, renderColliderIDs.count))
