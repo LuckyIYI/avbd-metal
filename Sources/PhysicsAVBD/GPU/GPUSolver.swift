@@ -206,12 +206,10 @@ public final class GPUSolver {
     var surfacedFlags, softNormalsBuf, faceNormalsBuf, renderTriBuf: MTLBuffer
     var renderBodyIdxBuf: MTLBuffer
     public private(set) var renderRigidBodyCount: Int = 0
-    /// Coarse spawn-state bounds of the rendered colliders (the oversized
-    /// ground slab excluded), padded for runtime motion - the renderer fits
-    /// its directional-shadow volume to this.
     /// (body, collider local offset, conservative half extent) for every
     /// rendered collider that should shape the shadow volume - wide static
-    /// scenery excluded. Positions are read live per query.
+    /// scenery excluded at init. Body positions are read live per
+    /// `renderedContentBounds` query.
     private var renderBoundsColliders: [(body: Int, local: F3, half: Float)] = []
     var clothGroupBuf: MTLBuffer
     /// Authored Scene collision domain for each deformable-surface body.

@@ -2092,16 +2092,21 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // biases larger than a cube's contact shadow.
         var contentBounds = renderScene.renderContentBounds
         // opaque auxiliary casters live in app space; a skeleton or marker
-        // outside the scene's own bounds must not fall off the light volume
-        if var bounds = contentBounds {
-            for instance in activeAuxiliaryInstances
-            where instance.material.w >= 1 && instance.parameters.w > 0.5 {
-                let t = instance.model.columns.3
-                let p = F3(t.x, t.y, t.z)
+        // outside the scene's own bounds must not fall off the light
+        // volume - and a backend without bounds of its own still gets a
+        // fitted volume from its casters alone
+        for instance in activeAuxiliaryInstances
+        where instance.material.w >= 1 && instance.parameters.w > 0.5 {
+            let t = instance.model.columns.3
+            let p = F3(t.x, t.y, t.z)
+            if var bounds = contentBounds {
                 let reach = length(p - bounds.center) + instance.parameters.z
                 bounds.radius = max(bounds.radius, reach)
+                contentBounds = bounds
+            } else {
+                contentBounds = GPUSimContentBounds(
+                    center: p, radius: max(instance.parameters.z, 0.5))
             }
-            contentBounds = bounds
         }
         let shadowFollowsContent = contentBounds.map { $0.radius <= 25 } ?? false
         let shadowFocus = shadowFollowsContent
@@ -2133,6 +2138,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                      width: Double(aoSize.x),
                                      height: Double(aoSize.y),
                                      znear: 0, zfar: 1)
+        // AO re-enabled after a disabled stretch: the frozen history and
+        // the stale previous-frame matrices must fall together, and BEFORE
+        // the uniforms capture prevVP and the temporal blend for this frame
+        if activeOptions.ambientOcclusion, aoTexIsWhite {
+            prevVP = nil
+            aoTexIsWhite = false
+        }
         var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(lightDirection, 0),
                          eye: SIMD4(activeEye, 0),
@@ -2242,12 +2254,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         // ---- 2. prepass: world pos + normals ----
-        if activeOptions.ambientOcclusion, aoTexIsWhite {
-            // re-enabled after a disabled stretch: the temporal history and
-            // previous-frame matrices are stale together - drop them
-            prevVP = nil
-            aoTexIsWhite = false
-        }
         if !activeOptions.ambientOcclusion {
             if !aoTexIsWhite {
                 let clearPass = MTLRenderPassDescriptor()
