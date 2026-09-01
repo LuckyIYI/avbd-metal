@@ -27,6 +27,50 @@ final class MJCFImporterTests: XCTestCase {
         XCTAssertTrue(options.includeVisuals)
     }
 
+    func testNamedMaterialColorsReachMeshAndPrimitiveVisuals() throws {
+        let xml = """
+        <mujoco model="material-fixture">
+          <asset>
+            <material name="body-yellow" rgba="0.98 0.71 0.004 1"/>
+            <material name="accent-teal" rgba="0.54 0.85 0.83 1"/>
+          </asset>
+          <worldbody>
+            <body name="root">
+              <inertial mass="1" diaginertia="1 1 1"/>
+              <geom type="sphere" size="0.1" contype="0" conaffinity="0"
+                    material="body-yellow"/>
+              <geom type="sphere" size="0.1" pos="1 0 0"
+                    contype="0" conaffinity="0" material="body-yellow"
+                    rgba="0.54 0.85 0.83 1"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+        var scene = PhysicsScene(name: "material-fixture")
+        _ = try asset.instantiate(
+            in: &scene, options: MJCFInstantiationOptions())
+
+        XCTAssertEqual(scene.colliders.count, 2)
+        XCTAssertLessThan(simd_length(
+            try XCTUnwrap(scene.colliders[0].renderColor)
+                - F3(0.98, 0.71, 0.004)), 1e-6)
+        // A local rgba has the same precedence as MuJoCo, including when a
+        // named material is also present.
+        XCTAssertLessThan(simd_length(
+            try XCTUnwrap(scene.colliders[1].renderColor)
+                - F3(0.54, 0.85, 0.83)), 1e-6)
+
+        let missing = xml.replacingOccurrences(
+            of: "material=\"body-yellow\"/>",
+            with: "material=\"missing\"/>",
+            options: [], range: xml.range(of: "material=\"body-yellow\"/>"))
+        XCTAssertThrowsError(try MJCFAsset.parse(data: Data(missing.utf8))) {
+            XCTAssertTrue(String(describing: $0).contains(
+                "references material missing"))
+        }
+    }
+
     func testInstantiationOptionsApplyCombinedConfiguration() throws {
         let xml = """
         <mujoco model="options-fixture">

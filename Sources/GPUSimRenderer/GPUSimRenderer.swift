@@ -565,6 +565,37 @@ inline float3 acesTonemap(float3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+// The drawable is an 8-bit sRGB target. A smooth near-white lighting ramp
+// can otherwise collapse into wide one-code plateaus after tone mapping.
+// Dither in encoded sRGB space, then return to linear so the attachment's
+// hardware conversion produces the intended sub-LSB distribution. The noise
+// is deterministic in screen space, zero-mean, and cannot shimmer over time.
+inline float3 linearToSRGBExact(float3 c) {
+    c = clamp(c, 0.0, 1.0);
+    float3 low = c * 12.92;
+    float3 high = 1.055 * pow(c, float3(1.0 / 2.4)) - 0.055;
+    return select(low, high, c > 0.0031308);
+}
+
+inline float3 sRGBToLinearExact(float3 c) {
+    c = clamp(c, 0.0, 1.0);
+    float3 low = c / 12.92;
+    float3 high = pow((c + 0.055) / 1.055, float3(2.4));
+    return select(low, high, c > 0.04045);
+}
+
+inline float interleavedGradientNoise(float2 pixel) {
+    float2 p = floor(pixel);
+    return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+inline float3 displayColorSRGB8(float3 toneMappedLinear, float2 pixel) {
+    float noise = interleavedGradientNoise(pixel) - 0.5;
+    float3 encoded = linearToSRGBExact(toneMappedLinear);
+    encoded = clamp(encoded + noise / 255.0, 0.0, 1.0);
+    return sRGBToLinearExact(encoded);
+}
+
 // Three-by-three comparison-filtered directional shadow. The light projection
 // follows the camera target, so the useful texel density stays around the robot
 // instead of being spent on the effectively infinite floor.
@@ -912,7 +943,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float3 lit = direct + ambient + in.emissive;
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(acesTonemap(lit), in.opacity);
+    return float4(displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +1006,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     float3 lit = direct + ambient + in.emissive;
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(acesTonemap(lit), in.opacity);
+    return float4(displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
 }
 
 // Prepass variant: only the FRONT layer reaches the AO/depth buffers. The
@@ -1288,7 +1319,7 @@ fragment float4 sky_fragment(FSOut in [[stage_in]]) {
     float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
     float glow = exp(-3.0 * distance(ndc, float2(-0.45, 0.55)));
     c += float3(0.30, 0.25, 0.16) * glow;
-    return float4(acesTonemap(c), 1);
+    return float4(displayColorSRGB8(acesTonemap(c), in.position.xy), 1);
 }
 
 struct FloorOut { float4 position [[position]]; float3 world; };
@@ -1349,7 +1380,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
 
     float fog = horizonFog(d);
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(acesTonemap(lit), 1);
+    return float4(displayColorSRGB8(acesTonemap(lit), in.position.xy), 1);
 }
 
 """

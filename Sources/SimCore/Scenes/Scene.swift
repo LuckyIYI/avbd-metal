@@ -544,6 +544,12 @@ public struct SimSettings {
     /// This is also the rigid-contact equilibrium skin, so an oversized value
     /// visibly permits geometry to settle below the rendered surface.
     public var collisionMargin: Float = 0.01
+    /// Optional contact slop for deformable V-T, E-E, and rigid-triangle
+    /// constraints. `nil` preserves the legacy radius-scaled 2 mm...1 cm
+    /// heuristic. Small-scale manipulation scenes can choose a tighter value
+    /// without shrinking the rigid broadphase margin for the whole robot.
+    /// Must be finite and strictly positive when set.
+    public var deformableCollisionMargin: Float? = nil
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note
