@@ -2467,7 +2467,24 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         cmd.present(drawable)
         cmd.addCompletedHandler { [weak self] finished in
             let ms = (finished.gpuEndTime - finished.gpuStartTime) * 1000
-            Task { @MainActor in self?.lastFrameGPUMilliseconds = ms }
+            // In no-wait mode this handler is also where failures are
+            // inspected: right after commit() a healthy buffer still reads
+            // .committed/.scheduled, so a synchronous status check would
+            // misreport it and latch runtimeFailure.
+            let status = finished.status
+            let error = finished.error as NSError?
+            Task { @MainActor in
+                guard let self else { return }
+                self.lastFrameGPUMilliseconds = ms
+                if GPUSimRenderer.benchNoWait,
+                   status != .completed || error != nil {
+                    let detail = error.map {
+                        "\($0.domain) \($0.code) — \($0.localizedDescription)"
+                    } ?? String(describing: status)
+                    self.reportFailure(
+                        "Metal command ended with status \(detail)")
+                }
+            }
         }
         cmd.commit()
 
@@ -2476,10 +2493,12 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // loop, where Play/Step/Reset/goal/impact actions may mutate those
         // buffers. This is the conservative cross-queue correctness boundary;
         // a future shared-event/read-lease API can recover overlap safely.
-        if !GPUSimRenderer.benchNoWait { cmd.waitUntilCompleted() }
-        if let failure = commandFailureDescription(cmd) {
-            reportFailure(failure)
-            return
+        if !GPUSimRenderer.benchNoWait {
+            cmd.waitUntilCompleted()
+            if let failure = commandFailureDescription(cmd) {
+                reportFailure(failure)
+                return
+            }
         }
 
         prevVP = vp
