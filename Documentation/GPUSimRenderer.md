@@ -178,7 +178,9 @@ model as well as the renderer.
 - `rendererWillDrawFrame()` runs before the renderer captures the scene.
 - `rendererSceneRevision` should change only when a new scene should adopt its
   default camera.
-- `rendererOptions` controls graph coloring and collision-hull diagnostics.
+- `rendererOptions` controls graph coloring, collision-hull diagnostics,
+  and ambient occlusion (`ambientOcclusion = false` skips the whole GTAO
+  chain, ~1.5 ms GPU on the reference scene, for hosts on a power budget).
 - `rendererBodyAppearances` supplies per-frame body color/emission overrides.
 - `rendererAuxiliaryInstances` supplies per-frame app-owned world geometry.
 - `rendererDidFail(_:)` lets the host stop its loop and present the error.

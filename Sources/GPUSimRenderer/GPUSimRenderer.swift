@@ -15,15 +15,21 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     public var colorMode: GPUSimRenderColorMode
     public var showConvexCollisionGeometry: Bool
     public var convexCollisionWireframe: Bool
+    /// Ambient occlusion (half-resolution GTAO with temporal accumulation),
+    /// ~1.5 ms GPU on the reference scene. Hosts on a power budget can
+    /// disable it and keep the rest of the pipeline unchanged.
+    public var ambientOcclusion: Bool
 
     public init(
         colorMode: GPUSimRenderColorMode = .bodyIndex,
         showConvexCollisionGeometry: Bool = false,
-        convexCollisionWireframe: Bool = true
+        convexCollisionWireframe: Bool = true,
+        ambientOcclusion: Bool = true
     ) {
         self.colorMode = colorMode
         self.showConvexCollisionGeometry = showConvexCollisionGeometry
         self.convexCollisionWireframe = convexCollisionWireframe
+        self.ambientOcclusion = ambientOcclusion
     }
 }
 
@@ -1332,9 +1338,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public nonisolated static let sampleCount = 4
     public nonisolated static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
     public nonisolated static let shadowMapSize = 2048
-    nonisolated static var effectiveShadowMapSize: Int {
-        benchShadow > 0 ? benchShadow : shadowMapSize
-    }
 
     public let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -1400,12 +1403,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public private(set) var runtimeFailure: String?
     /// GPU time of the most recently completed frame, milliseconds.
     public private(set) var lastFrameGPUMilliseconds: Double = 0
-    // ---- bench ablation switches (env, read once) -----------------------
-    nonisolated static let benchNoWait = ProcessInfo.processInfo.environment["GPUSIM_NO_WAIT"] == "1"
-    nonisolated static let benchNoAO = ProcessInfo.processInfo.environment["GPUSIM_NO_AO"] == "1"
-    nonisolated static let benchMSAA = Int(ProcessInfo.processInfo.environment["GPUSIM_MSAA"] ?? "") ?? 0
-    nonisolated static let benchShadow = Int(ProcessInfo.processInfo.environment["GPUSIM_SHADOW"] ?? "") ?? 0
-    nonisolated static let benchAORaw = ProcessInfo.processInfo.environment["GPUSIM_AO_RAW"] == "1"
 
     private func reportFailure(_ message: String) {
         guard runtimeFailure == nil else { return }
@@ -1450,8 +1447,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
         func pipe(_ v: String, _ f: String,
-                  samples: Int = GPUSimRenderer.benchMSAA > 0
-                      ? GPUSimRenderer.benchMSAA : GPUSimRenderer.sampleCount,
+                  samples: Int = GPUSimRenderer.sampleCount,
                   colorFormats: [MTLPixelFormat] = [GPUSimRenderer.colorFormat],
                   depth: MTLPixelFormat = .depth32Float,
                   blending: Bool = false) throws -> MTLRenderPipelineState {
@@ -1603,7 +1599,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         view.device = device
         view.colorPixelFormat = Self.colorFormat
         view.depthStencilPixelFormat = .depth32Float
-        view.sampleCount = Self.benchMSAA > 0 ? Self.benchMSAA : Self.sampleCount
+        view.sampleCount = Self.sampleCount
         if let preferredFramesPerSecond {
             view.preferredFramesPerSecond = preferredFramesPerSecond
         }
@@ -1678,8 +1674,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let sd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
-            width: GPUSimRenderer.effectiveShadowMapSize,
-            height: GPUSimRenderer.effectiveShadowMapSize,
+            width: GPUSimRenderer.shadowMapSize,
+            height: GPUSimRenderer.shadowMapSize,
             mipmapped: false)
         sd.usage = [.renderTarget, .shaderRead]
         sd.storageMode = .private
@@ -2028,7 +2024,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let lightUp = F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
-        let texelWorld = (2 * shadowExtent) / Float(GPUSimRenderer.effectiveShadowMapSize)
+        let texelWorld = (2 * shadowExtent) / Float(GPUSimRenderer.shadowMapSize)
         let rightCoord = (dot(activeFocus, lightRight) / texelWorld).rounded() * texelWorld
         let upCoord = (dot(activeFocus, lightMapUp) / texelWorld).rounded() * texelWorld
         let shadowCenter = activeFocus
@@ -2093,8 +2089,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             let enc = shadowEncoder
             enc.label = "Directional shadow casters"
             enc.setViewport(MTLViewport(originX: 0, originY: 0,
-                                        width: Double(GPUSimRenderer.effectiveShadowMapSize),
-                                        height: Double(GPUSimRenderer.effectiveShadowMapSize),
+                                        width: Double(GPUSimRenderer.shadowMapSize),
+                                        height: Double(GPUSimRenderer.shadowMapSize),
                                         znear: 0, zfar: 1))
             enc.setDepthStencilState(depthState)
             var shadowU = U
@@ -2142,7 +2138,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         // ---- 2. prepass: world pos + normals ----
-        if GPUSimRenderer.benchNoAO {
+        if !activeOptions.ambientOcclusion {
             if !aoTexIsWhite {
                 let clearPass = MTLRenderPassDescriptor()
                 clearPass.colorAttachments[0].texture = aoTexA
@@ -2243,7 +2239,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.endEncoding()
             }
 
-            if !GPUSimRenderer.benchAORaw {
             // ---- 4a. temporal resolve: raw A + reprojected history -> B ----
             let tPass = MTLRenderPassDescriptor()
             tPass.colorAttachments[0].texture = aoTexB
@@ -2298,9 +2293,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setFragmentTexture(normTex, index: 2)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 enc.endEncoding()
-            }
-
-
             }
         }
         // ---- 5. main pass ----
@@ -2467,24 +2459,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         cmd.present(drawable)
         cmd.addCompletedHandler { [weak self] finished in
             let ms = (finished.gpuEndTime - finished.gpuStartTime) * 1000
-            // In no-wait mode this handler is also where failures are
-            // inspected: right after commit() a healthy buffer still reads
-            // .committed/.scheduled, so a synchronous status check would
-            // misreport it and latch runtimeFailure.
-            let status = finished.status
-            let error = finished.error as NSError?
-            Task { @MainActor in
-                guard let self else { return }
-                self.lastFrameGPUMilliseconds = ms
-                if GPUSimRenderer.benchNoWait,
-                   status != .completed || error != nil {
-                    let detail = error.map {
-                        "\($0.domain) \($0.code) — \($0.localizedDescription)"
-                    } ?? String(describing: status)
-                    self.reportFailure(
-                        "Metal command ended with status \(detail)")
-                }
-            }
+            Task { @MainActor in self?.lastFrameGPUMilliseconds = ms }
         }
         cmd.commit()
 
@@ -2493,12 +2468,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // loop, where Play/Step/Reset/goal/impact actions may mutate those
         // buffers. This is the conservative cross-queue correctness boundary;
         // a future shared-event/read-lease API can recover overlap safely.
-        if !GPUSimRenderer.benchNoWait {
-            cmd.waitUntilCompleted()
-            if let failure = commandFailureDescription(cmd) {
-                reportFailure(failure)
-                return
-            }
+        cmd.waitUntilCompleted()
+        if let failure = commandFailureDescription(cmd) {
+            reportFailure(failure)
+            return
         }
 
         prevVP = vp
