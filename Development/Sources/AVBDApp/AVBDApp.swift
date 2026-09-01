@@ -3,6 +3,7 @@ import MetalKit
 import SimCore
 import PhysicsAVBD
 import GPUSimDemos
+import GPUSimRenderer
 import Robotics
 import RL
 import MLXRL
@@ -200,10 +201,6 @@ struct MetalView: NSViewRepresentable {
             || ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] != nil {
             view.framebufferOnly = false
         }
-        view.colorPixelFormat = Renderer.colorFormat
-        view.depthStencilPixelFormat = .depth32Float
-        view.sampleCount = Renderer.sampleCount
-        view.preferredFramesPerSecond = 60
         guard let device else {
             model.reportRenderFailure("no Metal device is available")
             view.isPaused = true
@@ -211,9 +208,10 @@ struct MetalView: NSViewRepresentable {
             return view
         }
         do {
-            let renderer = try Renderer(device: device, model: model)
+            let renderer = try GPUSimRenderer(device: device, source: model)
+            configureAppCapture(renderer: renderer, model: model)
+            renderer.configure(view, preferredFramesPerSecond: 60)
             context.coordinator.renderer = renderer
-            view.delegate = renderer
         } catch {
             model.reportRenderFailure(error.localizedDescription)
             view.isPaused = true
@@ -226,7 +224,7 @@ struct MetalView: NSViewRepresentable {
 
     final class Coordinator {
         let model: SimulationModel
-        var renderer: Renderer?
+        var renderer: GPUSimRenderer?
         var dragging = false
 
         init(model: SimulationModel) {

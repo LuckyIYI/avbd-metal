@@ -1,54 +1,318 @@
 import Metal
 import MetalKit
-
-/// What the renderer needs from a driving model — lets the same renderer
-/// serve both the physics playground and portable Policy Replay pages.
-@MainActor
-protocol RenderableModel {
-    /// Stable routing key for screenshots/video. SwiftUI may instantiate and
-    /// render hidden tabs, so capture must never be selected merely because a
-    /// renderer exists.
-    nonisolated var captureID: String { get }
-    var solver: GPUSolver? { get }
-    var colorByGraphColor: Bool { get }
-    /// Draw cooked collision hulls as an inspection overlay. These controls
-    /// are renderer-only and never mutate collider transforms or physics.
-    var showConvexCollisionGeometry: Bool { get }
-    var convexCollisionWireframe: Bool { get }
-    var statsText: String { get }
-    /// Increments only when the DEMO changes — reset/size/param rebuilds
-    /// keep the user's camera.
-    var cameraEpoch: Int { get }
-    func tickIfRunning()
-    /// Stop the driving model and expose a renderer failure through that
-    /// model's existing status UI. Render failures are deliberately separate
-    /// from GPUSolver's terminal physics health.
-    func reportRenderFailure(_ message: String)
-}
-
-extension RenderableModel {
-    var showConvexCollisionGeometry: Bool { false }
-    var convexCollisionWireframe: Bool { true }
-}
-
-extension SimulationModel {
-    func reportRenderFailure(_ message: String) {
-        running = false
-        statsText = "render stopped: \(message)"
-    }
-}
 import SimCore
 import PhysicsAVBD
-import Robotics
-import RL
-import MLXRL
 import simd
+
+/// Runtime presentation choices. They affect only rendering and never mutate
+/// the simulation or its collision geometry.
+public enum GPUSimRenderColorMode: UInt32, Sendable, Equatable {
+    case bodyIndex = 0
+    case constraintGraph = 1
+}
+
+public struct GPUSimRenderOptions: Sendable, Equatable {
+    public var colorMode: GPUSimRenderColorMode
+    public var showConvexCollisionGeometry: Bool
+    public var convexCollisionWireframe: Bool
+
+    public init(
+        colorMode: GPUSimRenderColorMode = .bodyIndex,
+        showConvexCollisionGeometry: Bool = false,
+        convexCollisionWireframe: Bool = true
+    ) {
+        self.colorMode = colorMode
+        self.showConvexCollisionGeometry = showConvexCollisionGeometry
+        self.convexCollisionWireframe = convexCollisionWireframe
+    }
+}
+
+public struct GPUSimRenderCameraHint: Sendable, Equatable {
+    public var distance: Float
+    public var target: F3
+    public var azimuth: Float
+    public var elevation: Float
+
+    public init(
+        distance: Float = 30,
+        target: F3 = F3(0, 0, 3),
+        azimuth: Float = 0.9,
+        elevation: Float = 0.35
+    ) {
+        self.distance = distance
+        self.target = target
+        self.azimuth = azimuth
+        self.elevation = elevation
+    }
+}
+
+/// ABI written into the `instances` buffer by
+/// ``GPUSimRenderableScene/encodeRenderInstances(_:instances:colorMode:)``.
+public struct GPUSimRenderInstance {
+    /// Column-major world transform, including primitive scale.
+    public var model: simd_float4x4
+    /// RGB is sRGB albedo. W selects box (0), sphere (1), torus (2), or
+    /// capsule (3).
+    public var color: SIMD4<Float>
+    /// X/Y are torus or capsule dimensions, Z is the bounding radius, and W
+    /// is nonzero for a dynamic shadow caster.
+    public var parameters: SIMD4<Float>
+
+    public init(
+        model: simd_float4x4,
+        color: SIMD4<Float>,
+        parameters: SIMD4<Float>
+    ) {
+        self.model = model
+        self.color = color
+        self.parameters = parameters
+    }
+}
+
+/// Vertex ABI for ``GPUSimSkinnedRenderSurface``.
+public struct GPUSimSkinRenderVertex {
+    public var position: SIMD4<Float>
+    public var normal: SIMD4<Float>
+
+    public init(position: SIMD4<Float>, normal: SIMD4<Float>) {
+        self.position = position
+        self.normal = normal
+    }
+}
+
+/// Vertex ABI for rigid and convex-debug surfaces. `positionBody.w` stores
+/// the owning body index as a `UInt32` bit pattern.
+public struct GPUSimRigidMeshRenderVertex {
+    public var positionBody: SIMD4<Float>
+    public var normal: SIMD4<Float>
+    public var color: SIMD4<Float>
+
+    public init(
+        positionBody: SIMD4<Float>,
+        normal: SIMD4<Float>,
+        color: SIMD4<Float>
+    ) {
+        self.positionBody = positionBody
+        self.normal = normal
+        self.color = color
+    }
+}
+
+/// `triangles` contains three packed `UInt32` corners per triangle. Bits
+/// 0...20 are the position index, bit 21 requests flat shading, bit 22 marks
+/// a rim, bit 23 marks the back layer, and bits 24...31 select its color.
+public struct GPUSimSoftRenderSurface {
+    public let triangles: MTLBuffer
+    public let triangleCount: Int
+    public let positions: MTLBuffer
+    public let normals: MTLBuffer
+
+    public init(
+        triangles: MTLBuffer,
+        triangleCount: Int,
+        positions: MTLBuffer,
+        normals: MTLBuffer
+    ) {
+        self.triangles = triangles
+        self.triangleCount = triangleCount
+        self.positions = positions
+        self.normals = normals
+    }
+}
+
+/// `triangles` contains three packed `UInt32` corners per triangle: bits
+/// 0...23 are the vertex index and bits 24...31 select its color.
+public struct GPUSimSkinnedRenderSurface {
+    public let triangles: MTLBuffer
+    public let triangleCount: Int
+    public let vertices: MTLBuffer
+
+    public init(
+        triangles: MTLBuffer,
+        triangleCount: Int,
+        vertices: MTLBuffer
+    ) {
+        self.triangles = triangles
+        self.triangleCount = triangleCount
+        self.vertices = vertices
+    }
+}
+
+public struct GPUSimRigidMeshRenderSurface {
+    public let vertices: MTLBuffer
+    public let indices: MTLBuffer
+    public let indexCount: Int
+    public let positions: MTLBuffer
+    public let rotations: MTLBuffer
+
+    public init(
+        vertices: MTLBuffer,
+        indices: MTLBuffer,
+        indexCount: Int,
+        positions: MTLBuffer,
+        rotations: MTLBuffer
+    ) {
+        self.vertices = vertices
+        self.indices = indices
+        self.indexCount = indexCount
+        self.positions = positions
+        self.rotations = rotations
+    }
+}
+
+public struct GPUSimConvexDebugRenderSurface {
+    public let triangleVertices: MTLBuffer
+    public let triangleVertexCount: Int
+    public let edgeVertices: MTLBuffer
+    public let edgeVertexCount: Int
+    public let positions: MTLBuffer
+    public let rotations: MTLBuffer
+
+    public init(
+        triangleVertices: MTLBuffer,
+        triangleVertexCount: Int,
+        edgeVertices: MTLBuffer,
+        edgeVertexCount: Int,
+        positions: MTLBuffer,
+        rotations: MTLBuffer
+    ) {
+        self.triangleVertices = triangleVertices
+        self.triangleVertexCount = triangleVertexCount
+        self.edgeVertices = edgeVertices
+        self.edgeVertexCount = edgeVertexCount
+        self.positions = positions
+        self.rotations = rotations
+    }
+}
+
+/// Backend-neutral GPU data contract consumed by ``GPUSimRenderer``.
+/// Backends can adopt it without exposing their CPU-side simulation model.
+public protocol GPUSimRenderableScene: AnyObject {
+    /// Device that owns every buffer returned by this scene.
+    var renderDevice: MTLDevice { get }
+    var renderRigidInstanceCount: Int { get }
+    var rendererStateIsValid: Bool { get }
+    var renderCameraHint: GPUSimRenderCameraHint { get }
+    var softRenderSurface: GPUSimSoftRenderSurface? { get }
+    var skinnedRenderSurface: GPUSimSkinnedRenderSurface? { get }
+    var rigidMeshRenderSurface: GPUSimRigidMeshRenderSurface? { get }
+    var convexDebugRenderSurface: GPUSimConvexDebugRenderSurface? { get }
+    /// Encodes `renderRigidInstanceCount` values with
+    /// `GPUSimRenderInstance` layout. A backend may also refresh the optional
+    /// surface buffers in this command buffer before returning.
+    func encodeRenderInstances(
+        _ commandBuffer: MTLCommandBuffer,
+        instances: MTLBuffer,
+        colorMode: GPUSimRenderColorMode
+    ) throws
+}
+
+extension GPUSolver: GPUSimRenderableScene {
+    public var renderDevice: MTLDevice { device }
+    public var renderRigidInstanceCount: Int { renderRigidBodyCount }
+    public var rendererStateIsValid: Bool { runtimeFailure == nil }
+
+    public var renderCameraHint: GPUSimRenderCameraHint {
+        GPUSimRenderCameraHint(
+            distance: settings.cameraDistance > 0 ? settings.cameraDistance : 30,
+            target: F3(
+                settings.cameraTargetX.isFinite ? settings.cameraTargetX : 0,
+                settings.cameraTargetY.isFinite ? settings.cameraTargetY : 0,
+                settings.cameraTargetZ != 0 ? settings.cameraTargetZ : 3
+            ),
+            azimuth: settings.cameraAzimuth.isFinite
+                ? settings.cameraAzimuth : 0.9,
+            elevation: settings.cameraElevation.isFinite
+                ? settings.cameraElevation : 0.35
+        )
+    }
+
+    public var softRenderSurface: GPUSimSoftRenderSurface? {
+        renderSurface.map {
+            GPUSimSoftRenderSurface(
+                triangles: $0.tris,
+                triangleCount: $0.triCount,
+                positions: $0.positions,
+                normals: $0.normals
+            )
+        }
+    }
+
+    public var skinnedRenderSurface: GPUSimSkinnedRenderSurface? {
+        renderSkinnedSurface.map {
+            GPUSimSkinnedRenderSurface(
+                triangles: $0.tris,
+                triangleCount: $0.triCount,
+                vertices: $0.vertices
+            )
+        }
+    }
+
+    public var rigidMeshRenderSurface: GPUSimRigidMeshRenderSurface? {
+        renderIndexedRigidMeshSurface.map {
+            GPUSimRigidMeshRenderSurface(
+                vertices: $0.vertices,
+                indices: $0.indices,
+                indexCount: $0.indexCount,
+                positions: $0.positions,
+                rotations: $0.rotations
+            )
+        }
+    }
+
+    public var convexDebugRenderSurface: GPUSimConvexDebugRenderSurface? {
+        renderConvexCollisionSurface.map {
+            GPUSimConvexDebugRenderSurface(
+                triangleVertices: $0.triangleVertices,
+                triangleVertexCount: $0.triangleVertexCount,
+                edgeVertices: $0.edgeVertices,
+                edgeVertexCount: $0.edgeVertexCount,
+                positions: $0.positions,
+                rotations: $0.rotations
+            )
+        }
+    }
+
+    public func encodeRenderInstances(
+        _ commandBuffer: MTLCommandBuffer,
+        instances: MTLBuffer,
+        colorMode: GPUSimRenderColorMode
+    ) throws {
+        try encodeBuildInstancesChecked(
+            commandBuffer,
+            instances: instances,
+            colorMode: colorMode.rawValue
+        )
+    }
+}
+
+/// Optional live source for applications that replace solvers or advance a
+/// simulation immediately before each rendered frame. A fixed scene can use
+/// ``GPUSimRenderer/init(device:solver:)`` and does not need a source object.
+@MainActor
+public protocol GPUSimRendererSource: AnyObject {
+    var renderScene: (any GPUSimRenderableScene)? { get }
+    var rendererOptions: GPUSimRenderOptions { get }
+    /// Increment when a different scene should receive its default camera.
+    /// Rebuilds of the same scene can keep the value stable to preserve the
+    /// user's camera.
+    var rendererSceneRevision: Int { get }
+    func rendererWillDrawFrame()
+    func rendererDidFail(_ message: String)
+}
+
+public extension GPUSimRendererSource {
+    var rendererOptions: GPUSimRenderOptions { GPUSimRenderOptions() }
+    var rendererSceneRevision: Int { 0 }
+    func rendererWillDrawFrame() {}
+    func rendererDidFail(_ message: String) {}
+}
 
 // Renderer: PBR (GGX metallic-roughness) + ACES, sRGB-correct framebuffer,
 // GTAO-style ambient occlusion from a world-position prepass, directional
 // shadow mapping, horizon-only fog, and analytic instanced geometry.
 
-let renderShaderSource = """
+private let renderShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
@@ -866,15 +1130,22 @@ let SPHV = 12 * 18 * 6
 let TORV = 24 * 12 * 6
 let CAPV = (2 * 6 + 1) * 16 * 6
 
-private enum RendererInitializationError: LocalizedError {
+public enum GPUSimRendererError: LocalizedError {
+    /// The Metal device could not create a rendering command queue.
     case commandQueue
+    /// A scene supplied buffers allocated by another Metal device.
+    case sceneDeviceMismatch
+    /// Runtime shader compilation did not produce a required entry point.
     case shaderFunction(String)
+    /// A required depth-stencil state could not be created.
     case depthState(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .commandQueue:
             return "could not create the Metal render command queue"
+        case .sceneDeviceMismatch:
+            return "render scene buffers belong to a different Metal device"
         case .shaderFunction(let name):
             return "render shader function '\(name)' is missing"
         case .depthState(let name):
@@ -883,14 +1154,27 @@ private enum RendererInitializationError: LocalizedError {
     }
 }
 
-final class Renderer: NSObject, MTKViewDelegate {
-    static let sampleCount = 4
-    static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
-    static let shadowMapSize = 2048
+/// Metal renderer for a live ``GPUSimRenderableScene``.
+///
+/// The renderer consumes the scene's GPU buffers directly, so normal frame
+/// rendering does not read poses back through the CPU. Keep the renderer alive
+/// for as long as it is assigned as an `MTKView` delegate.
+@MainActor
+public final class GPUSimRenderer: NSObject, MTKViewDelegate {
+    public nonisolated static let sampleCount = 4
+    public nonisolated static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb
+    public nonisolated static let shadowMapSize = 2048
 
-    let device: MTLDevice
-    let queue: MTLCommandQueue
-    weak var model: (AnyObject & RenderableModel)?
+    public let device: MTLDevice
+    private let queue: MTLCommandQueue
+    public weak var source: (any GPUSimRendererSource)?
+    public private(set) var scene: (any GPUSimRenderableScene)?
+    public var options = GPUSimRenderOptions()
+    public private(set) var sceneRevision = 0
+    /// Called after a frame completes. This is useful for screenshots,
+    /// telemetry, and embedding without coupling the package to app policy.
+    /// Set the view's `framebufferOnly` to `false` before reading texture bytes.
+    public var frameCompletionHandler: (@MainActor (MTLTexture, Int) -> Void)?
 
     var boxP, sphereP, torusP, capsuleP, softP, skinP, rigidMeshP: MTLRenderPipelineState!
     var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre,
@@ -908,16 +1192,22 @@ final class Renderer: NSObject, MTKViewDelegate {
     var targetSize = SIMD2<Int>(0, 0)
     var instances: MTLBuffer?
 
-    var azimuth: Float = 0.9
-    var elevation: Float = 0.35
-    var distance: Float = 30
-    var target = F3(0, 0, 3)
-    var viewportSize = SIMD2<Float>(1, 1)
+    /// Orbit azimuth in radians.
+    public var azimuth: Float = 0.9
+    /// Orbit elevation in radians.
+    public var elevation: Float = 0.35
+    /// Orbit distance in scene units.
+    public var distance: Float = 30
+    /// Orbit target in world coordinates.
+    public var target = F3(0, 0, 3)
+    /// When enabled, a new scene revision adopts the camera hints stored in
+    /// the scene adapter. Disable this before applying an app-owned camera.
+    public var automaticallyFramesScene = true
+    public private(set) var viewportSize = SIMD2<Float>(1, 1)
     private var framesDrawn = 0
     private var lastCameraEpoch: Int = -1
-    private var lastSolverIdentity: ObjectIdentifier?
-    private var envCameraSet = false
-    private var runtimeFailure: String?
+    private var lastSceneIdentity: ObjectIdentifier?
+    public private(set) var runtimeFailure: String?
 
     private func reportFailure(_ message: String) {
         guard runtimeFailure == nil else { return }
@@ -925,9 +1215,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         // A failed render command can leave temporal targets partially
         // written. Ignore their history if a later frame is retried.
         prevVP = nil
-        let target = model
+        let target = source
         DispatchQueue.main.async {
-            target?.reportRenderFailure(message)
+            target?.rendererDidFail(message)
         }
     }
 
@@ -943,39 +1233,34 @@ final class Renderer: NSObject, MTKViewDelegate {
             + "\(error.domain) \(error.code) — \(error.localizedDescription)"
     }
 
-    private var scriptedCaptureAllowed: Bool {
-        let environment = ProcessInfo.processInfo.environment
-        let selected = environment["AVBD_CAPTURE_VIEW"]
-            ?? (environment["AVBD_POLICY_REPLAY"] == nil ? "playground" : "policy")
-        return model?.captureID == selected
-    }
-
-    init(device: MTLDevice, model: AnyObject & RenderableModel) throws {
+    /// Creates a renderer for a fixed GPU render scene. Pass `nil` when the
+    /// scene will be supplied later with ``setScene(_:resetCamera:)``.
+    public init(
+        device: MTLDevice,
+        scene: (any GPUSimRenderableScene)? = nil
+    ) throws {
+        if let scene, scene.renderDevice.registryID != device.registryID {
+            throw GPUSimRendererError.sceneDeviceMismatch
+        }
         self.device = device
         guard let queue = device.makeCommandQueue() else {
-            throw RendererInitializationError.commandQueue
+            throw GPUSimRendererError.commandQueue
         }
         self.queue = queue
-        self.model = model
+        self.scene = scene
         super.init()
-        // scripted-capture camera overrides
-        let env = ProcessInfo.processInfo.environment
-        if let v = env["AVBD_CAM_DIST"].flatMap(Float.init) { distance = v; envCameraSet = true }
-        if let v = env["AVBD_CAM_AZ"].flatMap(Float.init) { azimuth = v; envCameraSet = true }
-        if let v = env["AVBD_CAM_EL"].flatMap(Float.init) { elevation = v; envCameraSet = true }
-        if let v = env["AVBD_CAM_TZ"].flatMap(Float.init) { target.z = v; envCameraSet = true }
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
-        func pipe(_ v: String, _ f: String, samples: Int = Renderer.sampleCount,
-                  colorFormats: [MTLPixelFormat] = [Renderer.colorFormat],
+        func pipe(_ v: String, _ f: String, samples: Int = GPUSimRenderer.sampleCount,
+                  colorFormats: [MTLPixelFormat] = [GPUSimRenderer.colorFormat],
                   depth: MTLPixelFormat = .depth32Float,
                   blending: Bool = false) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
             guard let vertex = lib.makeFunction(name: v) else {
-                throw RendererInitializationError.shaderFunction(v)
+                throw GPUSimRendererError.shaderFunction(v)
             }
             guard let fragment = lib.makeFunction(name: f) else {
-                throw RendererInitializationError.shaderFunction(f)
+                throw GPUSimRendererError.shaderFunction(f)
             }
             d.vertexFunction = vertex
             d.fragmentFunction = fragment
@@ -999,7 +1284,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             let d = MTLRenderPipelineDescriptor()
             d.label = "Directional shadow: \(vertex)"
             guard let function = lib.makeFunction(name: vertex) else {
-                throw RendererInitializationError.shaderFunction(vertex)
+                throw GPUSimRendererError.shaderFunction(vertex)
             }
             d.vertexFunction = function
             d.fragmentFunction = nil
@@ -1051,7 +1336,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
         guard let depthState = device.makeDepthStencilState(descriptor: dd) else {
-            throw RendererInitializationError.depthState("geometry")
+            throw GPUSimRendererError.depthState("geometry")
         }
         self.depthState = depthState
 
@@ -1059,7 +1344,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         nd.depthCompareFunction = .always
         nd.isDepthWriteEnabled = false
         guard let noDepthState = device.makeDepthStencilState(descriptor: nd) else {
-            throw RendererInitializationError.depthState("background")
+            throw GPUSimRendererError.depthState("background")
         }
         self.noDepthState = noDepthState
 
@@ -1068,10 +1353,63 @@ final class Renderer: NSObject, MTKViewDelegate {
         debugDepth.isDepthWriteEnabled = false
         guard let debugDepthState = device.makeDepthStencilState(
                 descriptor: debugDepth) else {
-            throw RendererInitializationError.depthState("convex-debug")
+            throw GPUSimRendererError.depthState("convex-debug")
         }
         self.debugDepthState = debugDepthState
 
+    }
+
+    /// Creates a renderer whose current scene and options are supplied by a
+    /// live application model.
+    public convenience init(
+        device: MTLDevice,
+        source: any GPUSimRendererSource
+    ) throws {
+        try self.init(device: device, scene: nil)
+        self.source = source
+    }
+
+    /// Convenience for the package's current Metal simulation backend.
+    public convenience init(device: MTLDevice, solver: GPUSolver) throws {
+        try self.init(device: device, scene: solver)
+    }
+
+    /// Applies the formats required by the renderer and installs it as the
+    /// view delegate. The caller must retain this renderer because `delegate`
+    /// is weak.
+    public func configure(_ view: MTKView, preferredFramesPerSecond: Int? = nil) {
+        view.device = device
+        view.colorPixelFormat = Self.colorFormat
+        view.depthStencilPixelFormat = .depth32Float
+        view.sampleCount = Self.sampleCount
+        if let preferredFramesPerSecond {
+            view.preferredFramesPerSecond = preferredFramesPerSecond
+        }
+        viewportSize = SIMD2(
+            Float(max(view.drawableSize.width, 1)),
+            Float(max(view.drawableSize.height, 1))
+        )
+        view.delegate = self
+    }
+
+    /// Replaces the fixed scene. Set `resetCamera` when this is a different
+    /// scene; temporal history is always invalidated across scene identity.
+    public func setScene(
+        _ scene: (any GPUSimRenderableScene)?,
+        resetCamera: Bool = true
+    ) throws {
+        if let scene, scene.renderDevice.registryID != device.registryID {
+            throw GPUSimRendererError.sceneDeviceMismatch
+        }
+        self.scene = scene
+        if resetCamera { sceneRevision &+= 1 }
+        prevVP = nil
+        lastSceneIdentity = nil
+    }
+
+    /// Discards temporal AO history, for example after a camera teleport.
+    public func resetTemporalHistory() {
+        prevVP = nil
     }
 
     @discardableResult
@@ -1106,8 +1444,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let sd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
-            width: Renderer.shadowMapSize,
-            height: Renderer.shadowMapSize,
+            width: GPUSimRenderer.shadowMapSize,
+            height: GPUSimRenderer.shadowMapSize,
             mipmapped: false)
         sd.usage = [.renderTarget, .shaderRead]
         sd.storageMode = .private
@@ -1131,24 +1469,28 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: - Camera
 
-    var viewMatrix: simd_float4x4 {
+    public var viewMatrix: simd_float4x4 {
         lookAt(eye: eyePosition, center: target, up: F3(0, 0, 1))
     }
 
-    var eyePosition: F3 {
+    public var eyePosition: F3 {
         target + F3(distance * cos(elevation) * cos(azimuth),
                     distance * cos(elevation) * sin(azimuth),
                     distance * sin(elevation))
     }
 
-    func projectionMatrix(aspect: Float) -> simd_float4x4 {
+    public func projectionMatrix(aspect: Float) -> simd_float4x4 {
         perspective(fovY: 50 * .pi / 180, aspect: aspect, near: 0.1, far: 1000)
     }
 
-    func ray(at point: CGPoint, in size: CGSize) -> (origin: F3, dir: F3) {
-        let aspect = Float(size.width / max(size.height, 1))
-        let ndcX = Float(point.x / size.width) * 2 - 1
-        let ndcY = 1 - Float(point.y / size.height) * 2
+    /// Builds a world ray from a pixel point whose origin is the view's
+    /// upper-left corner.
+    public func ray(at point: CGPoint, in size: CGSize) -> (origin: F3, dir: F3) {
+        let width = max(size.width, 1)
+        let height = max(size.height, 1)
+        let aspect = Float(width / height)
+        let ndcX = Float(point.x / width) * 2 - 1
+        let ndcY = 1 - Float(point.y / height) * 2
         let invVP = (projectionMatrix(aspect: aspect) * viewMatrix).inverse
         var pNear = invVP * SIMD4<Float>(ndcX, ndcY, 0, 1)
         var pFar = invVP * SIMD4<Float>(ndcX, ndcY, 1, 1)
@@ -1159,32 +1501,42 @@ final class Renderer: NSObject, MTKViewDelegate {
         return (o, d)
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         viewportSize = SIMD2(Float(size.width), Float(size.height))
     }
 
     // MARK: - Frame
 
-    func draw(in view: MTKView) {
+    public func draw(in view: MTKView) {
         guard runtimeFailure == nil else { return }
-        guard let model,
-              let solver = model.solver,
-              let rpd = view.currentRenderPassDescriptor,
+        guard let rpd = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable else { return }
+
+        source?.rendererWillDrawFrame()
+        guard let renderScene = source?.renderScene ?? scene else { return }
+
+        guard renderScene.renderDevice.registryID == device.registryID else {
+            reportFailure(
+                GPUSimRendererError.sceneDeviceMismatch.localizedDescription
+            )
+            return
+        }
+
+        let activeOptions = source?.rendererOptions ?? options
+        let activeSceneRevision = source?.rendererSceneRevision ?? sceneRevision
 
         guard let cmd = queue.makeCommandBuffer() else {
             reportFailure("could not create a Metal command buffer")
             return
         }
-        cmd.label = "AVBD render frame"
+        cmd.label = "GPU Sim render frame"
 
-        model.tickIfRunning()
-        // The model owns physics failure reporting. Never relabel a poisoned
-        // solver as a renderer failure or read its potentially invalid state.
-        guard solver.runtimeFailure == nil else { return }
-        let solverIdentity = ObjectIdentifier(solver)
-        if solverIdentity != lastSolverIdentity {
-            lastSolverIdentity = solverIdentity
+        // The source owns physics failure reporting. Never relabel a poisoned
+        // scene as a renderer failure or read its potentially invalid state.
+        guard renderScene.rendererStateIsValid else { return }
+        let sceneIdentity = ObjectIdentifier(renderScene)
+        if sceneIdentity != lastSceneIdentity {
+            lastSceneIdentity = sceneIdentity
             prevVP = nil
         }
         guard ensureTargets(view.drawableSize) else {
@@ -1196,29 +1548,19 @@ final class Renderer: NSObject, MTKViewDelegate {
         // default distance). Applied only when the DEMO changes — resets and
         // size/param rebuilds keep the user's camera. AVBD_CAM_* env
         // overrides outrank it.
-        if lastCameraEpoch != model.cameraEpoch {
-            lastCameraEpoch = model.cameraEpoch
-            if !envCameraSet {
-                distance = solver.settings.cameraDistance > 0
-                    ? solver.settings.cameraDistance : 30
-                target.z = solver.settings.cameraTargetZ != 0
-                    ? solver.settings.cameraTargetZ : 3
-                target.x = solver.settings.cameraTargetX.isFinite
-                    ? solver.settings.cameraTargetX : 0
-                target.y = solver.settings.cameraTargetY.isFinite
-                    ? solver.settings.cameraTargetY : 0
-                if solver.settings.cameraAzimuth.isFinite {
-                    azimuth = solver.settings.cameraAzimuth
-                }
-                if solver.settings.cameraElevation.isFinite {
-                    elevation = solver.settings.cameraElevation
-                }
+        if lastCameraEpoch != activeSceneRevision {
+            lastCameraEpoch = activeSceneRevision
+            if automaticallyFramesScene {
+                let hint = renderScene.renderCameraHint
+                distance = hint.distance
+                target = hint.target
+                azimuth = hint.azimuth
+                elevation = hint.elevation
             }
         }
 
-        let bodyCount = solver.bodyCount
-        let rigidCount = solver.renderRigidBodyCount
-        let stride = MemoryLayout<simd_float4x4>.stride + 32
+        let rigidCount = renderScene.renderRigidInstanceCount
+        let stride = MemoryLayout<GPUSimRenderInstance>.stride
         if instances == nil || instances!.length < max(1, rigidCount) * stride {
             instances = device.makeBuffer(length: max(256, max(1, rigidCount) * stride),
                                           options: .storageModePrivate)
@@ -1230,14 +1572,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         do {
-            try solver.encodeBuildInstancesChecked(
+            try renderScene.encodeRenderInstances(
                 cmd, instances: instances,
-                colorMode: model.colorByGraphColor ? 1 : 0)
+                colorMode: activeOptions.colorMode)
         } catch {
             // synchronize() inside the checked API may be the first observer
             // of a physics error. Its owning model will report it on the next
             // tick; do not poison or misclassify it here.
-            guard solver.runtimeFailure == nil else { return }
+            guard renderScene.rendererStateIsValid else { return }
             reportFailure("instance-build encoder failed: \(error.localizedDescription)")
             return
         }
@@ -1257,7 +1599,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         let lightUp = F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
-        let texelWorld = (2 * shadowExtent) / Float(Renderer.shadowMapSize)
+        let texelWorld = (2 * shadowExtent) / Float(GPUSimRenderer.shadowMapSize)
         let rightCoord = (dot(target, lightRight) / texelWorld).rounded() * texelWorld
         let upCoord = (dot(target, lightMapUp) / texelWorld).rounded() * texelWorld
         let shadowCenter = target
@@ -1300,8 +1642,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             let enc = shadowEncoder
             enc.label = "Directional shadow casters"
             enc.setViewport(MTLViewport(originX: 0, originY: 0,
-                                        width: Double(Renderer.shadowMapSize),
-                                        height: Double(Renderer.shadowMapSize),
+                                        width: Double(GPUSimRenderer.shadowMapSize),
+                                        height: Double(GPUSimRenderer.shadowMapSize),
                                         znear: 0, zfar: 1))
             enc.setDepthStencilState(depthState)
             var shadowU = U
@@ -1316,24 +1658,24 @@ final class Renderer: NSObject, MTKViewDelegate {
                                        vertexCount: verts, instanceCount: rigidCount)
                 }
             }
-            if let surf = solver.renderSurface {
+            if let surf = renderScene.softRenderSurface {
                 enc.setRenderPipelineState(softShadow)
-                enc.setVertexBuffer(surf.tris, offset: 0, index: 0)
+                enc.setVertexBuffer(surf.triangles, offset: 0, index: 0)
                 enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: surf.triCount * 3)
+                                   vertexCount: surf.triangleCount * 3)
             }
-            if let skin = solver.renderSkinnedSurface {
+            if let skin = renderScene.skinnedRenderSurface {
                 enc.setRenderPipelineState(skinShadow)
-                enc.setVertexBuffer(skin.tris, offset: 0, index: 0)
+                enc.setVertexBuffer(skin.triangles, offset: 0, index: 0)
                 enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: skin.triCount * 3)
+                                   vertexCount: skin.triangleCount * 3)
             }
-            if let mesh = solver.renderIndexedRigidMeshSurface {
+            if let mesh = renderScene.rigidMeshRenderSurface {
                 enc.setRenderPipelineState(rigidMeshShadow)
                 enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
                 enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1383,25 +1725,25 @@ final class Renderer: NSObject, MTKViewDelegate {
                                        vertexCount: verts, instanceCount: rigidCount)
                 }
             }
-            if let surf = solver.renderSurface {
+            if let surf = renderScene.softRenderSurface {
                 enc.setRenderPipelineState(softPre)
-                enc.setVertexBuffer(surf.tris, offset: 0, index: 0)
+                enc.setVertexBuffer(surf.triangles, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
                 enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: surf.triCount * 3)
+                                   vertexCount: surf.triangleCount * 3)
             }
-            if let skin = solver.renderSkinnedSurface {
+            if let skin = renderScene.skinnedRenderSurface {
                 enc.setRenderPipelineState(skinPre)
-                enc.setVertexBuffer(skin.tris, offset: 0, index: 0)
+                enc.setVertexBuffer(skin.triangles, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: skin.triCount * 3)
+                                   vertexCount: skin.triangleCount * 3)
             }
-            if let mesh = solver.renderIndexedRigidMeshSurface {
+            if let mesh = renderScene.rigidMeshRenderSurface {
                 enc.setRenderPipelineState(rigidMeshPre)
                 enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1526,9 +1868,9 @@ final class Renderer: NSObject, MTKViewDelegate {
                                    vertexCount: verts, instanceCount: rigidCount)
             }
         }
-        if let surf = solver.renderSurface {
+        if let surf = renderScene.softRenderSurface {
             enc.setRenderPipelineState(softP)
-            enc.setVertexBuffer(surf.tris, offset: 0, index: 0)
+            enc.setVertexBuffer(surf.triangles, offset: 0, index: 0)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
             enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
@@ -1536,20 +1878,20 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.setFragmentTexture(shadowTex, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: surf.triCount * 3)
+                               vertexCount: surf.triangleCount * 3)
         }
-        if let skin = solver.renderSkinnedSurface {
+        if let skin = renderScene.skinnedRenderSurface {
             enc.setRenderPipelineState(skinP)
-            enc.setVertexBuffer(skin.tris, offset: 0, index: 0)
+            enc.setVertexBuffer(skin.triangles, offset: 0, index: 0)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.setFragmentTexture(shadowTex, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: skin.triCount * 3)
+                               vertexCount: skin.triangleCount * 3)
         }
-        if let mesh = solver.renderIndexedRigidMeshSurface {
+        if let mesh = renderScene.rigidMeshRenderSurface {
             enc.setRenderPipelineState(rigidMeshP)
             enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1563,8 +1905,8 @@ final class Renderer: NSObject, MTKViewDelegate {
                 indexType: .uint32, indexBuffer: mesh.indices,
                 indexBufferOffset: 0)
         }
-        if model.showConvexCollisionGeometry,
-           let debug = solver.renderConvexCollisionSurface {
+        if activeOptions.showConvexCollisionGeometry,
+           let debug = renderScene.convexDebugRenderSurface {
             enc.setDepthStencilState(debugDepthState)
             // Pull the diagnostic surface very slightly toward the camera so
             // coincident visual and collision meshes do not z-fight. This is
@@ -1579,7 +1921,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: debug.triangleVertexCount)
             }
-            if model.convexCollisionWireframe, debug.edgeVertexCount > 0 {
+            if activeOptions.convexCollisionWireframe, debug.edgeVertexCount > 0 {
                 enc.setRenderPipelineState(convexDebugWireP)
                 enc.setVertexBuffer(debug.edgeVertices, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -1610,55 +1952,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         frameIdx &+= 1
 
         framesDrawn += 1
-        if framesDrawn == 30, ProcessInfo.processInfo.environment["AVBD_MARKER"] != nil {
-            let info = "frames=30 bodies=\(bodyCount) rigidInstances=\(rigidCount) stats=\(model.statsText)"
-            try? info.write(toFile: "/tmp/avbd_render_marker.txt", atomically: true, encoding: .utf8)
-        }
-        // Scripted capture: AVBD_SHOT=<path.png> [AVBD_SHOT_FRAME=n] writes
-        // the resolved frame and exits (needs framebufferOnly = false).
-        if scriptedCaptureAllowed,
-           let shotPath = ProcessInfo.processInfo.environment["AVBD_SHOT"],
-           framesDrawn == (Int(ProcessInfo.processInfo.environment["AVBD_SHOT_FRAME"] ?? "") ?? 90) {
-            writePNG(texture: drawable.texture, to: shotPath)
-            exit(0)
-        }
-        if scriptedCaptureAllowed,
-           let directory = ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] {
-            let every = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_EVERY"] ?? "") ?? 3, 1)
-            let maximum = max(Int(ProcessInfo.processInfo.environment["AVBD_VIDEO_FRAMES"] ?? "") ?? 600, 1)
-            if framesDrawn.isMultiple(of: every) {
-                let path = String(format: "%@/%05d.png", directory, framesDrawn / every)
-                writePNG(texture: drawable.texture, to: path)
-            }
-            if framesDrawn >= maximum { exit(0) }
-        }
-    }
-
-    private func writePNG(texture: MTLTexture, to path: String) {
-        let w = texture.width, h = texture.height
-        var bytes = [UInt8](repeating: 0, count: w * h * 4)
-        bytes.withUnsafeMutableBytes { raw in
-            texture.getBytes(raw.baseAddress!, bytesPerRow: w * 4,
-                             from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
-        }
-        // BGRA -> RGBA
-        for i in stride(from: 0, to: bytes.count, by: 4) { bytes.swapAt(i, i + 2) }
-        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
-        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
-              let img = CGImage(width: w, height: h, bitsPerComponent: 8,
-                                bitsPerPixel: 32, bytesPerRow: w * 4, space: cs,
-                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                                provider: provider, decode: nil,
-                                shouldInterpolate: false, intent: .defaultIntent),
-              let dest = CGImageDestinationCreateWithURL(
-                  URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil)
-        else { return }
-        CGImageDestinationAddImage(dest, img, nil)
-        CGImageDestinationFinalize(dest)
+        frameCompletionHandler?(drawable.texture, framesDrawn)
     }
 }
 
-func lookAt(eye: F3, center: F3, up: F3) -> simd_float4x4 {
+private func lookAt(eye: F3, center: F3, up: F3) -> simd_float4x4 {
     let f = normalize(center - eye)
     let s = normalize(cross(f, up))
     let u = cross(s, f)
@@ -1670,7 +1968,7 @@ func lookAt(eye: F3, center: F3, up: F3) -> simd_float4x4 {
     ))
 }
 
-func perspective(fovY: Float, aspect: Float, near: Float, far: Float) -> simd_float4x4 {
+private func perspective(fovY: Float, aspect: Float, near: Float, far: Float) -> simd_float4x4 {
     let y = 1 / tan(fovY * 0.5)
     let x = y / aspect
     let z = far / (near - far)

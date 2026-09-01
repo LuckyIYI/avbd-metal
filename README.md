@@ -53,10 +53,12 @@ applications.
 | `SimCore` | Backend-neutral math, scene descriptions, geometry, mesh import, and deterministic utilities |
 | `PhysicsAVBD` | Concrete AVBD CPU/Metal backend and its required shader resources; depends only on `SimCore` |
 | `GPUSimDemos` | Optional demo scenes and sample meshes; not linked or copied for `GPUSim` consumers |
+| `GPUSimRenderer` | Optional MetalKit renderer with PBR lighting, shadows, temporal GTAO, orbit-camera controls, and direct GPU-buffer integration |
 
 The root manifest has no external package dependencies. `SimCore` and
 `PhysicsAVBD` remain public products for advanced clients and source
-compatibility, while normal clients use only `GPUSim`.
+compatibility, while headless clients use only `GPUSim`. Add the independent
+`GPUSimRenderer` product only when the project needs visualization.
 
 ### Development package
 
@@ -115,6 +117,41 @@ print(solver.bodies[body].positionLin)
 clients that deliberately want a lower-level dependency boundary. Add the
 separate `GPUSimDemos` product only when sample scenes and meshes are useful.
 
+### Optional renderer
+
+Add `GPUSimRenderer` beside `GPUSim` in the consuming target:
+
+```swift
+.product(name: "GPUSim", package: "avbd-metal"),
+.product(name: "GPUSimRenderer", package: "avbd-metal"),
+```
+
+Then a live Metal scene needs only a solver, a retained renderer, and an
+`MTKView`:
+
+```swift
+import GPUSim
+import GPUSimRenderer
+import MetalKit
+
+let device = MTLCreateSystemDefaultDevice()!
+let solver = try GPUSolver(scene: scene, device: device)
+let renderer = try GPUSimRenderer(device: device, solver: solver)
+let view = MTKView(frame: .zero, device: device)
+renderer.configure(view, preferredFramesPerSecond: 60)
+```
+
+Keep `renderer` alive because `MTKView.delegate` is weak. Its public camera
+properties (`target`, `distance`, `azimuth`, and `elevation`) and `ray(at:in:)`
+cover orbit controls and scene picking. Apps that step or replace a simulation
+per frame can implement `GPUSimRendererSource`; future GPU backends can provide
+the compact `GPUSimRenderableScene` buffer contract without changing the view
+API. The renderer remains optional and pulls in neither demos, robotics, RL,
+nor MLX.
+
+See [GPU Sim renderer](Documentation/GPUSimRenderer.md) for live-source,
+camera, picking, synchronization, and alternate-backend integration details.
+
 ## Robot learning
 
 The vector RL path is task-agnostic and runs the simulator and MLX learner on
@@ -170,6 +207,7 @@ swift test                                    # standalone simulator suite
 swift test --package-path Development         # app/RL/MLX integration suite
 swift test --package-path Development --filter RLFrameworkTests
 make verify-package-consumer                  # compile and run a separate client
+make verify-renderer-consumer                 # compile/run renderer API client
 make verify-gpusim-ios                        # compile GPUSim for generic iOS
 make test                                     # both packages
 make verify-release                           # full arm64 Mac release gate

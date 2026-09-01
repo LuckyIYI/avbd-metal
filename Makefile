@@ -10,7 +10,7 @@ DEMOS_RESOURCE_BUNDLE := gpu-sim_GPUSimDemos.bundle
 ROBOTICS_RESOURCE_BUNDLE := avbd-metal_Robotics.bundle
 
 .PHONY: build workspace-build test simulator-test workspace-test \
-	verify-package-consumer verify-core verify-mlx-rl verify-release \
+	verify-package-consumer verify-renderer-consumer verify-core verify-mlx-rl verify-release \
 	app cli bench clean clean-all ml-tool \
 	app-ml ios-ml verify-gpusim-ios verify-arachne-assets \
 	verify-convex-assets \
@@ -34,17 +34,24 @@ test: simulator-test workspace-test
 verify-package-consumer:
 	swift run --package-path IntegrationTests/PackageConsumer PackageConsumer
 
-# Compile the public simulator facade and its Metal resources for the second
+verify-renderer-consumer:
+	swift run --package-path IntegrationTests/RendererPackageConsumer RendererPackageConsumer
+
+# Compile the public simulator facade and optional renderer for the second
 # platform declared by the root manifest. No signing or device is required.
 verify-gpusim-ios:
 	xcodebuild -scheme GPUSim -configuration Release \
 	  -destination 'generic/platform=iOS' \
 	  -derivedDataPath .xcbuild-gpusim-ios \
 	  CODE_SIGNING_ALLOWED=NO build -quiet
+	xcodebuild -scheme GPUSimRenderer -configuration Release \
+	  -destination 'generic/platform=iOS' \
+	  -derivedDataPath .xcbuild-gpusim-ios \
+	  CODE_SIGNING_ALLOWED=NO build -quiet
 
 # Local core merge gate: every checked-in generated/provenance contract plus
 # the complete SwiftPM suite. None of these checks needs network access.
-verify-core: verify-architecture verify-package-consumer verify-arachne-assets verify-convex-assets \
+verify-core: verify-architecture verify-package-consumer verify-renderer-consumer verify-arachne-assets verify-convex-assets \
 	verify-policy-evidence \
 	verify-panda-provenance verify-h1-provenance
 	swift test
@@ -150,7 +157,8 @@ bench: workspace-build
 	$(DEV_BUILD_DIR)/release/avbd bench boxpile --frames 100 --scale 3
 
 clean:
-	rm -rf .build Development/.build IntegrationTests/PackageConsumer/.build AVBD.app
+	rm -rf .build Development/.build IntegrationTests/PackageConsumer/.build \
+	  IntegrationTests/RendererPackageConsumer/.build AVBD.app
 
 # Deliberately expensive cleanup for every ignored Xcode build cache. Normal
 # `clean` keeps these caches so rebuilding the MLX app does not start cold.

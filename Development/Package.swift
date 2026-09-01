@@ -66,6 +66,7 @@ let package = Package(
                 .product(name: "SimCore", package: "gpu-sim"),
                 .product(name: "PhysicsAVBD", package: "gpu-sim"),
                 .product(name: "GPUSimDemos", package: "gpu-sim"),
+                .product(name: "GPUSimRenderer", package: "gpu-sim"),
                 "Robotics",
                 "RL",
                 "MLXRL",

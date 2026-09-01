@@ -6,7 +6,7 @@ that product does not resolve MLX, build the app or CLI, or copy sample meshes.
 
 ## Public simulator package
 
-The root [Package.swift](../Package.swift) owns four products:
+The root [Package.swift](../Package.swift) owns five products:
 
 - `GPUSim` is the stable, single-import facade. It re-exports the neutral scene
   API and the available solver backends.
@@ -15,12 +15,16 @@ The root [Package.swift](../Package.swift) owns four products:
   Its resource bundle contains only required Metal shaders.
 - `GPUSimDemos` is optional. It owns tuned sample scenes and all demonstration
   meshes, cooked convex fixtures, and their attribution records.
+- `GPUSimRenderer` is optional. It provides the reusable MetalKit renderer,
+  camera/raycast API, and a backend-neutral GPU render-scene contract. The
+  current `GPUSolver` conforms through the renderer module.
 
 The root manifest intentionally has no package dependencies. Both
 `PhysicsAVBD` and `GPUSimDemos` depend downward on `SimCore`; neither depends on
-the other. A client selecting only `GPUSim` therefore compiles the scene layer,
-the CPU/Metal backend, and shader resources—nothing from the demo or research
-workspace.
+the other. `GPUSimRenderer` depends only on the public simulation layers and is
+not part of the `GPUSim` facade. A client selecting only `GPUSim` therefore
+compiles the scene layer, the CPU/Metal backend, and shader resources—nothing
+from the renderer, demos, or research workspace.
 
 The `SimCore` and `PhysicsAVBD` products remain available for clients that need
 an explicit lower-level module boundary. New clients should prefer `GPUSim` so
@@ -43,7 +47,7 @@ accidental MLX resolution for simulator consumers.
 
 ## Verification
 
-Three independent checks protect the boundary:
+Four independent checks protect the boundary:
 
 1. `Tests/GPUSimTests` imports only `GPUSim` and exercises a complete CPU scene
    step.
@@ -53,12 +57,16 @@ Three independent checks protect the boundary:
 3. `Tools/verify_architecture.py` evaluates both manifests in isolated caches,
    requires zero root dependencies, verifies exact target/resource ownership,
    rejects reverse imports, and confines MLX to the development package.
+4. `IntegrationTests/RendererPackageConsumer` compiles the documented
+   `GPUSim` + `GPUSimRenderer` setup as a separate Swift package and initializes
+   it when Metal is available.
 
 Run the package gates with:
 
 ```bash
 swift test
 swift run --package-path IntegrationTests/PackageConsumer PackageConsumer
+swift run --package-path IntegrationTests/RendererPackageConsumer RendererPackageConsumer
 swift test --package-path Development
 python3 Tools/verify_architecture.py
 make verify-gpusim-ios

@@ -6,6 +6,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import SimCore
 import PhysicsAVBD
+import GPUSimRenderer
 import RL
 import MLXRL
 
@@ -598,20 +599,17 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
             || ProcessInfo.processInfo.environment["AVBD_VIDEO_DIR"] != nil {
             view.framebufferOnly = false
         }
-        view.colorPixelFormat = Renderer.colorFormat
-        view.depthStencilPixelFormat = .depth32Float
-        view.sampleCount = Renderer.sampleCount
-        view.preferredFramesPerSecond = 30
         guard let device else {
             model.reportRenderFailure("no Metal device is available")
             view.isPaused = true
             return view
         }
         do {
-            let renderer = try Renderer(device: device, model: model)
+            let renderer = try GPUSimRenderer(device: device, source: model)
+            configureAppCapture(renderer: renderer, model: model)
+            renderer.configure(view, preferredFramesPerSecond: 30)
             context.coordinator.renderer = renderer
             view.renderer = renderer
-            view.delegate = renderer
         } catch {
             model.reportRenderFailure(error.localizedDescription)
             view.isPaused = true
@@ -634,7 +632,7 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
     }
 
     @MainActor final class Coordinator {
-        var renderer: Renderer?
+        var renderer: GPUSimRenderer?
         var cameraID: String?
         weak var solver: GPUSolver?
     }
@@ -642,7 +640,7 @@ private struct PolicyReplayMetalView: NSViewRepresentable {
 
 /// Camera-only input. Policy actions remain the sole robot controls.
 private final class PolicyOrbitMTKView: MTKView {
-    weak var renderer: Renderer?
+    weak var renderer: GPUSimRenderer?
     override var acceptsFirstResponder: Bool { true }
 
     override func mouseDown(with event: NSEvent) {

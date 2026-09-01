@@ -69,6 +69,10 @@ def valid_simulator_manifest() -> dict[str, object]:
                 "GPUSimDemos", [target_dependency("SimCore")],
                 resources=[resource("Assets")],
             ),
+            target(
+                "GPUSimRenderer",
+                [target_dependency("SimCore"), target_dependency("PhysicsAVBD")],
+            ),
             target("SimCoreTests", target_type="test"),
         ],
         "products": [product(name) for name in architecture.SIMULATOR_TARGETS],
@@ -79,6 +83,7 @@ def valid_development_manifest() -> dict[str, object]:
     core = product_dependency("SimCore", "gpu-sim")
     physics = product_dependency("PhysicsAVBD", "gpu-sim")
     demos = product_dependency("GPUSimDemos", "gpu-sim")
+    renderer = product_dependency("GPUSimRenderer", "gpu-sim")
     mlx = [product_dependency(name, "mlx-swift")
            for name in architecture.MLX_PRODUCTS]
     return {
@@ -101,7 +106,7 @@ def valid_development_manifest() -> dict[str, object]:
             ),
             target(
                 "AVBDApp",
-                [core, physics, demos, target_dependency("Robotics"),
+                [core, physics, demos, renderer, target_dependency("Robotics"),
                  target_dependency("RL"), target_dependency("MLXRL")],
                 target_type="executable",
             ),
@@ -135,6 +140,10 @@ def create_valid_sources(root: Path) -> None:
     )
     write(root, "Sources/GPUSimDemos/Demos.swift",
           "import SimCore\npublic enum Demos {}\n")
+    write(
+        root, "Sources/GPUSimRenderer/Renderer.swift",
+        "import SimCore\nimport PhysicsAVBD\npublic struct Renderer {}\n",
+    )
     write(root, "Sources/PhysicsAVBD/Shaders/solver.metal",
           "kernel void solve() {}\n")
     write(root, "Sources/GPUSimDemos/Assets/bunny.obj", "o bunny\n")
@@ -158,7 +167,11 @@ def create_valid_sources(root: Path) -> None:
         ("SimCore", "PhysicsAVBD", "GPUSimDemos", "Robotics", "RL", "MLXRL")
     ) + "\n"
     write(development, "Sources/avbd/main.swift", imports)
-    write(development, "Sources/AVBDApp/App.swift", imports)
+    write(
+        development,
+        "Sources/AVBDApp/App.swift",
+        imports + "import GPUSimRenderer\n",
+    )
     write(development, "Sources/Robotics/Assets/robot.xml", "<mujoco/>\n")
 
 

@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "GPUSim", targets: ["GPUSim"]),
         .library(name: "GPUSimDemos", targets: ["GPUSimDemos"]),
+        .library(name: "GPUSimRenderer", targets: ["GPUSimRenderer"]),
         .library(name: "SimCore", targets: ["SimCore"]),
         .library(name: "PhysicsAVBD", targets: ["PhysicsAVBD"]),
     ],
@@ -26,6 +27,10 @@ let package = Package(
             dependencies: ["SimCore"],
             resources: [.copy("Assets")]
         ),
+        .target(
+            name: "GPUSimRenderer",
+            dependencies: ["SimCore", "PhysicsAVBD"]
+        ),
         .testTarget(
             name: "SimCoreTests",
             dependencies: ["SimCore"]
@@ -37,6 +42,10 @@ let package = Package(
         .testTarget(
             name: "GPUSimTests",
             dependencies: ["GPUSim"]
+        ),
+        .testTarget(
+            name: "GPUSimRendererTests",
+            dependencies: ["GPUSimRenderer"]
         ),
     ],
     swiftLanguageVersions: [.v5]

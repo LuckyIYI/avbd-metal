@@ -22,7 +22,9 @@ import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SIMULATOR_TARGETS = ("SimCore", "PhysicsAVBD", "GPUSim", "GPUSimDemos")
+SIMULATOR_TARGETS = (
+    "SimCore", "PhysicsAVBD", "GPUSim", "GPUSimDemos", "GPUSimRenderer"
+)
 DEVELOPMENT_LAYER_TARGETS = ("Robotics", "RL", "MLXRL")
 ENTRY_POINT_TARGETS = ("avbd", "AVBDApp")
 DEVELOPMENT_TARGETS = (*DEVELOPMENT_LAYER_TARGETS, *ENTRY_POINT_TARGETS)
@@ -57,12 +59,14 @@ SIMULATOR_DEPENDENCIES = {
     "PhysicsAVBD": frozenset({_target("SimCore")}),
     "GPUSim": frozenset({_target("SimCore"), _target("PhysicsAVBD")}),
     "GPUSimDemos": frozenset({_target("SimCore")}),
+    "GPUSimRenderer": frozenset({_target("SimCore"), _target("PhysicsAVBD")}),
 }
 SIMULATOR_RESOURCES = {
     "SimCore": frozenset(),
     "PhysicsAVBD": frozenset({"copy:Shaders"}),
     "GPUSim": frozenset(),
     "GPUSimDemos": frozenset({"copy:Assets"}),
+    "GPUSimRenderer": frozenset(),
 }
 SIMULATOR_PRODUCTS = {
     name: ("library", (name,)) for name in SIMULATOR_TARGETS
@@ -71,6 +75,7 @@ SIMULATOR_PRODUCTS = {
 _SIM_CORE = _product("SimCore", "gpu-sim")
 _PHYSICS = _product("PhysicsAVBD", "gpu-sim")
 _DEMOS = _product("GPUSimDemos", "gpu-sim")
+_RENDERER = _product("GPUSimRenderer", "gpu-sim")
 DEVELOPMENT_DEPENDENCIES = {
     "Robotics": frozenset({_SIM_CORE}),
     "RL": frozenset({_SIM_CORE, _PHYSICS, _DEMOS, _target("Robotics")}),
@@ -98,6 +103,7 @@ DEVELOPMENT_DEPENDENCIES = {
             _SIM_CORE,
             _PHYSICS,
             _DEMOS,
+            _RENDERER,
             _target("Robotics"),
             _target("RL"),
             _target("MLXRL"),
@@ -120,6 +126,7 @@ SIMULATOR_IMPORTS = {
     "PhysicsAVBD": frozenset({"SimCore"}),
     "GPUSim": frozenset({"SimCore", "PhysicsAVBD"}),
     "GPUSimDemos": frozenset({"SimCore"}),
+    "GPUSimRenderer": frozenset({"SimCore", "PhysicsAVBD"}),
 }
 DEVELOPMENT_IMPORTS = {
     "Robotics": frozenset({"SimCore"}),
@@ -129,7 +136,10 @@ DEVELOPMENT_IMPORTS = {
         {"SimCore", "PhysicsAVBD", "GPUSimDemos", "Robotics", "RL", "MLXRL"}
     ),
     "AVBDApp": frozenset(
-        {"SimCore", "PhysicsAVBD", "GPUSimDemos", "Robotics", "RL", "MLXRL"}
+        {
+            "SimCore", "PhysicsAVBD", "GPUSimDemos", "GPUSimRenderer",
+            "Robotics", "RL", "MLXRL"
+        }
     ),
 }
 
@@ -646,7 +656,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"architecture verification failed: {error}", file=sys.stderr)
         return 1
     print(
-        "verified standalone GPUSim -> optional demos and "
+        "verified standalone GPUSim -> optional demos/renderer and "
         "Development/Robotics -> RL -> MLXRL boundaries"
     )
     return 0
