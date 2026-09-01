@@ -146,7 +146,8 @@ public struct GPUSimRenderInstance {
         rotation: Quat = Quat(real: 1, imag: .zero),
         color: F3,
         emissive: F3 = .zero,
-        opacity: Float = 1
+        opacity: Float = 1,
+        castsShadow: Bool = false
     ) {
         var model = simd_float4x4(rotation.normalized)
         model.columns.3 = SIMD4(position, 1)
@@ -184,6 +185,7 @@ public struct GPUSimRenderInstance {
             parameters.y = radius
             parameters.z = capsuleLength * 0.5 + radius
         }
+        parameters.w = castsShadow ? 1 : 0
         self.init(
             model: model,
             color: SIMD4(color, kind),
@@ -1411,11 +1413,16 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var frameIdx: UInt32 = 0
     var targetSize = SIMD2<Int>(0, 0)
     var instances: MTLBuffer?
-    private var appearanceBuffer: MTLBuffer?
+    private var appearanceRing: [MTLBuffer?] = [nil, nil, nil]
+    private var appearanceActiveBodies: [[Int]] = [[], [], []]
     private var appearanceCapacity = 0
     private var activeAppearanceBodies: [Int] = []
     private var auxiliaryInstanceRing: [MTLBuffer?] = [nil, nil, nil]
-    private var auxiliaryInstanceIndex = 0
+    /// One staging slot per frame, shared by every CPU-written renderer
+    /// buffer; the in-flight semaphore caps outstanding frames to the ring
+    /// depth so a slot is never rewritten while a frame still reads it.
+    private var frameSlot = 0
+    private let inFlightFrames = DispatchSemaphore(value: 3)
 
     /// Orbit azimuth in radians.
     public var azimuth: Float = 0.9
@@ -1738,35 +1745,44 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         guard bodyCount > 0,
               appearances.keys.contains(where: { $0 >= 0 && $0 < bodyCount })
         else { return nil }
-        if appearanceBuffer == nil || appearanceCapacity < bodyCount {
-            appearanceCapacity = max(bodyCount, max(16, appearanceCapacity * 2))
-            appearanceBuffer = device.makeBuffer(
-                length: appearanceCapacity
-                    * MemoryLayout<GPUSimRenderAppearance>.stride,
-                options: .storageModeShared)
-            appearanceBuffer?.label = "GPU Sim body appearance overrides"
-            if let appearanceBuffer {
-                memset(appearanceBuffer.contents(), 0, appearanceBuffer.length)
+        // same in-flight ring as the auxiliary staging: a non-retired frame
+        // may still be reading the previous slot
+        let slot = frameSlot
+        if appearanceRing[slot] == nil || appearanceCapacity < bodyCount {
+            appearanceCapacity = max(bodyCount, max(16, appearanceCapacity))
+            for k in appearanceRing.indices where appearanceRing[k] == nil
+                || appearanceRing[k]!.length < appearanceCapacity
+                    * MemoryLayout<GPUSimRenderAppearance>.stride {
+                let buffer = device.makeBuffer(
+                    length: appearanceCapacity
+                        * MemoryLayout<GPUSimRenderAppearance>.stride,
+                    options: .storageModeShared)
+                buffer?.label = "GPU Sim body appearance overrides"
+                if let buffer {
+                    memset(buffer.contents(), 0, buffer.length)
+                }
+                appearanceRing[k] = buffer
+                appearanceActiveBodies[k].removeAll(keepingCapacity: true)
             }
-            activeAppearanceBodies.removeAll(keepingCapacity: true)
         }
-        guard let appearanceBuffer else { return nil }
-        let values = appearanceBuffer.contents().bindMemory(
+        guard let buffer = appearanceRing[slot] else { return nil }
+        let values = buffer.contents().bindMemory(
             to: GPUSimRenderAppearance.self, capacity: appearanceCapacity)
-        for body in activeAppearanceBodies { values[body] = .init() }
-        activeAppearanceBodies.removeAll(keepingCapacity: true)
+        for body in appearanceActiveBodies[slot] { values[body] = .init() }
+        appearanceActiveBodies[slot].removeAll(keepingCapacity: true)
         for (body, appearance) in appearances
-            where body >= 0 && body < bodyCount {
+        where body >= 0 && body < bodyCount {
             values[body] = appearance
-            activeAppearanceBodies.append(body)
+            appearanceActiveBodies[slot].append(body)
         }
-        return appearanceBuffer
+        return buffer
     }
 
     static func auxiliaryRenderOrder(
         _ values: [GPUSimRenderInstance],
         viewedFrom eye: F3
-    ) -> (opaque: [GPUSimRenderInstance], translucent: [GPUSimRenderInstance]) {
+    ) -> (opaque: [GPUSimRenderInstance], casterCount: Int,
+          translucent: [GPUSimRenderInstance]) {
         var opaque: [GPUSimRenderInstance] = []
         var translucent: [(index: Int, distanceSquared: Float,
                            instance: GPUSimRenderInstance)] = []
@@ -1794,13 +1810,18 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             return $0.distanceSquared > $1.distanceSquared
         }
-        return (opaque, translucent.map(\.instance))
+        // shadow casters lead the opaque run so the shadow pass draws a
+        // stable prefix; relative order is preserved on both sides
+        let casters = opaque.filter { $0.parameters.w > 0.5 }
+        let nonCasters = opaque.filter { $0.parameters.w <= 0.5 }
+        return (casters + nonCasters, casters.count,
+                translucent.map(\.instance))
     }
 
     private func prepareAuxiliaryInstanceBuffer(
         _ values: [GPUSimRenderInstance],
         viewedFrom eye: F3
-    ) -> (buffer: MTLBuffer, opaqueCount: Int,
+    ) -> (buffer: MTLBuffer, opaqueCount: Int, casterCount: Int,
           translucent: [GPUSimRenderInstance])? {
         let order = Self.auxiliaryRenderOrder(values, viewedFrom: eye)
         let ordered = order.opaque + order.translucent
@@ -1808,24 +1829,23 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // A ring, not a single buffer: scenes that opt out of per-frame
         // retirement can have frames in flight, and a CPU memcpy into a
         // buffer the previous frame still reads is a race.
-        auxiliaryInstanceIndex =
-            (auxiliaryInstanceIndex + 1) % auxiliaryInstanceRing.count
-        if auxiliaryInstanceRing[auxiliaryInstanceIndex] == nil
-            || auxiliaryInstanceRing[auxiliaryInstanceIndex]!.length
+        if auxiliaryInstanceRing[frameSlot] == nil
+            || auxiliaryInstanceRing[frameSlot]!.length
                 < ordered.count * MemoryLayout<GPUSimRenderInstance>.stride {
             let capacity = max(ordered.count * 2, 16)
             let buffer = device.makeBuffer(
                 length: capacity * MemoryLayout<GPUSimRenderInstance>.stride,
                 options: .storageModeShared)
             buffer?.label = "GPU Sim auxiliary instances"
-            auxiliaryInstanceRing[auxiliaryInstanceIndex] = buffer
+            auxiliaryInstanceRing[frameSlot] = buffer
         }
-        guard let buffer = auxiliaryInstanceRing[auxiliaryInstanceIndex]
+        guard let buffer = auxiliaryInstanceRing[frameSlot]
         else { return nil }
         _ = ordered.withUnsafeBytes { bytes in
             memcpy(buffer.contents(), bytes.baseAddress!, bytes.count)
         }
-        return (buffer, order.opaque.count, order.translucent)
+        return (buffer, order.opaque.count, order.casterCount,
+                order.translucent)
     }
 
     // MARK: - Camera
@@ -1961,6 +1981,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             ?? auxiliaryInstances
         let activeSceneRevision = source?.rendererSceneRevision ?? sceneRevision
 
+        // cap frames in flight to the staging ring depth; every exit that
+        // does not commit must release the slot
+        inFlightFrames.wait()
+        frameSlot = (frameSlot + 1) % auxiliaryInstanceRing.count
+        var releasedByCompletion = false
+        defer { if !releasedByCompletion { inFlightFrames.signal() } }
+
         guard let cmd = queue.makeCommandBuffer() else {
             reportFailure("could not create a Metal command buffer")
             return
@@ -2063,7 +2090,19 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // fitting for scenes without bounds or too large to cover crisply.
         // The old fixed 7 m floor gave tabletop scenes 7 mm texels and
         // biases larger than a cube's contact shadow.
-        let contentBounds = renderScene.renderContentBounds
+        var contentBounds = renderScene.renderContentBounds
+        // opaque auxiliary casters live in app space; a skeleton or marker
+        // outside the scene's own bounds must not fall off the light volume
+        if var bounds = contentBounds {
+            for instance in activeAuxiliaryInstances
+            where instance.material.w >= 1 && instance.parameters.w > 0.5 {
+                let t = instance.model.columns.3
+                let p = F3(t.x, t.y, t.z)
+                let reach = length(p - bounds.center) + instance.parameters.z
+                bounds.radius = max(bounds.radius, reach)
+            }
+            contentBounds = bounds
+        }
         let shadowFollowsContent = contentBounds.map { $0.radius <= 25 } ?? false
         let shadowFocus = shadowFollowsContent
             ? contentBounds!.center : activeFocus
@@ -2156,7 +2195,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                        vertexCount: verts, instanceCount: rigidCount)
                 }
             }
-            if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
+            if let auxiliaryBatch, auxiliaryBatch.casterCount > 0 {
                 for (p, verts) in [(boxShadow!, 36), (sphereShadow!, SPHV),
                                    (torusShadow!, TORV), (capsuleShadow!, CAPV)] {
                     enc.setRenderPipelineState(p)
@@ -2167,7 +2206,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                        index: 1)
                     enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                        vertexCount: verts,
-                                       instanceCount: auxiliaryBatch.opaqueCount)
+                                       instanceCount: auxiliaryBatch.casterCount)
                 }
             }
             if let surf = renderScene.softRenderSurface {
@@ -2203,6 +2242,12 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         // ---- 2. prepass: world pos + normals ----
+        if activeOptions.ambientOcclusion, aoTexIsWhite {
+            // re-enabled after a disabled stretch: the temporal history and
+            // previous-frame matrices are stale together - drop them
+            prevVP = nil
+            aoTexIsWhite = false
+        }
         if !activeOptions.ambientOcclusion {
             if !aoTexIsWhite {
                 let clearPass = MTLRenderPassDescriptor()
@@ -2523,25 +2568,35 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         cmd.present(drawable)
         let retire = renderScene.renderSceneRequiresFrameRetirement
+        framesDrawn += 1
+        let frameNumber = framesDrawn
+        let completedTexture = drawable.texture
+        let inFlight = inFlightFrames
         cmd.addCompletedHandler { [weak self] finished in
+            inFlight.signal()
+            guard !retire else { return }
+            // pipelined mode: the frame is only now finished, so timing,
+            // failure inspection, AND the completion callback (documented as
+            // running after the frame completes, safe for readback) all
+            // happen here
             let ms = (finished.gpuEndTime - finished.gpuStartTime) * 1000
-            // when the frame is not retired synchronously, a healthy buffer
-            // still reads .committed right after commit() - failures must be
-            // inspected here instead
             let status = finished.status
             let error = finished.error as NSError?
             Task { @MainActor in
                 guard let self else { return }
                 self.lastFrameGPUMilliseconds = ms
-                if !retire, status != .completed || error != nil {
+                if status != .completed || error != nil {
                     let detail = error.map {
                         "\($0.domain) \($0.code) — \($0.localizedDescription)"
                     } ?? String(describing: status)
                     self.reportFailure(
                         "Metal command ended with status \(detail)")
+                    return
                 }
+                self.frameCompletionHandler?(completedTexture, frameNumber)
             }
         }
+        releasedByCompletion = true
         cmd.commit()
 
         // Physics and rendering own different command queues but share pose
@@ -2551,17 +2606,19 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // keep CPU and GPU pipelined instead.
         if retire {
             cmd.waitUntilCompleted()
+            // the frame is complete: timing is current, and the completion
+            // callback runs with finished pixels, before this call returns
+            lastFrameGPUMilliseconds =
+                (cmd.gpuEndTime - cmd.gpuStartTime) * 1000
             if let failure = commandFailureDescription(cmd) {
                 reportFailure(failure)
                 return
             }
+            frameCompletionHandler?(completedTexture, frameNumber)
         }
 
         prevVP = vp
         frameIdx &+= 1
-
-        framesDrawn += 1
-        frameCompletionHandler?(drawable.texture, framesDrawn)
     }
 }
 

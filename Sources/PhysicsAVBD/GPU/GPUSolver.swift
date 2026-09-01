@@ -209,8 +209,10 @@ public final class GPUSolver {
     /// Coarse spawn-state bounds of the rendered colliders (the oversized
     /// ground slab excluded), padded for runtime motion - the renderer fits
     /// its directional-shadow volume to this.
-    public private(set) var renderedContentBounds:
-        (center: F3, radius: Float)?
+    /// (body, collider local offset, conservative half extent) for every
+    /// rendered collider that should shape the shadow volume - wide static
+    /// scenery excluded. Positions are read live per query.
+    private var renderBoundsColliders: [(body: Int, local: F3, half: Float)] = []
     var clothGroupBuf: MTLBuffer
     /// Authored Scene collision domain for each deformable-surface body.
     /// This is intentionally separate from clothGroupBuf, which identifies
@@ -3184,9 +3186,7 @@ public final class GPUSolver {
             renderColliderIDs.append(UInt32(i))
         }
         renderRigidBodyCount = renderColliderIDs.count
-        var boundsLo = F3(repeating: .greatestFiniteMagnitude)
-        var boundsHi = F3(repeating: -.greatestFiniteMagnitude)
-        var boundsAny = false
+        renderBoundsColliders.removeAll()
         for collider in scene.colliders where collider.isRendered {
             let size = collider.size
             let body = scene.bodies[collider.body]
@@ -3202,14 +3202,11 @@ public final class GPUSolver {
             case .sphere: half = size.x * 0.5
             default: half = 0.5 * max(size.x, max(size.y, size.z))
             }
-            boundsLo = min(boundsLo, body.position - F3(repeating: half))
-            boundsHi = max(boundsHi, body.position + F3(repeating: half))
-            boundsAny = true
+            // conservative: the local offset's length joins the half extent
+            // so body rotation can never carry the collider outside
+            renderBoundsColliders.append(
+                (collider.body, collider.localPosition, half))
         }
-        renderedContentBounds = boundsAny
-            ? ((boundsLo + boundsHi) * 0.5,
-               max(length(boundsHi - boundsLo) * 0.5 * 1.15, 0.5))
-            : nil
         renderBodyIdxBuf.contents().bindMemory(to: UInt32.self,
                                                capacity: max(1, renderColliderIDs.count))
             .update(from: renderColliderIDs.isEmpty ? [0] : renderColliderIDs,
@@ -4012,6 +4009,30 @@ public final class GPUSolver {
     }
 
     /// Debug compatibility count for fractured authored joints.
+    /// Live bounds of the rendered content: current body positions plus
+    /// each collider's local offset and conservative half extent. The
+    /// renderer fits its directional-shadow volume to this every frame, so
+    /// dynamics keep their shadows wherever they travel.
+    public var renderedContentBounds: (center: F3, radius: Float)? {
+        guard !renderBoundsColliders.isEmpty else { return nil }
+        let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self,
+                                              capacity: numBodies)
+        var lo = F3(repeating: .greatestFiniteMagnitude)
+        var hi = F3(repeating: -.greatestFiniteMagnitude)
+        for entry in renderBoundsColliders {
+            let p4 = pl[entry.body]
+            let reach = entry.half + length(entry.local)
+            let p = F3(p4.x, p4.y, p4.z)
+            lo = min(lo, p - F3(repeating: reach))
+            hi = max(hi, p + F3(repeating: reach))
+        }
+        // quantized so the fitted extent breathes in steps the texel
+        // snapping can absorb instead of shimmering every frame
+        let radius = max(length(hi - lo) * 0.5 * 1.1, 0.5)
+        let quantized = (radius / 0.25).rounded(.up) * 0.25
+        return ((lo + hi) * 0.5, quantized)
+    }
+
     public func debugBrokenJoints() -> Int {
         brokenJointIndices().count
     }

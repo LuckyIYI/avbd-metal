@@ -181,6 +181,16 @@ model as well as the renderer.
 - `rendererOptions` controls graph coloring, collision-hull diagnostics,
   and ambient occlusion (`ambientOcclusion = false` skips the whole GTAO
   chain, ~1.5 ms GPU on the reference scene, for hosts on a power budget).
+- Auxiliary instances do not cast shadows by default. An opaque instance
+  built with `castsShadow: true` (a visual skeleton, for example) joins
+  the directional-shadow pass and expands the fitted light volume.
+- `renderSceneRequiresFrameRetirement` (scene protocol, default `true`)
+  keeps the synchronous frame wait GPUSolver requires. A scene whose
+  buffers are all triple-buffered or written inside the frame's own
+  command buffer may return `false`; CPU and GPU then pipeline, and
+  `frameCompletionHandler` fires from the command buffer's completion
+  instead of before `draw` returns - in both modes it runs only after
+  the frame's pixels are final.
 - `rendererBodyAppearances` supplies per-frame body color/emission overrides.
 - `rendererAuxiliaryInstances` supplies per-frame app-owned world geometry.
 - `rendererDidFail(_:)` lets the host stop its loop and present the error.
