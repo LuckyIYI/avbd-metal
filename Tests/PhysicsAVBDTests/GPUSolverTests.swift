@@ -402,6 +402,61 @@ final class GPUSolverTests: XCTestCase {
                      "a visual-frame failure must not poison physics")
     }
 
+    func testFracturedJointInspectionAndSelectiveRepair() throws {
+        var scene = PhysicsScene(name: "joint-repair")
+        scene.settings.gravity = 0
+        let a = scene.addBody(
+            size: F3(repeating: 0.2), density: 1_000, friction: 0,
+            position: .zero)
+        let b = scene.addBody(
+            size: F3(repeating: 0.2), density: 1_000, friction: 0,
+            position: F3(0.3, 0, 0))
+        scene.addJoint(SceneJoint(
+            bodyA: a, bodyB: b, rA: .zero, rB: .zero,
+            stiffnessLin: .infinity, stiffnessAng: .infinity,
+            fracture: 10))
+        scene.addJoint(SceneJoint(
+            bodyA: a, bodyB: b, rA: .zero, rB: .zero,
+            stiffnessLin: 250, stiffnessAng: 125, fracture: 10))
+        let drag = scene.addDragSlot()
+        let solver = try makeGPU(scene)
+
+        let joints = solver.joints.contents().bindMemory(
+            to: JointGPU.self, capacity: scene.joints.count)
+        let initialPenalty0 = joints[0].penaltyLin
+        let initialPenalty1 = joints[1].penaltyAng
+        for index in [0, 1, drag] {
+            joints[index].header.z = 1
+            joints[index].lambdaLin = SIMD4(repeating: 7)
+            joints[index].lambdaAng = SIMD4(repeating: 9)
+            joints[index].penaltyLin = SIMD4(repeating: 99)
+            joints[index].penaltyAng = SIMD4(repeating: 101)
+            joints[index].motor.z = 4
+            joints[index].dynamics.y = 5
+            joints[index].dynamics.z = 6
+        }
+
+        XCTAssertEqual(solver.brokenJointIndices(), [0, 1])
+        XCTAssertEqual(solver.debugBrokenJoints(), 2)
+
+        solver.repairJoints([1, 1, drag])
+        XCTAssertEqual(solver.brokenJointIndices(), [0])
+        XCTAssertEqual(joints[1].header.z, 0)
+        XCTAssertEqual(joints[1].lambdaLin, .zero)
+        XCTAssertEqual(joints[1].lambdaAng, .zero)
+        XCTAssertEqual(joints[1].penaltyAng, initialPenalty1)
+        XCTAssertEqual(joints[1].motor.z, 0)
+        XCTAssertEqual(joints[1].dynamics.y, 0)
+        XCTAssertEqual(joints[1].dynamics.z, 0)
+        XCTAssertEqual(joints[drag].header.z, 1,
+                       "repair must not activate a disabled drag slot")
+
+        solver.repairJoints()
+        XCTAssertEqual(solver.brokenJointIndices(), [])
+        XCTAssertEqual(joints[0].header.z, 0)
+        XCTAssertEqual(joints[0].penaltyLin, initialPenalty0)
+    }
+
     func testDisconnectedSoftMeshUsesStructuralContactCapacity() throws {
         var scene = PhysicsScene(name: "disconnected-soft-capacity")
         for triangle in 0..<50 {

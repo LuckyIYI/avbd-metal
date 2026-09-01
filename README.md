@@ -53,7 +53,7 @@ applications.
 | `SimCore` | Backend-neutral math, scene descriptions, geometry, mesh import, and deterministic utilities |
 | `PhysicsAVBD` | Concrete AVBD CPU/Metal backend and its required shader resources; depends only on `SimCore` |
 | `GPUSimDemos` | Optional demo scenes and sample meshes; not linked or copied for `GPUSim` consumers |
-| `GPUSimRenderer` | Optional MetalKit renderer with PBR lighting, shadows, temporal GTAO, orbit-camera controls, and direct GPU-buffer integration |
+| `GPUSimRenderer` | Optional MetalKit renderer with PBR lighting, shadows, temporal GTAO, orbit/app-owned cameras, live appearance overrides, and auxiliary world geometry |
 
 The root manifest has no external package dependencies. `SimCore` and
 `PhysicsAVBD` remain public products for advanced clients and source
@@ -113,6 +113,10 @@ try solver.stepChecked()
 print(solver.bodies[body].positionLin)
 ```
 
+The Metal solver exposes fractured authored joints without leaking its GPU
+storage. Use `brokenJointIndices()` for gameplay predicates and
+`repairJoints()` after restoring body poses for an in-place round reset.
+
 `SimCore` and `PhysicsAVBD` remain public products for compatibility and for
 clients that deliberately want a lower-level dependency boundary. Add the
 separate `GPUSimDemos` product only when sample scenes and meshes are useful.
@@ -141,9 +145,11 @@ let view = MTKView(frame: .zero, device: device)
 renderer.configure(view, preferredFramesPerSecond: 60)
 ```
 
-Keep `renderer` alive because `MTKView.delegate` is weak. Its public camera
-properties (`target`, `distance`, `azimuth`, and `elevation`) and `ray(at:in:)`
-cover orbit controls and scene picking. Apps that step or replace a simulation
+Keep `renderer` alive because `MTKView.delegate` is weak. Orbit properties and
+`setCamera(position:target:up:)` cover editor, wrist, chase, and egocentric
+cameras; `ray(at:in:)` supports scene picking. Per-body appearance overrides
+provide live color/emission, while the depth-tested auxiliary-instance pass
+draws guides, targets, and ghost poses. Apps that step or replace a simulation
 per frame can implement `GPUSimRendererSource`; future GPU backends can provide
 the compact `GPUSimRenderableScene` buffer contract without changing the view
 API. The renderer remains optional and pulls in neither demos, robotics, RL,

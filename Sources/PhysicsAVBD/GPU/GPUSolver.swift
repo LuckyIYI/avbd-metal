@@ -3932,13 +3932,57 @@ public final class GPUSolver {
         return Array(all.sorted { $0.2 > $1.2 }.prefix(n))
     }
 
-    /// Debug: count of broken (fractured) joints.
-    public func debugBrokenJoints() -> Int {
+    /// Indices of authored breakable joints that are currently fractured.
+    /// Disabled interaction slots and other non-breakable constraints are
+    /// intentionally excluded even though they share the same internal
+    /// disabled-state bit.
+    public func brokenJointIndices() -> [Int] {
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
-        var n = 0
-        for i in 0..<numJoints where jp[i].header.z != 0 { n += 1 }
-        return n
+        return (0..<numJoints).filter {
+            jp[$0].header.z != 0 && (jp[$0].header.w & 4) != 0
+        }
+    }
+
+    /// Re-arm fractured joints and clear their temporal solver state.
+    ///
+    /// Passing `nil` repairs every fractured breakable joint. Explicit
+    /// indices are range-checked before any mutation; non-breakable or
+    /// already-live constraints are harmless no-ops. Reposition bodies
+    /// before repairing when resetting a scene, otherwise a repaired joint
+    /// will immediately constrain the bodies at their current separation.
+    public func repairJoints(_ jointIndices: [Int]? = nil) {
+        let indices: [Int]
+        if let jointIndices {
+            for index in jointIndices {
+                precondition(index >= 0 && index < numJoints,
+                             "joint index out of range")
+            }
+            indices = Array(Set(jointIndices)).sorted()
+        } else {
+            indices = Array(0..<numJoints)
+        }
+        guard numJoints > 0 else { return }
+        sync()
+
+        let jp = joints.contents().bindMemory(
+            to: JointGPU.self, capacity: numJoints)
+        for index in indices
+            where jp[index].header.z != 0 && (jp[index].header.w & 4) != 0 {
+            jp[index].header.z = 0
+            jp[index].lambdaLin = .zero
+            jp[index].lambdaAng = .zero
+            jp[index].motor.z = 0
+            jp[index].dynamics.y = 0
+            jp[index].dynamics.z = 0
+            jp[index].penaltyLin = initialJointPenaltyLin[index]
+            jp[index].penaltyAng = initialJointPenaltyAng[index]
+        }
+    }
+
+    /// Debug compatibility count for fractured authored joints.
+    public func debugBrokenJoints() -> Int {
+        brokenJointIndices().count
     }
 
     /// Debug: max joint lambda magnitudes (lin, ang) across live joints.
@@ -6202,10 +6246,12 @@ public final class GPUSolver {
 
     /// Encode instance-transform building into a render command buffer.
     public func encodeBuildInstances(_ cmd: MTLCommandBuffer, instances: MTLBuffer,
-                                     colorMode: UInt32 = 0) {
+                                     colorMode: UInt32 = 0,
+                                     appearanceOverrides: MTLBuffer? = nil) {
         do {
             try encodeBuildInstancesChecked(
-                cmd, instances: instances, colorMode: colorMode)
+                cmd, instances: instances, colorMode: colorMode,
+                appearanceOverrides: appearanceOverrides)
         } catch {
             fatalError("Render-instance encoding failed: \(error.localizedDescription)")
         }
@@ -6216,7 +6262,8 @@ public final class GPUSolver {
     /// solver because the caller owns this separate render command buffer.
     public func encodeBuildInstancesChecked(
         _ cmd: MTLCommandBuffer, instances: MTLBuffer,
-        colorMode: UInt32 = 0
+        colorMode: UInt32 = 0,
+        appearanceOverrides: MTLBuffer? = nil
     ) throws {
         // The caller may own a different Metal queue. Retire all preceding
         // physics before that queue reads solver buffers; the caller must in
@@ -6231,6 +6278,7 @@ public final class GPUSolver {
         }
         enc.label = "build-instances"
         var cm = colorMode
+        var hasAppearanceOverrides: UInt32 = appearanceOverrides == nil ? 0 : 1
         if renderRigidBodyCount > 0 {
             var nb = UInt32(renderRigidBodyCount)
             let p = ps("build_instances")
@@ -6248,6 +6296,13 @@ public final class GPUSolver {
             enc.setBuffer(colliderLocalPosition, offset: 0, index: 10)
             enc.setBuffer(colliderLocalRotation, offset: 0, index: 11)
             enc.setBuffer(colliderRenderColor, offset: 0, index: 12)
+            // Metal validates every reflected buffer binding even when the
+            // runtime flag prevents a read. Reuse a guaranteed live buffer
+            // as the disabled placeholder instead of binding nil.
+            enc.setBuffer(
+                appearanceOverrides ?? colliderRenderColor,
+                offset: 0, index: 13)
+            enc.setBytes(&hasAppearanceOverrides, length: 4, index: 14)
             enc.dispatchThreadgroups(MTLSize(width: (renderRigidBodyCount + 255) / 256,
                                              height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256,

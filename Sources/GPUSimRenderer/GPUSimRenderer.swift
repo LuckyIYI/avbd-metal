@@ -46,8 +46,54 @@ public struct GPUSimRenderCameraHint: Sendable, Equatable {
     }
 }
 
+/// An application-owned look-at camera. Use this for cameras attached to a
+/// robot, chase cameras, and other poses that cannot be represented by the
+/// renderer's editor-style orbit controls.
+public struct GPUSimCameraPose: Sendable, Equatable {
+    public var position: F3
+    public var target: F3
+    public var up: F3
+
+    public init(position: F3, target: F3, up: F3 = F3(0, 0, 1)) {
+        precondition(position.x.isFinite && position.y.isFinite
+            && position.z.isFinite && target.x.isFinite
+            && target.y.isFinite && target.z.isFinite
+            && up.x.isFinite && up.y.isFinite && up.z.isFinite,
+            "camera pose must be finite")
+        precondition(length_squared(target - position) > 1.0e-12,
+                     "camera position and target must differ")
+        precondition(length_squared(cross(target - position, up)) > 1.0e-12,
+                     "camera up must not be parallel to its view direction")
+        self.position = position
+        self.target = target
+        self.up = normalize(up)
+    }
+}
+
+/// Per-body presentation overrides uploaded by ``GPUSimRenderer``. This is
+/// also the exact 32-byte ABI passed to custom ``GPUSimRenderableScene``
+/// backends: `albedo.w > 0` enables the sRGB color override, while
+/// `emissive.rgb` is linear HDR radiance added after lighting.
+public struct GPUSimRenderAppearance: Sendable, Equatable {
+    public var albedo: SIMD4<Float>
+    public var emissive: SIMD4<Float>
+
+    public init(color: F3? = nil, emissive: F3 = .zero) {
+        self.albedo = color.map { SIMD4($0, 1) } ?? .zero
+        self.emissive = SIMD4(emissive, 0)
+    }
+}
+
+/// Analytic geometry accepted by the auxiliary-instance rendering pass.
+public enum GPUSimRenderPrimitive: Sendable, Equatable {
+    case box(size: F3)
+    case sphere(radius: Float)
+    case torus(majorRadius: Float, minorRadius: Float)
+    case capsule(length: Float, radius: Float)
+}
+
 /// ABI written into the `instances` buffer by
-/// ``GPUSimRenderableScene/encodeRenderInstances(_:instances:colorMode:)``.
+/// ``GPUSimRenderableScene/encodeRenderInstances(_:instances:colorMode:appearanceOverrides:)``.
 public struct GPUSimRenderInstance {
     /// Column-major world transform, including primitive scale.
     public var model: simd_float4x4
@@ -57,15 +103,73 @@ public struct GPUSimRenderInstance {
     /// X/Y are torus or capsule dimensions, Z is the bounding radius, and W
     /// is nonzero for a dynamic shadow caster.
     public var parameters: SIMD4<Float>
+    /// RGB is linear HDR emission. W is opacity when this value is submitted
+    /// through the auxiliary-instance pass; scene geometry remains opaque.
+    public var material: SIMD4<Float>
 
     public init(
         model: simd_float4x4,
         color: SIMD4<Float>,
-        parameters: SIMD4<Float>
+        parameters: SIMD4<Float>,
+        material: SIMD4<Float> = SIMD4(0, 0, 0, 1)
     ) {
         self.model = model
         self.color = color
         self.parameters = parameters
+        self.material = material
+    }
+
+    /// Builds an analytic primitive for ``GPUSimRenderer/auxiliaryInstances``
+    /// or ``GPUSimRendererSource/rendererAuxiliaryInstances``.
+    public init(
+        primitive: GPUSimRenderPrimitive,
+        position: F3,
+        rotation: Quat = Quat(real: 1, imag: .zero),
+        color: F3,
+        emissive: F3 = .zero,
+        opacity: Float = 1
+    ) {
+        var model = simd_float4x4(rotation.normalized)
+        model.columns.3 = SIMD4(position, 1)
+        let kind: Float
+        var parameters = SIMD4<Float>.zero
+        switch primitive {
+        case .box(let size):
+            precondition(size.x >= 0 && size.y >= 0 && size.z >= 0,
+                         "box size must be nonnegative")
+            model.columns.0 *= size.x
+            model.columns.1 *= size.y
+            model.columns.2 *= size.z
+            kind = 0
+            parameters.z = length(size) * 0.5
+        case .sphere(let radius):
+            precondition(radius >= 0, "sphere radius must be nonnegative")
+            let diameter = 2 * radius
+            model.columns.0 *= diameter
+            model.columns.1 *= diameter
+            model.columns.2 *= diameter
+            kind = 1
+            parameters.z = radius
+        case .torus(let majorRadius, let minorRadius):
+            precondition(majorRadius >= 0 && minorRadius >= 0,
+                         "torus radii must be nonnegative")
+            kind = 2
+            parameters.x = majorRadius
+            parameters.y = minorRadius
+            parameters.z = majorRadius + minorRadius
+        case .capsule(let capsuleLength, let radius):
+            precondition(capsuleLength >= 0 && radius >= 0,
+                         "capsule dimensions must be nonnegative")
+            kind = 3
+            parameters.x = capsuleLength
+            parameters.y = radius
+            parameters.z = capsuleLength * 0.5 + radius
+        }
+        self.init(
+            model: model,
+            color: SIMD4(color, kind),
+            parameters: parameters,
+            material: SIMD4(emissive, min(max(opacity, 0), 1)))
     }
 }
 
@@ -190,6 +294,9 @@ public struct GPUSimConvexDebugRenderSurface {
 public protocol GPUSimRenderableScene: AnyObject {
     /// Device that owns every buffer returned by this scene.
     var renderDevice: MTLDevice { get }
+    /// Number of stable body indices addressable by per-body appearance
+    /// overrides. Zero disables that optional presentation feature.
+    var renderBodyCount: Int { get }
     var renderRigidInstanceCount: Int { get }
     var rendererStateIsValid: Bool { get }
     var renderCameraHint: GPUSimRenderCameraHint { get }
@@ -199,16 +306,20 @@ public protocol GPUSimRenderableScene: AnyObject {
     var convexDebugRenderSurface: GPUSimConvexDebugRenderSurface? { get }
     /// Encodes `renderRigidInstanceCount` values with
     /// `GPUSimRenderInstance` layout. A backend may also refresh the optional
-    /// surface buffers in this command buffer before returning.
+    /// surface buffers in this command buffer before returning. When non-nil,
+    /// `appearanceOverrides` contains `renderBodyCount` elements with
+    /// `GPUSimRenderAppearance` layout and belongs to `renderDevice`.
     func encodeRenderInstances(
         _ commandBuffer: MTLCommandBuffer,
         instances: MTLBuffer,
-        colorMode: GPUSimRenderColorMode
+        colorMode: GPUSimRenderColorMode,
+        appearanceOverrides: MTLBuffer?
     ) throws
 }
 
 extension GPUSolver: GPUSimRenderableScene {
     public var renderDevice: MTLDevice { device }
+    public var renderBodyCount: Int { bodyCount }
     public var renderRigidInstanceCount: Int { renderRigidBodyCount }
     public var rendererStateIsValid: Bool { runtimeFailure == nil }
 
@@ -276,12 +387,14 @@ extension GPUSolver: GPUSimRenderableScene {
     public func encodeRenderInstances(
         _ commandBuffer: MTLCommandBuffer,
         instances: MTLBuffer,
-        colorMode: GPUSimRenderColorMode
+        colorMode: GPUSimRenderColorMode,
+        appearanceOverrides: MTLBuffer?
     ) throws {
         try encodeBuildInstancesChecked(
             commandBuffer,
             instances: instances,
-            colorMode: colorMode.rawValue
+            colorMode: colorMode.rawValue,
+            appearanceOverrides: appearanceOverrides
         )
     }
 }
@@ -293,6 +406,12 @@ extension GPUSolver: GPUSimRenderableScene {
 public protocol GPUSimRendererSource: AnyObject {
     var renderScene: (any GPUSimRenderableScene)? { get }
     var rendererOptions: GPUSimRenderOptions { get }
+    /// Presentation-only body overrides keyed by the scene's stable body
+    /// index. Invalid indices are ignored across scene swaps.
+    var rendererBodyAppearances: [Int: GPUSimRenderAppearance] { get }
+    /// World-space primitives drawn in a depth-tested alpha-blended pass
+    /// after the opaque simulation scene.
+    var rendererAuxiliaryInstances: [GPUSimRenderInstance] { get }
     /// Increment when a different scene should receive its default camera.
     /// Rebuilds of the same scene can keep the value stable to preserve the
     /// user's camera.
@@ -303,6 +422,8 @@ public protocol GPUSimRendererSource: AnyObject {
 
 public extension GPUSimRendererSource {
     var rendererOptions: GPUSimRenderOptions { GPUSimRenderOptions() }
+    var rendererBodyAppearances: [Int: GPUSimRenderAppearance] { [:] }
+    var rendererAuxiliaryInstances: [GPUSimRenderInstance] { [] }
     var rendererSceneRevision: Int { 0 }
     func rendererWillDrawFrame() {}
     func rendererDidFail(_ message: String) {}
@@ -320,6 +441,12 @@ struct RenderInstance {
     float4x4 model;
     float4 color;       // rgb albedo (sRGB), w = shape type (0 box 1 sphere 2 torus 3 capsule)
     float4 params;      // torus/capsule dims; z = bounding radius, w = dynamic flag
+    float4 material;    // rgb linear emission, w = opacity
+};
+
+struct RenderAppearance {
+    float4 albedo;      // rgb sRGB override, w = enabled
+    float4 emissive;    // rgb linear HDR radiance
 };
 
 struct SkinRenderVertex {
@@ -351,6 +478,8 @@ struct VOut {
     float3 normal;
     float3 world;
     float3 albedo;
+    float3 emissive;
+    float opacity;
     float flatShade;
 };
 
@@ -444,6 +573,7 @@ inline VOut collapse() {
     VOut o;
     o.position = float4(0, 0, -2, 1);
     o.normal = float3(0); o.world = float3(0); o.albedo = float3(0);
+    o.emissive = float3(0); o.opacity = 0;
     o.flatShade = 0;
     return o;
 }
@@ -458,6 +588,8 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
     o.normal = rot * n;
     o.world = world.xyz;
     o.albedo = srgbToLin(inst.color.rgb);
+    o.emissive = inst.material.rgb;
+    o.opacity = inst.material.w;
     o.flatShade = 0;
     return o;
 }
@@ -550,7 +682,9 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
                         device const uint* corners [[buffer(0)]],
                         constant Uniforms& U [[buffer(1)]],
                         device const float4* posLin [[buffer(2)]],
-                        device const float4* normals [[buffer(3)]])
+                        device const float4* normals [[buffer(3)]],
+                        device const RenderAppearance* appearanceOverrides [[buffer(4)]],
+                        constant uint& hasAppearanceOverrides [[buffer(5)]])
 {
     uint packed = corners[vid];
     uint body = packed & 0x001FFFFFu;
@@ -571,6 +705,15 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
     o.flatShade = ((packed >> 21) & 1u) != 0 ? 1.0 : 0.0;
     // warm fabric-ish tones, one per sheet/body
     o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 7u + 2u), 0.72));
+    o.emissive = float3(0);
+    o.opacity = 1;
+    if (hasAppearanceOverrides != 0) {
+        RenderAppearance appearance = appearanceOverrides[body];
+        if (appearance.albedo.w > 0.0f) {
+            o.albedo = srgbToLin(appearance.albedo.rgb);
+        }
+        o.emissive = appearance.emissive.rgb;
+    }
     return o;
 }
 
@@ -589,6 +732,8 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     o.normal = normalize(sv.normal.xyz);
     o.flatShade = 0.0;
     o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 5u + 11u), 0.76));
+    o.emissive = float3(0);
+    o.opacity = 1;
     return o;
 }
 
@@ -601,7 +746,9 @@ vertex VOut rigid_mesh_vertex(
     device const RigidMeshVertex* vertices [[buffer(0)]],
     constant Uniforms& U [[buffer(1)]],
     device const float4* posLin [[buffer(2)]],
-    device const float4* posAng [[buffer(3)]])
+    device const float4* posAng [[buffer(3)]],
+    device const RenderAppearance* appearanceOverrides [[buffer(4)]],
+    constant uint& hasAppearanceOverrides [[buffer(5)]])
 {
     RigidMeshVertex v = vertices[vid];
     uint body = as_type<uint>(v.positionBody.w);
@@ -612,6 +759,15 @@ vertex VOut rigid_mesh_vertex(
     o.world = world;
     o.normal = normalize(rigidMeshRotate(q, v.normal.xyz));
     o.albedo = srgbToLin(v.color.rgb);
+    o.emissive = float3(0);
+    o.opacity = 1;
+    if (hasAppearanceOverrides != 0) {
+        RenderAppearance appearance = appearanceOverrides[body];
+        if (appearance.albedo.w > 0.0f) {
+            o.albedo = srgbToLin(appearance.albedo.rgb);
+        }
+        o.emissive = appearance.emissive.rgb;
+    }
     o.flatShade = 0;
     return o;
 }
@@ -666,10 +822,10 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     ambient += skyRef * (F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0)) * 0.30;
     ambient *= ao;
 
-    float3 lit = direct + ambient;
+    float3 lit = direct + ambient + in.emissive;
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(acesTonemap(lit), 1.0);
+    return float4(acesTonemap(lit), in.opacity);
 }
 
 // ---------------------------------------------------------------------------
@@ -731,10 +887,10 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     float3 ambient = in.albedo * irr * 1.15;
     ambient *= ao;
 
-    float3 lit = direct + ambient;
+    float3 lit = direct + ambient + in.emissive;
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(acesTonemap(lit), 1.0);
+    return float4(acesTonemap(lit), in.opacity);
 }
 
 // Prepass variant: only the FRONT layer reaches the AO/depth buffers. The
@@ -757,6 +913,8 @@ vertex VOut soft_vertex_front(uint vid [[vertex_id]],
     o.world = w;
     o.normal = nt.xyz;
     o.albedo = float3(0);
+    o.emissive = float3(0);
+    o.opacity = 1;
     o.flatShade = ((packed >> 21) & 1u) != 0 ? 1.0 : 0.0;
     return o;
 }
@@ -1170,6 +1328,12 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public weak var source: (any GPUSimRendererSource)?
     public private(set) var scene: (any GPUSimRenderableScene)?
     public var options = GPUSimRenderOptions()
+    /// Presentation-only overrides keyed by simulation body index. A live
+    /// source's `rendererBodyAppearances` takes precedence when present.
+    public var bodyAppearances: [Int: GPUSimRenderAppearance] = [:]
+    /// World-space primitives drawn after opaque scene geometry with depth
+    /// testing, alpha blending, and optional HDR emission.
+    public var auxiliaryInstances: [GPUSimRenderInstance] = []
     public private(set) var sceneRevision = 0
     /// Called after a frame completes. This is useful for screenshots,
     /// telemetry, and embedding without coupling the package to app policy.
@@ -1177,13 +1341,14 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public var frameCompletionHandler: (@MainActor (MTLTexture, Int) -> Void)?
 
     var boxP, sphereP, torusP, capsuleP, softP, skinP, rigidMeshP: MTLRenderPipelineState!
+    var boxAuxP, sphereAuxP, torusAuxP, capsuleAuxP: MTLRenderPipelineState!
     var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre,
         rigidMeshPre: MTLRenderPipelineState!
     var boxShadow, sphereShadow, torusShadow, capsuleShadow, softShadow,
         skinShadow, rigidMeshShadow: MTLRenderPipelineState!
     var skyP, floorP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
     var convexDebugFillP, convexDebugWireP: MTLRenderPipelineState!
-    var depthState, noDepthState, debugDepthState: MTLDepthStencilState!
+    var depthState, noDepthState, debugDepthState, auxiliaryDepthState: MTLDepthStencilState!
 
     var posTex, normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
     var histTex, prevPosTex: MTLTexture?
@@ -1191,6 +1356,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var frameIdx: UInt32 = 0
     var targetSize = SIMD2<Int>(0, 0)
     var instances: MTLBuffer?
+    private var appearanceBuffer: MTLBuffer?
+    private var appearanceCapacity = 0
+    private var activeAppearanceBodies: [Int] = []
+    private var auxiliaryInstanceBuffer: MTLBuffer?
+    private var auxiliaryInstanceCapacity = 0
 
     /// Orbit azimuth in radians.
     public var azimuth: Float = 0.9
@@ -1200,6 +1370,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public var distance: Float = 30
     /// Orbit target in world coordinates.
     public var target = F3(0, 0, 3)
+    /// Active app-owned camera. `nil` means the public orbit properties drive
+    /// the view. Set through one of the `setCamera` methods.
+    public private(set) var cameraPose: GPUSimCameraPose?
     /// When enabled, a new scene revision adopts the camera hints stored in
     /// the scene adapter. Disable this before applying an app-owned camera.
     public var automaticallyFramesScene = true
@@ -1297,6 +1470,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         sphereP = try pipe("sphere_vertex", "pbr_fragment")
         torusP = try pipe("torus_vertex", "pbr_fragment")
         capsuleP = try pipe("capsule_vertex", "pbr_fragment")
+        boxAuxP = try pipe("box_vertex", "pbr_fragment", blending: true)
+        sphereAuxP = try pipe("sphere_vertex", "pbr_fragment", blending: true)
+        torusAuxP = try pipe("torus_vertex", "pbr_fragment", blending: true)
+        capsuleAuxP = try pipe("capsule_vertex", "pbr_fragment", blending: true)
         softP = try pipe("soft_vertex", "soft_fragment")
         skinP = try pipe("skin_vertex", "soft_fragment")
         rigidMeshP = try pipe("rigid_mesh_vertex", "pbr_fragment")
@@ -1356,6 +1533,15 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             throw GPUSimRendererError.depthState("convex-debug")
         }
         self.debugDepthState = debugDepthState
+
+        let auxiliaryDepth = MTLDepthStencilDescriptor()
+        auxiliaryDepth.depthCompareFunction = .lessEqual
+        auxiliaryDepth.isDepthWriteEnabled = false
+        guard let auxiliaryDepthState = device.makeDepthStencilState(
+                descriptor: auxiliaryDepth) else {
+            throw GPUSimRendererError.depthState("auxiliary geometry")
+        }
+        self.auxiliaryDepthState = auxiliaryDepthState
 
     }
 
@@ -1467,16 +1653,142 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         return true
     }
 
+    private func prepareAppearanceBuffer(
+        bodyCount: Int,
+        appearances: [Int: GPUSimRenderAppearance]
+    ) -> MTLBuffer? {
+        guard bodyCount > 0,
+              appearances.keys.contains(where: { $0 >= 0 && $0 < bodyCount })
+        else { return nil }
+        if appearanceBuffer == nil || appearanceCapacity < bodyCount {
+            appearanceCapacity = max(bodyCount, max(16, appearanceCapacity * 2))
+            appearanceBuffer = device.makeBuffer(
+                length: appearanceCapacity
+                    * MemoryLayout<GPUSimRenderAppearance>.stride,
+                options: .storageModeShared)
+            appearanceBuffer?.label = "GPU Sim body appearance overrides"
+            if let appearanceBuffer {
+                memset(appearanceBuffer.contents(), 0, appearanceBuffer.length)
+            }
+            activeAppearanceBodies.removeAll(keepingCapacity: true)
+        }
+        guard let appearanceBuffer else { return nil }
+        let values = appearanceBuffer.contents().bindMemory(
+            to: GPUSimRenderAppearance.self, capacity: appearanceCapacity)
+        for body in activeAppearanceBodies { values[body] = .init() }
+        activeAppearanceBodies.removeAll(keepingCapacity: true)
+        for (body, appearance) in appearances
+            where body >= 0 && body < bodyCount {
+            values[body] = appearance
+            activeAppearanceBodies.append(body)
+        }
+        return appearanceBuffer
+    }
+
+    private func prepareAuxiliaryInstanceBuffer(
+        _ values: [GPUSimRenderInstance]
+    ) -> MTLBuffer? {
+        guard !values.isEmpty else { return nil }
+        if auxiliaryInstanceBuffer == nil
+            || auxiliaryInstanceCapacity < values.count {
+            auxiliaryInstanceCapacity = max(
+                values.count, max(16, auxiliaryInstanceCapacity * 2))
+            auxiliaryInstanceBuffer = device.makeBuffer(
+                length: auxiliaryInstanceCapacity
+                    * MemoryLayout<GPUSimRenderInstance>.stride,
+                options: .storageModeShared)
+            auxiliaryInstanceBuffer?.label = "GPU Sim auxiliary instances"
+        }
+        guard let auxiliaryInstanceBuffer else { return nil }
+        _ = values.withUnsafeBytes { bytes in
+            memcpy(
+                auxiliaryInstanceBuffer.contents(), bytes.baseAddress!,
+                bytes.count)
+        }
+        return auxiliaryInstanceBuffer
+    }
+
     // MARK: - Camera
 
     public var viewMatrix: simd_float4x4 {
-        lookAt(eye: eyePosition, center: target, up: F3(0, 0, 1))
+        if let cameraPose {
+            return lookAt(
+                eye: cameraPose.position,
+                center: cameraPose.target,
+                up: cameraPose.up)
+        }
+        return lookAt(eye: eyePosition, center: target, up: F3(0, 0, 1))
     }
 
     public var eyePosition: F3 {
-        target + F3(distance * cos(elevation) * cos(azimuth),
-                    distance * cos(elevation) * sin(azimuth),
-                    distance * sin(elevation))
+        if let cameraPose { return cameraPose.position }
+        return target + F3(distance * cos(elevation) * cos(azimuth),
+                           distance * cos(elevation) * sin(azimuth),
+                           distance * sin(elevation))
+    }
+
+    private var cameraFocus: F3 { cameraPose?.target ?? target }
+    private var cameraUp: F3 { cameraPose?.up ?? F3(0, 0, 1) }
+
+    /// Activates an application-owned camera and disables automatic scene
+    /// framing. Continuous camera motion can preserve temporal history;
+    /// request a reset for cuts or teleports.
+    public func setCamera(
+        _ pose: GPUSimCameraPose,
+        resetTemporalHistory: Bool = false
+    ) {
+        cameraPose = pose
+        automaticallyFramesScene = false
+        if resetTemporalHistory { self.resetTemporalHistory() }
+    }
+
+    public func setCamera(
+        position: F3,
+        target: F3,
+        up: F3 = F3(0, 0, 1),
+        resetTemporalHistory: Bool = false
+    ) {
+        setCamera(
+            GPUSimCameraPose(position: position, target: target, up: up),
+            resetTemporalHistory: resetTemporalHistory)
+    }
+
+    /// Activates an app-owned camera from a world-to-view matrix. The focus
+    /// distance determines the target used for camera-relative effects and
+    /// the directional-shadow region.
+    public func setCamera(
+        viewMatrix: simd_float4x4,
+        focusDistance: Float = 1,
+        resetTemporalHistory: Bool = false
+    ) {
+        precondition(matrixIsFinite(viewMatrix)
+            && abs(simd_determinant(viewMatrix)) > 1.0e-12,
+            "camera view matrix must be finite and invertible")
+        precondition(focusDistance.isFinite && focusDistance > 0,
+                     "camera focus distance must be finite and positive")
+        let world = viewMatrix.inverse
+        let homogeneousEye = world.columns.3
+        precondition(abs(homogeneousEye.w) > 1.0e-12,
+                     "camera view matrix has no finite world-space origin")
+        let eye = F3(homogeneousEye.x, homogeneousEye.y, homogeneousEye.z)
+            / homogeneousEye.w
+        let forward = normalize(-F3(
+            world.columns.2.x, world.columns.2.y, world.columns.2.z))
+        let up = normalize(F3(
+            world.columns.1.x, world.columns.1.y, world.columns.1.z))
+        setCamera(
+            position: eye,
+            target: eye + forward * focusDistance,
+            up: up,
+            resetTemporalHistory: resetTemporalHistory)
+    }
+
+    /// Returns control to the public orbit properties. This does not change
+    /// `automaticallyFramesScene`; callers choose whether later scene
+    /// revisions should replace the orbit values.
+    public func useOrbitCamera(resetTemporalHistory: Bool = true) {
+        cameraPose = nil
+        if resetTemporalHistory { self.resetTemporalHistory() }
     }
 
     public func projectionMatrix(aspect: Float) -> simd_float4x4 {
@@ -1523,6 +1835,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         let activeOptions = source?.rendererOptions ?? options
+        let activeBodyAppearances = source?.rendererBodyAppearances
+            ?? bodyAppearances
+        let activeAuxiliaryInstances = source?.rendererAuxiliaryInstances
+            ?? auxiliaryInstances
         let activeSceneRevision = source?.rendererSceneRevision ?? sceneRevision
 
         guard let cmd = queue.makeCommandBuffer() else {
@@ -1552,6 +1868,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             lastCameraEpoch = activeSceneRevision
             if automaticallyFramesScene {
                 let hint = renderScene.renderCameraHint
+                cameraPose = nil
                 distance = hint.distance
                 target = hint.target
                 azimuth = hint.azimuth
@@ -1571,10 +1888,29 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             return
         }
 
+        let hasValidAppearance = activeBodyAppearances.keys.contains {
+            $0 >= 0 && $0 < renderScene.renderBodyCount
+        }
+        let appearanceOverrides = prepareAppearanceBuffer(
+            bodyCount: renderScene.renderBodyCount,
+            appearances: activeBodyAppearances)
+        if hasValidAppearance && appearanceOverrides == nil {
+            reportFailure("could not allocate body appearance overrides")
+            return
+        }
+
+        let auxiliaryBuffer = prepareAuxiliaryInstanceBuffer(
+            activeAuxiliaryInstances)
+        if !activeAuxiliaryInstances.isEmpty && auxiliaryBuffer == nil {
+            reportFailure("could not allocate auxiliary render instances")
+            return
+        }
+
         do {
             try renderScene.encodeRenderInstances(
                 cmd, instances: instances,
-                colorMode: activeOptions.colorMode)
+                colorMode: activeOptions.colorMode,
+                appearanceOverrides: appearanceOverrides)
         } catch {
             // synchronize() inside the checked API may be the first observer
             // of a physics error. Its owning model will report it on the next
@@ -1586,8 +1922,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
         let pxPerUnit = viewportSize.y * 0.5 / tan(25 * Float.pi / 180)
-        let fwd = normalize(target - eyePosition)
-        let camR = normalize(cross(fwd, F3(0, 0, 1)))
+        let activeEye = eyePosition
+        let activeFocus = cameraFocus
+        let fwd = normalize(activeFocus - activeEye)
+        let camR = normalize(cross(fwd, cameraUp))
         let camU = cross(camR, fwd)          // screen +y in UV space is DOWN
         let vp = projectionMatrix(aspect: aspect) * viewMatrix
         let lightDirection = normalize(F3(0.4, 0.25, -0.85))
@@ -1595,16 +1933,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // A camera-targeted, texel-stabilized orthographic light projection.
         // This keeps articulated robot detail crisp while preventing shadows
         // from crawling when the follow camera advances with a policy.
-        let shadowExtent = max(7.0, min(distance * 0.9, 40.0))
+        let shadowExtent = max(
+            7.0, min(length(activeFocus - activeEye) * 0.9, 40.0))
         let lightUp = F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
         let texelWorld = (2 * shadowExtent) / Float(GPUSimRenderer.shadowMapSize)
-        let rightCoord = (dot(target, lightRight) / texelWorld).rounded() * texelWorld
-        let upCoord = (dot(target, lightMapUp) / texelWorld).rounded() * texelWorld
-        let shadowCenter = target
-            + lightRight * (rightCoord - dot(target, lightRight))
-            + lightMapUp * (upCoord - dot(target, lightMapUp))
+        let rightCoord = (dot(activeFocus, lightRight) / texelWorld).rounded() * texelWorld
+        let upCoord = (dot(activeFocus, lightMapUp) / texelWorld).rounded() * texelWorld
+        let shadowCenter = activeFocus
+            + lightRight * (rightCoord - dot(activeFocus, lightRight))
+            + lightMapUp * (upCoord - dot(activeFocus, lightMapUp))
         let lightEye = shadowCenter - lightDirection * (shadowExtent * 2.5)
         let shadowVP = metalOrthographicProjection(
             left: -shadowExtent, right: shadowExtent,
@@ -1618,7 +1957,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                          znear: 0, zfar: 1)
         var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(lightDirection, 0),
-                         eye: SIMD4(eyePosition, 0),
+                         eye: SIMD4(activeEye, 0),
                          screen: SIMD4(viewportSize.x, viewportSize.y, pxPerUnit, 0),
                          camRight: SIMD4(camR, 0),
                          camUp: SIMD4(-camU, 0),
@@ -1627,6 +1966,18 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                          prevVP == nil ? 1.0 : 0.20, 0, 0),
                          shadowViewProj: shadowVP,
                          shadowParams: SIMD4(0.00008, 0.00022, 0, 0))
+        func bindAppearance(
+            _ encoder: MTLRenderCommandEncoder,
+            enabled: Bool = true
+        ) {
+            var hasAppearance: UInt32 = enabled && appearanceOverrides != nil
+                ? 1 : 0
+            encoder.setVertexBuffer(
+                enabled ? (appearanceOverrides ?? instances) : instances,
+                offset: 0, index: 4)
+            encoder.setVertexBytes(
+                &hasAppearance, length: 4, index: 5)
+        }
         // ---- 1. directional shadow depth ----
         let shadowPass = MTLRenderPassDescriptor()
         shadowPass.depthAttachment.texture = shadowTex
@@ -1681,6 +2032,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+                bindAppearance(enc)
                 enc.drawIndexedPrimitives(
                     type: .triangle, indexCount: mesh.indexCount,
                     indexType: .uint32, indexBuffer: mesh.indices,
@@ -1749,6 +2101,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+                bindAppearance(enc)
                 enc.drawIndexedPrimitives(
                     type: .triangle, indexCount: mesh.indexCount,
                     indexType: .uint32, indexBuffer: mesh.indices,
@@ -1874,6 +2227,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
             enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
+            bindAppearance(enc)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.setFragmentTexture(shadowTex, index: 1)
@@ -1897,6 +2251,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
             enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+            bindAppearance(enc)
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexA, index: 0)
             enc.setFragmentTexture(shadowTex, index: 1)
@@ -1918,6 +2273,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(debug.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(debug.rotations, offset: 0, index: 3)
+                bindAppearance(enc, enabled: false)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                    vertexCount: debug.triangleVertexCount)
             }
@@ -1927,10 +2283,33 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setVertexBuffer(debug.positions, offset: 0, index: 2)
                 enc.setVertexBuffer(debug.rotations, offset: 0, index: 3)
+                bindAppearance(enc, enabled: false)
                 enc.drawPrimitives(type: .line, vertexStart: 0,
                                    vertexCount: debug.edgeVertexCount)
             }
             enc.setDepthBias(0, slopeScale: 0, clamp: 0)
+        }
+        if let auxiliaryBuffer, !activeAuxiliaryInstances.isEmpty {
+            enc.setDepthStencilState(auxiliaryDepthState)
+            for (pipeline, vertices) in [
+                (boxAuxP!, 36),
+                (sphereAuxP!, SPHV),
+                (torusAuxP!, TORV),
+                (capsuleAuxP!, CAPV),
+            ] {
+                enc.setRenderPipelineState(pipeline)
+                enc.setVertexBuffer(auxiliaryBuffer, offset: 0, index: 0)
+                enc.setVertexBytes(
+                    &U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentBytes(
+                    &U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentTexture(aoTexA, index: 0)
+                enc.setFragmentTexture(shadowTex, index: 1)
+                enc.drawPrimitives(
+                    type: .triangle, vertexStart: 0,
+                    vertexCount: vertices,
+                    instanceCount: activeAuxiliaryInstances.count)
+            }
         }
         enc.endEncoding()
 
@@ -1954,6 +2333,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         framesDrawn += 1
         frameCompletionHandler?(drawable.texture, framesDrawn)
     }
+}
+
+private func matrixIsFinite(_ matrix: simd_float4x4) -> Bool {
+    for column in [
+        matrix.columns.0, matrix.columns.1,
+        matrix.columns.2, matrix.columns.3,
+    ] where !column.x.isFinite || !column.y.isFinite
+        || !column.z.isFinite || !column.w.isFinite {
+        return false
+    }
+    return true
 }
 
 private func lookAt(eye: F3, center: F3, up: F3) -> simd_float4x4 {

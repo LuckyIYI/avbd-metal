@@ -45,7 +45,7 @@ let package = Package(
         ),
         .testTarget(
             name: "GPUSimRendererTests",
-            dependencies: ["GPUSimRenderer"]
+            dependencies: ["SimCore", "PhysicsAVBD", "GPUSimRenderer"]
         ),
     ],
     swiftLanguageVersions: [.v5]
