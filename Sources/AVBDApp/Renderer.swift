@@ -122,9 +122,21 @@ inline float shadowVisibility(float3 world, float3 normal,
         return 1.0;
     }
 
-    float NdL = saturate(dot(normalize(normal), -U.lightDir.xyz));
-    float receiverDepth = ndc.z - (U.shadowParams.x
-                                  + U.shadowParams.y * (1.0 - NdL));
+    // Bias against the rasterized receiver plane, not the interpolated
+    // shading normal.  On a smooth-shaded, coarsely tessellated shape those
+    // normals differ most near the silhouette; using the shading normal there
+    // produces the view-dependent triangle/stripe acne the bias is meant to
+    // remove.  The capped tangent term supplies enough bias at grazing light
+    // angles without detaching contact shadows.
+    float3 shadeN = normalize(normal);
+    float3 plane = cross(dfdx(world), dfdy(world));
+    float planeLen2 = dot(plane, plane);
+    float3 geomN = planeLen2 > 1e-12 ? plane * rsqrt(planeLen2) : shadeN;
+    if (dot(geomN, shadeN) < 0.0) geomN = -geomN;
+    float geomNdL = saturate(dot(geomN, -U.lightDir.xyz));
+    float slope = min(2.0, sqrt(saturate(1.0 - geomNdL * geomNdL))
+                           / max(geomNdL, 0.2));
+    float receiverDepth = ndc.z - (U.shadowParams.x + U.shadowParams.y * slope);
     float2 texel = 1.0 / float2(shadowTex.get_width(), shadowTex.get_height());
     constexpr sampler shadowSampler(coord::normalized, filter::linear,
                                     address::clamp_to_edge,
@@ -628,63 +640,132 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     return float4(ao, ao, ao, 1);
 }
 
+// Store the surface normal beside AO in the temporal target.  Octahedral
+// packing keeps the history buffer compact (RGBA8) while giving the resolve
+// enough orientation information to reject history from another face/object.
+inline float2 encodeOctahedral(float3 n) {
+    n /= max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
+    float2 signN = select(float2(-1.0), float2(1.0), n.xy >= 0.0);
+    float2 e = n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * signN;
+    return e * 0.5 + 0.5;
+}
+
+inline float3 decodeOctahedral(float2 e) {
+    e = e * 2.0 - 1.0;
+    float3 n = float3(e, 1.0 - abs(e.x) - abs(e.y));
+    float t = saturate(-n.z);
+    n.xy += select(float2(t), float2(-t), n.xy >= 0.0);
+    return normalize(n);
+}
+
+inline float4 aoHistoryValue(float ao, float3 normal) {
+    return float4(ao, encodeOctahedral(normal), 1.0);
+}
+
 fragment float4 temporal_fragment(FSOut in [[stage_in]],
                                   constant Uniforms& U [[buffer(1)]],
                                   texture2d<float> rawAO [[texture(0)]],
                                   texture2d<float> histAO [[texture(1)]],
                                   texture2d<float> posTex [[texture(2)]],
-                                  texture2d<float> prevPosTex [[texture(3)]])
+                                  texture2d<float> prevPosTex [[texture(3)]],
+                                  texture2d<float> normTex [[texture(4)]])
 {
     // temporal accumulation with reprojection: find this pixel's world
-    // point in the previous frame, reuse its accumulated AO unless the
-    // surface was occluded/moved (world-position mismatch -> reject).
+    // point in the previous frame, then reuse accumulated AO only while the
+    // position and surface orientation still agree.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     constexpr sampler lsmp(filter::linear, address::clamp_to_edge);
     float cur = rawAO.sample(smp, in.uv).r;
     float4 P4 = posTex.sample(smp, in.uv);
-    if (P4.w < 0.5 || U.temporal.y >= 1.0) return float4(cur);
+    if (P4.w < 0.5) return float4(cur, 0.5, 0.5, 0.0);
     float3 P = P4.xyz;
+    float3 N = normalize(normTex.sample(smp, in.uv).xyz);
+    float4 current = aoHistoryValue(cur, N);
+    if (U.temporal.y >= 1.0) return current;
 
     float4 clipPrev = U.prevViewProj * float4(P, 1.0);
-    if (clipPrev.w <= 0.0) return float4(cur);
+    if (clipPrev.w <= 0.0) return current;
     float2 ndc = clipPrev.xy / clipPrev.w;
     float2 uvPrev = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return float4(cur);
+    if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return current;
 
     float4 Q4 = prevPosTex.sample(smp, uvPrev);
-    if (Q4.w < 0.5) return float4(cur);
-    // disocclusion / moving-body test: same surface point last frame?
-    float reuse = saturate(1.0 - length(Q4.xyz - P) * 14.0);
-    if (reuse <= 0.0) return float4(cur);
+    if (Q4.w < 0.5) return current;
 
-    float hist = histAO.sample(lsmp, uvPrev).r;
-    float blend = mix(1.0, U.temporal.y, reuse);   // partial trust on the edge
-    return float4(mix(hist, cur, blend));
+    // AO is continuous and may be bilinearly reprojected.  The octahedral
+    // normal is encoded metadata: filtering its packed coordinates across a
+    // hard edge or the octahedral fold can decode to an unrelated direction.
+    float historyAO = histAO.sample(lsmp, uvPrev).r;
+    float2 historyNormal = histAO.sample(smp, uvPrev).gb;
+    float3 historyN = decodeOctahedral(historyNormal);
+
+    // A nearest reprojection naturally differs by a fraction of one world
+    // pixel even for static geometry.  Derivative-scaled thresholds preserve
+    // that case but reject real motion much sooner than the old fixed 7 cm
+    // window, particularly for close-up objects.
+    float pixelWorld = clamp(min(length(dfdx(P)), length(dfdy(P))), 0.002, 0.03);
+    float motionStart = 0.002 + 0.35 * pixelWorld;
+    float motionEnd = 0.012 + 1.25 * pixelWorld;
+    float positionReuse = 1.0 - smoothstep(
+        motionStart, motionEnd, length(Q4.xyz - P));
+    float normalReuse = smoothstep(0.58, 0.92, dot(N, historyN));
+    float reuse = positionReuse * normalReuse;
+    if (reuse <= 0.0) return current;
+
+    // Clip history to a cheap five-sample current-frame neighborhood.  This
+    // removes dark/light trails immediately when AO changes, while stable
+    // stochastic variation still benefits from temporal convergence.
+    float2 pixel = 1.0 / U.screen.xy;
+    constexpr int2 offsets[4] = {
+        int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)
+    };
+    float localMin = cur, localMax = cur;
+    for (int i = 0; i < 4; ++i) {
+        float value = rawAO.sample(smp, in.uv + float2(offsets[i]) * pixel).r;
+        localMin = min(localMin, value);
+        localMax = max(localMax, value);
+    }
+    float padding = max(0.015, (localMax - localMin) * 0.15);
+    float hist = clamp(historyAO, localMin - padding, localMax + padding);
+    float blend = mix(1.0, U.temporal.y, reuse);
+    return aoHistoryValue(mix(hist, cur, blend), N);
 }
 
 fragment float4 blur_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
                               texture2d<float> src [[texture(0)]],
-                              texture2d<float> posTex [[texture(1)]])
+                              texture2d<float> posTex [[texture(1)]],
+                              texture2d<float> normTex [[texture(2)]])
 {
-    // depth-aware 5x5 blur: averages AO noise without bleeding across
-    // geometric edges (weights collapse when world distance jumps)
+    // Thirteen-tap Gaussian bilateral blur.  Position and normal agreement
+    // keep AO on its own surface at silhouettes and hard edges.  The diamond
+    // footprint costs fewer texture reads than the old 25-tap box kernel.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     float2 px = 1.0 / U.screen.xy;
     float4 c4 = posTex.sample(smp, in.uv);
     if (c4.w < 0.5) return float4(1);
     float3 cP = c4.xyz;
+    float3 cN = normalize(normTex.sample(smp, in.uv).xyz);
+    constexpr int2 offsets[13] = {
+        int2( 0, 0),
+        int2(-1, 0), int2( 1, 0), int2( 0,-1), int2( 0, 1),
+        int2(-1,-1), int2( 1,-1), int2(-1, 1), int2( 1, 1),
+        int2(-2, 0), int2( 2, 0), int2( 0,-2), int2( 0, 2)
+    };
     float acc = 0.0, wsum = 0.0;
-    for (int y = -2; y <= 2; y++) {
-        for (int x = -2; x <= 2; x++) {
-            float2 uv2 = in.uv + float2(float(x), float(y)) * px;
-            float4 q4 = posTex.sample(smp, uv2);
-            if (q4.w < 0.5) continue;
-            float d = length(q4.xyz - cP);
-            float w = exp(-d * d * 6.0);
-            acc += src.sample(smp, uv2).r * w;
-            wsum += w;
-        }
+    for (int i = 0; i < 13; ++i) {
+        float2 tap = float2(offsets[i]);
+        float2 uv2 = in.uv + tap * px;
+        float4 q4 = posTex.sample(smp, uv2);
+        if (q4.w < 0.5) continue;
+        float3 qN = normalize(normTex.sample(smp, uv2).xyz);
+        float3 delta = q4.xyz - cP;
+        float spatialWeight = exp(-0.5 * dot(tap, tap));
+        float positionWeight = exp(-dot(delta, delta) * 8.0);
+        float normalWeight = pow(saturate(dot(cN, qN)), 12.0);
+        float w = spatialWeight * positionWeight * normalWeight;
+        acc += src.sample(smp, uv2).r * w;
+        wsum += w;
     }
     return float4(wsum > 0.0 ? acc / wsum : 1.0);
 }
@@ -964,7 +1045,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         blurP = try pipe("fs_vertex", "blur_fragment", samples: 1,
                          colorFormats: [.r8Unorm], depth: .invalid)
         temporalP = try pipe("fs_vertex", "temporal_fragment", samples: 1,
-                             colorFormats: [.r8Unorm], depth: .invalid)
+                             colorFormats: [.rgba8Unorm], depth: .invalid)
 
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
@@ -1010,8 +1091,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         let newPos = tex(.rgba32Float)
         let newNorm = tex(.rgba16Float)
         let newAOA = tex(.r8Unorm)
-        let newAOB = tex(.r8Unorm)
-        let newHistory = tex(.r8Unorm)
+        // Resolved AO carries an octahedrally-packed normal in GB so history
+        // validation needs no extra texture or pass.  The final blurred AO
+        // remains the compact single-channel target.
+        let newAOB = tex(.rgba8Unorm)
+        let newHistory = tex(.rgba8Unorm)
         let newPreviousPosition = tex(.rgba32Float)
         let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                                                           width: w, height: h,
@@ -1198,9 +1282,9 @@ final class Renderer: NSObject, MTKViewDelegate {
                          camUp: SIMD4(-camU, 0),
                          prevViewProj: prevVP ?? vp,
                          temporal: SIMD4(noiseOff.truncatingRemainder(dividingBy: 1),
-                                         prevVP == nil ? 1.0 : 0.12, 0, 0),
+                                         prevVP == nil ? 1.0 : 0.20, 0, 0),
                          shadowViewProj: shadowVP,
-                         shadowParams: SIMD4(0.00008, 0.00030, 0, 0))
+                         shadowParams: SIMD4(0.00008, 0.00022, 0, 0))
         // ---- 1. directional shadow depth ----
         let shadowPass = MTLRenderPassDescriptor()
         shadowPass.depthAttachment.texture = shadowTex
@@ -1373,6 +1457,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setFragmentTexture(histTex, index: 1)
             enc.setFragmentTexture(posTex, index: 2)
             enc.setFragmentTexture(prevPosTex, index: 3)
+            enc.setFragmentTexture(normTex, index: 4)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }
@@ -1403,6 +1488,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentTexture(aoTexB, index: 0)
             enc.setFragmentTexture(posTex, index: 1)
+            enc.setFragmentTexture(normTex, index: 2)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }
