@@ -118,6 +118,7 @@ cli: workspace-build
 # Wrap the release executable + owned resource bundles into a double-clickable .app
 app: workspace-build
 	@set -eu; \
+	  mkdir -p .build; \
 	  staging_root="$$(mktemp -d .build/avbd-app-stage.XXXXXX)"; \
 	  staged_app="$$staging_root/AVBD.app"; \
 	  cleanup() { rm -rf "$$staging_root"; }; \
