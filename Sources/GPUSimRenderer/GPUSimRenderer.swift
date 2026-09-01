@@ -19,17 +19,26 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// ~1.5 ms GPU on the reference scene. Hosts on a power budget can
     /// disable it and keep the rest of the pipeline unchanged.
     public var ambientOcclusion: Bool
+    /// Minimum time each presented frame stays on screen, in seconds; nil
+    /// presents as soon as the GPU finishes. A loop running below the
+    /// panel's refresh (60 fps on a 120 Hz display) otherwise lands each
+    /// frame on whichever refresh its GPU work happened to finish before,
+    /// so content sampled at a steady rate displays with an uneven
+    /// cadence. Set it to the loop's frame period to pin the cadence.
+    public var minimumFrameDuration: Double?
 
     public init(
         colorMode: GPUSimRenderColorMode = .bodyIndex,
         showConvexCollisionGeometry: Bool = false,
         convexCollisionWireframe: Bool = true,
-        ambientOcclusion: Bool = true
+        ambientOcclusion: Bool = true,
+        minimumFrameDuration: Double? = nil
     ) {
         self.colorMode = colorMode
         self.showConvexCollisionGeometry = showConvexCollisionGeometry
         self.convexCollisionWireframe = convexCollisionWireframe
         self.ambientOcclusion = ambientOcclusion
+        self.minimumFrameDuration = minimumFrameDuration
     }
 }
 
@@ -2606,7 +2615,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
         enc.endEncoding()
 
-        cmd.present(drawable)
+        if let hold = activeOptions.minimumFrameDuration {
+            cmd.present(drawable, afterMinimumDuration: hold)
+        } else {
+            cmd.present(drawable)
+        }
         let retire = renderScene.renderSceneRequiresFrameRetirement
         framesDrawn += 1
         let frameNumber = framesDrawn
