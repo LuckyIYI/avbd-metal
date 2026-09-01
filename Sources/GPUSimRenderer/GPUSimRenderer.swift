@@ -15,15 +15,21 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     public var colorMode: GPUSimRenderColorMode
     public var showConvexCollisionGeometry: Bool
     public var convexCollisionWireframe: Bool
+    /// Ambient occlusion (half-resolution GTAO with temporal accumulation),
+    /// ~1.5 ms GPU on the reference scene. Hosts on a power budget can
+    /// disable it and keep the rest of the pipeline unchanged.
+    public var ambientOcclusion: Bool
 
     public init(
         colorMode: GPUSimRenderColorMode = .bodyIndex,
         showConvexCollisionGeometry: Bool = false,
-        convexCollisionWireframe: Bool = true
+        convexCollisionWireframe: Bool = true,
+        ambientOcclusion: Bool = true
     ) {
         self.colorMode = colorMode
         self.showConvexCollisionGeometry = showConvexCollisionGeometry
         self.convexCollisionWireframe = convexCollisionWireframe
+        self.ambientOcclusion = ambientOcclusion
     }
 }
 
@@ -84,6 +90,19 @@ public struct GPUSimRenderAppearance: Sendable, Equatable {
     }
 }
 
+/// Coarse world bounds of the renderable content, used to fit the
+/// directional-shadow volume. Optional: without it the light volume
+/// follows the camera focus, which cannot cover off-focus content.
+public struct GPUSimContentBounds: Sendable, Equatable {
+    public var center: F3
+    public var radius: Float
+
+    public init(center: F3, radius: Float) {
+        self.center = center
+        self.radius = radius
+    }
+}
+
 /// Analytic geometry accepted by the auxiliary-instance rendering pass.
 public enum GPUSimRenderPrimitive: Sendable, Equatable {
     case box(size: F3)
@@ -127,7 +146,8 @@ public struct GPUSimRenderInstance {
         rotation: Quat = Quat(real: 1, imag: .zero),
         color: F3,
         emissive: F3 = .zero,
-        opacity: Float = 1
+        opacity: Float = 1,
+        castsShadow: Bool = false
     ) {
         var model = simd_float4x4(rotation.normalized)
         model.columns.3 = SIMD4(position, 1)
@@ -165,6 +185,7 @@ public struct GPUSimRenderInstance {
             parameters.y = radius
             parameters.z = capsuleLength * 0.5 + radius
         }
+        parameters.w = castsShadow ? 1 : 0
         self.init(
             model: model,
             color: SIMD4(color, kind),
@@ -304,6 +325,14 @@ public protocol GPUSimRenderableScene: AnyObject {
     var skinnedRenderSurface: GPUSimSkinnedRenderSurface? { get }
     var rigidMeshRenderSurface: GPUSimRigidMeshRenderSurface? { get }
     var convexDebugRenderSurface: GPUSimConvexDebugRenderSurface? { get }
+    /// Coarse content bounds for shadow fitting; nil = camera-driven.
+    var renderContentBounds: GPUSimContentBounds? { get }
+    /// Whether the renderer must retire each frame before returning.
+    /// GPUSolver requires it (render reads pose buffers another queue
+    /// mutates); a scene whose buffers are all triple-buffered or written
+    /// inside the frame's own command buffer can return false and let CPU
+    /// and GPU pipeline.
+    var renderSceneRequiresFrameRetirement: Bool { get }
     /// Encodes `renderRigidInstanceCount` values with
     /// `GPUSimRenderInstance` layout. A backend may also refresh the optional
     /// surface buffers in this command buffer before returning. When non-nil,
@@ -319,6 +348,16 @@ public protocol GPUSimRenderableScene: AnyObject {
 
 extension GPUSolver: GPUSimRenderableScene {
     public var renderDevice: MTLDevice { device }
+
+    /// Live bounds of the rendered colliders: current body positions plus
+    /// each collider's local offset and conservative half extent, with wide
+    /// static scenery excluded. Computed per call - a few hundred entries,
+    /// render-thread cheap.
+    public var renderContentBounds: GPUSimContentBounds? {
+        guard let bounds = renderedContentBounds else { return nil }
+        return GPUSimContentBounds(center: bounds.center,
+                                   radius: bounds.radius)
+    }
     public var renderBodyCount: Int { bodyCount }
     public var renderRigidInstanceCount: Int { renderRigidBodyCount }
     public var rendererStateIsValid: Bool { runtimeFailure == nil }
@@ -420,6 +459,11 @@ public protocol GPUSimRendererSource: AnyObject {
     func rendererDidFail(_ message: String)
 }
 
+public extension GPUSimRenderableScene {
+    var renderContentBounds: GPUSimContentBounds? { nil }
+    var renderSceneRequiresFrameRetirement: Bool { true }
+}
+
 public extension GPUSimRendererSource {
     var rendererOptions: GPUSimRenderOptions { GPUSimRenderOptions() }
     var rendererBodyAppearances: [Int: GPUSimRenderAppearance] { [:] }
@@ -471,7 +515,19 @@ struct Uniforms {
     float4 temporal;    // x = per-frame noise offset, y = history blend
     float4x4 shadowViewProj;
     float4 shadowParams; // x = constant bias, y = normal/slope bias
+    float4x4 invViewProj;
+    float4x4 prevInvViewProj;
 };
+
+// World position from depth: 4 bytes per tap instead of a 16-byte stored
+// position, with full float32 precision - the position textures this
+// replaces were the renderer's dominant bandwidth cost.
+static inline float3 worldFromDepth(float2 uv, float depth, float4x4 invVP) {
+    float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    float4 w = invVP * clip;
+    return w.xyz / w.w;
+}
+
 
 struct VOut {
     float4 position [[position]];
@@ -829,16 +885,14 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Prepass: world position + normal into two attachments (for GTAO)
+// Prepass: normals to one attachment; the depth buffer carries position
 // ---------------------------------------------------------------------------
 struct PreOut {
-    float4 pos  [[color(0)]];   // xyz world, w = 1 (geometry present)
-    float4 norm [[color(1)]];
+    float4 norm [[color(0)]];
 };
 
 fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
     PreOut o;
-    o.pos = float4(in.world, 1.0);
     o.norm = float4(normalize(in.normal), 0);
     return o;
 }
@@ -930,7 +984,6 @@ fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
     float3 V = normalize(U.eye.xyz - in.world);
     if (dot(n, V) < 0.0) n = -n;           // AO sees the visible side
     PreOut o;
-    o.pos = float4(in.world, 1.0);
     o.norm = float4(n, 0);
     return o;
 }
@@ -950,16 +1003,16 @@ vertex FSOut fs_vertex(uint vid [[vertex_id]]) {
 
 fragment float4 gtao_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
-                              texture2d<float> posTex [[texture(0)]],
+                              depth2d<float> depthTex [[texture(0)]],
                               texture2d<float> normTex [[texture(1)]])
 {
     // GTAO (Jimenez et al. 2016 / XeGTAO-style): march several
     // screen-space slices, find both horizon angles per slice, clamp to the
     // normal hemisphere, then integrate the cosine-weighted visible arc.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
-    float4 P4 = posTex.sample(smp, in.uv);
-    if (P4.w < 0.5) return float4(1);
-    float3 P = P4.xyz;
+    float dC = depthTex.sample(smp, in.uv);
+    if (dC >= 1.0) return float4(1);
+    float3 P = worldFromDepth(in.uv, dC, U.invViewProj);
     float3 N = normalize(normTex.sample(smp, in.uv).xyz);
     float3 V = normalize(U.eye.xyz - P);
     float3 camForward = normalize(cross(U.camRight.xyz, U.camUp.xyz));
@@ -1028,9 +1081,9 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
                 float u = saturate((float(st) - 1.0 + stepJit) / float(STEPS));
                 float t = minS + (1.0 - minS) * pow(u, 2.0);
                 float2 uv2 = in.uv + sgn * dirPx * (t * pxRadius) / U.screen.xy;
-                float4 Q4 = posTex.sample(smp, uv2);
-                if (Q4.w < 0.5) continue;
-                float3 w = Q4.xyz - P;
+                float dQ = depthTex.sample(smp, uv2);
+                if (dQ >= 1.0) continue;
+                float3 w = worldFromDepth(uv2, dQ, U.invViewProj) - P;
                 float l = length(w);
                 if (l < 1e-4) continue;
                 float c = dot(w / l, V);
@@ -1088,8 +1141,8 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
                                   constant Uniforms& U [[buffer(1)]],
                                   texture2d<float> rawAO [[texture(0)]],
                                   texture2d<float> histAO [[texture(1)]],
-                                  texture2d<float> posTex [[texture(2)]],
-                                  texture2d<float> prevPosTex [[texture(3)]],
+                                  depth2d<float> depthTex [[texture(2)]],
+                                  depth2d<float> prevDepthTex [[texture(3)]],
                                   texture2d<float> normTex [[texture(4)]])
 {
     // temporal accumulation with reprojection: find this pixel's world
@@ -1098,9 +1151,9 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     constexpr sampler lsmp(filter::linear, address::clamp_to_edge);
     float cur = rawAO.sample(smp, in.uv).r;
-    float4 P4 = posTex.sample(smp, in.uv);
-    if (P4.w < 0.5) return float4(cur, 0.5, 0.5, 0.0);
-    float3 P = P4.xyz;
+    float dC = depthTex.sample(smp, in.uv);
+    if (dC >= 1.0) return float4(cur, 0.5, 0.5, 0.0);
+    float3 P = worldFromDepth(in.uv, dC, U.invViewProj);
     float3 N = normalize(normTex.sample(smp, in.uv).xyz);
     float4 current = aoHistoryValue(cur, N);
     if (U.temporal.y >= 1.0) return current;
@@ -1111,8 +1164,9 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     float2 uvPrev = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return current;
 
-    float4 Q4 = prevPosTex.sample(smp, uvPrev);
-    if (Q4.w < 0.5) return current;
+    float dPrev = prevDepthTex.sample(smp, uvPrev);
+    if (dPrev >= 1.0) return current;
+    float3 Qw = worldFromDepth(uvPrev, dPrev, U.prevInvViewProj);
 
     // AO is continuous and may be bilinearly reprojected.  The octahedral
     // normal is encoded metadata: filtering its packed coordinates across a
@@ -1129,7 +1183,7 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     float motionStart = 0.002 + 0.35 * pixelWorld;
     float motionEnd = 0.012 + 1.25 * pixelWorld;
     float positionReuse = 1.0 - smoothstep(
-        motionStart, motionEnd, length(Q4.xyz - P));
+        motionStart, motionEnd, length(Qw - P));
     float normalReuse = smoothstep(0.58, 0.92, dot(N, historyN));
     float reuse = positionReuse * normalReuse;
     if (reuse <= 0.0) return current;
@@ -1156,7 +1210,7 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
 fragment float4 blur_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
                               texture2d<float> src [[texture(0)]],
-                              texture2d<float> posTex [[texture(1)]],
+                              depth2d<float> depthTex [[texture(1)]],
                               texture2d<float> normTex [[texture(2)]])
 {
     // Thirteen-tap Gaussian bilateral blur.  Position and normal agreement
@@ -1164,9 +1218,9 @@ fragment float4 blur_fragment(FSOut in [[stage_in]],
     // footprint costs fewer texture reads than the old 25-tap box kernel.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     float2 px = 1.0 / U.screen.xy;
-    float4 c4 = posTex.sample(smp, in.uv);
-    if (c4.w < 0.5) return float4(1);
-    float3 cP = c4.xyz;
+    float cD = depthTex.sample(smp, in.uv);
+    if (cD >= 1.0) return float4(1);
+    float3 cP = worldFromDepth(in.uv, cD, U.invViewProj);
     float3 cN = normalize(normTex.sample(smp, in.uv).xyz);
     constexpr int2 offsets[13] = {
         int2( 0, 0),
@@ -1178,10 +1232,10 @@ fragment float4 blur_fragment(FSOut in [[stage_in]],
     for (int i = 0; i < 13; ++i) {
         float2 tap = float2(offsets[i]);
         float2 uv2 = in.uv + tap * px;
-        float4 q4 = posTex.sample(smp, uv2);
-        if (q4.w < 0.5) continue;
+        float qD = depthTex.sample(smp, uv2);
+        if (qD >= 1.0) continue;
         float3 qN = normalize(normTex.sample(smp, uv2).xyz);
-        float3 delta = q4.xyz - cP;
+        float3 delta = worldFromDepth(uv2, qD, U.invViewProj) - cP;
         float spatialWeight = exp(-0.5 * dot(tap, tap));
         float positionWeight = exp(-dot(delta, delta) * 8.0);
         float normalWeight = pow(saturate(dot(cN, qN)), 12.0);
@@ -1224,12 +1278,10 @@ vertex FloorOut floor_vertex(uint vid [[vertex_id]],
 }
 
 struct FloorPre {
-    float4 pos  [[color(0)]];
-    float4 norm [[color(1)]];
+    float4 norm [[color(0)]];
 };
 fragment FloorPre floor_prepass_fragment(FloorOut in [[stage_in]]) {
     FloorPre o;
-    o.pos = float4(in.world, 1.0);
     o.norm = float4(0, 0, 1, 0);
     return o;
 }
@@ -1282,6 +1334,8 @@ struct Uniforms {
     var temporal: SIMD4<Float>
     var shadowViewProj: simd_float4x4
     var shadowParams: SIMD4<Float>
+    var invViewProj: simd_float4x4
+    var prevInvViewProj: simd_float4x4
 }
 
 let SPHV = 12 * 18 * 6
@@ -1352,17 +1406,24 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var depthState, noDepthState, debugDepthState: MTLDepthStencilState!
     var auxiliaryOpaqueDepthState, auxiliaryTranslucentDepthState: MTLDepthStencilState!
 
-    var posTex, normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
-    var histTex, prevPosTex: MTLTexture?
+    var normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
+    var histTex, prevDepthTex: MTLTexture?
+    private var aoTexIsWhite = false
+    private var aoSize = SIMD2<Int>(0, 0)
     var prevVP: simd_float4x4?
     var frameIdx: UInt32 = 0
     var targetSize = SIMD2<Int>(0, 0)
     var instances: MTLBuffer?
-    private var appearanceBuffer: MTLBuffer?
+    private var appearanceRing: [MTLBuffer?] = [nil, nil, nil]
+    private var appearanceActiveBodies: [[Int]] = [[], [], []]
     private var appearanceCapacity = 0
     private var activeAppearanceBodies: [Int] = []
-    private var auxiliaryInstanceBuffer: MTLBuffer?
-    private var auxiliaryInstanceCapacity = 0
+    private var auxiliaryInstanceRing: [MTLBuffer?] = [nil, nil, nil]
+    /// One staging slot per frame, shared by every CPU-written renderer
+    /// buffer; the in-flight semaphore caps outstanding frames to the ring
+    /// depth so a slot is never rewritten while a frame still reads it.
+    private var frameSlot = 0
+    private let inFlightFrames = DispatchSemaphore(value: 3)
 
     /// Orbit azimuth in radians.
     public var azimuth: Float = 0.9
@@ -1383,6 +1444,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var lastCameraEpoch: Int = -1
     private var lastSceneIdentity: ObjectIdentifier?
     public private(set) var runtimeFailure: String?
+    /// GPU time of the most recently completed frame, milliseconds.
+    public private(set) var lastFrameGPUMilliseconds: Double = 0
 
     private func reportFailure(_ message: String) {
         guard runtimeFailure == nil else { return }
@@ -1426,7 +1489,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         super.init()
 
         let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
-        func pipe(_ v: String, _ f: String, samples: Int = GPUSimRenderer.sampleCount,
+        func pipe(_ v: String, _ f: String,
+                  samples: Int = GPUSimRenderer.sampleCount,
                   colorFormats: [MTLPixelFormat] = [GPUSimRenderer.colorFormat],
                   depth: MTLPixelFormat = .depth32Float,
                   blending: Bool = false) throws -> MTLRenderPipelineState {
@@ -1494,7 +1558,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         skinShadow = try depthPipe("skin_vertex")
         rigidMeshShadow = try depthPipe("rigid_mesh_vertex")
 
-        let preFmt: [MTLPixelFormat] = [.rgba32Float, .rgba16Float]
+        let preFmt: [MTLPixelFormat] = [.rgba16Float]
         boxPre = try pipe("box_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         spherePre = try pipe("sphere_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         torusPre = try pipe("torus_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
@@ -1612,18 +1676,25 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     @discardableResult
     private func ensureTargets(_ size: CGSize) -> Bool {
         let w = max(Int(size.width), 4), h = max(Int(size.height), 4)
-        if targetSize == SIMD2(w, h), posTex != nil, normTex != nil,
-           aoTexA != nil, aoTexB != nil, histTex != nil, prevPosTex != nil,
+        if targetSize == SIMD2(w, h), normTex != nil,
+           aoTexA != nil, aoTexB != nil, histTex != nil, prevDepthTex != nil,
            preDepthTex != nil, shadowTex != nil { return true }
+        // The AO chain runs at half resolution: GTAO is a low-frequency
+        // signal already smoothed by a bilateral blur and temporal
+        // accumulation, and full-resolution marching over a 16-byte
+        // position texture was measured at ~23 ms of a 24 ms frame.
+        let aw = max(w / 2, 4), ah = max(h / 2, 4)
         func tex(_ fmt: MTLPixelFormat) -> MTLTexture? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt,
-                                                             width: w, height: h,
+                                                             width: aw,
+                                                             height: ah,
                                                              mipmapped: false)
             d.usage = [.renderTarget, .shaderRead]
             d.storageMode = .private
             return device.makeTexture(descriptor: d)
         }
-        let newPos = tex(.rgba32Float)
+        aoTexIsWhite = false
+        aoSize = SIMD2(aw, ah)
         let newNorm = tex(.rgba16Float)
         let newAOA = tex(.r8Unorm)
         // Resolved AO carries an octahedrally-packed normal in GB so history
@@ -1631,13 +1702,18 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // remains the compact single-channel target.
         let newAOB = tex(.rgba8Unorm)
         let newHistory = tex(.rgba8Unorm)
-        let newPreviousPosition = tex(.rgba32Float)
         let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
-                                                          width: w, height: h,
+                                                          width: aw, height: ah,
                                                           mipmapped: false)
-        dd.usage = .renderTarget
+        dd.usage = [.renderTarget, .shaderRead]
         dd.storageMode = .private
         let newPreDepth = device.makeTexture(descriptor: dd)
+        let pd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float, width: aw, height: ah,
+            mipmapped: false)
+        pd.usage = .shaderRead
+        pd.storageMode = .private
+        let newPrevDepth = device.makeTexture(descriptor: pd)
 
         let sd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
@@ -1647,15 +1723,14 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         sd.usage = [.renderTarget, .shaderRead]
         sd.storageMode = .private
         let newShadow = device.makeTexture(descriptor: sd)
-        guard let newPos, let newNorm, let newAOA, let newAOB,
-              let newHistory, let newPreviousPosition, let newPreDepth,
+        guard let newNorm, let newAOA, let newAOB,
+              let newHistory, let newPrevDepth, let newPreDepth,
               let newShadow else { return false }
-        posTex = newPos
         normTex = newNorm
         aoTexA = newAOA
         aoTexB = newAOB
         histTex = newHistory
-        prevPosTex = newPreviousPosition
+        prevDepthTex = newPrevDepth
         preDepthTex = newPreDepth
         shadowTex = newShadow
         shadowTex?.label = "Directional shadow map"
@@ -1671,35 +1746,44 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         guard bodyCount > 0,
               appearances.keys.contains(where: { $0 >= 0 && $0 < bodyCount })
         else { return nil }
-        if appearanceBuffer == nil || appearanceCapacity < bodyCount {
-            appearanceCapacity = max(bodyCount, max(16, appearanceCapacity * 2))
-            appearanceBuffer = device.makeBuffer(
-                length: appearanceCapacity
-                    * MemoryLayout<GPUSimRenderAppearance>.stride,
-                options: .storageModeShared)
-            appearanceBuffer?.label = "GPU Sim body appearance overrides"
-            if let appearanceBuffer {
-                memset(appearanceBuffer.contents(), 0, appearanceBuffer.length)
+        // same in-flight ring as the auxiliary staging: a non-retired frame
+        // may still be reading the previous slot
+        let slot = frameSlot
+        if appearanceRing[slot] == nil || appearanceCapacity < bodyCount {
+            appearanceCapacity = max(bodyCount, max(16, appearanceCapacity))
+            for k in appearanceRing.indices where appearanceRing[k] == nil
+                || appearanceRing[k]!.length < appearanceCapacity
+                    * MemoryLayout<GPUSimRenderAppearance>.stride {
+                let buffer = device.makeBuffer(
+                    length: appearanceCapacity
+                        * MemoryLayout<GPUSimRenderAppearance>.stride,
+                    options: .storageModeShared)
+                buffer?.label = "GPU Sim body appearance overrides"
+                if let buffer {
+                    memset(buffer.contents(), 0, buffer.length)
+                }
+                appearanceRing[k] = buffer
+                appearanceActiveBodies[k].removeAll(keepingCapacity: true)
             }
-            activeAppearanceBodies.removeAll(keepingCapacity: true)
         }
-        guard let appearanceBuffer else { return nil }
-        let values = appearanceBuffer.contents().bindMemory(
+        guard let buffer = appearanceRing[slot] else { return nil }
+        let values = buffer.contents().bindMemory(
             to: GPUSimRenderAppearance.self, capacity: appearanceCapacity)
-        for body in activeAppearanceBodies { values[body] = .init() }
-        activeAppearanceBodies.removeAll(keepingCapacity: true)
+        for body in appearanceActiveBodies[slot] { values[body] = .init() }
+        appearanceActiveBodies[slot].removeAll(keepingCapacity: true)
         for (body, appearance) in appearances
-            where body >= 0 && body < bodyCount {
+        where body >= 0 && body < bodyCount {
             values[body] = appearance
-            activeAppearanceBodies.append(body)
+            appearanceActiveBodies[slot].append(body)
         }
-        return appearanceBuffer
+        return buffer
     }
 
     static func auxiliaryRenderOrder(
         _ values: [GPUSimRenderInstance],
         viewedFrom eye: F3
-    ) -> (opaque: [GPUSimRenderInstance], translucent: [GPUSimRenderInstance]) {
+    ) -> (opaque: [GPUSimRenderInstance], casterCount: Int,
+          translucent: [GPUSimRenderInstance]) {
         var opaque: [GPUSimRenderInstance] = []
         var translucent: [(index: Int, distanceSquared: Float,
                            instance: GPUSimRenderInstance)] = []
@@ -1727,34 +1811,41 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             return $0.distanceSquared > $1.distanceSquared
         }
-        return (opaque, translucent.map(\.instance))
+        // shadow casters lead the opaque run so the shadow pass draws a
+        // stable prefix; relative order is preserved on both sides
+        let casters = opaque.filter { $0.parameters.w > 0.5 }
+        let nonCasters = opaque.filter { $0.parameters.w <= 0.5 }
+        return (casters + nonCasters, casters.count,
+                translucent.map(\.instance))
     }
 
     private func prepareAuxiliaryInstanceBuffer(
         _ values: [GPUSimRenderInstance],
         viewedFrom eye: F3
-    ) -> (buffer: MTLBuffer, opaqueCount: Int,
+    ) -> (buffer: MTLBuffer, opaqueCount: Int, casterCount: Int,
           translucent: [GPUSimRenderInstance])? {
         let order = Self.auxiliaryRenderOrder(values, viewedFrom: eye)
         let ordered = order.opaque + order.translucent
         guard !ordered.isEmpty else { return nil }
-        if auxiliaryInstanceBuffer == nil
-            || auxiliaryInstanceCapacity < ordered.count {
-            auxiliaryInstanceCapacity = max(
-                ordered.count, max(16, auxiliaryInstanceCapacity * 2))
-            auxiliaryInstanceBuffer = device.makeBuffer(
-                length: auxiliaryInstanceCapacity
-                    * MemoryLayout<GPUSimRenderInstance>.stride,
+        // A ring, not a single buffer: scenes that opt out of per-frame
+        // retirement can have frames in flight, and a CPU memcpy into a
+        // buffer the previous frame still reads is a race.
+        if auxiliaryInstanceRing[frameSlot] == nil
+            || auxiliaryInstanceRing[frameSlot]!.length
+                < ordered.count * MemoryLayout<GPUSimRenderInstance>.stride {
+            let capacity = max(ordered.count * 2, 16)
+            let buffer = device.makeBuffer(
+                length: capacity * MemoryLayout<GPUSimRenderInstance>.stride,
                 options: .storageModeShared)
-            auxiliaryInstanceBuffer?.label = "GPU Sim auxiliary instances"
+            buffer?.label = "GPU Sim auxiliary instances"
+            auxiliaryInstanceRing[frameSlot] = buffer
         }
-        guard let auxiliaryInstanceBuffer else { return nil }
+        guard let buffer = auxiliaryInstanceRing[frameSlot]
+        else { return nil }
         _ = ordered.withUnsafeBytes { bytes in
-            memcpy(
-                auxiliaryInstanceBuffer.contents(), bytes.baseAddress!,
-                bytes.count)
+            memcpy(buffer.contents(), bytes.baseAddress!, bytes.count)
         }
-        return (auxiliaryInstanceBuffer, order.opaque.count,
+        return (buffer, order.opaque.count, order.casterCount,
                 order.translucent)
     }
 
@@ -1891,6 +1982,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             ?? auxiliaryInstances
         let activeSceneRevision = source?.rendererSceneRevision ?? sceneRevision
 
+        // cap frames in flight to the staging ring depth; every exit that
+        // does not commit must release the slot
+        inFlightFrames.wait()
+        frameSlot = (frameSlot + 1) % auxiliaryInstanceRing.count
+        var releasedByCompletion = false
+        defer { if !releasedByCompletion { inFlightFrames.signal() } }
+
         guard let cmd = queue.makeCommandBuffer() else {
             reportFailure("could not create a Metal command buffer")
             return
@@ -1932,8 +2030,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             instances = device.makeBuffer(length: max(256, max(1, rigidCount) * stride),
                                           options: .storageModePrivate)
         }
-        guard let instances, let posTex, let normTex, let aoTexA, let aoTexB,
-              let histTex, let prevPosTex, let preDepthTex, let shadowTex else {
+        guard let instances, let normTex, let aoTexA, let aoTexB,
+              let histTex, let prevDepthTex, let preDepthTex,
+              let shadowTex else {
             reportFailure("could not allocate required Metal render resources")
             return
         }
@@ -1986,17 +2085,45 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // A camera-targeted, texel-stabilized orthographic light projection.
         // This keeps articulated robot detail crisp while preventing shadows
         // from crawling when the follow camera advances with a policy.
-        let shadowExtent = max(
-            7.0, min(length(activeFocus - activeEye) * 0.9, 40.0))
+        // Fit the light volume to the CONTENT when the scene declares its
+        // bounds (a tabletop rig gets millimetre texels and every object
+        // casts, wherever the camera looks); fall back to camera-focus
+        // fitting for scenes without bounds or too large to cover crisply.
+        // The old fixed 7 m floor gave tabletop scenes 7 mm texels and
+        // biases larger than a cube's contact shadow.
+        var contentBounds = renderScene.renderContentBounds
+        // opaque auxiliary casters live in app space; a skeleton or marker
+        // outside the scene's own bounds must not fall off the light
+        // volume - and a backend without bounds of its own still gets a
+        // fitted volume from its casters alone
+        for instance in activeAuxiliaryInstances
+        where instance.material.w >= 1 && instance.parameters.w > 0.5 {
+            let t = instance.model.columns.3
+            let p = F3(t.x, t.y, t.z)
+            if var bounds = contentBounds {
+                let reach = length(p - bounds.center) + instance.parameters.z
+                bounds.radius = max(bounds.radius, reach)
+                contentBounds = bounds
+            } else {
+                contentBounds = GPUSimContentBounds(
+                    center: p, radius: max(instance.parameters.z, 0.5))
+            }
+        }
+        let shadowFollowsContent = contentBounds.map { $0.radius <= 25 } ?? false
+        let shadowFocus = shadowFollowsContent
+            ? contentBounds!.center : activeFocus
+        let shadowExtent = shadowFollowsContent
+            ? max(1.0, contentBounds!.radius * 1.15)
+            : max(1.5, min(length(activeFocus - activeEye) * 0.9, 40.0))
         let lightUp = F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
         let texelWorld = (2 * shadowExtent) / Float(GPUSimRenderer.shadowMapSize)
-        let rightCoord = (dot(activeFocus, lightRight) / texelWorld).rounded() * texelWorld
-        let upCoord = (dot(activeFocus, lightMapUp) / texelWorld).rounded() * texelWorld
-        let shadowCenter = activeFocus
-            + lightRight * (rightCoord - dot(activeFocus, lightRight))
-            + lightMapUp * (upCoord - dot(activeFocus, lightMapUp))
+        let rightCoord = (dot(shadowFocus, lightRight) / texelWorld).rounded() * texelWorld
+        let upCoord = (dot(shadowFocus, lightMapUp) / texelWorld).rounded() * texelWorld
+        let shadowCenter = shadowFocus
+            + lightRight * (rightCoord - dot(shadowFocus, lightRight))
+            + lightMapUp * (upCoord - dot(shadowFocus, lightMapUp))
         let lightEye = shadowCenter - lightDirection * (shadowExtent * 2.5)
         let shadowVP = metalOrthographicProjection(
             left: -shadowExtent, right: shadowExtent,
@@ -2008,6 +2135,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                          width: Double(targetSize.x),
                                          height: Double(targetSize.y),
                                          znear: 0, zfar: 1)
+        let aoViewport = MTLViewport(originX: 0, originY: 0,
+                                     width: Double(aoSize.x),
+                                     height: Double(aoSize.y),
+                                     znear: 0, zfar: 1)
+        // AO re-enabled after a disabled stretch: the frozen history and
+        // the stale previous-frame matrices must fall together, and BEFORE
+        // the uniforms capture prevVP and the temporal blend for this frame
+        if activeOptions.ambientOcclusion, aoTexIsWhite {
+            prevVP = nil
+            aoTexIsWhite = false
+        }
         var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(lightDirection, 0),
                          eye: SIMD4(activeEye, 0),
@@ -2018,7 +2156,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          temporal: SIMD4(noiseOff.truncatingRemainder(dividingBy: 1),
                                          prevVP == nil ? 1.0 : 0.20, 0, 0),
                          shadowViewProj: shadowVP,
-                         shadowParams: SIMD4(0.00008, 0.00022, 0, 0))
+                         shadowParams: SIMD4(
+                             0.30 * texelWorld / (shadowExtent * 5),
+                             1.15 * texelWorld / (shadowExtent * 5), 0, 0),
+                         invViewProj: vp.inverse,
+                         prevInvViewProj: (prevVP ?? vp).inverse)
         func bindAppearance(
             _ encoder: MTLRenderCommandEncoder,
             enabled: Bool = true
@@ -2031,6 +2173,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             encoder.setVertexBytes(
                 &hasAppearance, length: 4, index: 5)
         }
+        var Uh = U
+        Uh.screen = SIMD4(Float(aoSize.x), Float(aoSize.y),
+                          U.screen.z * 0.5, U.screen.w)
+
         // ---- 1. directional shadow depth ----
         let shadowPass = MTLRenderPassDescriptor()
         shadowPass.depthAttachment.texture = shadowTex
@@ -2060,6 +2206,20 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
                     enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                        vertexCount: verts, instanceCount: rigidCount)
+                }
+            }
+            if let auxiliaryBatch, auxiliaryBatch.casterCount > 0 {
+                for (p, verts) in [(boxShadow!, 36), (sphereShadow!, SPHV),
+                                   (torusShadow!, TORV), (capsuleShadow!, CAPV)] {
+                    enc.setRenderPipelineState(p)
+                    enc.setVertexBuffer(auxiliaryBatch.buffer, offset: 0,
+                                        index: 0)
+                    enc.setVertexBytes(&shadowU,
+                                       length: MemoryLayout<Uniforms>.stride,
+                                       index: 1)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: verts,
+                                       instanceCount: auxiliaryBatch.casterCount)
                 }
             }
             if let surf = renderScene.softRenderSurface {
@@ -2095,152 +2255,163 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         // ---- 2. prepass: world pos + normals ----
-        let pre = MTLRenderPassDescriptor()
-        pre.colorAttachments[0].texture = posTex
-        pre.colorAttachments[0].loadAction = .clear
-        pre.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        pre.colorAttachments[0].storeAction = .store
-        pre.colorAttachments[1].texture = normTex
-        pre.colorAttachments[1].loadAction = .clear
-        pre.colorAttachments[1].storeAction = .store
-        pre.depthAttachment.texture = preDepthTex
-        pre.depthAttachment.loadAction = .clear
-        pre.depthAttachment.clearDepth = 1
-        pre.depthAttachment.storeAction = .dontCare
-        guard let prepassEncoder = cmd.makeRenderCommandEncoder(
-                descriptor: pre) else {
-            reportFailure("could not create the world-position prepass encoder")
-            return
-        }
-        do {
-            let enc = prepassEncoder
-            enc.label = "World-position and normal prepass"
-            enc.setViewport(screenViewport)
-            enc.setDepthStencilState(depthState)
-            enc.setRenderPipelineState(floorPreP)
-            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-            if rigidCount > 0 {
-                for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
-                                   (torusPre!, TORV), (capsulePre!, CAPV)] {
-                    enc.setRenderPipelineState(p)
-                    enc.setVertexBuffer(instances, offset: 0, index: 0)
-                    enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                    enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                       vertexCount: verts, instanceCount: rigidCount)
+        if !activeOptions.ambientOcclusion {
+            if !aoTexIsWhite {
+                let clearPass = MTLRenderPassDescriptor()
+                clearPass.colorAttachments[0].texture = aoTexA
+                clearPass.colorAttachments[0].loadAction = .clear
+                clearPass.colorAttachments[0].clearColor = MTLClearColor(
+                    red: 1, green: 1, blue: 1, alpha: 1)
+                clearPass.colorAttachments[0].storeAction = .store
+                cmd.makeRenderCommandEncoder(descriptor: clearPass)?
+                    .endEncoding()
+                aoTexIsWhite = true
+            }
+        } else {
+            let pre = MTLRenderPassDescriptor()
+            pre.colorAttachments[0].texture = normTex
+            pre.colorAttachments[0].loadAction = .clear
+            pre.colorAttachments[0].clearColor = MTLClearColor(
+                red: 0, green: 0, blue: 0, alpha: 0)
+            pre.colorAttachments[0].storeAction = .store
+            pre.depthAttachment.texture = preDepthTex
+            pre.depthAttachment.loadAction = .clear
+            pre.depthAttachment.clearDepth = 1
+            pre.depthAttachment.storeAction = .store
+            guard let prepassEncoder = cmd.makeRenderCommandEncoder(
+                    descriptor: pre) else {
+                reportFailure("could not create the world-position prepass encoder")
+                return
+            }
+            do {
+                let enc = prepassEncoder
+                enc.label = "World-position and normal prepass"
+                enc.setViewport(aoViewport)
+                enc.setDepthStencilState(depthState)
+                enc.setRenderPipelineState(floorPreP)
+                enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                if rigidCount > 0 {
+                    for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
+                                       (torusPre!, TORV), (capsulePre!, CAPV)] {
+                        enc.setRenderPipelineState(p)
+                        enc.setVertexBuffer(instances, offset: 0, index: 0)
+                        enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                        enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                           vertexCount: verts, instanceCount: rigidCount)
+                    }
                 }
+                if let surf = renderScene.softRenderSurface {
+                    enc.setRenderPipelineState(softPre)
+                    enc.setVertexBuffer(surf.triangles, offset: 0, index: 0)
+                    enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
+                    enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
+                    enc.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: surf.triangleCount * 3)
+                }
+                if let skin = renderScene.skinnedRenderSurface {
+                    enc.setRenderPipelineState(skinPre)
+                    enc.setVertexBuffer(skin.triangles, offset: 0, index: 0)
+                    enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: skin.triangleCount * 3)
+                }
+                if let mesh = renderScene.rigidMeshRenderSurface {
+                    enc.setRenderPipelineState(rigidMeshPre)
+                    enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
+                    enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
+                    enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+                    bindAppearance(enc)
+                    enc.drawIndexedPrimitives(
+                        type: .triangle, indexCount: mesh.indexCount,
+                        indexType: .uint32, indexBuffer: mesh.indices,
+                        indexBufferOffset: 0)
+                }
+                enc.endEncoding()
             }
-            if let surf = renderScene.softRenderSurface {
-                enc.setRenderPipelineState(softPre)
-                enc.setVertexBuffer(surf.triangles, offset: 0, index: 0)
-                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.setVertexBuffer(surf.positions, offset: 0, index: 2)
-                enc.setVertexBuffer(surf.normals, offset: 0, index: 3)
-                enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: surf.triangleCount * 3)
-            }
-            if let skin = renderScene.skinnedRenderSurface {
-                enc.setRenderPipelineState(skinPre)
-                enc.setVertexBuffer(skin.triangles, offset: 0, index: 0)
-                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.setVertexBuffer(skin.vertices, offset: 0, index: 2)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: skin.triangleCount * 3)
-            }
-            if let mesh = renderScene.rigidMeshRenderSurface {
-                enc.setRenderPipelineState(rigidMeshPre)
-                enc.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
-                enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.setVertexBuffer(mesh.positions, offset: 0, index: 2)
-                enc.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
-                bindAppearance(enc)
-                enc.drawIndexedPrimitives(
-                    type: .triangle, indexCount: mesh.indexCount,
-                    indexType: .uint32, indexBuffer: mesh.indices,
-                    indexBufferOffset: 0)
-            }
-            enc.endEncoding()
-        }
 
-        // ---- 3. GTAO ----
-        let aoPass = MTLRenderPassDescriptor()
-        aoPass.colorAttachments[0].texture = aoTexA
-        aoPass.colorAttachments[0].loadAction = .dontCare
-        aoPass.colorAttachments[0].storeAction = .store
-        guard let gtaoEncoder = cmd.makeRenderCommandEncoder(
-                descriptor: aoPass) else {
-            reportFailure("could not create the GTAO encoder")
-            return
-        }
-        do {
-            let enc = gtaoEncoder
-            enc.label = "GTAO"
-            enc.setViewport(screenViewport)
-            enc.setRenderPipelineState(gtaoP)
-            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.setFragmentTexture(posTex, index: 0)
-            enc.setFragmentTexture(normTex, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc.endEncoding()
-        }
+            // ---- 3. GTAO ----
+            let aoPass = MTLRenderPassDescriptor()
+            aoPass.colorAttachments[0].texture = aoTexA
+            aoPass.colorAttachments[0].loadAction = .dontCare
+            aoPass.colorAttachments[0].storeAction = .store
+            guard let gtaoEncoder = cmd.makeRenderCommandEncoder(
+                    descriptor: aoPass) else {
+                reportFailure("could not create the GTAO encoder")
+                return
+            }
+            do {
+                let enc = gtaoEncoder
+                enc.label = "GTAO"
+                enc.setViewport(aoViewport)
+                enc.setRenderPipelineState(gtaoP)
+                enc.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentTexture(preDepthTex, index: 0)
+                enc.setFragmentTexture(normTex, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                enc.endEncoding()
+            }
 
-        // ---- 4a. temporal resolve: raw A + reprojected history -> B ----
-        let tPass = MTLRenderPassDescriptor()
-        tPass.colorAttachments[0].texture = aoTexB
-        tPass.colorAttachments[0].loadAction = .dontCare
-        tPass.colorAttachments[0].storeAction = .store
-        guard let temporalEncoder = cmd.makeRenderCommandEncoder(
-                descriptor: tPass) else {
-            reportFailure("could not create the temporal-AO encoder")
-            return
+            // ---- 4a. temporal resolve: raw A + reprojected history -> B ----
+            let tPass = MTLRenderPassDescriptor()
+            tPass.colorAttachments[0].texture = aoTexB
+            tPass.colorAttachments[0].loadAction = .dontCare
+            tPass.colorAttachments[0].storeAction = .store
+            guard let temporalEncoder = cmd.makeRenderCommandEncoder(
+                    descriptor: tPass) else {
+                reportFailure("could not create the temporal-AO encoder")
+                return
+            }
+            do {
+                let enc = temporalEncoder
+                enc.label = "Temporal AO resolve"
+                enc.setViewport(aoViewport)
+                enc.setRenderPipelineState(temporalP)
+                enc.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentTexture(aoTexA, index: 0)
+                enc.setFragmentTexture(histTex, index: 1)
+                enc.setFragmentTexture(preDepthTex, index: 2)
+                enc.setFragmentTexture(prevDepthTex, index: 3)
+                enc.setFragmentTexture(normTex, index: 4)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                enc.endEncoding()
+            }
+            // ---- 4b. save history (resolved AO + world positions) ----
+            guard let historyEncoder = cmd.makeBlitCommandEncoder() else {
+                reportFailure("could not create the temporal-history encoder")
+                return
+            }
+            historyEncoder.label = "Temporal history copy"
+            historyEncoder.copy(from: aoTexB, to: histTex)
+            historyEncoder.copy(from: preDepthTex, to: prevDepthTex)
+            historyEncoder.endEncoding()
+            // ---- 4c. one depth-aware spatial blur: B -> A ----
+            let blurPass = MTLRenderPassDescriptor()
+            blurPass.colorAttachments[0].texture = aoTexA
+            blurPass.colorAttachments[0].loadAction = .dontCare
+            blurPass.colorAttachments[0].storeAction = .store
+            guard let blurEncoder = cmd.makeRenderCommandEncoder(
+                    descriptor: blurPass) else {
+                reportFailure("could not create the AO-blur encoder")
+                return
+            }
+            do {
+                let enc = blurEncoder
+                enc.label = "Depth-aware AO blur"
+                enc.setViewport(aoViewport)
+                enc.setRenderPipelineState(blurP)
+                enc.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentTexture(aoTexB, index: 0)
+                enc.setFragmentTexture(preDepthTex, index: 1)
+                enc.setFragmentTexture(normTex, index: 2)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                enc.endEncoding()
+            }
         }
-        do {
-            let enc = temporalEncoder
-            enc.label = "Temporal AO resolve"
-            enc.setViewport(screenViewport)
-            enc.setRenderPipelineState(temporalP)
-            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.setFragmentTexture(aoTexA, index: 0)
-            enc.setFragmentTexture(histTex, index: 1)
-            enc.setFragmentTexture(posTex, index: 2)
-            enc.setFragmentTexture(prevPosTex, index: 3)
-            enc.setFragmentTexture(normTex, index: 4)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc.endEncoding()
-        }
-        // ---- 4b. save history (resolved AO + world positions) ----
-        guard let historyEncoder = cmd.makeBlitCommandEncoder() else {
-            reportFailure("could not create the temporal-history encoder")
-            return
-        }
-        historyEncoder.label = "Temporal history copy"
-        historyEncoder.copy(from: aoTexB, to: histTex)
-        historyEncoder.copy(from: posTex, to: prevPosTex)
-        historyEncoder.endEncoding()
-        // ---- 4c. one depth-aware spatial blur: B -> A ----
-        let blurPass = MTLRenderPassDescriptor()
-        blurPass.colorAttachments[0].texture = aoTexA
-        blurPass.colorAttachments[0].loadAction = .dontCare
-        blurPass.colorAttachments[0].storeAction = .store
-        guard let blurEncoder = cmd.makeRenderCommandEncoder(
-                descriptor: blurPass) else {
-            reportFailure("could not create the AO-blur encoder")
-            return
-        }
-        do {
-            let enc = blurEncoder
-            enc.label = "Depth-aware AO blur"
-            enc.setViewport(screenViewport)
-            enc.setRenderPipelineState(blurP)
-            enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-            enc.setFragmentTexture(aoTexB, index: 0)
-            enc.setFragmentTexture(posTex, index: 1)
-            enc.setFragmentTexture(normTex, index: 2)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc.endEncoding()
-        }
-
         // ---- 5. main pass ----
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
             reportFailure("could not create the main render encoder")
@@ -2403,24 +2574,58 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         enc.endEncoding()
 
         cmd.present(drawable)
+        let retire = renderScene.renderSceneRequiresFrameRetirement
+        framesDrawn += 1
+        let frameNumber = framesDrawn
+        let completedTexture = drawable.texture
+        let inFlight = inFlightFrames
+        cmd.addCompletedHandler { [weak self] finished in
+            inFlight.signal()
+            guard !retire else { return }
+            // pipelined mode: the frame is only now finished, so timing,
+            // failure inspection, AND the completion callback (documented as
+            // running after the frame completes, safe for readback) all
+            // happen here
+            let ms = (finished.gpuEndTime - finished.gpuStartTime) * 1000
+            let status = finished.status
+            let error = finished.error as NSError?
+            Task { @MainActor in
+                guard let self else { return }
+                self.lastFrameGPUMilliseconds = ms
+                if status != .completed || error != nil {
+                    let detail = error.map {
+                        "\($0.domain) \($0.code) — \($0.localizedDescription)"
+                    } ?? String(describing: status)
+                    self.reportFailure(
+                        "Metal command ended with status \(detail)")
+                    return
+                }
+                self.frameCompletionHandler?(completedTexture, frameNumber)
+            }
+        }
+        releasedByCompletion = true
         cmd.commit()
 
         // Physics and rendering own different command queues but share pose
-        // buffers. Retire every visual frame before returning to the main run
-        // loop, where Play/Step/Reset/goal/impact actions may mutate those
-        // buffers. This is the conservative cross-queue correctness boundary;
-        // a future shared-event/read-lease API can recover overlap safely.
-        cmd.waitUntilCompleted()
-        if let failure = commandFailureDescription(cmd) {
-            reportFailure(failure)
-            return
+        // buffers: GPUSolver-backed scenes retire every visual frame before
+        // returning to the run loop that may mutate them. Scenes that own
+        // their buffers (declared via renderSceneRequiresFrameRetirement)
+        // keep CPU and GPU pipelined instead.
+        if retire {
+            cmd.waitUntilCompleted()
+            // the frame is complete: timing is current, and the completion
+            // callback runs with finished pixels, before this call returns
+            lastFrameGPUMilliseconds =
+                (cmd.gpuEndTime - cmd.gpuStartTime) * 1000
+            if let failure = commandFailureDescription(cmd) {
+                reportFailure(failure)
+                return
+            }
+            frameCompletionHandler?(completedTexture, frameNumber)
         }
 
         prevVP = vp
         frameIdx &+= 1
-
-        framesDrawn += 1
-        frameCompletionHandler?(drawable.texture, framesDrawn)
     }
 }
 
