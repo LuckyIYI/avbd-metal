@@ -471,7 +471,19 @@ struct Uniforms {
     float4 temporal;    // x = per-frame noise offset, y = history blend
     float4x4 shadowViewProj;
     float4 shadowParams; // x = constant bias, y = normal/slope bias
+    float4x4 invViewProj;
+    float4x4 prevInvViewProj;
 };
+
+// World position from depth: 4 bytes per tap instead of a 16-byte stored
+// position, with full float32 precision - the position textures this
+// replaces were the renderer's dominant bandwidth cost.
+static inline float3 worldFromDepth(float2 uv, float depth, float4x4 invVP) {
+    float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    float4 w = invVP * clip;
+    return w.xyz / w.w;
+}
+
 
 struct VOut {
     float4 position [[position]];
@@ -829,16 +841,14 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Prepass: world position + normal into two attachments (for GTAO)
+// Prepass: normals to one attachment; the depth buffer carries position
 // ---------------------------------------------------------------------------
 struct PreOut {
-    float4 pos  [[color(0)]];   // xyz world, w = 1 (geometry present)
-    float4 norm [[color(1)]];
+    float4 norm [[color(0)]];
 };
 
 fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
     PreOut o;
-    o.pos = float4(in.world, 1.0);
     o.norm = float4(normalize(in.normal), 0);
     return o;
 }
@@ -930,7 +940,6 @@ fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
     float3 V = normalize(U.eye.xyz - in.world);
     if (dot(n, V) < 0.0) n = -n;           // AO sees the visible side
     PreOut o;
-    o.pos = float4(in.world, 1.0);
     o.norm = float4(n, 0);
     return o;
 }
@@ -950,16 +959,16 @@ vertex FSOut fs_vertex(uint vid [[vertex_id]]) {
 
 fragment float4 gtao_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
-                              texture2d<float> posTex [[texture(0)]],
+                              depth2d<float> depthTex [[texture(0)]],
                               texture2d<float> normTex [[texture(1)]])
 {
     // GTAO (Jimenez et al. 2016 / XeGTAO-style): march several
     // screen-space slices, find both horizon angles per slice, clamp to the
     // normal hemisphere, then integrate the cosine-weighted visible arc.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
-    float4 P4 = posTex.sample(smp, in.uv);
-    if (P4.w < 0.5) return float4(1);
-    float3 P = P4.xyz;
+    float dC = depthTex.sample(smp, in.uv);
+    if (dC >= 1.0) return float4(1);
+    float3 P = worldFromDepth(in.uv, dC, U.invViewProj);
     float3 N = normalize(normTex.sample(smp, in.uv).xyz);
     float3 V = normalize(U.eye.xyz - P);
     float3 camForward = normalize(cross(U.camRight.xyz, U.camUp.xyz));
@@ -986,8 +995,8 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     float ang = fract(ign + U.temporal.x) * M_PI_F;
     float stepJit = fract(ign * 7.0 + U.temporal.x * 5.0);
 
-    const int SLICES = 2;
-    const int STEPS = 3;
+    const int SLICES = 3;
+    const int STEPS = 4;
     float occlusion = 0.0;
 
     for (int sl = 0; sl < SLICES; sl++) {
@@ -1028,9 +1037,9 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
                 float u = saturate((float(st) - 1.0 + stepJit) / float(STEPS));
                 float t = minS + (1.0 - minS) * pow(u, 2.0);
                 float2 uv2 = in.uv + sgn * dirPx * (t * pxRadius) / U.screen.xy;
-                float4 Q4 = posTex.sample(smp, uv2);
-                if (Q4.w < 0.5) continue;
-                float3 w = Q4.xyz - P;
+                float dQ = depthTex.sample(smp, uv2);
+                if (dQ >= 1.0) continue;
+                float3 w = worldFromDepth(uv2, dQ, U.invViewProj) - P;
                 float l = length(w);
                 if (l < 1e-4) continue;
                 float c = dot(w / l, V);
@@ -1088,8 +1097,8 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
                                   constant Uniforms& U [[buffer(1)]],
                                   texture2d<float> rawAO [[texture(0)]],
                                   texture2d<float> histAO [[texture(1)]],
-                                  texture2d<float> posTex [[texture(2)]],
-                                  texture2d<float> prevPosTex [[texture(3)]],
+                                  depth2d<float> depthTex [[texture(2)]],
+                                  depth2d<float> prevDepthTex [[texture(3)]],
                                   texture2d<float> normTex [[texture(4)]])
 {
     // temporal accumulation with reprojection: find this pixel's world
@@ -1098,9 +1107,9 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     constexpr sampler lsmp(filter::linear, address::clamp_to_edge);
     float cur = rawAO.sample(smp, in.uv).r;
-    float4 P4 = posTex.sample(smp, in.uv);
-    if (P4.w < 0.5) return float4(cur, 0.5, 0.5, 0.0);
-    float3 P = P4.xyz;
+    float dC = depthTex.sample(smp, in.uv);
+    if (dC >= 1.0) return float4(cur, 0.5, 0.5, 0.0);
+    float3 P = worldFromDepth(in.uv, dC, U.invViewProj);
     float3 N = normalize(normTex.sample(smp, in.uv).xyz);
     float4 current = aoHistoryValue(cur, N);
     if (U.temporal.y >= 1.0) return current;
@@ -1111,8 +1120,9 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     float2 uvPrev = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return current;
 
-    float4 Q4 = prevPosTex.sample(smp, uvPrev);
-    if (Q4.w < 0.5) return current;
+    float dPrev = prevDepthTex.sample(smp, uvPrev);
+    if (dPrev >= 1.0) return current;
+    float3 Qw = worldFromDepth(uvPrev, dPrev, U.prevInvViewProj);
 
     // AO is continuous and may be bilinearly reprojected.  The octahedral
     // normal is encoded metadata: filtering its packed coordinates across a
@@ -1129,7 +1139,7 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     float motionStart = 0.002 + 0.35 * pixelWorld;
     float motionEnd = 0.012 + 1.25 * pixelWorld;
     float positionReuse = 1.0 - smoothstep(
-        motionStart, motionEnd, length(Q4.xyz - P));
+        motionStart, motionEnd, length(Qw - P));
     float normalReuse = smoothstep(0.58, 0.92, dot(N, historyN));
     float reuse = positionReuse * normalReuse;
     if (reuse <= 0.0) return current;
@@ -1156,7 +1166,7 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
 fragment float4 blur_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
                               texture2d<float> src [[texture(0)]],
-                              texture2d<float> posTex [[texture(1)]],
+                              depth2d<float> depthTex [[texture(1)]],
                               texture2d<float> normTex [[texture(2)]])
 {
     // Thirteen-tap Gaussian bilateral blur.  Position and normal agreement
@@ -1164,9 +1174,9 @@ fragment float4 blur_fragment(FSOut in [[stage_in]],
     // footprint costs fewer texture reads than the old 25-tap box kernel.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     float2 px = 1.0 / U.screen.xy;
-    float4 c4 = posTex.sample(smp, in.uv);
-    if (c4.w < 0.5) return float4(1);
-    float3 cP = c4.xyz;
+    float cD = depthTex.sample(smp, in.uv);
+    if (cD >= 1.0) return float4(1);
+    float3 cP = worldFromDepth(in.uv, cD, U.invViewProj);
     float3 cN = normalize(normTex.sample(smp, in.uv).xyz);
     constexpr int2 offsets[13] = {
         int2( 0, 0),
@@ -1178,10 +1188,10 @@ fragment float4 blur_fragment(FSOut in [[stage_in]],
     for (int i = 0; i < 13; ++i) {
         float2 tap = float2(offsets[i]);
         float2 uv2 = in.uv + tap * px;
-        float4 q4 = posTex.sample(smp, uv2);
-        if (q4.w < 0.5) continue;
+        float qD = depthTex.sample(smp, uv2);
+        if (qD >= 1.0) continue;
         float3 qN = normalize(normTex.sample(smp, uv2).xyz);
-        float3 delta = q4.xyz - cP;
+        float3 delta = worldFromDepth(uv2, qD, U.invViewProj) - cP;
         float spatialWeight = exp(-0.5 * dot(tap, tap));
         float positionWeight = exp(-dot(delta, delta) * 8.0);
         float normalWeight = pow(saturate(dot(cN, qN)), 12.0);
@@ -1224,12 +1234,10 @@ vertex FloorOut floor_vertex(uint vid [[vertex_id]],
 }
 
 struct FloorPre {
-    float4 pos  [[color(0)]];
-    float4 norm [[color(1)]];
+    float4 norm [[color(0)]];
 };
 fragment FloorPre floor_prepass_fragment(FloorOut in [[stage_in]]) {
     FloorPre o;
-    o.pos = float4(in.world, 1.0);
     o.norm = float4(0, 0, 1, 0);
     return o;
 }
@@ -1282,6 +1290,8 @@ struct Uniforms {
     var temporal: SIMD4<Float>
     var shadowViewProj: simd_float4x4
     var shadowParams: SIMD4<Float>
+    var invViewProj: simd_float4x4
+    var prevInvViewProj: simd_float4x4
 }
 
 let SPHV = 12 * 18 * 6
@@ -1355,8 +1365,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var depthState, noDepthState, debugDepthState: MTLDepthStencilState!
     var auxiliaryOpaqueDepthState, auxiliaryTranslucentDepthState: MTLDepthStencilState!
 
-    var posTex, normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
-    var histTex, prevPosTex: MTLTexture?
+    var normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
+    var histTex, prevDepthTex: MTLTexture?
     private var aoTexIsWhite = false
     private var aoSize = SIMD2<Int>(0, 0)
     var prevVP: simd_float4x4?
@@ -1509,7 +1519,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         skinShadow = try depthPipe("skin_vertex")
         rigidMeshShadow = try depthPipe("rigid_mesh_vertex")
 
-        let preFmt: [MTLPixelFormat] = [.rgba32Float, .rgba16Float]
+        let preFmt: [MTLPixelFormat] = [.rgba16Float]
         boxPre = try pipe("box_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         spherePre = try pipe("sphere_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
         torusPre = try pipe("torus_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
@@ -1627,8 +1637,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     @discardableResult
     private func ensureTargets(_ size: CGSize) -> Bool {
         let w = max(Int(size.width), 4), h = max(Int(size.height), 4)
-        if targetSize == SIMD2(w, h), posTex != nil, normTex != nil,
-           aoTexA != nil, aoTexB != nil, histTex != nil, prevPosTex != nil,
+        if targetSize == SIMD2(w, h), normTex != nil,
+           aoTexA != nil, aoTexB != nil, histTex != nil, prevDepthTex != nil,
            preDepthTex != nil, shadowTex != nil { return true }
         // The AO chain runs at half resolution: GTAO is a low-frequency
         // signal already smoothed by a bilateral blur and temporal
@@ -1646,7 +1656,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
         aoTexIsWhite = false
         aoSize = SIMD2(aw, ah)
-        let newPos = tex(.rgba16Float)
         let newNorm = tex(.rgba16Float)
         let newAOA = tex(.r8Unorm)
         // Resolved AO carries an octahedrally-packed normal in GB so history
@@ -1654,13 +1663,18 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // remains the compact single-channel target.
         let newAOB = tex(.rgba8Unorm)
         let newHistory = tex(.rgba8Unorm)
-        let newPreviousPosition = tex(.rgba16Float)
         let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                                                           width: aw, height: ah,
                                                           mipmapped: false)
-        dd.usage = .renderTarget
+        dd.usage = [.renderTarget, .shaderRead]
         dd.storageMode = .private
         let newPreDepth = device.makeTexture(descriptor: dd)
+        let pd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float, width: aw, height: ah,
+            mipmapped: false)
+        pd.usage = .shaderRead
+        pd.storageMode = .private
+        let newPrevDepth = device.makeTexture(descriptor: pd)
 
         let sd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
@@ -1670,15 +1684,14 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         sd.usage = [.renderTarget, .shaderRead]
         sd.storageMode = .private
         let newShadow = device.makeTexture(descriptor: sd)
-        guard let newPos, let newNorm, let newAOA, let newAOB,
-              let newHistory, let newPreviousPosition, let newPreDepth,
+        guard let newNorm, let newAOA, let newAOB,
+              let newHistory, let newPrevDepth, let newPreDepth,
               let newShadow else { return false }
-        posTex = newPos
         normTex = newNorm
         aoTexA = newAOA
         aoTexB = newAOB
         histTex = newHistory
-        prevPosTex = newPreviousPosition
+        prevDepthTex = newPrevDepth
         preDepthTex = newPreDepth
         shadowTex = newShadow
         shadowTex?.label = "Directional shadow map"
@@ -1955,8 +1968,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             instances = device.makeBuffer(length: max(256, max(1, rigidCount) * stride),
                                           options: .storageModePrivate)
         }
-        guard let instances, let posTex, let normTex, let aoTexA, let aoTexB,
-              let histTex, let prevPosTex, let preDepthTex, let shadowTex else {
+        guard let instances, let normTex, let aoTexA, let aoTexB,
+              let histTex, let prevDepthTex, let preDepthTex,
+              let shadowTex else {
             reportFailure("could not allocate required Metal render resources")
             return
         }
@@ -2045,7 +2059,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          temporal: SIMD4(noiseOff.truncatingRemainder(dividingBy: 1),
                                          prevVP == nil ? 1.0 : 0.20, 0, 0),
                          shadowViewProj: shadowVP,
-                         shadowParams: SIMD4(0.00008, 0.00022, 0, 0))
+                         shadowParams: SIMD4(0.00008, 0.00022, 0, 0),
+                         invViewProj: vp.inverse,
+                         prevInvViewProj: (prevVP ?? vp).inverse)
         func bindAppearance(
             _ encoder: MTLRenderCommandEncoder,
             enabled: Bool = true
@@ -2140,17 +2156,15 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
         } else {
             let pre = MTLRenderPassDescriptor()
-            pre.colorAttachments[0].texture = posTex
+            pre.colorAttachments[0].texture = normTex
             pre.colorAttachments[0].loadAction = .clear
-            pre.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            pre.colorAttachments[0].clearColor = MTLClearColor(
+                red: 0, green: 0, blue: 0, alpha: 0)
             pre.colorAttachments[0].storeAction = .store
-            pre.colorAttachments[1].texture = normTex
-            pre.colorAttachments[1].loadAction = .clear
-            pre.colorAttachments[1].storeAction = .store
             pre.depthAttachment.texture = preDepthTex
             pre.depthAttachment.loadAction = .clear
             pre.depthAttachment.clearDepth = 1
-            pre.depthAttachment.storeAction = .dontCare
+            pre.depthAttachment.storeAction = .store
             guard let prepassEncoder = cmd.makeRenderCommandEncoder(
                     descriptor: pre) else {
                 reportFailure("could not create the world-position prepass encoder")
@@ -2223,7 +2237,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setViewport(aoViewport)
                 enc.setRenderPipelineState(gtaoP)
                 enc.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.setFragmentTexture(posTex, index: 0)
+                enc.setFragmentTexture(preDepthTex, index: 0)
                 enc.setFragmentTexture(normTex, index: 1)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 enc.endEncoding()
@@ -2248,8 +2262,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentTexture(aoTexA, index: 0)
                 enc.setFragmentTexture(histTex, index: 1)
-                enc.setFragmentTexture(posTex, index: 2)
-                enc.setFragmentTexture(prevPosTex, index: 3)
+                enc.setFragmentTexture(preDepthTex, index: 2)
+                enc.setFragmentTexture(prevDepthTex, index: 3)
                 enc.setFragmentTexture(normTex, index: 4)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 enc.endEncoding()
@@ -2261,7 +2275,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             historyEncoder.label = "Temporal history copy"
             historyEncoder.copy(from: aoTexB, to: histTex)
-            historyEncoder.copy(from: posTex, to: prevPosTex)
+            historyEncoder.copy(from: preDepthTex, to: prevDepthTex)
             historyEncoder.endEncoding()
             // ---- 4c. one depth-aware spatial blur: B -> A ----
             let blurPass = MTLRenderPassDescriptor()
@@ -2280,7 +2294,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setRenderPipelineState(blurP)
                 enc.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentTexture(aoTexB, index: 0)
-                enc.setFragmentTexture(posTex, index: 1)
+                enc.setFragmentTexture(preDepthTex, index: 1)
                 enc.setFragmentTexture(normTex, index: 2)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 enc.endEncoding()
