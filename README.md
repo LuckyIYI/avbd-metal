@@ -1,10 +1,11 @@
-# AVBD Metal
+# GPU Sim
 
-Swift + Metal implementation of **Augmented Vertex Block Descent**
+GPU-oriented, multi-backend simulation for Swift. The current production
+backend is a Swift + Metal implementation of **Augmented Vertex Block Descent**
 ([Giles, Diaz, Yuksel — SIGGRAPH 2025](https://graphics.cs.utah.edu/research/projects/avbd/))
-grown into a unified solver where **rigid bodies, volumetric soft bodies, and
-cloth are first-class citizens** in one solve loop — plus a robotics/world-model
-research playground built on top of it.
+with a CPU reference backend alongside it. **Rigid bodies, volumetric soft
+bodies, and cloth are first-class citizens** in one solve loop. A
+robotics/world-model research playground is built on top of the simulator.
 
 ## Papers & techniques
 
@@ -42,6 +43,7 @@ same solver-level twist mode. Rolling friction is not yet implemented.
 
 | Target | Purpose |
 |---|---|
+| `GPUSim` | Recommended backend-neutral package import; exposes scene APIs and the available CPU/Metal solvers |
 | `SimCore` | Backend-neutral math, scene descriptions, geometry, mesh import, and deterministic utilities |
 | `PhysicsAVBD` | Concrete AVBD CPU/Metal solver, tuned demo scenes, and shader resources; depends only on `SimCore` |
 | `Robotics` | Robot models, MJCF import, calibration, and hardware-facing contracts; depends only on `SimCore` |
@@ -55,9 +57,34 @@ The production dependency graph is intentionally small: `SimCore` is the
 foundation; `PhysicsAVBD` and `Robotics` are independent siblings; `RL`
 composes them; and `MLXRL` is the only layer that depends on MLX. Policy
 metadata and runtime stay together with learning until they have an independent
-consumer or release cadence. Clients depend on the owning products directly;
-the `AVBD` name is reserved for the concrete physics backend rather than used
-as a generic simulator or learning namespace.
+consumer or release cadence. Simulator clients should import `GPUSim`; the
+`AVBD` name is reserved for the concrete physics backend rather than used as a
+generic simulator or learning namespace. The staged extraction plan is in
+[GPU Sim package extraction](Documentation/GPUSimPackaging.md).
+
+## Use as a Swift package
+
+Add this repository as a package dependency, select the `GPUSim` library
+product for your target, then use a single import:
+
+```swift
+import GPUSim
+
+var scene = PhysicsScene(name: "My simulation")
+let body = scene.addBody(
+    size: F3(repeating: 1),
+    density: 1,
+    friction: 0.5,
+    position: F3(0, 0, 2)
+)
+
+let solver = try scene.makeCPUSolverChecked()
+try solver.stepChecked()
+print(solver.bodies[body].positionLin)
+```
+
+`SimCore` and `PhysicsAVBD` remain public products for compatibility and for
+clients that deliberately want a lower-level dependency boundary.
 
 ## Robot learning
 

@@ -2,9 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "avbd-metal",
+    name: "gpu-sim",
     platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
+        .library(name: "GPUSim", targets: ["GPUSim"]),
         .library(name: "SimCore", targets: ["SimCore"]),
         .library(name: "PhysicsAVBD", targets: ["PhysicsAVBD"]),
         .library(name: "Robotics", targets: ["Robotics"]),
@@ -22,6 +23,10 @@ let package = Package(
             name: "PhysicsAVBD",
             dependencies: ["SimCore"],
             resources: [.copy("Shaders"), .copy("Assets")]
+        ),
+        .target(
+            name: "GPUSim",
+            dependencies: ["SimCore", "PhysicsAVBD"]
         ),
         .target(
             name: "Robotics",
@@ -69,6 +74,10 @@ let package = Package(
         .testTarget(
             name: "PhysicsAVBDTests",
             dependencies: ["SimCore", "PhysicsAVBD"]
+        ),
+        .testTarget(
+            name: "GPUSimTests",
+            dependencies: ["GPUSim"]
         ),
     ]
 )
