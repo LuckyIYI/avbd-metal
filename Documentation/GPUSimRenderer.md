@@ -122,7 +122,8 @@ The built-in primitives are boxes, spheres, tori, and capsules. Instances with
 opacity 1 write depth and therefore form correctly occluding multi-part solid
 geometry. Translucent instances are sorted back-to-front from the active
 camera, alpha blended, and do not write depth. Auxiliary geometry does not
-participate in shadows or GTAO.
+participate in GTAO. Opaque instances participate in directional shadows only
+when created with `castsShadow: true`.
 
 The pass is a deliberately bounded extension point: it preserves renderer
 ownership of its pipelines, uniforms, attachments, and synchronization instead

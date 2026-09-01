@@ -4006,7 +4006,6 @@ public final class GPUSolver {
         }
     }
 
-    /// Debug compatibility count for fractured authored joints.
     /// Live bounds of the rendered content: current body positions plus
     /// each collider's local offset and conservative half extent. The
     /// renderer fits its directional-shadow volume to this every frame, so
@@ -4031,6 +4030,7 @@ public final class GPUSolver {
         return ((lo + hi) * 0.5, quantized)
     }
 
+    /// Debug compatibility count for fractured authored joints.
     public func debugBrokenJoints() -> Int {
         brokenJointIndices().count
     }
