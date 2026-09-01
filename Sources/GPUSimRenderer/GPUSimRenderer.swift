@@ -349,9 +349,10 @@ public protocol GPUSimRenderableScene: AnyObject {
 extension GPUSolver: GPUSimRenderableScene {
     public var renderDevice: MTLDevice { device }
 
-    /// Spawn-state bounds of the rendered colliders (the oversized ground
-    /// slab excluded), padded for runtime motion. Computed per call from
-    /// scene data - a few hundred entries, render-thread cheap.
+    /// Live bounds of the rendered colliders: current body positions plus
+    /// each collider's local offset and conservative half extent, with wide
+    /// static scenery excluded. Computed per call - a few hundred entries,
+    /// render-thread cheap.
     public var renderContentBounds: GPUSimContentBounds? {
         guard let bounds = renderedContentBounds else { return nil }
         return GPUSimContentBounds(center: bounds.center,
