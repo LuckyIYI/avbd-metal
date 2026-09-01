@@ -518,7 +518,15 @@ extension Demos {
                 tet(c000, c110, c101, c011)
             }
         }
-        for (key, a) in nodeId {
+        // Dictionary iteration is process-randomized. These inert neighbor
+        // exclusions participate in graph construction, so random insertion
+        // order changes body colors and can send the same contact-rich replay
+        // down a different numerical trajectory on each launch.
+        let orderedKeys = nodeId.keys.sorted {
+            ($0.x, $0.y, $0.z) < ($1.x, $1.y, $1.z)
+        }
+        for key in orderedKeys {
+            let a = nodeId[key]!
             for d in [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1),
                       SIMD3(1, 1, 0), SIMD3(1, 0, 1), SIMD3(0, 1, 1),
                       SIMD3(1, 1, 1)] {

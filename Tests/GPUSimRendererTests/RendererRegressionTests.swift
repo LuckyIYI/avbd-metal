@@ -59,4 +59,49 @@ final class RendererRegressionTests: XCTestCase {
         XCTAssertTrue(source.contains(
             "enc.setDepthBias(1.0, slopeScale: 1.0, clamp: 0.001)"))
     }
+
+    /// An 8-bit target cannot represent a tone halfway between adjacent sRGB
+    /// codes.  Repeating the same rounded code creates a visible contour;
+    /// deterministic sub-LSB dithering represents the tone in the local
+    /// spatial average instead.
+    func testSRGBDitherRepresentsSubCodeTone() {
+        let lowerCode = 224
+        let targetEncoded = (Float(lowerCode) + 0.42) / 255
+
+        func noise(x: Int, y: Int) -> Float {
+            func fract(_ value: Float) -> Float {
+                value - floor(value)
+            }
+            let inner = fract(Float(x) * 0.06711056 + Float(y) * 0.00583715)
+            return fract(52.9829189 * inner) - 0.5
+        }
+
+        func quantized(_ encoded: Float) -> Float {
+            round(max(0, min(encoded, 1)) * 255) / 255
+        }
+
+        let undithered = quantized(targetEncoded)
+        var ditheredMean: Float = 0
+        let side = 64
+        for y in 0..<side {
+            for x in 0..<side {
+                ditheredMean += quantized(
+                    targetEncoded + noise(x: x, y: y) / 255)
+            }
+        }
+        ditheredMean /= Float(side * side)
+
+        XCTAssertGreaterThan(abs(undithered - targetEncoded), 0.35 / 255)
+        XCTAssertLessThan(abs(ditheredMean - targetEncoded), 0.03 / 255)
+    }
+
+    func testRendererDithersFinalToneMappedColorForSRGB8() throws {
+        let source = try String(contentsOf: root.appendingPathComponent(
+            "Sources/GPUSimRenderer/GPUSimRenderer.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("inline float3 displayColorSRGB8"))
+        XCTAssertEqual(
+            source.components(separatedBy: "displayColorSRGB8(acesTonemap(").count - 1,
+            4)
+        XCTAssertTrue(source.contains("static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb"))
+    }
 }

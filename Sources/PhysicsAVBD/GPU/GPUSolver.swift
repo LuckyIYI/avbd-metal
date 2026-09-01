@@ -1153,6 +1153,9 @@ public final class GPUSolver {
         precondition(scene.settings.collisionMargin >= 0
             && scene.settings.collisionMargin.isFinite,
             "collision margin must be finite and nonnegative")
+        precondition(scene.settings.deformableCollisionMargin.map {
+            $0 > 0 && $0.isFinite
+        } ?? true, "deformable collision margin must be finite and positive")
         precondition(scene.settings.rigidLinearDamping >= 0
             && scene.settings.rigidLinearDamping.isFinite
             && scene.settings.rigidAngularDamping >= 0
@@ -2858,7 +2861,8 @@ public final class GPUSolver {
             edgeLenSum += distance(a.position, b.position)
         }
         let meanEdge = topoEdgeKeys.isEmpty ? 0.2 : edgeLenSum / Float(topoEdgeKeys.count)
-        params.elemMargin = min(0.01, max(0.002, 0.5 * maxPartR))
+        params.elemMargin = settings.deformableCollisionMargin
+            ?? min(0.01, max(0.002, 0.5 * maxPartR))
         // Planar-DAT queries a wider safety neighborhood than the active
         // OGC force band. Anything beyond this radius is protected by the
         // unconditional 0.5*gamma*rq accumulated-displacement cap.

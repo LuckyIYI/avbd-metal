@@ -313,6 +313,8 @@ public struct MJCFAsset {
         }
 
         var warnings: [String] = []
+        let visualMaterials = try loadVisualMaterials(
+            root: root, warnings: &warnings)
         let visualMeshes = loadVisualMeshes(
             root: root, baseURL: baseURL, warnings: &warnings)
 
@@ -324,7 +326,9 @@ public struct MJCFAsset {
         var jointNameSet = Set<String>()
         for body in world.children where body.name == "body" {
             try parseBody(body, parent: nil, inheritedClass: nil,
-                          defaults: defaults, visualMeshes: visualMeshes,
+                          defaults: defaults,
+                          visualMaterials: visualMaterials,
+                          visualMeshes: visualMeshes,
                           links: &links,
                           bodyNameSet: &bodyNameSet,
                           jointNameSet: &jointNameSet, warnings: &warnings)
@@ -520,7 +524,8 @@ public struct MJCFAsset {
                     // proxies stay inspectable in assets without being drawn
                     // through the detailed surface.
                     isRendered: !options.includeVisuals
-                        || link.visualGeometries.isEmpty)
+                        || link.visualGeometries.isEmpty,
+                    renderColor: geom.renderColor)
             }
             for visual in options.includeVisuals
                 ? link.visualGeometries : [] {
@@ -541,7 +546,8 @@ public struct MJCFAsset {
                         localPosition: localPosition,
                         localRotation: localRotation, shape: shape,
                         collisionGroup: options.collisionGroup,
-                        collisionEnabled: false, isRendered: true)
+                        collisionEnabled: false, isRendered: true,
+                        renderColor: visual.color)
                 }
             }
         }
@@ -724,6 +730,9 @@ private struct CollisionGeometry {
     var friction: Float
     var boundingRadius: Float
     var collisionEnabled: Bool
+    /// Authored `rgba` or named material, when the geom has one. Nil keeps
+    /// the renderer's per-body fallback for uncolored contact geometry.
+    var renderColor: F3?
 }
 
 private enum VisualGeometryKind {
@@ -767,7 +776,8 @@ private func collectDefaults(_ node: XMLNode, inherited: DefaultBundle,
 
 private func parseBody(
     _ node: XMLNode, parent: Int?, inheritedClass: String?,
-    defaults: [String: DefaultBundle], visualMeshes: [String: SurfaceMesh],
+    defaults: [String: DefaultBundle], visualMaterials: [String: F3],
+    visualMeshes: [String: SurfaceMesh],
     links: inout [Link],
     bodyNameSet: inout Set<String>, jointNameSet: inout Set<String>,
     warnings: inout [String]
@@ -856,7 +866,7 @@ private func parseBody(
             if let meshName = attrs["mesh"],
                let mesh = visualMeshes[meshName] {
                 visualGeometries.append(try parseVisualGeometry(
-                    attrs, kind: .mesh(mesh)))
+                    attrs, kind: .mesh(mesh), materials: visualMaterials))
             } else if let meshName = attrs["mesh"] {
                 warnings.append("visual mesh \(meshName) is unavailable")
             }
@@ -864,14 +874,17 @@ private func parseBody(
         }
         if isVisualOnly {
             let primitive = try parseCollisionGeometry(
-                attrs, bodyName: name, warnings: &warnings)
+                attrs, bodyName: name, materials: visualMaterials,
+                warnings: &warnings)
             visualGeometries.append(try parseVisualGeometry(
                 attrs, kind: .primitive(primitive.shape, primitive.size),
+                materials: visualMaterials,
                 position: primitive.position, rotation: primitive.rotation))
             continue
         }
         geometries.append(try parseCollisionGeometry(
-            attrs, bodyName: name, warnings: &warnings))
+            attrs, bodyName: name, materials: visualMaterials,
+            warnings: &warnings))
     }
 
     let index = links.count
@@ -881,7 +894,9 @@ private func parseBody(
                       visualGeometries: visualGeometries))
     for child in node.children where child.name == "body" {
         try parseBody(child, parent: index, inheritedClass: activeClass,
-                      defaults: defaults, visualMeshes: visualMeshes,
+                      defaults: defaults,
+                      visualMaterials: visualMaterials,
+                      visualMeshes: visualMeshes,
                       links: &links,
                       bodyNameSet: &bodyNameSet, jointNameSet: &jointNameSet,
                       warnings: &warnings)
@@ -889,9 +904,11 @@ private func parseBody(
 }
 
 private func parseCollisionGeometry(
-    _ attrs: [String: String], bodyName: String, warnings: inout [String]
+    _ attrs: [String: String], bodyName: String, materials: [String: F3],
+    warnings: inout [String]
 ) throws -> CollisionGeometry {
     let type = attrs["type"] ?? "sphere"
+    let renderColor = try authoredColor(attrs, materials: materials)
     let friction = try floatList(attrs["friction"] ?? "1 0.005 0.0001",
                                  minimumCount: 1, element: "geom",
                                  attribute: "friction")[0]
@@ -959,23 +976,90 @@ private func parseCollisionGeometry(
     return CollisionGeometry(shape: shape, size: size, position: position,
                              rotation: rotation, friction: friction,
                              boundingRadius: radius,
-                             collisionEnabled: collisionEnabled)
+                             collisionEnabled: collisionEnabled,
+                             renderColor: renderColor)
 }
 
 private func parseVisualGeometry(
     _ attrs: [String: String], kind: VisualGeometryKind,
+    materials: [String: F3],
     position: F3? = nil, rotation: Quat? = nil
 ) throws -> VisualGeometry {
-    let rgba = try floatList(attrs["rgba"] ?? "0.24 0.28 0.34 1",
-                             minimumCount: 3, element: "geom",
-                             attribute: "rgba")
+    // Retain AVBD's established unmaterialed-CAD fallback.
+    let color = try authoredColor(attrs, materials: materials)
+        ?? F3(0.24, 0.28, 0.34)
     return VisualGeometry(
         kind: kind,
         position: try position ?? vector3(
             attrs["pos"] ?? "0 0 0", element: "geom", attribute: "pos"),
         rotation: try rotation ?? quaternion(
             attrs["quat"] ?? "1 0 0 0", element: "geom", attribute: "quat"),
-        color: F3(rgba[0], rgba[1], rgba[2]))
+        color: color)
+}
+
+/// The color a geom authors, or nil when it has neither `rgba` nor a
+/// `material`. Shared by rendered collision primitives and visual-only geoms
+/// so a named material colors an ordinary MJCF geom that both collides and
+/// renders, not only one with zeroed contact masks.
+private func authoredColor(
+    _ attrs: [String: String], materials: [String: F3]
+) throws -> F3? {
+    if let rawRGBA = attrs["rgba"] {
+        // MuJoCo gives a local/default-class rgba precedence over a referenced
+        // material. Preserve that rule instead of blindly applying the asset.
+        let rgba = try colorComponents(
+            rawRGBA, element: "geom", attribute: "rgba")
+        return F3(rgba[0], rgba[1], rgba[2])
+    }
+    if let name = attrs["material"] {
+        guard let material = materials[name] else {
+            throw MJCFImportError.missing(
+                "geom references material \(name)")
+        }
+        return material
+    }
+    return nil
+}
+
+/// Resolve named MJCF materials once at the asset boundary. SurfaceMesh is a
+/// position/normal STL representation and therefore has no UV channel; models
+/// that reference a texture keep their material tint and report the omitted
+/// texture explicitly rather than silently turning black.
+private func loadVisualMaterials(
+    root: XMLNode, warnings: inout [String]
+) throws -> [String: F3] {
+    guard let assets = root.children.first(where: { $0.name == "asset" }) else {
+        return [:]
+    }
+    var result: [String: F3] = [:]
+    for node in assets.children where node.name == "material" {
+        let name = try required(node, "name")
+        guard result[name] == nil else {
+            throw MJCFImportError.unsupported(
+                "duplicate visual material \(name)")
+        }
+        let rgba = try colorComponents(
+            node.attributes["rgba"] ?? "1 1 1 1",
+            element: "material", attribute: "rgba")
+        result[name] = F3(rgba[0], rgba[1], rgba[2])
+        if node.attributes["texture"] != nil {
+            warnings.append(
+                "visual material \(name) texture is unavailable; using rgba")
+        }
+    }
+    return result
+}
+
+private func colorComponents(
+    _ value: String, element: String, attribute: String
+) throws -> [Float] {
+    let rgba = try floatList(
+        value, count: 4, element: element, attribute: attribute)
+    guard rgba.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
+        throw MJCFImportError.invalidAttribute(
+            element: element, attribute: attribute, value: value)
+    }
+    return rgba
 }
 
 /// Load available visual assets without making rendering geometry a physics
