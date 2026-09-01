@@ -692,8 +692,12 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     float4 Q4 = prevPosTex.sample(smp, uvPrev);
     if (Q4.w < 0.5) return current;
 
-    float4 history = histAO.sample(lsmp, uvPrev);
-    float3 historyN = decodeOctahedral(history.gb);
+    // AO is continuous and may be bilinearly reprojected.  The octahedral
+    // normal is encoded metadata: filtering its packed coordinates across a
+    // hard edge or the octahedral fold can decode to an unrelated direction.
+    float historyAO = histAO.sample(lsmp, uvPrev).r;
+    float2 historyNormal = histAO.sample(smp, uvPrev).gb;
+    float3 historyN = decodeOctahedral(historyNormal);
 
     // A nearest reprojection naturally differs by a fraction of one world
     // pixel even for static geometry.  Derivative-scaled thresholds preserve
@@ -722,7 +726,7 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
         localMax = max(localMax, value);
     }
     float padding = max(0.015, (localMax - localMin) * 0.15);
-    float hist = clamp(history.r, localMin - padding, localMax + padding);
+    float hist = clamp(historyAO, localMin - padding, localMax + padding);
     float blend = mix(1.0, U.temporal.y, reuse);
     return aoHistoryValue(mix(hist, cur, blend), N);
 }
