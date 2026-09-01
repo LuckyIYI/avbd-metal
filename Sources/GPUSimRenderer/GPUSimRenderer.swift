@@ -1008,7 +1008,7 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     float3 camForward = normalize(cross(U.camRight.xyz, U.camUp.xyz));
     float viewDepth = max(dot(P - U.eye.xyz, camForward), 0.25);
 
-    const float R = 0.9;                                  // world AO radius
+    float R = U.screen.w > 0.0 ? U.screen.w : 0.9;        // world AO radius
     float pxRadius = U.screen.z * R / viewDepth;
     // far away the radius collapses below sampling density — fade AO out
     // instead of letting a few-pixel march invent large-scale occlusion
@@ -2042,7 +2042,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let camR = normalize(cross(fwd, cameraUp))
         let camU = cross(camR, fwd)          // screen +y in UV space is DOWN
         let vp = projectionMatrix(aspect: aspect) * viewMatrix
-        let lightDirection = normalize(F3(0.4, 0.25, -0.85))
+        let lightDirection = normalize(F3(0.5, 0.32, -0.78))
 
         // A camera-targeted, texel-stabilized orthographic light projection.
         // This keeps articulated robot detail crisp while preventing shadows
@@ -2111,9 +2111,12 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             encoder.setVertexBytes(
                 &hasAppearance, length: 4, index: 5)
         }
+        let aoRadius: Float = contentBounds.map {
+            min(max($0.radius * 0.15, 0.15), 0.9)
+        } ?? 0.9
         var Uh = U
         Uh.screen = SIMD4(Float(aoSize.x), Float(aoSize.y),
-                          U.screen.z * 0.5, U.screen.w)
+                          U.screen.z * 0.5, aoRadius)
 
         // ---- 1. directional shadow depth ----
         let shadowPass = MTLRenderPassDescriptor()
