@@ -325,6 +325,12 @@ public protocol GPUSimRenderableScene: AnyObject {
     var convexDebugRenderSurface: GPUSimConvexDebugRenderSurface? { get }
     /// Coarse content bounds for shadow fitting; nil = camera-driven.
     var renderContentBounds: GPUSimContentBounds? { get }
+    /// Whether the renderer must retire each frame before returning.
+    /// GPUSolver requires it (render reads pose buffers another queue
+    /// mutates); a scene whose buffers are all triple-buffered or written
+    /// inside the frame's own command buffer can return false and let CPU
+    /// and GPU pipeline.
+    var renderSceneRequiresFrameRetirement: Bool { get }
     /// Encodes `renderRigidInstanceCount` values with
     /// `GPUSimRenderInstance` layout. A backend may also refresh the optional
     /// surface buffers in this command buffer before returning. When non-nil,
@@ -452,6 +458,7 @@ public protocol GPUSimRendererSource: AnyObject {
 
 public extension GPUSimRenderableScene {
     var renderContentBounds: GPUSimContentBounds? { nil }
+    var renderSceneRequiresFrameRetirement: Bool { true }
 }
 
 public extension GPUSimRendererSource {
@@ -1407,8 +1414,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var appearanceBuffer: MTLBuffer?
     private var appearanceCapacity = 0
     private var activeAppearanceBodies: [Int] = []
-    private var auxiliaryInstanceBuffer: MTLBuffer?
-    private var auxiliaryInstanceCapacity = 0
+    private var auxiliaryInstanceRing: [MTLBuffer?] = [nil, nil, nil]
+    private var auxiliaryInstanceIndex = 0
 
     /// Orbit azimuth in radians.
     public var azimuth: Float = 0.9
@@ -1798,24 +1805,27 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let order = Self.auxiliaryRenderOrder(values, viewedFrom: eye)
         let ordered = order.opaque + order.translucent
         guard !ordered.isEmpty else { return nil }
-        if auxiliaryInstanceBuffer == nil
-            || auxiliaryInstanceCapacity < ordered.count {
-            auxiliaryInstanceCapacity = max(
-                ordered.count, max(16, auxiliaryInstanceCapacity * 2))
-            auxiliaryInstanceBuffer = device.makeBuffer(
-                length: auxiliaryInstanceCapacity
-                    * MemoryLayout<GPUSimRenderInstance>.stride,
+        // A ring, not a single buffer: scenes that opt out of per-frame
+        // retirement can have frames in flight, and a CPU memcpy into a
+        // buffer the previous frame still reads is a race.
+        auxiliaryInstanceIndex =
+            (auxiliaryInstanceIndex + 1) % auxiliaryInstanceRing.count
+        if auxiliaryInstanceRing[auxiliaryInstanceIndex] == nil
+            || auxiliaryInstanceRing[auxiliaryInstanceIndex]!.length
+                < ordered.count * MemoryLayout<GPUSimRenderInstance>.stride {
+            let capacity = max(ordered.count * 2, 16)
+            let buffer = device.makeBuffer(
+                length: capacity * MemoryLayout<GPUSimRenderInstance>.stride,
                 options: .storageModeShared)
-            auxiliaryInstanceBuffer?.label = "GPU Sim auxiliary instances"
+            buffer?.label = "GPU Sim auxiliary instances"
+            auxiliaryInstanceRing[auxiliaryInstanceIndex] = buffer
         }
-        guard let auxiliaryInstanceBuffer else { return nil }
+        guard let buffer = auxiliaryInstanceRing[auxiliaryInstanceIndex]
+        else { return nil }
         _ = ordered.withUnsafeBytes { bytes in
-            memcpy(
-                auxiliaryInstanceBuffer.contents(), bytes.baseAddress!,
-                bytes.count)
+            memcpy(buffer.contents(), bytes.baseAddress!, bytes.count)
         }
-        return (auxiliaryInstanceBuffer, order.opaque.count,
-                order.translucent)
+        return (buffer, order.opaque.count, order.translucent)
     }
 
     // MARK: - Camera
@@ -2512,21 +2522,39 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         enc.endEncoding()
 
         cmd.present(drawable)
+        let retire = renderScene.renderSceneRequiresFrameRetirement
         cmd.addCompletedHandler { [weak self] finished in
             let ms = (finished.gpuEndTime - finished.gpuStartTime) * 1000
-            Task { @MainActor in self?.lastFrameGPUMilliseconds = ms }
+            // when the frame is not retired synchronously, a healthy buffer
+            // still reads .committed right after commit() - failures must be
+            // inspected here instead
+            let status = finished.status
+            let error = finished.error as NSError?
+            Task { @MainActor in
+                guard let self else { return }
+                self.lastFrameGPUMilliseconds = ms
+                if !retire, status != .completed || error != nil {
+                    let detail = error.map {
+                        "\($0.domain) \($0.code) — \($0.localizedDescription)"
+                    } ?? String(describing: status)
+                    self.reportFailure(
+                        "Metal command ended with status \(detail)")
+                }
+            }
         }
         cmd.commit()
 
         // Physics and rendering own different command queues but share pose
-        // buffers. Retire every visual frame before returning to the main run
-        // loop, where Play/Step/Reset/goal/impact actions may mutate those
-        // buffers. This is the conservative cross-queue correctness boundary;
-        // a future shared-event/read-lease API can recover overlap safely.
-        cmd.waitUntilCompleted()
-        if let failure = commandFailureDescription(cmd) {
-            reportFailure(failure)
-            return
+        // buffers: GPUSolver-backed scenes retire every visual frame before
+        // returning to the run loop that may mutate them. Scenes that own
+        // their buffers (declared via renderSceneRequiresFrameRetirement)
+        // keep CPU and GPU pipelined instead.
+        if retire {
+            cmd.waitUntilCompleted()
+            if let failure = commandFailureDescription(cmd) {
+                reportFailure(failure)
+                return
+            }
         }
 
         prevVP = vp
