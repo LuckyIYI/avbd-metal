@@ -68,6 +68,18 @@ moving camera can reproject normally; pass `resetTemporalHistory: true` for a
 cut or teleport. `useOrbitCamera()` returns control to the orbit properties
 and resets temporal history by default.
 
+`configure(_:)` connects rendering to an `MTKView`; it deliberately does not
+install platform gestures. The host maps its own mouse, trackpad, touch, or
+controller input onto the orbit properties. A typical drag/zoom mapping is:
+
+```swift
+renderer.azimuth -= dragDeltaX * 0.008
+renderer.elevation = min(max(
+    renderer.elevation + dragDeltaY * 0.008, -1.5), 1.55)
+renderer.distance = min(max(
+    renderer.distance * (1 - scrollDeltaY * 0.02), 2), 400)
+```
+
 Use `ray(at:in:)` to turn a view-space point into a world-space ray for picking
 or simulation interaction.
 
@@ -87,9 +99,15 @@ Overrides apply to analytic rigid geometry, rigid visual meshes, and soft
 surface vertices. Skinned meshes do not have a single body identity after
 deformation and retain their authored material.
 
+`GPUSimRenderAppearance` changes material presentation only; it does not hide
+a body, and a missing color means "keep the authored color." Hide an analytic
+collision proxy at scene-authoring time with `SceneCollider.isRendered = false`
+or the `isRendered: false` argument on collider builders. Collision remains
+enabled.
+
 Guides, targets, ghost poses, and other app-owned world geometry use the
-auxiliary pass. It is depth-tested against the scene, does not write depth or
-participate in shadows/GTAO, and supports alpha plus emission:
+auxiliary pass. It is depth-tested against the scene and supports alpha plus
+emission:
 
 ```swift
 renderer.auxiliaryInstances = [GPUSimRenderInstance(
@@ -100,10 +118,15 @@ renderer.auxiliaryInstances = [GPUSimRenderInstance(
     opacity: 0.65)]
 ```
 
-The built-in primitives are boxes, spheres, tori, and capsules. The pass is a
-deliberately bounded extension point: it preserves renderer ownership of its
-pipelines, uniforms, attachments, and synchronization instead of exposing a
-raw encoder whose contract would be easy to break.
+The built-in primitives are boxes, spheres, tori, and capsules. Instances with
+opacity 1 write depth and therefore form correctly occluding multi-part solid
+geometry. Translucent instances are sorted back-to-front from the active
+camera, alpha blended, and do not write depth. Auxiliary geometry does not
+participate in shadows or GTAO.
+
+The pass is a deliberately bounded extension point: it preserves renderer
+ownership of its pipelines, uniforms, attachments, and synchronization instead
+of exposing a raw encoder whose contract would be easy to break.
 
 ## Rigid visual-mesh authoring
 

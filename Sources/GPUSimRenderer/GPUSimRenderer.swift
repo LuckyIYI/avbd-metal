@@ -1331,8 +1331,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// Presentation-only overrides keyed by simulation body index. A live
     /// source's `rendererBodyAppearances` takes precedence when present.
     public var bodyAppearances: [Int: GPUSimRenderAppearance] = [:]
-    /// World-space primitives drawn after opaque scene geometry with depth
-    /// testing, alpha blending, and optional HDR emission.
+    /// World-space primitives drawn after opaque scene geometry. Fully opaque
+    /// values write depth; translucent values are sorted back-to-front and
+    /// alpha blended without depth writes.
     public var auxiliaryInstances: [GPUSimRenderInstance] = []
     public private(set) var sceneRevision = 0
     /// Called after a frame completes. This is useful for screenshots,
@@ -1348,7 +1349,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         skinShadow, rigidMeshShadow: MTLRenderPipelineState!
     var skyP, floorP, gtaoP, blurP, temporalP: MTLRenderPipelineState!
     var convexDebugFillP, convexDebugWireP: MTLRenderPipelineState!
-    var depthState, noDepthState, debugDepthState, auxiliaryDepthState: MTLDepthStencilState!
+    var depthState, noDepthState, debugDepthState: MTLDepthStencilState!
+    var auxiliaryOpaqueDepthState, auxiliaryTranslucentDepthState: MTLDepthStencilState!
 
     var posTex, normTex, aoTexA, aoTexB, preDepthTex, shadowTex: MTLTexture?
     var histTex, prevPosTex: MTLTexture?
@@ -1534,14 +1536,23 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
         self.debugDepthState = debugDepthState
 
-        let auxiliaryDepth = MTLDepthStencilDescriptor()
-        auxiliaryDepth.depthCompareFunction = .lessEqual
-        auxiliaryDepth.isDepthWriteEnabled = false
-        guard let auxiliaryDepthState = device.makeDepthStencilState(
-                descriptor: auxiliaryDepth) else {
-            throw GPUSimRendererError.depthState("auxiliary geometry")
+        let auxiliaryOpaqueDepth = MTLDepthStencilDescriptor()
+        auxiliaryOpaqueDepth.depthCompareFunction = .lessEqual
+        auxiliaryOpaqueDepth.isDepthWriteEnabled = true
+        guard let auxiliaryOpaqueDepthState = device.makeDepthStencilState(
+                descriptor: auxiliaryOpaqueDepth) else {
+            throw GPUSimRendererError.depthState("opaque auxiliary geometry")
         }
-        self.auxiliaryDepthState = auxiliaryDepthState
+        self.auxiliaryOpaqueDepthState = auxiliaryOpaqueDepthState
+
+        let auxiliaryTranslucentDepth = MTLDepthStencilDescriptor()
+        auxiliaryTranslucentDepth.depthCompareFunction = .lessEqual
+        auxiliaryTranslucentDepth.isDepthWriteEnabled = false
+        guard let auxiliaryTranslucentDepthState = device.makeDepthStencilState(
+                descriptor: auxiliaryTranslucentDepth) else {
+            throw GPUSimRendererError.depthState("translucent auxiliary geometry")
+        }
+        self.auxiliaryTranslucentDepthState = auxiliaryTranslucentDepthState
 
     }
 
@@ -1685,14 +1696,52 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         return appearanceBuffer
     }
 
+    static func auxiliaryRenderOrder(
+        _ values: [GPUSimRenderInstance],
+        viewedFrom eye: F3
+    ) -> (opaque: [GPUSimRenderInstance], translucent: [GPUSimRenderInstance]) {
+        var opaque: [GPUSimRenderInstance] = []
+        var translucent: [(index: Int, distanceSquared: Float,
+                           instance: GPUSimRenderInstance)] = []
+        opaque.reserveCapacity(values.count)
+        translucent.reserveCapacity(values.count)
+        for (index, instance) in values.enumerated() {
+            let opacity = instance.material.w
+            guard opacity.isFinite && opacity > 0 else { continue }
+            if opacity >= 1 {
+                opaque.append(instance)
+                continue
+            }
+            let translation = instance.model.columns.3
+            let delta = F3(translation.x, translation.y, translation.z) - eye
+            let distanceSquared = length_squared(delta)
+            translucent.append((
+                index: index,
+                distanceSquared: distanceSquared.isNaN ? -.infinity
+                    : distanceSquared,
+                instance: instance))
+        }
+        translucent.sort {
+            if $0.distanceSquared == $1.distanceSquared {
+                return $0.index < $1.index
+            }
+            return $0.distanceSquared > $1.distanceSquared
+        }
+        return (opaque, translucent.map(\.instance))
+    }
+
     private func prepareAuxiliaryInstanceBuffer(
-        _ values: [GPUSimRenderInstance]
-    ) -> MTLBuffer? {
-        guard !values.isEmpty else { return nil }
+        _ values: [GPUSimRenderInstance],
+        viewedFrom eye: F3
+    ) -> (buffer: MTLBuffer, opaqueCount: Int,
+          translucent: [GPUSimRenderInstance])? {
+        let order = Self.auxiliaryRenderOrder(values, viewedFrom: eye)
+        let ordered = order.opaque + order.translucent
+        guard !ordered.isEmpty else { return nil }
         if auxiliaryInstanceBuffer == nil
-            || auxiliaryInstanceCapacity < values.count {
+            || auxiliaryInstanceCapacity < ordered.count {
             auxiliaryInstanceCapacity = max(
-                values.count, max(16, auxiliaryInstanceCapacity * 2))
+                ordered.count, max(16, auxiliaryInstanceCapacity * 2))
             auxiliaryInstanceBuffer = device.makeBuffer(
                 length: auxiliaryInstanceCapacity
                     * MemoryLayout<GPUSimRenderInstance>.stride,
@@ -1700,12 +1749,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             auxiliaryInstanceBuffer?.label = "GPU Sim auxiliary instances"
         }
         guard let auxiliaryInstanceBuffer else { return nil }
-        _ = values.withUnsafeBytes { bytes in
+        _ = ordered.withUnsafeBytes { bytes in
             memcpy(
                 auxiliaryInstanceBuffer.contents(), bytes.baseAddress!,
                 bytes.count)
         }
-        return auxiliaryInstanceBuffer
+        return (auxiliaryInstanceBuffer, order.opaque.count,
+                order.translucent)
     }
 
     // MARK: - Camera
@@ -1899,9 +1949,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             return
         }
 
-        let auxiliaryBuffer = prepareAuxiliaryInstanceBuffer(
-            activeAuxiliaryInstances)
-        if !activeAuxiliaryInstances.isEmpty && auxiliaryBuffer == nil {
+        let activeEye = eyePosition
+        let hasVisibleAuxiliary = activeAuxiliaryInstances.contains {
+            $0.material.w.isFinite && $0.material.w > 0
+        }
+        let auxiliaryBatch = prepareAuxiliaryInstanceBuffer(
+            activeAuxiliaryInstances, viewedFrom: activeEye)
+        if hasVisibleAuxiliary && auxiliaryBatch == nil {
             reportFailure("could not allocate auxiliary render instances")
             return
         }
@@ -1922,7 +1976,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
         let pxPerUnit = viewportSize.y * 0.5 / tan(25 * Float.pi / 180)
-        let activeEye = eyePosition
         let activeFocus = cameraFocus
         let fwd = normalize(activeFocus - activeEye)
         let camR = normalize(cross(fwd, cameraUp))
@@ -2289,16 +2342,19 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             enc.setDepthBias(0, slopeScale: 0, clamp: 0)
         }
-        if let auxiliaryBuffer, !activeAuxiliaryInstances.isEmpty {
-            enc.setDepthStencilState(auxiliaryDepthState)
+        if let auxiliaryBatch {
+            // Opaque auxiliary geometry participates in depth just like the
+            // scene, so multi-part app geometry occludes itself correctly.
+            enc.setDepthStencilState(auxiliaryOpaqueDepthState)
             for (pipeline, vertices) in [
-                (boxAuxP!, 36),
-                (sphereAuxP!, SPHV),
-                (torusAuxP!, TORV),
-                (capsuleAuxP!, CAPV),
+                (boxP!, 36),
+                (sphereP!, SPHV),
+                (torusP!, TORV),
+                (capsuleP!, CAPV),
             ] {
                 enc.setRenderPipelineState(pipeline)
-                enc.setVertexBuffer(auxiliaryBuffer, offset: 0, index: 0)
+                enc.setVertexBuffer(
+                    auxiliaryBatch.buffer, offset: 0, index: 0)
                 enc.setVertexBytes(
                     &U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentBytes(
@@ -2308,7 +2364,40 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.drawPrimitives(
                     type: .triangle, vertexStart: 0,
                     vertexCount: vertices,
-                    instanceCount: activeAuxiliaryInstances.count)
+                    instanceCount: auxiliaryBatch.opaqueCount)
+            }
+
+            // Blended geometry cannot write depth without incorrectly hiding
+            // farther translucent layers. Submit it strictly back-to-front;
+            // individual draws preserve that order across primitive types.
+            enc.setDepthStencilState(auxiliaryTranslucentDepthState)
+            let translucentOffset = auxiliaryBatch.opaqueCount
+                * MemoryLayout<GPUSimRenderInstance>.stride
+            for (index, instance) in auxiliaryBatch.translucent.enumerated() {
+                let pipeline: MTLRenderPipelineState
+                let vertices: Int
+                switch instance.color.w {
+                case 0: (pipeline, vertices) = (boxAuxP, 36)
+                case 1: (pipeline, vertices) = (sphereAuxP, SPHV)
+                case 2: (pipeline, vertices) = (torusAuxP, TORV)
+                case 3: (pipeline, vertices) = (capsuleAuxP, CAPV)
+                default: continue
+                }
+                enc.setRenderPipelineState(pipeline)
+                enc.setVertexBuffer(
+                    auxiliaryBatch.buffer,
+                    offset: translucentOffset
+                        + index * MemoryLayout<GPUSimRenderInstance>.stride,
+                    index: 0)
+                enc.setVertexBytes(
+                    &U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentBytes(
+                    &U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                enc.setFragmentTexture(aoTexA, index: 0)
+                enc.setFragmentTexture(shadowTex, index: 1)
+                enc.drawPrimitives(
+                    type: .triangle, vertexStart: 0,
+                    vertexCount: vertices, instanceCount: 1)
             }
         }
         enc.endEncoding()

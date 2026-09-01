@@ -103,6 +103,32 @@ final class GPUSimRendererTests: XCTestCase {
         XCTAssertEqual(instance.model.columns.3, SIMD4(1, 2, 3, 1))
     }
 
+    func testAuxiliaryRenderOrderPartitionsOpaqueAndSortsTranslucent() {
+        func instance(
+            _ primitive: GPUSimRenderPrimitive,
+            z: Float,
+            opacity: Float
+        ) -> GPUSimRenderInstance {
+            GPUSimRenderInstance(
+                primitive: primitive,
+                position: F3(0, 0, z),
+                color: F3(repeating: 0.5),
+                opacity: opacity)
+        }
+
+        let order = GPUSimRenderer.auxiliaryRenderOrder([
+            instance(.sphere(radius: 1), z: 1, opacity: 0.5),
+            instance(.box(size: F3(repeating: 1)), z: 2, opacity: 1),
+            instance(.capsule(length: 1, radius: 0.1), z: 9, opacity: 0),
+            instance(.torus(majorRadius: 1, minorRadius: 0.1),
+                     z: 5, opacity: 0.5),
+        ], viewedFrom: .zero)
+
+        XCTAssertEqual(order.opaque.map(\.color.w), [0])
+        XCTAssertEqual(order.translucent.map(\.color.w), [2, 1],
+                       "translucent primitive types must retain global far-to-near order")
+    }
+
     func testSolverEncodesBodyAppearanceIntoPublicInstanceABI() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal is unavailable")
