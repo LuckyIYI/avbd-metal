@@ -400,6 +400,9 @@ public final class CPUManifold: CPUForce {
                 contacts[i].penalty[2] = min(contacts[i].penalty[2] + solver.betaLin * abs(C[2]),
                                              AVBDConstants.penaltyMaxTangent)
                 contacts[i].stick = length(SIMD2<Float>(C[1], C[2])) < AVBDConstants.stickThresh
+            } else {
+                // Sliding drops the anchor (see the GPU dual update).
+                contacts[i].stick = false
             }
         }
         if !contacts.isEmpty, torsionalFriction > 0 {
