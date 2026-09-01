@@ -90,6 +90,19 @@ public struct GPUSimRenderAppearance: Sendable, Equatable {
     }
 }
 
+/// Coarse world bounds of the renderable content, used to fit the
+/// directional-shadow volume. Optional: without it the light volume
+/// follows the camera focus, which cannot cover off-focus content.
+public struct GPUSimContentBounds: Sendable, Equatable {
+    public var center: F3
+    public var radius: Float
+
+    public init(center: F3, radius: Float) {
+        self.center = center
+        self.radius = radius
+    }
+}
+
 /// Analytic geometry accepted by the auxiliary-instance rendering pass.
 public enum GPUSimRenderPrimitive: Sendable, Equatable {
     case box(size: F3)
@@ -310,6 +323,8 @@ public protocol GPUSimRenderableScene: AnyObject {
     var skinnedRenderSurface: GPUSimSkinnedRenderSurface? { get }
     var rigidMeshRenderSurface: GPUSimRigidMeshRenderSurface? { get }
     var convexDebugRenderSurface: GPUSimConvexDebugRenderSurface? { get }
+    /// Coarse content bounds for shadow fitting; nil = camera-driven.
+    var renderContentBounds: GPUSimContentBounds? { get }
     /// Encodes `renderRigidInstanceCount` values with
     /// `GPUSimRenderInstance` layout. A backend may also refresh the optional
     /// surface buffers in this command buffer before returning. When non-nil,
@@ -325,6 +340,15 @@ public protocol GPUSimRenderableScene: AnyObject {
 
 extension GPUSolver: GPUSimRenderableScene {
     public var renderDevice: MTLDevice { device }
+
+    /// Spawn-state bounds of the rendered colliders (the oversized ground
+    /// slab excluded), padded for runtime motion. Computed per call from
+    /// scene data - a few hundred entries, render-thread cheap.
+    public var renderContentBounds: GPUSimContentBounds? {
+        guard let bounds = renderedContentBounds else { return nil }
+        return GPUSimContentBounds(center: bounds.center,
+                                   radius: bounds.radius)
+    }
     public var renderBodyCount: Int { bodyCount }
     public var renderRigidInstanceCount: Int { renderRigidBodyCount }
     public var rendererStateIsValid: Bool { runtimeFailure == nil }
@@ -424,6 +448,10 @@ public protocol GPUSimRendererSource: AnyObject {
     var rendererSceneRevision: Int { get }
     func rendererWillDrawFrame()
     func rendererDidFail(_ message: String)
+}
+
+public extension GPUSimRenderableScene {
+    var renderContentBounds: GPUSimContentBounds? { nil }
 }
 
 public extension GPUSimRendererSource {
@@ -2019,17 +2047,28 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // A camera-targeted, texel-stabilized orthographic light projection.
         // This keeps articulated robot detail crisp while preventing shadows
         // from crawling when the follow camera advances with a policy.
-        let shadowExtent = max(
-            7.0, min(length(activeFocus - activeEye) * 0.9, 40.0))
+        // Fit the light volume to the CONTENT when the scene declares its
+        // bounds (a tabletop rig gets millimetre texels and every object
+        // casts, wherever the camera looks); fall back to camera-focus
+        // fitting for scenes without bounds or too large to cover crisply.
+        // The old fixed 7 m floor gave tabletop scenes 7 mm texels and
+        // biases larger than a cube's contact shadow.
+        let contentBounds = renderScene.renderContentBounds
+        let shadowFollowsContent = contentBounds.map { $0.radius <= 25 } ?? false
+        let shadowFocus = shadowFollowsContent
+            ? contentBounds!.center : activeFocus
+        let shadowExtent = shadowFollowsContent
+            ? max(1.0, contentBounds!.radius * 1.15)
+            : max(1.5, min(length(activeFocus - activeEye) * 0.9, 40.0))
         let lightUp = F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
         let texelWorld = (2 * shadowExtent) / Float(GPUSimRenderer.shadowMapSize)
-        let rightCoord = (dot(activeFocus, lightRight) / texelWorld).rounded() * texelWorld
-        let upCoord = (dot(activeFocus, lightMapUp) / texelWorld).rounded() * texelWorld
-        let shadowCenter = activeFocus
-            + lightRight * (rightCoord - dot(activeFocus, lightRight))
-            + lightMapUp * (upCoord - dot(activeFocus, lightMapUp))
+        let rightCoord = (dot(shadowFocus, lightRight) / texelWorld).rounded() * texelWorld
+        let upCoord = (dot(shadowFocus, lightMapUp) / texelWorld).rounded() * texelWorld
+        let shadowCenter = shadowFocus
+            + lightRight * (rightCoord - dot(shadowFocus, lightRight))
+            + lightMapUp * (upCoord - dot(shadowFocus, lightMapUp))
         let lightEye = shadowCenter - lightDirection * (shadowExtent * 2.5)
         let shadowVP = metalOrthographicProjection(
             left: -shadowExtent, right: shadowExtent,
@@ -2055,7 +2094,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          temporal: SIMD4(noiseOff.truncatingRemainder(dividingBy: 1),
                                          prevVP == nil ? 1.0 : 0.20, 0, 0),
                          shadowViewProj: shadowVP,
-                         shadowParams: SIMD4(0.00008, 0.00022, 0, 0),
+                         shadowParams: SIMD4(
+                             0.30 * texelWorld / (shadowExtent * 5),
+                             1.15 * texelWorld / (shadowExtent * 5), 0, 0),
                          invViewProj: vp.inverse,
                          prevInvViewProj: (prevVP ?? vp).inverse)
         func bindAppearance(
@@ -2103,6 +2144,20 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
                     enc.drawPrimitives(type: .triangle, vertexStart: 0,
                                        vertexCount: verts, instanceCount: rigidCount)
+                }
+            }
+            if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
+                for (p, verts) in [(boxShadow!, 36), (sphereShadow!, SPHV),
+                                   (torusShadow!, TORV), (capsuleShadow!, CAPV)] {
+                    enc.setRenderPipelineState(p)
+                    enc.setVertexBuffer(auxiliaryBatch.buffer, offset: 0,
+                                        index: 0)
+                    enc.setVertexBytes(&shadowU,
+                                       length: MemoryLayout<Uniforms>.stride,
+                                       index: 1)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: verts,
+                                       instanceCount: auxiliaryBatch.opaqueCount)
                 }
             }
             if let surf = renderScene.softRenderSurface {

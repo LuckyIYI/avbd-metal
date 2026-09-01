@@ -206,6 +206,11 @@ public final class GPUSolver {
     var surfacedFlags, softNormalsBuf, faceNormalsBuf, renderTriBuf: MTLBuffer
     var renderBodyIdxBuf: MTLBuffer
     public private(set) var renderRigidBodyCount: Int = 0
+    /// Coarse spawn-state bounds of the rendered colliders (the oversized
+    /// ground slab excluded), padded for runtime motion - the renderer fits
+    /// its directional-shadow volume to this.
+    public private(set) var renderedContentBounds:
+        (center: F3, radius: Float)?
     var clothGroupBuf: MTLBuffer
     /// Authored Scene collision domain for each deformable-surface body.
     /// This is intentionally separate from clothGroupBuf, which identifies
@@ -3179,6 +3184,22 @@ public final class GPUSolver {
             renderColliderIDs.append(UInt32(i))
         }
         renderRigidBodyCount = renderColliderIDs.count
+        var boundsLo = F3(repeating: .greatestFiniteMagnitude)
+        var boundsHi = F3(repeating: -.greatestFiniteMagnitude)
+        var boundsAny = false
+        for collider in scene.colliders where collider.isRendered {
+            let size = collider.size
+            if size.x > 150 { continue }
+            let body = scene.bodies[collider.body]
+            let r = max(size.x, max(size.y, size.z))
+            boundsLo = min(boundsLo, body.position - F3(repeating: r))
+            boundsHi = max(boundsHi, body.position + F3(repeating: r))
+            boundsAny = true
+        }
+        renderedContentBounds = boundsAny
+            ? ((boundsLo + boundsHi) * 0.5,
+               max(length(boundsHi - boundsLo) * 0.5 * 1.25, 0.5))
+            : nil
         renderBodyIdxBuf.contents().bindMemory(to: UInt32.self,
                                                capacity: max(1, renderColliderIDs.count))
             .update(from: renderColliderIDs.isEmpty ? [0] : renderColliderIDs,
