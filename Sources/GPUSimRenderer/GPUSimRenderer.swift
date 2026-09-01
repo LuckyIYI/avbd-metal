@@ -2540,31 +2540,35 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             enc.setDepthBias(0, slopeScale: 0, clamp: 0)
         }
-        if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
+        if let auxiliaryBatch {
             // Opaque auxiliary geometry participates in depth just like the
             // scene, so multi-part app geometry occludes itself correctly.
-            // (An all-translucent batch - a lone landing ring, say - must
-            // skip this: instanceCount 0 is a Metal validation failure.)
-            enc.setDepthStencilState(auxiliaryOpaqueDepthState)
-            for (pipeline, vertices) in [
-                (boxP!, 36),
-                (sphereP!, SPHV),
-                (torusP!, TORV),
-                (capsuleP!, CAPV),
-            ] {
-                enc.setRenderPipelineState(pipeline)
-                enc.setVertexBuffer(
-                    auxiliaryBatch.buffer, offset: 0, index: 0)
-                enc.setVertexBytes(
-                    &U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.setFragmentBytes(
-                    &U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.setFragmentTexture(aoTexA, index: 0)
-                enc.setFragmentTexture(shadowTex, index: 1)
-                enc.drawPrimitives(
-                    type: .triangle, vertexStart: 0,
-                    vertexCount: vertices,
-                    instanceCount: auxiliaryBatch.opaqueCount)
+            // Guarded per SECTION, not for the whole batch: an
+            // all-translucent batch (a lone landing ring, say) must skip
+            // only the opaque draws - instanceCount 0 is a Metal validation
+            // failure - while its translucent pieces still render.
+            if auxiliaryBatch.opaqueCount > 0 {
+                enc.setDepthStencilState(auxiliaryOpaqueDepthState)
+                for (pipeline, vertices) in [
+                    (boxP!, 36),
+                    (sphereP!, SPHV),
+                    (torusP!, TORV),
+                    (capsuleP!, CAPV),
+                ] {
+                    enc.setRenderPipelineState(pipeline)
+                    enc.setVertexBuffer(
+                        auxiliaryBatch.buffer, offset: 0, index: 0)
+                    enc.setVertexBytes(
+                        &U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.setFragmentBytes(
+                        &U, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    enc.setFragmentTexture(aoTexA, index: 0)
+                    enc.setFragmentTexture(shadowTex, index: 1)
+                    enc.drawPrimitives(
+                        type: .triangle, vertexStart: 0,
+                        vertexCount: vertices,
+                        instanceCount: auxiliaryBatch.opaqueCount)
+                }
             }
 
             // Blended geometry cannot write depth without incorrectly hiding
