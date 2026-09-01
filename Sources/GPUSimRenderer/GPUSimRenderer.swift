@@ -2540,9 +2540,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             enc.setDepthBias(0, slopeScale: 0, clamp: 0)
         }
-        if let auxiliaryBatch {
+        if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
             // Opaque auxiliary geometry participates in depth just like the
             // scene, so multi-part app geometry occludes itself correctly.
+            // (An all-translucent batch - a lone landing ring, say - must
+            // skip this: instanceCount 0 is a Metal validation failure.)
             enc.setDepthStencilState(auxiliaryOpaqueDepthState)
             for (pipeline, vertices) in [
                 (boxP!, 36),
