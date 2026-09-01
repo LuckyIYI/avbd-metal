@@ -26,7 +26,7 @@ final class ConvexAssetTests: XCTestCase {
             .deletingLastPathComponent() // Tests
             .deletingLastPathComponent() // repository
             .appendingPathComponent(
-                "Sources/PhysicsAVBD/Assets/convex/concave-u.avbdconvex.json"
+                "Sources/GPUSimDemos/Assets/convex/concave-u.avbdconvex.json"
             )
     }
 

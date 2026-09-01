@@ -112,7 +112,7 @@ final class ConvexCompoundMassPropertiesTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(
-                "Sources/PhysicsAVBD/Assets/convex/concave-u.avbdconvex.json"
+                "Sources/GPUSimDemos/Assets/convex/concave-u.avbdconvex.json"
             )
         let properties = try ConvexCompoundAsset.load(from: url)
             .massProperties()
@@ -186,7 +186,7 @@ final class ConvexCompoundMassPropertiesTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(
-                "Sources/PhysicsAVBD/Assets/convex/concave-u.avbdconvex.json"
+                "Sources/GPUSimDemos/Assets/convex/concave-u.avbdconvex.json"
             )
         let fixture = try ConvexCompoundAsset.load(from: fixtureURL)
         return try ConvexCompoundAsset(

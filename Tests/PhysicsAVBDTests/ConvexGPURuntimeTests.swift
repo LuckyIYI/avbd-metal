@@ -3,6 +3,7 @@ import Metal
 import SimCore
 import simd
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class ConvexGPURuntimeTests: XCTestCase {
     func testNearTouchingHullBoxUsesStableMPRGJKSwitchover() throws {

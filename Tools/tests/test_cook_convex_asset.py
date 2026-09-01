@@ -633,7 +633,7 @@ v 0 0 1
             self.assertEqual(source.read_bytes(), original)
 
     def test_checked_concave_fixture_has_meaningful_quality(self) -> None:
-        fixture_root = TOOLS.parent / "Sources/PhysicsAVBD/Assets/convex"
+        fixture_root = TOOLS.parent / "Sources/GPUSimDemos/Assets/convex"
         asset = cooker.verify_asset_file(
             fixture_root / "concave-u.avbdconvex.json",
             fixture_root / "concave-u.obj",
@@ -666,7 +666,7 @@ v 0 0 1
             self.assertFalse(inside, "decomposition filled the authored U cavity")
 
     def test_checked_classic_fixtures_are_grounded_and_budgeted(self) -> None:
-        asset_root = TOOLS.parent / "Sources/PhysicsAVBD/Assets"
+        asset_root = TOOLS.parent / "Sources/GPUSimDemos/Assets"
         source_root = asset_root / "classic"
         convex_root = asset_root / "convex/classic"
         expected = {

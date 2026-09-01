@@ -19,7 +19,8 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSET_DIRECTORY = ROOT / "Sources/Robotics/Assets/isaac_lab_h1"
+DEVELOPMENT_ROOT = ROOT / "Development"
+ASSET_DIRECTORY = DEVELOPMENT_ROOT / "Sources/Robotics/Assets/isaac_lab_h1"
 MANIFEST_PATH = ASSET_DIRECTORY / "PROVENANCE.json"
 
 EXPECTED_REPOSITORY = "https://github.com/isaac-sim/IsaacLab"
@@ -156,7 +157,8 @@ def verify_adaptation(manifest: dict[str, Any],
                 f"invalid or duplicate implementation path: {path}")
         require(isinstance(role, str) and role.strip(),
                 f"missing adaptation role for {path}")
-        require((ROOT / path).is_file(), f"missing implementation file: {path}")
+        require((DEVELOPMENT_ROOT / path).is_file(),
+                f"missing implementation file: {path}")
         implementation_paths.add(path)
     require(implementation_paths == EXPECTED_IMPLEMENTATION_FILES,
             "Isaac Lab adaptation file set changed without verifier review")
@@ -204,7 +206,7 @@ def verify_local_markers(manifest: dict[str, Any]) -> None:
                 f"invalid or duplicate marker path: {path}")
         require(isinstance(markers, list) and markers,
                 f"{path} has no contract markers")
-        source = normalized((ROOT / path).read_text())
+        source = normalized((DEVELOPMENT_ROOT / path).read_text())
         for marker in markers:
             require(isinstance(marker, str) and marker.strip(),
                     f"{path} contains an empty marker")
@@ -239,7 +241,8 @@ def verify_redistribution(manifest: dict[str, Any],
                 f"invalid or duplicate redistributed path: {path}")
         require(isinstance(expected_hash, str),
                 f"missing redistributed hash for {path}")
-        verify_file(ROOT / path, expected_hash, f"redistributed file {path}")
+        verify_file(DEVELOPMENT_ROOT / path, expected_hash,
+                    f"redistributed file {path}")
         redistributed[path] = expected_hash
 
     license_path = "Sources/Robotics/Assets/isaac_lab_h1/LICENSE"
@@ -255,7 +258,7 @@ def verify_redistribution(manifest: dict[str, Any],
     require(actual_assets == EXPECTED_ASSET_FILES,
             "unreviewed payload exists in Isaac Lab H1 attribution directory")
 
-    notice = (ROOT / notice_path).read_text()
+    notice = (DEVELOPMENT_ROOT / notice_path).read_text()
     for required in (
         EXPECTED_REPOSITORY,
         EXPECTED_RELEASE,

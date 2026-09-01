@@ -1865,17 +1865,22 @@ public final class GPUSolver {
     /// distributable layouts before falling back to SwiftPM's build-time
     /// accessor, whose absolute development path is not portable.
     private static var packagedResourceBundle: Bundle? {
-        let name = "avbd-metal_PhysicsAVBD.bundle"
+        let names = [
+            "gpu-sim_PhysicsAVBD.bundle",
+            "avbd-metal_PhysicsAVBD.bundle",
+        ]
         let roots = [Bundle.main.resourceURL, Bundle.main.bundleURL]
         for root in roots.compactMap({ $0 }) {
-            if let bundle = Bundle(url: root.appendingPathComponent(name)) {
-                return bundle
+            for name in names {
+                if let bundle = Bundle(url: root.appendingPathComponent(name)) {
+                    return bundle
+                }
             }
         }
         return nil
     }
 
-    /// Resource lookup shared by shaders and demos. The packaged bundle check
+    /// Resource lookup for solver shaders. The packaged bundle check
     /// must precede SwiftPM's generated accessor because that accessor embeds
     /// an absolute development-build fallback that is invalid after an app is
     /// relocated.
@@ -4243,7 +4248,7 @@ public final class GPUSolver {
     /// identity, and incremental coloring. It deliberately excludes authored
     /// scene data and soft-body state; callers must use it only with the same
     /// solver instance and a rigid scene.
-    package struct RigidSpeculationSnapshot {
+    public struct RigidSpeculationSnapshot: Sendable {
         fileprivate var posLin: Data
         fileprivate var posAng: Data
         fileprivate var initLin: Data
@@ -4278,7 +4283,7 @@ public final class GPUSolver {
         fileprivate var lastMaxColorUsed: Int
     }
 
-    package func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
+    public func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
         precondition(numTris == 0 && numTets == 0,
             "rigid speculation snapshots do not include soft-body state")
         sync()
@@ -4317,7 +4322,7 @@ public final class GPUSolver {
             lastMaxColorUsed: statistics.7)
     }
 
-    package func restoreRigidSpeculationSnapshot(
+    public func restoreRigidSpeculationSnapshot(
         _ snapshot: RigidSpeculationSnapshot
     ) {
         precondition(numTris == 0 && numTets == 0,

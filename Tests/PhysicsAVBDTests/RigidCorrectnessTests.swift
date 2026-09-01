@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 /// Targeted rigid-body correctness: static friction thresholds and
 /// mass-ratio stacking (each box larger than the one beneath).

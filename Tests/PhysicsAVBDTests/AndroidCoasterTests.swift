@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class AndroidCoasterTests: XCTestCase {
     /// A ball set at the top must ride every stadium lap around the statue

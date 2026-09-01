@@ -41,11 +41,27 @@ same solver-level twist mode. Rolling friction is not yet implemented.
 
 ## Targets
 
+The repository contains two Swift packages. The root package is the reusable
+simulator; the nested `Development` package contains the research workspace and
+applications.
+
+### Simulator package
+
 | Target | Purpose |
 |---|---|
 | `GPUSim` | Recommended backend-neutral package import; exposes scene APIs and the available CPU/Metal solvers |
 | `SimCore` | Backend-neutral math, scene descriptions, geometry, mesh import, and deterministic utilities |
-| `PhysicsAVBD` | Concrete AVBD CPU/Metal solver, tuned demo scenes, and shader resources; depends only on `SimCore` |
+| `PhysicsAVBD` | Concrete AVBD CPU/Metal backend and its required shader resources; depends only on `SimCore` |
+| `GPUSimDemos` | Optional demo scenes and sample meshes; not linked or copied for `GPUSim` consumers |
+
+The root manifest has no external package dependencies. `SimCore` and
+`PhysicsAVBD` remain public products for advanced clients and source
+compatibility, while normal clients use only `GPUSim`.
+
+### Development package
+
+| Target | Purpose |
+|---|---|
 | `Robotics` | Robot models, MJCF import, calibration, and hardware-facing contracts; depends only on `SimCore` |
 | `RL` | Vector task contracts, task registry, rewards, and the current AVBD-backed environments |
 | `MLXRL` | MLX learning, checkpoint/evidence formats, policy runtime, and research pipelines |
@@ -53,19 +69,31 @@ same solver-level twist mode. Rolling friction is not yet implemented.
 | `AVBDApp` | macOS app: physics playground and data-driven Policy Replay bundle viewer |
 | `AVBDTests` | Cross-layer and MLX integration tests; lower layers also have dependency-limited test targets |
 
-The production dependency graph is intentionally small: `SimCore` is the
-foundation; `PhysicsAVBD` and `Robotics` are independent siblings; `RL`
-composes them; and `MLXRL` is the only layer that depends on MLX. Policy
-metadata and runtime stay together with learning until they have an independent
-consumer or release cadence. Simulator clients should import `GPUSim`; the
-`AVBD` name is reserved for the concrete physics backend rather than used as a
-generic simulator or learning namespace. The staged extraction plan is in
-[GPU Sim package extraction](Documentation/GPUSimPackaging.md).
+The development graph lives in [Development/Package.swift](Development/Package.swift)
+and depends locally on the root simulator. It is the only package that resolves
+MLX. The architecture gate prevents app, robotics, RL, MLX, or demo assets from
+leaking back into the simulator product. The full boundary and release contract
+are documented in [GPU Sim package structure](Documentation/GPUSimPackaging.md).
 
 ## Use as a Swift package
 
-Add this repository as a package dependency, select the `GPUSim` library
-product for your target, then use a single import:
+Add the repository and select only the `GPUSim` product:
+
+```swift
+// Package.swift
+dependencies: [
+    .package(
+        url: "https://github.com/LuckyIYI/avbd-metal.git",
+        branch: "main"
+    ),
+]
+
+// In your target dependencies:
+.product(name: "GPUSim", package: "avbd-metal")
+```
+
+The Git URL currently gives the dependency its `avbd-metal` identity; the
+library product and imported module are both `GPUSim`.
 
 ```swift
 import GPUSim
@@ -84,7 +112,8 @@ print(solver.bodies[body].positionLin)
 ```
 
 `SimCore` and `PhysicsAVBD` remain public products for compatibility and for
-clients that deliberately want a lower-level dependency boundary.
+clients that deliberately want a lower-level dependency boundary. Add the
+separate `GPUSimDemos` product only when sample scenes and meshes are useful.
 
 ## Robot learning
 
@@ -104,12 +133,12 @@ as a separate project; this repository contains only its reviewed simulator
 runtime snapshot and sealed policy releases.
 
 ```bash
-make build
-.build/release/avbd list-rl
-.build/release/avbd rl-smoke pusht-state-v0 --envs 256 --frames 200
-.build/release/avbd rl-smoke arm-pusht-v0 --envs 128 --frames 200
-.build/release/avbd rl-smoke humanoid-isaac-flat-v0 --envs 128 --frames 200
-.build/release/avbd rl-smoke arachne15-velocity-v0 --envs 128 --frames 200
+make workspace-build
+Development/.build/release/avbd list-rl
+Development/.build/release/avbd rl-smoke pusht-state-v0 --envs 256 --frames 200
+Development/.build/release/avbd rl-smoke arm-pusht-v0 --envs 128 --frames 200
+Development/.build/release/avbd rl-smoke humanoid-isaac-flat-v0 --envs 128 --frames 200
+Development/.build/release/avbd rl-smoke arachne15-velocity-v0 --envs 128 --frames 200
 
 # MLX's Metal library is only produced by xcodebuild, not plain SwiftPM.
 make ml-tool
@@ -137,15 +166,19 @@ AVBD_POLICY_BUNDLE=/absolute/path/to/my-policy-bundle open AVBD.app
 ## Quick start
 
 ```bash
-swift test                                    # full battery
-swift test --filter RLFrameworkTests          # vector RL contract + GAE
+swift test                                    # standalone simulator suite
+swift test --package-path Development         # app/RL/MLX integration suite
+swift test --package-path Development --filter RLFrameworkTests
+make verify-package-consumer                  # compile and run a separate client
+make verify-gpusim-ios                        # compile GPUSim for generic iOS
+make test                                     # both packages
 make verify-release                           # full arm64 Mac release gate
 make app && open AVBD.app                     # interactive app
-.build/release/avbd run convexdecomp --frames 300 # cooked convex-compound demo
-.build/release/avbd run classicrigids --frames 720 # classic meshes on a primitive table
-.build/release/avbd run bed --frames 300
-.build/release/avbd profile clothfold --scale 16 --frames 80
-.build/release/avbd clothgate drape --frames 300
+Development/.build/release/avbd run convexdecomp --frames 300
+Development/.build/release/avbd run classicrigids --frames 720
+Development/.build/release/avbd run bed --frames 300
+Development/.build/release/avbd profile clothfold --scale 16 --frames 80
+Development/.build/release/avbd clothgate drape --frames 300
 ```
 
 ## Convex mesh pipeline

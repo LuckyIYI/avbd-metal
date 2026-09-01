@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 /// Soft body physics per the paper: 3-DOF particles, hard rod elements,
 /// Neo-Hookean tets, and two-way rigid coupling.

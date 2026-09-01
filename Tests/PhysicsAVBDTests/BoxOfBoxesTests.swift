@@ -1,6 +1,7 @@
 import XCTest
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class BoxOfBoxesTests: XCTestCase {
     func testSceneIsRegisteredAndSmallTierFormsDenseBox() throws {

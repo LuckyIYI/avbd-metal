@@ -21,11 +21,12 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEVELOPMENT_ROOT = ROOT / "Development"
 PANDA_MANIFEST = (
-    ROOT / "Sources/Robotics/Assets/panda_pusher/PROVENANCE.json"
+    DEVELOPMENT_ROOT / "Sources/Robotics/Assets/panda_pusher/PROVENANCE.json"
 )
 MANISKILL_MANIFEST = (
-    ROOT / "Sources/Robotics/Assets/maniskill_pusht/PROVENANCE.json"
+    DEVELOPMENT_ROOT / "Sources/Robotics/Assets/maniskill_pusht/PROVENANCE.json"
 )
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -302,14 +303,14 @@ def verify_panda(checkout: Path | None) -> None:
         "https://github.com/google-deepmind/mujoco_menagerie",
         "Menagerie Panda")
     asset = manifest["asset"]
-    asset_path = ROOT / asset["path"]
+    asset_path = DEVELOPMENT_ROOT / asset["path"]
     verify_file(asset_path, asset["sha256"], "Panda pusher MJCF")
     if checkout is not None:
         verify_panda_transform(
             checkout / "franka_emika_panda/panda.xml",
             asset_path, checkout)
     license_data = manifest["redistributedLicense"]
-    verify_file(ROOT / license_data["path"], license_data["sha256"],
+    verify_file(DEVELOPMENT_ROOT / license_data["path"], license_data["sha256"],
                 "Menagerie Panda license")
 
     root = ET.parse(asset_path).getroot()
@@ -356,10 +357,10 @@ def verify_maniskill(checkout: Path | None) -> None:
         manifest, checkout, "https://github.com/haosulab/ManiSkill",
         "ManiSkill PushT")
     for redistributed in manifest["redistributedFiles"]:
-        verify_file(ROOT / redistributed["path"], redistributed["sha256"],
+        verify_file(DEVELOPMENT_ROOT / redistributed["path"], redistributed["sha256"],
                     f"ManiSkill attribution {Path(redistributed['path']).name}")
     adapted = manifest["adaptedFile"]
-    verify_file(ROOT / adapted["path"], adapted["sha256"],
+    verify_file(DEVELOPMENT_ROOT / adapted["path"], adapted["sha256"],
                 "adapted ManiSkill PushT task")
     require(manifest["assetBoundary"]["redistributesManiSkillAssets"] is False,
             "ManiSkill asset boundary must remain explicit")

@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class MarbleRunTests: XCTestCase {
     /// The marble rollercoaster: a train of marbles descends the full

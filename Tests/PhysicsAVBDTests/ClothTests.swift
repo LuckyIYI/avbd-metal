@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 /// Cloth as a first-class citizen: surface-element contacts (V-T, rigid-T,
 /// E-E) with the full AVBD treatment. These are the plan gates.

@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class SphereTests: XCTestCase {
     func testSphereRestsOnGround() throws {
