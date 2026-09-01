@@ -85,7 +85,7 @@ but prohibits commercial use and inclusion in a product for sale without its
 permission, except for scholarly journals and books. These assets are not
 covered by this repository's software license. Exact source and derivative
 hashes are recorded in
-`Sources/PhysicsAVBD/Assets/classic/PROVENANCE.md`.
+`Sources/GPUSimDemos/Assets/classic/PROVENANCE.md`.
 
 Official terms and credits:
 <https://graphics.stanford.edu/data/3Dscanrep/>

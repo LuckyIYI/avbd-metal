@@ -423,7 +423,7 @@ def verify_checked_in_outputs(repository_root: Path, manifest_path: Path) -> Non
     swift_relative_path = output.get("swiftSource")
     if not isinstance(swift_relative_path, str):
         raise ValueError("generated Swift source path is missing")
-    swift_path = repository_root / swift_relative_path
+    swift_path = repository_root / "Development" / swift_relative_path
     swift_data = swift_path.read_bytes()
     if sha256(swift_data) != output.get("swiftSourceSHA256"):
         raise ValueError("generated Swift source SHA-256 does not match provenance")
@@ -499,6 +499,7 @@ def write_or_check(path: Path, data: bytes, check: bool) -> None:
 
 def main() -> int:
     repository_root = Path(__file__).resolve().parents[1]
+    development_root = repository_root / "Development"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source-dir",
@@ -508,13 +509,13 @@ def main() -> int:
     parser.add_argument(
         "--swift-output",
         type=Path,
-        default=repository_root
+        default=development_root
         / "Sources/Robotics/UnitreeH1CollisionHulls.swift",
     )
     parser.add_argument(
         "--manifest-output",
         type=Path,
-        default=repository_root
+        default=development_root
         / "Sources/Robotics/Assets/unitree_h1/COLLISION_HULLS_PROVENANCE.json",
     )
     parser.add_argument(
@@ -569,8 +570,8 @@ def main() -> int:
     swift_data = swift_source(hulls)
     manifest_data = manifest(
         Path(__file__).resolve(),
-        repository_root / "Sources/Robotics/Assets/unitree_h1/LICENSE",
-        swift_path.relative_to(repository_root),
+        development_root / "Sources/Robotics/Assets/unitree_h1/LICENSE",
+        swift_path.relative_to(development_root),
         swift_data,
         records,
         mirror_error,

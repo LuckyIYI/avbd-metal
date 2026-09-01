@@ -4,6 +4,7 @@ refs/
 .xcbuild/
 .xcbuild-app/
 .xcbuild-ios/
+.xcbuild-gpusim-ios/
 .xcbuild-test/
 runs/
 .DS_Store

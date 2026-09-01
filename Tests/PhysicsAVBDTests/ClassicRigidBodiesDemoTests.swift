@@ -3,16 +3,17 @@ import SimCore
 import simd
 import XCTest
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class ClassicRigidBodiesDemoTests: XCTestCase {
     func testSceneUsesFourDetailedMeshesAndCookedCompoundsOnPrimitiveTable()
         throws
     {
         for spec in Demos.classicRigidBodySpecs {
-            XCTAssertNotNil(GPUSolver.physicsResourceBundle.url(
+            XCTAssertNotNil(Demos.resourceBundle.url(
                 forResource: spec.assetName, withExtension: "obj",
                 subdirectory: "Assets/classic"))
-            XCTAssertNotNil(GPUSolver.physicsResourceBundle.url(
+            XCTAssertNotNil(Demos.resourceBundle.url(
                 forResource: spec.assetName,
                 withExtension: "avbdconvex.json",
                 subdirectory: "Assets/convex/classic"))

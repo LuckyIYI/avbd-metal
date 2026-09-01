@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class GaudiFunicularTests: XCTestCase {
     private func authoredMass(_ body: SceneBody) -> Float {

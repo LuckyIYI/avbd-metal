@@ -1,4 +1,5 @@
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 import SimCore
 import Testing
 import simd
@@ -7,7 +8,7 @@ import simd
 struct ConvexDecompositionDemoTests {
     @Test("connected concavity is preserved by shared compound parts")
     func sharedCompoundPreservesCavity() throws {
-        #expect(GPUSolver.physicsResourceBundle.url(
+        #expect(Demos.resourceBundle.url(
             forResource: "concave-u", withExtension: "avbdconvex.json",
             subdirectory: "Assets/convex") != nil)
         let scene = Demos.convexDecomposition(scale: 2)

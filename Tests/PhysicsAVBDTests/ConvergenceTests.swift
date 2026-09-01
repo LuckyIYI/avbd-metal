@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 /// Tests targeting AVBD's headline claims from the paper:
 /// hard constraints under high mass ratio, stiffness ratios, friction,

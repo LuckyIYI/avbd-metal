@@ -8,6 +8,12 @@ struct RenderInstance {
     float4x4 model;     // column-major, includes size scaling
     float4 color;       // w = shape type (0 box, 1 sphere, 2 torus)
     float4 params;      // torus: x = major R, y = minor r
+    float4 material;    // rgb linear emission, w = opacity
+};
+
+struct RenderAppearance {
+    float4 albedo;      // rgb sRGB override, w = enabled
+    float4 emissive;    // rgb linear HDR radiance
 };
 
 inline float3x3 q_to_mat(float4 q) {
@@ -45,6 +51,8 @@ kernel void build_instances(
     device const float4* colliderLocalPosition [[buffer(10)]],
     device const float4* colliderLocalRotation [[buffer(11)]],
     device const float4* colliderRenderColor [[buffer(12)]],
+    device const RenderAppearance* appearanceOverrides [[buffer(13)]],
+    constant uint& hasAppearanceOverrides [[buffer(14)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= numInstances) return;
@@ -71,6 +79,7 @@ kernel void build_instances(
         out[gid].model = float4x4(0.0f);
         out[gid].color = float4(0);
         out[gid].params = float4(0);
+        out[gid].material = float4(0, 0, 0, 1);
         return;
     }
     float3 c = pl.w > 0.0f
@@ -79,12 +88,19 @@ kernel void build_instances(
     if (colliderRenderColor[collider].w > 0.0f) {
         c = colliderRenderColor[collider].xyz;
     }
+    float3 emissive = float3(0);
+    if (hasAppearanceOverrides != 0) {
+        RenderAppearance appearance = appearanceOverrides[body];
+        if (appearance.albedo.w > 0.0f) c = appearance.albedo.xyz;
+        emissive = appearance.emissive.xyz;
+    }
     out[gid].color = float4(c, float(st));
     // params.z = bounding radius (blob shadow size), w = shadow strength
     // (statics cast none — they're scenery)
     out[gid].params = float4(shape[collider].x, shape[collider].y,
                              shape[collider].w,
                              pl.w > 0.0f ? 1.0f : 0.0f);
+    out[gid].material = float4(emissive, 1.0f);
 }
 
 // Smooth vertex normals, two passes (after the reference cloth renderer):

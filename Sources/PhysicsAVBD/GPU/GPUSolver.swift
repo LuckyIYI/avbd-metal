@@ -206,6 +206,11 @@ public final class GPUSolver {
     var surfacedFlags, softNormalsBuf, faceNormalsBuf, renderTriBuf: MTLBuffer
     var renderBodyIdxBuf: MTLBuffer
     public private(set) var renderRigidBodyCount: Int = 0
+    /// (body, collider local offset, conservative half extent) for every
+    /// rendered collider that should shape the shadow volume - wide static
+    /// scenery excluded at init. Body positions are read live per
+    /// `renderedContentBounds` query.
+    private var renderBoundsColliders: [(body: Int, local: F3, half: Float)] = []
     var clothGroupBuf: MTLBuffer
     /// Authored Scene collision domain for each deformable-surface body.
     /// This is intentionally separate from clothGroupBuf, which identifies
@@ -1865,17 +1870,22 @@ public final class GPUSolver {
     /// distributable layouts before falling back to SwiftPM's build-time
     /// accessor, whose absolute development path is not portable.
     private static var packagedResourceBundle: Bundle? {
-        let name = "avbd-metal_PhysicsAVBD.bundle"
+        let names = [
+            "gpu-sim_PhysicsAVBD.bundle",
+            "avbd-metal_PhysicsAVBD.bundle",
+        ]
         let roots = [Bundle.main.resourceURL, Bundle.main.bundleURL]
         for root in roots.compactMap({ $0 }) {
-            if let bundle = Bundle(url: root.appendingPathComponent(name)) {
-                return bundle
+            for name in names {
+                if let bundle = Bundle(url: root.appendingPathComponent(name)) {
+                    return bundle
+                }
             }
         }
         return nil
     }
 
-    /// Resource lookup shared by shaders and demos. The packaged bundle check
+    /// Resource lookup for solver shaders. The packaged bundle check
     /// must precede SwiftPM's generated accessor because that accessor embeds
     /// an absolute development-build fallback that is invalid after an app is
     /// relocated.
@@ -3174,6 +3184,27 @@ public final class GPUSolver {
             renderColliderIDs.append(UInt32(i))
         }
         renderRigidBodyCount = renderColliderIDs.count
+        renderBoundsColliders.removeAll()
+        for collider in scene.colliders where collider.isRendered {
+            let size = collider.size
+            let body = scene.bodies[collider.body]
+            // Scenery must not inflate the light volume: a 3 m tabletop
+            // slab would triple the shadow extent (and its texel size) for
+            // content that lives in half a metre. Static colliders wider
+            // than 2 m are floors/walls; the interesting shadows come from
+            // everything else.
+            if !body.isDynamic && max(size.x, size.y) > 2.0 { continue }
+            let half: Float
+            switch collider.shape {
+            case .capsule: half = size.x * 0.5 + size.y
+            case .sphere: half = size.x * 0.5
+            default: half = 0.5 * max(size.x, max(size.y, size.z))
+            }
+            // conservative: the local offset's length joins the half extent
+            // so body rotation can never carry the collider outside
+            renderBoundsColliders.append(
+                (collider.body, collider.localPosition, half))
+        }
         renderBodyIdxBuf.contents().bindMemory(to: UInt32.self,
                                                capacity: max(1, renderColliderIDs.count))
             .update(from: renderColliderIDs.isEmpty ? [0] : renderColliderIDs,
@@ -3927,13 +3958,81 @@ public final class GPUSolver {
         return Array(all.sorted { $0.2 > $1.2 }.prefix(n))
     }
 
-    /// Debug: count of broken (fractured) joints.
-    public func debugBrokenJoints() -> Int {
+    /// Indices of authored breakable joints that are currently fractured.
+    /// Disabled interaction slots and other non-breakable constraints are
+    /// intentionally excluded even though they share the same internal
+    /// disabled-state bit.
+    public func brokenJointIndices() -> [Int] {
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
-        var n = 0
-        for i in 0..<numJoints where jp[i].header.z != 0 { n += 1 }
-        return n
+        return (0..<numJoints).filter {
+            jp[$0].header.z != 0 && (jp[$0].header.w & 4) != 0
+        }
+    }
+
+    /// Re-arm fractured joints and clear their temporal solver state.
+    ///
+    /// Passing `nil` repairs every fractured breakable joint. Explicit
+    /// indices are range-checked before any mutation; non-breakable or
+    /// already-live constraints are harmless no-ops. Reposition bodies
+    /// before repairing when resetting a scene, otherwise a repaired joint
+    /// will immediately constrain the bodies at their current separation.
+    public func repairJoints(_ jointIndices: [Int]? = nil) {
+        let indices: [Int]
+        if let jointIndices {
+            for index in jointIndices {
+                precondition(index >= 0 && index < numJoints,
+                             "joint index out of range")
+            }
+            indices = Array(Set(jointIndices)).sorted()
+        } else {
+            indices = Array(0..<numJoints)
+        }
+        guard numJoints > 0 else { return }
+        sync()
+
+        let jp = joints.contents().bindMemory(
+            to: JointGPU.self, capacity: numJoints)
+        for index in indices
+            where jp[index].header.z != 0 && (jp[index].header.w & 4) != 0 {
+            jp[index].header.z = 0
+            jp[index].lambdaLin = .zero
+            jp[index].lambdaAng = .zero
+            jp[index].motor.z = 0
+            jp[index].dynamics.y = 0
+            jp[index].dynamics.z = 0
+            jp[index].penaltyLin = initialJointPenaltyLin[index]
+            jp[index].penaltyAng = initialJointPenaltyAng[index]
+        }
+    }
+
+    /// Live bounds of the rendered content: current body positions plus
+    /// each collider's local offset and conservative half extent. The
+    /// renderer fits its directional-shadow volume to this every frame, so
+    /// dynamics keep their shadows wherever they travel.
+    public var renderedContentBounds: (center: F3, radius: Float)? {
+        guard !renderBoundsColliders.isEmpty else { return nil }
+        let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self,
+                                              capacity: numBodies)
+        var lo = F3(repeating: .greatestFiniteMagnitude)
+        var hi = F3(repeating: -.greatestFiniteMagnitude)
+        for entry in renderBoundsColliders {
+            let p4 = pl[entry.body]
+            let reach = entry.half + length(entry.local)
+            let p = F3(p4.x, p4.y, p4.z)
+            lo = min(lo, p - F3(repeating: reach))
+            hi = max(hi, p + F3(repeating: reach))
+        }
+        // quantized so the fitted extent breathes in steps the texel
+        // snapping can absorb instead of shimmering every frame
+        let radius = max(length(hi - lo) * 0.5 * 1.1, 0.5)
+        let quantized = (radius / 0.25).rounded(.up) * 0.25
+        return ((lo + hi) * 0.5, quantized)
+    }
+
+    /// Debug compatibility count for fractured authored joints.
+    public func debugBrokenJoints() -> Int {
+        brokenJointIndices().count
     }
 
     /// Debug: max joint lambda magnitudes (lin, ang) across live joints.
@@ -4243,7 +4342,7 @@ public final class GPUSolver {
     /// identity, and incremental coloring. It deliberately excludes authored
     /// scene data and soft-body state; callers must use it only with the same
     /// solver instance and a rigid scene.
-    package struct RigidSpeculationSnapshot {
+    public struct RigidSpeculationSnapshot: Sendable {
         fileprivate var posLin: Data
         fileprivate var posAng: Data
         fileprivate var initLin: Data
@@ -4278,7 +4377,7 @@ public final class GPUSolver {
         fileprivate var lastMaxColorUsed: Int
     }
 
-    package func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
+    public func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
         precondition(numTris == 0 && numTets == 0,
             "rigid speculation snapshots do not include soft-body state")
         sync()
@@ -4317,7 +4416,7 @@ public final class GPUSolver {
             lastMaxColorUsed: statistics.7)
     }
 
-    package func restoreRigidSpeculationSnapshot(
+    public func restoreRigidSpeculationSnapshot(
         _ snapshot: RigidSpeculationSnapshot
     ) {
         precondition(numTris == 0 && numTets == 0,
@@ -6197,10 +6296,12 @@ public final class GPUSolver {
 
     /// Encode instance-transform building into a render command buffer.
     public func encodeBuildInstances(_ cmd: MTLCommandBuffer, instances: MTLBuffer,
-                                     colorMode: UInt32 = 0) {
+                                     colorMode: UInt32 = 0,
+                                     appearanceOverrides: MTLBuffer? = nil) {
         do {
             try encodeBuildInstancesChecked(
-                cmd, instances: instances, colorMode: colorMode)
+                cmd, instances: instances, colorMode: colorMode,
+                appearanceOverrides: appearanceOverrides)
         } catch {
             fatalError("Render-instance encoding failed: \(error.localizedDescription)")
         }
@@ -6211,7 +6312,8 @@ public final class GPUSolver {
     /// solver because the caller owns this separate render command buffer.
     public func encodeBuildInstancesChecked(
         _ cmd: MTLCommandBuffer, instances: MTLBuffer,
-        colorMode: UInt32 = 0
+        colorMode: UInt32 = 0,
+        appearanceOverrides: MTLBuffer? = nil
     ) throws {
         // The caller may own a different Metal queue. Retire all preceding
         // physics before that queue reads solver buffers; the caller must in
@@ -6226,6 +6328,7 @@ public final class GPUSolver {
         }
         enc.label = "build-instances"
         var cm = colorMode
+        var hasAppearanceOverrides: UInt32 = appearanceOverrides == nil ? 0 : 1
         if renderRigidBodyCount > 0 {
             var nb = UInt32(renderRigidBodyCount)
             let p = ps("build_instances")
@@ -6243,6 +6346,13 @@ public final class GPUSolver {
             enc.setBuffer(colliderLocalPosition, offset: 0, index: 10)
             enc.setBuffer(colliderLocalRotation, offset: 0, index: 11)
             enc.setBuffer(colliderRenderColor, offset: 0, index: 12)
+            // Metal validates every reflected buffer binding even when the
+            // runtime flag prevents a read. Reuse a guaranteed live buffer
+            // as the disabled placeholder instead of binding nil.
+            enc.setBuffer(
+                appearanceOverrides ?? colliderRenderColor,
+                offset: 0, index: 13)
+            enc.setBytes(&hasAppearanceOverrides, length: 4, index: 14)
             enc.dispatchThreadgroups(MTLSize(width: (renderRigidBodyCount + 255) / 256,
                                              height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256,

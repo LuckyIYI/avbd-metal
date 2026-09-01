@@ -93,7 +93,7 @@ therefore act as a robustness projection, not merely recover hidden actions.
 Exact reproduction command (replace the seed):
 
 ```sh
-.build/debug/avbd experiment-pusht-flow \
+Development/.build/debug/avbd experiment-pusht-flow \
   --envs 256 --iterations 18 --horizon 64 --seed 202 \
   --algorithm endpoint-contact-full-cem \
   --task-option simulationBatchSize=32 \
@@ -368,7 +368,7 @@ Its output is also intentionally written under `runs/`.
 Reproduction with that archived run tree:
 
 ```sh
-.build/release/avbd distill-h1-box-flow \
+Development/.build/release/avbd distill-h1-box-flow \
   --checkpoint runs/humanoid-box-carry-v0/carry-mlx-v147-placement-curriculum/checkpoints/update-000150 \
   --run runs/physical-flow/humanoid-box-flow/dynamic-leg-blend-carry35cm-discovery128x8-smoke.json \
   --output runs/humanoid-box-carry-v0/carry-flow-distill-v7-dagger-robust \

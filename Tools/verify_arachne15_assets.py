@@ -17,7 +17,9 @@ from typing import Mapping
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-ASSET_RELATIVE_DIRECTORY = Path("Sources/Robotics/Assets/arachne15")
+ASSET_RELATIVE_DIRECTORY = Path(
+    "Development/Sources/Robotics/Assets/arachne15"
+)
 EXPECTED_FILE_SHA256: dict[str, str] = {
     "README.md":
         "7bc9552ab39cfd29e5ce926f43ecf75016455667fd7cc6f35a5dc56f470cdf63",

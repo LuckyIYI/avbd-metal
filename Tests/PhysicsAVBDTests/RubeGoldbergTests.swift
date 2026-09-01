@@ -2,6 +2,7 @@ import XCTest
 import simd
 @testable import SimCore
 @testable import PhysicsAVBD
+@testable import GPUSimDemos
 
 final class RubeGoldbergTests: XCTestCase {
     /// The whole cascade must fire: marble -> rail -> dominoes -> ball off
