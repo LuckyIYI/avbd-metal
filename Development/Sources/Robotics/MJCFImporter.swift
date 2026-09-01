@@ -524,7 +524,8 @@ public struct MJCFAsset {
                     // proxies stay inspectable in assets without being drawn
                     // through the detailed surface.
                     isRendered: !options.includeVisuals
-                        || link.visualGeometries.isEmpty)
+                        || link.visualGeometries.isEmpty,
+                    renderColor: geom.renderColor)
             }
             for visual in options.includeVisuals
                 ? link.visualGeometries : [] {
@@ -729,6 +730,9 @@ private struct CollisionGeometry {
     var friction: Float
     var boundingRadius: Float
     var collisionEnabled: Bool
+    /// Authored `rgba` or named material, when the geom has one. Nil keeps
+    /// the renderer's per-body fallback for uncolored contact geometry.
+    var renderColor: F3?
 }
 
 private enum VisualGeometryKind {
@@ -870,7 +874,8 @@ private func parseBody(
         }
         if isVisualOnly {
             let primitive = try parseCollisionGeometry(
-                attrs, bodyName: name, warnings: &warnings)
+                attrs, bodyName: name, materials: visualMaterials,
+                warnings: &warnings)
             visualGeometries.append(try parseVisualGeometry(
                 attrs, kind: .primitive(primitive.shape, primitive.size),
                 materials: visualMaterials,
@@ -878,7 +883,8 @@ private func parseBody(
             continue
         }
         geometries.append(try parseCollisionGeometry(
-            attrs, bodyName: name, warnings: &warnings))
+            attrs, bodyName: name, materials: visualMaterials,
+            warnings: &warnings))
     }
 
     let index = links.count
@@ -898,9 +904,11 @@ private func parseBody(
 }
 
 private func parseCollisionGeometry(
-    _ attrs: [String: String], bodyName: String, warnings: inout [String]
+    _ attrs: [String: String], bodyName: String, materials: [String: F3],
+    warnings: inout [String]
 ) throws -> CollisionGeometry {
     let type = attrs["type"] ?? "sphere"
+    let renderColor = try authoredColor(attrs, materials: materials)
     let friction = try floatList(attrs["friction"] ?? "1 0.005 0.0001",
                                  minimumCount: 1, element: "geom",
                                  attribute: "friction")[0]
@@ -968,7 +976,8 @@ private func parseCollisionGeometry(
     return CollisionGeometry(shape: shape, size: size, position: position,
                              rotation: rotation, friction: friction,
                              boundingRadius: radius,
-                             collisionEnabled: collisionEnabled)
+                             collisionEnabled: collisionEnabled,
+                             renderColor: renderColor)
 }
 
 private func parseVisualGeometry(
@@ -976,23 +985,9 @@ private func parseVisualGeometry(
     materials: [String: F3],
     position: F3? = nil, rotation: Quat? = nil
 ) throws -> VisualGeometry {
-    let color: F3
-    if let rawRGBA = attrs["rgba"] {
-        // MuJoCo gives a local/default-class rgba precedence over a referenced
-        // material. Preserve that rule instead of blindly applying the asset.
-        let rgba = try colorComponents(
-            rawRGBA, element: "geom", attribute: "rgba")
-        color = F3(rgba[0], rgba[1], rgba[2])
-    } else if let name = attrs["material"] {
-        guard let material = materials[name] else {
-            throw MJCFImportError.missing(
-                "visual geom references material \(name)")
-        }
-        color = material
-    } else {
-        // Retain AVBD's established unmaterialed-CAD fallback.
-        color = F3(0.24, 0.28, 0.34)
-    }
+    // Retain AVBD's established unmaterialed-CAD fallback.
+    let color = try authoredColor(attrs, materials: materials)
+        ?? F3(0.24, 0.28, 0.34)
     return VisualGeometry(
         kind: kind,
         position: try position ?? vector3(
@@ -1000,6 +995,30 @@ private func parseVisualGeometry(
         rotation: try rotation ?? quaternion(
             attrs["quat"] ?? "1 0 0 0", element: "geom", attribute: "quat"),
         color: color)
+}
+
+/// The color a geom authors, or nil when it has neither `rgba` nor a
+/// `material`. Shared by rendered collision primitives and visual-only geoms
+/// so a named material colors an ordinary MJCF geom that both collides and
+/// renders, not only one with zeroed contact masks.
+private func authoredColor(
+    _ attrs: [String: String], materials: [String: F3]
+) throws -> F3? {
+    if let rawRGBA = attrs["rgba"] {
+        // MuJoCo gives a local/default-class rgba precedence over a referenced
+        // material. Preserve that rule instead of blindly applying the asset.
+        let rgba = try colorComponents(
+            rawRGBA, element: "geom", attribute: "rgba")
+        return F3(rgba[0], rgba[1], rgba[2])
+    }
+    if let name = attrs["material"] {
+        guard let material = materials[name] else {
+            throw MJCFImportError.missing(
+                "geom references material \(name)")
+        }
+        return material
+    }
+    return nil
 }
 
 /// Resolve named MJCF materials once at the asset boundary. SurfaceMesh is a

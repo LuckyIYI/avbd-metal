@@ -71,6 +71,47 @@ final class MJCFImporterTests: XCTestCase {
         }
     }
 
+    func testNamedMaterialColorsRenderedCollisionPrimitives() throws {
+        let xml = """
+        <mujoco model="collision-material-fixture">
+          <asset>
+            <material name="shell" rgba="0.9 0.2 0.1 1"/>
+          </asset>
+          <default>
+            <default class="shell-part">
+              <geom material="shell"/>
+            </default>
+          </default>
+          <worldbody>
+            <body name="root">
+              <inertial mass="1" diaginertia="1 1 1"/>
+              <geom type="sphere" size="0.1" material="shell"/>
+              <geom class="shell-part" type="sphere" size="0.1"
+                    pos="1 0 0"/>
+              <geom type="box" size="0.1 0.1 0.1" pos="2 0 0"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        let asset = try MJCFAsset.parse(data: Data(xml.utf8))
+        var scene = PhysicsScene(name: "collision-material-fixture")
+        _ = try asset.instantiate(
+            in: &scene, options: MJCFInstantiationOptions())
+
+        XCTAssertEqual(scene.colliders.count, 3)
+        // Ordinary geoms collide and render; a material must reach them the
+        // same way it reaches visual-only primitives.
+        for index in 0..<2 {
+            XCTAssertTrue(scene.colliders[index].collisionEnabled)
+            XCTAssertTrue(scene.colliders[index].isRendered)
+            XCTAssertLessThan(simd_length(
+                try XCTUnwrap(scene.colliders[index].renderColor)
+                    - F3(0.9, 0.2, 0.1)), 1e-6)
+        }
+        // Uncolored contact geometry keeps the renderer's per-body fallback.
+        XCTAssertNil(scene.colliders[2].renderColor)
+    }
+
     func testInstantiationOptionsApplyCombinedConfiguration() throws {
         let xml = """
         <mujoco model="options-fixture">
