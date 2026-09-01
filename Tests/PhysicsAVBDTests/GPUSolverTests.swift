@@ -344,6 +344,19 @@ final class GPUSolverTests: XCTestCase {
             "a settled dense stack must not run the serial coloring fallback")
     }
 
+    func testLargeBoxOfBoxesRunsCompactRigidSolve() throws {
+        var scene = Demos.boxOfBoxes(scale: 4)
+        scene.settings.iterations = 2
+        let solver = try makeGPU(scene)
+
+        XCTAssertGreaterThan(solver.bodyCount, 1_024)
+        try solver.submitStep()
+        try solver.synchronize()
+
+        XCTAssertNil(solver.runtimeFailure)
+        XCTAssertGreaterThan(solver.lastNumPairs, 0)
+    }
+
     func testStaticColorPaletteExhaustionFailsDuringInitialization() throws {
         var scene = PhysicsScene(name: "static-color-capacity")
         scene.settings.gravity = 0

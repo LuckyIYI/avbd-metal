@@ -18,8 +18,8 @@ public struct DemoParam: Identifiable {
 
 public enum Demos {
     public static var all: [String] {
-        ["gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall",
-         "pyramid", "pendulum", "boxpile", "convexdecomp", "classicrigids",
+        ["gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+         "convexdecomp", "classicrigids",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
          "wreckingball", "trebuchet", "rubegoldberg",

@@ -389,6 +389,7 @@ extension CPUManifold {
             index: owner.index, size: collider.size,
             density: 0, friction: collider.friction,
             dynamicFriction: collider.dynamicFriction,
+            torsionalFriction: collider.torsionalFriction,
             position: pose.position, rotation: pose.orientation,
             shape: collider.shape)
     }
@@ -892,7 +893,10 @@ extension CPUManifold {
                 if dist - rc > margin { continue }
                 n = d / dist
             }
-            if found.contains(where: { length($0.q - q) < 0.3 * rc + 0.05 }) { continue }
+            // Scale-aware dedup: a flat 5 cm radius is longer than a
+            // short capsule, collapsing every seed onto one contact point.
+            let dedupR = 0.3 * rc + min(0.05, 0.25 * length(p1 - p0) / 2)
+            if found.contains(where: { length($0.q - q) < dedupR }) { continue }
             found.append((q, bw, n))
         }
         if found.isEmpty { return 0 }
