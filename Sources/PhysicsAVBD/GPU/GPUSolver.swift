@@ -2896,6 +2896,8 @@ public final class GPUSolver {
         // The default heuristic often lands below the rigid margin as well,
         // so gating on the two values alone would widen the retry for
         // ordinary cloth and Planar-DAT scenes.
+        params.tetCompactionOnset = max(0, min(1, settings.tetCompactionOnset))
+        params.tetCompactionGain = max(0, settings.tetCompactionGain)
         params.deformablePortalRetryCap =
             settings.deformableCollisionMargin.map {
                 $0 < settings.collisionMargin

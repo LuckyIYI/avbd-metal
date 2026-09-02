@@ -1095,7 +1095,8 @@ inline void stampSpring(device const SpringGPU& sp, uint self,
 // dropping the indefinite second derivative of J.
 inline void stampTet(device const TetGPU& t, uint self,
                      device const float4* posLin,
-                     thread PrimalAccum& acc)
+                     thread PrimalAccum& acc,
+                     float compactionOnset, float compactionGain)
 {
     float3 x0 = posLin[t.ids.x].xyz;
     float3 x1 = posLin[t.ids.y].xyz;
@@ -1119,6 +1120,15 @@ inline void stampTet(device const TetGPU& t, uint self,
     float3 j2 = cross(f0, f1);
 
     float s2 = lamV * (J - alphaT);
+    // Compaction barrier: the stable Neo-Hookean volume term saturates as
+    // J -> 0, so a crushed tet offers no increasing resistance. Below the
+    // onset ratio add a quadratic bulk penalty of `gain * lambda`, the way
+    // stuffing compacts freely and then stiffens.
+    float compactionK = 0.0f;
+    if (compactionGain > 0.0f && J < compactionOnset) {
+        compactionK = compactionGain * lamV;
+        s2 += compactionK * (J - compactionOnset);
+    }
     // PK1 columns (scaled by volume via muV/lamV which premultiply vol)
     float3 p0 = muV * f0 + s2 * j0;
     float3 p1 = muV * f1 + s2 * j1;
@@ -1140,7 +1150,8 @@ inline void stampTet(device const TetGPU& t, uint self,
 
     acc.rhsLin += grad;
     acc.lhsLin = m3_add(acc.lhsLin, m3_diag(float3(muV * dot(w, w))));
-    acc.lhsLin = m3_add(acc.lhsLin, m3_scale(m3_outer(g, g), lamV));
+    acc.lhsLin = m3_add(acc.lhsLin,
+                        m3_scale(m3_outer(g, g), lamV + compactionK));
 }
 
 // Exact signed-J line limit for a colored tet update. Graph coloring gives
@@ -1803,7 +1814,8 @@ static inline void primal_one(
         } else if (kind == FK_SPRING) {
             stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
         } else if (kind == FK_TET) {
-            stampTet(tets[idx], body, posLin, acc);
+            stampTet(tets[idx], body, posLin, acc,
+                     P.tetCompactionOnset, P.tetCompactionGain);
         } else if (kind == FK_SOFT) {
             stampSoft(soft[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
         } else if (kind == FK_MEMBRANE) {
@@ -1920,7 +1932,8 @@ static inline void primal_one_torsion(
         } else if (kind == FK_SPRING) {
             stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
         } else if (kind == FK_TET) {
-            stampTet(tets[idx], body, posLin, acc);
+            stampTet(tets[idx], body, posLin, acc,
+                     P.tetCompactionOnset, P.tetCompactionGain);
         } else if (kind == FK_SOFT) {
             stampSoft(soft[idx], body, posLin, posAng, initLin, initAng,
                       P.alpha, acc);
@@ -2121,7 +2134,8 @@ static inline void primal_split_impl(
         } else if (kind == FK_SPRING) {
             stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
         } else if (kind == FK_TET) {
-            stampTet(tets[idx], body, posLin, acc);
+            stampTet(tets[idx], body, posLin, acc,
+                     P.tetCompactionOnset, P.tetCompactionGain);
         } else if (kind == FK_SOFT) {
             stampSoft(soft[idx], body, posLin, posAng, initLin, initAng, P.alpha, acc);
         } else if (kind == FK_MEMBRANE) {
@@ -2268,7 +2282,8 @@ kernel void primal_particles_split_torsion(
         } else if (kind == FK_SPRING) {
             stampSpring(springs[idx], body, posLin, posAng, acc, P.alpha);
         } else if (kind == FK_TET) {
-            stampTet(tets[idx], body, posLin, acc);
+            stampTet(tets[idx], body, posLin, acc,
+                     P.tetCompactionOnset, P.tetCompactionGain);
         } else if (kind == FK_SOFT) {
             stampSoft(soft[idx], body, posLin, posAng, initLin, initAng,
                       P.alpha, acc);

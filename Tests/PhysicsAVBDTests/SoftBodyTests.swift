@@ -184,6 +184,42 @@ final class SoftBodyTests: XCTestCase {
                              "heavy rigid ball must rest ON the soft block (two-way coupling)")
     }
 
+    /// A plush-stiffness block (E ~ 1.5 kPa) under a heavy plate flattens to
+    /// a sheet with the bare stable Neo-Hookean model; compaction stiffening
+    /// must let it keep a meaningful thickness while leaving the unloaded
+    /// block's rest height unchanged.
+    func testTetCompactionStiffeningKeepsCrushedPlushThick() throws {
+        func crushedThickness(onset: Float, gain: Float) throws -> Float {
+            var scene = PhysicsScene(name: "plush-compaction")
+            scene.settings.iterations = 20
+            scene.settings.betaLin = 20000
+            scene.settings.lambdaMax = 800
+            scene.settings.tetCompactionOnset = onset
+            scene.settings.tetCompactionGain = gain
+            Demos.addGround(&scene)
+            let ids = Demos.addSoftBlock(&scene, center: F3(0, 0, 0.6), nx: 5, ny: 5, nz: 4,
+                                         spacing: 0.3, mu: 600, lambda: 600,
+                                         massPerNode: 0.02)
+            _ = scene.addBody(size: F3(2.0, 2.0, 0.2), density: 400,
+                              friction: 0.6, position: F3(0, 0, 1.8))
+            let gpu = try GPUSolver(scene: scene)
+            for _ in 0..<400 { gpu.step() }
+            gpu.sync()
+            let states = gpu.bodyStates(ids)
+            XCTAssertNil(gpu.runtimeFailure)
+            let zs = states.map(\.position.z)
+            return zs.max()! - zs.min()!
+        }
+        let bare = try crushedThickness(onset: 0, gain: 0)
+        let stiffened = try crushedThickness(onset: 0.6, gain: 30)
+        print("compaction test: bare \(bare) stiffened \(stiffened) (rest 0.9)")
+        XCTAssertLessThan(bare, 0.35, "the bare model must flatten under this plate")
+        XCTAssertGreaterThan(stiffened, bare * 1.6,
+            "compaction stiffening must resist the crush well beyond the bare model")
+        XCTAssertLessThan(stiffened, 0.9,
+            "stiffening below the onset must not prevent ordinary compression")
+    }
+
     func testBallRestsOnSoftBunny() throws {
         let scene = Demos.softbody(res: 10)
         var ball = -1
