@@ -147,6 +147,37 @@ final class ConvexDeformableCollisionTests: XCTestCase {
             digest: digest, stableID: "hull-" + digest.prefix(16))
     }
 
+    func testUnifiedRigidDeformableDiagnosticIncludesParticleManifold()
+        throws
+    {
+        try requireMetal()
+        var scene = PhysicsScene(name: "rigid-deformable-contact-diagnostic")
+        configure(&scene)
+        let owner = scene.addBody(
+            size: F3(repeating: 1), density: 0, friction: 1,
+            position: .zero, collisionEnabled: false)
+        let collider = scene.addConvexCollider(
+            body: owner,
+            asset: try boxAsset(center: .zero, size: F3(repeating: 1)))
+        let particle = scene.addParticle(
+            radius: 0.1, mass: 0.1, friction: 1,
+            position: F3(0, 0, 0.55))
+
+        let solver = try GPUSolver(scene: scene)
+        try step(solver)
+        XCTAssertEqual(
+            solver.debugRigidTriangleContactCount(
+                colliderIDs: [collider], surfaceBodies: [particle]),
+            0,
+            "a particle-only fixture deliberately has no surface triangle")
+        XCTAssertGreaterThan(
+            solver.debugRigidDeformableContactCount(
+                colliderIDs: [collider], surfaceBodies: [particle]),
+            0,
+            "the physical particle manifold must not disappear from grasp "
+                + "qualification merely because no RT stencil was emitted")
+    }
+
     func testOffsetAnalyticColliderUsesColliderPoseAndBodyOwner() throws {
         try requireMetal()
         var scene = PhysicsScene(name: "rt-offset-collider")

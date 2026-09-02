@@ -6,6 +6,23 @@ public enum MeshUpAxis {
     case x, y, z
 }
 
+/// Controls how visual normals are handled at the mesh-import boundary.
+///
+/// Formats such as OBJ can author independent smooth or hard vertex normals,
+/// so their data is preserved by default. STL stores only one normal per
+/// facet; its duplicated corners need a topology-aware rebuild to avoid
+/// exposing tessellation on curved CAD surfaces.
+public enum SurfaceNormalPolicy: Sendable, Equatable {
+    /// Preserve authored normals, except for STL facet normals which are
+    /// rebuilt with the default crease angle.
+    case automatic
+    /// Preserve authored normals exactly, filling only missing/invalid values.
+    case preserveImported
+    /// Rebuild crease-aware normals, smoothing edges whose dihedral angle does
+    /// not exceed `maxSmoothAngleRadians`.
+    case creaseAware(maxSmoothAngleRadians: Float)
+}
+
 public enum SurfaceMeshError: Error, CustomStringConvertible {
     case emptyAsset(String)
     case missingPositions(String)
@@ -32,7 +49,11 @@ public struct SurfaceMesh {
         self.triangles = triangles
     }
 
-    public static func load(path: String, upAxis: MeshUpAxis = .y) throws -> SurfaceMesh {
+    public static func load(
+        path: String,
+        upAxis: MeshUpAxis = .y,
+        normalPolicy: SurfaceNormalPolicy = .automatic
+    ) throws -> SurfaceMesh {
         let url = URL(fileURLWithPath: path)
         let asset = MDLAsset(url: url)
         var vertices: [F3] = []
@@ -124,7 +145,18 @@ public struct SurfaceMesh {
             throw SurfaceMeshError.emptyAsset(path)
         }
         let mesh = SurfaceMesh(vertices: vertices, normals: normals, triangles: triangles)
-        return mesh.withConsistentNormals()
+            .withConsistentNormals()
+        switch normalPolicy {
+        case .automatic:
+            return url.pathExtension.lowercased() == "stl"
+                ? mesh.withCreaseNormals(maxSmoothAngleRadians: .pi / 5)
+                : mesh
+        case .preserveImported:
+            return mesh
+        case .creaseAware(let maxSmoothAngleRadians):
+            return mesh.withCreaseNormals(
+                maxSmoothAngleRadians: maxSmoothAngleRadians)
+        }
     }
 
     public func simplified(maxVertices: Int) -> SurfaceMesh {

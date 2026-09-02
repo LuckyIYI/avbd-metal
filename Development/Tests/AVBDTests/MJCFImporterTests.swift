@@ -7,6 +7,78 @@ import XCTest
 @testable import RL
 
 final class MJCFImporterTests: XCTestCase {
+    func testMJCFPreservesLegacySTLNormalsUnlessCallerOptsIntoSmoothing()
+        throws
+    {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cosine30 = sqrt(Float(3)) * 0.5
+        let sine30: Float = 0.5
+        let stl = """
+        solid hinge
+          facet normal 0 0 1
+            outer loop
+              vertex 0 0 0
+              vertex 1 0 0
+              vertex 0 1 0
+            endloop
+          endfacet
+          facet normal 0 \(-sine30) \(cosine30)
+            outer loop
+              vertex 1 0 0
+              vertex 0 0 0
+              vertex 0 \(-cosine30) \(-sine30)
+            endloop
+          endfacet
+        endsolid hinge
+        """
+        try stl.write(
+            to: root.appendingPathComponent("hinge.stl"),
+            atomically: true, encoding: .utf8)
+        let xml = """
+        <mujoco model="normal-policy">
+          <compiler meshdir="."/>
+          <asset><mesh name="hinge" file="hinge.stl"/></asset>
+          <worldbody>
+            <body name="root">
+              <inertial mass="1" diaginertia="1 1 1"/>
+              <geom type="mesh" mesh="hinge" contype="0" conaffinity="0"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        let url = root.appendingPathComponent("model.xml")
+        try xml.write(to: url, atomically: true, encoding: .utf8)
+
+        func normals(_ policy: SurfaceNormalPolicy?) throws -> [F3] {
+            let asset = try policy.map {
+                try MJCFAsset.parse(url: url, visualNormalPolicy: $0)
+            } ?? MJCFAsset.parse(url: url)
+            var scene = PhysicsScene(name: "normal-policy")
+            _ = try asset.instantiate(
+                in: &scene, options: .init(includeVisuals: true))
+            let mesh = try XCTUnwrap(scene.rigidMeshes.first)
+            return zip(mesh.vertices, mesh.normals).compactMap {
+                length_squared($0.0) < 1e-12 ? $0.1 : nil
+            }
+        }
+
+        let preserved = try normals(nil)
+        XCTAssertEqual(preserved.count, 2)
+        XCTAssertLessThan(dot(preserved[0], preserved[1]), 0.9,
+            "generic MJCF import must not silently restyle Arachne STL assets")
+
+        let smoothed = try normals(.automatic)
+        let expected = normalize(F3(0, -sine30, 1 + cosine30))
+        XCTAssertEqual(smoothed.count, 2)
+        XCTAssertTrue(smoothed.allSatisfy { dot($0, expected) > 0.9999 },
+            "robots such as MicroDuck can explicitly opt into CAD smoothing")
+    }
+
     func testInstantiationOptionsDefaults() {
         let options = MJCFInstantiationOptions()
         XCTAssertEqual(options.worldOffset, .zero)

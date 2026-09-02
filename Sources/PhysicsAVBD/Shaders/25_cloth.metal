@@ -1254,8 +1254,22 @@ kernel void rt_emit(
                                 }                                              \
                             }                                                  \
                             if (!recovered_) {                                 \
+                                float retryCap_ =                              \
+                                    2.0f * detect_ + 1.0e-4f;                  \
+                                /* Legacy cap unless the scene opted into */   \
+                                /* scale-aware recovery by asking for a */     \
+                                /* deformable margin tighter than its rigid */ \
+                                /* margin. The accepted witness is still */    \
+                                /* corrected to the undilated surfaces and */  \
+                                /* residual-certified. */                      \
+                                if (P.deformablePortalRetryCap > 0.0f) {       \
+                                    retryCap_ = max(                           \
+                                        retryCap_,                            \
+                                        min(P.deformablePortalRetryCap,       \
+                                            2.0f * rT + 1.0e-4f));            \
+                                }                                              \
                                 float adaptiveEnlarge_ = min(                  \
-                                    2.0f * detect_ + 1.0e-4f,                  \
+                                    retryCap_,                                 \
                                     max(1.0e-3f,                               \
                                         2.0f * failedUpper_ + 1.0e-4f));       \
                                 if (finite_bits(failedUpper_)                  \

@@ -2863,6 +2863,14 @@ public final class GPUSolver {
         let meanEdge = topoEdgeKeys.isEmpty ? 0.2 : edgeLenSum / Float(topoEdgeKeys.count)
         params.elemMargin = settings.deformableCollisionMargin
             ?? min(0.01, max(0.002, 0.5 * maxPartR))
+        // Scale-aware rigid/triangle portal recovery is an explicit opt-in.
+        // The default heuristic often lands below the rigid margin as well,
+        // so gating on the two values alone would widen the retry for
+        // ordinary cloth and Planar-DAT scenes.
+        params.deformablePortalRetryCap =
+            settings.deformableCollisionMargin.map {
+                $0 < settings.collisionMargin
+            } == true ? 0.02 : 0
         // Planar-DAT queries a wider safety neighborhood than the active
         // OGC force band. Anything beyond this radius is protected by the
         // unconditional 0.5*gamma*rq accumulated-displacement cap.
@@ -3654,6 +3662,20 @@ public final class GPUSolver {
         }
     }
 
+    /// Explicit velocity impulse used by disturbance tests and speculative
+    /// control. `deltaVelocity` is applied without clearing contact or joint
+    /// warm starts, unlike a pose reset. For a body of mass `m`, this is the
+    /// state change produced by a physical impulse `m * deltaVelocity`.
+    public struct BodyLinearVelocityImpulse {
+        public var body: Int
+        public var deltaVelocity: F3
+
+        public init(body: Int, deltaVelocity: F3) {
+            self.body = body
+            self.deltaVelocity = deltaVelocity
+        }
+    }
+
     public struct JointAnchorUpdate {
         public var joint: Int
         public var point: F3
@@ -3781,6 +3803,28 @@ public final class GPUSolver {
                         repeating: .zero, count: AVBD_MAX_CONTACTS)
                 }
             }
+        }
+    }
+
+    /// Apply a batch of external linear impulses at one synchronized control
+    /// boundary while preserving the checkpointed contact lineage.
+    public func applyLinearVelocityImpulses(
+        _ impulses: [BodyLinearVelocityImpulse]
+    ) {
+        guard !impulses.isEmpty else { return }
+        sync()
+        let velocities = velLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        for impulse in impulses {
+            precondition(impulse.body >= 0 && impulse.body < numBodies,
+                "body index out of range")
+            precondition(impulse.deltaVelocity.x.isFinite
+                && impulse.deltaVelocity.y.isFinite
+                && impulse.deltaVelocity.z.isFinite,
+                "velocity impulse must be finite")
+            velocities[impulse.body].x += impulse.deltaVelocity.x
+            velocities[impulse.body].y += impulse.deltaVelocity.y
+            velocities[impulse.body].z += impulse.deltaVelocity.z
         }
     }
 
@@ -4177,6 +4221,108 @@ public final class GPUSolver {
         return (vt, rt, ee)
     }
 
+    /// Count last-frame rigid/triangle contacts for a selected collider and
+    /// deformable-body set. This is a read-only qualification/diagnostic API;
+    /// it exposes no writable solver storage and does not affect dispatch.
+    public func debugRigidTriangleContactCount(
+        colliderIDs: [Int], surfaceBodies: [Int]
+    ) -> Int {
+        sync()
+        let colliders = Set(colliderIDs.map(UInt32.init))
+        let bodies = Set(surfaceBodies.map(UInt32.init))
+        guard !colliders.isEmpty, !bodies.isEmpty else { return 0 }
+        let contacts = prevSoftContacts.contents().bindMemory(
+            to: SoftContactGPU.self, capacity: max(1, maxSoft))
+        let count = min(lastNumSoft, maxSoft)
+        var result = 0
+        for index in 0..<count {
+            let contact = contacts[index]
+            let kind = (contact.anchorA.w.bitPattern >> 2) & 0x3
+            let collider = contact.lambda.w.bitPattern & 0x0FFF_FFFF
+            if kind == 2, colliders.contains(collider),
+               bodies.contains(contact.ids.y)
+                    || bodies.contains(contact.ids.z)
+                    || bodies.contains(contact.ids.w) {
+                result += 1
+            }
+        }
+        return result
+    }
+
+    /// Count every live rigid/deformable contact for paired collider/body
+    /// groups. Deformable particles participate in the ordinary rigid
+    /// manifold stream, while triangle interiors and edges participate in
+    /// the full-surface soft-contact stream. Qualification must observe both:
+    /// either one can be the active physical contact for a sparse tet cage.
+    ///
+    /// All groups are evaluated in one pass over the two GPU result streams.
+    /// This matters for replicated-policy evaluation, where rescanning every
+    /// contact buffer once per world would turn a batched GPU rollout into a
+    /// CPU O(worlds * contacts) diagnostic loop.
+    public func debugRigidDeformableContactCounts(
+        colliderGroups: [[Int]], surfaceBodyGroups: [[Int]]
+    ) -> [Int] {
+        precondition(colliderGroups.count == surfaceBodyGroups.count,
+                     "rigid/deformable contact query groups must align")
+        sync()
+        guard !colliderGroups.isEmpty else { return [] }
+
+        let surfaceSets = surfaceBodyGroups.map {
+            Set($0.map(UInt32.init))
+        }
+        var colliderQueries: [UInt32: [Int]] = [:]
+        for (query, colliders) in colliderGroups.enumerated() {
+            for collider in Set(colliders.map(UInt32.init)) {
+                colliderQueries[collider, default: []].append(query)
+            }
+        }
+        var result = [Int](repeating: 0, count: colliderGroups.count)
+
+        let manifolds = prevManifolds.contents().bindMemory(
+            to: ManifoldGPU.self, capacity: max(1, maxPairs))
+        for index in 0..<min(lastNumPairs, maxPairs) {
+            let manifold = manifolds[index]
+            guard manifold.header.z > 0 else { continue }
+            var queries = colliderQueries[manifold.colliderPair.x] ?? []
+            if let other = colliderQueries[manifold.colliderPair.y] {
+                for query in other where !queries.contains(query) {
+                    queries.append(query)
+                }
+            }
+            for query in queries where
+                surfaceSets[query].contains(manifold.header.x)
+                    || surfaceSets[query].contains(manifold.header.y) {
+                result[query] += Int(manifold.header.z)
+            }
+        }
+
+        let soft = prevSoftContacts.contents().bindMemory(
+            to: SoftContactGPU.self, capacity: max(1, maxSoft))
+        for index in 0..<min(lastNumSoft, maxSoft) {
+            let contact = soft[index]
+            let kind = (contact.anchorA.w.bitPattern >> 2) & 0x7
+            guard kind == 2 else { continue }
+            let collider = contact.lambda.w.bitPattern & 0x0FFF_FFFF
+            guard let queries = colliderQueries[collider] else { continue }
+            for query in queries where
+                surfaceSets[query].contains(contact.ids.y)
+                    || surfaceSets[query].contains(contact.ids.z)
+                    || surfaceSets[query].contains(contact.ids.w) {
+                result[query] += 1
+            }
+        }
+        return result
+    }
+
+    /// Scalar convenience for non-replicated diagnostics.
+    public func debugRigidDeformableContactCount(
+        colliderIDs: [Int], surfaceBodies: [Int]
+    ) -> Int {
+        debugRigidDeformableContactCounts(
+            colliderGroups: [colliderIDs],
+            surfaceBodyGroups: [surfaceBodies])[0]
+    }
+
     @discardableResult
     private func latch(_ failure: RuntimeFailure) -> RuntimeFailure {
         failureLock.lock()
@@ -4381,9 +4527,7 @@ public final class GPUSolver {
         fileprivate var lastMaxColorUsed: Int
     }
 
-    public func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
-        precondition(numTris == 0 && numTets == 0,
-            "rigid speculation snapshots do not include soft-body state")
+    private func captureRigidSpeculationState() -> RigidSpeculationSnapshot {
         sync()
         func copy(_ buffer: MTLBuffer) -> Data {
             Data(bytes: buffer.contents(), count: buffer.length)
@@ -4420,11 +4564,15 @@ public final class GPUSolver {
             lastMaxColorUsed: statistics.7)
     }
 
-    public func restoreRigidSpeculationSnapshot(
-        _ snapshot: RigidSpeculationSnapshot
-    ) {
+    public func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
         precondition(numTris == 0 && numTets == 0,
             "rigid speculation snapshots do not include soft-body state")
+        return captureRigidSpeculationState()
+    }
+
+    private func restoreRigidSpeculationState(
+        _ snapshot: RigidSpeculationSnapshot
+    ) {
         sync()
         func restore(_ data: Data, to buffer: MTLBuffer) {
             precondition(data.count == buffer.length,
@@ -4468,6 +4616,88 @@ public final class GPUSolver {
         lastConvexEdgePairTests = snapshot.lastConvexEdgePairTests
         lastMaxColorUsed = snapshot.lastMaxColorUsed
         statsLock.unlock()
+    }
+
+    public func restoreRigidSpeculationSnapshot(
+        _ snapshot: RigidSpeculationSnapshot
+    ) {
+        precondition(numTris == 0 && numTets == 0,
+            "rigid speculation snapshots do not include soft-body state")
+        restoreRigidSpeculationState(snapshot)
+    }
+
+    /// Opaque same-solver checkpoint for contact-rich speculative control.
+    ///
+    /// This extends `RigidSpeculationSnapshot` with the deformable contact
+    /// lineage and truncation history required to branch *after* a physical
+    /// pickup. It is intentionally an in-memory, same-solver object: authored
+    /// scene topology is not serialized, and restoring it into another solver
+    /// is rejected by the exact buffer-size checks below.
+    public struct SimulationSnapshot: Sendable {
+        fileprivate var rigid: RigidSpeculationSnapshot
+        fileprivate var softContacts: Data
+        fileprivate var prevSoftContacts: Data
+        fileprivate var softMapKeyA: Data
+        fileprivate var softMapKeyB: Data
+        fileprivate var softMapVal: Data
+        fileprivate var vtTrack: Data
+        fileprivate var eeTrack: Data
+        fileprivate var bounds: Data
+        fileprivate var ogcPrev: Data
+        fileprivate var planarDATT: Data
+        fileprivate var convexQueryPoison: Data
+    }
+
+    /// Capture the exact solver-complete state at a control boundary. The
+    /// caller must have a healthy solver; terminal failures remain terminal
+    /// and are never erased by restoring an older checkpoint.
+    public func captureSimulationSnapshot() -> SimulationSnapshot {
+        precondition(runtimeFailure == nil,
+            "cannot checkpoint a solver after a terminal runtime failure")
+        let rigid = captureRigidSpeculationState()
+        func copy(_ buffer: MTLBuffer) -> Data {
+            Data(bytes: buffer.contents(), count: buffer.length)
+        }
+        return SimulationSnapshot(
+            rigid: rigid,
+            softContacts: copy(softContacts),
+            prevSoftContacts: copy(prevSoftContacts),
+            softMapKeyA: copy(softMapKeyA),
+            softMapKeyB: copy(softMapKeyB),
+            softMapVal: copy(softMapVal),
+            vtTrack: copy(vtTrackBuf), eeTrack: copy(eeTrackBuf),
+            bounds: copy(boundsBuf), ogcPrev: copy(ogcPrevBuf),
+            planarDATT: copy(planarDATTBuf),
+            convexQueryPoison: copy(convexQueryPoison))
+    }
+
+    /// Restore a checkpoint captured from this solver shape. Contact
+    /// multipliers, feature maps, soft-contact identities and velocity
+    /// history are restored together; this is not the cold restart performed
+    /// by `setBodyStates`.
+    public func restoreSimulationSnapshot(_ snapshot: SimulationSnapshot) {
+        precondition(runtimeFailure == nil,
+            "a terminal solver cannot resume from a checkpoint")
+        restoreRigidSpeculationState(snapshot.rigid)
+        func restore(_ data: Data, to buffer: MTLBuffer) {
+            precondition(data.count == buffer.length,
+                "simulation snapshot buffer size mismatch")
+            data.withUnsafeBytes { bytes in
+                guard let source = bytes.baseAddress else { return }
+                memcpy(buffer.contents(), source, data.count)
+            }
+        }
+        restore(snapshot.softContacts, to: softContacts)
+        restore(snapshot.prevSoftContacts, to: prevSoftContacts)
+        restore(snapshot.softMapKeyA, to: softMapKeyA)
+        restore(snapshot.softMapKeyB, to: softMapKeyB)
+        restore(snapshot.softMapVal, to: softMapVal)
+        restore(snapshot.vtTrack, to: vtTrackBuf)
+        restore(snapshot.eeTrack, to: eeTrackBuf)
+        restore(snapshot.bounds, to: boundsBuf)
+        restore(snapshot.ogcPrev, to: ogcPrevBuf)
+        restore(snapshot.planarDATT, to: planarDATTBuf)
+        restore(snapshot.convexQueryPoison, to: convexQueryPoison)
     }
 
     /// Cap the pipeline depth to the two frame-owned counter readback slots.

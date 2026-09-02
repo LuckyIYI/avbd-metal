@@ -286,6 +286,7 @@ struct SimParams {
     float planarDATRelaxation;
     float surfaceContactCellSize; // legacy OGC velocity-inflation reference
     uint tetInversionPreventionEnabled; // independent signed-volume extension
+    float deformablePortalRetryCap; // metres; 0 keeps the legacy 2*detect rigid/triangle retry cap
 };
 
 inline float combine_friction(float a, float b, uint mode) {

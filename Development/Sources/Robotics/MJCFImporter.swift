@@ -236,8 +236,14 @@ public struct MJCFAsset {
         return url
     }
 
-    public static func parse(url: URL) throws -> MJCFAsset {
-        try parse(data: Data(contentsOf: url), baseURL: url.deletingLastPathComponent())
+    public static func parse(
+        url: URL,
+        visualNormalPolicy: SurfaceNormalPolicy = .preserveImported
+    ) throws -> MJCFAsset {
+        try parse(
+            data: Data(contentsOf: url),
+            baseURL: url.deletingLastPathComponent(),
+            visualNormalPolicy: visualNormalPolicy)
     }
 
     /// Resolve an MJCF plus any relative visual-mesh references from the
@@ -295,10 +301,15 @@ public struct MJCFAsset {
     }
 
     public static func parse(data: Data) throws -> MJCFAsset {
-        try parse(data: data, baseURL: nil)
+        try parse(
+            data: data, baseURL: nil,
+            visualNormalPolicy: .preserveImported)
     }
 
-    private static func parse(data: Data, baseURL: URL?) throws -> MJCFAsset {
+    private static func parse(
+        data: Data, baseURL: URL?,
+        visualNormalPolicy: SurfaceNormalPolicy
+    ) throws -> MJCFAsset {
         let tree = XMLTreeParser()
         guard tree.parse(data), let root = tree.root else {
             throw MJCFImportError.malformedXML(tree.errorMessage ?? "empty document")
@@ -316,7 +327,8 @@ public struct MJCFAsset {
         let visualMaterials = try loadVisualMaterials(
             root: root, warnings: &warnings)
         let visualMeshes = loadVisualMeshes(
-            root: root, baseURL: baseURL, warnings: &warnings)
+            root: root, baseURL: baseURL,
+            normalPolicy: visualNormalPolicy, warnings: &warnings)
 
         guard let world = root.children.first(where: { $0.name == "worldbody" }) else {
             throw MJCFImportError.missing("<worldbody>")
@@ -1067,7 +1079,8 @@ private func colorComponents(
 /// MJCF (the H1 asset does); missing visuals become explicit warnings while
 /// the articulation remains usable headlessly.
 private func loadVisualMeshes(
-    root: XMLNode, baseURL: URL?, warnings: inout [String]
+    root: XMLNode, baseURL: URL?, normalPolicy: SurfaceNormalPolicy,
+    warnings: inout [String]
 ) -> [String: SurfaceMesh] {
     guard let assets = root.children.first(where: { $0.name == "asset" }) else {
         return [:]
@@ -1094,7 +1107,8 @@ private func loadVisualMeshes(
         do {
             let scale = try vector3(node.attributes["scale"] ?? "1 1 1",
                                     element: "mesh", attribute: "scale")
-            let source = try SurfaceMesh.load(path: url.path, upAxis: .z)
+            let source = try SurfaceMesh.load(
+                path: url.path, upAxis: .z, normalPolicy: normalPolicy)
             let positions = source.vertices.map { $0 * scale }
             let inverseScale = F3(
                 1 / max(abs(scale.x), Float.leastNormalMagnitude),

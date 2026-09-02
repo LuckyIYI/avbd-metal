@@ -69,6 +69,105 @@ final class SoftBodyTests: XCTestCase {
                        "Neo-Hookean tet must preserve volume")
     }
 
+    func testSimulationSnapshotReplaysSoftContactBranchAfterImpulse() throws {
+        var scene = PhysicsScene(name: "soft-snapshot-contact")
+        scene.settings.dt = 1 / 120
+        scene.settings.iterations = 8
+        scene.settings.gravity = 0
+        let p0 = scene.addParticle(
+            radius: 0.02, mass: 1, friction: 1,
+            position: F3(-1, -1, 0.5))
+        let p1 = scene.addParticle(
+            radius: 0.02, mass: 1, friction: 1,
+            position: F3(1, -1, 0.5))
+        let p2 = scene.addParticle(
+            radius: 0.02, mass: 1, friction: 1,
+            position: F3(0, 1, 0.5))
+        let particles = [p0, p1, p2]
+        scene.addTri(SceneTri(ids: (p0, p1, p2)))
+        _ = scene.addBody(
+            size: F3(repeating: 1), density: 0, friction: 1,
+            position: .zero, shape: .box)
+        let solver = try GPUSolver(scene: scene)
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertGreaterThan(solver.lastNumSoft, 0)
+
+        let checkpoint = solver.captureSimulationSnapshot()
+        let checkpointStates = solver.bodyStates(particles)
+        let impulse = particles.map {
+            GPUSolver.BodyLinearVelocityImpulse(
+                body: $0, deltaVelocity: F3(0.15, 0, 0))
+        }
+        solver.applyLinearVelocityImpulses(impulse)
+        for _ in 0..<12 { try solver.submitStep() }
+        try solver.synchronize()
+        let firstBranch = solver.bodyStates(particles)
+
+        solver.restoreSimulationSnapshot(checkpoint)
+        let restored = solver.bodyStates(particles)
+        for (expected, actual) in zip(checkpointStates, restored) {
+            XCTAssertEqual(actual.position.x, expected.position.x, accuracy: 1e-7)
+            XCTAssertEqual(actual.position.y, expected.position.y, accuracy: 1e-7)
+            XCTAssertEqual(actual.position.z, expected.position.z, accuracy: 1e-7)
+            XCTAssertEqual(actual.linearVelocity.x,
+                           expected.linearVelocity.x, accuracy: 1e-7)
+            XCTAssertEqual(actual.linearVelocity.y,
+                           expected.linearVelocity.y, accuracy: 1e-7)
+            XCTAssertEqual(actual.linearVelocity.z,
+                           expected.linearVelocity.z, accuracy: 1e-7)
+        }
+        XCTAssertGreaterThan(solver.lastNumSoft, 0,
+            "restoring a soft checkpoint must not cold-start its contacts")
+
+        solver.applyLinearVelocityImpulses(impulse)
+        for _ in 0..<12 { try solver.submitStep() }
+        try solver.synchronize()
+        let replayedBranch = solver.bodyStates(particles)
+        for (expected, actual) in zip(firstBranch, replayedBranch) {
+            XCTAssertEqual(actual.position.x, expected.position.x, accuracy: 2e-5)
+            XCTAssertEqual(actual.position.y, expected.position.y, accuracy: 2e-5)
+            XCTAssertEqual(actual.position.z, expected.position.z, accuracy: 2e-5)
+            XCTAssertEqual(actual.linearVelocity.x,
+                           expected.linearVelocity.x, accuracy: 2e-4)
+            XCTAssertEqual(actual.linearVelocity.y,
+                           expected.linearVelocity.y, accuracy: 2e-4)
+            XCTAssertEqual(actual.linearVelocity.z,
+                           expected.linearVelocity.z, accuracy: 2e-4)
+        }
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
+    func testPortalRetryCapIsAnExplicitPrecisionOptIn() throws {
+        func cap(configure: (inout SimSettings) -> Void) throws -> Float {
+            var scene = PhysicsScene(name: "portal-retry-cap")
+            scene.settings.dt = 1 / 120
+            scene.settings.gravity = 0
+            configure(&scene.settings)
+            let p0 = scene.addParticle(
+                radius: 0.01, mass: 1, friction: 1, position: F3(-1, -1, 0.5))
+            let p1 = scene.addParticle(
+                radius: 0.01, mass: 1, friction: 1, position: F3(1, -1, 0.5))
+            let p2 = scene.addParticle(
+                radius: 0.01, mass: 1, friction: 1, position: F3(0, 1, 0.5))
+            scene.addTri(SceneTri(ids: (p0, p1, p2)))
+            _ = scene.addBody(
+                size: F3(repeating: 1), density: 0, friction: 1,
+                position: .zero, shape: .box)
+            let solver = try GPUSolver(scene: scene)
+            try solver.submitStep()
+            try solver.synchronize()
+            return solver.params.deformablePortalRetryCap
+        }
+        // The default heuristic lands below the rigid margin here (5 mm vs
+        // 10 mm), which must not enable the widened retry on its own.
+        XCTAssertEqual(try cap { _ in }, 0)
+        XCTAssertEqual(try cap { $0.deformableCollisionMargin = 0.02 }, 0,
+            "an explicit margin no tighter than the rigid one stays legacy")
+        XCTAssertEqual(try cap { $0.deformableCollisionMargin = 0.001 }, 0.02,
+            "only an explicit tighter deformable margin opts in")
+    }
+
     func testRigidRestsOnSoftBlock() throws {
         var scene = PhysicsScene(name: "ballonblock")
         scene.settings.iterations = 20
