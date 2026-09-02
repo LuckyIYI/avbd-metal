@@ -196,6 +196,9 @@ public final class GPUSolver {
     var nbrStart, nbrCount, nbrList: MTLBuffer
     var elemCellCount, elemCellStart, elemCells, elemSlot: MTLBuffer
     var softContacts, prevSoftContacts: MTLBuffer
+    /// Transient: key-ordered permutation and the permuted contact records.
+    /// Swapped with `softContacts` after ordering; never part of a snapshot.
+    var softOrder, softContactsScratch: MTLBuffer
     var softMapKeyA, softMapKeyB, softMapVal: MTLBuffer
     var membranes, bends: MTLBuffer
 
@@ -266,7 +269,17 @@ public final class GPUSolver {
     // elements: rigid stacking (stack/jenga/gearclock) provably needs
     // strict GS contact ordering, and springs were always part of the
     // dynamic coloring graph. Only cloth/tet scenes use the static palette.
-    var usesDynamicColoring: Bool { numTris == 0 && numTets == 0 }
+    /// Rigid-only scenes always use the contact-aware per-frame coloring.
+    /// Deformable scenes opt into it with `SimSettings.deterministic`;
+    /// otherwise they keep the static topology palette.
+    var usesDynamicColoring: Bool {
+        (numTris == 0 && numTets == 0) || deterministicColoring
+    }
+    let deterministicColoring: Bool
+    /// Opposite-endpoint slots per adjacency entry in the compact neighbor
+    /// stream: 1 for two-body rigid constraints, 3 once tets, soft contacts,
+    /// membranes or bends can appear.
+    let neighborSlots: Int
     var dynColorSrc: MTLBuffer?
 
     // Adjacency + coloring
@@ -370,6 +383,10 @@ public final class GPUSolver {
         "soft_face_normals",
         "soft_finalize",
         "soft_normals",
+        "soft_order_apply",
+        "soft_order_count",
+        "soft_order_scatter",
+        "soft_order_sort",
         "softmap_clear",
         "softmap_insert",
         "solve_persistent",
@@ -1259,6 +1276,8 @@ public final class GPUSolver {
         // membranes and the render extractor keep using scene.tris/tets.
         let tetBoundaryTris = Self.tetBoundaryFaces(scene)
         self.tetBoundaryTris = tetBoundaryTris
+        self.deterministicColoring = scene.settings.deterministic
+        self.neighborSlots = scene.tris.isEmpty && scene.tets.isEmpty ? 1 : 3
         self.numTris = scene.tris.count + tetBoundaryTris.count
         self.skinnedVertexCount = scene.skinnedMeshes.reduce(0) { $0 + $1.vertices.count }
         self.skinnedTriCount = scene.skinnedMeshes.reduce(0) { $0 + $1.triangles.count }
@@ -1542,6 +1561,9 @@ public final class GPUSolver {
         elemSlot = try makeBuf(elemHashSize * 4, "elemCursor")
         softContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "softContacts")
         prevSoftContacts = try makeBuf(maxSoft * MemoryLayout<SoftContactGPU>.stride, "prevSoftContacts")
+        softOrder = try makeBuf(maxSoft * 4, "softOrder")
+        softContactsScratch = try makeBuf(
+            maxSoft * MemoryLayout<SoftContactGPU>.stride, "softContactsScratch")
         softMapKeyA = try makeBuf(softMapCapacity * 4, "softMapKeyA")
         softMapKeyB = try makeBuf(softMapCapacity * 4, "softMapKeyB")
         softMapVal = try makeBuf(softMapCapacity * 4, "softMapVal")
@@ -1591,9 +1613,10 @@ public final class GPUSolver {
         let adjacencyCapacity = 2 * (numJoints + numSprings + maxPairs)
             + 4 * numTets + 4 * maxSoft + 3 * numTris + 4 * maxEdges
         adjList = try makeBuf(adjacencyCapacity * 4, "adjList")
-        let compactNeighborCapacity = numTris == 0 && numTets == 0
+        let compactNeighborCapacity =
+            ((numTris == 0 && numTets == 0) || deterministicColoring)
             && numBodies > Self.orderedColoringBodyLimit
-            ? adjacencyCapacity : 1
+            ? adjacencyCapacity * neighborSlots : 1
         adjNeighbor = try makeBuf(compactNeighborCapacity * 4, "adjNeighbor")
         colorsA = try makeBuf(nb * 4, "colorsA")
         colorsB = try makeBuf(nb * 4, "colorsB")
@@ -2572,7 +2595,11 @@ public final class GPUSolver {
         var triAdj = [SIMD4<UInt32>](repeating: SIMD4(repeating: 0xFFFFFFFF),
                                      count: max(1, numTris))
         var triAdjFill = [Int](repeating: 0, count: max(1, numTris))
-        for (_, e) in edgeToTris where e.1 >= 0 {
+        // Dictionary order is per-instance; two solvers built from one scene
+        // must upload identical tables or their summation orders differ.
+        for key in edgeToTris.keys.sorted() {
+            let e = edgeToTris[key]!
+            guard e.1 >= 0 else { continue }
             if triAdjFill[e.0] < 3 { triAdj[e.0][triAdjFill[e.0]] = UInt32(e.1); triAdjFill[e.0] += 1 }
             if triAdjFill[e.1] < 3 { triAdj[e.1][triAdjFill[e.1]] = UInt32(e.0); triAdjFill[e.1] += 1 }
         }
@@ -2788,7 +2815,9 @@ public final class GPUSolver {
         // null space of {constants, in-plane positions}, scaled to the
         // cotangent convention (flap coefficient = sum of its triangle's
         // edge-adjacent cotangents)
-        for (key, list) in edgeTris where list.count == 2 {
+        for key in edgeTris.keys.sorted() {
+            let list = edgeTris[key]!
+            guard list.count == 2 else { continue }
             let v0 = Int(key >> 32), v1 = Int(key & 0xFFFFFFFF)
             let (_, opp2, k1) = list[0]
             let (_, opp3, k2) = list[1]
@@ -2943,7 +2972,9 @@ public final class GPUSolver {
                     }
                 }
             }
-            for (_, e) in faceCount where e.count == 1 {
+            for key in faceCount.keys.sorted() {
+                let e = faceCount[key]!
+                guard e.count == 1 else { continue }
                 var (a, b, c) = e.tri
                 // outward winding: flip if the rest normal points toward the
                 // opposite (interior) vertex
@@ -4859,8 +4890,11 @@ public final class GPUSolver {
         // of thin shells; a body-incidence pass avoids rereading the stream
         // across the 5-7 colors required by tetrahedral element cliques.
         // Select from solver structure rather than demo names.
+        // The incidence pass sizes its per-color dispatch from the previous
+        // frame's color counts, which only a static palette keeps fixed.
         let usePlanarBodyIncidence = (staticUsedColors > 4
             || planarDATBodyIncidenceForTesting)
+            && !usesDynamicColoring
             && hasPlanarDATBodyIncidenceStorage
             && ProcessInfo.processInfo.environment[
                 "AVBD_DAT_GLOBAL_COLOR"] == nil
@@ -4901,6 +4935,16 @@ public final class GPUSolver {
                 e.setBuffer(self.elemCells, offset: 0, index: 5)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
                            index: 6)
+            }
+            // Scatter order is an atomic race. Sort each cell's element
+            // list so candidate iteration (and therefore which portal
+            // witness a query accepts first) is a function of the scene,
+            // exactly as the rigid grid already does with the same kernel.
+            dispatch1D(encoder, "bp_sort_cells", elemHashSize) { e in
+                e.setBuffer(self.elemCellStart, offset: 0, index: 0)
+                e.setBuffer(self.elemCellCount, offset: 0, index: 1)
+                e.setBuffer(self.elemCells, offset: 0, index: 2)
+                e.setBytes(&hashSize, length: 4, index: 3)
             }
         }
 
@@ -5071,6 +5115,55 @@ public final class GPUSolver {
                            index: 2)
             }
             var clearCapacity = UInt32(self.softMapCapacity)
+            // Re-index the emitted contacts by persistence key before the map
+            // and the adjacency lists see them. The map buffers are free
+            // scratch until softmap_clear below: keyA = bucket counts,
+            // keyB = bucket starts, val = scatter cursors.
+            dispatch1D(encoder, "softmap_clear", self.softMapCapacity) { e in
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 1)
+                e.setBytes(&clearCapacity, length: 4, index: 2)
+            }
+            dispatch1D(encoder, "soft_order_count", Int(P.maxSoft)) { e in
+                e.setBuffer(self.softContacts, offset: 0, index: 0)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 1)
+                e.setBuffer(self.counters, offset: 0, index: 2)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 3)
+            }
+            encodeScan(encoder, input: softMapKeyA, output: softMapKeyB,
+                       count: softMapCapacity)
+            dispatch1D(encoder, "adj_copy_cursor", softMapCapacity) { e in
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 0)
+                e.setBuffer(self.softMapVal, offset: 0, index: 1)
+                e.setBytes(&clearCapacity, length: 4, index: 2)
+            }
+            dispatch1D(encoder, "soft_order_scatter", Int(P.maxSoft)) { e in
+                e.setBuffer(self.softContacts, offset: 0, index: 0)
+                e.setBuffer(self.softMapVal, offset: 0, index: 1)
+                e.setBuffer(self.softOrder, offset: 0, index: 2)
+                e.setBuffer(self.counters, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
+            }
+            dispatch1D(encoder, "soft_order_sort", softMapCapacity) { e in
+                e.setBuffer(self.softContacts, offset: 0, index: 0)
+                e.setBuffer(self.softMapKeyB, offset: 0, index: 1)
+                e.setBuffer(self.softMapKeyA, offset: 0, index: 2)
+                e.setBuffer(self.softOrder, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
+            }
+            dispatch1D(encoder, "soft_order_apply", Int(P.maxSoft)) { e in
+                e.setBuffer(self.softContacts, offset: 0, index: 0)
+                e.setBuffer(self.softOrder, offset: 0, index: 1)
+                e.setBuffer(self.softContactsScratch, offset: 0, index: 2)
+                e.setBuffer(self.counters, offset: 0, index: 3)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
+                           index: 4)
+            }
+            swap(&softContacts, &softContactsScratch)
             dispatch1D(encoder, "softmap_clear", self.softMapCapacity) { e in
                 e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
@@ -5734,6 +5827,7 @@ public final class GPUSolver {
             e.setBuffer(self.adjList, offset: 0, index: 2)
             e.setBytes(&nb32, length: 4, index: 3)
         }
+        var neighborSlots32 = UInt32(neighborSlots)
         if usesDynamicColoring
             && numBodies > Self.orderedColoringBodyLimit {
             dispatch1D(enc, "adj_extract_neighbors", numBodies) { e in
@@ -5745,6 +5839,11 @@ public final class GPUSolver {
                 e.setBuffer(self.adjList, offset: 0, index: 5)
                 e.setBuffer(self.adjNeighbor, offset: 0, index: 6)
                 e.setBytes(&nb32, length: 4, index: 7)
+                e.setBytes(&neighborSlots32, length: 4, index: 8)
+                e.setBuffer(self.tets, offset: 0, index: 9)
+                e.setBuffer(self.softContacts, offset: 0, index: 10)
+                e.setBuffer(self.membranes, offset: 0, index: 11)
+                e.setBuffer(self.bends, offset: 0, index: 12)
             }
         }
 
@@ -5776,6 +5875,7 @@ public final class GPUSolver {
             let parallelColorPasses = 20
             for pass in 0..<parallelColorPasses {
                 dispatch1D(enc, "color_iterate", numBodies) { e in
+                    e.setBytes(&neighborSlots32, length: 4, index: 20)
                     e.setBuffer(self.posLin, offset: 0, index: 0)
                     e.setBuffer(self.joints, offset: 0, index: 1)
                     e.setBuffer(self.springs, offset: 0, index: 2)
@@ -5806,6 +5906,7 @@ public final class GPUSolver {
             // an arbitrary iteration-limit artifact.
             var finalPass = UInt32(parallelColorPasses - 1)
             dispatch1D(enc, "color_repair_greedy", 1) { e in
+                e.setBytes(&neighborSlots32, length: 4, index: 20)
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.joints, offset: 0, index: 1)
                 e.setBuffer(self.springs, offset: 0, index: 2)
@@ -5825,6 +5926,7 @@ public final class GPUSolver {
                 e.setBuffer(self.adjNeighbor, offset: 0, index: 15)
             }
             dispatch1D(enc, "color_validate", numBodies) { e in
+                e.setBytes(&neighborSlots32, length: 4, index: 20)
                 e.setBuffer(self.posLin, offset: 0, index: 0)
                 e.setBuffer(self.joints, offset: 0, index: 1)
                 e.setBuffer(self.springs, offset: 0, index: 2)

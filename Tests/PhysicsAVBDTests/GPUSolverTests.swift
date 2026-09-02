@@ -848,6 +848,56 @@ final class GPUSolverTests: XCTestCase {
         }
     }
 
+    /// Deformable contacts (V-T, E-E, rigid-triangle, Planar-DAT) must be as
+    /// reproducible as rigid manifolds. Their emission is parallel, so the
+    /// solver has to assign contact indices and element candidate order by
+    /// content rather than by which thread won an atomic append.
+    func testDeformableContactTrajectoryIsBitwiseDeterministic() throws {
+        // res 12 stays under the 1024-body ordered-coloring limit; res 34
+        // exceeds it and exercises the compact multi-slot neighbor stream.
+        for (mode, res) in [
+            (GPUSolver.SurfaceTruncationMode.isotropicDAT, 12),
+            (.planarDAT, 12), (.isotropicDAT, 34),
+        ] {
+            var scene = Demos.cloth(res: res, ball: true)
+            scene.settings.deterministic = true
+            let bodies = Array(0..<scene.bodies.count)
+            let first = try makeGPU(scene)
+            let second = try makeGPU(scene)
+            first.surfaceTruncationMode = mode
+            second.surfaceTruncationMode = mode
+            for _ in 0..<150 {
+                first.step()
+                second.step()
+            }
+            first.sync()
+            second.sync()
+            XCTAssertNil(first.runtimeFailure)
+            XCTAssertGreaterThan(first.lastNumSoft, 0,
+                "\(mode): the fixture must exercise soft contacts")
+            XCTAssertGreaterThan(res * res + 20, 0)
+            print("deterministic \(mode) res \(res): bodies \(bodies.count) "
+                + "colors \(first.lastMaxColorUsed + 1) soft \(first.lastNumSoft)")
+            XCTAssertEqual(first.lastNumSoft, second.lastNumSoft, "\(mode)")
+            let a = first.bodyStates(bodies)
+            let b = second.bodyStates(bodies)
+            var mismatches = 0
+            for i in a.indices where a[i].position.x.bitPattern
+                != b[i].position.x.bitPattern
+                || a[i].position.y.bitPattern != b[i].position.y.bitPattern
+                || a[i].position.z.bitPattern != b[i].position.z.bitPattern
+                || a[i].linearVelocity.x.bitPattern
+                    != b[i].linearVelocity.x.bitPattern
+                || a[i].rotation.real.bitPattern
+                    != b[i].rotation.real.bitPattern {
+                mismatches += 1
+            }
+            XCTAssertEqual(mismatches, 0,
+                "\(mode): \(mismatches) of \(bodies.count) bodies diverged "
+                    + "between two identical solvers")
+        }
+    }
+
     func testContactRichTrajectoryIsBitwiseDeterministic() throws {
         var scene = PhysicsScene(name: "deterministic-contact-grid")
         scene.settings.dt = 1 / 120

@@ -550,6 +550,16 @@ public struct SimSettings {
     /// without shrinking the rigid broadphase margin for the whole robot.
     /// Must be finite and strictly positive when set.
     public var deformableCollisionMargin: Float? = nil
+    /// Bitwise-reproducible solves for scenes with cloth or tets. Deformable
+    /// scenes normally color only their mesh topology and let contacts and
+    /// bending hinges between same-color bodies race (an unordered Jacobi
+    /// step), which the penalty contacts tolerate but which makes every run
+    /// differ at the last bit and, in contact-rich or chaotic scenes, far
+    /// beyond it. With this on, such scenes use the per-frame contact-aware
+    /// coloring rigid scenes already use, so every coupling is strictly
+    /// ordered. Costs more colors (more primal dispatches per iteration) and
+    /// a per-frame recoloring. Rigid-only scenes are reproducible either way.
+    public var deterministic: Bool = false
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note

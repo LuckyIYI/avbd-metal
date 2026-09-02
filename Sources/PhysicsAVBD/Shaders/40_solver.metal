@@ -268,22 +268,18 @@ inline uint otherBody(device const JointGPU* joints,
 
 // Keep the established small-scene path unchanged. It supports every force
 // kind even though dynamic coloring currently runs only for rigid scenes.
-inline void neighborColors(device const JointGPU* joints,
+/// Opposite endpoints of one adjacency entry (up to three for tets, soft
+/// contacts, membranes and bends). Returns how many slots were filled.
+inline uint neighborBodies(device const JointGPU* joints,
                            device const SpringGPU* springs,
                            device const ManifoldGPU* manifolds,
                            device const TetGPU* tets,
                            device const SoftContactGPU* soft,
                            device const MembraneGPU* membranes,
                            device const BendGPU* bends,
-                           device const float4* posLin,
-                           device const uint* colorsIn,
-                           uint entry, uint self, uint myColor,
-                           thread uint& maskLo, thread uint& maskHi,
-                           thread uint& allLo, thread uint& allHi,
-                           thread bool& conflict) {
+                           uint entry, uint self, thread uint* nbs) {
     uint kind = entry >> ADJ_KIND_SHIFT;
     uint idx = entry & ADJ_INDEX_MASK;
-    uint nbs[3];
     uint n = 0;
     if (kind == FK_TET) {
         uint4 ids = tets[idx].ids;
@@ -311,6 +307,25 @@ inline void neighborColors(device const JointGPU* joints,
         nbs[0] = otherBody(joints, springs, manifolds, entry, self);
         n = 1;
     }
+    return n;
+}
+
+inline void neighborColors(device const JointGPU* joints,
+                           device const SpringGPU* springs,
+                           device const ManifoldGPU* manifolds,
+                           device const TetGPU* tets,
+                           device const SoftContactGPU* soft,
+                           device const MembraneGPU* membranes,
+                           device const BendGPU* bends,
+                           device const float4* posLin,
+                           device const uint* colorsIn,
+                           uint entry, uint self, uint myColor,
+                           thread uint& maskLo, thread uint& maskHi,
+                           thread uint& allLo, thread uint& allHi,
+                           thread bool& conflict) {
+    uint nbs[3];
+    uint n = neighborBodies(joints, springs, manifolds, tets, soft,
+                            membranes, bends, entry, self, nbs);
     for (uint k = 0; k < n; k++) {
         uint nb = nbs[k];
         if (nb == WORLD_BODY || posLin[nb].w <= 0.0f) continue;
@@ -337,13 +352,27 @@ kernel void adj_extract_neighbors(
     device const uint* adjList      [[buffer(5)]],
     device uint* adjNeighbor        [[buffer(6)]],
     constant uint& numBodies        [[buffer(7)]],
+    constant uint& slots            [[buffer(8)]],
+    device const TetGPU* tets       [[buffer(9)]],
+    device const SoftContactGPU* soft [[buffer(10)]],
+    device const MembraneGPU* membranes [[buffer(11)]],
+    device const BendGPU* bends     [[buffer(12)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= numBodies) return;
     uint s = adjStart[gid], e = s + adjCount[gid];
     for (uint k = s; k < e; k++) {
-        adjNeighbor[k] = otherBody(joints, springs, manifolds,
-                                   adjList[k], gid);
+        if (slots == 1u) {
+            adjNeighbor[k] = otherBody(joints, springs, manifolds,
+                                       adjList[k], gid);
+            continue;
+        }
+        uint nbs[3] = { WORLD_BODY, WORLD_BODY, WORLD_BODY };
+        neighborBodies(joints, springs, manifolds, tets, soft, membranes,
+                       bends, adjList[k], gid, nbs);
+        for (uint m = 0; m < slots; m++) {
+            adjNeighbor[k * slots + m] = m < 3u ? nbs[m] : WORLD_BODY;
+        }
     }
 }
 
@@ -385,6 +414,7 @@ kernel void color_iterate(
     device const BendGPU* bends     [[buffer(14)]],
     constant uint& passIdx          [[buffer(15)]],
     device const uint* adjNeighbor  [[buffer(16)]],
+    constant uint& neighborSlots    [[buffer(20)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies) return;
@@ -413,8 +443,12 @@ kernel void color_iterate(
                            gid, myColor, maskLo, maskHi, allLo, allHi,
                            conflict);
         } else {
-            neighborColor(posLin, colorsIn, adjNeighbor[k], gid, myColor,
-                          maskLo, maskHi, allLo, allHi, conflict);
+            for (uint m = 0; m < neighborSlots; m++) {
+                neighborColor(posLin, colorsIn,
+                              adjNeighbor[k * neighborSlots + m], gid,
+                              myColor, maskLo, maskHi, allLo, allHi,
+                              conflict);
+            }
         }
     }
 
@@ -471,6 +505,7 @@ kernel void color_repair_greedy(
     device const BendGPU* bends     [[buffer(13)]],
     constant uint& finalPass        [[buffer(14)]],
     device const uint* adjNeighbor  [[buffer(15)]],
+    constant uint& neighborSlots    [[buffer(20)]],
     uint gid                        [[thread_position_in_grid]])
 {
     bool needsRepair = atomic_load_explicit(&changedFlag[finalPass],
@@ -495,9 +530,12 @@ kernel void color_repair_greedy(
                                self, colors[self], maskLo, maskHi, allLo,
                                allHi, conflict);
             } else {
-                neighborColor(posLin, colors, adjNeighbor[k], self,
-                              colors[self], maskLo, maskHi, allLo, allHi,
-                              conflict);
+                for (uint m = 0; m < neighborSlots; m++) {
+                    neighborColor(posLin, colors,
+                                  adjNeighbor[k * neighborSlots + m], self,
+                                  colors[self], maskLo, maskHi, allLo, allHi,
+                                  conflict);
+                }
             }
         }
         uint freeLo = ~maskLo;
@@ -533,6 +571,7 @@ kernel void color_validate(
     device const MembraneGPU* membranes [[buffer(12)]],
     device const BendGPU* bends     [[buffer(13)]],
     device const uint* adjNeighbor  [[buffer(14)]],
+    constant uint& neighborSlots    [[buffer(20)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numBodies || posLin[gid].w <= 0.0f) return;
@@ -548,8 +587,12 @@ kernel void color_validate(
                            colors[gid], maskLo, maskHi, allLo, allHi,
                            conflict);
         } else {
-            neighborColor(posLin, colors, adjNeighbor[k], gid, colors[gid],
-                          maskLo, maskHi, allLo, allHi, conflict);
+            for (uint m = 0; m < neighborSlots; m++) {
+                neighborColor(posLin, colors,
+                              adjNeighbor[k * neighborSlots + m], gid,
+                              colors[gid], maskLo, maskHi, allLo, allHi,
+                              conflict);
+            }
         }
     }
     if (conflict) {
