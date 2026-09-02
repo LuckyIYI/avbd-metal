@@ -635,7 +635,7 @@ extension Demos {
                       position: F3(0, halfY + thickness * 0.5, z))
     }
 
-    private struct TetBindRecord {
+    struct TetBindRecord {
         var ids: (Int, Int, Int, Int)
         var x0: F3
         var x1: F3
@@ -673,7 +673,7 @@ extension Demos {
         }
     }
 
-    private struct TetBindIndex {
+    struct TetBindIndex {
         var records: [TetBindRecord]
         var origin: F3 = .zero
         var cellSize: Float = 1
@@ -725,7 +725,13 @@ extension Demos {
 
         func candidates(near p: F3, maxRing: Int) -> [Int] {
             guard !records.isEmpty else { return [] }
-            let c = coord(p)
+            // Clamp into the grid so a point outside the cage (a dressed
+            // skin larger than its cage) searches from the nearest cage
+            // cells instead of needing rings wide enough to reach them.
+            let raw = coord(p)
+            let c = SIMD3(min(max(raw.x, 0), dims.x - 1),
+                          min(max(raw.y, 0), dims.y - 1),
+                          min(max(raw.z, 0), dims.z - 1))
             var seen = Set<Int>()
             var out: [Int] = []
             for r in 0...max(0, maxRing) {
@@ -749,19 +755,59 @@ extension Demos {
         }
     }
 
-    private static func bindVisualMesh(_ mesh: SurfaceMesh,
-                                       scene: PhysicsScene,
-                                       tetRange: Range<Int>,
-                                       bodyIDs: [Int]) -> SceneSkinnedMesh {
+    /// Bind a visual surface to an existing tetrahedral cage: every vertex
+    /// takes barycentric weights in its containing (or nearest) tet of
+    /// `tetRange`. Public so task builders can dress an authored cage.
+    public static func bindVisualMesh(_ mesh: SurfaceMesh,
+                                      scene: PhysicsScene,
+                                      tetRange: Range<Int>,
+                                      bodyIDs: [Int]) -> SceneSkinnedMesh {
         let index = TetBindIndex(tets: tetRange.map { scene.tets[$0] },
                                  scene: scene)
+        guard !index.records.isEmpty else {
+            return SceneSkinnedMesh(vertices: [], triangles: mesh.triangles,
+                                    bodyIDs: bodyIDs)
+        }
+        // Binding is a per-vertex nearest-tet search over a hash grid: it is
+        // embarrassingly parallel, so run it as a compute kernel and keep the
+        // serial walk only as the no-Metal fallback.
+        let picks = SkinBindGPU.shared?.bind(mesh: mesh, index: index)
+            ?? bindVisualMeshCPU(mesh, index: index)
         var vertices: [SceneSkinnedVertex] = []
         vertices.reserveCapacity(mesh.vertices.count)
-        for (vi, p) in mesh.vertices.enumerated() {
-            var best: (record: TetBindRecord, w: SIMD4<Float>, inside: Bool,
+        for (vi, pick) in picks.enumerated() {
+            let record = index.records[pick.record]
+            vertices.append(SceneSkinnedVertex(ids: record.ids,
+                                               weights: pick.weights,
+                                               restNormal: mesh.normals[vi],
+                                               restInv0: record.restInv0,
+                                               restInv1: record.restInv1,
+                                               restInv2: record.restInv2))
+        }
+        return SceneSkinnedMesh(vertices: vertices, triangles: mesh.triangles,
+                                bodyIDs: bodyIDs)
+    }
+
+    struct SkinBindPick {
+        var record: Int
+        var weights: SIMD4<Float>
+    }
+
+    private static func bindVisualMeshCPU(_ mesh: SurfaceMesh,
+                                          index: TetBindIndex) -> [SkinBindPick] {
+        var picks: [SkinBindPick] = []
+        picks.reserveCapacity(mesh.vertices.count)
+        for p in mesh.vertices {
+            var best: (record: Int, w: SIMD4<Float>, inside: Bool,
                        dist2: Float, outside: Float)?
-            let candidates = index.candidates(near: p, maxRing: 3)
-            let search = candidates.isEmpty ? index.records.indices.map { $0 } : candidates
+            var candidates = index.candidates(near: p, maxRing: 3)
+            var ring = 6
+            while candidates.isEmpty && ring <= 12 {
+                candidates = index.candidates(near: p, maxRing: ring)
+                ring *= 2
+            }
+            let search: [Int] = candidates.isEmpty
+                ? Array(index.records.indices) : candidates
             for ti in search {
                 let record = index.records[ti]
                 let w = record.barycentric(p)
@@ -777,27 +823,14 @@ extension Demos {
                     || (inside == best!.inside && d2 < best!.dist2)
                     || (inside == best!.inside && d2 == best!.dist2
                         && outside < best!.outside) {
-                    best = (record, w, inside, d2, outside)
+                    best = (ti, w, inside, d2, outside)
                 }
             }
-            if let best {
-                vertices.append(SceneSkinnedVertex(ids: best.record.ids,
-                                                   weights: best.w,
-                                                   restNormal: mesh.normals[vi],
-                                                   restInv0: best.record.restInv0,
-                                                   restInv1: best.record.restInv1,
-                                                   restInv2: best.record.restInv2))
-            } else if let first = index.records.first {
-                vertices.append(SceneSkinnedVertex(ids: first.ids,
-                                                   weights: SIMD4(0.25, 0.25, 0.25, 0.25),
-                                                   restNormal: mesh.normals[vi],
-                                                   restInv0: first.restInv0,
-                                                   restInv1: first.restInv1,
-                                                   restInv2: first.restInv2))
-            }
+            picks.append(SkinBindPick(
+                record: best?.record ?? 0,
+                weights: best?.w ?? SIMD4(0.25, 0.25, 0.25, 0.25)))
         }
-        return SceneSkinnedMesh(vertices: vertices, triangles: mesh.triangles,
-                                bodyIDs: bodyIDs)
+        return picks
     }
 
     private static func loadDefaultSkinMeshWithKey(meshPath: String?) -> (SurfaceMesh, String) {

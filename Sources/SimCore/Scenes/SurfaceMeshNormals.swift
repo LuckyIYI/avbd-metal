@@ -9,7 +9,7 @@ extension SurfaceMesh {
     /// Equal face weighting prevents tessellation density from changing the
     /// apparent curvature: a large, irregular CAD triangle must not overpower
     /// several smaller neighbours that describe the same smooth surface.
-    func withCreaseNormals(
+    public func withCreaseNormals(
         maxSmoothAngleRadians: Float,
         weldTolerance: Float = 1e-4
     ) -> SurfaceMesh {
@@ -78,6 +78,33 @@ extension SurfaceMesh {
             vertices: outputVertices,
             normals: outputNormals,
             triangles: outputTriangles).withConsistentNormals()
+    }
+}
+
+extension SurfaceMesh {
+    /// Smooth vertex normals on the existing welded topology: each vertex
+    /// takes the normalized sum of its incident unit face normals. Unlike
+    /// `withCreaseNormals`, no corners are split, so an organic asset keeps
+    /// its vertex count for skinning and rendering.
+    public func withSmoothNormals() -> SurfaceMesh {
+        guard !vertices.isEmpty, !triangles.isEmpty else { return self }
+        var sums = [F3](repeating: .zero, count: vertices.count)
+        for triangle in triangles {
+            let a = vertices[triangle.0]
+            let b = vertices[triangle.1]
+            let c = vertices[triangle.2]
+            let normal = normalizedOrZero(cross(b - a, c - a))
+            sums[triangle.0] += normal
+            sums[triangle.1] += normal
+            sums[triangle.2] += normal
+        }
+        let smoothed = sums.enumerated().map { index, sum in
+            normalizedOrZero(sum, fallback: normals.indices.contains(index)
+                ? normals[index] : F3(0, 0, 1))
+        }
+        return SurfaceMesh(
+            vertices: vertices, normals: smoothed, triangles: triangles)
+            .withConsistentNormals()
     }
 }
 
