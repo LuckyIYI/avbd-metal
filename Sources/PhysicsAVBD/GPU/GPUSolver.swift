@@ -5120,7 +5120,10 @@ public final class GPUSolver {
             // Re-index the emitted contacts by persistence key before the map
             // and the adjacency lists see them. The map buffers are free
             // scratch until softmap_clear below: keyA = bucket counts,
-            // keyB = bucket starts, val = scatter cursors.
+            // keyB = bucket starts, val = scatter cursors. Seven small
+            // dispatches per frame that only buy bitwise reproducibility, so
+            // they follow the deterministic setting.
+            if deterministicColoring {
             dispatch1D(encoder, "softmap_clear", self.softMapCapacity) { e in
                 e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
@@ -5166,6 +5169,7 @@ public final class GPUSolver {
                            index: 4)
             }
             swap(&softContacts, &softContactsScratch)
+            }
             dispatch1D(encoder, "softmap_clear", self.softMapCapacity) { e in
                 e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
