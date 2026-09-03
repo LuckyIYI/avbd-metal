@@ -382,6 +382,78 @@ final class GPUSolverTests: XCTestCase {
         }
     }
 
+    /// A skin vertex outside its tet must keep its rest offset from the tet
+    /// under compression (carried by the tet's rotation) instead of being
+    /// scaled with the tet's strain, while inside vertices stay barycentric.
+    func testSkinOverhangIsCarriedRigidlyNotAffinely() throws {
+        var scene = Demos.ground()
+        // Rest tet: unit-ish corners. Current pose: the same tet compressed
+        // to half size, authored directly as static particles.
+        let rest: [F3] = [F3(0, 0, 0), F3(0.1, 0, 0), F3(0, 0.1, 0), F3(0, 0, 0.1)]
+        // Current pose: anisotropic compression followed by a rotation, so
+        // the polar factor is a non-trivial rotation.
+        let rot = simd_quatf(angle: 0.7, axis: normalize(F3(1, 2, 3)))
+        let stretch = simd_float3x3(diagonal: F3(0.5, 0.8, 0.6))
+        let current = rest.map { rot.act(stretch * $0) + F3(0, 0, 0.3) }
+        var ids: [Int] = []
+        for p in current {
+            ids.append(scene.addParticle(radius: 0.005, mass: 0, position: p))
+        }
+        let dm = simd_float3x3(columns: (rest[1] - rest[0], rest[2] - rest[0],
+                                         rest[3] - rest[0]))
+        let inv = dm.inverse
+        func row(_ r: Int) -> F3 {
+            F3(inv.columns.0[r], inv.columns.1[r], inv.columns.2[r])
+        }
+        let inside = SIMD4<Float>(0.25, 0.25, 0.25, 0.25)
+        let outside = SIMD4<Float>(-2, 1, 1, 1)   // three tet lengths out
+        let tuple = (ids[0], ids[1], ids[2], ids[3])
+        let mesh = SceneSkinnedMesh(
+            vertices: [
+                SceneSkinnedVertex(ids: tuple, weights: inside,
+                                   restNormal: F3(0, 0, 1),
+                                   restInv0: row(0), restInv1: row(1),
+                                   restInv2: row(2)),
+                SceneSkinnedVertex(ids: tuple, weights: outside,
+                                   restNormal: F3(0, 0, 1),
+                                   restInv0: row(0), restInv1: row(1),
+                                   restInv2: row(2)),
+            ],
+            triangles: [(0, 1, 1)], bodyIDs: ids)
+        scene.addSkinnedMesh(mesh)
+        let solver = try makeGPU(scene)
+        solver.step()
+        solver.sync()
+        guard let queue = solver.metalDevice.makeCommandQueue(),
+              let command = queue.makeCommandBuffer(),
+              let instances = solver.metalDevice.makeBuffer(length: 4096)
+        else { return XCTFail("could not allocate render test resources") }
+        try solver.encodeBuildInstancesChecked(command, instances: instances)
+        command.commit()
+        command.waitUntilCompleted()
+        let surface = try XCTUnwrap(solver.renderSkinnedSurface)
+        let out = surface.vertices.contents()
+            .bindMemory(to: SkinVertexGPU.self, capacity: 2)
+        func bary(_ w: SIMD4<Float>, _ x: [F3]) -> F3 {
+            x[0] * w.x + x[1] * w.y + x[2] * w.z + x[3] * w.w
+        }
+        let drawnInside = F3(out[0].position.x, out[0].position.y, out[0].position.z)
+        XCTAssertLessThan(simd_length(drawnInside - bary(inside, current)), 1e-6)
+        // Affine extrapolation would place the overhang at bary(outside,
+        // current): half the rest offset. Rigid carriage keeps the full
+        // rest offset, turned by the rotation part of F.
+        let anchor = bary(SIMD4<Float>(0, 1, 1, 1) / 3, current)
+        let restOffset = bary(outside, rest) - bary(SIMD4<Float>(0, 1, 1, 1) / 3, rest)
+        let expected = anchor + rot.act(restOffset)
+        let drawnOutside = F3(out[1].position.x, out[1].position.y, out[1].position.z)
+        XCTAssertLessThan(simd_length(drawnOutside - expected), 1e-5,
+            "overhang \(drawnOutside) expected \(expected), affine would be "
+                + "\(bary(outside, current))")
+        XCTAssertGreaterThan(
+            simd_length(drawnOutside - bary(outside, current)), 0.01,
+            "the overhang must not follow the affine extrapolation")
+    }
+
     func testCheckedRenderInstanceEncoderFailureIsNotSilentOrPhysicsFatal() throws {
         let solver = try makeGPU(Demos.ground())
         guard let queue = solver.metalDevice.makeCommandQueue(),

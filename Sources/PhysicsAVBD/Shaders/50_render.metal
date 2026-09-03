@@ -184,6 +184,34 @@ kernel void soft_normals(
     normalsOut[v] = float4(softSafeNormalize(acc), thick);
 }
 
+// Adjugate inverse of a 3x3 with a precomputed determinant.
+inline float3x3 skinInverse3(float3x3 m, float det)
+{
+    float3 c0 = m[0], c1 = m[1], c2 = m[2];
+    float3 r0 = cross(c1, c2), r1 = cross(c2, c0), r2 = cross(c0, c1);
+    // rows of the inverse are the cofactor cross products over det
+    float invDet = 1.0f / det;
+    return float3x3(float3(r0.x, r1.x, r2.x) * invDet,
+                    float3(r0.y, r1.y, r2.y) * invDet,
+                    float3(r0.z, r1.z, r2.z) * invDet);
+}
+
+// Rotation factor of F by Higham's iteration X <- (X + X^-T) / 2. Six
+// steps are ample for the strains a plush skin sees; a reflected F keeps
+// its sign so the caller falls back to the affine map elsewhere.
+inline float3x3 skinPolarRotation(float3x3 F, float3x3 Finv)
+{
+    float3x3 X = F;
+    float3x3 Xinv = Finv;
+    for (int i = 0; i < 6; i++) {
+        X = (X + transpose(Xinv)) * 0.5f;
+        float d = determinant(X);
+        if (fabs(d) < 1e-14f) break;
+        Xinv = skinInverse3(X, d);
+    }
+    return X;
+}
+
 kernel void skin_deform(
     device const float4* posLin             [[buffer(0)]],
     device const SkinBindingGPU* bindings   [[buffer(1)]],
@@ -199,7 +227,6 @@ kernel void skin_deform(
     float3 q3 = posLin[b.ids.w].xyz;
 
     float4 w = b.weights;
-    float3 p = q0 * w.x + q1 * w.y + q2 * w.z + q3 * w.w;
 
     // F = Ds * Dm^-1. With columns e0/e1/e2 for Ds and rows inv0..2 for
     // Dm^-1, each F column is Ds times the corresponding inverse column.
@@ -209,6 +236,37 @@ kernel void skin_deform(
     float3 f0 = e0 * b.inv0.x + e1 * b.inv1.x + e2 * b.inv2.x;
     float3 f1 = e0 * b.inv0.y + e1 * b.inv1.y + e2 * b.inv2.y;
     float3 f2 = e0 * b.inv0.z + e1 * b.inv1.z + e2 * b.inv2.z;
+
+    float3 p;
+    float minW = min(min(w.x, w.y), min(w.z, w.w));
+    if (minW >= 0.0f) {
+        p = q0 * w.x + q1 * w.y + q2 * w.z + q3 * w.w;
+    } else {
+        // The vertex lies outside its tet (a skin fatter than its cage).
+        // Plain barycentric extrapolation is the tet's affine map, so the
+        // overhang inherits the tet's strain scaled by its lever arm: a
+        // compressed bottom tet drags a foot through the floor and any
+        // node flicker becomes visible jitter at the extremities. Anchor
+        // the vertex at its clamped point on the tet and carry the rest
+        // offset rigidly with the tet's rotation instead.
+        float4 wc = max(w, float4(0.0f));
+        float sum = wc.x + wc.y + wc.z + wc.w;
+        wc = sum > 1e-12f ? wc / sum : float4(0.25f);
+        float3 anchor = q0 * wc.x + q1 * wc.y + q2 * wc.z + q3 * wc.w;
+        // Both weight sets sum to one, so this is F times the rest offset.
+        float4 dw = w - wc;
+        float3 affineOffset = q0 * dw.x + q1 * dw.y + q2 * dw.z + q3 * dw.w;
+        float3x3 F(f0, f1, f2);
+        float det = determinant(F);
+        if (fabs(det) > 1e-14f) {
+            float3x3 Finv = skinInverse3(F, det);
+            float3 restOffset = Finv * affineOffset;
+            float3x3 R = skinPolarRotation(F, Finv);
+            p = anchor + R * restOffset;
+        } else {
+            p = anchor + affineOffset;
+        }
+    }
 
     // Normal transform is inverse(transpose(F)); cof(F) is the same up to
     // determinant scale, which drops out under normalize.
