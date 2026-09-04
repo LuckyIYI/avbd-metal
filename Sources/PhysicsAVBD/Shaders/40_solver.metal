@@ -749,7 +749,8 @@ kernel void warmstart_joints(
     float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
     float torqueArm = j.C0Lin.w;
 
-    j.C0Lin = float4(pA - pB, torqueArm);
+    j.C0Lin = float4(j.prismaticAxis.w != 0
+        ? prismaticError(j, pA - pB, qA) : pA - pB, torqueArm);
     float3 c0a;
     if (j.hingeAxis.w != 0.0f) {
         // hinge: axis-alignment error, invariant to spin about the axis
@@ -802,6 +803,11 @@ kernel void warmstart_joints(
     float warm = P.alpha * P.gamma;
     float stiffLin = j.rA.w;
     float stiffAng = j.rB.w;
+    if (j.prismaticAxis.w != 0) {
+        float stop = prismaticActiveStop(j, pA - pB, qA);
+        j.lambdaLin.xyz = prismaticWarmStart(j, stop);
+        j.translationLimits.w = stop;
+    }
     j.lambdaLin.xyz *= warm;
     j.lambdaAng.xyz *= warm;
     j.penaltyLin.xyz = min(clamp(j.penaltyLin.xyz * P.gamma, PENALTY_MIN, PENALTY_MAX), stiffLin);
@@ -903,7 +909,29 @@ inline void stampJoint(device const JointGPU& j, uint self,
 
     // Linear
     float3 penLin = j.penaltyLin.xyz;
-    if (dot(penLin, penLin) > 0.0f) {
+    if (dot(penLin, penLin) > 0.0f && j.prismaticAxis.w != 0) {
+        float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+        float3 xA = a == WORLD_BODY ? float3(0) : posLin[a].xyz;
+        float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(xA, qA, j.rA.xyz);
+        float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
+        float stop = prismaticActiveStop(j, pA - pB, qA);
+        M3 P = prismaticProjection(j, stop);
+        M3 basis = m3_mulm(P, inverseRotation(qA));
+        float3 C = prismaticError(j, pA - pB, qA);
+        if (j.header.w & 1) C -= j.C0Lin.xyz * alpha;
+        // Prediction or a primal update can switch stops after initialization.
+        float3 F = penLin * C + prismaticWarmStart(j, stop);
+        M3 jLin = m3_scale(basis, isA ? 1.0f : -1.0f);
+        M3 jAng = m3_mulm(basis, m3_skew(isA ? xA - pB
+            : q_rotate(posAng[b], j.rB.xyz)));
+        M3 jLinT = m3_transpose(jLin), jAngT = m3_transpose(jAng);
+        M3 K = m3_diag(penLin), jAngTk = m3_mulm(jAngT, K);
+        acc.lhsLin = m3_add(acc.lhsLin, m3_mulm(m3_mulm(jLinT, K), jLin));
+        acc.lhsAng = m3_add(acc.lhsAng, m3_mulm(jAngTk, jAng));
+        acc.lhsCross = m3_add(acc.lhsCross, m3_mulm(jAngTk, jLin));
+        acc.rhsLin += m3_mul(jLinT, F);
+        acc.rhsAng += m3_mul(jAngT, F);
+    } else if (dot(penLin, penLin) > 0.0f) {
         float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
         float3 C = pA - pB;
@@ -2710,6 +2738,13 @@ static inline void dual_joint_one(
         float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
         float3 C = pA - pB;
+        if (j.prismaticAxis.w != 0) {
+            float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+            float stop = prismaticActiveStop(j, C, qA);
+            j.lambdaLin.xyz = prismaticWarmStart(j, stop);
+            j.translationLimits.w = stop;
+            C = prismaticError(j, C, qA);
+        }
         if (j.header.w & 1) {
             C -= j.C0Lin.xyz * P.alpha;
             j.lambdaLin.xyz = clamp(penLin * C + j.lambdaLin.xyz,

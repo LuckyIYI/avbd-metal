@@ -25,6 +25,10 @@ public final class CPUJoint: CPUForce {
     public var restRel: Quat
     /// Hinge axis in B local (nil = full weld). Rotation about it stays free.
     public var hingeAxis: F3? = nil
+    public var prismaticAxis: F3? = nil
+    public var translationLimits: ClosedRange<Float>? = nil
+    // Bound owning the axial multiplier: -1 lower, 0 free, +1 upper.
+    private var prismaticWarmStartStop = 0
 
     init(solver: CPUSolver, bodyA: CPURigid?, bodyB: CPURigid, rA: F3, rB: F3,
          stiffnessLin: Float, stiffnessAng: Float, fracture: Float) {
@@ -48,7 +52,37 @@ public final class CPUJoint: CPUForce {
     func currentCLin() -> F3 {
         guard let bodyB else { return .zero }
         let pA = bodyA.map { transform($0.positionLin, $0.positionAng, rA) } ?? rA
-        return pA - transform(bodyB.positionLin, bodyB.positionAng, rB)
+        let delta = pA - transform(bodyB.positionLin, bodyB.positionAng, rB)
+        guard let axis = prismaticAxis else { return delta }
+        let d = (bodyA?.positionAng ?? Quat(real: 1, imag: .zero)).inverse.act(delta)
+        let t = -dot(d, axis)
+        let target = translationLimits.map { min(max(t, $0.lowerBound), $0.upperBound) } ?? t
+        return d + axis * target
+    }
+
+    private func prismaticActiveStop() -> Int {
+        guard let axis = prismaticAxis, let limits = translationLimits,
+              let bodyB else { return 0 }
+        let qA = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
+        let pA = bodyA.map { transform($0.positionLin, $0.positionAng, rA) } ?? rA
+        let pB = transform(bodyB.positionLin, bodyB.positionAng, rB)
+        let t = -dot(qA.inverse.act(pA - pB), axis)
+        return t < limits.lowerBound ? -1 : (t > limits.upperBound ? 1 : 0)
+    }
+
+    private func prismaticProjection(activeStop: Int) -> Mat3Rows {
+        guard let axis = prismaticAxis, activeStop == 0 else { return .identity }
+        return Mat3Rows(rowMajor: matrix_identity_float3x3 - outer(axis, axis))
+    }
+
+    private func prismaticWarmStart(activeStop: Int) -> F3 {
+        guard let axis = prismaticAxis else { return lambdaLin }
+        // The projection is the identity at either stop, so it alone cannot
+        // reject a multiplier carried directly across the whole free interval.
+        if activeStop == 0 || activeStop != prismaticWarmStartStop {
+            return lambdaLin - axis * dot(lambdaLin, axis)
+        }
+        return lambdaLin
     }
 
     func currentCAng() -> F3 {
@@ -68,6 +102,11 @@ public final class CPUJoint: CPUForce {
         C0Ang = currentCAng()
 
         // Warmstart dual variables and penalty (Eq. 19)
+        if prismaticAxis != nil {
+            let stop = prismaticActiveStop()
+            lambdaLin = prismaticWarmStart(activeStop: stop)
+            prismaticWarmStartStop = stop
+        }
         lambdaLin *= solver.alpha * solver.gamma
         lambdaAng *= solver.alpha * solver.gamma
         penaltyLin = simd_clamp(penaltyLin * solver.gamma,
@@ -88,7 +127,27 @@ public final class CPUJoint: CPUForce {
         let isA = body === bodyA
 
         // Linear constraint
-        if length_squared(penaltyLin) > 0 {
+        if length_squared(penaltyLin) > 0, prismaticAxis != nil {
+            let qA = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
+            let xA = bodyA?.positionLin ?? .zero
+            let pB = transform(bodyB.positionLin, bodyB.positionAng, rB)
+            let stop = prismaticActiveStop()
+            let projection = prismaticProjection(activeStop: stop)
+            let basis = projection.mul(Mat3Rows(rowMajor: simd_float3x3(qA).transpose))
+            var C = currentCLin()
+            if stiffnessLin.isInfinite { C -= C0Lin * alpha }
+            // Prediction or a primal update can switch stops after initialize.
+            let F = penaltyLin * C + prismaticWarmStart(activeStop: stop)
+            let jLin = basis * (isA ? 1 : -1)
+            let jAng = basis.mul(.skewRows(isA ? xA - pB : bodyB.positionAng.act(rB)))
+            let jLinT = jLin.transposed, jAngT = jAng.transposed
+            let K = Mat3Rows.diagonal(penaltyLin), jAngTk = jAngT.mul(K)
+            lhsLin += jLinT.mul(K).mul(jLin)
+            lhsAng += jAngTk.mul(jAng)
+            lhsCross += jAngTk.mul(jLin)
+            rhsLin += jLinT.mul(F)
+            rhsAng += jAngT.mul(F)
+        } else if length_squared(penaltyLin) > 0 {
             var C = currentCLin()
             if stiffnessLin.isInfinite { C -= C0Lin * alpha }
             let F = penaltyLin * C + lambdaLin
@@ -133,6 +192,11 @@ public final class CPUJoint: CPUForce {
 
     override func updateDual(_ alpha: Float) {
         if length_squared(penaltyLin) > 0 {
+            if prismaticAxis != nil {
+                let stop = prismaticActiveStop()
+                lambdaLin = prismaticWarmStart(activeStop: stop)
+                prismaticWarmStartStop = stop
+            }
             var C = currentCLin()
             if stiffnessLin.isInfinite {
                 C -= C0Lin * alpha

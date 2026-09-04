@@ -270,6 +270,11 @@ public struct SceneJoint {
     /// Hinge axis in body B's LOCAL frame. When set, the angular constraint
     /// leaves rotation about this axis free (1-DOF revolute joint).
     public var hingeAxis: F3?
+    /// Translation axis in A's local frame (world frame for bodyA == -1).
+    /// Leaves only translation along this axis free. Use stiffnessAng = infinity
+    /// to preserve orientation. Limits are signed B-minus-A anchor displacement.
+    public var prismaticAxis: F3? = nil
+    public var translationLimits: ClosedRange<Float>? = nil
     /// Motor command. This is a target angle in the two position-PD modes
     /// and a target angular velocity in velocity mode.
     public var motorTarget: Float
