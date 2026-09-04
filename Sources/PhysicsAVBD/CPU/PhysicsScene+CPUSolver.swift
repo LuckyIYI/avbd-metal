@@ -1,3 +1,4 @@
+import simd
 import SimCore
 
 public enum CPUConvexCollisionError: Error, Equatable, Sendable,
@@ -132,6 +133,13 @@ public extension PhysicsScene {
                 fracture: joint.fracture
             )
             cpuJoint.hingeAxis = joint.hingeAxis
+            if let axis = joint.prismaticAxis {
+                precondition(axis.x.isFinite && axis.y.isFinite && axis.z.isFinite
+                    && length_squared(axis) > 1e-12)
+                precondition(joint.hingeAxis == nil && joint.motorTorque == 0)
+                cpuJoint.prismaticAxis = normalize(axis)
+                cpuJoint.translationLimits = joint.translationLimits
+            }
             cpuJoint.fractureLinear = joint.fractureLinear
         }
         for spring in springs {

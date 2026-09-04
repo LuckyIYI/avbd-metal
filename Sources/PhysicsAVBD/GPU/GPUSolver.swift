@@ -2384,6 +2384,17 @@ public final class GPUSolver {
             let qA0 = j.bodyA >= 0 ? scene.bodies[j.bodyA].rotation : Quat(real: 1, imag: .zero)
             let rel = (qA0.inverse * scene.bodies[j.bodyB].rotation).normalized
             g.restRel = SIMD4(rel.imag, rel.real)
+            if let axis = j.prismaticAxis {
+                precondition(axis.x.isFinite && axis.y.isFinite && axis.z.isFinite
+                    && length_squared(axis) > 1e-12, "prismatic axis must be finite and nonzero")
+                precondition(j.hingeAxis == nil && j.motorTorque == 0,
+                    "prismatic joints cannot also be hinge motors")
+                g.prismaticAxis = SIMD4(normalize(axis), 1)
+                if let limits = j.translationLimits {
+                    precondition(limits.lowerBound.isFinite && limits.upperBound.isFinite)
+                    g.translationLimits = SIMD4(limits.lowerBound, limits.upperBound, 1, 0)
+                }
+            }
             if let axis = j.hingeAxis {
                 g.hingeAxis = SIMD4(axis, 1)
                 g.dynamics.x = j.armature

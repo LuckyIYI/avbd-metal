@@ -343,12 +343,33 @@ struct JointGPU {
     float4 penaltyAng;
     float4 restRel;     // rest relative rotation qA^-1 * qB (quaternion)
     float4 hingeAxis;   // xyz: axis in B local; w != 0 -> 1-DOF hinge
+    float4 prismaticAxis; // xyz: A-local translation axis, w: enabled
+    float4 translationLimits; // x/y: metres, z: enabled
     float4 motor;       // x = angle/velocity target, y = effort limit,
                         // z = pad, w = position-PD kp (zero for velocity)
     float4 limits;      // x/y = twist range, z = kd, w = pad
     float4 dynamics;    // x = armature, y = inertial-predicted twist,
                         // z = start-of-step explicit effort
 };
+
+inline float3 prismaticError(device const JointGPU& j, float3 delta, float4 qA) {
+    float3 d = q_rotate(q_inv(qA), delta);
+    float t = -dot(d, j.prismaticAxis.xyz);
+    float target = j.translationLimits.z != 0
+        ? clamp(t, j.translationLimits.x, j.translationLimits.y) : t;
+    return d + j.prismaticAxis.xyz * target;
+}
+inline M3 prismaticProjection(device const JointGPU& j, float3 delta, float4 qA) {
+    float t = -dot(q_rotate(q_inv(qA), delta), j.prismaticAxis.xyz);
+    bool stop = j.translationLimits.z != 0
+        && (t < j.translationLimits.x || t > j.translationLimits.y);
+    return stop ? m3_identity()
+        : m3_add(m3_identity(), m3_scale(m3_outer(j.prismaticAxis.xyz, j.prismaticAxis.xyz), -1.0f));
+}
+inline M3 inverseRotation(float4 q) {
+    return M3{q_rotate(q, float3(1,0,0)), q_rotate(q, float3(0,1,0)),
+              q_rotate(q, float3(0,0,1))};
+}
 
 struct SpringGPU {
     uint4 header;       // bodyA, bodyB, hard flag, pad
