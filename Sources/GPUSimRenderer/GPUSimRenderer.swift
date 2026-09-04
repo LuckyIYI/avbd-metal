@@ -19,6 +19,8 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// ~1.5 ms GPU on the reference scene. Hosts on a power budget can
     /// disable it and keep the rest of the pipeline unchanged.
     public var ambientOcclusion: Bool
+    /// Disable the built-in checker ground when the host authors its own floor.
+    public var showsGroundPlane: Bool
     /// Minimum time each presented frame stays on screen, in seconds; nil
     /// presents as soon as the GPU finishes. A loop running below the
     /// panel's refresh (60 fps on a 120 Hz display) otherwise lands each
@@ -32,12 +34,14 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         showConvexCollisionGeometry: Bool = false,
         convexCollisionWireframe: Bool = true,
         ambientOcclusion: Bool = true,
+        showsGroundPlane: Bool = true,
         minimumFrameDuration: Double? = nil
     ) {
         self.colorMode = colorMode
         self.showConvexCollisionGeometry = showConvexCollisionGeometry
         self.convexCollisionWireframe = convexCollisionWireframe
         self.ambientOcclusion = ambientOcclusion
+        self.showsGroundPlane = showsGroundPlane
         self.minimumFrameDuration = minimumFrameDuration
     }
 }
@@ -215,7 +219,9 @@ public struct GPUSimSkinRenderVertex {
 }
 
 /// Vertex ABI for rigid and convex-debug surfaces. `positionBody.w` stores
-/// the owning body index as a `UInt32` bit pattern.
+/// the owning body index as a `UInt32` bit pattern. `normal.w > 0` opts into
+/// metallic/roughness shading: normal.w is roughness, color.w is metallic.
+/// Zero normal.w preserves the legacy dielectric, roughness-0.45 appearance.
 public struct GPUSimRigidMeshRenderVertex {
     public var positionBody: SIMD4<Float>
     public var normal: SIMD4<Float>
@@ -546,6 +552,7 @@ struct VOut {
     float3 emissive;
     float opacity;
     float flatShade;
+    float2 pbr; // perceptual roughness, metallic
 };
 
 #define HORIZON_LIN float3(0.78, 0.81, 0.85)
@@ -689,6 +696,7 @@ constant float3 cubeNormals[6] = {
 
 inline VOut collapse() {
     VOut o;
+    o.pbr = float2(0.45, 0.0);
     o.position = float4(0, 0, -2, 1);
     o.normal = float3(0); o.world = float3(0); o.albedo = float3(0);
     o.emissive = float3(0); o.opacity = 0;
@@ -702,6 +710,7 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
                             normalize(inst.model[1].xyz),
                             normalize(inst.model[2].xyz));
     VOut o;
+    o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * world;
     o.normal = rot * n;
     o.world = world.xyz;
@@ -817,6 +826,7 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
     // the render skin matches the contact skin, so layered cloth touches
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * (side == 0 ? 1.0 : -1.0) * 0.95);
     VOut o;
+    o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
     o.normal = nt.xyz;
@@ -845,6 +855,7 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     uint comp = packed >> 24;
     SkinRenderVertex sv = verts[v];
     VOut o;
+    o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(sv.position.xyz, 1);
     o.world = sv.position.xyz;
     o.normal = normalize(sv.normal.xyz);
@@ -873,10 +884,13 @@ vertex VOut rigid_mesh_vertex(
     float4 q = posAng[body];
     float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
     VOut o;
+    o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(world, 1);
     o.world = world;
     o.normal = normalize(rigidMeshRotate(q, v.normal.xyz));
     o.albedo = srgbToLin(v.color.rgb);
+    if (v.normal.w > 0.0) o.pbr = float2(clamp(v.normal.w, 0.02, 1.0),
+                                       clamp(v.color.w, 0.0, 1.0));
     o.emissive = float3(0);
     o.opacity = 1;
     if (hasAppearanceOverrides != 0) {
@@ -920,24 +934,26 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float NdH = max(dot(n, H), 0.0);
     float HdV = max(dot(H, V), 0.0);
 
-    const float rough = 0.45;
+    float rough = clamp(in.pbr.x, 0.02, 1.0);
+    float metal = clamp(in.pbr.y, 0.0, 1.0);
     float a2 = rough * rough; a2 *= a2;
     float dDen = NdH * NdH * (a2 - 1.0) + 1.0;
     float D = a2 / (M_PI_F * dDen * dDen);
     float k = (rough + 1.0); k = k * k / 8.0;
     float G = (NdV / (NdV * (1.0 - k) + k)) * (NdL / (NdL * (1.0 - k) + k));
-    float3 F0 = float3(0.04);
+    float3 F0 = mix(float3(0.04), in.albedo, metal);
     float3 F = F0 + (1.0 - F0) * pow(1.0 - HdV, 5.0);
     float3 spec = D * G * F / max(4.0 * NdV * NdL, 1e-4);
 
     float shadow = shadowVisibility(in.world, n, U, shadowTex);
-    float3 direct = (in.albedo / M_PI_F * (1.0 - F) + spec) * SUN_COL * NdL * shadow;
+    float3 direct = (in.albedo / M_PI_F * (1.0 - metal) * (1.0 - F) + spec) * SUN_COL * NdL * shadow;
 
     float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
-    float3 ambient = in.albedo * irr;
+    float3 ambient = in.albedo * irr * (1.0 - metal);
     float3 R = reflect(-V, n);
     float3 skyRef = mix(HORIZON_LIN, float3(0.42, 0.48, 0.58), clamp(R.z, 0.0, 1.0));
-    ambient += skyRef * (F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0)) * 0.30;
+    ambient += skyRef * (F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0))
+        * mix(0.50, 0.20, rough);
     ambient *= ao;
 
     float3 lit = direct + ambient + in.emissive;
@@ -1025,6 +1041,7 @@ vertex VOut soft_vertex_front(uint vid [[vertex_id]],
     float4 nt = normals[body];
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * 0.95);
     VOut o;
+    o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
     o.normal = nt.xyz;
@@ -2355,9 +2372,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.label = "World-position and normal prepass"
                 enc.setViewport(aoViewport)
                 enc.setDepthStencilState(depthState)
-                enc.setRenderPipelineState(floorPreP)
                 enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                if activeOptions.showsGroundPlane {
+                    enc.setRenderPipelineState(floorPreP)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                }
                 if rigidCount > 0 {
                     for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
                                        (torusPre!, TORV), (capsulePre!, CAPV)] {
@@ -2492,12 +2511,14 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 
         enc.setDepthStencilState(depthState)
-        enc.setRenderPipelineState(floorP)
+        if activeOptions.showsGroundPlane { enc.setRenderPipelineState(floorP) }
         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentTexture(aoTexA, index: 0)
         enc.setFragmentTexture(shadowTex, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        if activeOptions.showsGroundPlane {
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        }
 
         enc.setDepthStencilState(depthState)
         if rigidCount > 0 {

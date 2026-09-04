@@ -132,6 +132,8 @@ public struct SkinVertexGPU {
 /// Expanded visual-only rigid-mesh corner. `position.w` stores the owning
 /// body id as Float bit-pattern so the Metal vertex shader can fetch the live
 /// body pose without a per-mesh draw call or duplicated transforms.
+/// normal.w > 0 stores roughness; color.w stores metallic in that case.
+/// normal.w == 0 is the legacy dielectric material (roughness 0.45).
 public struct RigidMeshVertexGPU {
     public var positionBody: SIMD4<Float> = .zero
     public var normal: SIMD4<Float> = .zero

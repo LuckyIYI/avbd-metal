@@ -471,12 +471,18 @@ public struct SceneRigidMesh {
     public var localPosition: F3
     public var localRotation: Quat
     public var color: F3
+    public var roughness: Float
+    public var metallic: Float
 
     public init(body: Int, mesh: SurfaceMesh,
                 localPosition: F3 = .zero,
                 localRotation: Quat = Quat(real: 1, imag: .zero),
-                color: F3 = F3(0.24, 0.28, 0.34)) {
+                color: F3 = F3(0.24, 0.28, 0.34),
+                roughness: Float = 0.45, metallic: Float = 0) {
         precondition(body >= 0)
+        precondition(roughness.isFinite && metallic.isFinite
+            && (0...1).contains(roughness) && (0...1).contains(metallic),
+            "PBR roughness and metallic must be in 0...1")
         self.body = body
         vertices = mesh.vertices
         normals = mesh.normals
@@ -484,6 +490,8 @@ public struct SceneRigidMesh {
         self.localPosition = localPosition
         self.localRotation = localRotation.normalized
         self.color = color
+        self.roughness = roughness
+        self.metallic = metallic
     }
 }
 
