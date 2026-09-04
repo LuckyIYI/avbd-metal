@@ -560,6 +560,15 @@ public struct SimSettings {
     /// ordered. Costs more colors (more primal dispatches per iteration) and
     /// a per-frame recoloring. Rigid-only scenes are reproducible either way.
     public var deterministic: Bool = false
+    /// Compaction stiffening for tetrahedral soft bodies. The stable
+    /// Neo-Hookean volume term is bounded as a tet is crushed flat, so a
+    /// low-modulus plush pinched by a torque-limited gripper collapses to a
+    /// sheet with no grip. Below volume ratio `tetCompactionOnset` (0 = off)
+    /// the bulk stiffness is raised by `tetCompactionGain` times lambda,
+    /// modelling stuffing that compacts and then stiffens sharply. Softness
+    /// in bending, shear and moderate compression is unchanged.
+    public var tetCompactionOnset: Float = 0
+    public var tetCompactionGain: Float = 0
     public var frictionCombineMode: FrictionCombineMode = .geometricMean
     public var alpha: Float = 0.99
     // 10000 matches the reference avbd-demo3d default (its in-code note
