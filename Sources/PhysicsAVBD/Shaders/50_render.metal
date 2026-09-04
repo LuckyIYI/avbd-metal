@@ -196,20 +196,38 @@ inline float3x3 skinInverse3(float3x3 m, float det)
                     float3(r0.z, r1.z, r2.z) * invDet);
 }
 
-// Rotation factor of F by Higham's iteration X <- (X + X^-T) / 2. Six
-// steps are ample for the strains a plush skin sees; a reflected F keeps
-// its sign so the caller falls back to the affine map elsewhere.
-inline float3x3 skinPolarRotation(float3x3 F, float3x3 Finv)
+// Rotation factor of F by the scaled Newton iteration for the polar
+// decomposition, X <- (g X + X^-T / g) / 2 with g = sqrt(|X^-1| / |X|)
+// (Frobenius). The scaling makes convergence quadratic even for strongly
+// anisotropic strains, where the unscaled iteration needs dozens of steps.
+// Returns false when the iteration did not converge to an orthogonal
+// matrix so the caller can fall back to the affine map.
+inline bool skinPolarRotation(float3x3 F, float3x3 Finv, thread float3x3& R)
 {
     float3x3 X = F;
     float3x3 Xinv = Finv;
-    for (int i = 0; i < 6; i++) {
-        X = (X + transpose(Xinv)) * 0.5f;
+    bool converged = false;
+    for (int i = 0; i < 12; i++) {
+        float nx = sqrt(dot(X[0], X[0]) + dot(X[1], X[1]) + dot(X[2], X[2]));
+        float ni = sqrt(dot(Xinv[0], Xinv[0]) + dot(Xinv[1], Xinv[1]) + dot(Xinv[2], Xinv[2]));
+        if (!(nx > 0.0f) || !(ni > 0.0f)) break;
+        float g = sqrt(ni / nx);
+        float3x3 next = (X * g + transpose(Xinv) * (1.0f / g)) * 0.5f;
+        float3x3 delta = next - X;
+        float change = sqrt(dot(delta[0], delta[0]) + dot(delta[1], delta[1])
+                            + dot(delta[2], delta[2]));
+        X = next;
         float d = determinant(X);
-        if (fabs(d) < 1e-14f) break;
+        if (!(fabs(d) > 1e-14f)) break;
         Xinv = skinInverse3(X, d);
+        if (change < 1e-5f) { converged = true; break; }
     }
-    return X;
+    // Accept only a proper rotation: orthonormal columns and det +1.
+    float3x3 gram = transpose(X) * X;
+    float3x3 err = gram - float3x3(1.0f);
+    float ortho = sqrt(dot(err[0], err[0]) + dot(err[1], err[1]) + dot(err[2], err[2]));
+    R = X;
+    return converged && ortho < 1e-3f && determinant(X) > 0.5f;
 }
 
 kernel void skin_deform(
@@ -256,13 +274,19 @@ kernel void skin_deform(
         // Both weight sets sum to one, so this is F times the rest offset.
         float4 dw = w - wc;
         float3 affineOffset = q0 * dw.x + q1 * dw.y + q2 * dw.z + q3 * dw.w;
+        // Inverted tets (det <= 0) and degenerate ones keep the affine
+        // map: there is no rotation to carry the offset with.
         float3x3 F(f0, f1, f2);
         float det = determinant(F);
-        if (fabs(det) > 1e-14f) {
+        float3x3 R;
+        if (det > 1e-14f) {
             float3x3 Finv = skinInverse3(F, det);
             float3 restOffset = Finv * affineOffset;
-            float3x3 R = skinPolarRotation(F, Finv);
-            p = anchor + R * restOffset;
+            if (skinPolarRotation(F, Finv, R)) {
+                p = anchor + R * restOffset;
+            } else {
+                p = anchor + affineOffset;
+            }
         } else {
             p = anchor + affineOffset;
         }

@@ -15,6 +15,15 @@ import simd
 /// lattice cell. Offsetting the field outward (`fieldOffset` < 0) fattens
 /// such features so a visual skin stays inside its simulation cage.
 public enum IsosurfaceStuffing {
+    public enum Error: Swift.Error, Equatable {
+        case invalidOptions
+        case invalidBounds
+        /// The lattice would need more vertices than `Options.maxLatticeVertices`.
+        case latticeTooLarge(vertices: Int, limit: Int)
+        /// The field returned a non-finite value at a lattice vertex.
+        case nonFiniteField(at: F3)
+    }
+
     public struct Options {
         /// Lattice spacing (cube edge). BCC tets have edges of spacing and
         /// spacing * sqrt(3) / 2.
@@ -24,6 +33,9 @@ public enum IsosurfaceStuffing {
         /// Warp thresholds as fractions of edge length (paper defaults).
         public var alphaLong: Float = 0.24871
         public var alphaShort: Float = 0.41189
+        /// Upper bound on lattice vertices (grid nodes plus cube centres);
+        /// a request beyond it throws instead of allocating.
+        public var maxLatticeVertices: Int = 20_000_000
         public init(spacing: Float) { self.spacing = spacing }
     }
 
@@ -69,18 +81,43 @@ public enum IsosurfaceStuffing {
         }
     }
 
-    /// Meshes the negative region of `field` inside `bounds`.
+    /// Meshes the negative region of `field` inside `bounds`. Throws on
+    /// non-finite or inverted bounds, non-finite options, a lattice beyond
+    /// `Options.maxLatticeVertices`, or a non-finite field sample.
     public static func mesh(field: @Sendable (F3) -> Float, bounds: (lo: F3, hi: F3),
-                            options: Options) -> TetMesh {
+                            options: Options) throws -> TetMesh {
         let h = options.spacing
-        precondition(h > 0, "spacing must be positive")
-        // Pad by one cell so the surface never touches the lattice boundary.
-        let origin = bounds.lo - F3(repeating: 1.5 * h)
-        let span = bounds.hi - bounds.lo + F3(repeating: 3 * h)
-        let nx = max(2, Int(ceil(span.x / h))), ny = max(2, Int(ceil(span.y / h)))
-        let nz = max(2, Int(ceil(span.z / h)))
-        let gridCount = (nx + 1) * (ny + 1) * (nz + 1)
-        let centerCount = nx * ny * nz
+        guard h.isFinite, h > 0, options.fieldOffset.isFinite,
+              options.alphaLong.isFinite, options.alphaShort.isFinite,
+              options.alphaLong >= 0, options.alphaLong < 0.5,
+              options.alphaShort >= 0, options.alphaShort < 0.5,
+              options.maxLatticeVertices > 0 else { throw Error.invalidOptions }
+        let finite = { (v: F3) in v.x.isFinite && v.y.isFinite && v.z.isFinite }
+        guard finite(bounds.lo), finite(bounds.hi),
+              bounds.lo.x < bounds.hi.x, bounds.lo.y < bounds.hi.y,
+              bounds.lo.z < bounds.hi.z else { throw Error.invalidBounds }
+        // Pad so the surface never touches the lattice boundary: one and a
+        // half cells, plus whatever a negative offset grows the solid by.
+        let pad = 1.5 * h + max(0, -options.fieldOffset)
+        let origin = bounds.lo - F3(repeating: pad)
+        let span = bounds.hi - bounds.lo + F3(repeating: 2 * pad)
+        func cells(_ extent: Float) throws -> Int {
+            let n = ceil(Double(extent) / Double(h))
+            guard n.isFinite, n < Double(Int32.max) else {
+                throw Error.latticeTooLarge(vertices: Int.max, limit: options.maxLatticeVertices)
+            }
+            return max(2, Int(n))
+        }
+        let nx = try cells(span.x), ny = try cells(span.y), nz = try cells(span.z)
+        let (gridA, o1) = (nx + 1).multipliedReportingOverflow(by: ny + 1)
+        let (gridCount, o2) = gridA.multipliedReportingOverflow(by: nz + 1)
+        let (centA, o3) = nx.multipliedReportingOverflow(by: ny)
+        let (centerCount, o4) = centA.multipliedReportingOverflow(by: nz)
+        if o1 || o2 || o3 || o4 || gridCount + centerCount > options.maxLatticeVertices {
+            throw Error.latticeTooLarge(
+                vertices: (o1 || o2 || o3 || o4) ? Int.max : gridCount + centerCount,
+                limit: options.maxLatticeVertices)
+        }
         func gid(_ i: Int, _ j: Int, _ k: Int) -> Int { (i * (ny + 1) + j) * (nz + 1) + k }
         func cid(_ i: Int, _ j: Int, _ k: Int) -> Int { gridCount + (i * ny + j) * nz + k }
         var pos = [F3](repeating: .zero, count: gridCount + centerCount)
@@ -98,6 +135,9 @@ public enum IsosurfaceStuffing {
             DispatchQueue.concurrentPerform(iterations: pos.count) { i in
                 base[i] = field(pos[i]) + options.fieldOffset
             }
+        }
+        if let bad = val.firstIndex(where: { !$0.isFinite }) {
+            throw Error.nonFiniteField(at: pos[bad])
         }
 
         // BCC tets: two face-adjacent cube centres plus an edge of the shared
