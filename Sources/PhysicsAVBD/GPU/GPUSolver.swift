@@ -3206,7 +3206,7 @@ public final class GPUSolver {
                 precondition(mesh.normals.count == mesh.vertices.count,
                              "rigid mesh normal count mismatch")
                 let bodyBits = Float(bitPattern: UInt32(mesh.body))
-                let color = SIMD4(mesh.color, 1)
+                let color = SIMD4(mesh.color, min(max(mesh.metallic, 0), 1))
                 let vertexBase = UInt32(vertices.count)
                 for index in mesh.vertices.indices {
                     var vertex = RigidMeshVertexGPU()
@@ -3215,7 +3215,7 @@ public final class GPUSolver {
                     let normal = normalize(
                         mesh.localRotation.act(mesh.normals[index]))
                     vertex.positionBody = SIMD4(position, bodyBits)
-                    vertex.normal = SIMD4(normal, 0)
+                    vertex.normal = SIMD4(normal, min(max(mesh.roughness, 0.02), 1))
                     vertex.color = color
                     vertices.append(vertex)
                 }

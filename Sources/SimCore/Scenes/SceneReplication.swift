@@ -135,7 +135,8 @@ public extension PhysicsScene {
                         vertices: mesh.vertices, normals: mesh.normals,
                         triangles: mesh.triangles),
                     localPosition: mesh.localPosition,
-                    localRotation: mesh.localRotation, color: mesh.color))
+                    localRotation: mesh.localRotation, color: mesh.color,
+                    roughness: mesh.roughness, metallic: mesh.metallic))
             }
             for mesh in source.skinnedMeshes {
                 let vertices = mesh.vertices.map { vertex in
