@@ -7,6 +7,61 @@ import simd
 /// Soft body physics per the paper: 3-DOF particles, hard rod elements,
 /// Neo-Hookean tets, and two-way rigid coupling.
 final class SoftBodyTests: XCTestCase {
+    func testLinearVelocityImpulsePreservesAccelerationHistory() throws {
+        var scene = PhysicsScene(name: "impulse-history")
+        scene.settings.gravity = -9.81
+        let body = scene.addBody(
+            size: F3(repeating: 0.2), density: 1, friction: 0.5,
+            position: F3(0, 0, 1), shape: .box)
+        let solver = try GPUSolver(scene: scene)
+        solver.setBodyStates([.init(
+            body: body, position: F3(0, 0, 1), rotation: Quat(),
+            linearVelocity: F3(0.25, -0.5, 0.75),
+            angularVelocity: .zero)])
+
+        let beforeVelocity = solver.velLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        let beforePrevious = solver.prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        let accelerationHistory = beforeVelocity - beforePrevious
+        let delta = F3(-0.4, 0.6, -0.8)
+
+        solver.applyLinearVelocityImpulses([.init(
+            body: body, deltaVelocity: delta)])
+
+        let afterVelocity = solver.velLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        let afterPrevious = solver.prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        XCTAssertEqual(afterVelocity.x, beforeVelocity.x + delta.x, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.y, beforeVelocity.y + delta.y, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.z, beforeVelocity.z + delta.z, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.x - afterPrevious.x,
+                       accelerationHistory.x, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.y - afterPrevious.y,
+                       accelerationHistory.y, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.z - afterPrevious.z,
+                       accelerationHistory.z, accuracy: 1e-7)
+    }
+
+    func testSnapshotsAreBoundToTheirOriginatingSolver() throws {
+        var scene = PhysicsScene(name: "snapshot-owner")
+        _ = scene.addBody(
+            size: F3(repeating: 0.2), density: 1, friction: 0.5,
+            position: F3(0, 0, 1), shape: .box)
+        let first = try GPUSolver(scene: scene)
+        let second = try GPUSolver(scene: scene)
+
+        let rigid = first.captureRigidSpeculationSnapshot()
+        let full = first.captureSimulationSnapshot()
+        XCTAssertTrue(first.owns(rigid))
+        XCTAssertTrue(first.owns(full))
+        XCTAssertFalse(second.owns(rigid),
+            "equal-sized solvers must not accept each other's topology-opaque snapshots")
+        XCTAssertFalse(second.owns(full),
+            "full simulation snapshots require the same ownership guard")
+    }
+
     private func particleBounds(_ scene: PhysicsScene,
                                 bodyIDs: [Int]) -> (F3, F3) {
         var mn = F3(repeating: Float.greatestFiniteMagnitude)

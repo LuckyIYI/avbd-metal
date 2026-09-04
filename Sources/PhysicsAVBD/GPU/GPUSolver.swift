@@ -15,6 +15,10 @@ import SimCore
 //   5. n iterations of: per-color primal solve (6x6 LDL) + dual update
 //   6. BDF1 velocity finalize
 public final class GPUSolver {
+    /// Process-local identity for opaque checkpoints. Equal buffer sizes do
+    /// not imply equal authored topology, so snapshots must never be restored
+    /// into a different solver instance.
+    private let snapshotOwnerID = UUID()
     /// Collision-safe displacement limiter for deformable surface V-T/E-E
     /// motion. Automatic selection uses Planar-DAT for shell-only scenes and
     /// opt-in volumetric self-collision. Ordinary closed tet bodies retain the
@@ -3846,6 +3850,8 @@ public final class GPUSolver {
         sync()
         let velocities = velLin.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: numBodies)
+        let previousVelocities = prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
         for impulse in impulses {
             precondition(impulse.body >= 0 && impulse.body < numBodies,
                 "body index out of range")
@@ -3856,6 +3862,13 @@ public final class GPUSolver {
             velocities[impulse.body].x += impulse.deltaVelocity.x
             velocities[impulse.body].y += impulse.deltaVelocity.y
             velocities[impulse.body].z += impulse.deltaVelocity.z
+            // warmstart_bodies estimates pre-existing acceleration from
+            // velLin - prevVelLin. Move both samples by the same external
+            // impulse so that estimate is preserved rather than interpreting
+            // the control input as an extra frame of acceleration.
+            previousVelocities[impulse.body].x += impulse.deltaVelocity.x
+            previousVelocities[impulse.body].y += impulse.deltaVelocity.y
+            previousVelocities[impulse.body].z += impulse.deltaVelocity.z
         }
     }
 
@@ -4524,6 +4537,7 @@ public final class GPUSolver {
     /// scene data and soft-body state; callers must use it only with the same
     /// solver instance and a rigid scene.
     public struct RigidSpeculationSnapshot: Sendable {
+        fileprivate var ownerID: UUID
         fileprivate var posLin: Data
         fileprivate var posAng: Data
         fileprivate var initLin: Data
@@ -4571,6 +4585,7 @@ public final class GPUSolver {
             lastMaxColorUsed)
         statsLock.unlock()
         return RigidSpeculationSnapshot(
+            ownerID: snapshotOwnerID,
             posLin: copy(posLin), posAng: copy(posAng),
             initLin: copy(initLin), initAng: copy(initAng),
             inertLin: copy(inertLin), inertAng: copy(inertAng),
@@ -4604,6 +4619,8 @@ public final class GPUSolver {
     private func restoreRigidSpeculationState(
         _ snapshot: RigidSpeculationSnapshot
     ) {
+        precondition(snapshot.ownerID == snapshotOwnerID,
+            "speculation snapshot belongs to a different solver")
         sync()
         func restore(_ data: Data, to buffer: MTLBuffer) {
             precondition(data.count == buffer.length,
@@ -4655,6 +4672,12 @@ public final class GPUSolver {
         precondition(numTris == 0 && numTets == 0,
             "rigid speculation snapshots do not include soft-body state")
         restoreRigidSpeculationState(snapshot)
+    }
+
+    /// Internal test seam for the fail-fast ownership guard. Keeping this
+    /// non-public preserves the snapshot's intentionally opaque API.
+    func owns(_ snapshot: RigidSpeculationSnapshot) -> Bool {
+        snapshot.ownerID == snapshotOwnerID
     }
 
     /// Opaque same-solver checkpoint for contact-rich speculative control.
@@ -4729,6 +4752,11 @@ public final class GPUSolver {
         restore(snapshot.ogcPrev, to: ogcPrevBuf)
         restore(snapshot.planarDATT, to: planarDATTBuf)
         restore(snapshot.convexQueryPoison, to: convexQueryPoison)
+    }
+
+    /// Internal counterpart for full simulation checkpoints.
+    func owns(_ snapshot: SimulationSnapshot) -> Bool {
+        snapshot.rigid.ownerID == snapshotOwnerID
     }
 
     /// Cap the pipeline depth to the two frame-owned counter readback slots.
