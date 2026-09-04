@@ -2646,11 +2646,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
         enc.endEncoding()
 
+        #if targetEnvironment(simulator)
+        // the simulator SDK has no present(afterMinimumDuration:); pacing is
+        // a device concern anyway
+        cmd.present(drawable)
+        #else
         if let hold = activeOptions.minimumFrameDuration {
             cmd.present(drawable, afterMinimumDuration: hold)
         } else {
             cmd.present(drawable)
         }
+        #endif
         let retire = renderScene.renderSceneRequiresFrameRetirement
         framesDrawn += 1
         let frameNumber = framesDrawn
