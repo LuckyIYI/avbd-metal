@@ -16,7 +16,7 @@ private struct SkinnedSoftMeshTemplateKey: Hashable {
     var height: UInt32
     var res: Int
     var visualVertexLimit: Int
-    var voxelVertexLimit: Int
+    var fieldVertexLimit: Int
     var minTetElements: Int
 }
 
@@ -76,7 +76,7 @@ extension Demos {
                                           height: Float = 1.7,
                                           res: Int = 8,
                                           visualVertexLimit: Int = 1400,
-                                          voxelVertexLimit: Int = 6000,
+                                          fieldVertexLimit: Int = 3000,
                                           minTetElements: Int = 600,
                                           mu: Float = 2500,
                                           lambda: Float? = nil,
@@ -86,7 +86,7 @@ extension Demos {
         addSkinnedSoftMesh(
             &s, mesh: input, center: center, height: height, res: res,
             visualVertexLimit: visualVertexLimit,
-            voxelVertexLimit: voxelVertexLimit,
+            fieldVertexLimit: fieldVertexLimit,
             minTetElements: minTetElements, mu: mu, lambda: lambda,
             massScale: massScale, friction: friction,
             selfCollisionEnabled: false)
@@ -99,7 +99,7 @@ extension Demos {
                                           height: Float = 1.7,
                                           res: Int = 8,
                                           visualVertexLimit: Int = 1400,
-                                          voxelVertexLimit: Int = 6000,
+                                          fieldVertexLimit: Int = 3000,
                                           minTetElements: Int = 600,
                                           mu: Float = 2500,
                                           lambda: Float? = nil,
@@ -110,7 +110,7 @@ extension Demos {
         let template = makeSkinnedSoftMeshTemplate(mesh: input, height: height,
                                                    res: res,
                                                    visualVertexLimit: visualVertexLimit,
-                                                   voxelVertexLimit: voxelVertexLimit,
+                                                   fieldVertexLimit: fieldVertexLimit,
                                                    minTetElements: minTetElements)
         return instantiateSkinnedSoftMesh(&s, template: template, center: center,
                                           mu: mu, lambda: lambda ?? 10 * mu,
@@ -120,63 +120,54 @@ extension Demos {
                                             selfCollisionEnabled)
     }
 
+    /// Builds the simulation cage for a skinned asset with isosurface
+    /// stuffing: a BCC lattice at `height / res` spacing cut to the asset's
+    /// signed distance field, grown by a third of a cell so the visual
+    /// surface lies inside its tets. The field comes from a decimated proxy
+    /// (`fieldVertexLimit`); the drawn skin from `visualVertexLimit`. The
+    /// lattice refines until at least `minTetElements` tets exist.
     private static func makeSkinnedSoftMeshTemplate(mesh input: SurfaceMesh,
                                                     height: Float,
                                                     res: Int,
                                                     visualVertexLimit: Int,
-                                                    voxelVertexLimit: Int,
+                                                    fieldVertexLimit: Int,
                                                     minTetElements: Int)
         -> SkinnedSoftMeshTemplate {
         let fitted = input.fitted(height: height, center: .zero)
         let visual = fitted.simplified(maxVertices: visualVertexLimit)
-        let voxelSource = fitted.simplified(maxVertices: voxelVertexLimit)
+        let fieldSource = fitted.simplified(maxVertices: fieldVertexLimit)
+        let field: TriangleMeshDistanceField
+        do {
+            field = try TriangleMeshDistanceField(mesh: fieldSource)
+        } catch {
+            preconditionFailure("skinned soft mesh: unusable surface: \(error)")
+        }
+        let bounds = fieldSource.bounds()
         let targetTets = max(1, minTetElements)
-        var voxelRes = max(3, res)
-        var surfaceBand: Float = 0.45
-        var voxel = voxelSource.voxelCells(res: voxelRes,
-                                           surfaceBand: surfaceBand)
-        while voxelRes > 3 {
-            let candidate = voxelSource.voxelCells(res: voxelRes - 1,
-                                                   surfaceBand: surfaceBand)
-            guard candidate.0.count * 5 >= targetTets else { break }
-            voxelRes -= 1
-            voxel = candidate
+        var spacing = height / Float(max(3, res))
+        var cage: IsosurfaceStuffing.TetMesh
+        // Refine the lattice until the element budget is met (each step
+        // adds about 2x the tets), stopping at 0.4% of the height.
+        while true {
+            cage = stuffedCage(field: field, bounds: bounds, spacing: spacing,
+                               growth: spacing / 3)
+            if cage.tets.count >= targetTets || spacing <= height * 0.004 { break }
+            spacing *= 0.8
         }
-        while voxel.0.count * 5 < targetTets
-            && (voxelRes < 40 || surfaceBand < 1.05) {
-            if voxelRes < 40 {
-                voxelRes = min(40, voxelRes + max(1, voxelRes / 3))
-            } else {
-                surfaceBand = min(1.05, surfaceBand + 0.20)
-            }
-            voxel = voxelSource.voxelCells(res: voxelRes,
-                                           surfaceBand: surfaceBand)
+        // The drawn surface must lie inside its cage: an overhang binds with
+        // extrapolating weights and follows the tet's strain, not its
+        // shape. The field proxy is a clustered decimation that shrinks
+        // convex features, and ears thinner than a cell vanish from the
+        // lattice, so grow the field until every visual vertex is inside,
+        // up to one cell.
+        var growth = spacing / 3
+        var bound = bindAndMeasure(cage: cage, visual: visual, spacing: spacing)
+        while bound.minimumWeight < -1e-4 && growth < spacing {
+            growth = min(spacing, growth + spacing / 6)
+            cage = stuffedCage(field: field, bounds: bounds, spacing: spacing, growth: growth)
+            bound = bindAndMeasure(cage: cage, visual: visual, spacing: spacing)
         }
-        var cells = voxel.0
-        let (_, origin, spacing) = voxel
-        // The visual surface must be embedded inside the tetrahedral cage.
-        // A center-distance surface raster can omit the cell containing a
-        // vertex near a cell corner, which forces extrapolating barycentric
-        // weights and makes a volume-preserving cage look like a collapsing
-        // shell. Include each visual vertex's containing voxel explicitly,
-        // then seal enclosed gaps in imperfect scan meshes before tetrahedralizing.
-        for p in visual.vertices {
-            let q = floor((p - origin) / spacing)
-            cells.insert(SIMD3(Int(q.x), Int(q.y), Int(q.z)))
-        }
-        cells = fillEnclosedCells(in: cells)
-        if cells.count * 5 < targetTets {
-            cells = expandedCells(cells, targetCount: (targetTets + 4) / 5)
-        }
-        var tmp = PhysicsScene(name: "skin-template")
-        let nodes = addSoftVoxelCells(&tmp, cells: cells, origin: origin,
-                                      spacing: spacing, mu: 1,
-                                      lambda: 1,
-                                      massPerNode: 1,
-                                      friction: 0)
-        let skin = bindVisualMesh(visual, scene: tmp,
-                                  tetRange: 0..<tmp.tets.count,
-                                  bodyIDs: nodes)
+        let (tmp, nodes, skin) = (bound.scene, bound.nodes, bound.skin)
         let nodePositions = nodes.map { tmp.bodies[$0].position }
         let joints = tmp.joints.compactMap { j -> (Int, Int)? in
             guard j.bodyA >= 0, j.bodyB >= 0 else { return nil }
@@ -190,26 +181,76 @@ extension Demos {
                                        spacing: spacing)
     }
 
+    private static func stuffedCage(field: TriangleMeshDistanceField,
+                                    bounds: (F3, F3), spacing: Float,
+                                    growth: Float) -> IsosurfaceStuffing.TetMesh {
+        var options = IsosurfaceStuffing.Options(spacing: spacing)
+        options.fieldOffset = -growth
+        do {
+            return try IsosurfaceStuffing.mesh(
+                field: { field.signedDistance($0) }, bounds: bounds, options: options)
+        } catch {
+            preconditionFailure("skinned soft mesh: stuffing failed: \(error)")
+        }
+    }
+
+    /// Instantiates the cage in a scratch scene, binds the visual mesh to it
+    /// and reports the most negative barycentric weight (0 or above means
+    /// every visual vertex lies inside a tet).
+    private static func bindAndMeasure(cage: IsosurfaceStuffing.TetMesh,
+                                       visual: SurfaceMesh, spacing: Float)
+        -> (scene: PhysicsScene, nodes: [Int], skin: SceneSkinnedMesh, minimumWeight: Float) {
+        var tmp = PhysicsScene(name: "skin-template")
+        var nodes: [Int] = []
+        nodes.reserveCapacity(cage.nodes.count)
+        for p in cage.nodes {
+            nodes.append(tmp.addParticle(radius: spacing * 0.32, mass: 1,
+                                         friction: 0, position: p))
+        }
+        var edges = Set<UInt64>()
+        for t in cage.tets {
+            let ids = [nodes[Int(t.x)], nodes[Int(t.y)], nodes[Int(t.z)], nodes[Int(t.w)]]
+            tmp.addTet(SceneTet(ids: (ids[0], ids[1], ids[2], ids[3]), mu: 1, lambda: 1))
+            for i in 0..<4 { for j in (i + 1)..<4 {
+                let lo = min(ids[i], ids[j]), hi = max(ids[i], ids[j])
+                edges.insert(UInt64(lo) << 32 | UInt64(hi))
+            } }
+        }
+        // Inert joints mark tet neighbours as collision exclusions; a
+        // sorted walk keeps their order deterministic.
+        for key in edges.sorted() {
+            tmp.addJoint(SceneJoint(bodyA: Int(key >> 32), bodyB: Int(key & 0xffff_ffff),
+                                    rA: .zero, rB: .zero,
+                                    stiffnessLin: 0, stiffnessAng: 0))
+        }
+        let skin = bindVisualMesh(visual, scene: tmp,
+                                  tetRange: 0..<tmp.tets.count, bodyIDs: nodes)
+        let minimumWeight = skin.vertices.reduce(Float(0)) {
+            min($0, min(min($1.weights.x, $1.weights.y), min($1.weights.z, $1.weights.w)))
+        }
+        return (tmp, nodes, skin, minimumWeight)
+    }
+
     private static func cachedSkinnedSoftMeshTemplate(mesh input: SurfaceMesh,
                                                       meshKey: String,
                                                       height: Float,
                                                       res: Int,
                                                       visualVertexLimit: Int,
-                                                      voxelVertexLimit: Int,
+                                                      fieldVertexLimit: Int,
                                                       minTetElements: Int)
         -> SkinnedSoftMeshTemplate {
         let key = SkinnedSoftMeshTemplateKey(mesh: meshKey,
                                              height: height.bitPattern,
                                              res: res,
                                              visualVertexLimit: visualVertexLimit,
-                                             voxelVertexLimit: voxelVertexLimit,
+                                             fieldVertexLimit: fieldVertexLimit,
                                              minTetElements: minTetElements)
         return SkinnedSoftMeshCache.shared.template(for: key) {
             makeSkinnedSoftMeshTemplate(mesh: input,
                                         height: height,
                                         res: res,
                                         visualVertexLimit: visualVertexLimit,
-                                        voxelVertexLimit: voxelVertexLimit,
+                                        fieldVertexLimit: fieldVertexLimit,
                                         minTetElements: minTetElements)
         }
     }
@@ -273,13 +314,13 @@ extension Demos {
         let n = max(1, count)
         let bodyHeight: Float = n > 8 ? 1.12 : 1.35
         let visualLimit = n > 12 ? 8_000 : 40_000
-        let voxelLimit = n > 12 ? 6500 : 9000
+        let fieldLimit = 3000
         let template = cachedSkinnedSoftMeshTemplate(mesh: source,
                                                      meshKey: sourceKey,
                                                      height: bodyHeight,
                                                      res: res,
                                                      visualVertexLimit: visualLimit,
-                                                     voxelVertexLimit: voxelLimit,
+                                                     fieldVertexLimit: fieldLimit,
                                                      minTetElements: 1500)
         var templateMin = F3(repeating: Float.greatestFiniteMagnitude)
         var templateMax = F3(repeating: -Float.greatestFiniteMagnitude)
@@ -405,13 +446,13 @@ extension Demos {
         // voxel/tet collision proxy. Keeping the complete imported surface
         // here does not increase the solver's particle/tet count.
         let softLimit = 40_000
-        let voxelLimit = softCount > 6 ? 6500 : 9000
+        let fieldLimit = 3000
         let template = cachedSkinnedSoftMeshTemplate(mesh: source,
                                                      meshKey: sourceKey,
                                                      height: 0.62,
                                                      res: softRes,
                                                      visualVertexLimit: softLimit,
-                                                     voxelVertexLimit: voxelLimit,
+                                                     fieldVertexLimit: fieldLimit,
                                                      minTetElements: 600)
         var templateMin = F3(repeating: Float.greatestFiniteMagnitude)
         var templateMax = F3(repeating: -Float.greatestFiniteMagnitude)
@@ -473,143 +514,6 @@ extension Demos {
         s.settings.cameraDistance = 8.5 + Float(k).squareRoot() * 1.2
         s.settings.cameraTargetZ = pinZ + 0.6
         return s
-    }
-
-    private static func addSoftVoxelCells(_ s: inout PhysicsScene,
-                                          cells: Set<SIMD3<Int>>,
-                                          origin: F3,
-                                          spacing: Float,
-                                          mu: Float,
-                                          lambda: Float,
-                                          massPerNode: Float,
-                                          friction: Float) -> [Int] {
-        var nodeId: [SIMD3<Int>: Int] = [:]
-        var flat: [Int] = []
-        func node(_ i: Int, _ j: Int, _ k: Int) -> Int {
-            let key = SIMD3(i, j, k)
-            if let id = nodeId[key] { return id }
-            let p = origin + F3(Float(i), Float(j), Float(k)) * spacing
-            let id = s.addParticle(radius: spacing * 0.32, mass: massPerNode,
-                                   friction: friction, position: p)
-            nodeId[key] = id
-            flat.append(id)
-            return id
-        }
-        func tet(_ a: Int, _ b: Int, _ c: Int, _ d: Int) {
-            s.addTet(SceneTet(ids: (a, b, c, d), mu: mu, lambda: lambda))
-        }
-        for c in cells.sorted(by: { ($0.x, $0.y, $0.z) < ($1.x, $1.y, $1.z) }) {
-            let i = c.x, j = c.y, k = c.z
-            let c000 = node(i, j, k),         c100 = node(i + 1, j, k)
-            let c010 = node(i, j + 1, k),     c110 = node(i + 1, j + 1, k)
-            let c001 = node(i, j, k + 1),     c101 = node(i + 1, j, k + 1)
-            let c011 = node(i, j + 1, k + 1), c111 = node(i + 1, j + 1, k + 1)
-            if (i + j + k) % 2 == 0 {
-                tet(c000, c100, c010, c001)
-                tet(c110, c100, c010, c111)
-                tet(c101, c100, c001, c111)
-                tet(c011, c010, c001, c111)
-                tet(c100, c010, c001, c111)
-            } else {
-                tet(c100, c000, c110, c101)
-                tet(c010, c000, c110, c011)
-                tet(c001, c000, c101, c011)
-                tet(c111, c110, c101, c011)
-                tet(c000, c110, c101, c011)
-            }
-        }
-        // Dictionary iteration is process-randomized. These inert neighbor
-        // exclusions participate in graph construction, so random insertion
-        // order changes body colors and can send the same contact-rich replay
-        // down a different numerical trajectory on each launch.
-        let orderedKeys = nodeId.keys.sorted {
-            ($0.x, $0.y, $0.z) < ($1.x, $1.y, $1.z)
-        }
-        for key in orderedKeys {
-            let a = nodeId[key]!
-            for d in [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1),
-                      SIMD3(1, 1, 0), SIMD3(1, 0, 1), SIMD3(0, 1, 1),
-                      SIMD3(1, 1, 1)] {
-                if let b = nodeId[key &+ d] {
-                    s.addJoint(SceneJoint(bodyA: a, bodyB: b, rA: .zero, rB: .zero,
-                                          stiffnessLin: 0, stiffnessAng: 0))
-                }
-            }
-        }
-        return flat
-    }
-
-    private static func expandedCells(_ cells: Set<SIMD3<Int>>,
-                                      targetCount: Int) -> Set<SIMD3<Int>> {
-        var out = cells
-        guard !out.isEmpty, out.count < targetCount else { return out }
-        let dirs = [
-            SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0),
-            SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)
-        ]
-        var frontier = cells.sorted { ($0.x, $0.y, $0.z) < ($1.x, $1.y, $1.z) }
-        while !frontier.isEmpty && out.count < targetCount {
-            var next: [SIMD3<Int>] = []
-            for c in frontier {
-                for d in dirs {
-                    let n = c &+ d
-                    if out.insert(n).inserted {
-                        next.append(n)
-                        if out.count >= targetCount { return out }
-                    }
-                }
-            }
-            frontier = next.sorted { ($0.x, $0.y, $0.z) < ($1.x, $1.y, $1.z) }
-        }
-        return out
-    }
-
-    private static func fillEnclosedCells(
-        in cells: Set<SIMD3<Int>>
-    ) -> Set<SIMD3<Int>> {
-        guard let first = cells.first else { return cells }
-        var mn = first
-        var mx = first
-        for cell in cells {
-            mn = SIMD3(Swift.min(mn.x, cell.x), Swift.min(mn.y, cell.y),
-                       Swift.min(mn.z, cell.z))
-            mx = SIMD3(Swift.max(mx.x, cell.x), Swift.max(mx.y, cell.y),
-                       Swift.max(mx.z, cell.z))
-        }
-        let lo = mn &- SIMD3(repeating: 1)
-        let hi = mx &+ SIMD3(repeating: 1)
-        let directions = [
-            SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0),
-            SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)
-        ]
-        var exterior: Set<SIMD3<Int>> = [lo]
-        var queue = [lo]
-        var head = 0
-        while head < queue.count {
-            let cell = queue[head]
-            head += 1
-            for direction in directions {
-                let next = cell &+ direction
-                guard next.x >= lo.x, next.x <= hi.x,
-                      next.y >= lo.y, next.y <= hi.y,
-                      next.z >= lo.z, next.z <= hi.z,
-                      !cells.contains(next), exterior.insert(next).inserted else {
-                    continue
-                }
-                queue.append(next)
-            }
-        }
-
-        var filled = cells
-        for x in mn.x...mx.x {
-            for y in mn.y...mx.y {
-                for z in mn.z...mx.z {
-                    let cell = SIMD3(x, y, z)
-                    if !exterior.contains(cell) { filled.insert(cell) }
-                }
-            }
-        }
-        return filled
     }
 
     private static func addOpenBox(_ s: inout PhysicsScene,
@@ -831,6 +735,12 @@ extension Demos {
                 weights: best?.w ?? SIMD4(0.25, 0.25, 0.25, 0.25)))
         }
         return picks
+    }
+
+    /// The bundled asset skinned demos and tests use by default (the
+    /// Stanford bunny unless `meshPath` names another OBJ).
+    public static func defaultSkinMesh(meshPath: String? = nil) -> SurfaceMesh {
+        loadDefaultSkinMeshWithKey(meshPath: meshPath).0
     }
 
     private static func loadDefaultSkinMeshWithKey(meshPath: String?) -> (SurfaceMesh, String) {
