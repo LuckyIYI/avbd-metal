@@ -898,6 +898,41 @@ final class GPUSolverTests: XCTestCase {
         }
     }
 
+    func testDeformableDeterministicColoringTracksRuntimeSetting() throws {
+        var scene = Demos.cloth(res: 8, ball: true)
+        scene.settings.deterministic = false
+        let solver = try makeGPU(scene)
+        XCTAssertFalse(solver.usesDynamicColoring)
+
+        solver.settings.deterministic = true
+        XCTAssertTrue(solver.usesDynamicColoring)
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertNil(solver.runtimeFailure)
+
+        solver.settings.deterministic = false
+        XCTAssertFalse(solver.usesDynamicColoring)
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertNil(solver.runtimeFailure,
+            "switching back must use the preserved static topology palette")
+    }
+
+    func testRuntimeDeterministicColoringLazilyAllocatesLargeNeighborStream() throws {
+        var scene = Demos.cloth(res: 34, ball: false)
+        scene.settings.deterministic = false
+        let solver = try makeGPU(scene)
+        XCTAssertEqual(solver.adjNeighbor.length, 16,
+            "ordinary large cloth should keep the construction-time placeholder")
+
+        solver.settings.deterministic = true
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertGreaterThan(solver.adjNeighbor.length, 16)
+        XCTAssertTrue(solver.usesDynamicColoring)
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
     func testContactRichTrajectoryIsBitwiseDeterministic() throws {
         var scene = PhysicsScene(name: "deterministic-contact-grid")
         scene.settings.dt = 1 / 120
