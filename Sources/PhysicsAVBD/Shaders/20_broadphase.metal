@@ -154,6 +154,30 @@ kernel void bp_sort_cells(
     }
 }
 
+// Parallel form of the bucket sort above: every hashed item counts the
+// smaller ids in its bucket and scatters itself into the sorted copy. A
+// compact scene (one soft body inside a cell sized by its rigid neighbours)
+// puts hundreds of items into one bucket, where the serial insertion sort
+// ran ~0.6 ms per frame on a single thread. Same output, unique ids only.
+kernel void bp_rank_cells(
+    device const uint* hashedIdx    [[buffer(0)]],
+    device const uint2* bodyCellSlot [[buffer(1)]],
+    device const uint* cellStart    [[buffer(2)]],
+    device const uint* cellCount    [[buffer(3)]],
+    device const uint* cellBodies   [[buffer(4)]],   // scatter order
+    device uint* sortedBodies       [[buffer(5)]],
+    constant SimParams& P           [[buffer(6)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= P.numHashed) return;
+    uint value = hashedIdx[gid];
+    uint h = bodyCellSlot[gid].x;
+    uint s = cellStart[h], n = cellCount[h];
+    uint rank = 0;
+    for (uint k = 0; k < n; k++) rank += cellBodies[s + k] < value ? 1u : 0u;
+    sortedBodies[s + rank] = value;
+}
+
 // Binary search in sorted exclusion list of (a,b) pairs, a < b.
 inline bool pairExcluded(device const uint2* excl, uint count, uint a, uint b) {
     uint lo = 0, hi = count;

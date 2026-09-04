@@ -135,6 +135,105 @@ kernel void softmap_insert(
 }
 
 // ----------------------------------------------------------------------------
+// Deterministic soft-contact order.
+//
+// Emission appends with an atomic counter, so a contact's index depends on
+// which thread won the race, and every downstream consumer (adjacency lists,
+// per-body force accumulation order, warm-start map slots) inherits that
+// race. The persistence key pair (keyA, keyB) is unique per contact and a
+// pure function of the scene state, so re-indexing by key makes the whole
+// frame reproducible: bucket by key hash, prefix-sum the buckets, insertion
+// sort each (tiny) bucket by key, then permute the contact records.
+// ----------------------------------------------------------------------------
+
+inline bool softKeyLess(device const SoftContactGPU* soft, uint a, uint b) {
+    uint aA = as_type<uint>(soft[a].lambda.w);
+    uint bA = as_type<uint>(soft[b].lambda.w);
+    if (aA != bA) return aA < bA;
+    uint aB = as_type<uint>(soft[a].penalty.w);
+    uint bB = as_type<uint>(soft[b].penalty.w);
+    if (aB != bB) return aB < bB;
+    // Duplicate keys cannot occur from one emitter; keep the order total
+    // anyway so a duplicate can never reintroduce a race.
+    uint4 ia = soft[a].ids, ib = soft[b].ids;
+    if (ia.x != ib.x) return ia.x < ib.x;
+    if (ia.y != ib.y) return ia.y < ib.y;
+    if (ia.z != ib.z) return ia.z < ib.z;
+    return ia.w < ib.w;
+}
+
+kernel void soft_order_count(
+    device const SoftContactGPU* soft [[buffer(0)]],
+    device atomic_uint* bucketCount [[buffer(1)]],
+    device const atomic_uint* counters [[buffer(2)]],
+    constant SimParams& P           [[buffer(3)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint n = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                 P.maxSoft);
+    if (gid >= n) return;
+    uint h = softKeyHash(as_type<uint>(soft[gid].lambda.w),
+                         as_type<uint>(soft[gid].penalty.w),
+                         P.softMapCapacity);
+    atomic_fetch_add_explicit(&bucketCount[h], 1u, memory_order_relaxed);
+}
+
+kernel void soft_order_scatter(
+    device const SoftContactGPU* soft [[buffer(0)]],
+    device atomic_uint* bucketCursor [[buffer(1)]],
+    device uint* order              [[buffer(2)]],
+    device const atomic_uint* counters [[buffer(3)]],
+    constant SimParams& P           [[buffer(4)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint n = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                 P.maxSoft);
+    if (gid >= n) return;
+    uint h = softKeyHash(as_type<uint>(soft[gid].lambda.w),
+                         as_type<uint>(soft[gid].penalty.w),
+                         P.softMapCapacity);
+    uint slot = atomic_fetch_add_explicit(&bucketCursor[h], 1u,
+                                          memory_order_relaxed);
+    order[slot] = gid;
+}
+
+kernel void soft_order_sort(
+    device const SoftContactGPU* soft [[buffer(0)]],
+    device const uint* bucketStart  [[buffer(1)]],
+    device const uint* bucketCount  [[buffer(2)]],
+    device uint* order              [[buffer(3)]],
+    constant SimParams& P           [[buffer(4)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= P.softMapCapacity) return;
+    uint s = bucketStart[gid];
+    uint n = bucketCount[gid];
+    for (uint i = 1; i < n; i++) {
+        uint value = order[s + i];
+        uint j = i;
+        while (j > 0 && softKeyLess(soft, value, order[s + j - 1])) {
+            order[s + j] = order[s + j - 1];
+            j--;
+        }
+        order[s + j] = value;
+    }
+}
+
+kernel void soft_order_apply(
+    device const SoftContactGPU* soft [[buffer(0)]],
+    device const uint* order        [[buffer(1)]],
+    device SoftContactGPU* sorted   [[buffer(2)]],
+    device const atomic_uint* counters [[buffer(3)]],
+    constant SimParams& P           [[buffer(4)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint n = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                 P.maxSoft);
+    if (gid >= n) return;
+    sorted[gid] = soft[order[gid]];
+}
+
+// ----------------------------------------------------------------------------
 // Element binning: triangles + edges register in EVERY cell their AABB
 // overlaps, at a DETECTION-radius cell size (coarse centroid cells made
 // every query scan most of the sheet at high resolution: ~1000 candidate
@@ -1254,8 +1353,22 @@ kernel void rt_emit(
                                 }                                              \
                             }                                                  \
                             if (!recovered_) {                                 \
+                                float retryCap_ =                              \
+                                    2.0f * detect_ + 1.0e-4f;                  \
+                                /* Legacy cap unless the scene opted into */   \
+                                /* scale-aware recovery by asking for a */     \
+                                /* deformable margin tighter than its rigid */ \
+                                /* margin. The accepted witness is still */    \
+                                /* corrected to the undilated surfaces and */  \
+                                /* residual-certified. */                      \
+                                if (P.deformablePortalRetryCap > 0.0f) {       \
+                                    retryCap_ = max(                           \
+                                        retryCap_,                            \
+                                        min(P.deformablePortalRetryCap,       \
+                                            2.0f * rT + 1.0e-4f));            \
+                                }                                              \
                                 float adaptiveEnlarge_ = min(                  \
-                                    2.0f * detect_ + 1.0e-4f,                  \
+                                    retryCap_,                                 \
                                     max(1.0e-3f,                               \
                                         2.0f * failedUpper_ + 1.0e-4f));       \
                                 if (finite_bits(failedUpper_)                  \
