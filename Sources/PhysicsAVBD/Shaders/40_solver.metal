@@ -803,6 +803,11 @@ kernel void warmstart_joints(
     float warm = P.alpha * P.gamma;
     float stiffLin = j.rA.w;
     float stiffAng = j.rB.w;
+    if (j.prismaticAxis.w != 0) {
+        float stop = prismaticActiveStop(j, pA - pB, qA);
+        j.lambdaLin.xyz = prismaticWarmStart(j, stop);
+        j.translationLimits.w = stop;
+    }
     j.lambdaLin.xyz *= warm;
     j.lambdaAng.xyz *= warm;
     j.penaltyLin.xyz = min(clamp(j.penaltyLin.xyz * P.gamma, PENALTY_MIN, PENALTY_MAX), stiffLin);
@@ -909,11 +914,13 @@ inline void stampJoint(device const JointGPU& j, uint self,
         float3 xA = a == WORLD_BODY ? float3(0) : posLin[a].xyz;
         float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(xA, qA, j.rA.xyz);
         float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
-        M3 P = prismaticProjection(j, pA - pB, qA);
+        float stop = prismaticActiveStop(j, pA - pB, qA);
+        M3 P = prismaticProjection(j, stop);
         M3 basis = m3_mulm(P, inverseRotation(qA));
         float3 C = prismaticError(j, pA - pB, qA);
         if (j.header.w & 1) C -= j.C0Lin.xyz * alpha;
-        float3 F = penLin * C + m3_mul(P, j.lambdaLin.xyz);
+        // Prediction or a primal update can switch stops after initialization.
+        float3 F = penLin * C + prismaticWarmStart(j, stop);
         M3 jLin = m3_scale(basis, isA ? 1.0f : -1.0f);
         M3 jAng = m3_mulm(basis, m3_skew(isA ? xA - pB
             : q_rotate(posAng[b], j.rB.xyz)));
@@ -2733,7 +2740,9 @@ static inline void dual_joint_one(
         float3 C = pA - pB;
         if (j.prismaticAxis.w != 0) {
             float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
-            j.lambdaLin.xyz = m3_mul(prismaticProjection(j, C, qA), j.lambdaLin.xyz);
+            float stop = prismaticActiveStop(j, C, qA);
+            j.lambdaLin.xyz = prismaticWarmStart(j, stop);
+            j.translationLimits.w = stop;
             C = prismaticError(j, C, qA);
         }
         if (j.header.w & 1) {
