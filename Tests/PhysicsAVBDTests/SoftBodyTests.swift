@@ -7,6 +7,61 @@ import simd
 /// Soft body physics per the paper: 3-DOF particles, hard rod elements,
 /// Neo-Hookean tets, and two-way rigid coupling.
 final class SoftBodyTests: XCTestCase {
+    func testLinearVelocityImpulsePreservesAccelerationHistory() throws {
+        var scene = PhysicsScene(name: "impulse-history")
+        scene.settings.gravity = -9.81
+        let body = scene.addBody(
+            size: F3(repeating: 0.2), density: 1, friction: 0.5,
+            position: F3(0, 0, 1), shape: .box)
+        let solver = try GPUSolver(scene: scene)
+        solver.setBodyStates([.init(
+            body: body, position: F3(0, 0, 1), rotation: Quat(),
+            linearVelocity: F3(0.25, -0.5, 0.75),
+            angularVelocity: .zero)])
+
+        let beforeVelocity = solver.velLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        let beforePrevious = solver.prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        let accelerationHistory = beforeVelocity - beforePrevious
+        let delta = F3(-0.4, 0.6, -0.8)
+
+        solver.applyLinearVelocityImpulses([.init(
+            body: body, deltaVelocity: delta)])
+
+        let afterVelocity = solver.velLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        let afterPrevious = solver.prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: solver.numBodies)[body]
+        XCTAssertEqual(afterVelocity.x, beforeVelocity.x + delta.x, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.y, beforeVelocity.y + delta.y, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.z, beforeVelocity.z + delta.z, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.x - afterPrevious.x,
+                       accelerationHistory.x, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.y - afterPrevious.y,
+                       accelerationHistory.y, accuracy: 1e-7)
+        XCTAssertEqual(afterVelocity.z - afterPrevious.z,
+                       accelerationHistory.z, accuracy: 1e-7)
+    }
+
+    func testSnapshotsAreBoundToTheirOriginatingSolver() throws {
+        var scene = PhysicsScene(name: "snapshot-owner")
+        _ = scene.addBody(
+            size: F3(repeating: 0.2), density: 1, friction: 0.5,
+            position: F3(0, 0, 1), shape: .box)
+        let first = try GPUSolver(scene: scene)
+        let second = try GPUSolver(scene: scene)
+
+        let rigid = first.captureRigidSpeculationSnapshot()
+        let full = first.captureSimulationSnapshot()
+        XCTAssertTrue(first.owns(rigid))
+        XCTAssertTrue(first.owns(full))
+        XCTAssertFalse(second.owns(rigid),
+            "equal-sized solvers must not accept each other's topology-opaque snapshots")
+        XCTAssertFalse(second.owns(full),
+            "full simulation snapshots require the same ownership guard")
+    }
+
     private func particleBounds(_ scene: PhysicsScene,
                                 bodyIDs: [Int]) -> (F3, F3) {
         var mn = F3(repeating: Float.greatestFiniteMagnitude)
@@ -69,6 +124,105 @@ final class SoftBodyTests: XCTestCase {
                        "Neo-Hookean tet must preserve volume")
     }
 
+    func testSimulationSnapshotReplaysSoftContactBranchAfterImpulse() throws {
+        var scene = PhysicsScene(name: "soft-snapshot-contact")
+        scene.settings.dt = 1 / 120
+        scene.settings.iterations = 8
+        scene.settings.gravity = 0
+        let p0 = scene.addParticle(
+            radius: 0.02, mass: 1, friction: 1,
+            position: F3(-1, -1, 0.5))
+        let p1 = scene.addParticle(
+            radius: 0.02, mass: 1, friction: 1,
+            position: F3(1, -1, 0.5))
+        let p2 = scene.addParticle(
+            radius: 0.02, mass: 1, friction: 1,
+            position: F3(0, 1, 0.5))
+        let particles = [p0, p1, p2]
+        scene.addTri(SceneTri(ids: (p0, p1, p2)))
+        _ = scene.addBody(
+            size: F3(repeating: 1), density: 0, friction: 1,
+            position: .zero, shape: .box)
+        let solver = try GPUSolver(scene: scene)
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertGreaterThan(solver.lastNumSoft, 0)
+
+        let checkpoint = solver.captureSimulationSnapshot()
+        let checkpointStates = solver.bodyStates(particles)
+        let impulse = particles.map {
+            GPUSolver.BodyLinearVelocityImpulse(
+                body: $0, deltaVelocity: F3(0.15, 0, 0))
+        }
+        solver.applyLinearVelocityImpulses(impulse)
+        for _ in 0..<12 { try solver.submitStep() }
+        try solver.synchronize()
+        let firstBranch = solver.bodyStates(particles)
+
+        solver.restoreSimulationSnapshot(checkpoint)
+        let restored = solver.bodyStates(particles)
+        for (expected, actual) in zip(checkpointStates, restored) {
+            XCTAssertEqual(actual.position.x, expected.position.x, accuracy: 1e-7)
+            XCTAssertEqual(actual.position.y, expected.position.y, accuracy: 1e-7)
+            XCTAssertEqual(actual.position.z, expected.position.z, accuracy: 1e-7)
+            XCTAssertEqual(actual.linearVelocity.x,
+                           expected.linearVelocity.x, accuracy: 1e-7)
+            XCTAssertEqual(actual.linearVelocity.y,
+                           expected.linearVelocity.y, accuracy: 1e-7)
+            XCTAssertEqual(actual.linearVelocity.z,
+                           expected.linearVelocity.z, accuracy: 1e-7)
+        }
+        XCTAssertGreaterThan(solver.lastNumSoft, 0,
+            "restoring a soft checkpoint must not cold-start its contacts")
+
+        solver.applyLinearVelocityImpulses(impulse)
+        for _ in 0..<12 { try solver.submitStep() }
+        try solver.synchronize()
+        let replayedBranch = solver.bodyStates(particles)
+        for (expected, actual) in zip(firstBranch, replayedBranch) {
+            XCTAssertEqual(actual.position.x, expected.position.x, accuracy: 2e-5)
+            XCTAssertEqual(actual.position.y, expected.position.y, accuracy: 2e-5)
+            XCTAssertEqual(actual.position.z, expected.position.z, accuracy: 2e-5)
+            XCTAssertEqual(actual.linearVelocity.x,
+                           expected.linearVelocity.x, accuracy: 2e-4)
+            XCTAssertEqual(actual.linearVelocity.y,
+                           expected.linearVelocity.y, accuracy: 2e-4)
+            XCTAssertEqual(actual.linearVelocity.z,
+                           expected.linearVelocity.z, accuracy: 2e-4)
+        }
+        XCTAssertNil(solver.runtimeFailure)
+    }
+
+    func testPortalRetryCapIsAnExplicitPrecisionOptIn() throws {
+        func cap(configure: (inout SimSettings) -> Void) throws -> Float {
+            var scene = PhysicsScene(name: "portal-retry-cap")
+            scene.settings.dt = 1 / 120
+            scene.settings.gravity = 0
+            configure(&scene.settings)
+            let p0 = scene.addParticle(
+                radius: 0.01, mass: 1, friction: 1, position: F3(-1, -1, 0.5))
+            let p1 = scene.addParticle(
+                radius: 0.01, mass: 1, friction: 1, position: F3(1, -1, 0.5))
+            let p2 = scene.addParticle(
+                radius: 0.01, mass: 1, friction: 1, position: F3(0, 1, 0.5))
+            scene.addTri(SceneTri(ids: (p0, p1, p2)))
+            _ = scene.addBody(
+                size: F3(repeating: 1), density: 0, friction: 1,
+                position: .zero, shape: .box)
+            let solver = try GPUSolver(scene: scene)
+            try solver.submitStep()
+            try solver.synchronize()
+            return solver.params.deformablePortalRetryCap
+        }
+        // The default heuristic lands below the rigid margin here (5 mm vs
+        // 10 mm), which must not enable the widened retry on its own.
+        XCTAssertEqual(try cap { _ in }, 0)
+        XCTAssertEqual(try cap { $0.deformableCollisionMargin = 0.02 }, 0,
+            "an explicit margin no tighter than the rigid one stays legacy")
+        XCTAssertEqual(try cap { $0.deformableCollisionMargin = 0.001 }, 0.02,
+            "only an explicit tighter deformable margin opts in")
+    }
+
     func testRigidRestsOnSoftBlock() throws {
         var scene = PhysicsScene(name: "ballonblock")
         scene.settings.iterations = 20
@@ -83,6 +237,122 @@ final class SoftBodyTests: XCTestCase {
         for _ in 0..<500 { gpu.step() }
         XCTAssertGreaterThan(gpu.bodyPosition(ball).z, 0.8,
                              "heavy rigid ball must rest ON the soft block (two-way coupling)")
+    }
+
+    /// A plush-stiffness block (E ~ 1.5 kPa) under a heavy plate flattens to
+    /// a sheet with the bare stable Neo-Hookean model; compaction stiffening
+    /// must let it keep a meaningful thickness while leaving the unloaded
+    /// block's rest height unchanged.
+    func testTetCompactionStiffeningKeepsCrushedPlushThick() throws {
+        func crushedThickness(onset: Float, gain: Float) throws -> Float {
+            var scene = PhysicsScene(name: "plush-compaction")
+            scene.settings.iterations = 20
+            scene.settings.betaLin = 20000
+            scene.settings.lambdaMax = 800
+            scene.settings.tetCompactionOnset = onset
+            scene.settings.tetCompactionGain = gain
+            Demos.addGround(&scene)
+            let ids = Demos.addSoftBlock(&scene, center: F3(0, 0, 0.6), nx: 5, ny: 5, nz: 4,
+                                         spacing: 0.3, mu: 600, lambda: 600,
+                                         massPerNode: 0.02)
+            _ = scene.addBody(size: F3(2.0, 2.0, 0.2), density: 400,
+                              friction: 0.6, position: F3(0, 0, 1.8))
+            let gpu = try GPUSolver(scene: scene)
+            for _ in 0..<400 { gpu.step() }
+            gpu.sync()
+            let states = gpu.bodyStates(ids)
+            XCTAssertNil(gpu.runtimeFailure)
+            let zs = states.map(\.position.z)
+            return zs.max()! - zs.min()!
+        }
+        let bare = try crushedThickness(onset: 0, gain: 0)
+        let stiffened = try crushedThickness(onset: 0.6, gain: 30)
+        print("compaction test: bare \(bare) stiffened \(stiffened) (rest 0.9)")
+        XCTAssertLessThan(bare, 0.35, "the bare model must flatten under this plate")
+        XCTAssertGreaterThan(stiffened, bare * 1.6,
+            "compaction stiffening must resist the crush well beyond the bare model")
+        XCTAssertLessThan(stiffened, 0.9,
+            "stiffening below the onset must not prevent ordinary compression")
+    }
+
+    func testTetCompactionSettingsSyncAtRuntime() throws {
+        var scene = PhysicsScene(name: "runtime-compaction-settings")
+        scene.settings.gravity = 0
+        let p0 = scene.addParticle(radius: 0.02, mass: 1,
+                                   position: F3(0, 0, 0))
+        let p1 = scene.addParticle(radius: 0.02, mass: 1,
+                                   position: F3(1, 0, 0))
+        let p2 = scene.addParticle(radius: 0.02, mass: 1,
+                                   position: F3(0, 1, 0))
+        let p3 = scene.addParticle(radius: 0.02, mass: 1,
+                                   position: F3(0, 0, 1))
+        scene.addTet(SceneTet(ids: (p0, p1, p2, p3), mu: 100, lambda: 200))
+        let solver = try GPUSolver(scene: scene)
+
+        solver.settings.tetCompactionOnset = 0.57
+        solver.settings.tetCompactionGain = 13
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertEqual(solver.params.tetCompactionOnset, 0.57, accuracy: 1e-7)
+        XCTAssertEqual(solver.params.tetCompactionGain, 13, accuracy: 1e-7)
+
+        solver.settings.tetCompactionOnset = -1
+        solver.settings.tetCompactionGain = -2
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertEqual(solver.params.tetCompactionOnset, 0)
+        XCTAssertEqual(solver.params.tetCompactionGain, 0)
+    }
+
+    func testZeroTetCompactionOnsetDisablesPenaltyForInvertedTet() throws {
+        func run(gain: Float) throws -> [GPUSolver.RigidBodyState] {
+            var scene = PhysicsScene(name: "zero-onset-inverted-tet")
+            scene.settings.dt = 1 / 120
+            scene.settings.gravity = 0
+            scene.settings.iterations = 1
+            scene.settings.tetCompactionOnset = 0
+            scene.settings.tetCompactionGain = gain
+            let rest = [
+                F3(0, 0, 0), F3(1, 0, 0),
+                F3(0, 1, 0), F3(0, 0, 1),
+            ]
+            let ids = rest.map {
+                scene.addParticle(radius: 0.01, mass: 1, position: $0)
+            }
+            scene.addTet(SceneTet(
+                ids: (ids[0], ids[1], ids[2], ids[3]),
+                mu: 500, lambda: 1_000))
+            let solver = try GPUSolver(scene: scene)
+            // Swap two vertices after construction so the current signed
+            // volume is negative relative to the authored rest tetrahedron.
+            solver.setBodyStates([
+                .init(body: ids[1], position: rest[2], rotation: Quat(),
+                      linearVelocity: .zero, angularVelocity: .zero),
+                .init(body: ids[2], position: rest[1], rotation: Quat(),
+                      linearVelocity: .zero, angularVelocity: .zero),
+            ])
+            try solver.submitStep()
+            try solver.synchronize()
+            XCTAssertNil(solver.runtimeFailure)
+            return solver.bodyStates(ids)
+        }
+
+        let disabledByGain = try run(gain: 0)
+        let disabledByOnset = try run(gain: 50)
+        for (expected, actual) in zip(disabledByGain, disabledByOnset) {
+            XCTAssertEqual(actual.position.x.bitPattern,
+                           expected.position.x.bitPattern)
+            XCTAssertEqual(actual.position.y.bitPattern,
+                           expected.position.y.bitPattern)
+            XCTAssertEqual(actual.position.z.bitPattern,
+                           expected.position.z.bitPattern)
+            XCTAssertEqual(actual.linearVelocity.x.bitPattern,
+                           expected.linearVelocity.x.bitPattern)
+            XCTAssertEqual(actual.linearVelocity.y.bitPattern,
+                           expected.linearVelocity.y.bitPattern)
+            XCTAssertEqual(actual.linearVelocity.z.bitPattern,
+                           expected.linearVelocity.z.bitPattern)
+        }
     }
 
     func testBallRestsOnSoftBunny() throws {
@@ -122,6 +392,57 @@ final class SoftBodyTests: XCTestCase {
         XCTAssertNotNil(gpu.renderSkinnedSurface)
         for _ in 0..<5 { gpu.step() }
         XCTAssertTrue(gpu.bodyPosition(1).z.isFinite)
+    }
+
+    func testGPUHashGridSkinBindingReconstructsContainedVertices() throws {
+        var scene = PhysicsScene(name: "gpu-skin-bind")
+        let positions = [
+            F3(0, 0, 0), F3(1, 0, 0),
+            F3(0, 1, 0), F3(0, 0, 1),
+        ]
+        let bodies = positions.map {
+            scene.addParticle(radius: 0.01, mass: 1, position: $0)
+        }
+        scene.addTet(SceneTet(
+            ids: (bodies[0], bodies[1], bodies[2], bodies[3]),
+            mu: 100, lambda: 200))
+        let visualPositions = [
+            F3(0.1, 0.2, 0.3), F3(0.25, 0.25, 0.25),
+            F3(0.7, 0.1, 0.1),
+        ]
+        let mesh = SurfaceMesh(
+            vertices: visualPositions,
+            normals: [F3](repeating: F3(0, 0, 1), count: 3),
+            triangles: [(0, 1, 2)])
+        let index = Demos.TetBindIndex(tets: scene.tets, scene: scene)
+        let binder = try XCTUnwrap(SkinBindGPU.shared,
+            "the GPU binding regression requires a Metal device")
+        let picks = try XCTUnwrap(binder.bind(mesh: mesh, index: index))
+        XCTAssertEqual(picks.count, visualPositions.count)
+
+        for (expected, pick) in zip(visualPositions, picks) {
+            XCTAssertEqual(pick.record, 0)
+            let w = pick.weights
+            let reconstructed = positions[0] * w.x + positions[1] * w.y
+                + positions[2] * w.z + positions[3] * w.w
+            XCTAssertLessThan(length(reconstructed - expected), 1e-5)
+            XCTAssertGreaterThanOrEqual(
+                min(min(w.x, w.y), min(w.z, w.w)), -1e-4)
+            XCTAssertEqual(w.x + w.y + w.z + w.w, 1, accuracy: 1e-5)
+        }
+    }
+
+    func testBindingWithoutValidTetsReturnsStructurallyEmptyMesh() {
+        let mesh = SurfaceMesh(
+            vertices: [F3.zero, F3(1, 0, 0), F3(0, 1, 0)],
+            normals: [F3](repeating: F3(0, 0, 1), count: 3),
+            triangles: [(0, 1, 2)])
+        let bound = Demos.bindVisualMesh(
+            mesh, scene: PhysicsScene(name: "no-tets"),
+            tetRange: 0..<0, bodyIDs: [])
+        XCTAssertTrue(bound.vertices.isEmpty)
+        XCTAssertTrue(bound.triangles.isEmpty,
+            "an empty vertex buffer must not retain dangling triangle indices")
     }
 
     func testMeshSoftBodiesDropOnPinnedClothBuilds() throws {

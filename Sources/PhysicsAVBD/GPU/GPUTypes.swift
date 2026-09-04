@@ -76,6 +76,15 @@ public struct SimParamsGPU {
     /// Independent opt-in for the experimental signed-volume limiter. The
     /// Planar-DAT paper/Newton surface path does not require this extension.
     public var tetInversionPreventionEnabled: UInt32 = 0
+    /// Upper bound, in metres, for scale-aware rigid/triangle portal retry
+    /// dilation. Zero keeps the legacy `2 * detect` cap. Set only when a
+    /// scene explicitly asks for deformable accuracy tighter than its rigid
+    /// margin.
+    public var deformablePortalRetryCap: Float = 0
+    /// Tet compaction stiffening: onset volume ratio (0 = off) and gain in
+    /// units of lambda. See `SimSettings.tetCompactionOnset`.
+    public var tetCompactionOnset: Float = 0
+    public var tetCompactionGain: Float = 0
 }
 
 extension SimParamsGPU: Equatable {}
