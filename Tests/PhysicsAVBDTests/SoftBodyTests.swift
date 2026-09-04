@@ -549,8 +549,10 @@ final class SoftBodyTests: XCTestCase {
                 && bodySet.contains($0.ids.2) && bodySet.contains($0.ids.3)
         }
         XCTAssertFalse(tets.isEmpty)
-        XCTAssertEqual(tets.count % 5, 0,
-                       "the voxel cage uses five tetrahedra per occupied cell")
+        // The stuffed cage is a conforming volumetric mesh: every interior
+        // face is shared by two tets, the boundary is a closed 2-manifold,
+        // no tet is inverted and the dihedral angles stay in the stuffing
+        // bounds.
         func volume(_ tet: SceneTet, _ position: (Int) -> F3) -> Float {
             let a = position(tet.ids.0)
             return abs(dot(position(tet.ids.1) - a,
@@ -561,60 +563,38 @@ final class SoftBodyTests: XCTestCase {
             $0 + volume($1) { scene.bodies[$0].position }
         }
         XCTAssertGreaterThan(restVolume, 0)
-        let firstCellBodies = Set(tets.prefix(5).flatMap {
-            [$0.ids.0, $0.ids.1, $0.ids.2, $0.ids.3]
-        })
-        let firstCellPositions = firstCellBodies.map { scene.bodies[$0].position }
-        let firstCellMin = firstCellPositions.reduce(F3(repeating: .greatestFiniteMagnitude), min)
-        let firstCellMax = firstCellPositions.reduce(F3(repeating: -.greatestFiniteMagnitude), max)
-        let firstCellExtent = firstCellMax - firstCellMin
-        let voxelSpacing = max(firstCellExtent.x,
-                               max(firstCellExtent.y, firstCellExtent.z))
-        let cellMins = stride(from: 0, to: tets.count, by: 5).map { start -> F3 in
-            tets[start..<min(start + 5, tets.count)].flatMap {
-                [$0.ids.0, $0.ids.1, $0.ids.2, $0.ids.3]
-            }.reduce(F3(repeating: .greatestFiniteMagnitude)) {
-                min($0, scene.bodies[$1].position)
+        var faceUse: [[Int]: Int] = [:]
+        var inverted = 0
+        var minDihedral: Float = 180
+        for tet in tets {
+            let ids = [tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3]
+            let p = ids.map { scene.bodies[$0].position }
+            if dot(cross(p[1] - p[0], p[2] - p[0]), p[3] - p[0]) <= 0 { inverted += 1 }
+            for drop in 0..<4 {
+                faceUse[ids.enumerated().filter { $0.offset != drop }.map(\.element).sorted(),
+                        default: 0] += 1
+            }
+            let faces = [(0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2)]
+            let n = faces.map { normalize(cross(p[$0.1] - p[$0.0], p[$0.2] - p[$0.0])) }
+            for i in 0..<4 { for j in (i + 1)..<4 {
+                let c = max(-1, min(1, dot(n[i], n[j])))
+                minDihedral = min(minDihedral, 180 - acos(c) * 180 / .pi)
+            } }
+        }
+        XCTAssertEqual(inverted, 0, "stuffed cage tets must be positively oriented")
+        XCTAssertEqual(faceUse.values.filter { $0 > 2 }.count, 0, "conforming cage")
+        XCTAssertGreaterThan(minDihedral, 8, "stuffing keeps dihedral angles bounded")
+        var boundaryEdges: [[Int]: Int] = [:]
+        for (face, uses) in faceUse where uses == 1 {
+            for (x, y) in [(face[0], face[1]), (face[1], face[2]), (face[0], face[2])] {
+                boundaryEdges[[x, y], default: 0] += 1
             }
         }
-        let cellOrigin = cellMins.reduce(F3(repeating: .greatestFiniteMagnitude), min)
-        let occupiedCells = Set(cellMins.map { p in
-            let q = (p - cellOrigin) / voxelSpacing
-            return SIMD3(Int(q.x.rounded()), Int(q.y.rounded()), Int(q.z.rounded()))
-        })
-        XCTAssertEqual(occupiedCells.count, tets.count / 5)
-        let maxCell = occupiedCells.reduce(SIMD3<Int>(repeating: 0)) {
-            SIMD3(Swift.max($0.x, $1.x), Swift.max($0.y, $1.y),
-                  Swift.max($0.z, $1.z))
-        }
-        var outside = Set<SIMD3<Int>>()
-        var queue = [SIMD3(-1, -1, -1)]
-        outside.insert(queue[0])
-        var head = 0
-        while head < queue.count {
-            let c = queue[head]
-            head += 1
-            for d in [SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0),
-                      SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)] {
-                let n = c &+ d
-                guard n.x >= -1, n.y >= -1, n.z >= -1,
-                      n.x <= maxCell.x + 1, n.y <= maxCell.y + 1,
-                      n.z <= maxCell.z + 1,
-                      !occupiedCells.contains(n), outside.insert(n).inserted else { continue }
-                queue.append(n)
-            }
-        }
-        var cavities = 0
-        for x in 0...maxCell.x {
-            for y in 0...maxCell.y {
-                for z in 0...maxCell.z {
-                    let c = SIMD3(x, y, z)
-                    if !occupiedCells.contains(c) && !outside.contains(c) { cavities += 1 }
-                }
-            }
-        }
-        XCTAssertEqual(cavities, 0,
-                       "a volumetric bunny cage must not be a hollow tet shell")
+        // Every boundary edge belongs to an even number of boundary faces:
+        // two normally, four where two thin parts of the bunny pinch along
+        // one lattice edge. An odd count would be an open hole.
+        XCTAssertEqual(boundaryEdges.values.filter { $0 % 2 != 0 }.count, 0,
+                       "a volumetric bunny cage must have a closed boundary")
         var minimumWeight: Float = 1
         var maximumWeight: Float = 0
         var maximumWeightSumError: Float = 0
@@ -672,6 +652,60 @@ final class SoftBodyTests: XCTestCase {
                              "the bunny's FEM cage must preserve tet volume")
         XCTAssertGreaterThan(currentSkinVolume / restSkinVolume, 0.95,
                              "the visible bunny must follow the volumetric cage, not collapse like a shell")
+    }
+
+    /// Sustained GPU dynamics on the stuffed cage: a skinned bunny dropped
+    /// on the ground for 600 steps must stay finite, come to rest, keep its
+    /// volume, keep its skin near the cage and not sink into the floor.
+    func testStuffedSkinnedBunnyRestsOnGroundOverSustainedRun() throws {
+        var scene = PhysicsScene(name: "stuffed-bunny-rest")
+        scene.settings.iterations = 20
+        Demos.addGround(&scene)
+        let mesh = Demos.defaultSkinMesh()
+        let bodies = Demos.addSkinnedSoftMesh(&scene, mesh: mesh, center: F3(0, 0, 0.05),
+                                              height: 1.0, res: 8, minTetElements: 600,
+                                              mu: 2500)
+        let skin = try XCTUnwrap(scene.skinnedMeshes.first)
+        let bodySet = Set(bodies)
+        let tets = scene.tets.filter { bodySet.contains($0.ids.0) }
+        func cageVolume(_ position: (Int) -> F3) -> Float {
+            tets.reduce(Float.zero) {
+                let a = position($1.ids.0)
+                return $0 + abs(dot(position($1.ids.1) - a,
+                                    cross(position($1.ids.2) - a, position($1.ids.3) - a))) / 6
+            }
+        }
+        let restVolume = cageVolume { scene.bodies[$0].position }
+        let gpu = try GPUSolver(scene: scene)
+        var speeds: [Float] = []
+        for step in 0..<600 {
+            gpu.step()
+            if step % 100 == 99 {
+                try gpu.synchronize()
+                let states = gpu.bodyStates(bodies)
+                XCTAssertTrue(states.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite
+                    && $0.position.z.isFinite }, "finite at step \(step)")
+                speeds.append(states.map { length($0.linearVelocity) }.max() ?? .infinity)
+            }
+        }
+        try gpu.synchronize()
+        let states = gpu.bodyStates(bodies)
+        let minZ = states.map(\.position.z).min() ?? -1
+        XCTAssertGreaterThan(minZ, -0.01, "cage nodes must not sink into the floor")
+        XCTAssertLessThan(speeds.last ?? .infinity, 0.05,
+                          "the bunny must come to rest: node speeds \(speeds)")
+        XCTAssertGreaterThan(cageVolume { gpu.bodyPosition($0) } / restVolume, 0.9,
+                             "the stuffed cage must keep its volume under sustained contact")
+        let cageLo = states.map(\.position).reduce(F3(repeating: .greatestFiniteMagnitude), min)
+        let cageHi = states.map(\.position).reduce(F3(repeating: -.greatestFiniteMagnitude), max)
+        var outside = 0
+        for v in skin.vertices {
+            let ids = [v.ids.0, v.ids.1, v.ids.2, v.ids.3]
+            let w = [v.weights.x, v.weights.y, v.weights.z, v.weights.w]
+            let p = zip(ids, w).reduce(F3.zero) { $0 + gpu.bodyPosition($1.0) * $1.1 }
+            if any(p .< cageLo - 0.05) || any(p .> cageHi + 0.05) { outside += 1 }
+        }
+        XCTAssertEqual(outside, 0, "skin vertices left the cage's neighbourhood")
     }
 
     func testSoftBlocksDontInterpenetrate() throws {
