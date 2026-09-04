@@ -5,6 +5,35 @@ import simd
 @testable import GPUSimDemos
 
 final class GPUSolverTests: XCTestCase {
+    func testDrivenBodyStateUpdatesPoseAndVelocity() throws {
+        var scene = PhysicsScene(name: "driven-body-state")
+        scene.settings.gravity = 0
+        let body = scene.addBody(
+            size: F3(repeating: 0.1), density: 1_000, friction: 0,
+            position: .zero)
+        let gpu = try GPUSolver(scene: scene)
+        let rotation = Quat(angle: .pi / 3, axis: F3(0, 1, 0))
+
+        gpu.setDrivenBodyStates([.init(
+            body: body, position: F3(0.2, -0.3, 0.4), rotation: rotation,
+            linearVelocity: F3(1, 2, 3), angularVelocity: F3(4, 5, 6))])
+
+        let state = try XCTUnwrap(gpu.bodyStates([body]).first)
+        XCTAssertEqual(state.position.x, 0.2, accuracy: 1e-6)
+        XCTAssertEqual(state.position.y, -0.3, accuracy: 1e-6)
+        XCTAssertEqual(state.position.z, 0.4, accuracy: 1e-6)
+        XCTAssertEqual(state.rotation.real, rotation.real, accuracy: 1e-6)
+        XCTAssertEqual(state.rotation.imag.x, rotation.imag.x, accuracy: 1e-6)
+        XCTAssertEqual(state.rotation.imag.y, rotation.imag.y, accuracy: 1e-6)
+        XCTAssertEqual(state.rotation.imag.z, rotation.imag.z, accuracy: 1e-6)
+        XCTAssertEqual(state.linearVelocity.x, 1, accuracy: 1e-6)
+        XCTAssertEqual(state.linearVelocity.y, 2, accuracy: 1e-6)
+        XCTAssertEqual(state.linearVelocity.z, 3, accuracy: 1e-6)
+        XCTAssertEqual(state.angularVelocity.x, 4, accuracy: 1e-6)
+        XCTAssertEqual(state.angularVelocity.y, 5, accuracy: 1e-6)
+        XCTAssertEqual(state.angularVelocity.z, 6, accuracy: 1e-6)
+    }
+
     func testPerBodyGravityScaleMatchesCPUAndGPU() throws {
         var scene = PhysicsScene(name: "gravity-scale")
         scene.settings.dt = 1 / 100

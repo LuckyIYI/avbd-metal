@@ -3973,6 +3973,37 @@ public final class GPUSolver {
         }
     }
 
+    /// Update continuously pose-driven rigid bodies after one GPU fence.
+    ///
+    /// Unlike ``setBodyStates(_:)``, this preserves constraint and contact
+    /// warm starts. Use it for kinematic robot links, grippers, and other
+    /// bodies that receive a nearby authored pose every frame. Episode
+    /// resets and discontinuous teleports must continue to use
+    /// ``setBodyStates(_:)`` so stale impulses are cleared.
+    public func setDrivenBodyStates(_ updates: [BodyStateUpdate]) {
+        guard !updates.isEmpty else { return }
+        sync()
+        let pl = posLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        let pa = posAng.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        let vl = velLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        let va = velAng.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        let pvl = prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
+        for update in updates {
+            precondition(update.body >= 0 && update.body < numBodies,
+                         "body index out of range")
+            pl[update.body] = SIMD4(update.position, pl[update.body].w)
+            pa[update.body] = SIMD4(update.rotation.imag, update.rotation.real)
+            vl[update.body] = SIMD4(update.linearVelocity, 0)
+            va[update.body] = SIMD4(update.angularVelocity, 0)
+            pvl[update.body] = SIMD4(update.linearVelocity, 0)
+        }
+    }
+
     /// Apply a batch of external linear impulses at one synchronized control
     /// boundary while preserving the checkpointed contact lineage.
     public func applyLinearVelocityImpulses(
