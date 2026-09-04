@@ -344,7 +344,7 @@ struct JointGPU {
     float4 restRel;     // rest relative rotation qA^-1 * qB (quaternion)
     float4 hingeAxis;   // xyz: axis in B local; w != 0 -> 1-DOF hinge
     float4 prismaticAxis; // xyz: A-local translation axis, w: enabled
-    float4 translationLimits; // x/y: metres, z: enabled
+    float4 translationLimits; // x/y: metres, z: enabled, w: warm-start stop (-1/0/+1)
     float4 motor;       // x = angle/velocity target, y = effort limit,
                         // z = pad, w = position-PD kp (zero for velocity)
     float4 limits;      // x/y = twist range, z = kd, w = pad
@@ -359,12 +359,22 @@ inline float3 prismaticError(device const JointGPU& j, float3 delta, float4 qA) 
         ? clamp(t, j.translationLimits.x, j.translationLimits.y) : t;
     return d + j.prismaticAxis.xyz * target;
 }
-inline M3 prismaticProjection(device const JointGPU& j, float3 delta, float4 qA) {
+inline float prismaticActiveStop(device const JointGPU& j, float3 delta, float4 qA) {
+    if (j.translationLimits.z == 0) return 0.0f;
     float t = -dot(q_rotate(q_inv(qA), delta), j.prismaticAxis.xyz);
-    bool stop = j.translationLimits.z != 0
-        && (t < j.translationLimits.x || t > j.translationLimits.y);
-    return stop ? m3_identity()
+    return t < j.translationLimits.x ? -1.0f : (t > j.translationLimits.y ? 1.0f : 0.0f);
+}
+inline M3 prismaticProjection(device const JointGPU& j, float activeStop) {
+    return activeStop != 0 ? m3_identity()
         : m3_add(m3_identity(), m3_scale(m3_outer(j.prismaticAxis.xyz, j.prismaticAxis.xyz), -1.0f));
+}
+inline float3 prismaticWarmStart(device const JointGPU& j, float activeStop) {
+    // Both stops use an identity projection; track which bound owns the force
+    // so a direct stop-to-stop crossing cannot reuse the opposite reaction.
+    float3 lambda = j.lambdaLin.xyz;
+    if (activeStop == 0 || activeStop != j.translationLimits.w)
+        lambda -= j.prismaticAxis.xyz * dot(lambda, j.prismaticAxis.xyz);
+    return lambda;
 }
 inline M3 inverseRotation(float4 q) {
     return M3{q_rotate(q, float3(1,0,0)), q_rotate(q, float3(0,1,0)),
