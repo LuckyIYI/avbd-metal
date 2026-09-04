@@ -5,6 +5,35 @@ import simd
 @testable import GPUSimDemos
 
 final class GPUSolverTests: XCTestCase {
+    func testContinuouslyDrivenBodyPushesDynamicBody() throws {
+        var scene = PhysicsScene(name: "driven-body-contact")
+        scene.settings.gravity = 0
+        scene.settings.dt = 1.0 / 120
+        scene.settings.iterations = 16
+        scene.settings.collisionMargin = 0.003
+        let driven = scene.addBody(
+            size: F3(repeating: 0.04), density: 1_000, friction: 0.8,
+            position: F3(-0.10, 0, 0), gravityScale: 0)
+        let object = scene.addBody(
+            size: F3(repeating: 0.04), density: 500, friction: 0.8,
+            position: .zero, gravityScale: 0)
+        let gpu = try GPUSolver(scene: scene)
+
+        let speed: Float = 0.18
+        for step in 1...100 {
+            let position = F3(-0.10 + speed * scene.settings.dt * Float(step), 0, 0)
+            gpu.setDrivenBodyStates([.init(
+                body: driven, position: position,
+                rotation: Quat(real: 1, imag: .zero),
+                linearVelocity: F3(speed, 0, 0))])
+            try gpu.submitStep()
+        }
+        try gpu.synchronize()
+
+        XCTAssertGreaterThan(gpu.bodyPosition(object).x, 0.025,
+            "a continuously driven collider must transmit its motion through contact")
+    }
+
     func testDrivenBodyStateUpdatesPoseAndVelocity() throws {
         var scene = PhysicsScene(name: "driven-body-state")
         scene.settings.gravity = 0
