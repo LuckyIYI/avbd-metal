@@ -3991,8 +3991,6 @@ public final class GPUSolver {
             to: SIMD4<Float>.self, capacity: numBodies)
         let va = velAng.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: numBodies)
-        let pvl = prevVelLin.contents().bindMemory(
-            to: SIMD4<Float>.self, capacity: numBodies)
         for update in updates {
             precondition(update.body >= 0 && update.body < numBodies,
                          "body index out of range")
@@ -4000,7 +3998,8 @@ public final class GPUSolver {
             pa[update.body] = SIMD4(update.rotation.imag, update.rotation.real)
             vl[update.body] = SIMD4(update.linearVelocity, 0)
             va[update.body] = SIMD4(update.angularVelocity, 0)
-            pvl[update.body] = SIMD4(update.linearVelocity, 0)
+            // Preserve prevVelLin: warmstart_bodies uses the prior sample to
+            // estimate acceleration for this continuous update.
         }
     }
 
