@@ -15,6 +15,10 @@ import SimCore
 //   5. n iterations of: per-color primal solve (6x6 LDL) + dual update
 //   6. BDF1 velocity finalize
 public final class GPUSolver {
+    /// Process-local identity for opaque checkpoints. Equal buffer sizes do
+    /// not imply equal authored topology, so snapshots must never be restored
+    /// into a different solver instance.
+    private let snapshotOwnerID = UUID()
     /// Collision-safe displacement limiter for deformable surface V-T/E-E
     /// motion. Automatic selection uses Planar-DAT for shell-only scenes and
     /// opt-in volumetric self-collision. Ordinary closed tet bodies retain the
@@ -273,9 +277,8 @@ public final class GPUSolver {
     /// Deformable scenes opt into it with `SimSettings.deterministic`;
     /// otherwise they keep the static topology palette.
     var usesDynamicColoring: Bool {
-        (numTris == 0 && numTets == 0) || deterministicColoring
+        (numTris == 0 && numTets == 0) || settings.deterministic
     }
-    let deterministicColoring: Bool
     /// Opposite-endpoint slots per adjacency entry in the compact neighbor
     /// stream: 1 for two-body rigid constraints, 3 once tets, soft contacts,
     /// membranes or bends can appear.
@@ -285,6 +288,10 @@ public final class GPUSolver {
     // Adjacency + coloring
     var degrees, adjStart, adjCursor, adjList, adjNeighbor: MTLBuffer
     var colorsA, colorsB, bodySlot, colorStart, colorList: MTLBuffer
+    // Dynamic coloring overwrites its compact buckets every frame. Preserve
+    // the authored topology palette separately so the public deterministic
+    // setting can be changed in either direction between steps.
+    var staticColorStart, staticColorList, staticColorArgs: MTLBuffer
     var changedFlag: MTLBuffer
 
     // Control
@@ -404,6 +411,7 @@ public final class GPUSolver {
 
     // Cached per-frame color counts (read back once per step)
     public internal(set) var lastColorCounts: [Int] = []
+    private var staticColorCounts: [Int] = []
     public private(set) var lastNumPairs: Int = 0
     public private(set) var lastPairCandidates: Int = 0
     public private(set) var lastNumSoft: Int = 0
@@ -1276,7 +1284,6 @@ public final class GPUSolver {
         // membranes and the render extractor keep using scene.tris/tets.
         let tetBoundaryTris = Self.tetBoundaryFaces(scene)
         self.tetBoundaryTris = tetBoundaryTris
-        self.deterministicColoring = scene.settings.deterministic
         self.neighborSlots = scene.tris.isEmpty && scene.tets.isEmpty ? 1 : 3
         self.numTris = scene.tris.count + tetBoundaryTris.count
         self.skinnedVertexCount = scene.skinnedMeshes.reduce(0) { $0 + $1.vertices.count }
@@ -1614,7 +1621,7 @@ public final class GPUSolver {
             + 4 * numTets + 4 * maxSoft + 3 * numTris + 4 * maxEdges
         adjList = try makeBuf(adjacencyCapacity * 4, "adjList")
         let compactNeighborCapacity =
-            ((numTris == 0 && numTets == 0) || deterministicColoring)
+            ((numTris == 0 && numTets == 0) || scene.settings.deterministic)
             && numBodies > Self.orderedColoringBodyLimit
             ? adjacencyCapacity * neighborSlots : 1
         adjNeighbor = try makeBuf(compactNeighborCapacity * 4, "adjNeighbor")
@@ -1623,6 +1630,9 @@ public final class GPUSolver {
         bodySlot = try makeBuf(nb * 4, "bodySlot")
         colorStart = try makeBuf((AVBD_MAX_COLORS + 2) * 4, "colorStart")
         colorList = try makeBuf(nb * 4, "colorList")
+        staticColorStart = try makeBuf(
+            (AVBD_MAX_COLORS + 2) * 4, "staticColorStart")
+        staticColorList = try makeBuf(nb * 4, "staticColorList")
         changedFlag = try makeBuf(24 * 4, "changedFlag")  // per-pass slots
 
         counters = try makeBuf(GPUCounters.total * 4, "counters")
@@ -1632,6 +1642,8 @@ public final class GPUSolver {
         }
         dispatchArgs = try makeBuf(9 * 4, "dispatchArgs")
         colorArgs = try makeBuf(AVBD_MAX_COLORS * 3 * 4, "colorArgs")
+        staticColorArgs = try makeBuf(
+            AVBD_MAX_COLORS * 3 * 4, "staticColorArgs")
         let maxScanCount = max(max(gridHashSize, elemHashSize), nb)
         scanBlockSums = try makeBuf(((maxScanCount + 1023) / 1024 + 1) * 4, "scanBlockSums")
         scanTotal = try makeBuf(4, "scanTotal")
@@ -3332,22 +3344,25 @@ public final class GPUSolver {
         }
         cstart.append(UInt32(clist.count))
         cstart.append(UInt32(staticUsedColors))
-        colorStart.contents().bindMemory(to: UInt32.self, capacity: cstart.count)
+        staticColorStart.contents().bindMemory(
+            to: UInt32.self, capacity: cstart.count)
             .update(from: cstart, count: cstart.count)
         if !clist.isEmpty {
-            colorList.contents().bindMemory(to: UInt32.self, capacity: clist.count)
+            staticColorList.contents().bindMemory(
+                to: UInt32.self, capacity: clist.count)
                 .update(from: clist, count: clist.count)
         }
         // indirect dispatch args per color, fixed for the scene's lifetime
-        let cargs = colorArgs.contents().bindMemory(to: UInt32.self,
-                                                    capacity: AVBD_MAX_COLORS * 3)
+        let cargs = staticColorArgs.contents().bindMemory(
+            to: UInt32.self, capacity: AVBD_MAX_COLORS * 3)
         for c in 0..<AVBD_MAX_COLORS {
             cargs[c * 3 + 0] = UInt32((buckets[c].count + 63) / 64)
             cargs[c * 3 + 1] = 1
             cargs[c * 3 + 2] = 1
         }
         for i in 0..<numBodies { colA[i] = UInt32(staticColors[i]) }
-        lastColorCounts = buckets.map { $0.count }
+        staticColorCounts = buckets.map { $0.count }
+        lastColorCounts = staticColorCounts
         lastMaxColorUsed = staticUsedColors - 1
 
         // Clear manifolds + map
@@ -3455,6 +3470,19 @@ public final class GPUSolver {
            let v = Float(env) {
             params.particleDamping = v
         }
+    }
+
+    private func ensureDynamicColoringStorage() throws {
+        guard usesDynamicColoring,
+              numBodies > Self.orderedColoringBodyLimit else { return }
+        let requiredBytes = adjList.length * neighborSlots
+        guard adjNeighbor.length < requiredBytes else { return }
+        guard let buffer = device.makeBuffer(
+            length: requiredBytes, options: .storageModeShared) else {
+            throw AVBDError.allocFailed("adjNeighbor")
+        }
+        buffer.label = "adjNeighbor"
+        adjNeighbor = buffer
     }
 
     private func dispatch1D(_ enc: MTLComputeCommandEncoder, _ name: String, _ count: Int,
@@ -3848,6 +3876,8 @@ public final class GPUSolver {
         sync()
         let velocities = velLin.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: numBodies)
+        let previousVelocities = prevVelLin.contents().bindMemory(
+            to: SIMD4<Float>.self, capacity: numBodies)
         for impulse in impulses {
             precondition(impulse.body >= 0 && impulse.body < numBodies,
                 "body index out of range")
@@ -3858,6 +3888,13 @@ public final class GPUSolver {
             velocities[impulse.body].x += impulse.deltaVelocity.x
             velocities[impulse.body].y += impulse.deltaVelocity.y
             velocities[impulse.body].z += impulse.deltaVelocity.z
+            // warmstart_bodies estimates pre-existing acceleration from
+            // velLin - prevVelLin. Move both samples by the same external
+            // impulse so that estimate is preserved rather than interpreting
+            // the control input as an extra frame of acceleration.
+            previousVelocities[impulse.body].x += impulse.deltaVelocity.x
+            previousVelocities[impulse.body].y += impulse.deltaVelocity.y
+            previousVelocities[impulse.body].z += impulse.deltaVelocity.z
         }
     }
 
@@ -4447,6 +4484,9 @@ public final class GPUSolver {
             }
             lastColorCounts = counts
             lastMaxColorUsed = maxUsed
+        } else {
+            lastColorCounts = staticColorCounts
+            lastMaxColorUsed = staticUsedColors - 1
         }
         statsLock.unlock()
 
@@ -4526,6 +4566,7 @@ public final class GPUSolver {
     /// scene data and soft-body state; callers must use it only with the same
     /// solver instance and a rigid scene.
     public struct RigidSpeculationSnapshot: Sendable {
+        fileprivate var ownerID: UUID
         fileprivate var posLin: Data
         fileprivate var posAng: Data
         fileprivate var initLin: Data
@@ -4573,6 +4614,7 @@ public final class GPUSolver {
             lastMaxColorUsed)
         statsLock.unlock()
         return RigidSpeculationSnapshot(
+            ownerID: snapshotOwnerID,
             posLin: copy(posLin), posAng: copy(posAng),
             initLin: copy(initLin), initAng: copy(initAng),
             inertLin: copy(inertLin), inertAng: copy(inertAng),
@@ -4606,6 +4648,8 @@ public final class GPUSolver {
     private func restoreRigidSpeculationState(
         _ snapshot: RigidSpeculationSnapshot
     ) {
+        precondition(snapshot.ownerID == snapshotOwnerID,
+            "speculation snapshot belongs to a different solver")
         sync()
         func restore(_ data: Data, to buffer: MTLBuffer) {
             precondition(data.count == buffer.length,
@@ -4657,6 +4701,12 @@ public final class GPUSolver {
         precondition(numTris == 0 && numTets == 0,
             "rigid speculation snapshots do not include soft-body state")
         restoreRigidSpeculationState(snapshot)
+    }
+
+    /// Internal test seam for the fail-fast ownership guard. Keeping this
+    /// non-public preserves the snapshot's intentionally opaque API.
+    func owns(_ snapshot: RigidSpeculationSnapshot) -> Bool {
+        snapshot.ownerID == snapshotOwnerID
     }
 
     /// Opaque same-solver checkpoint for contact-rich speculative control.
@@ -4731,6 +4781,11 @@ public final class GPUSolver {
         restore(snapshot.ogcPrev, to: ogcPrevBuf)
         restore(snapshot.planarDATT, to: planarDATTBuf)
         restore(snapshot.convexQueryPoison, to: convexQueryPoison)
+    }
+
+    /// Internal counterpart for full simulation checkpoints.
+    func owns(_ snapshot: SimulationSnapshot) -> Bool {
+        snapshot.rigid.ownerID == snapshotOwnerID
     }
 
     /// Cap the pipeline depth to the two frame-owned counter readback slots.
@@ -4815,6 +4870,7 @@ public final class GPUSolver {
 
     private func encodeAndSubmitStep() throws {
         syncParams()
+        try ensureDynamicColoringStorage()
         let submittedFrame = frameIndex + 1
         if convexQueryFailureForTesting {
             convexSafetyPathActivated = true
@@ -5213,7 +5269,7 @@ public final class GPUSolver {
                                       index: 13)
                     encoder.setBuffer(self.planarDATBodyPairsBuf, offset: 0,
                                       index: 14)
-                    let threads = self.lastColorCounts[activeColor] * 8
+                    let threads = self.staticColorCounts[activeColor] * 8
                     encoder.dispatchThreadgroups(
                         MTLSize(width: (threads + 63) / 64,
                                 height: 1, depth: 1),
@@ -5996,6 +6052,13 @@ public final class GPUSolver {
         // Multi-threadgroup persistent path: whole solve in one dispatch of
         // a few co-resident threadgroups (device-scope spin barrier). Covers
         // small AND mid scenes; huge scenes amortize per-color dispatches.
+        let activeColorList = usesDynamicColoring
+            ? colorList : staticColorList
+        let activeColorStart = usesDynamicColoring
+            ? colorStart : staticColorStart
+        let activeColorArgs = usesDynamicColoring
+            ? colorArgs : staticColorArgs
+
         // EXPERIMENTAL, opt-in: deadlocked on first contact with reality —
         // Metal guarantees no forward progress between threadgroups, and the
         // arrive-and-spin barrier wedged the queue. Kept for further study.
@@ -6027,8 +6090,8 @@ public final class GPUSolver {
             enc.setBuffer(adjStart, offset: 0, index: 10)
             enc.setBuffer(degrees, offset: 0, index: 11)
             enc.setBuffer(adjList, offset: 0, index: 12)
-            enc.setBuffer(colorList, offset: 0, index: 13)
-            enc.setBuffer(colorStart, offset: 0, index: 14)
+            enc.setBuffer(activeColorList, offset: 0, index: 13)
+            enc.setBuffer(activeColorStart, offset: 0, index: 14)
             enc.setBuffer(counters, offset: 0, index: 15)
             enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
             enc.setBuffer(shape, offset: 0, index: 17)
@@ -6061,8 +6124,8 @@ public final class GPUSolver {
             enc.setBuffer(adjStart, offset: 0, index: 10)
             enc.setBuffer(degrees, offset: 0, index: 11)
             enc.setBuffer(adjList, offset: 0, index: 12)
-            enc.setBuffer(colorList, offset: 0, index: 13)
-            enc.setBuffer(colorStart, offset: 0, index: 14)
+            enc.setBuffer(activeColorList, offset: 0, index: 13)
+            enc.setBuffer(activeColorStart, offset: 0, index: 14)
             enc.setBuffer(counters, offset: 0, index: 15)
             enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
             enc.setBuffer(shape, offset: 0, index: 17)
@@ -6113,7 +6176,7 @@ public final class GPUSolver {
         // (8 lanes per body for the split kernel)
         let splitSizes: [Int] = usesDynamicColoring ? []
             : (0..<staticUsedColors).map {
-                lastColorCounts[$0] * Int(primalThreadsPerBody)
+                staticColorCounts[$0] * Int(primalThreadsPerBody)
             }
         for it in 0..<settings.iterations {
             var writeBackCompactManifoldFlag: UInt32 =
@@ -6135,8 +6198,8 @@ public final class GPUSolver {
                 enc.setBuffer(adjStart, offset: 0, index: 10)
                 enc.setBuffer(degrees, offset: 0, index: 11)
                 enc.setBuffer(adjList, offset: 0, index: 12)
-                enc.setBuffer(colorList, offset: 0, index: 13)
-                enc.setBuffer(colorStart, offset: 0, index: 14)
+                enc.setBuffer(activeColorList, offset: 0, index: 13)
+                enc.setBuffer(activeColorStart, offset: 0, index: 14)
                 enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
                 enc.setBuffer(shape, offset: 0, index: 17)
                 enc.setBuffer(tets, offset: 0, index: 18)
@@ -6170,8 +6233,8 @@ public final class GPUSolver {
                 enc.setBuffer(adjStart, offset: 0, index: 10)
                 enc.setBuffer(degrees, offset: 0, index: 11)
                 enc.setBuffer(adjList, offset: 0, index: 12)
-                enc.setBuffer(colorList, offset: 0, index: 13)
-                enc.setBuffer(colorStart, offset: 0, index: 14)
+                enc.setBuffer(activeColorList, offset: 0, index: 13)
+                enc.setBuffer(activeColorStart, offset: 0, index: 14)
                 enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
                 enc.setBuffer(shape, offset: 0, index: 17)
                 enc.setBuffer(tets, offset: 0, index: 18)
@@ -6196,7 +6259,7 @@ public final class GPUSolver {
                 solveDispatchObserverForTesting?(
                     .primal(torsion: hasTorsionalFriction))
                 if usesDynamicColoring {
-                    enc.dispatchThreadgroups(indirectBuffer: colorArgs,
+                    enc.dispatchThreadgroups(indirectBuffer: activeColorArgs,
                                              indirectBufferOffset: c * 12,
                                              threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
                 } else {
@@ -6234,8 +6297,8 @@ public final class GPUSolver {
                     enc.setBuffer(adjStart, offset: 0, index: 10)
                     enc.setBuffer(degrees, offset: 0, index: 11)
                     enc.setBuffer(adjList, offset: 0, index: 12)
-                    enc.setBuffer(colorList, offset: 0, index: 13)
-                    enc.setBuffer(colorStart, offset: 0, index: 14)
+                    enc.setBuffer(activeColorList, offset: 0, index: 13)
+                    enc.setBuffer(activeColorStart, offset: 0, index: 14)
                 }
             }
             if profiling { try stage("solve-dual") }
