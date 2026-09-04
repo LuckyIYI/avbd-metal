@@ -852,6 +852,139 @@ final class GPUSolverTests: XCTestCase {
     /// reproducible as rigid manifolds. Their emission is parallel, so the
     /// solver has to assign contact indices and element candidate order by
     /// content rather than by which thread won an atomic append.
+    /// The bounded colour loop plus the colour-tail dispatch must reproduce
+    /// the fully dispatched loop bit for bit: run one solver with a margin
+    /// that never engages the tail and one that pushes every colour into it.
+    private func assertBitwiseEqualStates(
+        _ a: GPUSolver, _ b: GPUSolver, bodies: [Int], _ label: String,
+        file: StaticString = #filePath, line: UInt = #line) {
+        let sa = a.bodyStates(bodies)
+        let sb = b.bodyStates(bodies)
+        var mismatches = 0
+        for i in sa.indices where !bitwiseEqual(sa[i], sb[i]) {
+            mismatches += 1
+        }
+        XCTAssertEqual(mismatches, 0,
+            "\(label): \(mismatches) of \(bodies.count) bodies differ",
+            file: file, line: line)
+    }
+
+    private func bitwiseEqual(
+        _ a: GPUSolver.RigidBodyState, _ b: GPUSolver.RigidBodyState
+    ) -> Bool {
+        a.position.x.bitPattern == b.position.x.bitPattern
+            && a.position.y.bitPattern == b.position.y.bitPattern
+            && a.position.z.bitPattern == b.position.z.bitPattern
+            && a.rotation.imag.x.bitPattern == b.rotation.imag.x.bitPattern
+            && a.rotation.imag.y.bitPattern == b.rotation.imag.y.bitPattern
+            && a.rotation.imag.z.bitPattern == b.rotation.imag.z.bitPattern
+            && a.rotation.real.bitPattern == b.rotation.real.bitPattern
+            && a.linearVelocity.x.bitPattern == b.linearVelocity.x.bitPattern
+            && a.linearVelocity.y.bitPattern == b.linearVelocity.y.bitPattern
+            && a.linearVelocity.z.bitPattern == b.linearVelocity.z.bitPattern
+            && a.angularVelocity.x.bitPattern == b.angularVelocity.x.bitPattern
+            && a.angularVelocity.y.bitPattern == b.angularVelocity.y.bitPattern
+            && a.angularVelocity.z.bitPattern == b.angularVelocity.z.bitPattern
+    }
+
+    func testDispatchMetricCountsEachEncodedDispatchOnce() throws {
+        let solver = try makeGPU(Demos.stack(height: 2))
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertGreaterThan(solver.dispatchesLastFrame, 0)
+        XCTAssertEqual(solver.dispatchesLastFrame,
+                       solver.dispatchNamesLastFrame["raw"],
+            "raw is a category for every encoded dispatch, not a second dispatch")
+    }
+
+    /// The parallel rank sorts (bp_rank_cells, adj_rank) replace serial
+    /// per-bucket insertion sorts; the sorted streams must be identical, so
+    /// the trajectories must match bit for bit.
+    func testParallelRankSortsMatchSerialSorts() throws {
+        var cloth = Demos.cloth(res: 12, ball: true)
+        cloth.settings.deterministic = true
+        var pile = Demos.boxpile(count: 60)
+        pile.settings.deterministic = true
+        for (label, scene) in [("cloth", cloth), ("boxpile", pile)] {
+            let bodies = Array(0..<scene.bodies.count)
+            let parallel = try makeGPU(scene)
+            let serial = try makeGPU(scene)
+            serial.legacySerialSortsForTesting = true
+            for _ in 0..<120 {
+                parallel.step()
+                serial.step()
+            }
+            parallel.sync()
+            serial.sync()
+            XCTAssertNil(parallel.runtimeFailure, label)
+            assertBitwiseEqualStates(parallel, serial, bodies: bodies, label)
+        }
+    }
+
+    /// A single tet solid without cloth vertices never emits a V-T or E-E
+    /// contact (the kernels drop every same-solid candidate), so skipping the
+    /// element grid and both emitters must leave the trajectory untouched.
+    func testSurfaceEmissionSkipIsExactForSingleSolid() throws {
+        var scene = Demos.softbody()
+        scene.settings.deterministic = true
+        let bodies = Array(0..<scene.bodies.count)
+        let skipping = try makeGPU(scene)
+        let emitting = try makeGPU(scene)
+        emitting.forceSurfaceEmissionForTesting = true
+        for s in [skipping, emitting] { s.surfaceTruncationMode = .isotropicDAT }
+        XCTAssertGreaterThan(skipping.numTris, 0, "fixture needs boundary faces")
+        for _ in 0..<120 {
+            skipping.step()
+            emitting.step()
+        }
+        skipping.sync()
+        emitting.sync()
+        XCTAssertNil(skipping.runtimeFailure)
+        XCTAssertLessThan(skipping.dispatchesLastFrame,
+                          emitting.dispatchesLastFrame,
+                          "the skip must remove dispatches")
+        assertBitwiseEqualStates(skipping, emitting, bodies: bodies, "softbody")
+    }
+
+    func testDynamicColorTailIsBitwiseExact() throws {
+        for (label, torsion) in [("plain", false), ("torsion", true)] {
+            var scene = Demos.cloth(res: 12, ball: true)
+            scene.settings.deterministic = true
+            if torsion {
+                for i in scene.colliders.indices {
+                    scene.colliders[i].torsionalFriction = 0.02
+                }
+            }
+            let bodies = Array(0..<scene.bodies.count)
+            let loop = try makeGPU(scene)
+            let tail = try makeGPU(scene)
+            loop.surfaceTruncationMode = .isotropicDAT
+            tail.surfaceTruncationMode = .isotropicDAT
+            loop.colorBoundMarginForTesting = AVBD_MAX_COLORS
+            tail.colorBoundMarginForTesting = -AVBD_MAX_COLORS
+            var tailDispatches = 0
+            tail.solveDispatchObserverForTesting = {
+                if case .primalTail = $0 { tailDispatches += 1 }
+            }
+            for _ in 0..<120 {
+                loop.step()
+                tail.step()
+            }
+            loop.sync()
+            tail.sync()
+            XCTAssertNil(tail.runtimeFailure, label)
+            XCTAssertEqual(loop.lastColorTailColors, 0, label)
+            XCTAssertEqual(tail.lastColorTailColors,
+                           tail.lastMaxColorUsed + 1, label)
+            XCTAssertGreaterThan(tailDispatches, 0, label)
+            XCTAssertGreaterThan(tail.lastNumSoft, 0, label)
+            assertBitwiseEqualStates(
+                loop, tail, bodies: bodies,
+                "\(label) dispatched loop vs colour tail "
+                    + "(colours \(tail.lastMaxColorUsed + 1))")
+        }
+    }
+
     func testDeformableContactTrajectoryIsBitwiseDeterministic() throws {
         // res 12 stays under the 1024-body ordered-coloring limit; res 34
         // exceeds it and exercises the compact multi-slot neighbor stream.

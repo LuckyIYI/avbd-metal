@@ -131,6 +131,7 @@ kernel void adj_scatter(
     device const SoftContactGPU* soft [[buffer(9)]],
     device const MembraneGPU* membranes [[buffer(10)]],
     device const BendGPU* bends     [[buffer(11)]],
+    device uint* slotBody           [[buffer(12)]],   // owner of each slot, for adj_rank
     uint gid                        [[thread_position_in_grid]])
 {
     uint numPairs = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
@@ -148,6 +149,7 @@ kernel void adj_scatter(
                 if (bodyDynamic(posLin, ids[k])) {
                     uint slot = atomic_fetch_add_explicit(&cursor[ids[k]], 1u, memory_order_relaxed);
                     adjList[slot] = entry;
+                    slotBody[slot] = ids[k];
                 }
             }
         } else {
@@ -158,6 +160,7 @@ kernel void adj_scatter(
                 if (bodyDynamic(posLin, ids[k])) {
                     uint slot = atomic_fetch_add_explicit(&cursor[ids[k]], 1u, memory_order_relaxed);
                     adjList[slot] = entry;
+                    slotBody[slot] = ids[k];
                 }
             }
         }
@@ -193,6 +196,7 @@ kernel void adj_scatter(
             if (bodyDynamic(posLin, v)) {
                 uint slot = atomic_fetch_add_explicit(&cursor[v], 1u, memory_order_relaxed);
                 adjList[slot] = entry;
+                slotBody[slot] = v;
             }
         }
         return;
@@ -205,6 +209,7 @@ kernel void adj_scatter(
             if (v != WORLD_BODY && bodyDynamic(posLin, v)) {
                 uint slot = atomic_fetch_add_explicit(&cursor[v], 1u, memory_order_relaxed);
                 adjList[slot] = entry;
+                slotBody[slot] = v;
             }
         }
         return;
@@ -212,10 +217,12 @@ kernel void adj_scatter(
     if (bodyDynamic(posLin, a)) {
         uint slot = atomic_fetch_add_explicit(&cursor[a], 1u, memory_order_relaxed);
         adjList[slot] = entry;
+        slotBody[slot] = a;
     }
     if (bodyDynamic(posLin, b)) {
         uint slot = atomic_fetch_add_explicit(&cursor[b], 1u, memory_order_relaxed);
         adjList[slot] = entry;
+        slotBody[slot] = b;
     }
 }
 
@@ -223,6 +230,29 @@ kernel void adj_scatter(
 // dependent summation order. Once pair/manifold indices are deterministic,
 // sorting each (typically short) CSR segment makes every primal accumulation
 // bitwise repeatable for a fixed input state.
+// Parallel form of adj_sort: one thread per filled slot ranks its entry
+// inside the owner's segment and writes the sorted copy. Entries are unique
+// per body (an element lists a body once), so ranks are a permutation.
+kernel void adj_rank(
+    device const uint* adjStart     [[buffer(0)]],
+    device const uint* adjCount     [[buffer(1)]],
+    device const uint* adjList      [[buffer(2)]],   // scatter order
+    device const uint* slotBody     [[buffer(3)]],
+    device uint* sortedList         [[buffer(4)]],
+    constant uint& numBodies        [[buffer(5)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (numBodies == 0) return;
+    uint total = adjStart[numBodies - 1] + adjCount[numBodies - 1];
+    if (gid >= total) return;
+    uint b = slotBody[gid];
+    uint s = adjStart[b], n = adjCount[b];
+    uint value = adjList[gid];
+    uint rank = 0;
+    for (uint k = 0; k < n; k++) rank += adjList[s + k] < value ? 1u : 0u;
+    sortedList[s + rank] = value;
+}
+
 kernel void adj_sort(
     device const uint* adjStart     [[buffer(0)]],
     device const uint* adjCount     [[buffer(1)]],
@@ -2073,8 +2103,8 @@ kernel void primal_solve_torsion(
 // the group reduces the system via simd_shuffle_xor, and lane 0 solves.
 // Per-body serial stamping (~20-30 scattered gathers) left contact-rich
 // dispatches latency-bound; cooperative stamping exposes those gathers.
-template <uint splitShift, uint splitWidth>
-static inline void primal_split_impl(
+template <uint splitWidth>
+static inline void primal_split_body_impl(
     device float4* posLin,
     device float4* posAng,
     device const float4* initLin,
@@ -2088,9 +2118,6 @@ static inline void primal_split_impl(
     device const uint* adjStart,
     device const uint* adjCount,
     device const uint* adjList,
-    device const uint* colorList,
-    device const uint* colorStart,
-    constant uint& colorIndex,
     constant SimParams& P,
     device const float4* shape,
     device const TetGPU* tets,
@@ -2103,14 +2130,8 @@ static inline void primal_split_impl(
     device const SolverManifoldGPU* solveManifolds,
     device const SolverContactGPU* solveContacts,
     constant uint& useCompactManifolds,
-    uint tid)
+    uint body, uint lane)
 {
-    uint s = colorStart[colorIndex];
-    uint e = colorStart[colorIndex + 1];
-    uint slot = tid >> splitShift;
-    uint lane = tid & (splitWidth - 1u);
-    if (s + slot >= e) return;       // uniform across the cooperative group
-    uint body = colorList[s + slot];
     // Rigids stamp cooperatively too: a box resting on high-res cloth
     // gathers THOUSANDS of contacts (rt corner-tri + particle np) in its
     // adjacency — serialized on one lane it gated the whole dispatch
@@ -2224,44 +2245,82 @@ static inline void primal_split_impl(
     if (rigid) posAng[body] = q_addw(posAng[body], dxAng);
 }
 
-// Fused torsion specialization of the cooperative primal. Its dispatch and
-// reduction topology exactly match `primal_particles_split`; the only added
-// work is one rank-1 angular stamp when a lane owns a manifold adjacency.
-kernel void primal_particles_split_torsion(
-    device float4* posLin           [[buffer(0)]],
-    device float4* posAng           [[buffer(1)]],
-    device const float4* initLin    [[buffer(2)]],
-    device const float4* initAng    [[buffer(3)]],
-    device const float4* inertLin   [[buffer(4)]],
-    device const float4* inertAng   [[buffer(5)]],
-    device const float4* props      [[buffer(6)]],
-    device const JointGPU* joints   [[buffer(7)]],
-    device const SpringGPU* springs [[buffer(8)]],
-    device const ManifoldGPU* manifolds [[buffer(9)]],
-    device const uint* adjStart     [[buffer(10)]],
-    device const uint* adjCount     [[buffer(11)]],
-    device const uint* adjList      [[buffer(12)]],
-    device const uint* colorList    [[buffer(13)]],
-    device const uint* colorStart   [[buffer(14)]],
-    constant uint& colorIndex       [[buffer(15)]],
-    constant SimParams& P           [[buffer(16)]],
-    device const float4* shape      [[buffer(17)]],
-    device const TetGPU* tets       [[buffer(18)]],
-    device const SoftContactGPU* soft [[buffer(19)]],
-    device const MembraneGPU* membranes [[buffer(20)]],
-    device const BendGPU* bends     [[buffer(21)]],
-    device const uint* boundsBits   [[buffer(22)]],
-    device const float4* ogcPrev    [[buffer(23)]],
-    device atomic_uint* ogcCounters [[buffer(24)]],
-    device const float4* torsionState [[buffer(25)]],
-    uint tid                        [[thread_position_in_grid]])
+template <uint splitShift, uint splitWidth>
+static inline void primal_split_impl(
+    device float4* posLin,
+    device float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device const float4* inertLin,
+    device const float4* inertAng,
+    device const float4* props,
+    device const JointGPU* joints,
+    device const SpringGPU* springs,
+    device const ManifoldGPU* manifolds,
+    device const uint* adjStart,
+    device const uint* adjCount,
+    device const uint* adjList,
+    device const uint* colorList,
+    device const uint* colorStart,
+    constant uint& colorIndex,
+    constant SimParams& P,
+    device const float4* shape,
+    device const TetGPU* tets,
+    device const SoftContactGPU* soft,
+    device const MembraneGPU* membranes,
+    device const BendGPU* bends,
+    device const uint* boundsBits,
+    device const float4* ogcPrev,
+    device atomic_uint* ogcCounters,
+    device const SolverManifoldGPU* solveManifolds,
+    device const SolverContactGPU* solveContacts,
+    constant uint& useCompactManifolds,
+    uint tid)
 {
     uint s = colorStart[colorIndex];
     uint e = colorStart[colorIndex + 1];
-    uint slot = tid >> 3;
-    uint lane = tid & 7u;
-    if (s + slot >= e) return;
-    uint body = colorList[s + slot];
+    uint slot = tid >> splitShift;
+    uint lane = tid & (splitWidth - 1u);
+    if (s + slot >= e) return;       // uniform across the cooperative group
+    primal_split_body_impl<splitWidth>(
+        posLin, posAng, initLin, initAng, inertLin, inertAng, props,
+        joints, springs, manifolds, adjStart, adjCount, adjList, P, shape,
+        tets, soft, membranes, bends, boundsBits, ogcPrev, ogcCounters,
+        solveManifolds, solveContacts, useCompactManifolds,
+        colorList[s + slot], lane);
+}
+
+// Fused torsion specialization of the cooperative primal. Its dispatch and
+// reduction topology exactly match `primal_particles_split`; the only added
+// work is one rank-1 angular stamp when a lane owns a manifold adjacency.
+// Body-level torsion primal shared by the per-colour dispatch and the
+// single-threadgroup colour tail (see primal_particles_split_torsion_tail).
+static inline void primal_split_torsion_body(
+    device float4* posLin,
+    device float4* posAng,
+    device const float4* initLin,
+    device const float4* initAng,
+    device const float4* inertLin,
+    device const float4* inertAng,
+    device const float4* props,
+    device const JointGPU* joints,
+    device const SpringGPU* springs,
+    device const ManifoldGPU* manifolds,
+    device const uint* adjStart,
+    device const uint* adjCount,
+    device const uint* adjList,
+    constant SimParams& P,
+    device const float4* shape,
+    device const TetGPU* tets,
+    device const SoftContactGPU* soft,
+    device const MembraneGPU* membranes,
+    device const BendGPU* bends,
+    device const uint* boundsBits,
+    device const float4* ogcPrev,
+    device atomic_uint* ogcCounters,
+    device const float4* torsionState,
+    uint body, uint lane)
+{
     bool rigid = shape[body].w >= 0.0f;
 
     PrimalAccum acc;
@@ -2371,6 +2430,104 @@ kernel void primal_particles_split_torsion(
     if (rigid) posAng[body] = q_addw(posAng[body], dxAng);
 }
 
+kernel void primal_particles_split_torsion(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device const JointGPU* joints   [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    constant uint& colorIndex       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device const SoftContactGPU* soft [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(22)]],
+    device const float4* ogcPrev    [[buffer(23)]],
+    device atomic_uint* ogcCounters [[buffer(24)]],
+    device const float4* torsionState [[buffer(25)]],
+    uint tid                        [[thread_position_in_grid]])
+{
+    uint s = colorStart[colorIndex];
+    uint e = colorStart[colorIndex + 1];
+    uint slot = tid >> 3;
+    uint lane = tid & 7u;
+    if (s + slot >= e) return;
+    primal_split_torsion_body(
+        posLin, posAng, initLin, initAng, inertLin, inertAng, props,
+        joints, springs, manifolds, adjStart, adjCount, adjList, P, shape,
+        tets, soft, membranes, bends, boundsBits, ogcPrev, ogcCounters,
+        torsionState, colorList[s + slot], lane);
+}
+
+// Colour tail: the CPU bounds the per-colour dispatch loop by last frame's
+// palette size plus a margin (a stale readback under pipelining is fine,
+// the bound only affects speed). Colours at or beyond that bound are solved
+// here, exactly as the per-colour dispatches would: one threadgroup walks
+// the remaining colours in order, and inside a colour bodies are
+// independent, so waves of threadgroup-size / 8 bodies separated by a
+// device-memory barrier reproduce the dispatched result bit for bit.
+kernel void primal_particles_split_torsion_tail(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device const JointGPU* joints   [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]],
+    device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    constant uint& firstColor       [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device const SoftContactGPU* soft [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    device const uint* boundsBits   [[buffer(22)]],
+    device const float4* ogcPrev    [[buffer(23)]],
+    device atomic_uint* ogcCounters [[buffer(24)]],
+    device const float4* torsionState [[buffer(25)]],
+    uint ltid                       [[thread_index_in_threadgroup]],
+    uint tgSize                     [[threads_per_threadgroup]])
+{
+    uint used = colorStart[MAX_COLORS + 1];
+    uint slots = tgSize >> 3;
+    uint lane = ltid & 7u;
+    for (uint c = firstColor; c < used; c++) {
+        uint s = colorStart[c];
+        uint e = colorStart[c + 1];
+        for (uint base = s; base < e; base += slots) {
+            uint slot = base + (ltid >> 3);
+            if (slot < e) {
+                primal_split_torsion_body(
+                posLin, posAng, initLin, initAng, inertLin, inertAng, props,
+                joints, springs, manifolds, adjStart, adjCount, adjList, P, shape,
+                tets, soft, membranes, bends, boundsBits, ogcPrev, ogcCounters,
+                torsionState, colorList[slot], lane);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+    }
+}
+
 #define PRIMAL_SPLIT_KERNEL_ARGS \
     device float4* posLin [[buffer(0)]], \
     device float4* posAng [[buffer(1)]], \
@@ -2419,6 +2576,73 @@ kernel void primal_rigid_split(PRIMAL_SPLIT_KERNEL_ARGS)
 {
     CALL_PRIMAL_SPLIT(4u, 16u);
 }
+
+#define PRIMAL_SPLIT_TAIL_KERNEL_ARGS \
+    device float4* posLin [[buffer(0)]], \
+    device float4* posAng [[buffer(1)]], \
+    device const float4* initLin [[buffer(2)]], \
+    device const float4* initAng [[buffer(3)]], \
+    device const float4* inertLin [[buffer(4)]], \
+    device const float4* inertAng [[buffer(5)]], \
+    device const float4* props [[buffer(6)]], \
+    device const JointGPU* joints [[buffer(7)]], \
+    device const SpringGPU* springs [[buffer(8)]], \
+    device const ManifoldGPU* manifolds [[buffer(9)]], \
+    device const uint* adjStart [[buffer(10)]], \
+    device const uint* adjCount [[buffer(11)]], \
+    device const uint* adjList [[buffer(12)]], \
+    device const uint* colorList [[buffer(13)]], \
+    device const uint* colorStart [[buffer(14)]], \
+    constant uint& firstColor [[buffer(15)]], \
+    constant SimParams& P [[buffer(16)]], \
+    device const float4* shape [[buffer(17)]], \
+    device const TetGPU* tets [[buffer(18)]], \
+    device const SoftContactGPU* soft [[buffer(19)]], \
+    device const MembraneGPU* membranes [[buffer(20)]], \
+    device const BendGPU* bends [[buffer(21)]], \
+    device const uint* boundsBits [[buffer(22)]], \
+    device const float4* ogcPrev [[buffer(23)]], \
+    device atomic_uint* ogcCounters [[buffer(24)]], \
+    device const SolverManifoldGPU* solveManifolds [[buffer(25)]], \
+    device const SolverContactGPU* solveContacts [[buffer(26)]], \
+    constant uint& useCompactManifolds [[buffer(27)]], \
+    uint ltid [[thread_index_in_threadgroup]], \
+    uint tgSize [[threads_per_threadgroup]]
+
+// Colour tail for the lane-split kernels; see primal_particles_split_torsion_tail.
+#define PRIMAL_SPLIT_TAIL(SHIFT, WIDTH) \
+    uint used = colorStart[MAX_COLORS + 1]; \
+    uint slots = tgSize >> SHIFT; \
+    uint lane = ltid & (WIDTH - 1u); \
+    for (uint c = firstColor; c < used; c++) { \
+        uint s = colorStart[c]; \
+        uint e = colorStart[c + 1]; \
+        for (uint base = s; base < e; base += slots) { \
+            uint slot = base + (ltid >> SHIFT); \
+            if (slot < e) { \
+                primal_split_body_impl<WIDTH>( \
+                    posLin, posAng, initLin, initAng, inertLin, inertAng, \
+                    props, joints, springs, manifolds, adjStart, adjCount, \
+                    adjList, P, shape, tets, soft, membranes, bends, \
+                    boundsBits, ogcPrev, ogcCounters, solveManifolds, \
+                    solveContacts, useCompactManifolds, colorList[slot], \
+                    lane); \
+            } \
+            threadgroup_barrier(mem_flags::mem_device); \
+        } \
+    }
+
+kernel void primal_particles_split_tail(PRIMAL_SPLIT_TAIL_KERNEL_ARGS)
+{
+    PRIMAL_SPLIT_TAIL(3u, 8u);
+}
+
+kernel void primal_rigid_split_tail(PRIMAL_SPLIT_TAIL_KERNEL_ARGS)
+{
+    PRIMAL_SPLIT_TAIL(4u, 16u);
+}
+#undef PRIMAL_SPLIT_TAIL
+#undef PRIMAL_SPLIT_TAIL_KERNEL_ARGS
 
 #undef CALL_PRIMAL_SPLIT
 #undef PRIMAL_SPLIT_KERNEL_ARGS
