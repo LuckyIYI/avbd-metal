@@ -394,6 +394,57 @@ final class SoftBodyTests: XCTestCase {
         XCTAssertTrue(gpu.bodyPosition(1).z.isFinite)
     }
 
+    func testGPUHashGridSkinBindingReconstructsContainedVertices() throws {
+        var scene = PhysicsScene(name: "gpu-skin-bind")
+        let positions = [
+            F3(0, 0, 0), F3(1, 0, 0),
+            F3(0, 1, 0), F3(0, 0, 1),
+        ]
+        let bodies = positions.map {
+            scene.addParticle(radius: 0.01, mass: 1, position: $0)
+        }
+        scene.addTet(SceneTet(
+            ids: (bodies[0], bodies[1], bodies[2], bodies[3]),
+            mu: 100, lambda: 200))
+        let visualPositions = [
+            F3(0.1, 0.2, 0.3), F3(0.25, 0.25, 0.25),
+            F3(0.7, 0.1, 0.1),
+        ]
+        let mesh = SurfaceMesh(
+            vertices: visualPositions,
+            normals: [F3](repeating: F3(0, 0, 1), count: 3),
+            triangles: [(0, 1, 2)])
+        let index = Demos.TetBindIndex(tets: scene.tets, scene: scene)
+        let binder = try XCTUnwrap(SkinBindGPU.shared,
+            "the GPU binding regression requires a Metal device")
+        let picks = try XCTUnwrap(binder.bind(mesh: mesh, index: index))
+        XCTAssertEqual(picks.count, visualPositions.count)
+
+        for (expected, pick) in zip(visualPositions, picks) {
+            XCTAssertEqual(pick.record, 0)
+            let w = pick.weights
+            let reconstructed = positions[0] * w.x + positions[1] * w.y
+                + positions[2] * w.z + positions[3] * w.w
+            XCTAssertLessThan(length(reconstructed - expected), 1e-5)
+            XCTAssertGreaterThanOrEqual(
+                min(min(w.x, w.y), min(w.z, w.w)), -1e-4)
+            XCTAssertEqual(w.x + w.y + w.z + w.w, 1, accuracy: 1e-5)
+        }
+    }
+
+    func testBindingWithoutValidTetsReturnsStructurallyEmptyMesh() {
+        let mesh = SurfaceMesh(
+            vertices: [F3.zero, F3(1, 0, 0), F3(0, 1, 0)],
+            normals: [F3](repeating: F3(0, 0, 1), count: 3),
+            triangles: [(0, 1, 2)])
+        let bound = Demos.bindVisualMesh(
+            mesh, scene: PhysicsScene(name: "no-tets"),
+            tetRange: 0..<0, bodyIDs: [])
+        XCTAssertTrue(bound.vertices.isEmpty)
+        XCTAssertTrue(bound.triangles.isEmpty,
+            "an empty vertex buffer must not retain dangling triangle indices")
+    }
+
     func testMeshSoftBodiesDropOnPinnedClothBuilds() throws {
         let scene = Demos.meshclothdrop(res: 10, scale: 1)
         XCTAssertGreaterThanOrEqual(scene.skinnedMeshes.count, 2)

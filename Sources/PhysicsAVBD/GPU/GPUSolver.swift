@@ -5182,7 +5182,7 @@ public final class GPUSolver {
             // keyB = bucket starts, val = scatter cursors. Seven small
             // dispatches per frame that only buy bitwise reproducibility, so
             // they follow the deterministic setting.
-            if deterministicColoring {
+            if settings.deterministic {
             dispatch1D(encoder, "softmap_clear", self.softMapCapacity) { e in
                 e.setBuffer(self.softMapKeyA, offset: 0, index: 0)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
