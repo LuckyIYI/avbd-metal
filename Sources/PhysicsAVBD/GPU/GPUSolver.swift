@@ -3441,6 +3441,9 @@ public final class GPUSolver {
         params.contactMaterialReserved = 0
         params.rigidLinearDamping = max(settings.rigidLinearDamping, 0)
         params.rigidAngularDamping = max(settings.rigidAngularDamping, 0)
+        params.tetCompactionOnset = max(
+            0, min(1, settings.tetCompactionOnset))
+        params.tetCompactionGain = max(0, settings.tetCompactionGain)
         let effectiveTruncationMode = effectiveSurfaceTruncationMode
         params.surfaceTruncationMode = numParticles > 0
             ? effectiveTruncationMode.rawValue : 0
