@@ -765,7 +765,7 @@ extension Demos {
         let index = TetBindIndex(tets: tetRange.map { scene.tets[$0] },
                                  scene: scene)
         guard !index.records.isEmpty else {
-            return SceneSkinnedMesh(vertices: [], triangles: mesh.triangles,
+            return SceneSkinnedMesh(vertices: [], triangles: [],
                                     bodyIDs: bodyIDs)
         }
         // Binding is a per-vertex nearest-tet search over a hash grid: it is

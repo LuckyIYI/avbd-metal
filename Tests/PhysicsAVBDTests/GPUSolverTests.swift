@@ -861,19 +861,40 @@ final class GPUSolverTests: XCTestCase {
         let sa = a.bodyStates(bodies)
         let sb = b.bodyStates(bodies)
         var mismatches = 0
-        for i in sa.indices where sa[i].position.x.bitPattern
-            != sb[i].position.x.bitPattern
-            || sa[i].position.y.bitPattern != sb[i].position.y.bitPattern
-            || sa[i].position.z.bitPattern != sb[i].position.z.bitPattern
-            || sa[i].linearVelocity.x.bitPattern
-                != sb[i].linearVelocity.x.bitPattern
-            || sa[i].rotation.real.bitPattern
-                != sb[i].rotation.real.bitPattern {
+        for i in sa.indices where !bitwiseEqual(sa[i], sb[i]) {
             mismatches += 1
         }
         XCTAssertEqual(mismatches, 0,
             "\(label): \(mismatches) of \(bodies.count) bodies differ",
             file: file, line: line)
+    }
+
+    private func bitwiseEqual(
+        _ a: GPUSolver.RigidBodyState, _ b: GPUSolver.RigidBodyState
+    ) -> Bool {
+        a.position.x.bitPattern == b.position.x.bitPattern
+            && a.position.y.bitPattern == b.position.y.bitPattern
+            && a.position.z.bitPattern == b.position.z.bitPattern
+            && a.rotation.imag.x.bitPattern == b.rotation.imag.x.bitPattern
+            && a.rotation.imag.y.bitPattern == b.rotation.imag.y.bitPattern
+            && a.rotation.imag.z.bitPattern == b.rotation.imag.z.bitPattern
+            && a.rotation.real.bitPattern == b.rotation.real.bitPattern
+            && a.linearVelocity.x.bitPattern == b.linearVelocity.x.bitPattern
+            && a.linearVelocity.y.bitPattern == b.linearVelocity.y.bitPattern
+            && a.linearVelocity.z.bitPattern == b.linearVelocity.z.bitPattern
+            && a.angularVelocity.x.bitPattern == b.angularVelocity.x.bitPattern
+            && a.angularVelocity.y.bitPattern == b.angularVelocity.y.bitPattern
+            && a.angularVelocity.z.bitPattern == b.angularVelocity.z.bitPattern
+    }
+
+    func testDispatchMetricCountsEachEncodedDispatchOnce() throws {
+        let solver = try makeGPU(Demos.stack(height: 2))
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertGreaterThan(solver.dispatchesLastFrame, 0)
+        XCTAssertEqual(solver.dispatchesLastFrame,
+                       solver.dispatchNamesLastFrame["raw"],
+            "raw is a category for every encoded dispatch, not a second dispatch")
     }
 
     /// The parallel rank sorts (bp_rank_cells, adj_rank) replace serial
@@ -957,22 +978,9 @@ final class GPUSolverTests: XCTestCase {
                            tail.lastMaxColorUsed + 1, label)
             XCTAssertGreaterThan(tailDispatches, 0, label)
             XCTAssertGreaterThan(tail.lastNumSoft, 0, label)
-            let a = loop.bodyStates(bodies)
-            let b = tail.bodyStates(bodies)
-            var mismatches = 0
-            for i in a.indices where a[i].position.x.bitPattern
-                != b[i].position.x.bitPattern
-                || a[i].position.y.bitPattern != b[i].position.y.bitPattern
-                || a[i].position.z.bitPattern != b[i].position.z.bitPattern
-                || a[i].linearVelocity.x.bitPattern
-                    != b[i].linearVelocity.x.bitPattern
-                || a[i].rotation.real.bitPattern
-                    != b[i].rotation.real.bitPattern {
-                mismatches += 1
-            }
-            XCTAssertEqual(mismatches, 0,
-                "\(label): \(mismatches) of \(bodies.count) bodies differ "
-                    + "between the dispatched loop and the colour tail "
+            assertBitwiseEqualStates(
+                loop, tail, bodies: bodies,
+                "\(label) dispatched loop vs colour tail "
                     + "(colours \(tail.lastMaxColorUsed + 1))")
         }
     }
@@ -1023,6 +1031,40 @@ final class GPUSolverTests: XCTestCase {
         }
     }
 
+    func testDeformableDeterministicColoringTracksRuntimeSetting() throws {
+        var scene = Demos.cloth(res: 8, ball: true)
+        scene.settings.deterministic = false
+        let solver = try makeGPU(scene)
+        XCTAssertFalse(solver.usesDynamicColoring)
+
+        solver.settings.deterministic = true
+        XCTAssertTrue(solver.usesDynamicColoring)
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertNil(solver.runtimeFailure)
+
+        solver.settings.deterministic = false
+        XCTAssertFalse(solver.usesDynamicColoring)
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertNil(solver.runtimeFailure,
+            "switching back must use the preserved static topology palette")
+    }
+
+    func testRuntimeDeterministicColoringLazilyAllocatesLargeNeighborStream() throws {
+        var scene = Demos.cloth(res: 34, ball: false)
+        scene.settings.deterministic = false
+        let solver = try makeGPU(scene)
+        XCTAssertEqual(solver.adjNeighbor.length, 16,
+            "ordinary large cloth should keep the construction-time placeholder")
+
+        solver.settings.deterministic = true
+        try solver.submitStep()
+        try solver.synchronize()
+        XCTAssertGreaterThan(solver.adjNeighbor.length, 16)
+        XCTAssertTrue(solver.usesDynamicColoring)
+        XCTAssertNil(solver.runtimeFailure)
+    }
 
     func testContactRichTrajectoryIsBitwiseDeterministic() throws {
         var scene = PhysicsScene(name: "deterministic-contact-grid")

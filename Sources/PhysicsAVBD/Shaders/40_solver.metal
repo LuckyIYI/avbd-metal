@@ -1155,7 +1155,8 @@ inline void stampTet(device const TetGPU& t, uint self,
     // onset ratio add a quadratic bulk penalty of `gain * lambda`, the way
     // stuffing compacts freely and then stiffens.
     float compactionK = 0.0f;
-    if (compactionGain > 0.0f && J < compactionOnset) {
+    if (compactionOnset > 0.0f && compactionGain > 0.0f
+        && J < compactionOnset) {
         compactionK = compactionGain * lamV;
         s2 += compactionK * (J - compactionOnset);
     }
