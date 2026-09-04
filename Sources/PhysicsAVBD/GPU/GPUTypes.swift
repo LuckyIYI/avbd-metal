@@ -81,6 +81,10 @@ public struct SimParamsGPU {
     /// scene explicitly asks for deformable accuracy tighter than its rigid
     /// margin.
     public var deformablePortalRetryCap: Float = 0
+    /// Tet compaction stiffening: onset volume ratio (0 = off) and gain in
+    /// units of lambda. See `SimSettings.tetCompactionOnset`.
+    public var tetCompactionOnset: Float = 0
+    public var tetCompactionGain: Float = 0
 }
 
 extension SimParamsGPU: Equatable {}
