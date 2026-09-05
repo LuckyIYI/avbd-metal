@@ -489,10 +489,10 @@ public extension GPUSimRendererSource {
 }
 
 // Renderer: PBR (GGX metallic-roughness) + ACES, sRGB-correct framebuffer,
-// GTAO-style ambient occlusion from a world-position prepass, directional
+// GTAO-style ambient occlusion from a depth/normal prepass, directional
 // shadow mapping, horizon-only fog, and analytic instanced geometry.
 
-private let renderShaderSource = """
+let renderShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
@@ -532,6 +532,7 @@ struct Uniforms {
     float4 shadowParams; // x = constant bias, y = normal/slope bias
     float4x4 invViewProj;
     float4x4 prevInvViewProj;
+    float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
 };
 
 // World position from depth: 4 bytes per tap instead of a 16-byte stored
@@ -1087,15 +1088,23 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
 {
     // GTAO (Jimenez et al. 2016 / XeGTAO-style): march several
     // screen-space slices, find both horizon angles per slice, clamp to the
-    // normal hemisphere, then integrate the cosine-weighted visible arc.
+    // normal hemisphere, then integrate the cosine-weighted occluded arc.
     constexpr sampler smp(filter::nearest, address::clamp_to_edge);
     float dC = depthTex.sample(smp, in.uv);
     if (dC >= 1.0) return float4(1);
-    float3 P = worldFromDepth(in.uv, dC, U.invViewProj);
-    float3 N = normalize(normTex.sample(smp, in.uv).xyz);
-    float3 V = normalize(U.eye.xyz - P);
     float3 camForward = normalize(cross(U.camRight.xyz, U.camUp.xyz));
-    float viewDepth = max(dot(P - U.eye.xyz, camForward), 0.25);
+    float3 worldN = normalize(normTex.sample(smp, in.uv).xyz);
+    // Work in the orthonormal (screen right, screen down, forward) basis.
+    // Linearizing depth and scaling a ray replaces a matrix multiply per
+    // tap, and subtraction stays precise when the camera is far from origin.
+    float3 N = float3(dot(worldN, U.camRight.xyz), dot(worldN, U.camUp.xyz),
+                      dot(worldN, camForward));
+    float2 pixelToView = 2.0 * U.aoProjection.zw / U.screen.xy;
+    float2 sliceScale = pixelToView / pixelToView.y;
+    float centerZ = U.aoProjection.y / (dC - U.aoProjection.x);
+    float3 P = float3(in.position.xy * pixelToView - U.aoProjection.zw, 1.0) * centerZ;
+    float3 V = normalize(-P);
+    float viewDepth = max(centerZ, 0.25);
 
     const float R = 0.9;                                  // world AO radius
     float pxRadius = U.screen.z * R / viewDepth;
@@ -1109,14 +1118,17 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     float Reff = pxRadius * viewDepth / U.screen.z;
     float falloffRange = max(Reff * 0.65, 1e-4);
 
-    // interleaved gradient noise: much better spectral distribution than a
-    // sin-hash, so residual error is high-frequency and blurs away cleanly
+    // Independent spatial angle/radius seeds; linear IGN bands and a radial
+    // jitter derived from the angle seed remain correlated after denoising.
     float2 px = floor(in.position.xy);
-    float ign = fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
-    // golden-ratio rotation per frame: the temporal pass averages 1/blend
-    // frames of differently-rotated estimates into a converged result
-    float ang = fract(ign + U.temporal.x) * M_PI_F;
-    float stepJit = fract(ign * 7.0 + U.temporal.x * 5.0);
+    uint seed = uint(px.x) + uint(px.y) * 65537u;
+    seed ^= seed >> 17; seed *= 0xed5ad4bbu;
+    seed ^= seed >> 11; seed *= 0xac4c1b51u;
+    seed ^= seed >> 15; seed *= 0x31848babu;
+    seed ^= seed >> 14;
+    float2 noise = float2(seed & 65535u, seed >> 16) / 65536.0;
+    float ang = fract(noise.x + U.temporal.x) * M_PI_F;
+    float stepJit = fract(noise.y + U.temporal.x * 5.0);
 
     const int SLICES = 3;
     const int STEPS = 4;
@@ -1126,45 +1138,61 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
         float phi = ang + float(sl) * (M_PI_F / float(SLICES));
         float2 dirPx = float2(cos(phi), sin(phi));
 
-        // ANALYTIC slice tangent: the world direction this screen-space
+        // ANALYTIC slice tangent: the view direction this screen-space
         // march corresponds to, projected perpendicular to V. Deriving it
         // from the camera basis (not from samples) keeps the slice plane
         // exact and view-consistent.
-        float3 dirW = U.camRight.xyz * dirPx.x + U.camUp.xyz * dirPx.y;
-        float3 omega = dirW - V * dot(dirW, V);
+        float3 dirV = float3(dirPx * sliceScale, 0.0);
+        float3 omega = dirV - V * dot(dirV, V);
         float ol = length(omega);
-        if (ol < 1e-4) { occlusion += 1.0; continue; }
+        if (ol < 1e-4) continue;
         omega /= ol;
 
         // project N into the slice plane (spanned by V and omega)
         float3 sliceN = cross(V, omega);
         float3 projN = N - sliceN * dot(N, sliceN);
         float projLen = length(projN);
-        if (projLen < 1e-4) { occlusion += 1.0; continue; }
+        if (projLen < 1e-4) continue;
         float3 pn = projN / projLen;
         float cosNV = saturate(dot(pn, V));
         float n = acos(cosNV) * (dot(pn, omega) >= 0.0 ? 1.0 : -1.0);
 
         // XeGTAO fades discarded/out-of-radius samples toward the normal
         // hemisphere edge instead of -1, avoiding grazing-angle detail loss.
-        float lowH0 = cos(n + M_PI_F * 0.5);
-        float lowH1 = cos(n - M_PI_F * 0.5);
+        float sinN = sin(n);
+        float lowH0 = -sinN;
+        float lowH1 = sinN;
 
-        // horizon cosines per WORLD side of the slice (classified by the
+        // horizon cosines per side of the slice (classified by the
         // actual sample offset, so screen/UV orientation can't flip them)
         float cosH0 = lowH0, cosH1 = lowH1;
         float minS = min(0.95, 1.3 / max(pxRadius, 1e-3));
-        for (int side = 0; side < 2; side++) {
-            float sgn = side == 0 ? 1.0 : -1.0;
-            for (int st = 1; st <= STEPS; st++) {
-                float u = saturate((float(st) - 1.0 + stepJit) / float(STEPS));
-                float t = minS + (1.0 - minS) * pow(u, 2.0);
-                float2 uv2 = in.uv + sgn * dirPx * (t * pxRadius) / U.screen.xy;
-                float dQ = depthTex.sample(smp, uv2);
+        for (int st = 1; st <= STEPS; st++) {
+            // Shift each stratum independently instead of moving every
+            // radius in every slice together. Share the offset across sides.
+            float stepNoise = fract(stepJit + float(sl + (st - 1) * STEPS) * 0.6180339887);
+            float u = (float(st) - 1.0 + stepNoise) / float(STEPS);
+            float t = minS + (1.0 - minS) * (u * u);
+            int2 offset = int2(round(dirPx * (t * pxRadius)));
+            for (int side = 0; side < 2; side++) {
+                // Depth belongs to a texel CENTER. Unprojecting a nearest
+                // depth at the continuous march UV fabricates height steps
+                // on tilted planes. Off-screen taps have no geometry data.
+                int2 samplePixel = int2(px) + (side == 0 ? offset : -offset);
+                if (any(samplePixel < 0) || any(samplePixel >= int2(U.screen.xy))) continue;
+                float dQ = depthTex.read(uint2(samplePixel));
                 if (dQ >= 1.0) continue;
-                float3 w = worldFromDepth(uv2, dQ, U.invViewProj) - P;
+                float sampleZ = U.aoProjection.y / (dQ - U.aoProjection.x);
+                float3 w = float3((float2(samplePixel) + 0.5) * pixelToView
+                                 - U.aoProjection.zw, 1.0) * sampleZ - P;
                 float l = length(w);
                 if (l < 1e-4) continue;
+                // Rounding moves samples off the ideal slice. Coplanar or
+                // below-tangent points cannot occlude the normal hemisphere,
+                // even if their view cosine exceeds this slice's horizon.
+                // Cover half-float normal error plus sub-mm depth roundoff;
+                // this is a tangent-plane tolerance, not an AO radius bias.
+                if (dot(N, w) <= 0.001 * l + 0.0001) continue;
                 float c = dot(w / l, V);
                 float weight = saturate((Reff - l) / falloffRange);
                 if (dot(w, omega) >= 0.0) {
@@ -1175,6 +1203,10 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
             }
         }
 
+        // An unchanged horizon has exactly zero missing visibility. This
+        // common case also avoids four inverse/trigonometric evaluations.
+        if (cosH0 == lowH0 && cosH1 == lowH1) continue;
+
         // signed horizon angles in the slice plane (+ = toward omega),
         // clamped to the hemisphere around the projected normal
         float h1 =  acos(clamp(cosH0, -1.0, 1.0));
@@ -1183,11 +1215,16 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
         h2 = n + max(h2 - n, -M_PI_F / 2.0);
 
         // analytic cosine-weighted visible arc (GTAO inner integral)
-        float a1 = 0.25 * (-cos(2.0 * h1 - n) + cosNV + 2.0 * h1 * sin(n));
-        float a2 = 0.25 * (-cos(2.0 * h2 - n) + cosNV + 2.0 * h2 * sin(n));
-        occlusion += projLen * (a1 + a2);
+        float a1 = 0.25 * (-cos(2.0 * h1 - n) + cosNV + 2.0 * h1 * sinN);
+        float a2 = 0.25 * (-cos(2.0 * h2 - n) + cosNV + 2.0 * h2 * sinN);
+        // Integrate missing visibility relative to the analytic open arc.
+        // The full unoccluded hemisphere is exactly 1; estimating it with
+        // only three slices and then saturating creates a normal-dependent
+        // dark bias and structured noise even without any occluders.
+        float unoccluded = cosNV + n * sinN;
+        occlusion += projLen * max(0.0, unoccluded - a1 - a2);
     }
-    float ao = clamp(occlusion / float(SLICES), 0.0, 1.0);
+    float ao = saturate(1.0 - occlusion / float(SLICES));
     ao = pow(ao, 1.25);    // slight contrast shaping
     ao = max(ao, 0.03);    // visible pixels should not reach total black
     ao = mix(1.0, ao, farFade);
@@ -1241,17 +1278,19 @@ fragment float4 temporal_fragment(FSOut in [[stage_in]],
     if (clipPrev.w <= 0.0) return current;
     float2 ndc = clipPrev.xy / clipPrev.w;
     float2 uvPrev = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return current;
+    if (any(uvPrev < 0.0) || any(uvPrev >= 1.0)) return current;
 
-    float dPrev = prevDepthTex.sample(smp, uvPrev);
+    uint2 historyPixel = uint2(uvPrev * U.screen.xy);
+    float2 historyUV = (float2(historyPixel) + 0.5) / U.screen.xy;
+    float dPrev = prevDepthTex.read(historyPixel);
     if (dPrev >= 1.0) return current;
-    float3 Qw = worldFromDepth(uvPrev, dPrev, U.prevInvViewProj);
+    float3 Qw = worldFromDepth(historyUV, dPrev, U.prevInvViewProj);
 
     // AO is continuous and may be bilinearly reprojected.  The octahedral
     // normal is encoded metadata: filtering its packed coordinates across a
     // hard edge or the octahedral fold can decode to an unrelated direction.
     float historyAO = histAO.sample(lsmp, uvPrev).r;
-    float2 historyNormal = histAO.sample(smp, uvPrev).gb;
+    float2 historyNormal = histAO.read(historyPixel).gb;
     float3 historyN = decodeOctahedral(historyNormal);
 
     // A nearest reprojection naturally differs by a fraction of one world
@@ -1310,6 +1349,8 @@ fragment float4 blur_fragment(FSOut in [[stage_in]],
     float acc = 0.0, wsum = 0.0;
     for (int i = 0; i < 13; ++i) {
         float2 tap = float2(offsets[i]);
+        int2 samplePixel = int2(in.position.xy) + offsets[i];
+        if (any(samplePixel < 0) || any(samplePixel >= int2(U.screen.xy))) continue;
         float2 uv2 = in.uv + tap * px;
         float qD = depthTex.sample(smp, uv2);
         if (qD >= 1.0) continue;
@@ -1415,6 +1456,7 @@ struct Uniforms {
     var shadowParams: SIMD4<Float>
     var invViewProj: simd_float4x4
     var prevInvViewProj: simd_float4x4
+    var aoProjection: SIMD4<Float>
 }
 
 let SPHV = 12 * 18 * 6
@@ -2158,7 +2200,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let fwd = normalize(activeFocus - activeEye)
         let camR = normalize(cross(fwd, cameraUp))
         let camU = cross(camR, fwd)          // screen +y in UV space is DOWN
-        let vp = projectionMatrix(aspect: aspect) * viewMatrix
+        let projection = projectionMatrix(aspect: aspect)
+        let vp = projection * viewMatrix
         let lightDirection = normalize(F3(0.4, 0.25, -0.85))
 
         // A camera-targeted, texel-stabilized orthographic light projection.
@@ -2239,7 +2282,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                              0.30 * texelWorld / (shadowExtent * 5),
                              1.15 * texelWorld / (shadowExtent * 5), 0, 0),
                          invViewProj: vp.inverse,
-                         prevInvViewProj: (prevVP ?? vp).inverse)
+                         prevInvViewProj: (prevVP ?? vp).inverse,
+                         aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
+                                             1 / projection.columns.0.x, 1 / projection.columns.1.y))
         func bindAppearance(
             _ encoder: MTLRenderCommandEncoder,
             enabled: Bool = true
@@ -2254,7 +2299,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
         var Uh = U
         Uh.screen = SIMD4(Float(aoSize.x), Float(aoSize.y),
-                          U.screen.z * 0.5, U.screen.w)
+                          U.screen.z * Float(aoSize.y) / U.screen.y, U.screen.w)
 
         // ---- 1. directional shadow depth ----
         let shadowPass = MTLRenderPassDescriptor()

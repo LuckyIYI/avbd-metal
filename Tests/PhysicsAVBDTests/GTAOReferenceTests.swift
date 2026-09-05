@@ -3,10 +3,12 @@ import simd
 @testable import SimCore
 @testable import PhysicsAVBD
 
-/// Validates the GTAO algorithm (CPU port of the shader math) against
+/// Validates the original world-position GTAO reference against
 /// Monte-Carlo ray-traced ground-truth AO on an analytic scene, and checks
 /// that the value at a fixed surface point does not depend on camera
 /// distance or azimuth.
+/// Production depth sampling and denoising are exercised separately by
+/// GPUSimRendererTests/GTAOMetalTests, which executes the shipped Metal code.
 final class GTAOReferenceTests: XCTestCase {
     // analytic scene: ground plane z=0 + unit box [-0.5,0.5]^2 x [0,1]
     static let boxMin = F3(-0.5, -0.5, 0)
@@ -93,7 +95,7 @@ final class GTAOReferenceTests: XCTestCase {
         return GBuf(w: w, h: h, pos: pos, nrm: nrm)
     }
 
-    /// Exact port of `gtao_fragment` (production shader constants included).
+    /// Historical world-position estimator, not a port of the current depth shader.
     func gtaoPixel(_ g: GBuf, _ px: Int, _ py: Int, eye: F3,
                    camRight: F3, camUpUV: F3, pxPerUnit: Float) -> Float {
         let (P4, Nr) = g.at(px, py)
