@@ -140,6 +140,13 @@ enum ConvexHullTopologyBuilder {
             throw Failure(reason: "does not span a finite three-dimensional hull")
         }
         let tolerance = max(diagonal * 1.0e-7, 1.0e-9)
+        // Construction operates in Double. A point within the Float-sized
+        // validation envelope of an early face can lie outside a later face
+        // after the horizon changes. Skipping it with that same envelope can
+        // therefore produce a hull that fails its own containment check.
+        // Retain those near-coplanar extremes during construction, while
+        // leaving the public geometry-validation tolerance unchanged.
+        let visibilityTolerance = max(diagonal * 1.0e-12, 1.0e-15)
 
         // Deterministic maximal selections use lexicographic order as the
         // tie-breaker (the points array is already sorted ascending).
@@ -215,7 +222,7 @@ enum ConvexHullTopologyBuilder {
                 }
                 let distance = dot(faceNormal,
                     points[pointIndex].value - points[face.a].value)
-                if distance > tolerance * normalLength {
+                if distance > visibilityTolerance * normalLength {
                     visible.append(faceIndex)
                 }
             }
