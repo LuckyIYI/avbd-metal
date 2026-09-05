@@ -2166,6 +2166,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // the uniforms capture prevVP and the temporal blend for this frame
         if activeOptions.ambientOcclusion, screenSpace.aoIsWhite { prevVP = nil }
         var temporal = SIMD4<Float>(0, 1, 0, 0)
+        if activeOptions.ambientOcclusion {
+            temporal.x = (Float(frameIdx % 64) * 0.6180339887).truncatingRemainder(dividingBy: 1)
+            temporal.y = prevVP == nil ? 1 : 0.2
+        }
         if metalFX != nil {
             temporal.x = (Float(frameIdx % 1024) * 0.6180339887).truncatingRemainder(dividingBy: 1)
         }

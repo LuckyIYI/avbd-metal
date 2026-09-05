@@ -497,6 +497,8 @@ final class ScreenSpaceLightingTests: XCTestCase {
             try e.prepare(size: CGSize(width: 319,height: 201), options: options)
             XCTAssertEqual(e.sceneColor != nil, options.usesHDR)
             XCTAssertEqual(e.aoRaw == nil, options.usesRayTracing)
+            XCTAssertEqual(e.aoHistory == nil, options.usesRayTracing)
+            XCTAssertEqual(e.aoPreviousDepth == nil, options.usesRayTracing)
             XCTAssertEqual(e.depthHierarchy != nil, options.screenSpaceReflections)
             XCTAssertNotNil(e.directVisibilityRaw)
         }

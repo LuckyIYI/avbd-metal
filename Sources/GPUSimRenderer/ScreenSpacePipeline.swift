@@ -7,7 +7,7 @@ import simd
 final class ScreenSpacePipeline {
     enum Failure: Error { case allocation(String), encoder(String), shaderFunction(String) }
     let device: MTLDevice
-    private let aoPipeline, visibilityPipeline: MTLRenderPipelineState
+    private let aoPipeline, aoTemporalPipeline, visibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
     private let reconstructionDisplayPipeline: MTLRenderPipelineState
     private let reconstructedDepth: MTLDepthStencilState
@@ -21,6 +21,8 @@ final class ScreenSpacePipeline {
     private(set) var halfSize = SIMD2<Int>(0, 0)
     private(set) var depth, normal, material: MTLTexture?
     private(set) var visibility, aoRaw: MTLTexture?
+    private(set) var aoResolved, aoHistory, aoPreviousDepth: MTLTexture?
+    private var aoHistoryValid = false
     private(set) var directVisibilityRaw, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth: MTLTexture?
     private(set) var diffuse, diffuseRaw: MTLTexture?
     private(set) var displayColor: MTLTexture?
@@ -48,6 +50,7 @@ final class ScreenSpacePipeline {
         depthCopyPipeline = try device.makeComputePipelineState(function: function("screen_depth_copy"))
         depthReducePipeline = try device.makeComputePipelineState(function: function("screen_depth_reduce"))
         aoPipeline = try pipeline("gtao_fragment", format: .r8Unorm)
+        aoTemporalPipeline = try pipeline("temporal_fragment", format: .rgba8Unorm)
         visibilityPipeline = try pipeline("visibility_fragment", format: .rg8Unorm)
         contactPipeline = try pipeline("contact_fragment", format: .r8Unorm)
         reflectionPipeline = try pipeline("reflection_fragment", format: .rgba16Float)
@@ -102,6 +105,11 @@ final class ScreenSpacePipeline {
             let n = try texture(.rgba16Float, width: half.x, height: half.y, label: "Screen normal / roughness")
             let a = try texture(.rg8Unorm, width: half.x, height: half.y, label: "Ambient / direct visibility")
             let raw = try reconstructs ? nil : texture(.r8Unorm, width: half.x, height: half.y, label: "Raw AO")
+            let resolved = try reconstructs ? nil : texture(.rgba8Unorm, width: half.x, height: half.y, label: "Temporal AO")
+            let history = try reconstructs ? nil : texture(.rgba8Unorm, width: half.x, height: half.y, label: "AO history / normal")
+            let previousDepth = try reconstructs ? nil : texture(.depth32Float, width: half.x, height: half.y, label: "AO previous depth")
+            (aoResolved, aoHistory, aoPreviousDepth) = (resolved, history, previousDepth)
+            aoHistoryValid = false
             (size, halfSize) = (next, half)
             (depth, normal, visibility, aoRaw) = (d, n, a, raw)
             directVisibilityRaw = nil; material = nil; reflection = nil; reflectionRaw = nil
@@ -202,14 +210,24 @@ final class ScreenSpacePipeline {
     func encodeBeforeLighting(command: MTLCommandBuffer, uniforms: Uniforms, options: GPUSimRenderOptions) throws {
         if options.ambientOcclusion {
             try pass(aoPipeline, command: command, output: aoRaw!, inputs: [depth!, normal!], uniforms: uniforms)
+            var temporalUniforms = uniforms
+            if !aoHistoryValid { temporalUniforms.temporal.y = 1 }
+            try pass(aoTemporalPipeline, command: command, output: aoResolved!,
+                inputs: [aoRaw!, aoHistory!, depth!, aoPreviousDepth!, normal!], uniforms: temporalUniforms)
+            guard let blit = command.makeBlitCommandEncoder() else { throw Failure.encoder("AO history") }
+            blit.label = "Store AO history"
+            blit.copy(from: aoResolved!, to: aoHistory!)
+            blit.copy(from: depth!, to: aoPreviousDepth!)
+            blit.endEncoding()
+            aoHistoryValid = true
             aoIsWhite = false
-        }
+        } else { aoHistoryValid = false }
         if options.contactShadows && !options.usesRayTracing {
             try pass(contactPipeline, command: command, output: directVisibilityRaw!, inputs: [depth!, normal!], uniforms: uniforms)
         }
         if options.ambientOcclusion || options.contactShadows || options.usesRayTracing {
             try pass(visibilityPipeline, command: command, output: visibility!,
-                inputs: [options.ambientOcclusion ? aoRaw! : white, directVisibilityRaw ?? white, depth!, normal!], uniforms: uniforms)
+                inputs: [options.ambientOcclusion ? aoResolved! : white, directVisibilityRaw ?? white, depth!, normal!], uniforms: uniforms)
         } else if !visibilityIsWhite {
             // A fullscreen clear initializes both ambient and direct visibility channels.
             let d = MTLRenderPassDescriptor()

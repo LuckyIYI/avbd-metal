@@ -352,7 +352,7 @@ fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U 
     if (d >= 1.0) return float4(1);
     float3 P = screenPosition(in.uv, d, U), N = screenVector(normal.read(pixel).xyz, U);
     float tolerance = max(0.003, P.z / U.screen.z * 1.5);
-    float2 sum = float2(0); float weights = 0.0;
+    float2 sum = float2(0); float2 weights = float2(0);
     int2 size = int2(depth.get_width(), depth.get_height());
     constexpr sampler nearest(filter::nearest);
     for (int y = -2; y <= 2; ++y) for (int x = -2; x <= 2; ++x) {
@@ -363,11 +363,16 @@ fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U 
         float2 uv = (float2(q) + 0.5) / float2(size);
         float3 Q = screenPosition(uv, dq, U), QN = screenVector(normal.read(uint2(q)).xyz, U);
         float w = screenFilterWeight(P, N, Q, QN, tolerance) * float((3-abs(x))*(3-abs(y)));
+        // AO keeps its thirteen-tap bilateral reconstruction; contact shadows
+        // use their tighter plane-distance filter independently.
+        float aw = abs(x) + abs(y) <= 2
+            ? exp(-0.5 * float(x*x+y*y)) * exp(-dot(Q-P,Q-P)*8.0)
+                * pow(saturate(dot(N,QN)),12.0) : 0.0;
         float a = ambient.sample(nearest, uv).r;
         float c = U.effects.y > 0.0 ? contact.read(uint2(q)).r : 1.0;
-        sum += float2(a, c) * w; weights += w;
+        sum += float2(a * aw, c * w); weights += float2(aw, w);
     }
-    return float4(weights > 0.0 ? sum / weights : float2(1), 0, 1);
+    return float4(select(float2(1), sum / max(weights, float2(1e-8)), weights > 0.0), 0, 1);
 }
 inline float3 reflectionModulation(float3 P, float4 nr, float4 material, constant Uniforms& U) {
     float NdV = saturate(dot(screenVector(nr.xyz, U), normalize(-P)));
