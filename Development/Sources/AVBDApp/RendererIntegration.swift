@@ -11,7 +11,7 @@ protocol RenderableModel: GPUSimRendererSource {
     nonisolated var captureID: String { get }
     var solver: GPUSolver? { get }
     var rayTracingEnabled: Bool { get }
-    var metalFXEnabled: Bool { get }
+    var screenSpaceReflectionsEnabled: Bool { get }
     var colorByGraphColor: Bool { get }
     var showConvexCollisionGeometry: Bool { get }
     var convexCollisionWireframe: Bool { get }
@@ -25,7 +25,7 @@ extension RenderableModel {
     var showConvexCollisionGeometry: Bool { false }
     var convexCollisionWireframe: Bool { true }
     var supportsRayTracing: Bool {
-        (solver?.device ?? MTLCreateSystemDefaultDevice())?.supportsRaytracing ?? false
+        (solver?.device ?? MTLCreateSystemDefaultDevice()).map { GPUSimRenderer.supportsHQ(device: $0) } ?? false
     }
 
     var renderScene: (any GPUSimRenderableScene)? { solver }
@@ -34,8 +34,8 @@ extension RenderableModel {
             colorMode: colorByGraphColor ? .constraintGraph : .bodyIndex,
             showConvexCollisionGeometry: showConvexCollisionGeometry,
             convexCollisionWireframe: convexCollisionWireframe,
-            lightingMode: rayTracingEnabled ? .qualityBeta : .lightweight,
-            reconstruction: metalFXEnabled ? .metalFX : .legacy
+            screenSpaceReflections: screenSpaceReflectionsEnabled,
+            lightingMode: rayTracingEnabled ? .qualityBeta : .lightweight
         )
     }
 

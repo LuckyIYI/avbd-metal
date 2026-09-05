@@ -40,44 +40,6 @@ inline float4 surfaceDiffuse(float2 uv, float3 P, float3 N, constant Uniforms& U
 }
 """
 
-let diffuseFilterShaderSource = """
-fragment float4 diffuse_temporal_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
-    texture2d<float> current [[texture(0)]], texture2d<float> history [[texture(1)]]) {
-    uint2 p = uint2(in.position.xy);
-    float4 value = current.read(p);
-    if (U.temporal.z<=1) return value;
-    return float4(mix(history.read(p).rgb,value.rgb,1.0/U.temporal.z),value.a);
-}
-
-fragment float4 diffuse_filter_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
-    constant float4& filter [[buffer(2)]], texture2d<float> raw [[texture(0)]],
-    depth2d<float> depth [[texture(1)]], texture2d<float> normal [[texture(2)]]) {
-    uint2 pixel = uint2(in.position.xy), size = uint2(raw.get_width(),raw.get_height());
-    uint2 surfaceSize = uint2(depth.get_width(),depth.get_height());
-    uint2 s = diffuseSurfacePixel(pixel,surfaceSize);
-    float d = depth.read(s);
-    if (d>=1 || raw.read(pixel).a==0) return float4(0);
-    float3 P = screenPosition((float2(s)+0.5)/float2(surfaceSize),d,U);
-    float3 N = screenVector(normal.read(s).xyz,U);
-    float tolerance = max(0.001,P.z/U.screen.z*0.75);
-    float3 sum = float3(0); float weights = 0;
-    for (int y=-1;y<=1;++y) for (int x=-1;x<=1;++x) {
-        int2 q = int2(pixel)+int2(x,y)*int(filter.x);
-        if (any(q<0) || any(q>=int2(size))) continue;
-        uint2 qs = diffuseSurfacePixel(uint2(q),surfaceSize);
-        float dq = depth.read(qs); float4 value = raw.read(uint2(q));
-        if (dq>=1 || value.a==0) continue;
-        float3 Q = screenPosition((float2(qs)+0.5)/float2(surfaceSize),dq,U);
-        float3 QN = screenVector(normal.read(qs).xyz,U);
-        float plane = max(abs(dot(Q-P,N)),abs(dot(Q-P,QN)));
-        float w = pow(saturate(dot(N,QN)),32.0)*saturate(1-plane/tolerance);
-        w *= (x==0 ? 2.0 : 1.0)*(y==0 ? 2.0 : 1.0);
-        sum += value.rgb*w; weights += w;
-    }
-    return float4(weights>0 ? sum/weights : float3(0),1);
-}
-"""
-
 let diffuseRayShaderSource = """
 // Sixteen strata per receiver, with complementary sub-strata over every
 // 4x4 receiver neighborhood. The two tent passes integrate those neighbors

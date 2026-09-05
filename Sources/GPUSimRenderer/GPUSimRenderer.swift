@@ -14,26 +14,25 @@ public enum GPUSimRenderColorMode: UInt32, Sendable, Equatable {
 public enum GPUSimLightingMode: Sendable, Equatable {
     case lightweight
     /// Selective world-space shadows, reflections and diffuse bounce. Experimental.
-    /// Devices without Metal ray tracing use the lightweight path.
+    /// Requires Metal ray tracing and MetalFX neural denoising; otherwise uses Fast.
     case qualityBeta
 }
 
 public enum GPUSimReconstruction: Sendable, Equatable {
     case legacy
-    /// MetalFX temporal AA and upscaling in Fast, neural denoising in HQ.
-    /// Unsupported devices retain the legacy reconstruction.
+    /// Neural denoising and upscaling for HQ.
     case metalFX
 }
 
 public struct GPUSimRenderOptions: Sendable, Equatable {
     /// Linear internal resolution for MetalFX, clamped to 0.5...1.
     public var reconstructionScale: Float
-    public var reconstruction: GPUSimReconstruction
+    public var reconstruction: GPUSimReconstruction { usesRayTracing ? .metalFX : .legacy }
     public var lightingMode: GPUSimLightingMode
     public var colorMode: GPUSimRenderColorMode
     public var showConvexCollisionGeometry: Bool
     public var convexCollisionWireframe: Bool
-    /// Half-resolution GTAO with stable samples. HQ accumulates unchanged scenes.
+    /// Half-resolution GTAO with stable samples in Fast.
     /// Hosts on a power
     /// budget can disable it independently of the other lighting effects.
     public var ambientOcclusion: Bool
@@ -44,16 +43,14 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// A display-space edge resolve supplements 4x MSAA for shading and
     /// screen-space effects. It keeps no temporal color history.
     public var edgeAntialiasing: Bool
-    /// One world-space diffuse bounce in RT Beta; ignored by Fast mode.
-    public var diffuseGlobalIllumination: Bool
 
     /// Default lighting: rasterized shadows, GTAO and short contact shadows.
     /// Allocates no HDR reflection targets or depth hierarchy.
     public static var lightweight: Self { Self() }
 
     /// Ray-traced directional shadows, glossy reflections and a bounded diffuse
-    /// bounce. World geometry supplies offscreen lighting; GTAO fills fine
-    /// features that the diffuse reconstruction cannot resolve.
+    /// bounce, reconstructed by MetalFX. World rays supply diffuse occlusion;
+    /// HQ does not run GTAO, contact shadows, SSR, or display-space FXAA.
     public static var qualityBeta: Self { Self(lightingMode: .qualityBeta) }
     /// Disable the built-in checker ground when the host authors its own floor.
     public var showsGroundPlane: Bool
@@ -66,8 +63,20 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     public var minimumFrameDuration: Double?
 
     var usesRayTracing: Bool { lightingMode == .qualityBeta }
-    var usesDiffuseGI: Bool { usesRayTracing && diffuseGlobalIllumination }
+    var usesDiffuseGI: Bool { usesRayTracing }
     var usesHDR: Bool { screenSpaceReflections || usesRayTracing || reconstruction == .metalFX }
+
+    func resolved(supportsHQ: Bool) -> Self {
+        var result = self
+        if usesRayTracing && !supportsHQ { result.lightingMode = .lightweight }
+        if result.usesRayTracing {
+            result.ambientOcclusion = false
+            result.contactShadows = false
+            result.screenSpaceReflections = false
+            result.edgeAntialiasing = false
+        }
+        return result
+    }
 
     public init(
         colorMode: GPUSimRenderColorMode = .bodyIndex,
@@ -80,12 +89,9 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         minimumFrameDuration: Double? = nil,
         lightingMode: GPUSimLightingMode = .lightweight,
         edgeAntialiasing: Bool = true,
-        diffuseGlobalIllumination: Bool = true,
-        reconstruction: GPUSimReconstruction = .legacy,
         reconstructionScale: Float = 0.67
     ) {
         self.reconstructionScale = reconstructionScale
-        self.reconstruction = reconstruction
         self.lightingMode = lightingMode
         self.colorMode = colorMode
         self.showConvexCollisionGeometry = showConvexCollisionGeometry
@@ -94,7 +100,6 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         self.contactShadows = contactShadows
         self.screenSpaceReflections = screenSpaceReflections
         self.edgeAntialiasing = edgeAntialiasing
-        self.diffuseGlobalIllumination = diffuseGlobalIllumination
         self.showsGroundPlane = showsGroundPlane
         self.minimumFrameDuration = minimumFrameDuration
     }
@@ -1382,7 +1387,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var surfacePipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
     var prevVP: simd_float4x4?
     var frameIdx: UInt32 = 0
-    private var lightingAccumulation = LightingAccumulation()
     var targetSize = SIMD2<Int>(0, 0)
     var instances: MTLBuffer?
     private var appearanceRing: [MTLBuffer?] = [nil, nil, nil]
@@ -1898,6 +1902,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
     // MARK: - Frame
 
+    public static func supportsHQ(device: MTLDevice) -> Bool {
+        device.supportsRaytracing && MetalFXReconstruction.supports(device: device, denoising: true)
+    }
+
     public func draw(in view: MTKView) {
         guard runtimeFailure == nil else { return }
         guard let rpd = view.currentRenderPassDescriptor,
@@ -1914,14 +1922,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         var activeOptions = source?.rendererOptions ?? options
-        if activeOptions.usesRayTracing && !device.supportsRaytracing {
-            activeOptions.lightingMode = .lightweight
-        }
-        if activeOptions.reconstruction == .metalFX &&
-            (activeOptions.screenSpaceReflections || !MetalFXReconstruction.supports(device: device, denoising: activeOptions.usesRayTracing)) {
-            activeOptions.reconstruction = .legacy
-        }
-        if activeOptions.reconstruction == .metalFX { activeOptions.edgeAntialiasing = false }
+        activeOptions = activeOptions.resolved(supportsHQ: Self.supportsHQ(device: device))
         activeLightingMode = activeOptions.lightingMode
         guard renderScene.rendererStateIsValid else { return }
         let activeBodyAppearances = source?.rendererBodyAppearances
@@ -1994,10 +1995,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 }
             } else { metalFX = nil }
         } catch {
-            metalFX = nil
-            activeOptions.reconstruction = .legacy
-            activeOptions.edgeAntialiasing = (source?.rendererOptions ?? options).edgeAntialiasing
-            guard ensureTargets(view.drawableSize, options: activeOptions) else { return }
+            reportFailure("could not initialize HQ MetalFX reconstruction: \(error)")
+            return
         }
         activeReconstruction = metalFX == nil ? .legacy : .metalFX
 
@@ -2151,10 +2150,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // the stale previous-frame matrices must fall together, and BEFORE
         // the uniforms capture prevVP and the temporal blend for this frame
         if activeOptions.ambientOcclusion, screenSpace.aoIsWhite { prevVP = nil }
-        var temporal = lightingAccumulation.advance(
-            world: rayWorld.map(ObjectIdentifier.init), revision: rayWorld?.lightingRevision,
-            camera: vp, light: lightDirection, size: targetSize, options: activeOptions, reset: prevVP == nil)
-        if metalFX != nil { temporal = SIMD4(Float(frameIdx % 1024) * 0.6180339887, 1, 0, 0); temporal.x -= floor(temporal.x) }
+        var temporal = SIMD4<Float>(0, 1, 0, 0)
+        if metalFX != nil {
+            temporal.x = (Float(frameIdx % 1024) * 0.6180339887).truncatingRemainder(dividingBy: 1)
+        }
         var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(lightDirection, 0),
                          eye: SIMD4(activeEye, 0),
@@ -2469,12 +2468,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             if activeOptions.usesDiffuseGI, let rayWorld {
                 try rayWorld.encodeDiffuse(command: cmd, uniforms: Uh, screen: screenSpace,
                     instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides)
-                if metalFX == nil { try screenSpace.encodeDiffuseFilter(command: cmd, uniforms: Uh) }
             }
             if Uh.rayTracing.w > 0, let rayWorld {
                 try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
                     instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
-                if metalFX == nil { try screenSpace.encodeReflectionFilter(command: cmd, uniforms: Uh) }
             }
         } catch {
             reportFailure("screen-space lighting failed: \(error)")

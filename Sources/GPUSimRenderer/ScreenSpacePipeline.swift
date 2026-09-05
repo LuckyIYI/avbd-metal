@@ -7,10 +7,8 @@ import simd
 final class ScreenSpacePipeline {
     enum Failure: Error { case allocation(String), encoder(String), shaderFunction(String) }
     let device: MTLDevice
-    private let aoPipeline, temporalPipeline, visibilityPipeline: MTLRenderPipelineState
+    private let aoPipeline, visibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
-    private let diffuseTemporalPipeline: MTLRenderPipelineState
-    private let diffuseFilterPipeline: MTLRenderPipelineState
     private let reconstructionDisplayPipeline: MTLRenderPipelineState
     private let reconstructedDepth: MTLDepthStencilState
     private let antialiasingPipeline: MTLRenderPipelineState
@@ -22,11 +20,9 @@ final class ScreenSpacePipeline {
     private(set) var size = SIMD2<Int>(0, 0)
     private(set) var halfSize = SIMD2<Int>(0, 0)
     private(set) var depth, normal, material: MTLTexture?
-    private(set) var visibility, aoRaw, aoResolved, aoHistory: MTLTexture?
+    private(set) var visibility, aoRaw: MTLTexture?
     private(set) var directVisibilityRaw, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth: MTLTexture?
-    private(set) var reflectionScratch: MTLTexture?
-    private(set) var diffuse, diffuseRaw, diffuseScratch: MTLTexture?
-    private var diffuseHistory: MTLTexture?
+    private(set) var diffuse, diffuseRaw: MTLTexture?
     private(set) var displayColor: MTLTexture?
     private var displayEncoded: MTLTexture?
     private(set) var aoIsWhite = false
@@ -52,14 +48,11 @@ final class ScreenSpacePipeline {
         depthCopyPipeline = try device.makeComputePipelineState(function: function("screen_depth_copy"))
         depthReducePipeline = try device.makeComputePipelineState(function: function("screen_depth_reduce"))
         aoPipeline = try pipeline("gtao_fragment", format: .r8Unorm)
-        temporalPipeline = try pipeline("temporal_fragment", format: .r16Float)
         visibilityPipeline = try pipeline("visibility_fragment", format: .rg8Unorm)
         contactPipeline = try pipeline("contact_fragment", format: .r8Unorm)
         reflectionPipeline = try pipeline("reflection_fragment", format: .rgba16Float)
         reflectionFilterPipeline = try pipeline("reflection_filter_fragment", format: .rgba16Float)
         compositePipeline = try pipeline("screen_composite_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
-        diffuseTemporalPipeline = try pipeline("diffuse_temporal_fragment", format: .rgba16Float)
-        diffuseFilterPipeline = try pipeline("diffuse_filter_fragment", format: .rgba16Float)
         antialiasingPipeline = try pipeline("edge_antialiasing_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
         reconstructionDisplayPipeline = try pipeline("reconstruction_display_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
         let reconstructedDS = MTLDepthStencilDescriptor()
@@ -108,17 +101,13 @@ final class ScreenSpacePipeline {
             let d = try texture(.depth32Float, width: half.x, height: half.y, label: "Screen depth")
             let n = try texture(.rgba16Float, width: half.x, height: half.y, label: "Screen normal / roughness")
             let a = try texture(.rg8Unorm, width: half.x, height: half.y, label: "Ambient / direct visibility")
-            let raw = try texture(.r8Unorm, width: half.x, height: half.y, label: "Raw AO")
-            let r = try reconstructs ? raw : texture(.r16Float, width: half.x, height: half.y, label: "AO resolve")
-            let h = try reconstructs ? raw : texture(.r16Float, width: half.x, height: half.y, label: "AO history")
+            let raw = try reconstructs ? nil : texture(.r8Unorm, width: half.x, height: half.y, label: "Raw AO")
             (size, halfSize) = (next, half)
-            (depth, normal, visibility, aoRaw, aoResolved, aoHistory) = (d, n, a, raw, r, h)
+            (depth, normal, visibility, aoRaw) = (d, n, a, raw)
             directVisibilityRaw = nil; material = nil; reflection = nil; reflectionRaw = nil
-            reflectionScratch = nil
             sceneColor = nil; sceneMSAA = nil; sceneDepth = nil; depthHierarchy = nil; depthLevels = []
             displayColor = nil; displayEncoded = nil
-            diffuse = nil; diffuseRaw = nil; diffuseScratch = nil
-            diffuseHistory = nil
+            diffuse = nil; diffuseRaw = nil
             aoIsWhite = false
             visibilityIsWhite = false
         }
@@ -127,7 +116,7 @@ final class ScreenSpacePipeline {
         } else if !options.contactShadows && !options.usesRayTracing { directVisibilityRaw = nil }
         if options.usesHDR, sceneColor == nil || (sceneColor!.mipmapLevelCount > 1) != options.screenSpaceReflections {
             let m = try texture(.rgba8Unorm, width: halfSize.x, height: halfSize.y, label: "Screen albedo / metallic")
-            let r = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection radiance correction")
+            let r = try reconstructs ? nil : texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection radiance correction")
             let raw = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Raw reflected radiance")
             let c = try texture(.rgba16Float, width: size.x, height: size.y, label: "HDR scene", mipmapped: options.screenSpaceReflections)
             let s = try texture(.rgba16Float, width: size.x, height: size.y, label: "Transient HDR MSAA", samples: GPUSimRenderer.sampleCount)
@@ -147,29 +136,17 @@ final class ScreenSpacePipeline {
                 pyramid.label = "Screen depth hierarchy"
                 hierarchy = pyramid
             }
-            (material, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth) = (m, r, raw, c, s, d)
+            (material, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth) = (m, reconstructs ? raw : r, raw, c, s, d)
             depthHierarchy = hierarchy; depthLevels = levels
         } else if !options.usesHDR {
             material = nil; reflection = nil; reflectionRaw = nil; sceneColor = nil; sceneMSAA = nil; sceneDepth = nil
             depthHierarchy = nil; depthLevels = []
         }
-        if options.usesRayTracing && !reconstructs, reflectionScratch == nil {
-            reflectionScratch = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection filter scratch")
-        } else if !options.usesRayTracing || reconstructs { reflectionScratch = nil }
         if options.usesDiffuseGI, diffuse == nil {
-            let width = reconstructs ? halfSize.x : (halfSize.x+1)/2, height = reconstructs ? halfSize.y : (halfSize.y+1)/2
-            let raw = try texture(.rgba16Float, width: width, height: height, label: "Raw diffuse irradiance")
-            diffuseRaw = raw
-            if reconstructs {
-                diffuse = raw
-            } else {
-                diffuse = try texture(.rgba16Float, width: width, height: height, label: "Diffuse irradiance correction")
-                diffuseScratch = try texture(.rgba16Float, width: width, height: height, label: "Diffuse filter scratch")
-                diffuseHistory = try texture(.rgba16Float, width: width, height: height, label: "Diffuse lighting history")
-            }
+            let raw = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Raw diffuse irradiance")
+            diffuseRaw = raw; diffuse = raw
         } else if !options.usesDiffuseGI {
-            diffuse = nil; diffuseRaw = nil; diffuseScratch = nil
-            diffuseHistory = nil
+            diffuse = nil; diffuseRaw = nil
         }
         if options.edgeAntialiasing, displayColor == nil {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: size.x, height: size.y, mipmapped: false)
@@ -223,16 +200,8 @@ final class ScreenSpacePipeline {
     }
 
     func encodeBeforeLighting(command: MTLCommandBuffer, uniforms: Uniforms, options: GPUSimRenderOptions) throws {
-        if options.ambientOcclusion && uniforms.temporal.z<=64 {
+        if options.ambientOcclusion {
             try pass(aoPipeline, command: command, output: aoRaw!, inputs: [depth!, normal!], uniforms: uniforms)
-            if uniforms.temporal.z>0 {
-                try pass(temporalPipeline, command: command, output: aoResolved!,
-                         inputs: [aoRaw!, aoHistory!], uniforms: uniforms)
-                guard let b = command.makeBlitCommandEncoder() else { throw Failure.encoder("AO history") }
-                b.label = "AO history"
-                b.copy(from: aoResolved!, to: aoHistory!)
-                b.endEncoding()
-            }
             aoIsWhite = false
         }
         if options.contactShadows && !options.usesRayTracing {
@@ -240,7 +209,7 @@ final class ScreenSpacePipeline {
         }
         if options.ambientOcclusion || options.contactShadows || options.usesRayTracing {
             try pass(visibilityPipeline, command: command, output: visibility!,
-                inputs: [options.ambientOcclusion ? (uniforms.temporal.z>0 ? aoResolved! : aoRaw!) : white, directVisibilityRaw ?? white, depth!, normal!], uniforms: uniforms)
+                inputs: [options.ambientOcclusion ? aoRaw! : white, directVisibilityRaw ?? white, depth!, normal!], uniforms: uniforms)
         } else if !visibilityIsWhite {
             // A fullscreen clear initializes both ambient and direct visibility channels.
             let d = MTLRenderPassDescriptor()
@@ -253,20 +222,6 @@ final class ScreenSpacePipeline {
         }
         aoIsWhite = !options.ambientOcclusion
         visibilityIsWhite = !options.ambientOcclusion && !options.contactShadows && !options.usesRayTracing
-    }
-
-    func encodeDiffuseFilter(command: MTLCommandBuffer, uniforms: Uniforms) throws {
-        guard uniforms.temporal.z<=64 else { return }
-        for (step, source, destination) in [(1, diffuseRaw!, diffuseScratch!), (2, diffuseScratch!, diffuse!)] {
-            try pass(diffuseFilterPipeline, command: command, output: destination,
-                     inputs: [source, depth!, normal!], uniforms: uniforms, parameters: SIMD4(Float(step),0,0,0))
-        }
-        try pass(diffuseTemporalPipeline, command: command, output: diffuseScratch!,
-                 inputs: [diffuse!, diffuseHistory!], uniforms: uniforms)
-        swap(&diffuse, &diffuseScratch)
-        guard let blit = command.makeBlitCommandEncoder() else { throw Failure.encoder("diffuse history") }
-        blit.copy(from: diffuse!, to: diffuseHistory!)
-        blit.endEncoding()
     }
 
     func scenePass(using destination: MTLRenderPassDescriptor, singleSample: Bool = false) -> MTLRenderPassDescriptor {
@@ -315,22 +270,8 @@ final class ScreenSpacePipeline {
     }
 
     func encodeReflectionFilter(command: MTLCommandBuffer, uniforms: Uniforms) throws {
-        if uniforms.rayTracing.x > 0 {
-            guard let scratch = reflectionScratch else { throw Failure.allocation("reflection filter scratch") }
-            // Increasing tap spacing suppresses low-sample blotches without
-            // retaining old geometry or reflected lighting across frames.
-            for (input, output, parameters) in [
-                (reflectionRaw!, reflection!, SIMD4<Float>(1, 1, 0, 0)),
-                (reflection!, scratch, SIMD4<Float>(2, 0, 0, 0)),
-                (scratch, reflection!, SIMD4<Float>(4, 0, 1, 0))
-            ] {
-                try pass(reflectionFilterPipeline, command: command, output: output,
-                    inputs: [input, depth!, normal!, material!], uniforms: uniforms, parameters: parameters)
-            }
-        } else {
-            try pass(reflectionFilterPipeline, command: command, output: reflection!,
-                inputs: [reflectionRaw!, depth!, normal!, material!], uniforms: uniforms, parameters: SIMD4(1, 1, 1, 0))
-        }
+        try pass(reflectionFilterPipeline, command: command, output: reflection!,
+            inputs: [reflectionRaw!, depth!, normal!, material!], uniforms: uniforms, parameters: SIMD4(1, 1, 1, 0))
     }
 
     /// Returns the open display encoder so overlays share the tone-mapped MSAA

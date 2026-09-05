@@ -447,4 +447,4 @@ fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Unifor
     }
     return float4(displayColorSRGB8(acesTonemap(max(color, 0.0)), in.position.xy), 1);
 }
-""" + antialiasingShaderSource + diffuseFilterShaderSource + reconstructionShaderSource
+""" + antialiasingShaderSource + reconstructionShaderSource

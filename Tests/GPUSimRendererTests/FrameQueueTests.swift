@@ -35,6 +35,28 @@ final class FrameQueueTests: XCTestCase {
         }
     }
 
+    func testTwoRenderingPathsAndUnsupportedHQFallback() {
+        var requested = GPUSimRenderOptions.qualityBeta
+        requested.screenSpaceReflections = true
+        let hq = requested.resolved(supportsHQ: true)
+        XCTAssertEqual(hq.reconstruction, .metalFX)
+        XCTAssertFalse(hq.ambientOcclusion)
+        XCTAssertFalse(hq.contactShadows)
+        XCTAssertFalse(hq.screenSpaceReflections)
+        XCTAssertFalse(hq.edgeAntialiasing)
+        XCTAssertTrue(hq.usesDiffuseGI)
+        let fallback = requested.resolved(supportsHQ: false)
+        XCTAssertEqual(fallback.lightingMode, .lightweight)
+        XCTAssertEqual(fallback.reconstruction, .legacy)
+        XCTAssertTrue(fallback.ambientOcclusion)
+        XCTAssertTrue(fallback.contactShadows)
+        XCTAssertTrue(fallback.screenSpaceReflections)
+        let fast = GPUSimRenderOptions.lightweight.resolved(supportsHQ: true)
+        XCTAssertEqual(fast.reconstruction, .legacy)
+        XCTAssertTrue(fast.edgeAntialiasing)
+        XCTAssertFalse(fast.usesDiffuseGI)
+    }
+
     func testMetalFXModeSwitchAndResizeKeepSubmittingValidFrames() throws {
         guard let device = MTLCreateSystemDefaultDevice(),
               MetalFXReconstruction.supports(device: device, denoising: true) else { throw XCTSkip("MetalFX denoising unavailable") }
@@ -43,7 +65,7 @@ final class FrameQueueTests: XCTestCase {
         let view = MTKView(frame: CGRect(x: 0,y: 0,width: 128,height: 96),device: device)
         renderer.configure(view); view.isPaused = true
         for (index, mode) in [GPUSimLightingMode.lightweight,.qualityBeta,.qualityBeta,.lightweight,.lightweight].enumerated() {
-            renderer.options = GPUSimRenderOptions(lightingMode: mode,reconstruction: index == 4 ? .legacy : .metalFX)
+            renderer.options = GPUSimRenderOptions(lightingMode: mode)
             if index == 2 { view.drawableSize = CGSize(width: 160,height: 112) }
             let count = scene.frames.count
             view.draw()
@@ -51,7 +73,7 @@ final class FrameQueueTests: XCTestCase {
             XCTAssertEqual(scene.frames.count,count+1)
             scene.frames.last?.waitUntilCompleted()
             XCTAssertEqual(scene.frames.last?.status,.completed)
-            XCTAssertEqual(renderer.activeReconstruction,index == 4 ? .legacy : .metalFX)
+            XCTAssertEqual(renderer.activeReconstruction,mode == .qualityBeta ? .metalFX : .legacy)
         }
     }
 

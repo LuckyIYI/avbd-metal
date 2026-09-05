@@ -59,7 +59,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Text("AVBD Metal").font(.title2).bold()
                 RenderingModePicker(rayTracingEnabled: $model.rayTracingEnabled,
-                                    metalFXEnabled: $model.metalFXEnabled,
+                                    screenSpaceReflectionsEnabled: $model.screenSpaceReflectionsEnabled,
                                     supportsRayTracing: model.supportsRayTracing)
 
                 GroupBox("Demo") {
@@ -190,7 +190,7 @@ struct ContentView: View {
 
 struct RenderingModePicker: View {
     @Binding var rayTracingEnabled: Bool
-    @Binding var metalFXEnabled: Bool
+    @Binding var screenSpaceReflectionsEnabled: Bool
     let supportsRayTracing: Bool
 
     var body: some View {
@@ -198,15 +198,16 @@ struct RenderingModePicker: View {
             VStack(alignment: .leading, spacing: 6) {
                 Picker("Rendering", selection: $rayTracingEnabled) {
                     Text("Fast").tag(false)
-                    Text("RT Beta").tag(true)
+                    Text("HQ Beta").tag(true)
                 }
                 .pickerStyle(.segmented)
                 .disabled(!supportsRayTracing)
-                Toggle("MetalFX reconstruction (Beta)", isOn: $metalFXEnabled)
-                    .help("Temporal antialiasing in Fast; denoising in RT Beta. Renders at 67% resolution. Unsupported devices use the existing renderer.")
-                Text(!supportsRayTracing ? "Ray tracing is unavailable on this Mac."
-                     : rayTracingEnabled ? "Ray-traced shadows, reflections and bounced light. Experimental."
-                     : "Raster shadows and ambient occlusion.")
+                if !rayTracingEnabled {
+                    Toggle("Screen-space reflections", isOn: $screenSpaceReflectionsEnabled)
+                }
+                Text(!supportsRayTracing ? "HQ requires ray tracing and MetalFX denoising support."
+                     : rayTracingEnabled ? "Ray-traced lighting with MetalFX denoising and upscaling. Experimental."
+                     : "Raster shadows, GTAO and contact shadows.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

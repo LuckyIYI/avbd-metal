@@ -34,7 +34,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
     }
     @Published var running = true
     @Published var rayTracingEnabled = false
-    @Published var metalFXEnabled = false
+    @Published var screenSpaceReflectionsEnabled = false
     @Published var colorByGraphColor = false
     @Published var showConvexCollisionGeometry = false
     @Published var convexCollisionWireframe = true
