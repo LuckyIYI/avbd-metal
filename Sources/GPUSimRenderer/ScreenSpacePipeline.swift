@@ -20,12 +20,11 @@ final class ScreenSpacePipeline {
     private(set) var size = SIMD2<Int>(0, 0)
     private(set) var halfSize = SIMD2<Int>(0, 0)
     private(set) var depth, normal, material: MTLTexture?
-    private(set) var visibility, aoRaw, aoResolved, aoHistory, previousDepth: MTLTexture?
+    private(set) var visibility, aoRaw, aoResolved, aoHistory: MTLTexture?
     private(set) var directVisibilityRaw, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth: MTLTexture?
     private(set) var reflectionScratch: MTLTexture?
-    private(set) var diffuse, diffuseRaw, diffuseScratch, diffuseSurface: MTLTexture?
-    private var diffuseHistory, diffusePreviousSurface: MTLTexture?
-    private var diffuseHistoryValid = false
+    private(set) var diffuse, diffuseRaw, diffuseScratch: MTLTexture?
+    private var diffuseHistory: MTLTexture?
     private(set) var displayColor: MTLTexture?
     private var displayEncoded: MTLTexture?
     private(set) var aoIsWhite = false
@@ -50,7 +49,7 @@ final class ScreenSpacePipeline {
         depthCopyPipeline = try device.makeComputePipelineState(function: function("screen_depth_copy"))
         depthReducePipeline = try device.makeComputePipelineState(function: function("screen_depth_reduce"))
         aoPipeline = try pipeline("gtao_fragment", format: .r8Unorm)
-        temporalPipeline = try pipeline("temporal_fragment", format: .rgba8Unorm)
+        temporalPipeline = try pipeline("temporal_fragment", format: .r16Float)
         visibilityPipeline = try pipeline("visibility_fragment", format: .rg8Unorm)
         contactPipeline = try pipeline("contact_fragment", format: .r8Unorm)
         reflectionPipeline = try pipeline("reflection_fragment", format: .rgba16Float)
@@ -101,17 +100,16 @@ final class ScreenSpacePipeline {
             let n = try texture(.rgba16Float, width: half.x, height: half.y, label: "Screen normal / roughness")
             let a = try texture(.rg8Unorm, width: half.x, height: half.y, label: "Ambient / direct visibility")
             let raw = try texture(.r8Unorm, width: half.x, height: half.y, label: "Raw AO")
-            let r = try texture(.rgba8Unorm, width: half.x, height: half.y, label: "AO resolve")
-            let h = try texture(.rgba8Unorm, width: half.x, height: half.y, label: "AO history")
-            let p = try texture(.depth32Float, width: half.x, height: half.y, label: "Previous screen depth")
+            let r = try texture(.r16Float, width: half.x, height: half.y, label: "AO resolve")
+            let h = try texture(.r16Float, width: half.x, height: half.y, label: "AO history")
             (size, halfSize) = (next, half)
-            (depth, normal, visibility, aoRaw, aoResolved, aoHistory, previousDepth) = (d, n, a, raw, r, h, p)
+            (depth, normal, visibility, aoRaw, aoResolved, aoHistory) = (d, n, a, raw, r, h)
             directVisibilityRaw = nil; material = nil; reflection = nil; reflectionRaw = nil
             reflectionScratch = nil
             sceneColor = nil; sceneMSAA = nil; sceneDepth = nil; depthHierarchy = nil; depthLevels = []
             displayColor = nil; displayEncoded = nil
             diffuse = nil; diffuseRaw = nil; diffuseScratch = nil
-            diffuseSurface = nil; diffusePreviousSurface = nil; diffuseHistory = nil; diffuseHistoryValid = false
+            diffuseHistory = nil
             aoIsWhite = false
             visibilityIsWhite = false
         }
@@ -155,14 +153,10 @@ final class ScreenSpacePipeline {
             let b = try texture(.rgba16Float, width: width, height: height, label: "Raw diffuse irradiance")
             let c = try texture(.rgba16Float, width: width, height: height, label: "Diffuse filter scratch")
             let h = try texture(.rgba16Float, width: width, height: height, label: "Diffuse lighting history")
-            let g = try texture(.rgba32Float, width: width, height: height, label: "Diffuse receiver geometry")
-            let p = try texture(.rgba32Float, width: width, height: height, label: "Previous diffuse receivers")
-            (diffuse, diffuseRaw, diffuseScratch) = (a,b,c)
-            (diffuseHistory, diffuseSurface, diffusePreviousSurface) = (h,g,p)
-            diffuseHistoryValid = false
+            (diffuse, diffuseRaw, diffuseScratch, diffuseHistory) = (a,b,c,h)
         } else if !options.usesDiffuseGI {
             diffuse = nil; diffuseRaw = nil; diffuseScratch = nil
-            diffuseSurface = nil; diffusePreviousSurface = nil; diffuseHistory = nil; diffuseHistoryValid = false
+            diffuseHistory = nil
         }
         if options.edgeAntialiasing, displayColor == nil {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: size.x, height: size.y, mipmapped: false)
@@ -216,15 +210,16 @@ final class ScreenSpacePipeline {
     }
 
     func encodeBeforeLighting(command: MTLCommandBuffer, uniforms: Uniforms, options: GPUSimRenderOptions) throws {
-        if options.ambientOcclusion {
+        if options.ambientOcclusion && uniforms.temporal.z<=64 {
             try pass(aoPipeline, command: command, output: aoRaw!, inputs: [depth!, normal!], uniforms: uniforms)
-            try pass(temporalPipeline, command: command, output: aoResolved!,
-                     inputs: [aoRaw!, aoHistory!, depth!, previousDepth!, normal!], uniforms: uniforms)
-            guard let b = command.makeBlitCommandEncoder() else { throw Failure.encoder("AO history") }
-            b.label = "AO history"
-            b.copy(from: aoResolved!, to: aoHistory!)
-            b.copy(from: depth!, to: previousDepth!)
-            b.endEncoding()
+            if uniforms.temporal.z>0 {
+                try pass(temporalPipeline, command: command, output: aoResolved!,
+                         inputs: [aoRaw!, aoHistory!], uniforms: uniforms)
+                guard let b = command.makeBlitCommandEncoder() else { throw Failure.encoder("AO history") }
+                b.label = "AO history"
+                b.copy(from: aoResolved!, to: aoHistory!)
+                b.endEncoding()
+            }
             aoIsWhite = false
         }
         if options.contactShadows && !options.usesRayTracing {
@@ -232,7 +227,7 @@ final class ScreenSpacePipeline {
         }
         if options.ambientOcclusion || options.contactShadows || options.usesRayTracing {
             try pass(visibilityPipeline, command: command, output: visibility!,
-                inputs: [options.ambientOcclusion ? aoResolved! : white, directVisibilityRaw ?? white, depth!, normal!], uniforms: uniforms)
+                inputs: [options.ambientOcclusion ? (uniforms.temporal.z>0 ? aoResolved! : aoRaw!) : white, directVisibilityRaw ?? white, depth!, normal!], uniforms: uniforms)
         } else if !visibilityIsWhite {
             // A fullscreen clear initializes both ambient and direct visibility channels.
             let d = MTLRenderPassDescriptor()
@@ -248,20 +243,17 @@ final class ScreenSpacePipeline {
     }
 
     func encodeDiffuseFilter(command: MTLCommandBuffer, uniforms: Uniforms) throws {
-        for (step, source, destination) in [(1, diffuseRaw!, diffuse!), (2, diffuse!, diffuseScratch!), (4, diffuseScratch!, diffuse!)] {
+        guard uniforms.temporal.z<=64 else { return }
+        for (step, source, destination) in [(1, diffuseRaw!, diffuseScratch!), (2, diffuseScratch!, diffuse!)] {
             try pass(diffuseFilterPipeline, command: command, output: destination,
                      inputs: [source, depth!, normal!], uniforms: uniforms, parameters: SIMD4(Float(step),0,0,0))
         }
-        var u = uniforms
-        u.diffuse.y = !diffuseHistoryValid || u.temporal.y>=1 ? 1 : 0.2
         try pass(diffuseTemporalPipeline, command: command, output: diffuseScratch!,
-                 inputs: [diffuse!, diffuseHistory!, diffusePreviousSurface!, diffuseSurface!], uniforms: u)
+                 inputs: [diffuse!, diffuseHistory!], uniforms: uniforms)
         swap(&diffuse, &diffuseScratch)
         guard let blit = command.makeBlitCommandEncoder() else { throw Failure.encoder("diffuse history") }
         blit.copy(from: diffuse!, to: diffuseHistory!)
-        blit.copy(from: diffuseSurface!, to: diffusePreviousSurface!)
         blit.endEncoding()
-        diffuseHistoryValid = true
     }
 
     func scenePass(using destination: MTLRenderPassDescriptor) -> MTLRenderPassDescriptor {

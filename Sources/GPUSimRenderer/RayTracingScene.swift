@@ -53,6 +53,7 @@ final class RayTracingScene {
     private(set) var scratch: MTLBuffer!
     private var topBuilt = false
     private var updateCount = 0
+    private(set) var lightingRevision: UInt64 = 0
     private var topologyKey = ""
     private var objectCount = 0
     private var hasGround = false
@@ -315,6 +316,7 @@ final class RayTracingScene {
         build.endEncoding()
         topBuilt = true
         updateCount += 1
+        lightingRevision &+= 1
         lastUpdateKey = key
     }
 
@@ -328,6 +330,7 @@ final class RayTracingScene {
 
     func encodeDiffuse(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
                        instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?) throws {
+        guard uniforms.temporal.z<=64 else { return }
         try encodeRays(command: command, uniforms: uniforms, screen: screen, instances: instances,
             auxiliary: auxiliary, appearances: appearances, pipeline: diffusePipeline,
             output: screen.diffuseRaw!, label: "World diffuse bounce")
@@ -357,7 +360,7 @@ final class RayTracingScene {
         e.setTexture(screen.normal, index: 1)
         e.setTexture(output, index: 2)
         e.setTexture(screen.material, index: 3)
-        e.setTexture(pipeline === diffusePipeline ? screen.diffuseSurface : screen.visibility, index: 4)
+        e.setTexture(screen.visibility, index: 4)
         e.dispatchThreads(MTLSize(width: output.width, height: output.height, depth: 1),
                           threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         e.endEncoding()

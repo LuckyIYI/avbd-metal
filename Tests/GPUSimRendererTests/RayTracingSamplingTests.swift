@@ -4,6 +4,55 @@ import XCTest
 @testable import GPUSimRenderer
 
 final class RayTracingSamplingTests: XCTestCase {
+    func testDiffuseSpatialAndTemporalStrataCoverTheHemisphereWithoutBias() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), device.supportsRaytracing else {
+            throw XCTSkip("Metal ray tracing is unavailable")
+        }
+        let source = """
+        kernel void diffuse_samples(device float2* output [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+            uint receiver = (i%256u)/16u;
+            uint2 pixel = i<256u ? uint2(receiver&3u,receiver>>2u) : uint2(7,11);
+            uint frame = i<256u ? 0u : receiver;
+            output[i] = diffuseSample(pixel,i%16u,frame,fract(float(frame)*0.6180339887));
+        }
+        """
+        let library = try device.makeLibrary(source: renderShaderSource+"\n"+rayTracingShaderSource+"\n"+source,options: nil)
+        let pipeline = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "diffuse_samples")))
+        let output = try XCTUnwrap(device.makeBuffer(length: 512*MemoryLayout<SIMD2<Float>>.stride,options: .storageModeShared))
+        let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+        let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline); encoder.setBuffer(output,offset: 0,index: 0)
+        encoder.dispatchThreads(MTLSize(width: 512,height: 1,depth: 1),threadsPerThreadgroup: MTLSize(width: 64,height: 1,depth: 1))
+        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+        XCTAssertEqual(command.status,.completed,"\(String(describing: command.error))")
+        let samples = output.contents().assumingMemoryBound(to: SIMD2<Float>.self)
+        for start in [0,256] {
+            var cells = Set<Int>()
+            for i in start..<(start+256) {
+                let p = samples[i]
+                XCTAssertTrue(p.x>=0 && p.x<1 && p.y>=0 && p.y<1)
+                cells.insert(Int(p.x*16)+Int(p.y*16)*16)
+            }
+            XCTAssertEqual(cells.count,256,"Both spatial neighbors and a receiver over time must cover every fine stratum")
+            var mse: Float = 0, bias: Float = 0
+            // A constant-radiance region cut by a sloped visibility boundary
+            // has cosine-weighted integral a+b/2 in this uniform sample domain.
+            for k in 0..<64 {
+                let b = Float(k)/100-0.32, a: Float = 0.43
+                let estimate = Float((start..<(start+256)).filter { samples[$0].y<a+b*samples[$0].x }.count)/256
+                let error = estimate-(a+b/2)
+                mse += error*error; bias += error
+            }
+            XCTAssertLessThan(sqrt(mse/64),0.008)
+            XCTAssertLessThan(abs(bias/64),0.005)
+        }
+        for receiver in 0..<16 {
+            let rows = Set((0..<16).map { Int(samples[receiver*16+$0].x*16) })
+            let columns = Set((0..<16).map { Int(samples[receiver*16+$0].y*16) })
+            XCTAssertEqual(rows.count,16); XCTAssertEqual(columns.count,16)
+        }
+    }
+
     func testGGXSampleWeightsMatchIndependentHemisphereIntegration() throws {
         guard let device = MTLCreateSystemDefaultDevice(), device.supportsRaytracing else {
             throw XCTSkip("Metal ray tracing is unavailable")

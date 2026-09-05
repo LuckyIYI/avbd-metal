@@ -104,12 +104,13 @@ final class GTAOMetalTests: XCTestCase {
         }
         let fixtureP = try pipeline("ao_fixture", .rgba16Float, depth: true)
         let aoP = try pipeline("gtao_fragment", .r8Unorm)
-        let temporalP = try pipeline("temporal_fragment", .rgba8Unorm)
         let historical = ProcessInfo.processInfo.environment["GTAO_TEST_SHADER"] != nil
+        let historyFormat: MTLPixelFormat = historical ? .rgba8Unorm : .r16Float
+        let temporalP = try pipeline("temporal_fragment", historyFormat)
         let blurP = try pipeline(historical ? "blur_fragment" : "visibility_fragment", historical ? .r8Unorm : .rg8Unorm)
         let depth = try texture(.depth32Float), normal = try texture(.rgba16Float)
-        let raw = try texture(.r8Unorm), history = try texture(.rgba8Unorm)
-        let resolved = try texture(.rgba8Unorm), blurred = try texture(historical ? .r8Unorm : .rg8Unorm)
+        let raw = try texture(.r8Unorm), history = try texture(historyFormat)
+        let resolved = try texture(historyFormat), blurred = try texture(historical ? .r8Unorm : .rg8Unorm)
         let queue = try XCTUnwrap(device.makeCommandQueue())
         let depthDesc = MTLDepthStencilDescriptor()
         depthDesc.isDepthWriteEnabled = true
@@ -120,7 +121,7 @@ final class GTAOMetalTests: XCTestCase {
         var gpuTime: Double = 0
         for frame in 0..<frames {
             U.temporal = SIMD4((Float(frame % 64) * 0.6180339887).truncatingRemainder(dividingBy: 1),
-                              frame == 0 ? 1 : 0.2, 0, 0)
+                              frame == 0 ? 1 : 1/Float(frame+1), Float(frame+1), 0)
             let cmd = try XCTUnwrap(queue.makeCommandBuffer())
             func pass(_ p: MTLRenderPipelineState, _ target: MTLTexture,
                       textures: [MTLTexture] = [], prepass: Bool = false) throws {

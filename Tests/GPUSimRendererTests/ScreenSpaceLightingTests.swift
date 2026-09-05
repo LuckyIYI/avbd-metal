@@ -106,7 +106,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
     private func render(_ fixture: Fixture, harness h: Harness, eye: SIMD3<Float> = .zero,
                         world: RayTracingScene? = nil, rayScene: RaySceneFixture? = nil,
                         auxiliary: [GPUSimRenderInstance] = [], appearances: [Int: GPUSimRenderAppearance] = [:],
-                        lightDirection: SIMD3<Float>? = nil, screenShortcut: Bool = false, diffuseFrame: Int? = nil) throws -> ([Float], [SIMD4<Float>]) {
+                        lightDirection: SIMD3<Float>? = nil, screenShortcut: Bool = false, diffuseFrame: Int? = nil, accumulationFrame: Int = 0) throws -> ([Float], [SIMD4<Float>]) {
         let e = h.effects
         var options = GPUSimRenderOptions(ambientOcclusion: false, screenSpaceReflections: world == nil || screenShortcut)
         if world != nil { options.lightingMode = .qualityBeta }
@@ -114,7 +114,10 @@ final class ScreenSpaceLightingTests: XCTestCase {
         var U = uniforms(width: e.halfSize.x, height: e.halfSize.y, eye: eye)
         if let lightDirection { U.lightDir = SIMD4(normalize(lightDirection), 0) }
         U.rayTracing = SIMD4(world == nil ? 0 : 1, screenShortcut ? 1 : 0, 0, 0)
-        if let frame = diffuseFrame { U.temporal = SIMD4((Float(frame)*0.6180339887).truncatingRemainder(dividingBy: 1),frame==0 ? 1 : 0.2,0,0) }
+        if diffuseFrame != nil {
+            let phase = Float(max(0,min(accumulationFrame,64)-1))*0.6180339887
+            U.temporal = SIMD4(phase.truncatingRemainder(dividingBy: 1),accumulationFrame<=1 ? 1 : 1/Float(accumulationFrame),Float(accumulationFrame),0)
+        }
         var F = fixture
         let cmd = try XCTUnwrap((world?.queue ?? h.queue).makeCommandBuffer())
         var rayInstances: MTLBuffer?
@@ -403,9 +406,53 @@ final class ScreenSpaceLightingTests: XCTestCase {
         XCTAssertLessThan(simd_length(reset-open),0.012,"A reset must discard stale occluded lighting")
         var options=GPUSimRenderOptions.qualityBeta; options.diffuseGlobalIllumination=false
         try h.effects.prepare(size: CGSize(width: 257,height: 193),options: options)
-        XCTAssertNil(h.effects.diffuse); XCTAssertNil(h.effects.diffuseRaw); XCTAssertNil(h.effects.diffuseSurface)
+        XCTAssertNil(h.effects.diffuse); XCTAssertNil(h.effects.diffuseRaw)
         try h.effects.prepare(size: CGSize(width: 131,height: 97),options: .lightweight)
         XCTAssertNil(h.effects.diffuse,"Fast does not allocate GI textures")
+    }
+
+    func testDiffuseAccumulationSettlesAndMovingLightingUsesFreshSamples() throws {
+        let h = try Harness(source: fixtureSource,width: 257,height: 193)
+        let device = h.effects.device
+        guard device.supportsRaytracing else { throw XCTSkip("Metal ray tracing unavailable") }
+        let scene = RaySceneFixture(device: device,values: [GPUSimRenderInstance(
+            primitive: .box(size: SIMD3(3,3,0.01)),position: SIMD3(0,0,1),color: .zero,emissive: SIMD3(2,0.1,0.02))])
+        let world = try RayTracingScene.shared(scene: scene)
+        try world.prepare(scene: scene,revision: 0,auxiliary: [],ground: false)
+        var f = Fixture(); f.boxMin.w = 0; f.plane = SIMD4(0,0,1,-1)
+        f.material = SIMD4(0.5,0.5,0.5,0); f.parameters.x = 1
+        func sample(_ count: Int) throws -> Data {
+            _ = try render(f,harness: h,world: world,rayScene: scene,diffuseFrame: 0,accumulationFrame: count)
+            return Data(try read(h.effects.diffuse!,queue: h.queue,bytesPerPixel: 8))
+        }
+        let moving = try sample(0)
+        XCTAssertEqual(try sample(0),moving,"Fresh samples must not boil with a fixed camera and geometry")
+        var previous = try sample(1), early = 0.0, late = 0.0
+        func distance(_ a: Data, _ b: Data) -> Double {
+            a.withUnsafeBytes { aa in b.withUnsafeBytes { bb in
+                let x = aa.bindMemory(to: UInt16.self), y = bb.bindMemory(to: UInt16.self)
+                return (0..<x.count).filter { $0%4 != 3 }.reduce(0) {
+                    $0+pow(Double(Float(Float16(bitPattern: x[$1]))-Float(Float16(bitPattern: y[$1]))),2)
+                }/Double(x.count)
+            } }
+        }
+        for count in 2...64 {
+            let current = try sample(count), delta = distance(current,previous)
+            if count<=8 { early += delta }
+            if count>=58 { late += delta }
+            previous = current
+        }
+        XCTAssertGreaterThan(early,1e-6,"The fixture must exercise stochastic lighting")
+        XCTAssertLessThan(late,early*0.03,"Accumulation must reduce late-frame fluctuations")
+        XCTAssertNotEqual(previous,moving)
+        for _ in 0..<8 { XCTAssertEqual(try sample(65),previous,"Completed lighting must remain byte-stable") }
+        scene.values[0].material = SIMD4(0.02,0.1,2,1)
+        try world.prepare(scene: scene,revision: 0,auxiliary: [],ground: false)
+        let changed = try sample(0)
+        var off = GPUSimRenderOptions.qualityBeta; off.diffuseGlobalIllumination = false
+        try h.effects.prepare(size: CGSize(width: 257,height: 193),options: off)
+        XCTAssertEqual(try sample(0),changed,"Changing light must match an independently empty history without trails")
+        XCTAssertNotEqual(changed,previous)
     }
 
     func testDiffuseHistoryRejectsAReceiverDepthChange() throws {

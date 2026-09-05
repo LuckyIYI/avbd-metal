@@ -38,43 +38,11 @@ inline float4 surfaceDiffuse(float2 uv, float3 P, float3 N, constant Uniforms& U
 
 let diffuseFilterShaderSource = """
 fragment float4 diffuse_temporal_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
-    texture2d<float> current [[texture(0)]], texture2d<float> history [[texture(1)]],
-    texture2d<float> previousSurface [[texture(2)]], texture2d<float> surface [[texture(3)]]) {
-    uint2 pixel = uint2(in.position.xy), size = uint2(current.get_width(),current.get_height());
-    float4 value = current.read(pixel), geometry = surface.read(pixel);
-    if (value.a==0 || U.diffuse.y>=1) return value;
-    uint2 s = diffuseSurfacePixel(pixel,uint2(U.screen.xy));
-    float3 P = worldFromDepth((float2(s)+0.5)/U.screen.xy,geometry.w,U.invViewProj);
-    float4 clip = U.prevViewProj*float4(P,1);
-    if (clip.w<=0) return value;
-    float2 uv = clip.xy/clip.w*float2(0.5,-0.5)+0.5;
-    float2 q = (uv*U.screen.xy-1.5)*0.5, f = fract(q);
-    int2 base = int2(floor(q));
-    float3 sum = float3(0); float weight = 0;
-    float pixelWorld = max(0.0005,screenDepth(geometry.w,U)/U.screen.z);
-    for (int y=0;y<2;++y) for (int x=0;x<2;++x) {
-        int2 h = base+int2(x,y);
-        if (any(h<0) || any(h>=int2(size))) continue;
-        float4 oldGeometry = previousSurface.read(uint2(h)), old = history.read(uint2(h));
-        if (old.a==0 || oldGeometry.w>=1 || dot(geometry.xyz,oldGeometry.xyz)<0.95) continue;
-        uint2 hs = diffuseSurfacePixel(uint2(h),uint2(U.screen.xy));
-        float3 Q = worldFromDepth((float2(hs)+0.5)/U.screen.xy,oldGeometry.w,U.prevInvViewProj);
-        float plane = max(abs(dot(Q-P,geometry.xyz)),abs(dot(Q-P,oldGeometry.xyz)));
-        if (length(Q-P)>pixelWorld*4 || plane>pixelWorld*0.3) continue;
-        float w = (x ? f.x : 1-f.x)*(y ? f.y : 1-f.y);
-        sum += old.rgb*w; weight += w;
-    }
-    if (weight<0.25) return value;
-    // Clip history to current reconstructed lighting so newly exposed light
-    // or moving occluders cannot retain an unrelated old color indefinitely.
-    float3 lo = value.rgb, hi = value.rgb;
-    for (int y=-1;y<=1;++y) for (int x=-1;x<=1;++x) {
-        int2 q = clamp(int2(pixel)+int2(x,y),int2(0),int2(size)-1);
-        float4 tap = current.read(uint2(q));
-        if (tap.a>0) { lo=min(lo,tap.rgb); hi=max(hi,tap.rgb); }
-    }
-    float3 previous = clamp(sum/weight,lo-0.005,hi+0.005);
-    return float4(mix(previous,value.rgb,U.diffuse.y),value.a);
+    texture2d<float> current [[texture(0)]], texture2d<float> history [[texture(1)]]) {
+    uint2 p = uint2(in.position.xy);
+    float4 value = current.read(p);
+    if (U.temporal.z<=1) return value;
+    return float4(mix(history.read(p).rgb,value.rgb,1.0/U.temporal.z),value.a);
 }
 
 fragment float4 diffuse_filter_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
@@ -107,19 +75,31 @@ fragment float4 diffuse_filter_fragment(FSOut in [[stage_in]], constant Uniforms
 """
 
 let diffuseRayShaderSource = """
+// Sixteen strata per receiver, with complementary sub-strata over every
+// 4x4 receiver neighborhood. The two tent passes integrate those neighbors
+// with balanced weights on a flat surface. Shift the sub-strata during
+// accumulation so each individual receiver also covers the full domain.
+inline float2 diffuseSample(uint2 pixel, uint i, uint frame, float phase) {
+    uint2 cell = uint2(i&3u,i>>2u);
+    uint2 subcell = uint2((pixel.x+2u*pixel.y+cell.y+(frame&3u))&3u,
+                         (pixel.y+cell.x+((frame>>2u)&3u))&3u);
+    uint stratum = subcell.x+subcell.y*4u;
+    float2 jitter = fract(float2(screenNoise(uint2(i,stratum+113u)),screenNoise(uint2(i,stratum+331u)))
+                         +float2(phase,phase*5));
+    return (float2(cell)+(float2(subcell)+jitter)*0.25)*0.25;
+}
 kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], constant Uniforms& U [[buffer(1)]],
     device const RTVertex* vertices [[buffer(2)]], device const RTObject* objects [[buffer(3)]],
     device const RTInstance* instances [[buffer(4)]], device const RenderInstance* rigid [[buffer(5)]],
     device const RenderInstance* auxiliary [[buffer(6)]], device const RenderAppearance* appearances [[buffer(7)]],
     constant uint& hasAppearance [[buffer(8)]], depth2d<float,access::read> depth [[texture(0)]],
     texture2d<float,access::read> normal [[texture(1)]], texture2d<float,access::write> output [[texture(2)]],
-    texture2d<float,access::read> material [[texture(3)]], texture2d<float,access::write> surface [[texture(4)]],
+    texture2d<float,access::read> material [[texture(3)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel>=uint2(output.get_width(),output.get_height()))) return;
     uint2 size = uint2(depth.get_width(),depth.get_height()), s = diffuseSurfacePixel(pixel,size);
     float d = depth.read(s);
     float3 N = normalize(normal.read(s).xyz);
-    surface.write(float4(N,d),pixel);
     if (d>=1 || material.read(s).a>=0.99) { output.write(float4(0),pixel); return; }
     float3 cameraP = screenPosition((float2(s)+0.5)/float2(size),d,U);
     // Reconstruct relative to the camera before adding its world translation.
@@ -129,11 +109,9 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
     float3 tangent = normalize(cross(abs(N.z)<0.99 ? float3(0,0,1) : float3(0,1,0),N));
     float3 bitangent = cross(N,tangent);
     float3 sum = float3(0);
-    const uint samples = 4;
-    float2 jitter = fract(float2(screenNoise(pixel+uint2(113,17)),screenNoise(pixel+uint2(31,91)))
-                         +float2(U.temporal.x,U.temporal.x*5));
+    const uint samples = 16;
     for (uint i=0;i<samples;++i) {
-        float2 xi = float2((float(i)+jitter.x)/float(samples),fract(jitter.y+float(i)*0.6180339887));
+        float2 xi = diffuseSample(pixel,i,uint(max(U.temporal.z-1,0.0)),U.temporal.x);
         float phi = 2*M_PI_F*xi.y;
         float3 R = tangent*(sqrt(xi.x)*cos(phi))+bitangent*(sqrt(xi.x)*sin(phi))+N*sqrt(1-xi.x);
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);

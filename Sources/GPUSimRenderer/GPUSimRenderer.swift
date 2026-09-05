@@ -23,7 +23,8 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     public var colorMode: GPUSimRenderColorMode
     public var showConvexCollisionGeometry: Bool
     public var convexCollisionWireframe: Bool
-    /// Half-resolution GTAO with temporal accumulation. Hosts on a power
+    /// Half-resolution GTAO with stable samples. HQ accumulates unchanged scenes.
+    /// Hosts on a power
     /// budget can disable it independently of the other lighting effects.
     public var ambientOcclusion: Bool
     /// Short directional contact rays supplement the shadow map.
@@ -578,7 +579,7 @@ struct Uniforms {
     float4 camRight;    // xyz: world dir of screen +x
     float4 camUp;       // xyz: world dir of UV +y (down on screen)
     float4x4 prevViewProj;
-    float4 temporal;    // x = per-frame noise offset, y = history blend
+    float4 temporal;    // x: sample phase, y: history blend, z: stable accumulation frame (65 = complete)
     float4x4 shadowViewProj;
     float4 shadowParams; // x = constant bias, y = normal/slope bias
     float4x4 invViewProj;
@@ -586,7 +587,7 @@ struct Uniforms {
     float4 effects; // x: HDR output, y: contact distance, z: SSR distance, w: max SSR roughness
     float4 rayTracing; // x: world visibility, y: screen reflection shortcut enabled
     float4 rayScene; // x: analytic built-in ground enabled
-    float4 diffuse; // x: world diffuse lighting enabled, y: fresh history weight
+    float4 diffuse; // x: world diffuse lighting enabled
     float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
 };
 
@@ -1307,6 +1308,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var surfacePipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
     var prevVP: simd_float4x4?
     var frameIdx: UInt32 = 0
+    private var lightingAccumulation = LightingAccumulation()
     var targetSize = SIMD2<Int>(0, 0)
     var instances: MTLBuffer?
     private var appearanceRing: [MTLBuffer?] = [nil, nil, nil]
@@ -2033,7 +2035,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             bottom: -shadowExtent, top: shadowExtent,
             near: 0.1, far: shadowExtent * 5.0)
             * lookAt(eye: lightEye, center: shadowCenter, up: lightUp)
-        let noiseOff = Float(frameIdx % 64) * 0.6180339887
         let screenViewport = MTLViewport(originX: 0, originY: 0,
                                          width: Double(targetSize.x),
                                          height: Double(targetSize.y),
@@ -2046,6 +2047,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // the stale previous-frame matrices must fall together, and BEFORE
         // the uniforms capture prevVP and the temporal blend for this frame
         if activeOptions.ambientOcclusion, screenSpace.aoIsWhite { prevVP = nil }
+        let temporal = lightingAccumulation.advance(
+            world: rayWorld.map(ObjectIdentifier.init), revision: rayWorld?.lightingRevision,
+            camera: vp, light: lightDirection, size: targetSize, options: activeOptions, reset: prevVP == nil)
         var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(lightDirection, 0),
                          eye: SIMD4(activeEye, 0),
@@ -2053,8 +2057,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          camRight: SIMD4(camR, 0),
                          camUp: SIMD4(-camU, 0),
                          prevViewProj: prevVP ?? vp,
-                         temporal: SIMD4(noiseOff.truncatingRemainder(dividingBy: 1),
-                                         prevVP == nil ? 1.0 : 0.20, 0, 0),
+                         temporal: temporal,
                          shadowViewProj: shadowVP,
                          shadowParams: SIMD4(
                              0.30 * texelWorld / (shadowExtent * 5),
