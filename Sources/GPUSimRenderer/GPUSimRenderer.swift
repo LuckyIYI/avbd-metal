@@ -367,6 +367,11 @@ public protocol GPUSimRenderableScene: AnyObject {
     /// or torus/capsule dimensions in place. Pose and deformation changes do
     /// not require an increment. Replacing a mesh buffer is detected directly.
     var renderGeometryRevision: UInt64 { get }
+    /// An exact revision of current poses and deformed surface attributes,
+    /// observed after encodeRenderInstances. Advance it for teleports, resets,
+    /// restores, and direct buffer edits too. Equal revisions allow cameras
+    /// to reuse a scene's acceleration-structure update. Nil updates every draw.
+    var renderStateRevision: UInt64? { get }
     var rendererStateIsValid: Bool { get }
     var renderCameraHint: GPUSimRenderCameraHint { get }
     var softRenderSurface: GPUSimSoftRenderSurface? { get }
@@ -408,6 +413,7 @@ extension GPUSolver: GPUSimRenderableScene {
     }
     public var renderBodyCount: Int { bodyCount }
     public var renderRigidInstanceCount: Int { renderRigidBodyCount }
+    public var renderStateRevision: UInt64? { geometryStateRevision }
     public var rendererStateIsValid: Bool { runtimeFailure == nil }
 
     public var renderCameraHint: GPUSimRenderCameraHint {
@@ -509,6 +515,7 @@ public protocol GPUSimRendererSource: AnyObject {
 
 public extension GPUSimRenderableScene {
     var renderGeometryRevision: UInt64 { 0 }
+    var renderStateRevision: UInt64? { nil }
     var renderContentBounds: GPUSimContentBounds? { nil }
     var renderSceneRequiresFrameRetirement: Bool { true }
 }
@@ -1898,7 +1905,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         do {
             try rayWorld?.encodeUpdate(command: cmd, scene: renderScene, instances: instances,
-                                       auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides)
+                                       auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides,
+                                       appearanceValues: activeBodyAppearances)
         } catch {
             reportFailure("ray tracing geometry update failed: \(error)")
             return

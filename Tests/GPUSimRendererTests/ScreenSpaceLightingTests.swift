@@ -105,6 +105,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
 
     private func render(_ fixture: Fixture, harness h: Harness, eye: SIMD3<Float> = .zero,
                         world: RayTracingScene? = nil, rayScene: RaySceneFixture? = nil,
+                        auxiliary: [GPUSimRenderInstance] = [], appearances: [Int: GPUSimRenderAppearance] = [:],
                         lightDirection: SIMD3<Float>? = nil, screenShortcut: Bool = false) throws -> ([Float], [SIMD4<Float>]) {
         let e = h.effects
         var options = GPUSimRenderOptions(ambientOcclusion: false, screenSpaceReflections: world == nil || screenShortcut)
@@ -116,10 +117,17 @@ final class ScreenSpaceLightingTests: XCTestCase {
         var F = fixture
         let cmd = try XCTUnwrap((world?.queue ?? h.queue).makeCommandBuffer())
         var rayInstances: MTLBuffer?
+        func buffer<T>(_ values: [T]) throws -> MTLBuffer? {
+            guard !values.isEmpty else { return nil }
+            return try XCTUnwrap(values.withUnsafeBytes { e.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) })
+        }
+        let auxiliaryBuffer = try buffer(auxiliary)
+        let appearanceBuffer = try buffer(appearances.isEmpty ? [] : (0..<(rayScene?.renderBodyCount ?? 0)).map { appearances[$0] ?? .init() })
         if let world, let rayScene {
             let buffer = try XCTUnwrap(e.device.makeBuffer(length: max(1,rayScene.values.count)*MemoryLayout<GPUSimRenderInstance>.stride, options: .storageModePrivate))
-            try rayScene.encodeRenderInstances(cmd, instances: buffer, colorMode: .bodyIndex, appearanceOverrides: nil)
-            try world.encodeUpdate(command: cmd, scene: rayScene, instances: buffer, auxiliary: nil, appearances: nil)
+            try rayScene.encodeRenderInstances(cmd, instances: buffer, colorMode: .bodyIndex, appearanceOverrides: appearanceBuffer)
+            try world.encodeUpdate(command: cmd, scene: rayScene, instances: buffer, auxiliary: auxiliaryBuffer,
+                                   appearances: appearanceBuffer, appearanceValues: appearances)
             rayInstances = buffer
         }
         for isSurface in [true, false] {
@@ -142,13 +150,13 @@ final class ScreenSpaceLightingTests: XCTestCase {
         }
         if let world, let rayInstances {
             try world.encodeLighting(command: cmd, uniforms: U, screen: e, instances: rayInstances,
-                                     auxiliary: nil, appearances: nil, reflections: false)
+                                     auxiliary: auxiliaryBuffer, appearances: appearanceBuffer, reflections: false)
         }
         try e.encodeBeforeLighting(command: cmd, uniforms: U, options: options)
         if let world, let rayInstances {
             if screenShortcut { try e.encodeReflections(command: cmd, uniforms: U, filter: false) }
             try world.encodeLighting(command: cmd, uniforms: U, screen: e, instances: rayInstances,
-                                     auxiliary: nil, appearances: nil, reflections: true)
+                                     auxiliary: auxiliaryBuffer, appearances: appearanceBuffer, reflections: true)
             try e.encodeReflectionFilter(command: cmd, uniforms: U)
         } else {
             try e.encodeReflections(command: cmd, uniforms: U)
@@ -323,6 +331,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
         var renderBodyCount: Int { values.count }
         var renderRigidInstanceCount: Int { values.count }
         var rendererStateIsValid: Bool { true }
+        var renderStateRevision: UInt64?
         var renderCameraHint: GPUSimRenderCameraHint { .init() }
         var softRenderSurface: GPUSimSoftRenderSurface?
         var skinnedRenderSurface: GPUSimSkinnedRenderSurface?
@@ -398,6 +407,118 @@ final class ScreenSpaceLightingTests: XCTestCase {
             XCTAssertEqual(e.depthHierarchy != nil, options.screenSpaceReflections)
             XCTAssertNotNil(e.directVisibilityRaw)
         }
+    }
+
+    func testAccelerationUpdatesAreSharedAcrossCamerasAndInvalidatedByChanges() throws {
+        let h = try Harness(source: fixtureSource, width: 255, height: 191)
+        let device = h.effects.device
+        guard device.supportsRaytracing else { throw XCTSkip("Metal ray tracing is unavailable") }
+        let scene = RaySceneFixture(device: device, values: [
+            GPUSimRenderInstance(primitive: .box(size: SIMD3(100,100,0.1)), position: SIMD3(0,0,-3.05), color: .zero),
+            GPUSimRenderInstance(primitive: .box(size: SIMD3(0.7,0.7,0.6)), position: SIMD3(0,0,0.8), color: .zero,
+                                 emissive: SIMD3(3,0.05,0.02))
+        ])
+        scene.renderStateRevision = 41
+        let world = try RayTracingScene.shared(scene: scene)
+        try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: false)
+        var f = Fixture(); f.boxMin.w = 0; f.plane = SIMD4(0,0,1,-3)
+        let first = try render(f, harness: h, world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+        XCTAssertGreaterThan(first.0.filter { $0 < 0.5 }.count, 100)
+        XCTAssertEqual(world.lastUpdate, .init(primitiveBuilds: 1, instanceBuilds: 1), "rigid boxes share one cached mesh structure")
+        let scratch = world.scratch, structure = world.structure
+        XCTAssertEqual(scratch?.hazardTrackingMode, .tracked)
+
+        let otherCamera = try Harness(source: fixtureSource, width: 319, height: 201)
+        _ = try render(f, harness: otherCamera, eye: SIMD3(0.02,0,0), world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+        XCTAssertEqual(world.lastUpdate, .init(), "another camera and staging buffer do not change world geometry")
+        let command = try XCTUnwrap(world.queue.makeCommandBuffer())
+        let instances = try XCTUnwrap(device.makeBuffer(length: scene.values.count*MemoryLayout<GPUSimRenderInstance>.stride, options: .storageModePrivate))
+        for _ in 0..<130 {
+            try world.encodeUpdate(command: command, scene: scene, instances: instances, auxiliary: nil, appearances: nil)
+            XCTAssertEqual(world.lastUpdate, .init(), "camera draws must not consume the periodic rebuild budget")
+        }
+        command.commit(); command.waitUntilCompleted()
+
+        scene.values[1].model.columns.3.x = 100
+        scene.renderStateRevision = 42
+        try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: false)
+        let moved = try render(f, harness: h, world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+        XCTAssertEqual(moved.0.min(), 1)
+        XCTAssertTrue(moved.1.allSatisfy { $0 == .zero })
+        XCTAssertEqual(world.lastUpdate, .init(instanceRefits: 1), "rigid motion refits instances without touching mesh structures")
+        XCTAssertTrue(world.structure === structure); XCTAssertTrue(world.scratch === scratch)
+
+        scene.values.append(GPUSimRenderInstance(primitive: .sphere(radius: 0.4), position: SIMD3(0,0,0.8), color: .zero))
+        try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: false)
+        let added = try render(f, harness: h, world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+        XCTAssertGreaterThan(added.0.filter { $0 < 0.5 }.count, 100)
+        XCTAssertEqual(world.lastUpdate, .init(primitiveBuilds: 2, instanceBuilds: 1))
+        world.invalidateBuilds()
+        _ = try render(f, harness: h, world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+        XCTAssertEqual(world.lastUpdate, .init(primitiveBuilds: 2, instanceBuilds: 1), "an aborted update cannot leave a reusable state key")
+        scene.renderStateRevision = nil
+        _ = try render(f, harness: h, world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+        XCTAssertEqual(world.lastUpdate, .init(instanceRefits: 1), "unknown backend revisions always update")
+    }
+
+    func testPausedAccelerationReuseTracksAuxiliaryTransformsAndShadowMasks() throws {
+        let h = try Harness(source: fixtureSource, width: 255, height: 191)
+        guard h.effects.device.supportsRaytracing else { throw XCTSkip("Metal ray tracing is unavailable") }
+        let scene = RaySceneFixture(device: h.effects.device, values: [
+            GPUSimRenderInstance(primitive: .box(size: SIMD3(100,100,0.1)), position: SIMD3(0,0,-3.05), color: .zero)
+        ])
+        scene.renderStateRevision = 0
+        var auxiliary = [GPUSimRenderInstance(primitive: .box(size: SIMD3(0.7,0.7,0.6)), position: SIMD3(0,0,0.8),
+                                              color: .zero, emissive: SIMD3(3,0,0), castsShadow: true)]
+        let world = try RayTracingScene.shared(scene: scene)
+        var f = Fixture(); f.boxMin.w = 0; f.plane = SIMD4(0,0,1,-3)
+        func draw() throws -> ([Float], [SIMD4<Float>]) {
+            try world.prepare(scene: scene, revision: 0, auxiliary: auxiliary, ground: false)
+            return try render(f, harness: h, world: world, rayScene: scene, auxiliary: auxiliary, lightDirection: SIMD3(0,0,-1))
+        }
+        let first = try draw()
+        XCTAssertGreaterThan(first.0.filter { $0 < 0.5 }.count, 100)
+        _ = try draw()
+        XCTAssertEqual(world.lastUpdate, .init(), "identical auxiliary data in a fresh staging buffer is reusable")
+        auxiliary[0].parameters.w = 0
+        let unshadowed = try draw()
+        XCTAssertEqual(unshadowed.0.min(), 1)
+        XCTAssertGreaterThan(unshadowed.1.filter { $0.x > 0.1 }.count, 100, "shadow masks must leave reflections visible")
+        XCTAssertEqual(world.lastUpdate, .init(instanceRefits: 1))
+        auxiliary[0].model.columns.3.x = 100
+        let moved = try draw()
+        XCTAssertTrue(moved.1.allSatisfy { $0 == .zero }, "auxiliary motion must invalidate unchanged physics state")
+        XCTAssertEqual(world.lastUpdate, .init(instanceRefits: 1))
+    }
+
+    func testPausedAccelerationReuseTracksDeformedSurfaceAppearances() throws {
+        let h = try Harness(source: fixtureSource, width: 255, height: 191)
+        let device = h.effects.device
+        guard device.supportsRaytracing else { throw XCTSkip("Metal ray tracing is unavailable") }
+        func buffer<T>(_ values: [T]) throws -> MTLBuffer {
+            try XCTUnwrap(values.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) })
+        }
+        let scene = RaySceneFixture(device: device, values: [
+            GPUSimRenderInstance(primitive: .box(size: SIMD3(100,100,0.1)), position: SIMD3(0,0,-3.05), color: .zero),
+            GPUSimRenderInstance(primitive: .sphere(radius: 0), position: SIMD3(100,0,0), color: .zero),
+            GPUSimRenderInstance(primitive: .sphere(radius: 0), position: SIMD3(100,0,0), color: .zero)
+        ])
+        scene.renderStateRevision = 0
+        scene.softRenderSurface = GPUSimSoftRenderSurface(triangles: try buffer([UInt32(0),1,2]), triangleCount: 1,
+            positions: try buffer([SIMD4<Float>(-0.5,-0.5,0.8,0), SIMD4(0.5,-0.5,0.8,0), SIMD4(0,0.5,0.8,0)]),
+            normals: try buffer(Array(repeating: SIMD4<Float>(0,0,-1,0), count: 3)))
+        let world = try RayTracingScene.shared(scene: scene)
+        try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: false)
+        var f = Fixture(); f.boxMin.w = 0; f.plane = SIMD4(0,0,1,-3)
+        let red = Dictionary(uniqueKeysWithValues: (0..<3).map { ($0, GPUSimRenderAppearance(color: .zero, emissive: SIMD3(3,0,0))) })
+        let blue = Dictionary(uniqueKeysWithValues: (0..<3).map { ($0, GPUSimRenderAppearance(color: .zero, emissive: SIMD3(0,0,3))) })
+        let first = try render(f, harness: h, world: world, rayScene: scene, appearances: red, lightDirection: SIMD3(0,0,-1))
+        XCTAssertGreaterThan(first.1.filter { $0.x > 0.1 && $0.x > $0.z }.count, 100)
+        _ = try render(f, harness: h, world: world, rayScene: scene, appearances: red, lightDirection: SIMD3(0,0,-1))
+        XCTAssertEqual(world.lastUpdate, .init())
+        let changed = try render(f, harness: h, world: world, rayScene: scene, appearances: blue, lightDirection: SIMD3(0,0,-1))
+        XCTAssertGreaterThan(changed.1.filter { $0.z > 0.1 && $0.z > $0.x }.count, 100, "paused cameras must not reuse stale baked surface materials")
+        XCTAssertEqual(world.lastUpdate, .init(primitiveRefits: 1, instanceRefits: 1))
     }
 
     func testReflectionReconstructionRemovesNoiseWithoutMixingMetalsOrBlurringMirrors() throws {

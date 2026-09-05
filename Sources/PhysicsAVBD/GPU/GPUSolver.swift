@@ -47,7 +47,13 @@ public final class GPUSolver {
     public let device: MTLDevice
     let queue: MTLCommandQueue
 
-    public var settings = SimSettings()
+    public var settings = SimSettings() {
+        didSet {
+            if settings.clothRenderScale != oldValue.clothRenderScale {
+                invalidateGeometryState()
+            }
+        }
+    }
 
     // Capacities
     let numBodies: Int
@@ -436,6 +442,14 @@ public final class GPUSolver {
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
+    /// Monotonic geometry state, including pose edits and checkpoint restores
+    /// that do not advance simulation time. Consumers may reuse derived data
+    /// while this value is unchanged.
+    public private(set) var geometryStateRevision: UInt64 = 0
+
+    /// Call after external writes to exposed position, rotation, or deformed
+    /// surface buffers. Solver mutation APIs advance the revision themselves.
+    public func invalidateGeometryState() { geometryStateRevision &+= 1 }
     /// Legacy position-servo targets advanced each step as `(joint, rad/s)`.
     private var rateMotors: [(Int, Float)] = []
 
@@ -3905,6 +3919,7 @@ public final class GPUSolver {
     public func setBodyStates(_ updates: [BodyStateUpdate]) {
         guard !updates.isEmpty else { return }
         sync()
+        invalidateGeometryState()
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let vl = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -3994,6 +4009,7 @@ public final class GPUSolver {
     public func setDrivenBodyStates(_ updates: [BodyStateUpdate]) {
         guard !updates.isEmpty else { return }
         sync()
+        invalidateGeometryState()
         let pl = posLin.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(
@@ -4839,6 +4855,7 @@ public final class GPUSolver {
         restore(snapshot.colorsB, to: colorsB)
         restore(snapshot.counters, to: counters)
         frameIndex = snapshot.frameIndex
+        invalidateGeometryState()
         statsLock.lock()
         lastColorCounts = snapshot.lastColorCounts
         lastNumPairs = snapshot.lastNumPairs
@@ -6739,6 +6756,7 @@ public final class GPUSolver {
         // simulation time or move spinners.
         advanceSpinners()
         frameIndex = submittedFrame
+        invalidateGeometryState()
         let submission = StepSubmission(
             commandBuffer: cmd1, counterSnapshot: counterSnapshot,
             frame: submittedFrame,

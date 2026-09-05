@@ -23,7 +23,6 @@ final class RayTracingScene {
     private struct Asset {
         let descriptor: MTLPrimitiveAccelerationStructureDescriptor
         let structure: MTLAccelerationStructure
-        let scratch: MTLBuffer
         let vertexStart, vertexCount: Int
         let deformation: Int // 0 static, 1 soft, 2 skinned
         var built = false
@@ -50,11 +49,26 @@ final class RayTracingScene {
     private(set) var vertices, objects, descriptors: MTLBuffer!
     private(set) var structure: MTLAccelerationStructure!
     private var topDescriptor: MTLInstanceAccelerationStructureDescriptor!
-    private var topScratch: MTLBuffer!
+    // Separate AS encoders and tracked buffer hazards serialize scratch reuse.
+    private(set) var scratch: MTLBuffer!
     private var topBuilt = false
     private var updateCount = 0
     private var topologyKey = ""
     private var objectCount = 0
+    private var auxiliaryState = Data()
+    private struct UpdateKey: Equatable {
+        let revision: UInt64
+        let auxiliary: Data
+        let appearances: [Int: GPUSimRenderAppearance]
+    }
+    private var lastUpdateKey: UpdateKey?
+    struct UpdateStatistics: Equatable {
+        var primitiveBuilds = 0
+        var primitiveRefits = 0
+        var instanceBuilds = 0
+        var instanceRefits = 0
+    }
+    private(set) var lastUpdate = UpdateStatistics()
     private let dummy: MTLBuffer
 
     private init(scene: any GPUSimRenderableScene) throws {
@@ -94,6 +108,7 @@ final class RayTracingScene {
         let skin = scene.skinnedRenderSurface
         func identity(_ buffer: MTLBuffer?) -> String { buffer.map { String(describing: ObjectIdentifier($0)) } ?? "nil" }
         let auxKey = auxiliary.map { "\($0.color.w):\($0.parameters.x):\($0.parameters.y)" }.joined(separator: ",")
+        auxiliaryState = auxiliary.withUnsafeBytes { Data($0) }
         let key = "\(revision):\(scene.renderGeometryRevision):\(scene.renderRigidInstanceCount):\(identity(mesh?.vertices)):\(identity(mesh?.indices)):\(mesh?.indexCount ?? 0):\(identity(soft?.triangles)):\(soft?.triangleCount ?? 0):\(identity(skin?.triangles)):\(skin?.triangleCount ?? 0):\(auxKey):\(ground)"
         guard key != topologyKey else { return }
         guard let command = queue.makeCommandBuffer() else { throw Failure.allocation("topology command") }
@@ -183,6 +198,7 @@ final class RayTracingScene {
         let newVertices = try buffer(allVertices, label: "RT object-local vertices")
         let newObjects = try buffer(allObjects, label: "RT object bindings")
         var newAssets: [Asset] = []
+        var scratchSize = 256
         for range in ranges {
             let geometry = MTLAccelerationStructureTriangleGeometryDescriptor()
             geometry.vertexBuffer = newVertices
@@ -195,10 +211,10 @@ final class RayTracingScene {
             descriptor.geometryDescriptors = [geometry]
             if range.deformation != 0 { descriptor.usage = .refit }
             let sizes = device.accelerationStructureSizes(descriptor: descriptor)
-            guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
-                  let scratch = device.makeBuffer(length: max(256, max(sizes.buildScratchBufferSize, sizes.refitScratchBufferSize)), options: .storageModePrivate)
+            scratchSize = max(scratchSize, max(sizes.buildScratchBufferSize, sizes.refitScratchBufferSize))
+            guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize)
             else { throw Failure.allocation("object acceleration structure") }
-            newAssets.append(Asset(descriptor: descriptor, structure: structure, scratch: scratch,
+            newAssets.append(Asset(descriptor: descriptor, structure: structure,
                                    vertexStart: range.start, vertexCount: range.count, deformation: range.deformation))
         }
         let top = MTLInstanceAccelerationStructureDescriptor()
@@ -209,24 +225,37 @@ final class RayTracingScene {
                                                 options: .storageModePrivate) else { throw Failure.allocation("RT instances") }
         top.instanceDescriptorBuffer = instances
         let sizes = device.accelerationStructureSizes(descriptor: top)
+        scratchSize = max(scratchSize, max(sizes.buildScratchBufferSize, sizes.refitScratchBufferSize))
         guard let newTop = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
-              let scratch = device.makeBuffer(length: max(256, max(sizes.buildScratchBufferSize, sizes.refitScratchBufferSize)), options: .storageModePrivate)
+              let newScratch = device.makeBuffer(length: scratchSize, options: [.storageModePrivate, .hazardTrackingModeTracked])
         else { throw Failure.allocation("scene acceleration structure") }
+        newScratch.label = "Shared acceleration-structure scratch"
         (vertices, objects, descriptors) = (newVertices, newObjects, instances)
-        (assets, topDescriptor, structure, topScratch) = (newAssets, top, newTop, scratch)
+        (assets, topDescriptor, structure, scratch) = (newAssets, top, newTop, newScratch)
         objectCount = allObjects.count
         topBuilt = false
         updateCount = 0
+        lastUpdateKey = nil
         topologyKey = key
     }
 
     func invalidateBuilds() {
         topBuilt = false
+        lastUpdateKey = nil
         for i in assets.indices { assets[i].built = false }
     }
 
     func encodeUpdate(command: MTLCommandBuffer, scene: any GPUSimRenderableScene,
-                      instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?) throws {
+                      instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?,
+                      appearanceValues: [Int: GPUSimRenderAppearance]? = nil) throws {
+        lastUpdate = UpdateStatistics()
+        // Unknown backend state or opaque appearance buffers stay conservative.
+        // Per-camera staging-buffer identity is deliberately not a state token.
+        let key = scene.renderStateRevision.flatMap { revision -> UpdateKey? in
+            guard appearances == nil || appearanceValues != nil else { return nil }
+            return UpdateKey(revision: revision, auxiliary: auxiliaryState, appearances: appearanceValues ?? [:])
+        }
+        if topBuilt, let key, key == lastUpdateKey { return }
         guard let e = command.makeComputeCommandEncoder() else { throw Failure.allocation("RT update encoder") }
         e.label = "World instance transforms and deformation"
         e.setComputePipelineState(instancesPipeline)
@@ -262,26 +291,33 @@ final class RayTracingScene {
             let asset = assets[i]
             if asset.built && updateCount % 120 != 0 {
                 build.refit(sourceAccelerationStructure: asset.structure, descriptor: asset.descriptor,
-                            destinationAccelerationStructure: nil, scratchBuffer: asset.scratch, scratchBufferOffset: 0)
+                            destinationAccelerationStructure: nil, scratchBuffer: scratch, scratchBufferOffset: 0,
+                            options: .vertexData)
+                lastUpdate.primitiveRefits += 1
             } else {
                 build.build(accelerationStructure: asset.structure, descriptor: asset.descriptor,
-                            scratchBuffer: asset.scratch, scratchBufferOffset: 0)
+                            scratchBuffer: scratch, scratchBufferOffset: 0)
+                lastUpdate.primitiveBuilds += 1
             }
             build.endEncoding()
             assets[i].built = true
         }
         guard let build = command.makeAccelerationStructureCommandEncoder() else { throw Failure.allocation("scene build encoder") }
+        for asset in assets { build.useResource(asset.structure, usage: .read) }
         // Periodic rebuilds bound traversal degradation after large motion
         // and folding; ordinary frames only refit existing structures.
         if topBuilt && updateCount % 120 != 0 {
             build.refit(sourceAccelerationStructure: structure, descriptor: topDescriptor,
-                        destinationAccelerationStructure: nil, scratchBuffer: topScratch, scratchBufferOffset: 0)
+                        destinationAccelerationStructure: nil, scratchBuffer: scratch, scratchBufferOffset: 0)
+            lastUpdate.instanceRefits += 1
         } else {
-            build.build(accelerationStructure: structure, descriptor: topDescriptor, scratchBuffer: topScratch, scratchBufferOffset: 0)
+            build.build(accelerationStructure: structure, descriptor: topDescriptor, scratchBuffer: scratch, scratchBufferOffset: 0)
+            lastUpdate.instanceBuilds += 1
         }
         build.endEncoding()
         topBuilt = true
         updateCount += 1
+        lastUpdateKey = key
     }
 
     func encodeLighting(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
