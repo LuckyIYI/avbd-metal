@@ -105,10 +105,11 @@ final class GTAOMetalTests: XCTestCase {
         let fixtureP = try pipeline("ao_fixture", .rgba16Float, depth: true)
         let aoP = try pipeline("gtao_fragment", .r8Unorm)
         let temporalP = try pipeline("temporal_fragment", .rgba8Unorm)
-        let blurP = try pipeline("blur_fragment", .r8Unorm)
+        let historical = ProcessInfo.processInfo.environment["GTAO_TEST_SHADER"] != nil
+        let blurP = try pipeline(historical ? "blur_fragment" : "visibility_fragment", historical ? .r8Unorm : .rg8Unorm)
         let depth = try texture(.depth32Float), normal = try texture(.rgba16Float)
         let raw = try texture(.r8Unorm), history = try texture(.rgba8Unorm)
-        let resolved = try texture(.rgba8Unorm), blurred = try texture(.r8Unorm)
+        let resolved = try texture(.rgba8Unorm), blurred = try texture(historical ? .r8Unorm : .rg8Unorm)
         let queue = try XCTUnwrap(device.makeCommandQueue())
         let depthDesc = MTLDepthStencilDescriptor()
         depthDesc.isDepthWriteEnabled = true
@@ -150,14 +151,15 @@ final class GTAOMetalTests: XCTestCase {
             let blit = try XCTUnwrap(cmd.makeBlitCommandEncoder())
             blit.copy(from: resolved, to: history)
             blit.endEncoding()
-            try pass(blurP, blurred, textures: [resolved, depth, normal])
+            try pass(blurP, blurred, textures: historical ? [resolved, depth, normal] : [resolved, raw, depth, normal])
             cmd.commit()
             cmd.waitUntilCompleted()
             XCTAssertEqual(cmd.status, .completed, "\(String(describing: cmd.error))")
             if frame >= 8 { gpuTime += cmd.gpuEndTime - cmd.gpuStartTime }
         }
         func read(_ tex: MTLTexture) throws -> [Float] {
-            let stride = (width + 255) / 256 * 256
+            let channels = tex.pixelFormat == .rg8Unorm ? 2 : 1
+            let stride = (width * channels + 255) / 256 * 256
             let buffer = try XCTUnwrap(device.makeBuffer(length: stride * height, options: .storageModeShared))
             let cmd = try XCTUnwrap(queue.makeCommandBuffer())
             let enc = try XCTUnwrap(cmd.makeBlitCommandEncoder())
@@ -168,7 +170,7 @@ final class GTAOMetalTests: XCTestCase {
             cmd.commit()
             cmd.waitUntilCompleted()
             let bytes = buffer.contents().assumingMemoryBound(to: UInt8.self)
-            return (0..<height).flatMap { y in (0..<width).map { x in Float(bytes[y * stride + x]) / 255 } }
+            return (0..<height).flatMap { y in (0..<width).map { x in Float(bytes[y * stride + x * channels]) / 255 } }
         }
         return try Result(raw: read(raw), resolved: read(blurred),
                           milliseconds: gpuTime * 1000 / Double(max(frames - 8, 1)))
