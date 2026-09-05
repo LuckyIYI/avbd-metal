@@ -37,6 +37,57 @@ inline float3 screenEnvironment(float3 R) {
     return mix(HORIZON_LIN, float3(0.42, 0.48, 0.58), clamp(R.z, 0.0, 1.0));
 }
 
+// Tokuyoshi/Kaplanyan (I3D 2019), normal-based isotropic NDF filtering.
+// Add pixel-footprint variance to alpha squared, not perceptual roughness.
+inline float specularRoughness(float3 n, float rough, float pixelScale) {
+    float3 dx = dfdx(n)*pixelScale, dy = dfdy(n)*pixelScale;
+    float varianceRoughness = min(0.25*(dot(dx,dx)+dot(dy,dy)),0.18);
+    float alpha = rough*rough;
+    return sqrt(sqrt(saturate(alpha*alpha+varianceRoughness)));
+}
+
+inline float3 reflectionFactor(float3 P, float3 N, float rough, float3 albedo, float metal, constant Uniforms& U) {
+    float NdV = saturate(dot(N,normalize(U.eye.xyz-P)));
+    float3 F0 = mix(float3(0.04),albedo,metal);
+    return max((F0+(1-F0)*pow(1-NdV,5.0))*mix(0.50,0.20,rough),float3(0.001));
+}
+
+inline float specularOcclusion(float NdV, float ao, float rough, constant Uniforms& U) {
+    // World rays already evaluate visibility along the specular lobe. Diffuse
+    // hemisphere AO must not darken that result a second time. Keep the same
+    // unoccluded environment baseline when applying the signed ray correction.
+    // Lagarde's approximation uses microfacet roughness (perceptual squared).
+    float untraced = saturate(pow(NdV+ao,exp2(-16*rough*rough-1))-1+ao);
+    float traced = U.rayTracing.x > 0 ? 1-smoothstep(U.effects.w-0.15,U.effects.w,rough) : 0;
+    return mix(untraced,1.0,traced);
+}
+
+inline float3 surfaceReflection(float2 uv, float3 P, float3 N, float rough, float3 albedo, float metal,
+    constant Uniforms& U, texture2d<float> reflection, texture2d<float> normal,
+    depth2d<float> depth, texture2d<float> material) {
+    if (rough >= U.effects.w) return float3(0);
+    float2 size = float2(depth.get_width(),depth.get_height());
+    float2 p = uv*size-0.5, f = fract(p);
+    int2 base = int2(floor(p));
+    float z = dot(P-U.eye.xyz,cross(U.camRight.xyz,U.camUp.xyz));
+    float tolerance = max(0.0005,z/U.screen.z*0.75);
+    float3 sum = float3(0); float weight = 0;
+    for (int y=0; y<2; ++y) for (int x=0; x<2; ++x) {
+        int2 q = base+int2(x,y);
+        if (any(q<0) || any(q>=int2(size))) continue;
+        float d = depth.read(uint2(q)); float4 nr = normal.read(uint2(q));
+        if (d>=1 || abs(nr.w-rough)>0.08) continue;
+        float3 Q = worldFromDepth((float2(q)+0.5)/size,d,U.invViewProj);
+        float plane = max(abs(dot(Q-P,N)),abs(dot(Q-P,nr.xyz)));
+        float w = (x ? f.x : 1-f.x)*(y ? f.y : 1-f.y);
+        w *= saturate(1-plane/tolerance)*pow(saturate(dot(N,nr.xyz)),32.0);
+        float4 mat = material.read(uint2(q));
+        sum += reflection.read(uint2(q)).rgb/reflectionFactor(Q,nr.xyz,nr.w,mat.rgb,mat.a,U)*w;
+        weight += w;
+    }
+    return weight > 1e-5 ? sum/weight*reflectionFactor(P,N,rough,albedo,metal,U)*saturate(weight*4) : float3(0);
+}
+
 inline float3 pbrRadiance(float3 albedo, float rough, float metal, float3 emissive,
                          float3 n, float3 V, float ao, float shadow, constant Uniforms& U) {
     float3 L = -U.lightDir.xyz;
@@ -58,12 +109,11 @@ inline float3 pbrRadiance(float3 albedo, float rough, float metal, float3 emissi
     float3 direct = (albedo / M_PI_F * (1.0 - metal) * (1.0 - F) + spec) * SUN_COL * NdL * shadow;
 
     float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
-    float3 ambient = albedo * irr * (1.0 - metal);
+    float3 ambient = albedo * irr * (1.0 - metal) * ao;
     float3 R = reflect(-V, n);
     float3 skyRef = screenEnvironment(R);
     ambient += skyRef * (F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0))
-        * mix(0.50, 0.20, rough);
-    ambient *= ao;
+        * mix(0.50, 0.20, rough) * specularOcclusion(NdV,ao,rough,U);
 
     return direct + ambient + emissive;
 }
@@ -105,7 +155,8 @@ let screenSpaceShaderSource = """
 struct SurfaceOut { float4 normal [[color(0)]]; float4 material [[color(1)]]; };
 fragment SurfaceOut surface_fragment(VOut in [[stage_in]]) {
     SurfaceOut o;
-    o.normal = float4(normalize(in.normal), clamp(in.pbr.x, 0.02, 1.0));
+    float3 n = normalize(in.normal);
+    o.normal = float4(n, specularRoughness(n,clamp(in.pbr.x,0.02,1.0),0.5));
     o.material = float4(in.albedo, saturate(in.pbr.y));
     return o;
 }
@@ -280,15 +331,14 @@ fragment float4 reflection_fragment(FSOut in [[stage_in]], constant Uniforms& U 
                             + P.z * cross(U.camRight.xyz, U.camUp.xyz))), normalize(nr.xyz));
     // Replace the covered portion of the existing environment term instead
     // of adding a second copy of specular illumination.
-    float3 correction = (incoming - screenEnvironment(worldR)) * response * ao.read(pixel).r;
+    float3 correction = (incoming - screenEnvironment(worldR)) * response
+        * specularOcclusion(NdV,ao.read(pixel).r,rough,U);
     correction *= 1.0 - horizonFog(length(P));
     return float4(correction * confidence, confidence);
 }
 
-// One spatial resolve per signal. The fixed disc avoids directional blur;
-// receiver-plane and normal weights keep filtering on the same surface.
-constant int2 screenFilterOffsets[13] = { int2(0), int2(1,0), int2(-1,0), int2(0,1), int2(0,-1),
-    int2(1,1), int2(-1,1), int2(1,-1), int2(-1,-1), int2(2,0), int2(-2,0), int2(0,2), int2(0,-2) };
+// One spatial resolve per signal. A 5x5 tent averages stochastic visibility
+// without a preferred axis; plane/normal weights preserve contact boundaries.
 inline float screenFilterWeight(float3 P, float3 N, float3 Q, float3 QN, float tolerance) {
     float agreement = max(dot(N, QN), 0.0);
     return pow(agreement, 16.0) * saturate(1.0 - abs(dot(Q-P, N)) / tolerance);
@@ -304,14 +354,14 @@ fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U 
     float2 sum = float2(0); float weights = 0.0;
     int2 size = int2(depth.get_width(), depth.get_height());
     constexpr sampler nearest(filter::nearest);
-    for (int i = 0; i < 13; ++i) {
-        int2 q = int2(pixel) + screenFilterOffsets[i];
+    for (int y = -2; y <= 2; ++y) for (int x = -2; x <= 2; ++x) {
+        int2 q = int2(pixel) + int2(x,y);
         if (any(q < 0) || any(q >= size)) continue;
         float dq = depth.read(uint2(q));
         if (dq >= 1.0) continue;
         float2 uv = (float2(q) + 0.5) / float2(size);
         float3 Q = screenPosition(uv, dq, U), QN = screenVector(normal.read(uint2(q)).xyz, U);
-        float w = screenFilterWeight(P, N, Q, QN, tolerance) / (1.0 + dot(float2(screenFilterOffsets[i]), float2(screenFilterOffsets[i])));
+        float w = screenFilterWeight(P, N, Q, QN, tolerance) * float((3-abs(x))*(3-abs(y)));
         float a = ambient.sample(nearest, uv).r;
         float c = U.effects.y > 0.0 ? contact.read(uint2(q)).r : 1.0;
         sum += float2(a, c) * w; weights += w;
@@ -372,7 +422,7 @@ fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Unifor
     float d = fullDepth.read(pixel);
     uint2 np = min(uint2(in.uv * float2(normal.get_width(), normal.get_height())),
                    uint2(normal.get_width()-1, normal.get_height()-1));
-    if (d < 1.0 && normal.read(np).w < U.effects.w) {
+    if (U.rayTracing.w == 0 && d < 1.0 && normal.read(np).w < U.effects.w) {
         float3 P = screenPosition(in.uv, d, U);
         float2 size = float2(depth.get_width(), depth.get_height());
         float2 p = in.uv * size - 0.5;
@@ -396,4 +446,4 @@ fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Unifor
     }
     return float4(displayColorSRGB8(acesTonemap(max(color, 0.0)), in.position.xy), 1);
 }
-"""
+""" + antialiasingShaderSource

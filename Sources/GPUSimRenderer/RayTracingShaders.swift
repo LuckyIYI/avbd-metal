@@ -145,7 +145,9 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     float3 correctionSum = float3(0); float coverage = 0;
     // Stratified samples, followed by a surface-aware spatial resolve.
     // A fixed seed prevents idle flicker and requires no stale frame history.
-    const uint sampleCount = 4;
+    // Spend extra rays where low-sample variance is most visible; matte
+    // dielectrics and near mirrors retain the cheaper four-sample budget.
+    const uint sampleCount = receiver.a > 0.5 && nr.w >= 0.08 ? 8u : 4u;
     for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
     float2 random = float2((float(sampleIndex)+screenNoise(pixel+uint2(0,17)))/float(sampleCount),
                           fract(screenNoise(pixel+uint2(31,0))+float(sampleIndex)*0.6180339887));
@@ -197,7 +199,7 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     coverage += 1;
     }
     float confidence = 1-smoothstep(U.effects.w-0.15,U.effects.w,nr.w);
-    correctionSum *= (1.0/float(sampleCount))*visibility.read(pixel).r*(1-horizonFog(length(P-U.eye.xyz)))*confidence;
+    correctionSum *= (1.0/float(sampleCount))*(1-horizonFog(length(P-U.eye.xyz)))*confidence;
     output.write(float4(correctionSum,coverage/float(sampleCount)*confidence),pixel);
 }
 """

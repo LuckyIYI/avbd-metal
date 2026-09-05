@@ -30,6 +30,9 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     public var contactShadows: Bool
     /// Reflections of visible opaque geometry, with a procedural sky fallback.
     public var screenSpaceReflections: Bool
+    /// A display-space edge resolve supplements 4x MSAA for shading and
+    /// screen-space effects. It keeps no temporal color history.
+    public var edgeAntialiasing: Bool
 
     /// Default lighting: rasterized shadows, GTAO and short contact shadows.
     /// Allocates no HDR reflection targets or depth hierarchy.
@@ -61,7 +64,8 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         screenSpaceReflections: Bool = false,
         showsGroundPlane: Bool = true,
         minimumFrameDuration: Double? = nil,
-        lightingMode: GPUSimLightingMode = .lightweight
+        lightingMode: GPUSimLightingMode = .lightweight,
+        edgeAntialiasing: Bool = true
     ) {
         self.lightingMode = lightingMode
         self.colorMode = colorMode
@@ -70,6 +74,7 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         self.ambientOcclusion = ambientOcclusion
         self.contactShadows = contactShadows
         self.screenSpaceReflections = screenSpaceReflections
+        self.edgeAntialiasing = edgeAntialiasing
         self.showsGroundPlane = showsGroundPlane
         self.minimumFrameDuration = minimumFrameDuration
     }
@@ -590,8 +595,8 @@ static inline float3 worldFromDepth(float2 uv, float depth, float4x4 invVP) {
 
 struct VOut {
     float4 position [[position]];
-    float3 normal;
-    float3 world;
+    float3 normal [[centroid_perspective]];
+    float3 world [[centroid_perspective]];
     float3 albedo;
     float3 emissive;
     float opacity;
@@ -966,7 +971,11 @@ fragment float4 convex_debug_wire_fragment(VOut in [[stage_in]])
 fragment float4 pbr_fragment(VOut in [[stage_in]],
                              constant Uniforms& U [[buffer(1)]],
                              texture2d<float> aoTex [[texture(0)]],
-                             depth2d<float> shadowTex [[texture(1)]])
+                             depth2d<float> shadowTex [[texture(1)]],
+                             texture2d<float> reflection [[texture(2)]],
+                             texture2d<float> screenNormal [[texture(3)]],
+                             depth2d<float> screenDepthTexture [[texture(4)]],
+                             texture2d<float> screenMaterial [[texture(5)]])
 {
     constexpr sampler smp(filter::linear);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : aoTex.sample(smp, in.position.xy / U.screen.xy).rg;
@@ -974,9 +983,18 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
 
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
-    float3 lit = pbrRadiance(in.albedo,clamp(in.pbr.x,0.02,1.0),saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
+    float rough = specularRoughness(n,clamp(in.pbr.x,0.02,1.0),1.0);
+    float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
+    float3 correction = float3(0);
+    if (U.rayTracing.w > 0 && U.rayTracing.z == 0) {
+        // Resolve against this fragment's surface before MSAA coverage is
+        // averaged. A half-resolution neighbour cannot tint another object.
+        correction = surfaceReflection(in.position.xy/U.screen.xy,in.world,n,rough,in.albedo,saturate(in.pbr.y),
+            U,reflection,screenNormal,screenDepthTexture,screenMaterial);
+    }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
+    lit += correction; // The reflection buffer already carries distance fog.
     return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
 }
 
@@ -2016,7 +2034,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                         activeOptions.contactShadows || activeOptions.usesRayTracing ? 0.2 : 0,
                                         activeOptions.screenSpaceReflections ? 4 : 0, 0.65),
                          rayTracing: SIMD4(activeOptions.usesRayTracing ? 1 : 0,
-                                           activeOptions.screenSpaceReflections ? 1 : 0, 0, 0),
+                                           activeOptions.screenSpaceReflections ? 1 : 0, 0,
+                                           activeOptions.usesRayTracing && !activeOptions.screenSpaceReflections ? 1 : 0),
                          aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                              1 / projection.columns.0.x, 1 / projection.columns.1.y))
         func bindAppearance(
@@ -2030,6 +2049,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 offset: 0, index: 4)
             encoder.setVertexBytes(
                 &hasAppearance, length: 4, index: 5)
+        }
+
+        func bindReflections(_ encoder: MTLRenderCommandEncoder) {
+            encoder.setFragmentTexture(screenSpace.reflection ?? visibilityTex, index: 2)
+            encoder.setFragmentTexture(normTex, index: 3)
+            encoder.setFragmentTexture(preDepthTex, index: 4)
+            encoder.setFragmentTexture(screenSpace.material ?? visibilityTex, index: 5)
         }
         var Uh = U
         Uh.screen = SIMD4(Float(aoSize.x), Float(aoSize.y),
@@ -2212,17 +2238,24 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             try rayWorld?.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
                 instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: false)
             try screenSpace.encodeBeforeLighting(command: cmd, uniforms: Uh, options: activeOptions)
+            if Uh.rayTracing.w > 0, let rayWorld {
+                try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
+                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
+                try screenSpace.encodeReflectionFilter(command: cmd, uniforms: Uh)
+            }
         } catch {
             reportFailure("screen-space lighting failed: \(error)")
             return
         }
         // ---- 5. main pass ----
-        let scenePass = activeOptions.usesHDR ? screenSpace.scenePass(using: rpd) : rpd
+        let displayPass = activeOptions.edgeAntialiasing ? screenSpace.displayPass(using: rpd) : rpd
+        let scenePass = activeOptions.usesHDR ? screenSpace.scenePass(using: displayPass) : displayPass
         guard var enc = cmd.makeRenderCommandEncoder(descriptor: scenePass) else {
             reportFailure("could not create the main render encoder")
             return
         }
         enc.label = "Main PBR pass"
+        bindReflections(enc)
         enc.setViewport(screenViewport)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         func scenePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
@@ -2333,12 +2366,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 if activeOptions.screenSpaceReflections {
                     try screenSpace.encodeReflections(command: cmd, uniforms: Uh, filter: !activeOptions.usesRayTracing)
                 }
-                if let rayWorld {
+                if U.rayTracing.w == 0, let rayWorld {
                     try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
                         instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
                     try screenSpace.encodeReflectionFilter(command: cmd, uniforms: Uh)
                 }
-                enc = try screenSpace.beginComposite(command: cmd, destination: rpd, uniforms: U)
+                enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U)
+                bindReflections(enc)
             } catch {
                 reportFailure("screen-space reflections failed: \(error)")
                 return
@@ -2413,6 +2447,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
         }
         enc.endEncoding()
+
+        if activeOptions.edgeAntialiasing {
+            do { try screenSpace.encodeAntialiasing(command: cmd, destination: rpd) }
+            catch { reportFailure("edge antialiasing failed: \(error)"); return }
+        }
 
         #if targetEnvironment(simulator)
         // the simulator SDK has no present(afterMinimumDuration:); pacing is

@@ -10,6 +10,7 @@ final class ScreenSpacePipeline {
     let device: MTLDevice
     private let aoPipeline, temporalPipeline, visibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
+    private let antialiasingPipeline: MTLRenderPipelineState
     private let depthCopyPipeline, depthReducePipeline: MTLComputePipelineState
     private var depthLevels: [MTLTexture] = []
     private(set) var depthHierarchy: MTLTexture?
@@ -21,6 +22,8 @@ final class ScreenSpacePipeline {
     private(set) var visibility, aoRaw, aoResolved, aoHistory, previousDepth: MTLTexture?
     private(set) var directVisibilityRaw, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth: MTLTexture?
     private(set) var reflectionScratch: MTLTexture?
+    private(set) var displayColor: MTLTexture?
+    private var displayEncoded: MTLTexture?
     private(set) var aoIsWhite = false
     private var visibilityIsWhite = false
 
@@ -49,6 +52,7 @@ final class ScreenSpacePipeline {
         reflectionPipeline = try pipeline("reflection_fragment", format: .rgba16Float)
         reflectionFilterPipeline = try pipeline("reflection_filter_fragment", format: .rgba16Float)
         compositePipeline = try pipeline("screen_composite_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
+        antialiasingPipeline = try pipeline("edge_antialiasing_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
         let ds = MTLDepthStencilDescriptor()
         ds.depthCompareFunction = .always
         ds.isDepthWriteEnabled = false
@@ -99,6 +103,7 @@ final class ScreenSpacePipeline {
             directVisibilityRaw = nil; material = nil; reflection = nil; reflectionRaw = nil
             reflectionScratch = nil
             sceneColor = nil; sceneMSAA = nil; sceneDepth = nil; depthHierarchy = nil; depthLevels = []
+            displayColor = nil; displayEncoded = nil
             aoIsWhite = false
             visibilityIsWhite = false
         }
@@ -136,7 +141,35 @@ final class ScreenSpacePipeline {
         if options.usesRayTracing, reflectionScratch == nil {
             reflectionScratch = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection filter scratch")
         } else if !options.usesRayTracing { reflectionScratch = nil }
+        if options.edgeAntialiasing, displayColor == nil {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: size.x, height: size.y, mipmapped: false)
+            d.usage = [.renderTarget, .shaderRead, .pixelFormatView]
+            d.storageMode = .private
+            guard let color = device.makeTexture(descriptor: d),
+                  let encoded = color.makeTextureView(pixelFormat: .bgra8Unorm) else { throw Failure.allocation("display AA color") }
+            color.label = "Display color before edge AA"
+            displayColor = color; displayEncoded = encoded
+        } else if !options.edgeAntialiasing { displayColor = nil; displayEncoded = nil }
         return resized
+    }
+
+    func displayPass(using destination: MTLRenderPassDescriptor) -> MTLRenderPassDescriptor {
+        let d = destination.copy() as! MTLRenderPassDescriptor
+        d.colorAttachments[0].resolveTexture = displayColor
+        return d
+    }
+
+    func encodeAntialiasing(command: MTLCommandBuffer, destination: MTLRenderPassDescriptor) throws {
+        let d = destination.copy() as! MTLRenderPassDescriptor
+        d.colorAttachments[0].loadAction = .dontCare
+        d.depthAttachment.loadAction = .dontCare
+        guard let e = command.makeRenderCommandEncoder(descriptor: d) else { throw Failure.encoder("edge AA") }
+        e.label = "Display edge antialiasing"
+        e.setRenderPipelineState(antialiasingPipeline)
+        e.setDepthStencilState(noDepth)
+        e.setFragmentTexture(displayEncoded, index: 0)
+        e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        e.endEncoding()
     }
 
     /// Fullscreen effects declare only their output and ordered inputs. Metal
