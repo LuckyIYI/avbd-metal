@@ -4053,6 +4053,14 @@ public final class GPUSolver {
     /// Robotics: move a world-anchored joint's target point (Cartesian
     /// position actuator — the joint's bounded force does the rest).
     public func setJointWorldAnchors(_ updates: [JointAnchorUpdate]) {
+        setJointParentAnchors(updates)
+    }
+
+    /// Updates anchor A in the joint parent's coordinate frame. For a
+    /// world joint (bodyA == -1), this is a world-space position. For a
+    /// body-to-body actuator it remains attached to that moving body and
+    /// applies equal and opposite constraint forces to both bodies.
+    public func setJointParentAnchors(_ updates: [JointAnchorUpdate]) {
         guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
