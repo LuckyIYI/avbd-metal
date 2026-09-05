@@ -125,7 +125,7 @@ final class GTAOMetalTests: XCTestCase {
         var gpuTime: Double = 0
         for frame in 0..<frames {
             U.temporal = SIMD4((Float(frame % 64) * 0.6180339887).truncatingRemainder(dividingBy: 1),
-                              frame == 0 ? 1 : 0.2, Float(frame+1), 0)
+                              frame == 0 ? 1 : 0.2, Float(frame % 64), 0)
             let cmd = try XCTUnwrap(queue.makeCommandBuffer())
             func pass(_ p: MTLRenderPipelineState, _ target: MTLTexture,
                       textures: [MTLTexture] = [], prepass: Bool = false) throws {
@@ -314,6 +314,20 @@ final class GTAOMetalTests: XCTestCase {
                 if energyA * energyB > 1e-12 { peak = max(peak, abs(product) / sqrt(energyA * energyB)) }
             }
         }
+        var residualEnergy: Float = 0
+        var blockEnergy: Float = 0
+        var samples = 0
+        for x in columns {
+            for y in firstY..<(lastY - 4) {
+                let residual = result.resolved[y*w+x] - means[x]
+                var block: Float = 0
+                for offset in 0..<4 { block += (result.resolved[(y+offset)*w+x] - means[x]) / 4 }
+                residualEnergy += residual*residual
+                blockEnergy += block*block
+                samples += 1
+            }
+        }
+        print("GTAO spatial RMS=\(sqrt(residualEnergy/Float(samples))), four-pixel RMS=\(sqrt(blockEnergy/Float(samples)))")
         print("GTAO directional residual correlation=\(peak), columns=\(columns.count)")
         XCTAssertLessThan(peak, 0.5)
         try save(result.resolved, width: w, height: h, name: "wall-noise")

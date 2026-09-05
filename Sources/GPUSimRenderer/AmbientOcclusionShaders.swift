@@ -1,5 +1,5 @@
 /// GTAO estimator and its independently validated temporal visibility history.
-let ambientOcclusionShaderSource = """
+let ambientOcclusionShaderSource = gtaoSamplingShaderSource + """
 fragment float4 gtao_fragment(FSOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
                               depth2d<float> depthTex [[texture(0)]],
@@ -31,30 +31,46 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     // instead of letting a few-pixel march invent large-scale occlusion
     float farFade = saturate((pxRadius - 2.5) / 6.0);
     if (farFade <= 0.0) return float4(1);
+    // Reconstruct the geometric plane from the closest depth neighbor on
+    // each axis. Quad derivatives can span silhouettes and invent a plane
+    // between different objects. Smoothed normals remain the shading basis.
+    float3 neighbors[4];
+    constexpr int2 axisOffsets[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
+    float distances[4];
+    for (int i = 0; i < 4; ++i) {
+        int2 q = int2(in.position.xy) + axisOffsets[i];
+        bool valid = all(q >= 0) && all(q < int2(U.screen.xy));
+        float dq = valid ? depthTex.read(uint2(q)) : 1.0;
+        valid = valid && dq < 1.0;
+        float zq = valid ? U.aoProjection.y / (dq - U.aoProjection.x) : centerZ;
+        neighbors[i] = float3((float2(q) + 0.5 - U.reconstruction.yz * U.screen.xy)
+            * pixelToView - U.aoProjection.zw, 1.0) * zq;
+        distances[i] = valid ? abs(zq - centerZ) : INFINITY;
+    }
+    float3 dx = distances[0] < distances[1] ? P-neighbors[0] : neighbors[1]-P;
+    float3 dy = distances[2] < distances[3] ? P-neighbors[2] : neighbors[3]-P;
+    float3 geometricN = cross(dx, dy);
+    float geometricLength = length(geometricN);
+    bool hasPlane = isfinite(min(distances[0], distances[1]))
+                 && isfinite(min(distances[2], distances[3])) && geometricLength > 1e-10;
+    geometricN = hasPlane ? geometricN/geometricLength : N;
+    geometricN *= dot(geometricN, -P) < 0.0 ? -1.0 : 1.0;
     pxRadius = min(pxRadius, 96.0);
     // the falloff must use the radius we ACTUALLY march (post-clamp), or
     // near-camera AO reaches past its sampled range and over-darkens
     float Reff = pxRadius * viewDepth / U.screen.z;
     float falloffRange = max(Reff * 0.65, 1e-4);
 
-    // Independent spatial angle/radius seeds; linear IGN bands and a radial
-    // jitter derived from the angle seed remain correlated after denoising.
     float2 px = floor(in.position.xy);
-    uint seed = uint(px.x) + uint(px.y) * 65537u;
-    seed ^= seed >> 17; seed *= 0xed5ad4bbu;
-    seed ^= seed >> 11; seed *= 0xac4c1b51u;
-    seed ^= seed >> 15; seed *= 0x31848babu;
-    seed ^= seed >> 14;
-    float2 noise = float2(seed & 65535u, seed >> 16) / 65536.0;
-    float ang = fract(noise.x + U.temporal.x) * M_PI_F;
-    float stepJit = fract(noise.y + U.temporal.x * 5.0);
+    float2 noise = gtaoSampleNoise(uint2(px), uint(U.temporal.z));
+    float stepJit = noise.y;
 
     const int SLICES = 3;
     const int STEPS = 4;
     float occlusion = 0.0;
 
     for (int sl = 0; sl < SLICES; sl++) {
-        float phi = ang + float(sl) * (M_PI_F / float(SLICES));
+        float phi = (float(sl) + noise.x) * (M_PI_F / float(SLICES));
         float2 dirPx = float2(cos(phi), sin(phi));
 
         // ANALYTIC slice tangent: the view direction this screen-space
@@ -111,7 +127,7 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
                 // even if their view cosine exceeds this slice's horizon.
                 // Cover half-float normal error plus sub-mm depth roundoff;
                 // this is a tangent-plane tolerance, not an AO radius bias.
-                if (dot(N, w) <= 0.001 * l + 0.0001) continue;
+                if (dot(N, w) <= 0.001 * l + 0.0001 || dot(geometricN, w) <= 0.001 * l + 0.0001) continue;
                 float c = dot(w / l, V);
                 float weight = saturate((Reff - l) / falloffRange);
                 if (dot(w, omega) >= 0.0) {

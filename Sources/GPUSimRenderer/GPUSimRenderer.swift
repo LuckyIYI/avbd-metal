@@ -2169,6 +2169,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         if activeOptions.ambientOcclusion {
             temporal.x = (Float(frameIdx % 64) * 0.6180339887).truncatingRemainder(dividingBy: 1)
             temporal.y = prevVP == nil ? 1 : 0.2
+            temporal.z = Float(frameIdx % 64)
         }
         if metalFX != nil {
             temporal.x = (Float(frameIdx % 1024) * 0.6180339887).truncatingRemainder(dividingBy: 1)
