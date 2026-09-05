@@ -551,6 +551,26 @@ final class GPUSolverTests: XCTestCase {
                           "inverted tet: drawn \(drawn) should equal the affine map \(affine)")
     }
 
+    func testRenderSnapshotFailureDoesNotCommitAndCompletionErrorsAreLatched() throws {
+        let solver = try makeGPU(Demos.ground())
+        enum EncodingFailure: Error { case injected }
+        var rejected: MTLCommandBuffer?
+        XCTAssertThrowsError(try solver.submitRenderSnapshot { command in
+            rejected = command
+            throw EncodingFailure.injected
+        })
+        XCTAssertEqual(rejected?.status,.notEnqueued)
+        XCTAssertNil(solver.runtimeFailure)
+        try solver.synchronize()
+        let expected = GPUSolver.RuntimeFailure.commandExecution(
+            operation: "render snapshot", frame: 0, status: Int(MTLCommandBufferStatus.error.rawValue),
+            domain: "test", code: 1, message: "snapshot completion failed")
+        solver.completionFailureForTesting = { operation,_ in operation == "render snapshot" ? expected : nil }
+        _ = try solver.submitRenderSnapshot { _ in }
+        XCTAssertThrowsError(try solver.synchronize()) { XCTAssertEqual($0 as? GPUSolver.RuntimeFailure,expected) }
+        XCTAssertEqual(solver.runtimeFailure,expected)
+    }
+
     func testCheckedRenderInstanceEncoderFailureIsNotSilentOrPhysicsFatal() throws {
         let solver = try makeGPU(Demos.ground())
         guard let queue = solver.metalDevice.makeCommandQueue(),

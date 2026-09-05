@@ -3669,6 +3669,7 @@ public final class GPUSolver {
         let planarDATCapacity: Int
     }
     private var inflight: [StepSubmission] = []
+    private var renderSnapshotSubmission: MTLCommandBuffer?
     private let statsLock = NSLock()
     private let failureLock = NSLock()
     private var latchedRuntimeFailure: RuntimeFailure?
@@ -4703,6 +4704,24 @@ public final class GPUSolver {
         }
     }
 
+    /// Submit a short read/copy of presentation data on the physics queue.
+    /// Subsequent GPU steps follow it in queue order. CPU mutation APIs that
+    /// synchronize also retire this copy, never the consumer's render frame.
+    /// The closure must finish encoding without committing the command buffer.
+    public func submitRenderSnapshot(
+        _ encode: (MTLCommandBuffer) throws -> Void
+    ) throws -> MTLCommandBuffer {
+        try synchronize()
+        guard let command = queue.makeCommandBuffer() else {
+            throw RuntimeFailure.commandBufferCreation(operation: "render snapshot", frame: frameIndex)
+        }
+        command.label = "AVBD render snapshot"
+        try encode(command)
+        renderSnapshotSubmission = command
+        command.commit()
+        return command
+    }
+
     /// Wait for every submitted physics frame, validate Metal completion,
     /// then publish frame-owned statistics. The earliest failure is sticky
     /// and permanently invalidates this solver instance.
@@ -4716,6 +4735,11 @@ public final class GPUSolver {
             } catch let failure as RuntimeFailure {
                 if observedFailure == nil { observedFailure = failure }
             }
+        }
+        if let snapshot = renderSnapshotSubmission {
+            renderSnapshotSubmission = nil
+            do { try waitForCompletion(snapshot, operation: "render snapshot", frame: frameIndex) }
+            catch let failure as RuntimeFailure { if observedFailure == nil { observedFailure = failure } }
         }
         if let failure = observedFailure ?? runtimeFailure { throw failure }
     }
@@ -7049,9 +7073,10 @@ public final class GPUSolver {
             enc.setBuffer(colliderRenderColor, offset: 0, index: 12)
             // Metal validates every reflected buffer binding even when the
             // runtime flag prevents a read. Reuse a guaranteed live buffer
-            // as the disabled placeholder instead of binding nil.
+            // as the disabled placeholder instead of binding nil. The instance
+            // stride exceeds the 32-byte appearance ABI even for one body.
             enc.setBuffer(
-                appearanceOverrides ?? colliderRenderColor,
+                appearanceOverrides ?? instances,
                 offset: 0, index: 13)
             enc.setBytes(&hasAppearanceOverrides, length: 4, index: 14)
             noteDispatch("raw")

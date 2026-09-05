@@ -411,10 +411,9 @@ public protocol GPUSimRenderableScene: AnyObject {
     /// Coarse content bounds for shadow fitting; nil = camera-driven.
     var renderContentBounds: GPUSimContentBounds? { get }
     /// Whether the renderer must retire each frame before returning.
-    /// GPUSolver requires it (render reads pose buffers another queue
-    /// mutates); a scene whose buffers are all triple-buffered or written
-    /// inside the frame's own command buffer can return false and let CPU
-    /// and GPU pipeline.
+    /// A scene exposing live mutable buffers must return true. The renderer
+    /// automatically snapshots GPUSolver scenes before consuming them; other
+    /// backends can return false when their buffers are already frame-owned.
     var renderSceneRequiresFrameRetirement: Bool { get }
     /// Encodes `renderRigidInstanceCount` values with
     /// `GPUSimRenderInstance` layout. A backend may also refresh the optional
@@ -1400,6 +1399,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var frameSlot = 0
     private let inFlightFrames = DispatchSemaphore(value: 3)
     private var lastSubmittedFrame: MTLCommandBuffer?
+    private var renderSnapshots: [RenderSnapshot?] = [nil, nil, nil]
 
     /// Orbit azimuth in radians.
     public var azimuth: Float = 0.9
@@ -1912,7 +1912,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
               let drawable = view.currentDrawable else { return }
 
         source?.rendererWillDrawFrame()
-        guard let renderScene = source?.renderScene ?? scene else { return }
+        guard var renderScene = source?.renderScene ?? scene else { return }
 
         guard renderScene.renderDevice.registryID == device.registryID else {
             reportFailure(
@@ -2054,6 +2054,21 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             reportFailure("could not allocate auxiliary render instances")
             return
         }
+
+        if let solver = renderScene as? GPUSolver {
+            do {
+                if renderSnapshots[frameSlot] == nil { renderSnapshots[frameSlot] = try RenderSnapshot(device: device) }
+                let snapshot = renderSnapshots[frameSlot]!
+                try snapshot.capture(solver: solver, colorMode: activeOptions.colorMode, appearances: appearanceOverrides,
+                                     includeDebug: activeOptions.showConvexCollisionGeometry)
+                renderScene = snapshot
+            } catch {
+                guard solver.runtimeFailure == nil else { return }
+                reportFailure("render snapshot failed: \(error)")
+                return
+            }
+        }
+        let snapshotSubmission = (renderScene as? RenderSnapshot)?.submission
 
         do {
             try renderScene.encodeRenderInstances(
@@ -2715,9 +2730,15 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             let ms = (finished.gpuEndTime - finished.gpuStartTime) * 1000
             let status = finished.status
             let error = finished.error as NSError?
+            let snapshotFailure = snapshotSubmission?.status == .error
+                ? "render snapshot command failed: \(String(describing: snapshotSubmission?.error))" : nil
             Task { @MainActor in
                 guard let self else { return }
                 self.lastFrameGPUMilliseconds = ms
+                if let snapshotFailure {
+                    self.reportFailure(snapshotFailure)
+                    return
+                }
                 if status != .completed || error != nil {
                     let detail = error.map {
                         "\($0.domain) \($0.code) — \($0.localizedDescription)"
@@ -2733,11 +2754,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         cmd.commit()
         lastSubmittedFrame = cmd
 
-        // Physics and rendering own different command queues but share pose
-        // buffers: GPUSolver-backed scenes retire every visual frame before
-        // returning to the run loop that may mutate them. Scenes that own
-        // their buffers (declared via renderSceneRequiresFrameRetirement)
-        // keep CPU and GPU pipelined instead.
+        // Solver-backed frames now own immutable snapshots. Conservative
+        // third-party scenes may still require retirement of their live buffers.
         if retire {
             cmd.waitUntilCompleted()
             // the frame is complete: timing is current, and the completion

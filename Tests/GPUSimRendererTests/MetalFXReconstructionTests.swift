@@ -78,7 +78,7 @@ final class MetalFXReconstructionTests: XCTestCase {
         e.setVertexBuffer(vertices,offset: 0,index: 0); e.setVertexBytes(&u,length: MemoryLayout<Uniforms>.stride,index: 1)
         e.setVertexBuffer(current,offset: 0,index: 2); e.setVertexBuffer(rotation,offset: 0,index: 3)
         e.setVertexBuffer(previous,offset: 0,index: 6); e.setVertexBuffer(rotation,offset: 0,index: 7)
-        var noAppearance: UInt32 = 0; e.setVertexBuffer(current,offset: 0,index: 4); e.setVertexBytes(&noAppearance,length: 4,index: 5)
+        var noAppearance: UInt32 = 0; e.setVertexBuffer(vertices,offset: 0,index: 4); e.setVertexBytes(&noAppearance,length: 4,index: 5)
         e.setFragmentBytes(&u,length: MemoryLayout<Uniforms>.stride,index: 1); e.setFragmentBytes(&guide,length: MemoryLayout<MetalFXReconstruction.GuideUniforms>.stride,index: 2)
         e.drawPrimitives(type: .triangle,vertexStart: 0,vertexCount: 3); e.endEncoding(); command.commit(); command.waitUntilCompleted()
         XCTAssertEqual(command.status,.completed,"\(String(describing: command.error))")
