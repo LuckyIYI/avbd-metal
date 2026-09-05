@@ -143,10 +143,12 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     float4 receiver = material.read(pixel);
     float3 F0 = mix(float3(0.04),receiver.rgb,receiver.a);
     float3 correctionSum = float3(0); float coverage = 0;
-    // Two decorrelated samples, followed by a surface-aware spatial resolve.
+    // Stratified samples, followed by a surface-aware spatial resolve.
     // A fixed seed prevents idle flicker and requires no stale frame history.
-    for (uint sampleIndex = 0; sampleIndex < 2; ++sampleIndex) {
-    float2 random = float2(screenNoise(pixel+uint2(sampleIndex*197u,17)),screenNoise(pixel+uint2(31,sampleIndex*269u)));
+    const uint sampleCount = 4;
+    for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
+    float2 random = float2((float(sampleIndex)+screenNoise(pixel+uint2(0,17)))/float(sampleCount),
+                          fract(screenNoise(pixel+uint2(31,0))+float(sampleIndex)*0.6180339887));
     float3 localH = rtGlossyNormal(localV,alpha,random);
     float3 H = tangent*localH.x+bitangent*localH.y+N*localH.z;
     float3 R = reflect(-V,H);
@@ -195,7 +197,7 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     coverage += 1;
     }
     float confidence = 1-smoothstep(U.effects.w-0.15,U.effects.w,nr.w);
-    correctionSum *= 0.5*visibility.read(pixel).r*(1-horizonFog(length(P-U.eye.xyz)))*confidence;
-    output.write(float4(correctionSum,coverage*0.5*confidence),pixel);
+    correctionSum *= (1.0/float(sampleCount))*visibility.read(pixel).r*(1-horizonFog(length(P-U.eye.xyz)))*confidence;
+    output.write(float4(correctionSum,coverage/float(sampleCount)*confidence),pixel);
 }
 """

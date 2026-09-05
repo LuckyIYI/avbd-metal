@@ -107,6 +107,9 @@ final class ScreenSpaceLightingTests: XCTestCase {
                         world: RayTracingScene? = nil, rayScene: RaySceneFixture? = nil,
                         lightDirection: SIMD3<Float>? = nil, screenShortcut: Bool = false) throws -> ([Float], [SIMD4<Float>]) {
         let e = h.effects
+        var options = GPUSimRenderOptions(ambientOcclusion: false, screenSpaceReflections: world == nil || screenShortcut)
+        if world != nil { options.lightingMode = .qualityBeta }
+        try e.prepare(size: CGSize(width: e.size.x, height: e.size.y), options: options)
         var U = uniforms(width: e.halfSize.x, height: e.halfSize.y, eye: eye)
         if let lightDirection { U.lightDir = SIMD4(normalize(lightDirection), 0) }
         U.rayTracing = SIMD4(world == nil ? 0 : 1, screenShortcut ? 1 : 0, 0, 0)
@@ -141,8 +144,6 @@ final class ScreenSpaceLightingTests: XCTestCase {
             try world.encodeLighting(command: cmd, uniforms: U, screen: e, instances: rayInstances,
                                      auxiliary: nil, appearances: nil, reflections: false)
         }
-        var options = GPUSimRenderOptions(ambientOcclusion: false, screenSpaceReflections: true)
-        if world != nil { options.lightingMode = .qualityBeta }
         try e.encodeBeforeLighting(command: cmd, uniforms: U, options: options)
         if let world, let rayInstances {
             if screenShortcut { try e.encodeReflections(command: cmd, uniforms: U, filter: false) }
@@ -309,6 +310,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
         let off = GPUSimRenderOptions(ambientOcclusion: false, contactShadows: false, screenSpaceReflections: false)
         XCTAssertFalse(try e.prepare(size: CGSize(width: 512, height: 384), options: off))
         XCTAssertNil(e.sceneColor); XCTAssertNil(e.sceneDepth); XCTAssertNil(e.reflection); XCTAssertNil(e.directVisibilityRaw)
+        XCTAssertNil(e.reflectionScratch)
         XCTAssertTrue(try e.prepare(size: CGSize(width: 319, height: 201), options: GPUSimRenderOptions(screenSpaceReflections: true)))
         XCTAssertFalse(e.aoIsWhite)
         XCTAssertEqual(e.depth?.width, 159); XCTAssertEqual(e.depth?.height, 100)
@@ -392,8 +394,89 @@ final class ScreenSpaceLightingTests: XCTestCase {
         for options in [GPUSimRenderOptions.lightweight, .qualityBeta, .lightweight, .qualityBeta] {
             try e.prepare(size: CGSize(width: 319,height: 201), options: options)
             XCTAssertEqual(e.sceneColor != nil, options.usesHDR)
+            XCTAssertEqual(e.reflectionScratch != nil, options.usesRayTracing)
             XCTAssertEqual(e.depthHierarchy != nil, options.screenSpaceReflections)
             XCTAssertNotNil(e.directVisibilityRaw)
+        }
+    }
+
+    func testReflectionReconstructionRemovesNoiseWithoutMixingMetalsOrBlurringMirrors() throws {
+        let h = try Harness(source: fixtureSource, width: 257, height: 193)
+        let e = h.effects
+        try e.prepare(size: CGSize(width: e.size.x, height: e.size.y), options: .qualityBeta)
+        let width = e.halfSize.x, height = e.halfSize.y
+        var U = uniforms(width: width, height: height); U.rayTracing.x = 1
+        var depths: [Float] = [], normals: [SIMD4<UInt16>] = [], materials: [SIMD4<UInt8>] = []
+        var raw: [SIMD4<UInt16>] = [], modulation: [SIMD3<Float>] = [], noisy: [Float] = []
+        var seed: UInt32 = 97
+        for y in 0..<height { for x in 0..<width {
+            let rough: Float = x >= width-8 ? 0.02 : Float(Float16(0.3))
+            let z: Float = y < height/2 ? 3 : 4
+            depths.append(U.aoProjection.x + U.aoProjection.y/z)
+            normals.append(SIMD4(0, 0, Float16(1).bitPattern, Float16(rough).bitPattern))
+            let metal = x < width/2 ? SIMD4<UInt8>(204, 51, 13, 255) : SIMD4(13, 64, 204, 255)
+            materials.append(metal)
+            let sx = ((Float(x)+0.5)/Float(width)*2-1)*U.aoProjection.z
+            let sy = ((Float(y)+0.5)/Float(height)*2-1)*U.aoProjection.w
+            let cosine = 1/sqrt(1+sx*sx+sy*sy)
+            let f0 = SIMD3(Float(metal.x), Float(metal.y), Float(metal.z))/255
+            let response = (f0 + (1-f0)*pow(1-cosine, 5))*(0.5-0.3*rough)
+            modulation.append(response)
+            seed = seed &* 1664525 &+ 1013904223
+            let noise = (Float(seed >> 8)/Float(1 << 24)-0.5)*1.2
+            let lighting: Float = (y < height/2 ? 0.4 : -0.25) + noise
+            noisy.append(lighting)
+            let value = response*lighting
+            raw.append(SIMD4(Float16(value.x).bitPattern, Float16(value.y).bitPattern,
+                             Float16(value.z).bitPattern, Float16(1).bitPattern))
+        } }
+        let command = try XCTUnwrap(h.queue.makeCommandBuffer())
+        let blit = try XCTUnwrap(command.makeBlitCommandEncoder())
+        func upload<T>(_ values: [T], to texture: MTLTexture) throws {
+            let stride = MemoryLayout<T>.stride, row = (width*MemoryLayout<T>.stride+255)/256*256
+            let buffer = try XCTUnwrap(e.device.makeBuffer(length: row*height, options: .storageModeShared))
+            values.withUnsafeBytes { bytes in
+                for y in 0..<height {
+                    buffer.contents().advanced(by: y*row).copyMemory(from: bytes.baseAddress!.advanced(by: y*width*stride), byteCount: width*stride)
+                }
+            }
+            blit.copy(from: buffer, sourceOffset: 0, sourceBytesPerRow: row, sourceBytesPerImage: row*height,
+                sourceSize: MTLSize(width: width, height: height, depth: 1), to: texture,
+                destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin())
+        }
+        try upload(depths, to: e.depth!); try upload(normals, to: e.normal!)
+        try upload(materials, to: e.material!); try upload(raw, to: e.reflectionRaw!)
+        blit.endEncoding()
+        try e.encodeReflectionFilter(command: command, uniforms: U)
+        command.commit(); command.waitUntilCompleted()
+        XCTAssertEqual(command.status, .completed, "\(String(describing: command.error))")
+        let data = try read(e.reflection!, queue: h.queue, bytesPerPixel: 8)
+        data.withUnsafeBytes { bytes in
+            let values = bytes.bindMemory(to: UInt16.self)
+            var squaredError: Float = 0, rawSquaredError: Float = 0, colorLeak: Float = 0, mirrorError: Float = 0
+            var bias = SIMD2<Float>.zero, counts = SIMD2<Float>.zero
+            for y in 0..<height { for x in 0..<width {
+                let i = y*width+x
+                let rgb = SIMD3(Float(Float16(bitPattern: values[i*4])), Float(Float16(bitPattern: values[i*4+1])),
+                                Float(Float16(bitPattern: values[i*4+2])))
+                let light = rgb/modulation[i]
+                if x >= width-8 {
+                    mirrorError = max(mirrorError, simd_reduce_max(abs(light-SIMD3(repeating: noisy[i]))))
+                } else {
+                    let reference: Float = y < height/2 ? 0.4 : -0.25
+                    let error = light.x-reference
+                    squaredError += error*error; rawSquaredError += pow(noisy[i]-reference, 2)
+                    let region = y < height/2 ? 0 : 1
+                    bias[region] += error; counts[region] += 1
+                    // Equal incident RGB must remain equal after removing each
+                    // metal's Fresnel tint, even across their shared boundary.
+                    colorLeak = max(colorLeak, simd_reduce_max(light)-simd_reduce_min(light))
+                }
+            } }
+            XCTAssertLessThan(sqrt(squaredError/rawSquaredError), 0.25)
+            XCTAssertLessThan(simd_reduce_max(abs(bias/counts)), 0.02, "Filtering must preserve mean reflected energy on both depth layers")
+            XCTAssertLessThan(colorLeak, 0.003, "Neighboring metals must retain their own reflection color")
+            XCTAssertLessThan(mirrorError, 0.003, "Mirror detail must bypass the rough-reflection filter")
         }
     }
 

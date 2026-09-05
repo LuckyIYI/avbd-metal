@@ -318,27 +318,49 @@ fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U 
     }
     return float4(weights > 0.0 ? sum / weights : float2(1), 0, 1);
 }
+inline float3 reflectionModulation(float3 P, float4 nr, float4 material, constant Uniforms& U) {
+    float NdV = saturate(dot(screenVector(nr.xyz, U), normalize(-P)));
+    float3 F0 = mix(float3(0.04), material.rgb, material.a);
+    return max((F0 + (1.0-F0)*pow(1.0-NdV, 5.0))*mix(0.50, 0.20, nr.w), float3(0.001));
+}
 fragment float4 reflection_filter_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
-    texture2d<float> raw [[texture(0)]], depth2d<float> depth [[texture(1)]],
-    texture2d<float> normal [[texture(2)]]) {
+    constant float4& filter [[buffer(2)]], texture2d<float> raw [[texture(0)]],
+    depth2d<float> depth [[texture(1)]], texture2d<float> normal [[texture(2)]],
+    texture2d<float> material [[texture(3)]]) {
     uint2 pixel = uint2(in.position.xy);
     float d = depth.read(pixel); float4 nr = normal.read(pixel);
     if (d >= 1.0 || nr.w >= U.effects.w) return float4(0);
     float3 P = screenPosition(in.uv, d, U), N = screenVector(nr.xyz, U);
-    float tolerance = max(0.003, P.z / U.screen.z * 1.5);
-    int radius = nr.w > 0.25 ? 2 : 1;
+    float3 modulation = reflectionModulation(P, nr, material.read(pixel), U);
+    int step = int(filter.x);
+    if (nr.w < 0.06 || (step > 1 && nr.w < 0.16)) {
+        float4 value = raw.read(pixel);
+        if (filter.y > 0) value.rgb /= modulation;
+        if (filter.z > 0) value.rgb *= modulation;
+        return value;
+    }
+    float tolerance = max(0.001, P.z / U.screen.z * 0.75);
     float4 sum = float4(0); float weights = 0.0;
     int2 size = int2(depth.get_width(), depth.get_height());
-    for (int i = 0; i < 13; ++i) {
-        int2 q = int2(pixel) + screenFilterOffsets[i] * radius;
+    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+        int2 q = int2(pixel) + int2(x, y) * step;
         if (any(q < 0) || any(q >= size)) continue;
         float dq = depth.read(uint2(q)); float4 qn = normal.read(uint2(q));
-        if (dq >= 1.0 || abs(qn.w - nr.w) > 0.1) continue;
+        if (dq >= 1.0 || abs(qn.w - nr.w) > 0.05) continue;
         float3 Q = screenPosition((float2(q) + 0.5) / float2(size), dq, U);
-        float w = screenFilterWeight(P, N, Q, screenVector(qn.xyz, U), tolerance);
-        sum += raw.read(uint2(q)) * w; weights += w;
+        float3 QN = screenVector(qn.xyz, U);
+        float planeDistance = max(abs(dot(Q-P, N)), abs(dot(Q-P, QN)));
+        float w = pow(saturate(dot(N, QN)), mix(256.0, 32.0, nr.w));
+        w *= saturate(1.0-planeDistance/tolerance) * (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+        float4 value = raw.read(uint2(q));
+        // Filter incident lighting separately from the receiving material's
+        // Fresnel color, then restore that color once on the final pass.
+        if (filter.y > 0) value.rgb /= reflectionModulation(Q, qn, material.read(uint2(q)), U);
+        sum += value * w; weights += w;
     }
-    return weights > 0.0 ? sum / weights : float4(0);
+    float4 result = weights > 0.0 ? sum / weights : float4(0);
+    if (filter.z > 0) result.rgb *= modulation;
+    return result;
 }
 
 fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],

@@ -20,6 +20,7 @@ final class ScreenSpacePipeline {
     private(set) var depth, normal, material: MTLTexture?
     private(set) var visibility, aoRaw, aoResolved, aoHistory, previousDepth: MTLTexture?
     private(set) var directVisibilityRaw, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth: MTLTexture?
+    private(set) var reflectionScratch: MTLTexture?
     private(set) var aoIsWhite = false
     private var visibilityIsWhite = false
 
@@ -96,6 +97,7 @@ final class ScreenSpacePipeline {
             (size, halfSize) = (next, half)
             (depth, normal, visibility, aoRaw, aoResolved, aoHistory, previousDepth) = (d, n, a, raw, r, h, p)
             directVisibilityRaw = nil; material = nil; reflection = nil; reflectionRaw = nil
+            reflectionScratch = nil
             sceneColor = nil; sceneMSAA = nil; sceneDepth = nil; depthHierarchy = nil; depthLevels = []
             aoIsWhite = false
             visibilityIsWhite = false
@@ -131,13 +133,17 @@ final class ScreenSpacePipeline {
             material = nil; reflection = nil; reflectionRaw = nil; sceneColor = nil; sceneMSAA = nil; sceneDepth = nil
             depthHierarchy = nil; depthLevels = []
         }
+        if options.usesRayTracing, reflectionScratch == nil {
+            reflectionScratch = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection filter scratch")
+        } else if !options.usesRayTracing { reflectionScratch = nil }
         return resized
     }
 
     /// Fullscreen effects declare only their output and ordered inputs. Metal
     /// tracks the dependencies within the frame's existing command buffer.
     private func pass(_ pipeline: MTLRenderPipelineState, command: MTLCommandBuffer,
-                      output: MTLTexture, inputs: [MTLTexture], uniforms: Uniforms) throws {
+                      output: MTLTexture, inputs: [MTLTexture], uniforms: Uniforms,
+                      parameters: SIMD4<Float>? = nil) throws {
         let d = MTLRenderPassDescriptor()
         d.colorAttachments[0].texture = output
         d.colorAttachments[0].loadAction = .dontCare
@@ -147,6 +153,7 @@ final class ScreenSpacePipeline {
         e.setRenderPipelineState(pipeline)
         var u = uniforms
         e.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+        if var parameters { e.setFragmentBytes(&parameters, length: MemoryLayout<SIMD4<Float>>.stride, index: 2) }
         for (i, t) in inputs.enumerated() { e.setFragmentTexture(t, index: i) }
         e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         e.endEncoding()
@@ -219,8 +226,22 @@ final class ScreenSpacePipeline {
     }
 
     func encodeReflectionFilter(command: MTLCommandBuffer, uniforms: Uniforms) throws {
-        try pass(reflectionFilterPipeline, command: command, output: reflection!,
-                 inputs: [reflectionRaw!, depth!, normal!], uniforms: uniforms)
+        if uniforms.rayTracing.x > 0 {
+            guard let scratch = reflectionScratch else { throw Failure.allocation("reflection filter scratch") }
+            // Increasing tap spacing suppresses low-sample blotches without
+            // retaining old geometry or reflected lighting across frames.
+            for (input, output, parameters) in [
+                (reflectionRaw!, reflection!, SIMD4<Float>(1, 1, 0, 0)),
+                (reflection!, scratch, SIMD4<Float>(2, 0, 0, 0)),
+                (scratch, reflection!, SIMD4<Float>(4, 0, 1, 0))
+            ] {
+                try pass(reflectionFilterPipeline, command: command, output: output,
+                    inputs: [input, depth!, normal!, material!], uniforms: uniforms, parameters: parameters)
+            }
+        } else {
+            try pass(reflectionFilterPipeline, command: command, output: reflection!,
+                inputs: [reflectionRaw!, depth!, normal!, material!], uniforms: uniforms, parameters: SIMD4(1, 1, 1, 0))
+        }
     }
 
     /// Returns the open display encoder so overlays share the tone-mapped MSAA
