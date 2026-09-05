@@ -1270,6 +1270,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// depth so a slot is never rewritten while a frame still reads it.
     private var frameSlot = 0
     private let inFlightFrames = DispatchSemaphore(value: 3)
+    private var lastSubmittedFrame: MTLCommandBuffer?
 
     /// Orbit azimuth in radians.
     public var azimuth: Float = 0.9
@@ -1790,13 +1791,26 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             ?? auxiliaryInstances
         let activeSceneRevision = source?.rendererSceneRevision ?? sceneRevision
 
+        let frameQueue: MTLCommandQueue
         do {
-            if activeOptions.usesRayTracing {
-                rayWorld = try RayTracingScene.shared(scene: renderScene)
+            let nextWorld = activeOptions.usesRayTracing ? try RayTracingScene.shared(scene: renderScene) : nil
+            frameQueue = nextWorld?.queue ?? queue
+            // The ring semaphore limits outstanding frames, but does not order
+            // different queues. Retire the old queue before even preparing the
+            // new world: preparation can refresh scene surface buffers too.
+            if let previous = lastSubmittedFrame, previous.commandQueue !== frameQueue {
+                previous.waitUntilCompleted()
+                if let failure = commandFailureDescription(previous) {
+                    reportFailure(failure)
+                    return
+                }
+            }
+            rayWorld = nextWorld
+            if let rayWorld {
                 let opaque = Self.auxiliaryRenderOrder(activeAuxiliaryInstances, viewedFrom: eyePosition).opaque
-                try rayWorld?.prepare(scene: renderScene, revision: activeSceneRevision,
-                                      auxiliary: opaque, ground: activeOptions.showsGroundPlane)
-            } else { rayWorld = nil }
+                try rayWorld.prepare(scene: renderScene, revision: activeSceneRevision,
+                                     auxiliary: opaque, ground: activeOptions.showsGroundPlane)
+            }
         } catch {
             guard renderScene.rendererStateIsValid else { return }
             reportFailure("ray tracing scene preparation failed: \(error)")
@@ -1815,7 +1829,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        guard let cmd = (rayWorld?.queue ?? queue).makeCommandBuffer() else {
+        guard let cmd = frameQueue.makeCommandBuffer() else {
             reportFailure("could not create a Metal command buffer")
             return
         }
@@ -2442,6 +2456,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
         releasedByCompletion = true
         cmd.commit()
+        lastSubmittedFrame = cmd
 
         // Physics and rendering own different command queues but share pose
         // buffers: GPUSolver-backed scenes retire every visual frame before
