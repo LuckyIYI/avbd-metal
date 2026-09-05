@@ -53,6 +53,44 @@ final class RayTracingSamplingTests: XCTestCase {
         }
     }
 
+    func testSparseDiffuseStratificationReducesVisibilityVarianceWithoutBias() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), device.supportsRaytracing else {
+            throw XCTSkip("Metal ray tracing is unavailable")
+        }
+        let source = """
+        kernel void sparse_samples(device float2* output [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+            uint frame = i/4u;
+            uint2 pixel = uint2(frame%127u,frame/127u);
+            output[i] = sparseDiffuseSample(pixel,i%4u,4u,frame);
+        }
+        """
+        let library = try device.makeLibrary(source: renderShaderSource+"\n"+rayTracingShaderSource+"\n"+source,options: nil)
+        let pipeline = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "sparse_samples")))
+        let count = 16384
+        let output = try XCTUnwrap(device.makeBuffer(length: count*MemoryLayout<SIMD2<Float>>.stride,options: .storageModeShared))
+        let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+        let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline); encoder.setBuffer(output,offset: 0,index: 0)
+        encoder.dispatchThreads(MTLSize(width: count,height: 1,depth: 1),threadsPerThreadgroup: MTLSize(width: 64,height: 1,depth: 1))
+        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+        XCTAssertEqual(command.status,.completed)
+        let samples = output.contents().assumingMemoryBound(to: SIMD2<Float>.self)
+        // Integrate a sloped occluder with known cosine-domain area 0.45.
+        var bias = 0.0, mse = 0.0
+        for frame in 0..<(count/4) {
+            var estimate = 0.0
+            for i in 0..<4 {
+                let p = samples[frame*4+i]
+                XCTAssertTrue(p.x>=0 && p.x<1 && p.y>=0 && p.y<1)
+                XCTAssertEqual(Int(p.x*2)+2*Int(p.y*2),i)
+                if p.y < 0.3+0.3*p.x { estimate += 0.25 }
+            }
+            bias += estimate-0.45; mse += pow(estimate-0.45,2)
+        }
+        XCTAssertLessThan(abs(bias/Double(count/4)),0.015)
+        XCTAssertLessThan(mse/Double(count/4),0.45*0.55*0.25)
+    }
+
     func testGGXSampleWeightsMatchIndependentHemisphereIntegration() throws {
         guard let device = MTLCreateSystemDefaultDevice(), device.supportsRaytracing else {
             throw XCTSkip("Metal ray tracing is unavailable")

@@ -201,7 +201,10 @@ fragment ReconstructionOut soft_reconstruction_fragment(VOut in [[stage_in]], co
 }
 fragment ReconstructionOut floor_reconstruction_fragment(FloorOut in [[stage_in]], constant Uniforms& U [[buffer(1)]], constant ReconstructionUniforms& R [[buffer(2)]]) {
     float3 albedo = floorAlbedo(in.world,U);
-    return reconstructionGuides(in.world, in.world, float3(0,0,1), albedo, 1, 0, R);
+    // The checker floor is diffuse-only; its guide must not advertise a specular lobe.
+    ReconstructionOut result = reconstructionGuides(in.world, in.world, float3(0,0,1), albedo, 1, 0, R);
+    result.specular = float4(0);
+    return result;
 }
 struct ReconstructionDisplayOut { float4 color [[color(0)]]; float depth [[depth(any)]]; };
 fragment ReconstructionDisplayOut reconstruction_display_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],

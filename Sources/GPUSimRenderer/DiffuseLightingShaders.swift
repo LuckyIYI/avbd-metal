@@ -92,6 +92,12 @@ inline float2 diffuseSample(uint2 pixel, uint i, uint frame, float phase) {
                          +float2(phase,phase*5));
     return (float2(cell)+(float2(subcell)+jitter)*0.25)*0.25;
 }
+// Stratify scarce diffuse rays where indirect light dominates the visible signal.
+inline float2 sparseDiffuseSample(uint2 pixel, uint i, uint samples, uint frame) {
+    float2 xi = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),
+                       screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
+    return samples == 4u ? (float2(i&1u,i>>1u)+xi)*0.5 : xi;
+}
 kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], constant Uniforms& U [[buffer(1)]],
     device const RTVertex* vertices [[buffer(2)]], device const RTObject* objects [[buffer(3)]],
     device const RTInstance* instances [[buffer(4)]], device const RenderInstance* rigid [[buffer(5)]],
@@ -99,6 +105,7 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
     constant uint& hasAppearance [[buffer(8)]], depth2d<float,access::read> depth [[texture(0)]],
     texture2d<float,access::read> normal [[texture(1)]], texture2d<float,access::write> output [[texture(2)]],
     texture2d<float,access::read> material [[texture(3)]],
+    texture2d<float,access::read> visibility [[texture(4)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel>=uint2(output.get_width(),output.get_height()))) return;
     uint2 size = uint2(depth.get_width(),depth.get_height()), s = U.reconstruction.x > 0 ? pixel : diffuseSurfacePixel(pixel,size);
@@ -113,12 +120,15 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
     float3 tangent = normalize(cross(abs(N.z)<0.99 ? float3(0,0,1) : float3(0,1,0),N));
     float3 bitangent = cross(N,tangent);
     float3 sum = float3(0);
-    const uint samples = U.reconstruction.x > 0 ? 1u : 16u;
+    uint samples = 16u;
+    if (U.reconstruction.x > 0) {
+        float direct = max(dot(N,-U.lightDir.xyz),0.0)*visibility.read(s).g;
+        samples = direct < 0.2 ? 4u : 1u;
+    }
     for (uint i=0;i<samples;++i) {
         float2 xi = diffuseSample(pixel,i,uint(max(U.temporal.z-1,0.0)),U.temporal.x);
         if (U.reconstruction.x > 0) {
-            uint frame = uint(U.reconstruction.w);
-            xi = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
+            xi = sparseDiffuseSample(pixel,i,samples,uint(U.reconstruction.w));
         }
         float phi = 2*M_PI_F*xi.y;
         float3 R = tangent*(sqrt(xi.x)*cos(phi))+bitangent*(sqrt(xi.x)*sin(phi))+N*sqrt(1-xi.x);
