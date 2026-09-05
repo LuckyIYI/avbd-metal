@@ -33,6 +33,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
         Demos.tunables(name).reduce(into: [:]) { $0[$1.key] = $1.def }
     }
     @Published var running = true
+    @Published var rayTracingEnabled = false
     @Published var colorByGraphColor = false
     @Published var showConvexCollisionGeometry = false
     @Published var convexCollisionWireframe = true

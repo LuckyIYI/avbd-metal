@@ -43,6 +43,7 @@ final class PolicyReplayModel: ObservableObject, RenderableModel {
     @Published private(set) var interactionStatus = ""
     @Published private(set) var statsText = ""
     @Published var running = true
+    @Published var rayTracingEnabled = false
     @Published var playbackRate: Double = 1
     @Published var selectedCameraID = "" {
         didSet {
@@ -460,6 +461,8 @@ struct PolicyReplayLabView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("Policy Replay").font(.title2).bold()
+                    RenderingModePicker(rayTracingEnabled: $model.rayTracingEnabled,
+                                        supportsRayTracing: model.supportsRayTracing)
                     if let manifest = model.manifest {
                         Text(manifest.summary)
                             .font(.caption)

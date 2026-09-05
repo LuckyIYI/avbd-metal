@@ -58,6 +58,8 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 Text("AVBD Metal").font(.title2).bold()
+                RenderingModePicker(rayTracingEnabled: $model.rayTracingEnabled,
+                                    supportsRayTracing: model.supportsRayTracing)
 
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
@@ -180,6 +182,30 @@ struct ContentView: View {
                 ), in: Foundation.log10(range.lowerBound)...Foundation.log10(range.upperBound))
             } else {
                 Slider(value: value, in: range)
+            }
+        }
+    }
+}
+
+struct RenderingModePicker: View {
+    @Binding var rayTracingEnabled: Bool
+    let supportsRayTracing: Bool
+
+    var body: some View {
+        GroupBox("Rendering") {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Rendering", selection: $rayTracingEnabled) {
+                    Text("Fast").tag(false)
+                    Text("RT Beta").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .disabled(!supportsRayTracing)
+                Text(!supportsRayTracing ? "Ray tracing is unavailable on this Mac."
+                     : rayTracingEnabled ? "Ray-traced shadows and reflections. Experimental."
+                     : "Raster shadows and ambient occlusion.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
