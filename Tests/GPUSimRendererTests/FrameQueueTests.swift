@@ -35,6 +35,26 @@ final class FrameQueueTests: XCTestCase {
         }
     }
 
+    func testMetalFXModeSwitchAndResizeKeepSubmittingValidFrames() throws {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              MetalFXReconstruction.supports(device: device, denoising: true) else { throw XCTSkip("MetalFX denoising unavailable") }
+        let scene = PipelinedScene(device: device)
+        let renderer = try GPUSimRenderer(device: device, scene: scene)
+        let view = MTKView(frame: CGRect(x: 0,y: 0,width: 128,height: 96),device: device)
+        renderer.configure(view); view.isPaused = true
+        for (index, mode) in [GPUSimLightingMode.lightweight,.qualityBeta,.qualityBeta,.lightweight,.lightweight].enumerated() {
+            renderer.options = GPUSimRenderOptions(lightingMode: mode,reconstruction: index == 4 ? .legacy : .metalFX)
+            if index == 2 { view.drawableSize = CGSize(width: 160,height: 112) }
+            let count = scene.frames.count
+            view.draw()
+            XCTAssertNil(renderer.runtimeFailure)
+            XCTAssertEqual(scene.frames.count,count+1)
+            scene.frames.last?.waitUntilCompleted()
+            XCTAssertEqual(scene.frames.last?.status,.completed)
+            XCTAssertEqual(renderer.activeReconstruction,index == 4 ? .legacy : .metalFX)
+        }
+    }
+
     func testLightingAndSceneQueueChangesRetirePipelinedFrames() throws {
         guard let device = MTLCreateSystemDefaultDevice(), device.supportsRaytracing else {
             throw XCTSkip("Metal ray tracing is unavailable")

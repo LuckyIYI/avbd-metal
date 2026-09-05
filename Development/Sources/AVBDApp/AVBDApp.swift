@@ -59,6 +59,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Text("AVBD Metal").font(.title2).bold()
                 RenderingModePicker(rayTracingEnabled: $model.rayTracingEnabled,
+                                    metalFXEnabled: $model.metalFXEnabled,
                                     supportsRayTracing: model.supportsRayTracing)
 
                 GroupBox("Demo") {
@@ -189,6 +190,7 @@ struct ContentView: View {
 
 struct RenderingModePicker: View {
     @Binding var rayTracingEnabled: Bool
+    @Binding var metalFXEnabled: Bool
     let supportsRayTracing: Bool
 
     var body: some View {
@@ -200,6 +202,8 @@ struct RenderingModePicker: View {
                 }
                 .pickerStyle(.segmented)
                 .disabled(!supportsRayTracing)
+                Toggle("MetalFX reconstruction (Beta)", isOn: $metalFXEnabled)
+                    .help("Temporal antialiasing in Fast; denoising in RT Beta. Renders at 67% resolution. Unsupported devices use the existing renderer.")
                 Text(!supportsRayTracing ? "Ray tracing is unavailable on this Mac."
                      : rayTracingEnabled ? "Ray-traced shadows, reflections and bounced light. Experimental."
                      : "Raster shadows and ambient occlusion.")

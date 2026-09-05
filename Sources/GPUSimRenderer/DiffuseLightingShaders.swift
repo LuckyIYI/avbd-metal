@@ -10,6 +10,10 @@ inline float3 diffuseEnvironment(float3 R) {
 inline uint2 diffuseSurfacePixel(uint2 p, uint2 size) { return min(p*2u+1u,size-1u); }
 inline float4 surfaceDiffuse(float2 uv, float3 P, float3 N, constant Uniforms& U,
     texture2d<float> diffuse, texture2d<float> normal, depth2d<float> depth) {
+    if (U.reconstruction.x > 0) {
+        uint2 pixel = min(uint2(uv*float2(diffuse.get_width(),diffuse.get_height())), uint2(diffuse.get_width()-1,diffuse.get_height()-1));
+        return diffuse.read(pixel);
+    }
     float2 size = float2(depth.get_width(),depth.get_height());
     float2 p = (uv*size-1.5)*0.5, f = fract(p);
     int2 base = int2(floor(p)), outputSize = int2(diffuse.get_width(),diffuse.get_height());
@@ -97,7 +101,7 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
     texture2d<float,access::read> material [[texture(3)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel>=uint2(output.get_width(),output.get_height()))) return;
-    uint2 size = uint2(depth.get_width(),depth.get_height()), s = diffuseSurfacePixel(pixel,size);
+    uint2 size = uint2(depth.get_width(),depth.get_height()), s = U.reconstruction.x > 0 ? pixel : diffuseSurfacePixel(pixel,size);
     float d = depth.read(s);
     float3 N = normalize(normal.read(s).xyz);
     if (d>=1 || material.read(s).a>=0.99) { output.write(float4(0),pixel); return; }
@@ -109,9 +113,13 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
     float3 tangent = normalize(cross(abs(N.z)<0.99 ? float3(0,0,1) : float3(0,1,0),N));
     float3 bitangent = cross(N,tangent);
     float3 sum = float3(0);
-    const uint samples = 16;
+    const uint samples = U.reconstruction.x > 0 ? 1u : 16u;
     for (uint i=0;i<samples;++i) {
         float2 xi = diffuseSample(pixel,i,uint(max(U.temporal.z-1,0.0)),U.temporal.x);
+        if (U.reconstruction.x > 0) {
+            uint frame = uint(U.reconstruction.w);
+            xi = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
+        }
         float phi = 2*M_PI_F*xi.y;
         float3 R = tangent*(sqrt(xi.x)*cos(phi))+bitangent*(sqrt(xi.x)*sin(phi))+N*sqrt(1-xi.x);
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
@@ -119,7 +127,13 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
         float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,true);
         // Control variate: open sky is integrated analytically and contributes
         // exactly zero noise. Only geometry changes the diffuse lighting.
-        if (hit.w>0) sum += hit.rgb-diffuseEnvironment(R);
+        if (U.reconstruction.x > 0) {
+            // A one-sample control-variate correction can make ambient + sample
+            // negative. Clipping that before denoising would bias dark rooms
+            // brighter. Sample nonnegative incoming radiance instead, then
+            // subtract the exact baseline expected by the compositor.
+            sum += (hit.w>0 ? hit.rgb : diffuseEnvironment(R))-diffuseAmbient(N);
+        } else if (hit.w>0) sum += hit.rgb-diffuseEnvironment(R);
     }
     // cos(theta)/pi cancels the cosine-hemisphere PDF: no extra pi or albedo.
     output.write(float4(sum/float(samples),1),pixel);

@@ -11,6 +11,7 @@ protocol RenderableModel: GPUSimRendererSource {
     nonisolated var captureID: String { get }
     var solver: GPUSolver? { get }
     var rayTracingEnabled: Bool { get }
+    var metalFXEnabled: Bool { get }
     var colorByGraphColor: Bool { get }
     var showConvexCollisionGeometry: Bool { get }
     var convexCollisionWireframe: Bool { get }
@@ -33,7 +34,8 @@ extension RenderableModel {
             colorMode: colorByGraphColor ? .constraintGraph : .bodyIndex,
             showConvexCollisionGeometry: showConvexCollisionGeometry,
             convexCollisionWireframe: convexCollisionWireframe,
-            lightingMode: rayTracingEnabled ? .qualityBeta : .lightweight
+            lightingMode: rayTracingEnabled ? .qualityBeta : .lightweight,
+            reconstruction: metalFXEnabled ? .metalFX : .legacy
         )
     }
 

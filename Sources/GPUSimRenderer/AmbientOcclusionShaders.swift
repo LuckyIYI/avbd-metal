@@ -21,7 +21,7 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     float2 pixelToView = 2.0 * U.aoProjection.zw / U.screen.xy;
     float2 sliceScale = pixelToView / pixelToView.y;
     float centerZ = U.aoProjection.y / (dC - U.aoProjection.x);
-    float3 P = float3(in.position.xy * pixelToView - U.aoProjection.zw, 1.0) * centerZ;
+    float3 P = float3((in.position.xy - U.reconstruction.yz * U.screen.xy) * pixelToView - U.aoProjection.zw, 1.0) * centerZ;
     float3 V = normalize(-P);
     float viewDepth = max(centerZ, 0.25);
 
@@ -102,7 +102,7 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
                 float dQ = depthTex.read(uint2(samplePixel));
                 if (dQ >= 1.0) continue;
                 float sampleZ = U.aoProjection.y / (dQ - U.aoProjection.x);
-                float3 w = float3((float2(samplePixel) + 0.5) * pixelToView
+                float3 w = float3((float2(samplePixel) + 0.5 - U.reconstruction.yz * U.screen.xy) * pixelToView
                                  - U.aoProjection.zw, 1.0) * sampleZ - P;
                 float l = length(w);
                 if (l < 1e-4) continue;

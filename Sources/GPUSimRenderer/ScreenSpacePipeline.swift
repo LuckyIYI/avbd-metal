@@ -11,6 +11,8 @@ final class ScreenSpacePipeline {
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
     private let diffuseTemporalPipeline: MTLRenderPipelineState
     private let diffuseFilterPipeline: MTLRenderPipelineState
+    private let reconstructionDisplayPipeline: MTLRenderPipelineState
+    private let reconstructedDepth: MTLDepthStencilState
     private let antialiasingPipeline: MTLRenderPipelineState
     private let depthCopyPipeline, depthReducePipeline: MTLComputePipelineState
     private var depthLevels: [MTLTexture] = []
@@ -29,6 +31,7 @@ final class ScreenSpacePipeline {
     private var displayEncoded: MTLTexture?
     private(set) var aoIsWhite = false
     private var visibilityIsWhite = false
+    private var reconstructs = false
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         self.device = device
@@ -58,6 +61,11 @@ final class ScreenSpacePipeline {
         diffuseTemporalPipeline = try pipeline("diffuse_temporal_fragment", format: .rgba16Float)
         diffuseFilterPipeline = try pipeline("diffuse_filter_fragment", format: .rgba16Float)
         antialiasingPipeline = try pipeline("edge_antialiasing_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
+        reconstructionDisplayPipeline = try pipeline("reconstruction_display_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
+        let reconstructedDS = MTLDepthStencilDescriptor()
+        reconstructedDS.depthCompareFunction = .always; reconstructedDS.isDepthWriteEnabled = true
+        guard let rd = device.makeDepthStencilState(descriptor: reconstructedDS) else { throw Failure.allocation("reconstructed depth state") }
+        reconstructedDepth = rd
         let ds = MTLDepthStencilDescriptor()
         ds.depthCompareFunction = .always
         ds.isDepthWriteEnabled = false
@@ -92,16 +100,17 @@ final class ScreenSpacePipeline {
     @discardableResult
     func prepare(size requested: CGSize, options: GPUSimRenderOptions) throws -> Bool {
         let next = SIMD2(max(Int(requested.width), 4), max(Int(requested.height), 4))
-        let resized = next != size
+        let resized = next != size || reconstructs != (options.reconstruction == .metalFX)
+        reconstructs = options.reconstruction == .metalFX
         if resized {
             // Allocate into locals before publishing a complete surface set.
-            let half = SIMD2(max(next.x / 2, 4), max(next.y / 2, 4))
+            let half = reconstructs ? next : SIMD2(max(next.x / 2, 4), max(next.y / 2, 4))
             let d = try texture(.depth32Float, width: half.x, height: half.y, label: "Screen depth")
             let n = try texture(.rgba16Float, width: half.x, height: half.y, label: "Screen normal / roughness")
             let a = try texture(.rg8Unorm, width: half.x, height: half.y, label: "Ambient / direct visibility")
             let raw = try texture(.r8Unorm, width: half.x, height: half.y, label: "Raw AO")
-            let r = try texture(.r16Float, width: half.x, height: half.y, label: "AO resolve")
-            let h = try texture(.r16Float, width: half.x, height: half.y, label: "AO history")
+            let r = try reconstructs ? raw : texture(.r16Float, width: half.x, height: half.y, label: "AO resolve")
+            let h = try reconstructs ? raw : texture(.r16Float, width: half.x, height: half.y, label: "AO history")
             (size, halfSize) = (next, half)
             (depth, normal, visibility, aoRaw, aoResolved, aoHistory) = (d, n, a, raw, r, h)
             directVisibilityRaw = nil; material = nil; reflection = nil; reflectionRaw = nil
@@ -144,16 +153,20 @@ final class ScreenSpacePipeline {
             material = nil; reflection = nil; reflectionRaw = nil; sceneColor = nil; sceneMSAA = nil; sceneDepth = nil
             depthHierarchy = nil; depthLevels = []
         }
-        if options.usesRayTracing, reflectionScratch == nil {
+        if options.usesRayTracing && !reconstructs, reflectionScratch == nil {
             reflectionScratch = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection filter scratch")
-        } else if !options.usesRayTracing { reflectionScratch = nil }
+        } else if !options.usesRayTracing || reconstructs { reflectionScratch = nil }
         if options.usesDiffuseGI, diffuse == nil {
-            let width = (halfSize.x+1)/2, height = (halfSize.y+1)/2
-            let a = try texture(.rgba16Float, width: width, height: height, label: "Diffuse irradiance correction")
-            let b = try texture(.rgba16Float, width: width, height: height, label: "Raw diffuse irradiance")
-            let c = try texture(.rgba16Float, width: width, height: height, label: "Diffuse filter scratch")
-            let h = try texture(.rgba16Float, width: width, height: height, label: "Diffuse lighting history")
-            (diffuse, diffuseRaw, diffuseScratch, diffuseHistory) = (a,b,c,h)
+            let width = reconstructs ? halfSize.x : (halfSize.x+1)/2, height = reconstructs ? halfSize.y : (halfSize.y+1)/2
+            let raw = try texture(.rgba16Float, width: width, height: height, label: "Raw diffuse irradiance")
+            diffuseRaw = raw
+            if reconstructs {
+                diffuse = raw
+            } else {
+                diffuse = try texture(.rgba16Float, width: width, height: height, label: "Diffuse irradiance correction")
+                diffuseScratch = try texture(.rgba16Float, width: width, height: height, label: "Diffuse filter scratch")
+                diffuseHistory = try texture(.rgba16Float, width: width, height: height, label: "Diffuse lighting history")
+            }
         } else if !options.usesDiffuseGI {
             diffuse = nil; diffuseRaw = nil; diffuseScratch = nil
             diffuseHistory = nil
@@ -256,8 +269,19 @@ final class ScreenSpacePipeline {
         blit.endEncoding()
     }
 
-    func scenePass(using destination: MTLRenderPassDescriptor) -> MTLRenderPassDescriptor {
+    func scenePass(using destination: MTLRenderPassDescriptor, singleSample: Bool = false) -> MTLRenderPassDescriptor {
         let d = destination.copy() as! MTLRenderPassDescriptor
+        if singleSample {
+            d.colorAttachments[0].texture = sceneColor
+            d.colorAttachments[0].resolveTexture = nil
+            d.colorAttachments[0].loadAction = .clear
+            d.colorAttachments[0].storeAction = .store
+            d.depthAttachment.texture = sceneDepth
+            d.depthAttachment.resolveTexture = nil
+            d.depthAttachment.loadAction = .clear
+            d.depthAttachment.storeAction = .store
+            return d
+        }
         d.colorAttachments[0].texture = sceneMSAA
         d.colorAttachments[0].resolveTexture = sceneColor
         d.colorAttachments[0].loadAction = .clear
@@ -312,17 +336,17 @@ final class ScreenSpacePipeline {
     /// Returns the open display encoder so overlays share the tone-mapped MSAA
     /// pass. Translucency is composed afterward and never becomes an SSR receiver.
     func beginComposite(command: MTLCommandBuffer, destination: MTLRenderPassDescriptor,
-                        uniforms: Uniforms) throws -> MTLRenderCommandEncoder {
+                        uniforms: Uniforms, reconstructed: MTLTexture? = nil) throws -> MTLRenderCommandEncoder {
         let d = destination.copy() as! MTLRenderPassDescriptor
         d.colorAttachments[0].loadAction = .dontCare
-        d.depthAttachment.loadAction = .load
+        d.depthAttachment.loadAction = reconstructed == nil ? .load : .clear
         guard let e = command.makeRenderCommandEncoder(descriptor: d) else { throw Failure.encoder("display composite") }
         e.label = "Reflections and display composite"
-        e.setRenderPipelineState(compositePipeline)
-        e.setDepthStencilState(noDepth)
+        e.setRenderPipelineState(reconstructed == nil ? compositePipeline : reconstructionDisplayPipeline)
+        e.setDepthStencilState(reconstructed == nil ? noDepth : reconstructedDepth)
         var u = uniforms
         e.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
-        for (i, t) in [sceneColor!, reflection!, depth!, normal!, sceneDepth!].enumerated() { e.setFragmentTexture(t, index: i) }
+        for (i, t) in [reconstructed ?? sceneColor!, reflection!, depth!, normal!, sceneDepth!].enumerated() { e.setFragmentTexture(t, index: i) }
         e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         return e
     }

@@ -19,10 +19,10 @@ inline float screenDepth(float d, constant Uniforms& U) {
     return U.aoProjection.y / (d - U.aoProjection.x);
 }
 inline float3 screenPosition(float2 uv, float d, constant Uniforms& U) {
-    return float3((uv * 2.0 - 1.0) * U.aoProjection.zw, 1.0) * screenDepth(d, U);
+    return float3(((uv - U.reconstruction.yz) * 2.0 - 1.0) * U.aoProjection.zw, 1.0) * screenDepth(d, U);
 }
 inline float2 screenProject(float3 p, constant Uniforms& U) {
-    return (p.xy / (p.z * U.aoProjection.zw)) * 0.5 + 0.5;
+    return (p.xy / (p.z * U.aoProjection.zw)) * 0.5 + 0.5 + U.reconstruction.yz;
 }
 inline bool screenInside(float2 uv) { return all(uv >= 0.0) && all(uv < 1.0); }
 inline float screenNoise(uint2 p) {
@@ -238,7 +238,7 @@ kernel void screen_depth_reduce(texture2d<float, access::read> source [[texture(
 // line, then reconstruct on the exact screen ray. Linear Z interpolation would
 // bend the ray and fabricate intersections on tilted surfaces.
 inline float3 reflectionPoint(float2 uv, float inverseZ, constant Uniforms& U) {
-    return float3((uv * 2.0 - 1.0) * U.aoProjection.zw, 1) / inverseZ;
+    return float3(((uv - U.reconstruction.yz) * 2.0 - 1.0) * U.aoProjection.zw, 1) / inverseZ;
 }
 fragment float4 reflection_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
     depth2d<float> depth [[texture(0)]], texture2d<float> normal [[texture(1)]],
@@ -447,4 +447,4 @@ fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Unifor
     }
     return float4(displayColorSRGB8(acesTonemap(max(color, 0.0)), in.position.xy), 1);
 }
-""" + antialiasingShaderSource + diffuseFilterShaderSource
+""" + antialiasingShaderSource + diffuseFilterShaderSource + reconstructionShaderSource

@@ -214,10 +214,14 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     // A fixed seed prevents idle flicker and requires no stale frame history.
     // Spend extra rays where low-sample variance is most visible; matte
     // dielectrics and near mirrors retain the cheaper four-sample budget.
-    const uint sampleCount = receiver.a > 0.5 && nr.w >= 0.08 ? 8u : 4u;
+    const uint sampleCount = U.reconstruction.x > 0 ? 1u : (receiver.a > 0.5 && nr.w >= 0.08 ? 8u : 4u);
     for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
     float2 random = float2((float(sampleIndex)+screenNoise(pixel+uint2(0,17)))/float(sampleCount),
                           fract(screenNoise(pixel+uint2(31,0))+float(sampleIndex)*0.6180339887));
+    if (U.reconstruction.x > 0) {
+        uint frame = uint(U.reconstruction.w);
+        random = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
+    }
     float3 localH = rtGlossyNormal(localV,alpha,random);
     float3 H = tangent*localH.x+bitangent*localH.y+N*localH.z;
     float3 R = reflect(-V,H);
@@ -226,15 +230,18 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
     ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
     float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance);
-    if (hit.w == 0) continue;
-    float3 incoming = hit.rgb;
+    if (hit.w == 0 && U.reconstruction.x == 0) continue;
+    float3 incoming = hit.w > 0 ? hit.rgb : screenEnvironment(R);
     float viewLambda = rtSmithLambda(localV.z,alpha);
     float masking = (1+viewLambda)/(1+viewLambda+rtSmithLambda(NdR,alpha));
     // BRDF*cos/pdf for visible-normal sampling simplifies to Fresnel*G2/G1.
     // Retain the raster environment's gain while replacing covered radiance.
     float3 response = (F0+(1-F0)*pow(1-saturate(dot(V,H)),5.0))*masking*mix(0.50,0.20,nr.w);
-    correctionSum += (incoming-screenEnvironment(R))*response;
+    correctionSum += (U.reconstruction.x > 0 ? incoming : incoming-screenEnvironment(R))*response;
     coverage += 1;
+    }
+    if (U.reconstruction.x > 0) {
+        correctionSum -= float(sampleCount)*screenEnvironment(reflect(-V,N))*reflectionFactor(P,N,nr.w,receiver.rgb,receiver.a,U);
     }
     float confidence = 1-smoothstep(U.effects.w-0.15,U.effects.w,nr.w);
     correctionSum *= (1.0/float(sampleCount))*(1-horizonFog(length(P-U.eye.xyz)))*confidence;
