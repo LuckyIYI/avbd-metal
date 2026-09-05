@@ -140,6 +140,13 @@ enum ConvexHullTopologyBuilder {
             throw Failure(reason: "does not span a finite three-dimensional hull")
         }
         let tolerance = max(diagonal * 1.0e-7, 1.0e-9)
+        // Construction operates in Double. A point within the Float-sized
+        // validation envelope of an early face can lie outside a later face
+        // after the horizon changes. Skipping it with that same envelope can
+        // therefore produce a hull that fails its own containment check.
+        // Retain those near-coplanar extremes during construction, while
+        // leaving the public geometry-validation tolerance unchanged.
+        let visibilityTolerance = max(diagonal * 1.0e-12, 1.0e-15)
 
         // Deterministic maximal selections use lexicographic order as the
         // tie-breaker (the points array is already sorted ascending).
@@ -215,7 +222,7 @@ enum ConvexHullTopologyBuilder {
                 }
                 let distance = dot(faceNormal,
                     points[pointIndex].value - points[face.a].value)
-                if distance > tolerance * normalLength {
+                if distance > visibilityTolerance * normalLength {
                     visible.append(faceIndex)
                 }
             }
@@ -275,15 +282,33 @@ enum ConvexHullTopologyBuilder {
                 throw Failure(reason: "generated hull horizon is disconnected")
             }
 
+            let replacements = horizon.map { edge in
+                orientedFace(edge.1, edge.0, pointIndex,
+                             points: points, interior: interior)
+            }
+            // Adjacent Float extrema can cut a nanometre-sized sliver off
+            // an otherwise valid face. The GPU clipping topology rejects
+            // cross lengths <= 1e-12, including after Float centering. Keep
+            // the existing boundary only when it already contains this
+            // sample within the public validation envelope. Final full-
+            // cloud containment and manifold checks still apply below.
+            let createsSliver = replacements.contains { face in
+                let a = SIMD3<Float>(points[face.a].value)
+                let b = SIMD3<Float>(points[face.b].value)
+                let c = SIMD3<Float>(points[face.c].value)
+                return simd_length(simd_cross(b - a, c - a)) <= 1e-12
+            }
+            if createsSliver && faces.allSatisfy({ face in
+                let n = normal(face, points: points)
+                return dot(n, points[pointIndex].value - points[face.a].value)
+                    <= tolerance * sqrt(lengthSquared(n))
+            }) { continue }
+
             let visibleSet = Set(visible)
             faces = faces.enumerated().compactMap {
                 visibleSet.contains($0.offset) ? nil : $0.element
             }
-            for edge in horizon {
-                faces.append(orientedFace(
-                    edge.1, edge.0, pointIndex,
-                    points: points, interior: interior))
-            }
+            faces.append(contentsOf: replacements)
         }
 
         guard faces.count >= 4,
