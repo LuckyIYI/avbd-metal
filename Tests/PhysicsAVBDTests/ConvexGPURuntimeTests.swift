@@ -1281,7 +1281,8 @@ final class ConvexGPURuntimeTests: XCTestCase {
         XCTAssertTrue(solver.usesRigidColliderHierarchy)
         XCTAssertTrue(GPUSolver.requiredHierarchyKernelNames
             .isSubset(of: solver.pso.keys))
-        XCTAssertEqual(solver.rigidBroadphaseProxyCount, 2)
+        XCTAssertGreaterThan(solver.rigidBroadphaseProxyCount, 2,
+            "large compounds must distribute expansion across multiple proxies")
         XCTAssertEqual(solver.rigidBroadphaseBVHNodeCount, 254)
         try solver.submitStep()
         try solver.synchronize()
@@ -1294,6 +1295,249 @@ final class ConvexGPURuntimeTests: XCTestCase {
             Set([$0.0, $0.1]) == Set([base, moving])
         })
         XCTAssertTrue(manifoldSnapshots(solver).allSatisfy(\.finite))
+    }
+
+    func testHierarchyFinalizationHasExactlyOneWriter() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "hierarchy-finalizer-writer")
+        let body = scene.addBody(size: F3(repeating: 1), density: 1,
+            friction: 0.5, position: .zero, collisionEnabled: false)
+        for _ in 0..<2 { scene.addCollider(body: body, size: F3(repeating: 0.5)) }
+        let solver = try GPUSolver(scene: scene)
+        let device = solver.device
+        let counts = try XCTUnwrap(device.makeBuffer(length: 4096 * 4, options: .storageModeShared))
+        let starts = try XCTUnwrap(device.makeBuffer(length: 4096 * 4, options: .storageModeShared))
+        memset(counts.contents(), 0, counts.length)
+        memset(starts.contents(), 0, starts.length)
+        counts.contents().assumingMemoryBound(to: UInt32.self)[0] = 256
+        // If another invocation mistakes the published contact count for a
+        // proxy count, this valid allocation leads it to a zero sentinel.
+        let counters = solver.counters.contents().assumingMemoryBound(to: UInt32.self)
+        counters[GPUCounters.pairs] = 1
+        counters[GPUCounters.pairCandidates] = 1
+        let cmd = try XCTUnwrap(solver.queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(cmd.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(try XCTUnwrap(solver.pso["bp_finalize_hierarchy_pairs"]))
+        encoder.setBuffer(counts, offset: 0, index: 0)
+        encoder.setBuffer(starts, offset: 0, index: 1)
+        encoder.setBuffer(solver.counters, offset: 0, index: 2)
+        encoder.setBuffer(solver.dispatchArgs, offset: 0, index: 3)
+        var params = solver.params
+        encoder.setBytes(&params, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
+        // Exercise multiple scheduling waves with an oversized dispatch;
+        // production dispatch1D also launches multiple SIMD groups.
+        encoder.dispatchThreadgroups(MTLSize(width: 4096, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        encoder.endEncoding()
+        cmd.commit(); cmd.waitUntilCompleted()
+        XCTAssertEqual(cmd.status, .completed)
+        XCTAssertEqual(counters[GPUCounters.pairs], 256)
+        XCTAssertEqual(counters[GPUCounters.pairCandidates], 256)
+        XCTAssertEqual(solver.dispatchArgs.contents().assumingMemoryBound(to: UInt32.self)[0], 4)
+    }
+
+    func testHierarchyScratchUsesBothProducerAndProxyPairBounds() throws {
+        try requireMetal()
+        for bodyCount in [1, 2, 5] {
+            var scene = PhysicsScene(name: "hierarchy-small-proxy-scratch")
+            scene.settings.gravity = 0
+            scene.settings.iterations = 0
+            for _ in 0..<bodyCount {
+                let body = scene.addBody(size: F3(repeating: 1), density: 1,
+                    friction: 0.5, position: .zero, collisionEnabled: false)
+                for _ in 0..<2 {
+                    scene.addCollider(body: body, size: F3(repeating: 0.5), shape: .sphere)
+                }
+            }
+            let solver = try GPUSolver(scene: scene, maxPairsPerBody: 128)
+            XCTAssertEqual(solver.rigidBroadphaseProxyCount, bodyCount)
+            let pairCapacity = max(1, bodyCount * (bodyCount - 1) / 2)
+            let scanCapacity = max(pairCapacity, bodyCount)
+            XCTAssertEqual(solver.broadphaseProxyPairs.length, max(16, pairCapacity * 8))
+            XCTAssertEqual(solver.pairCount.length, max(16, scanCapacity * 4))
+            XCTAssertEqual(solver.pairStart.length, max(16, scanCapacity * 4))
+            try solver.submitStep()
+            try solver.synchronize()
+            XCTAssertEqual(solver.lastPairCandidates, bodyCount * (bodyCount - 1) / 2 * 4)
+        }
+    }
+
+    func testHierarchyRejectsProxyOverflowBeforeExpandingMissingPairs() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "hierarchy-proxy-overflow")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        for _ in 0..<100 {
+            let body = scene.addBody(size: F3(repeating: 1), density: 1,
+                friction: 0.5, position: .zero, collisionEnabled: false)
+            for _ in 0..<2 {
+                scene.addCollider(body: body, size: F3(repeating: 0.5), shape: .sphere)
+            }
+        }
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertEqual(solver.hierarchyPairCapacity, 4096)
+        // 4,950 eligible proxy pairs exceed the cache's 4,096 entries;
+        // expansion must read only initialized pairs and fail explicitly.
+        try solver.submitStep()
+        XCTAssertThrowsError(try solver.synchronize()) { error in
+            guard case let GPUSolver.RuntimeFailure.rigidPairCapacity(frame, required, capacity) = error else {
+                return XCTFail("unexpected failure: \(error)")
+            }
+            XCTAssertEqual(frame, 1)
+            XCTAssertEqual(capacity, 4096)
+            XCTAssertGreaterThan(required, capacity)
+        }
+    }
+
+    func testHierarchySubtreesPreserveAllEligibleSpherePairs() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "compound-subtree-pair-oracle")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        scene.settings.collisionMargin = 0.007
+        let asset = try tetraAsset(offset: F3(0.07, -0.11, 0.03))
+        var owners: [Int] = []
+        // Unequal, non-power-of-two leaf counts exercise both frontier
+        // branches. Rotated, mixed analytic/convex compounds cover radius
+        // padding, local transforms, collision domains and owner exclusions.
+        for (bodyIndex, count) in [67, 35, 19, 1].enumerated() {
+            let body = scene.addBody(
+                size: F3(repeating: 1), density: bodyIndex == 0 ? 0 : 1, friction: 0.5,
+                position: F3(Float(bodyIndex) * 0.31, 0.17, 0.23),
+                rotation: Quat(angle: Float(bodyIndex) * 0.19,
+                               axis: normalize(F3(1, 2, 3))),
+                collisionEnabled: false)
+            owners.append(body)
+            for index in 0..<count {
+                let local = F3(Float(index % 7) * 0.61,
+                               Float(index / 7) * 0.53, 0.13)
+                let collider: Int
+                if index % 3 == 0 {
+                    collider = scene.addConvexCollider(
+                        body: body, asset: asset, localPosition: local,
+                        localRotation: Quat(angle: 0.21, axis: F3(0, 1, 0)))
+                } else {
+                    collider = scene.addCollider(
+                        body: body, size: F3(0.83, 0.09, 0.07),
+                        localPosition: local,
+                        localRotation: Quat(angle: 0.37, axis: F3(1, 0, 0)))
+                }
+                scene.colliders[collider].collisionGroup = bodyIndex == 0
+                    ? 0 : (index % 5 == 0 ? 2 : 1)
+                scene.colliders[collider].collidesWithSharedGeometry = index % 4 != 0
+            }
+        }
+        scene.addCollisionExclusion(bodyA: owners[1], bodyB: owners[3])
+        let solver = try GPUSolver(scene: scene, maxPairsPerBody: 64)
+        let nodeBuffer = solver.broadphaseBVHNodes.contents()
+            .assumingMemoryBound(to: ColliderBVHNodeGPU.self)
+        let roots = solver.broadphaseProxyRoot.contents()
+            .assumingMemoryBound(to: UInt32.self)
+        func leafIDs(_ root: UInt32) -> [UInt32] {
+            let node = nodeBuffer[Int(root)]
+            if node.links.w & 1 != 0 { return [node.links.z] }
+            return leafIDs(node.links.x) + leafIDs(node.links.y)
+        }
+        var covered: [UInt32] = []
+        for proxy in 0..<solver.rigidBroadphaseProxyCount {
+            let leaves = leafIDs(roots[proxy])
+            XCTAssertLessThanOrEqual(leaves.count,
+                                    GPUSolver.rigidBroadphaseMaxLeavesPerProxy)
+            covered += leaves
+        }
+        XCTAssertEqual(covered.sorted(), scene.colliders.indices
+            .filter { scene.colliders[$0].collisionEnabled }.map(UInt32.init))
+
+        let shape = solver.colliderShape.contents().assumingMemoryBound(to: SIMD4<Float>.self)
+        let local = solver.colliderLocalPosition.contents().assumingMemoryBound(to: SIMD4<Float>.self)
+        let shapeType = solver.colliderShapeType.contents().assumingMemoryBound(to: UInt32.self)
+        func center(_ index: Int) -> F3 {
+            let body = scene.bodies[scene.colliders[index].body]
+            let p = local[index]
+            return body.position + body.rotation.act(F3(p.x, p.y, p.z))
+        }
+        var expected = Set<SIMD2<UInt32>>()
+        for a in scene.colliders.indices {
+            for b in scene.colliders.indices where b > a {
+                guard scene.canPotentiallyCollide(colliderA: a, colliderB: b) else { continue }
+                let ra = abs(shape[a].w), rb = abs(shape[b].w)
+                var radius = ra + rb
+                if shapeType[a] & 15 == 4 || shapeType[b] & 15 == 4 {
+                    radius += scene.settings.collisionMargin + min(0.25,
+                        max(4 * scene.settings.collisionMargin, 3 * min(ra, rb)))
+                }
+                if simd_length_squared(center(a) - center(b)) <= radius * radius {
+                    expected.insert(SIMD2(UInt32(a), UInt32(b)))
+                }
+            }
+        }
+        XCTAssertFalse(expected.isEmpty)
+        let initial = solver.captureSimulationSnapshot()
+        var first: [SIMD2<UInt32>]?
+        for _ in 0..<3 {
+            solver.restoreSimulationSnapshot(initial)
+            try solver.submitStep()
+            try solver.synchronize()
+            XCTAssertNil(solver.runtimeFailure)
+            let emitted = Array(UnsafeBufferPointer(
+                start: solver.pairs.contents().assumingMemoryBound(to: SIMD2<UInt32>.self),
+                count: solver.lastNumPairs))
+            XCTAssertEqual(emitted.count, Set(emitted).count, "no duplicate collider pairs")
+            XCTAssertTrue(Set(emitted) == expected,
+                "subtrees must preserve all \(expected.count) pairs, got \(emitted.count)")
+            if let first { XCTAssertTrue(emitted == first, "stable emission order") }
+            else { first = emitted }
+        }
+    }
+
+    func testHierarchyCachedPairsHandleFullTilesEmptyFramesAndOverflow() throws {
+        try requireMetal()
+        for leafCount in [16, 64, 65] {
+            var scene = PhysicsScene(name: "hierarchy-cache-capacity-\(leafCount)")
+            scene.settings.gravity = 0
+            scene.settings.iterations = 0
+            let base = scene.addBody(size: F3(repeating: 1), density: 0,
+                friction: 0.5, position: .zero, collisionEnabled: false)
+            let moving = scene.addBody(size: F3(repeating: 1), density: 1,
+                friction: 0.5, position: F3(0, 0, 0.1), collisionEnabled: false)
+            for index in 0..<leafCount {
+                for body in [base, moving] {
+                    scene.addCollider(body: body, size: F3(repeating: 0.5),
+                        localPosition: F3(Float(index) * 0.0001, 0, 0), shape: .sphere)
+                }
+            }
+            let solver = try GPUSolver(scene: scene)
+            XCTAssertLessThan(solver.hierarchyPairCapacity, solver.maxPairs)
+            try solver.submitStep()
+            let required = leafCount * leafCount
+            if required > solver.maxPairs {
+                XCTAssertThrowsError(try solver.synchronize()) { error in
+                    XCTAssertEqual(error as? GPUSolver.RuntimeFailure,
+                        .rigidPairCapacity(frame: 1, required: required, capacity: 4096))
+                }
+                continue
+            }
+            try solver.synchronize()
+            XCTAssertEqual(solver.lastPairCandidates, required)
+            let emitted = Array(UnsafeBufferPointer(
+                start: solver.pairs.contents().assumingMemoryBound(to: SIMD2<UInt32>.self),
+                count: solver.lastNumPairs))
+            XCTAssertEqual(Set(emitted).count, required,
+                "all 256 entries in full tiles must decode to distinct pairs")
+            // Shrink the live proxy list to zero after a full cache, then
+            // restore contacts. Finalization must not read stale scan tails.
+            solver.setBodyPose(moving, position: F3(100, 0, 0),
+                               rotation: Quat(real: 1, imag: .zero))
+            try solver.submitStep()
+            try solver.synchronize()
+            XCTAssertEqual(solver.lastPairCandidates, 0)
+            solver.setBodyPose(moving, position: F3(0, 0, 0.1),
+                               rotation: Quat(real: 1, imag: .zero))
+            solver.profiling = true
+            try solver.submitStep()
+            try solver.synchronize()
+            XCTAssertEqual(solver.lastPairCandidates, required)
+        }
     }
 
     func testRigidColliderHierarchySupportsBodyAcrossCompoundSeam() throws {

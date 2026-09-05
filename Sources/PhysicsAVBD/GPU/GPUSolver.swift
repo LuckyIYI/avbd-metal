@@ -178,11 +178,13 @@ public final class GPUSolver {
     public let usesRigidColliderHierarchy: Bool
     public let rigidBroadphaseProxyCount: Int
     public let rigidBroadphaseBVHNodeCount: Int
+    let hierarchyPairCapacity: Int
     var broadphaseProxyOwner, broadphaseProxyLocalPosition: MTLBuffer
     var broadphaseProxyShape, broadphaseProxyGroup: MTLBuffer
     var broadphaseProxySharedCollision, broadphaseProxyShapeType: MTLBuffer
     var broadphaseProxyRoot, broadphaseBVHNodes: MTLBuffer
     var broadphaseProxyPairs: MTLBuffer
+    var broadphaseProxyLeaves, hierarchyLeafPairs: MTLBuffer
     /// Per-producer candidate counts and exclusive offsets. Pair emission is
     /// count/scan/scatter instead of atomic append so manifold identity and
     /// contact accumulation order are reproducible across Metal schedules.
@@ -544,13 +546,21 @@ public final class GPUSolver {
         var shapeTypes: [UInt32] = []
         var roots: [UInt32] = []
         var nodes: [ColliderBVHNodeGPU] = []
+        var leaves: [UInt32] = []
     }
 
-    /// Build one balanced body-local sphere BVH per collision domain. This is
-    /// used only by rigid-only scenes; deformable RT queries retain their
-    /// proven collider-level spatial grid. Single-collider bodies stay as
-    /// one-leaf proxies, while decomposed bodies broad-phase once and expand
-    /// only overlapping BVH leaves.
+    // Bound the work assigned to one hierarchy-expansion thread. A whole
+    // compound body (racks, rooms, decomposed meshes) can have thousands of
+    // leaves; making it one proxy serializes its child-pair search on one
+    // GPU lane. Disjoint subtrees give the grid tighter bounds and distribute
+    // that work without duplicating leaves or changing collision predicates.
+    // Keep the traversal stack in 21_hierarchy_broadphase.metal in sync.
+    static let rigidBroadphaseMaxLeavesPerProxy = 16
+
+    /// Build balanced body-local sphere BVHs, exposing bounded subtrees as
+    /// spatial-grid proxies. Used only by rigid-only scenes; deformable RT
+    /// queries retain their collider-level grid. Small compounds retain one
+    /// proxy and their established enumeration order.
     private static func makeRigidBroadphaseHierarchy(
         scene: PhysicsScene, convexUpload: ConvexGPUUpload
     ) -> RigidBroadphaseHierarchyUpload? {
@@ -649,19 +659,43 @@ public final class GPUSolver {
             }
 
             let root = build(colliders)
-            let rootNode = upload.nodes[Int(root)]
-            let particle = scene.bodies[key.body].isParticle
-            upload.owners.append(UInt32(key.body))
-            upload.localPositions.append(SIMD4(
-                rootNode.centerRadius.x, rootNode.centerRadius.y,
-                rootNode.centerRadius.z, 0))
-            upload.shapes.append(SIMD4(
-                0, 0, 0,
-                particle ? -rootNode.centerRadius.w : rootNode.centerRadius.w))
-            upload.groups.append(key.group)
-            upload.sharedCollision.append(key.shared ? 1 : 0)
-            upload.shapeTypes.append((rootNode.links.w & 2) != 0 ? 4 : 0)
-            upload.roots.append(root)
+            func appendProxies(_ nodeIndex: UInt32, leafCount: Int) {
+                let node = upload.nodes[Int(nodeIndex)]
+                if leafCount > rigidBroadphaseMaxLeavesPerProxy {
+                    let leftCount = leafCount / 2
+                    appendProxies(node.links.x, leafCount: leftCount)
+                    appendProxies(node.links.y, leafCount: leafCount - leftCount)
+                    return
+                }
+                let particle = scene.bodies[key.body].isParticle
+                upload.owners.append(UInt32(key.body))
+                upload.localPositions.append(SIMD4(
+                    node.centerRadius.x, node.centerRadius.y,
+                    node.centerRadius.z, 0))
+                upload.shapes.append(SIMD4(
+                    0, 0, 0,
+                    particle ? -node.centerRadius.w : node.centerRadius.w))
+                upload.groups.append(key.group)
+                upload.sharedCollision.append(key.shared ? 1 : 0)
+                upload.shapeTypes.append((node.links.w & 2) != 0 ? 4 : 0)
+                upload.roots.append(nodeIndex)
+                let leafBase = upload.leaves.count
+                func appendLeaves(_ index: UInt32) {
+                    let leafNode = upload.nodes[Int(index)]
+                    if leafNode.links.w & 1 != 0 {
+                        let ordinal = UInt32(upload.leaves.count - leafBase)
+                        upload.nodes[Int(index)].links.w |= ordinal << 2
+                        upload.leaves.append(leafNode.links.z)
+                    } else {
+                        appendLeaves(leafNode.links.x)
+                        appendLeaves(leafNode.links.y)
+                    }
+                }
+                appendLeaves(nodeIndex)
+                upload.leaves.append(contentsOf: repeatElement(UInt32.max,
+                    count: rigidBroadphaseMaxLeavesPerProxy - leafCount))
+            }
+            appendProxies(root, leafCount: colliders.count)
         }
         return upload
     }
@@ -1279,6 +1313,13 @@ public final class GPUSolver {
         // for batched robots: H1 keeps its analytic MJCF proxies for replay,
         // while only three exact USD hulls per environment are active.
         self.maxPairs = max(4096, enabledColliderCount * maxPairsPerBody)
+        // The expansion scan contains one entry per proxy pair, not per
+        // collider-pair output slot. Bound it by the number of distinct
+        // proxy pairs even when a caller reserves a large contact capacity.
+        let proxyProduct = broadphaseItemCount.multipliedReportingOverflow(
+            by: max(0, broadphaseItemCount - 1))
+        self.hierarchyPairCapacity = max(1, min(maxPairs,
+            proxyProduct.overflow ? maxPairs : proxyProduct.partialValue / 2))
         self.mapCapacity = Self.nextPow2(2 * maxPairs)
         let broadphaseGridItemCount = rigidHierarchy?.owners.count
             ?? enabledColliderCount
@@ -1485,8 +1526,18 @@ public final class GPUSolver {
                 * MemoryLayout<ColliderBVHNodeGPU>.stride,
             "broadphaseBVHNodes")
         broadphaseProxyPairs = try makeBuf(
-            usesRigidColliderHierarchy ? maxPairs * 8 : 16,
+            usesRigidColliderHierarchy ? hierarchyPairCapacity * 8 : 16,
             "broadphaseProxyPairs")
+        broadphaseProxyLeaves = try makeBuf(
+            max(1, rigidBroadphaseProxyCount) * Self.rigidBroadphaseMaxLeavesPerProxy * 4,
+            "broadphaseProxyLeaves")
+        // Four bits identify each leaf within its proxy. Store the accepted
+        // pairs in traversal order (one byte each) so emit need not repeat
+        // any hierarchy search or change deterministic manifold ordering.
+        hierarchyLeafPairs = try makeBuf(usesRigidColliderHierarchy
+            ? hierarchyPairCapacity * Self.rigidBroadphaseMaxLeavesPerProxy
+                * Self.rigidBroadphaseMaxLeavesPerProxy : 16,
+            "hierarchyLeafPairs")
         joints = try makeBuf(max(1, numJoints) * MemoryLayout<JointGPU>.stride, "joints")
         springs = try makeBuf(max(1, numSprings) * MemoryLayout<SpringGPU>.stride, "springs")
         tets = try makeBuf(max(1, numTets) * MemoryLayout<TetGPU>.stride, "tets")
@@ -1545,10 +1596,14 @@ public final class GPUSolver {
                                        "cellBodiesSorted")
         bodyCellSlot = try makeBuf(max(1, broadphaseItemCount) * 8,
                                    "bodyCellSlot")
-        pairCount = try makeBuf(max(maxPairs, broadphaseItemCount) * 4,
-                                "pairCount")
-        pairStart = try makeBuf(max(maxPairs, broadphaseItemCount) * 4,
-                                "pairStart")
+        // The two passes share scratch: one count per grid producer, then
+        // one count per possible proxy pair. Contact-output capacity is not
+        // the scan length. Retain both bounds for one- and two-proxy scenes.
+        let pairScanCapacity = usesRigidColliderHierarchy
+            ? max(hierarchyPairCapacity, broadphaseItemCount)
+            : max(maxPairs, broadphaseItemCount)
+        pairCount = try makeBuf(pairScanCapacity * 4, "pairCount")
+        pairStart = try makeBuf(pairScanCapacity * 4, "pairStart")
         pairs = try makeBuf(maxPairs * 8, "pairs")
         exclusions = try makeBuf(max(1, scene.joints.count + scene.springs.count
                                      + scene.collisionExclusions.count) * 8,
@@ -2178,12 +2233,13 @@ public final class GPUSolver {
                         to: broadphaseProxyShapeType)
             uploadArray(rigidHierarchy.roots, to: broadphaseProxyRoot)
             uploadArray(rigidHierarchy.nodes, to: broadphaseBVHNodes)
+            uploadArray(rigidHierarchy.leaves, to: broadphaseProxyLeaves)
         } else {
             for buffer in [
                 broadphaseProxyOwner, broadphaseProxyLocalPosition,
                 broadphaseProxyShape, broadphaseProxyGroup,
                 broadphaseProxySharedCollision, broadphaseProxyShapeType,
-                broadphaseProxyRoot, broadphaseBVHNodes,
+                broadphaseProxyRoot, broadphaseBVHNodes, broadphaseProxyLeaves,
             ] {
                 memset(buffer.contents(), 0, buffer.length)
             }
@@ -3538,6 +3594,7 @@ public final class GPUSolver {
          "hashedRigid": Int(params.numHashedRigid), "tris": numTris,
          "particles": numParticles, "gridHashSize": gridHashSize,
          "rigidProxies": rigidBroadphaseProxyCount, "maxPairs": maxPairs,
+         "hierarchyPairCapacity": usesRigidColliderHierarchy ? hierarchyPairCapacity : 0,
          "bodies": numBodies,
          "cellSizeMicrons": Int(params.cellSize * 1e6),
          "elemCellSizeMicrons": Int(params.elemCellSize * 1e6),
@@ -5656,8 +5713,11 @@ public final class GPUSolver {
             e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
         }
         if usesRigidColliderHierarchy {
-            if profiling { try stage("bp-pairs/bp_count_hierarchy_pairs") }
-            dispatch1D(enc, "bp_count_hierarchy_pairs", maxPairs) { e in
+            var hierarchyCount = UInt32(hierarchyPairCapacity)
+            // The proxy producer counts/starts are reused by expansion.
+            // Finish their consumers before rebinding them for the next pass.
+            try stage("bp-pairs/bp_count_hierarchy_pairs")
+            dispatch1D(enc, "bp_count_hierarchy_pairs", hierarchyPairCapacity) { e in
                 e.setBuffer(self.broadphaseProxyPairs, offset: 0, index: 0)
                 e.setBuffer(self.counters, offset: 0, index: 1)
                 e.setBuffer(self.pairCount, offset: 0, index: 2)
@@ -5666,34 +5726,27 @@ public final class GPUSolver {
                 e.setBuffer(self.broadphaseBVHNodes, offset: 0, index: 5)
                 e.setBuffer(self.posLin, offset: 0, index: 6)
                 e.setBuffer(self.posAng, offset: 0, index: 7)
-                e.setBuffer(self.colliderShape, offset: 0, index: 8)
-                e.setBuffer(self.colliderOwner, offset: 0, index: 9)
-                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 10)
-                e.setBuffer(self.colliderShapeType, offset: 0, index: 11)
-                e.setBuffer(self.pairs, offset: 0, index: 12)
+                e.setBuffer(self.hierarchyLeafPairs, offset: 0, index: 8)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
-                           index: 13)
+                           index: 9)
+                e.setBytes(&hierarchyCount, length: 4, index: 10)
             }
             if profiling { try stage("bp-pairs/scan") }
             encodeScan(enc, input: pairCount, output: pairStart,
-                       count: maxPairs)
-            if profiling { try stage("bp-pairs/bp_emit_hierarchy_pairs") }
-            dispatch1D(enc, "bp_emit_hierarchy_pairs", maxPairs) { e in
+                       count: hierarchyPairCapacity)
+            // GPU-written indirect arguments must be visible before dispatch;
+            // this boundary is required in unprofiled execution as well.
+            try stage("bp-pairs/bp_emit_hierarchy_pairs")
+            dispatchIndirect(enc, "bp_emit_hierarchy_pairs", argsOffset: 0) { e in
                 e.setBuffer(self.broadphaseProxyPairs, offset: 0, index: 0)
                 e.setBuffer(self.counters, offset: 0, index: 1)
                 e.setBuffer(self.pairStart, offset: 0, index: 2)
-                e.setBuffer(self.broadphaseProxyOwner, offset: 0, index: 3)
-                e.setBuffer(self.broadphaseProxyRoot, offset: 0, index: 4)
-                e.setBuffer(self.broadphaseBVHNodes, offset: 0, index: 5)
-                e.setBuffer(self.posLin, offset: 0, index: 6)
-                e.setBuffer(self.posAng, offset: 0, index: 7)
-                e.setBuffer(self.colliderShape, offset: 0, index: 8)
-                e.setBuffer(self.colliderOwner, offset: 0, index: 9)
-                e.setBuffer(self.colliderLocalPosition, offset: 0, index: 10)
-                e.setBuffer(self.colliderShapeType, offset: 0, index: 11)
-                e.setBuffer(self.pairs, offset: 0, index: 12)
+                e.setBuffer(self.pairCount, offset: 0, index: 3)
+                e.setBuffer(self.broadphaseProxyLeaves, offset: 0, index: 4)
+                e.setBuffer(self.hierarchyLeafPairs, offset: 0, index: 5)
+                e.setBuffer(self.pairs, offset: 0, index: 6)
                 e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride,
-                           index: 13)
+                           index: 7)
             }
             if profiling { try stage("bp-pairs/bp_finalize_hierarchy_pairs") }
             dispatch1D(enc, "bp_finalize_hierarchy_pairs", 1) { e in

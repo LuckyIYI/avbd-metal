@@ -222,7 +222,8 @@ public struct ConvexEdgeGPU {
 
 /// One node of the immutable body-local broadphase hierarchy. Bounds are
 /// spheres so live rigid transforms require only one rotation/translation.
-/// links: left node, right node, leaf collider, flags (bit 0 leaf, bit 1 hull).
+/// links: left node, right node, leaf collider, flags (bit 0 leaf, bit 1 hull,
+/// bits 2–5 leaf ordinal within its bounded proxy subtree).
 public struct ColliderBVHNodeGPU {
     public var centerRadius: SIMD4<Float> = .zero
     public var links: SIMD4<UInt32> = .zero
