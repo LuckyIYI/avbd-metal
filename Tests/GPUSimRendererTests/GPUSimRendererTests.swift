@@ -165,4 +165,37 @@ final class GPUSimRendererTests: XCTestCase {
         XCTAssertEqual(instance.color, SIMD4(0.1, 0.3, 0.7, 0))
         XCTAssertEqual(instance.material, SIMD4(3, 2, 1, 1))
     }
+
+    func testSolverGeometryRevisionTracksStepsPoseEditsAndRestores() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal is unavailable") }
+        var scene = PhysicsScene(name: "render-state-revision")
+        _ = scene.addBody(size: F3(repeating: 0.2), density: 1_000, friction: 0, position: F3(0,0,1))
+        let solver = try GPUSolver(scene: scene, device: device)
+        let initial = solver.geometryStateRevision
+        let snapshot = solver.captureRigidSpeculationSnapshot()
+        let rotation = solver.bodyRotation(0)
+        solver.setBodyPose(0, position: F3(1,0,1), rotation: rotation)
+        let teleported = solver.geometryStateRevision
+        XCTAssertGreaterThan(teleported, initial)
+        XCTAssertEqual(solver.frameIndex, 0, "pose edits invalidate geometry without advancing simulation time")
+        solver.setDrivenBodyStates([.init(body: 0, position: F3(1.1,0,1), rotation: rotation)])
+        let driven = solver.geometryStateRevision
+        XCTAssertGreaterThan(driven, teleported)
+        try solver.submitStep(); try solver.synchronize()
+        let stepped = solver.geometryStateRevision
+        XCTAssertGreaterThan(stepped, driven)
+        solver.restoreRigidSpeculationSnapshot(snapshot)
+        XCTAssertEqual(solver.frameIndex, 0)
+        let restored = solver.geometryStateRevision
+        XCTAssertGreaterThan(restored, stepped, "restoring a frame counter must never restore a cache revision")
+        let unchangedSettings = solver.settings
+        solver.settings = unchangedSettings
+        XCTAssertEqual(solver.geometryStateRevision, restored)
+        solver.settings.clothRenderScale += 0.1
+        XCTAssertGreaterThan(solver.geometryStateRevision, restored)
+        let configured = solver.geometryStateRevision
+        solver.invalidateGeometryState()
+        XCTAssertGreaterThan(solver.geometryStateRevision, configured)
+        XCTAssertEqual(solver.renderStateRevision, solver.geometryStateRevision)
+    }
 }

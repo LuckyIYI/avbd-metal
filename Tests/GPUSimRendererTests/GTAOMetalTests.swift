@@ -77,7 +77,7 @@ final class GTAOMetalTests: XCTestCase {
     }
 
     private func render(_ fixture: Fixture, width: Int = 256, height: Int = 192,
-                        frames: Int = 32, eye: SIMD3<Float> = .zero) throws -> Result {
+                        frames: Int = 32, eye: SIMD3<Float> = .zero, finalFixture: Fixture? = nil) throws -> Result {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal is unavailable") }
         // Opt-in A/B capture uses a saved Swift shader source; normal tests
         // always compile the exact source passed to the production renderer.
@@ -104,11 +104,17 @@ final class GTAOMetalTests: XCTestCase {
         }
         let fixtureP = try pipeline("ao_fixture", .rgba16Float, depth: true)
         let aoP = try pipeline("gtao_fragment", .r8Unorm)
-        let temporalP = try pipeline("temporal_fragment", .rgba8Unorm)
-        let blurP = try pipeline("blur_fragment", .r8Unorm)
-        let depth = try texture(.depth32Float), normal = try texture(.rgba16Float)
-        let raw = try texture(.r8Unorm), history = try texture(.rgba8Unorm)
-        let resolved = try texture(.rgba8Unorm), blurred = try texture(.r8Unorm)
+        let historical = ProcessInfo.processInfo.environment["GTAO_TEST_SHADER"] != nil
+        let historyFormat: MTLPixelFormat = .rgba8Unorm
+        let temporalP = try pipeline("temporal_fragment", historyFormat)
+        let blurP = try pipeline(historical ? "blur_fragment" : "visibility_fragment", historical ? .r8Unorm : .rg8Unorm)
+        let effects = try historical ? nil : ScreenSpacePipeline(device: device, library: library)
+        let options = GPUSimRenderOptions(ambientOcclusion: true, contactShadows: false)
+        try effects?.prepare(size: CGSize(width: width * 2, height: height * 2), options: options)
+        let depth = try historical ? texture(.depth32Float) : XCTUnwrap(effects?.depth)
+        let normal = try historical ? texture(.rgba16Float) : XCTUnwrap(effects?.normal)
+        let raw = try texture(.r8Unorm), history = try texture(historyFormat)
+        let resolved = try texture(historyFormat), blurred = try texture(historical ? .r8Unorm : .rg8Unorm)
         let queue = try XCTUnwrap(device.makeCommandQueue())
         let depthDesc = MTLDepthStencilDescriptor()
         depthDesc.isDepthWriteEnabled = true
@@ -119,7 +125,7 @@ final class GTAOMetalTests: XCTestCase {
         var gpuTime: Double = 0
         for frame in 0..<frames {
             U.temporal = SIMD4((Float(frame % 64) * 0.6180339887).truncatingRemainder(dividingBy: 1),
-                              frame == 0 ? 1 : 0.2, 0, 0)
+                              frame == 0 ? 1 : 0.2, Float(frame+1), 0)
             let cmd = try XCTUnwrap(queue.makeCommandBuffer())
             func pass(_ p: MTLRenderPipelineState, _ target: MTLTexture,
                       textures: [MTLTexture] = [], prepass: Bool = false) throws {
@@ -144,20 +150,26 @@ final class GTAOMetalTests: XCTestCase {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 enc.endEncoding()
             }
-            if frame == 0 { try pass(fixtureP, normal, prepass: true) }
-            try pass(aoP, raw, textures: [depth, normal])
-            try pass(temporalP, resolved, textures: [raw, history, depth, depth, normal])
-            let blit = try XCTUnwrap(cmd.makeBlitCommandEncoder())
-            blit.copy(from: resolved, to: history)
-            blit.endEncoding()
-            try pass(blurP, blurred, textures: [resolved, depth, normal])
+            if frame == frames - 1, let finalFixture { F = finalFixture }
+            if frame == 0 || (frame == frames - 1 && finalFixture != nil) { try pass(fixtureP, normal, prepass: true) }
+            if historical {
+                try pass(aoP, raw, textures: [depth, normal])
+                try pass(temporalP, resolved, textures: [raw, history, depth, depth, normal])
+                let blit = try XCTUnwrap(cmd.makeBlitCommandEncoder())
+                blit.copy(from: resolved, to: history)
+                blit.endEncoding()
+                try pass(blurP, blurred, textures: [resolved, depth, normal])
+            } else {
+                try effects!.encodeBeforeLighting(command: cmd, uniforms: U, options: options)
+            }
             cmd.commit()
             cmd.waitUntilCompleted()
             XCTAssertEqual(cmd.status, .completed, "\(String(describing: cmd.error))")
             if frame >= 8 { gpuTime += cmd.gpuEndTime - cmd.gpuStartTime }
         }
         func read(_ tex: MTLTexture) throws -> [Float] {
-            let stride = (width + 255) / 256 * 256
+            let channels = tex.pixelFormat == .rg8Unorm ? 2 : 1
+            let stride = (width * channels + 255) / 256 * 256
             let buffer = try XCTUnwrap(device.makeBuffer(length: stride * height, options: .storageModeShared))
             let cmd = try XCTUnwrap(queue.makeCommandBuffer())
             let enc = try XCTUnwrap(cmd.makeBlitCommandEncoder())
@@ -168,9 +180,9 @@ final class GTAOMetalTests: XCTestCase {
             cmd.commit()
             cmd.waitUntilCompleted()
             let bytes = buffer.contents().assumingMemoryBound(to: UInt8.self)
-            return (0..<height).flatMap { y in (0..<width).map { x in Float(bytes[y * stride + x]) / 255 } }
+            return (0..<height).flatMap { y in (0..<width).map { x in Float(bytes[y * stride + x * channels]) / 255 } }
         }
-        return try Result(raw: read(raw), resolved: read(blurred),
+        return try Result(raw: read(historical ? raw : effects!.aoRaw!), resolved: read(historical ? blurred : effects!.visibility!),
                           milliseconds: gpuTime * 1000 / Double(max(frames - 8, 1)))
     }
 
@@ -305,6 +317,30 @@ final class GTAOMetalTests: XCTestCase {
         print("GTAO directional residual correlation=\(peak), columns=\(columns.count)")
         XCTAssertLessThan(peak, 0.5)
         try save(result.resolved, width: w, height: h, name: "wall-noise")
+    }
+
+    func testTemporalAOReconstructionReducesNoiseAndRejectsChangedDepth() throws {
+        let fixture = Fixture(plane: SIMD4(0, 0, 1, -3),
+            boxMin: SIMD4(-10, -100, -3, 1), boxMax: SIMD4(0.2, 100, -2.7, 1))
+        let w = 256, h = 192
+        let first = try render(fixture, width: w, height: h, frames: 1, eye: SIMD3(1.2, 0, 0))
+        let stable = try render(fixture, width: w, height: h, frames: 32, eye: SIMD3(1.2, 0, 0))
+        func variance(_ values: [Float]) -> Float {
+            var total: Float = 0
+            for x in 0..<w {
+                let column = (24..<(h-24)).map { values[$0*w+x] }
+                let mean = column.reduce(0,+) / Float(column.count)
+                total += column.reduce(0) { $0 + ($1-mean)*($1-mean) }
+            }
+            return total
+        }
+        let ratio = variance(stable.resolved) / variance(first.resolved)
+        print("Fast AO temporal noise variance ratio: \(ratio)")
+        XCTAssertLessThan(ratio, 0.5)
+        let moved = Fixture(plane: SIMD4(0, 0, 1, -2))
+        let changed = try render(fixture, width: w, height: h, frames: 33,
+                                 eye: SIMD3(1.2, 0, 0), finalFixture: moved)
+        XCTAssertGreaterThan(changed.resolved.min()!, 0.99, "Disocclusion must discard dark AO history immediately")
     }
 
     func testAOChainBenchmark() throws {
