@@ -46,4 +46,27 @@ final class ThinConvexHullTests: XCTestCase {
         try gpu.synchronize()
         XCTAssertTrue(gpu.bodyPosition(body).z.isFinite)
     }
+
+    func testAdjacentFloatExtremaDoNotEmitSubthresholdSlivers() throws {
+        var scene = PhysicsScene(name: "near-coincident Float extrema")
+        for i in 1...8 {
+            let r: Float = 0.001 * Float(i)
+            var vertices = [-1, 1].flatMap { x in [-1, 1].flatMap { y in [-1, 1].map { z in
+                F3(Float(x) * r, Float(y) * r, Float(z) * 0.01)
+            } } }
+            vertices += [F3(r.nextDown, r.nextUp, 0.01), F3(r.nextUp, r.nextDown, 0.01),
+                         F3(r, r, Float(0.01).nextUp)]
+            let triangles = try ConvexHullTopologyBuilder.triangulate(vertices: vertices)
+            for t in triangles {
+                let crossLength = length(cross(vertices[Int(t.y)] - vertices[Int(t.x)],
+                                               vertices[Int(t.z)] - vertices[Int(t.x)]))
+                XCTAssertGreaterThan(crossLength, 1e-12, "case \(i) must meet the GPU topology threshold")
+            }
+            let body = scene.addBody(size: F3(repeating: 0.1), density: 100,
+                friction: 0.5, position: F3(Float(i), 0, 1), collisionEnabled: false)
+            scene.addConvexCollider(body: body, vertices: vertices, collisionEnabled: true, isRendered: false)
+        }
+        let gpu = try GPUSolver(scene: scene)
+        try gpu.submitStep(); try gpu.synchronize()
+    }
 }
