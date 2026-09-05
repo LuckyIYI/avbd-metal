@@ -397,6 +397,80 @@ final class ScreenSpaceLightingTests: XCTestCase {
         }
     }
 
+    func testRayTracedGroundDoesNotShadowItselfAsCameraMoves() throws {
+        let h = try Harness(source: fixtureSource, width: 2240, height: 1520)
+        let e = h.effects, device = e.device
+        guard device.supportsRaytracing else { throw XCTSkip("Metal ray tracing is unavailable") }
+        let scene = RaySceneFixture(device: device, values: [])
+        let world = try RayTracingScene.shared(scene: scene)
+        try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: true)
+        let library = try device.makeLibrary(source: renderShaderSource, options: nil)
+        let p = MTLRenderPipelineDescriptor()
+        p.vertexFunction = library.makeFunction(name: "floor_vertex")
+        p.fragmentFunction = library.makeFunction(name: "floor_prepass_fragment")
+        p.colorAttachments[0].pixelFormat = .rgba16Float
+        p.depthAttachmentPixelFormat = .depth32Float
+        let pipeline = try device.makeRenderPipelineState(descriptor: p)
+        let renderer = try GPUSimRenderer(device: device)
+        let instances = try XCTUnwrap(device.makeBuffer(length: MemoryLayout<GPUSimRenderInstance>.stride, options: .storageModePrivate))
+        for offset: Float in [0, 0.001, 0.01, 0.1, 1, 7.999, 8, 8.001, 20] {
+            let eye = SIMD3<Float>(offset, -2, 1)
+            renderer.setCamera(position: eye, target: eye + SIMD3(0.2, 1, -0.1))
+            let projection = renderer.projectionMatrix(aspect: Float(e.halfSize.x)/Float(e.halfSize.y))
+            let vp = projection * renderer.viewMatrix
+            var U = uniforms(width: e.halfSize.x, height: e.halfSize.y, eye: eye)
+            U.viewProj = vp; U.invViewProj = vp.inverse
+            U.screen.z = Float(e.halfSize.y)*projection.columns.1.y*0.5
+            U.aoProjection = SIMD4(-projection.columns.2.z, projection.columns.3.z,
+                                  1/projection.columns.0.x, 1/projection.columns.1.y)
+            U.lightDir = SIMD4(normalize(SIMD3<Float>(0.4, 0.25, -0.85)), 0)
+            let inverseView = renderer.viewMatrix.inverse
+            U.camRight = inverseView.columns.0; U.camUp = -inverseView.columns.1
+            let cmd = try XCTUnwrap(world.queue.makeCommandBuffer())
+            try world.encodeUpdate(command: cmd, scene: scene, instances: instances, auxiliary: nil, appearances: nil)
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = e.normal
+            pass.colorAttachments[0].loadAction = .clear; pass.colorAttachments[0].storeAction = .store
+            pass.depthAttachment.texture = e.depth; pass.depthAttachment.clearDepth = 1
+            pass.depthAttachment.loadAction = .clear; pass.depthAttachment.storeAction = .store
+            let enc = try XCTUnwrap(cmd.makeRenderCommandEncoder(descriptor: pass))
+            enc.setRenderPipelineState(pipeline); enc.setDepthStencilState(h.depthState)
+            enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: floorVertexCount); enc.endEncoding()
+            try world.encodeLighting(command: cmd, uniforms: U, screen: e, instances: instances,
+                                     auxiliary: nil, appearances: nil, reflections: false)
+            cmd.commit(); cmd.waitUntilCompleted()
+            XCTAssertEqual(cmd.status, .completed, "\(String(describing: cmd.error))")
+            let visibility = try read(e.directVisibilityRaw!, queue: world.queue, bytesPerPixel: 1)
+            let falseShadows = visibility.filter { $0 < 255 }.count
+            XCTAssertEqual(falseShadows, 0, "An empty ground plane cannot cast shadows on itself; camera x=\(offset)")
+            let depthData = try read(e.depth!, queue: world.queue, bytesPerPixel: 4)
+            depthData.withUnsafeBytes { raw in
+                let depths = raw.bindMemory(to: Float.self)
+                let right = SIMD3(U.camRight.x, U.camRight.y, U.camRight.z)
+                let up = SIMD3(U.camUp.x, U.camUp.y, U.camUp.z)
+                var missingFloor = 0, maxNearError: Float = 0
+                for y in 0..<e.halfSize.y { for x in 0..<e.halfSize.x {
+                    let uv = SIMD2((Float(x)+0.5)/Float(e.halfSize.x), (Float(y)+0.5)/Float(e.halfSize.y))
+                    let ray = right*((uv.x*2-1)*U.aoProjection.z)
+                        + up*((uv.y*2-1)*U.aoProjection.w) + cross(right, up)
+                    let distance = (0.005-eye.z)/ray.z
+                    let reference = eye + ray*distance
+                    let depth = depths[y*e.halfSize.x+x]
+                    if distance > 0.1 && distance < 999 && abs(reference.x) < 3999 && abs(reference.y) < 3999 {
+                        if depth >= 1 { missingFloor += 1 }
+                        if distance < 20 {
+                            let point = U.invViewProj * SIMD4(uv.x*2-1, 1-uv.y*2, depth, 1)
+                            maxNearError = max(maxNearError, abs(point.z/point.w - 0.005))
+                        }
+                    }
+                } }
+                XCTAssertEqual(missingFloor, 0, "Floor rings must cover the same plane without cracks")
+                XCTAssertLessThan(maxNearError, 0.0002, "Within 20 m, raster depth must stay within 0.2 mm of the floor")
+            }
+        }
+    }
+
 
     func testRayTracingUpdatesRigidMeshesAndRefitsDeformingSurfaces() throws {
         let h = try Harness(source: fixtureSource, width: 255, height: 191)

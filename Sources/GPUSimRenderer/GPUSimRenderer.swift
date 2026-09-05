@@ -1078,12 +1078,26 @@ struct FloorOut { float4 position [[position]]; float3 world; };
 vertex FloorOut floor_vertex(uint vid [[vertex_id]],
                              constant Uniforms& U [[buffer(1)]])
 {
-    const float E = 4000.0;
-    float2 corners[6] = {
-        float2(-E,-E), float2(E,-E), float2(E,E),
-        float2(-E,-E), float2(E,E), float2(-E,E)
-    };
-    float3 p = float3(corners[vid], 0.005);
+    // A single 8 km quad loses millimetres of near-camera depth during
+    // rasterization. Concentric quads keep nearby triangles small enough for
+    // depth reconstruction and world-space shadow rays to agree on the floor.
+    const float2 corners[4] = { float2(-1,-1), float2(1,-1), float2(1,1), float2(-1,1) };
+    const uint triangle[6] = { 0, 1, 2, 0, 2, 3 };
+    const float radii[4] = { 8, 64, 512, 4000 };
+    float2 center = clamp(floor(U.eye.xy / 8.0) * 8.0, -4000.0, 4000.0);
+    float2 point;
+    if (vid < 6) {
+        point = center + corners[triangle[vid]] * radii[0];
+    } else {
+        uint ring = (vid - 6) / 24 + 1;
+        uint side = ((vid - 6) % 24) / 6;
+        uint corner = triangle[(vid - 6) % 6];
+        bool outer = corner == 1 || corner == 2;
+        uint edge = (side + uint(corner >= 2)) % 4;
+        float2 origin = ring == 3 && outer ? float2(0) : center;
+        point = origin + corners[edge] * radii[ring - uint(!outer)];
+    }
+    float3 p = float3(clamp(point, -4000.0, 4000.0), 0.005);
     FloorOut o;
     o.position = U.viewProj * float4(p, 1);
     o.world = p;
@@ -1109,12 +1123,14 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     float ao = visibility.r;
 
     float2 c = in.world.xy / 2.0;
-    float2 fw = fwidth(c);
-    float2 fc = fract(c);
-    float2 aa = clamp((fc - 0.5) / max(fw, 0.0001) + 0.5, 0.0, 1.0)
-              - clamp(fc / max(fw, 0.0001), 0.0, 1.0) + 1.0;
-    float2 sq = abs(aa - 1.0);
-    float checker = abs(sq.x - sq.y);
+    float2 fw = max(fwidth(c), 0.00001);
+    // Integrate the periodic square waves over the pixel footprint. The
+    // triangle wave is their antiderivative, including across negative wraps
+    // and multiple tiles. Multiplying the averages preserves corner coverage;
+    // abs(x-y) on separately softened edges does not.
+    float2 square = (abs(fract(c - fw * 0.5) - 0.5)
+                   - abs(fract(c + fw * 0.5) - 0.5)) / fw;
+    float checker = 0.5 - 0.5 * square.x * square.y;
     float3 tileA = srgbToLin(float3(0.93, 0.93, 0.94));
     float3 tileB = srgbToLin(float3(0.62, 0.66, 0.72));
     float3 albedo = mix(tileA, tileB, checker);
@@ -1158,6 +1174,7 @@ struct Uniforms {
 let SPHV = 12 * 18 * 6
 let TORV = 24 * 12 * 6
 let CAPV = (2 * 6 + 1) * 16 * 6
+let floorVertexCount = 6 + 3 * 24
 
 public enum GPUSimRendererError: LocalizedError {
     /// The Metal device could not create a rendering command queue.
@@ -2114,7 +2131,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
                 if activeOptions.showsGroundPlane {
                     enc.setRenderPipelineState(surfacePipeline(floorPreP))
-                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: floorVertexCount)
                 }
                 if rigidCount > 0 {
                     for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
@@ -2201,7 +2218,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         enc.setFragmentTexture(visibilityTex, index: 0)
         enc.setFragmentTexture(shadowTex, index: 1)
         if activeOptions.showsGroundPlane {
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: floorVertexCount)
         }
 
         enc.setDepthStencilState(depthState)
