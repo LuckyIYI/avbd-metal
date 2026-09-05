@@ -1297,6 +1297,98 @@ final class ConvexGPURuntimeTests: XCTestCase {
         XCTAssertTrue(manifoldSnapshots(solver).allSatisfy(\.finite))
     }
 
+    func testHierarchyFinalizationHasExactlyOneWriter() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "hierarchy-finalizer-writer")
+        let body = scene.addBody(size: F3(repeating: 1), density: 1,
+            friction: 0.5, position: .zero, collisionEnabled: false)
+        for _ in 0..<2 { scene.addCollider(body: body, size: F3(repeating: 0.5)) }
+        let solver = try GPUSolver(scene: scene)
+        let device = solver.device
+        let counts = try XCTUnwrap(device.makeBuffer(length: 4096 * 4, options: .storageModeShared))
+        let starts = try XCTUnwrap(device.makeBuffer(length: 4096 * 4, options: .storageModeShared))
+        memset(counts.contents(), 0, counts.length)
+        memset(starts.contents(), 0, starts.length)
+        counts.contents().assumingMemoryBound(to: UInt32.self)[0] = 256
+        // If another invocation mistakes the published contact count for a
+        // proxy count, this valid allocation leads it to a zero sentinel.
+        let counters = solver.counters.contents().assumingMemoryBound(to: UInt32.self)
+        counters[GPUCounters.pairs] = 1
+        counters[GPUCounters.pairCandidates] = 1
+        let cmd = try XCTUnwrap(solver.queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(cmd.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(try XCTUnwrap(solver.pso["bp_finalize_hierarchy_pairs"]))
+        encoder.setBuffer(counts, offset: 0, index: 0)
+        encoder.setBuffer(starts, offset: 0, index: 1)
+        encoder.setBuffer(solver.counters, offset: 0, index: 2)
+        encoder.setBuffer(solver.dispatchArgs, offset: 0, index: 3)
+        var params = solver.params
+        encoder.setBytes(&params, length: MemoryLayout<SimParamsGPU>.stride, index: 4)
+        // Exercise multiple scheduling waves with an oversized dispatch;
+        // production dispatch1D also launches multiple SIMD groups.
+        encoder.dispatchThreadgroups(MTLSize(width: 4096, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        encoder.endEncoding()
+        cmd.commit(); cmd.waitUntilCompleted()
+        XCTAssertEqual(cmd.status, .completed)
+        XCTAssertEqual(counters[GPUCounters.pairs], 256)
+        XCTAssertEqual(counters[GPUCounters.pairCandidates], 256)
+        XCTAssertEqual(solver.dispatchArgs.contents().assumingMemoryBound(to: UInt32.self)[0], 4)
+    }
+
+    func testHierarchyScratchUsesBothProducerAndProxyPairBounds() throws {
+        try requireMetal()
+        for bodyCount in [1, 2, 5] {
+            var scene = PhysicsScene(name: "hierarchy-small-proxy-scratch")
+            scene.settings.gravity = 0
+            scene.settings.iterations = 0
+            for _ in 0..<bodyCount {
+                let body = scene.addBody(size: F3(repeating: 1), density: 1,
+                    friction: 0.5, position: .zero, collisionEnabled: false)
+                for _ in 0..<2 {
+                    scene.addCollider(body: body, size: F3(repeating: 0.5), shape: .sphere)
+                }
+            }
+            let solver = try GPUSolver(scene: scene, maxPairsPerBody: 128)
+            XCTAssertEqual(solver.rigidBroadphaseProxyCount, bodyCount)
+            let pairCapacity = max(1, bodyCount * (bodyCount - 1) / 2)
+            let scanCapacity = max(pairCapacity, bodyCount)
+            XCTAssertEqual(solver.broadphaseProxyPairs.length, max(16, pairCapacity * 8))
+            XCTAssertEqual(solver.pairCount.length, max(16, scanCapacity * 4))
+            XCTAssertEqual(solver.pairStart.length, max(16, scanCapacity * 4))
+            try solver.submitStep()
+            try solver.synchronize()
+            XCTAssertEqual(solver.lastPairCandidates, bodyCount * (bodyCount - 1) / 2 * 4)
+        }
+    }
+
+    func testHierarchyRejectsProxyOverflowBeforeExpandingMissingPairs() throws {
+        try requireMetal()
+        var scene = PhysicsScene(name: "hierarchy-proxy-overflow")
+        scene.settings.gravity = 0
+        scene.settings.iterations = 0
+        for _ in 0..<100 {
+            let body = scene.addBody(size: F3(repeating: 1), density: 1,
+                friction: 0.5, position: .zero, collisionEnabled: false)
+            for _ in 0..<2 {
+                scene.addCollider(body: body, size: F3(repeating: 0.5), shape: .sphere)
+            }
+        }
+        let solver = try GPUSolver(scene: scene)
+        XCTAssertEqual(solver.hierarchyPairCapacity, 4096)
+        // 4,950 eligible proxy pairs exceed the cache's 4,096 entries;
+        // expansion must read only initialized pairs and fail explicitly.
+        try solver.submitStep()
+        XCTAssertThrowsError(try solver.synchronize()) { error in
+            guard case let GPUSolver.RuntimeFailure.rigidPairCapacity(frame, required, capacity) = error else {
+                return XCTFail("unexpected failure: \(error)")
+            }
+            XCTAssertEqual(frame, 1)
+            XCTAssertEqual(capacity, 4096)
+            XCTAssertGreaterThan(required, capacity)
+        }
+    }
+
     func testHierarchySubtreesPreserveAllEligibleSpherePairs() throws {
         try requireMetal()
         var scene = PhysicsScene(name: "compound-subtree-pair-oracle")

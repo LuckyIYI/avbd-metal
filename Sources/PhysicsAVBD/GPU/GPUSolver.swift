@@ -1526,7 +1526,7 @@ public final class GPUSolver {
                 * MemoryLayout<ColliderBVHNodeGPU>.stride,
             "broadphaseBVHNodes")
         broadphaseProxyPairs = try makeBuf(
-            usesRigidColliderHierarchy ? maxPairs * 8 : 16,
+            usesRigidColliderHierarchy ? hierarchyPairCapacity * 8 : 16,
             "broadphaseProxyPairs")
         broadphaseProxyLeaves = try makeBuf(
             max(1, rigidBroadphaseProxyCount) * Self.rigidBroadphaseMaxLeavesPerProxy * 4,
@@ -1596,10 +1596,14 @@ public final class GPUSolver {
                                        "cellBodiesSorted")
         bodyCellSlot = try makeBuf(max(1, broadphaseItemCount) * 8,
                                    "bodyCellSlot")
-        pairCount = try makeBuf(max(maxPairs, broadphaseItemCount) * 4,
-                                "pairCount")
-        pairStart = try makeBuf(max(maxPairs, broadphaseItemCount) * 4,
-                                "pairStart")
+        // The two passes share scratch: one count per grid producer, then
+        // one count per possible proxy pair. Contact-output capacity is not
+        // the scan length. Retain both bounds for one- and two-proxy scenes.
+        let pairScanCapacity = usesRigidColliderHierarchy
+            ? max(hierarchyPairCapacity, broadphaseItemCount)
+            : max(maxPairs, broadphaseItemCount)
+        pairCount = try makeBuf(pairScanCapacity * 4, "pairCount")
+        pairStart = try makeBuf(pairScanCapacity * 4, "pairStart")
         pairs = try makeBuf(maxPairs * 8, "pairs")
         exclusions = try makeBuf(max(1, scene.joints.count + scene.springs.count
                                      + scene.collisionExclusions.count) * 8,

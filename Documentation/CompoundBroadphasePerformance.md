@@ -8,7 +8,7 @@ Large rigid compounds now expose disjoint BVH subtrees of at most 16 leaves to t
 
 The count pass records accepted pairs as one-byte proxy-local leaf indices in traversal order. Emit copies these cached pairs after the exclusive scan; it no longer repeats transforms, sphere tests, or the tree walk. The leaf-node sphere already equals the previous collider sphere predicate, including hull padding, so the redundant second leaf test is removed.
 
-The hierarchy count/scan capacity is bounded by `min(maxPairs, proxyCount * (proxyCount - 1) / 2)` (with a one-entry empty-case allocation). Emit dispatches only the live proxy pairs. Explicit encoder boundaries protect scratch-buffer reuse and GPU-written indirect arguments during unprofiled execution.
+The hierarchy expansion count/scan capacity is bounded by `min(maxPairs, proxyCount * (proxyCount - 1) / 2)` (with a one-entry empty-case allocation). The proxy-pair buffer uses that bound, and the shared count/start buffers reserve the larger of that bound and the grid producer count. Emit dispatches only the live proxy pairs. Explicit encoder boundaries protect scratch-buffer reuse and GPU-written indirect arguments during unprofiled execution.
 
 ## Dishwasher results
 
@@ -27,7 +27,7 @@ GPU totals sum the existing encoder timestamp measurements. They are instrumente
 
 ## Validation
 
-40 Metal GPU tests passed: the full `ConvexGPURuntimeTests` suite, contact-rich trajectory determinism, exact pair capacity, and overflow rejection. New checks cover:
+43 Metal GPU tests passed with Metal API and shader validation enabled: the full `ConvexGPURuntimeTests` suite, contact-rich trajectory determinism, exact pair capacity, and overflow rejection. New checks cover:
 
 - Complete pair-set equality against a brute-force sphere oracle for mixed, rotated, uneven compounds with collision domains, shared geometry, and owner exclusions.
 - Disjoint, complete leaf coverage and the maximum subtree size.
@@ -36,7 +36,7 @@ GPU totals sum the existing encoder timestamp measurements. They are instrumente
 - A populated frame followed by an empty frame and contacts returning, with both unprofiled and profiled dispatch paths.
 
 ```sh
-swift test --filter 'ConvexGPURuntimeTests|GPUSolverTests.testExactRigidPairCapacity|GPUSolverTests.testRigidPairOverflow|GPUSolverTests.testContactRichTrajectory'
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 swift test -c release --filter 'ConvexGPURuntimeTests|GPUSolverTests.testExactRigidPairCapacity|GPUSolverTests.testRigidPairOverflow|GPUSolverTests.testContactRichTrajectory'
 ```
 
 Tests must run with Metal access; a sandbox that hides the GPU skips the Metal cases. Local raw profiles, the benchmark Swift source, machine-readable summary, and test log are under `artifacts/compound-broadphase/` (ignored generated artifacts).
@@ -46,3 +46,25 @@ Tests must run with Metal access; a sandbox that hides the GPU skips the Metal c
 The optimization applies to rigid compound scenes generally. Analytic scenes without compounds and deformable collision paths keep their existing broad phase. It uses the existing conservative sphere bounds and hull padding; tighter geometric bounds remain a separate improvement. More proxies can increase grid pair-generation work, which is included in the GPU totals above. The compact cache requires up to 256 bytes per reserved hierarchy proxy-pair entry, capped by the existing output pair capacity, plus 64 bytes per proxy.
 
 The TeleopKit app remains pinned to the baseline revision; these results use a separate headless harness linked to the optimization worktree.
+
+## PR review follow-up
+
+The initial change bounded scan work but left the proxy-pair and count/start
+allocations at contact-output capacity. The review fix applies the same
+proven proxy-pair bound to those buffers, retaining the grid-producer bound
+for shared scan scratch. For seed 0 this removes 1,311,232 reserved bytes
+from those three buffers without changing dispatches or pair order. This is
+a storage calculation, not an additional measured timing claim.
+
+Added tests exercise one/two/five-proxy scratch bounds and raw proxy overflow
+(4,950 eligible proxy pairs against 4,096 entries), in addition to the existing
+leaf-output overflow, full cache tiles and empty-frame checks.
+
+The review also found a correctness issue in the new finalizer: `dispatch1D`
+launches a full threadgroup, but every invocation read and replaced the same
+proxy-count counter. A later invocation could interpret the published leaf
+count as a proxy count. The finalizer now explicitly permits only global
+thread zero to write. An integration run exposed a zero-contact first frame
+(0 instead of 256) with tighter scratch; a scheduling stress test covers the
+finalizer alongside the full-tile regression. Race manifestation is schedule
+dependent; the original allocation layout passed a separate 41-test run.

@@ -146,8 +146,13 @@ kernel void bp_finalize_hierarchy_pairs(
     device const uint* pairStarts [[buffer(1)]],
     device atomic_uint* counters [[buffer(2)]],
     device uint* dispatchArgs [[buffer(3)]],
-    constant SimParams& P [[buffer(4)]])
+    constant SimParams& P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
 {
+    // dispatch1D rounds up to a complete threadgroup. This kernel replaces
+    // the proxy count with the leaf count; another writer could read that
+    // new value as a proxy index and corrupt counts or access past the scan.
+    if (gid != 0u) return;
     uint rawProxyCount = atomic_load_explicit(
         &counters[CTR_PAIR_CANDIDATES], memory_order_relaxed);
     uint proxyCount = atomic_load_explicit(
