@@ -13,7 +13,7 @@ public enum GPUSimRenderColorMode: UInt32, Sendable, Equatable {
 
 public enum GPUSimLightingMode: Sendable, Equatable {
     case lightweight
-    /// Selective world-space ray-traced shadows and reflections. Experimental.
+    /// Selective world-space shadows, reflections and diffuse bounce. Experimental.
     /// Devices without Metal ray tracing use the lightweight path.
     case qualityBeta
 }
@@ -33,14 +33,16 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// A display-space edge resolve supplements 4x MSAA for shading and
     /// screen-space effects. It keeps no temporal color history.
     public var edgeAntialiasing: Bool
+    /// One world-space diffuse bounce in RT Beta; ignored by Fast mode.
+    public var diffuseGlobalIllumination: Bool
 
     /// Default lighting: rasterized shadows, GTAO and short contact shadows.
     /// Allocates no HDR reflection targets or depth hierarchy.
     public static var lightweight: Self { Self() }
 
-    /// Selective ray-traced directional shadows and glossy reflections.
-    /// World geometry also supplies offscreen visibility. GTAO remains local
-    /// ambient detail; world-space diffuse GI is not yet implemented.
+    /// Ray-traced directional shadows, glossy reflections and a bounded diffuse
+    /// bounce. World geometry supplies offscreen lighting; GTAO fills fine
+    /// features that the diffuse reconstruction cannot resolve.
     public static var qualityBeta: Self { Self(lightingMode: .qualityBeta) }
     /// Disable the built-in checker ground when the host authors its own floor.
     public var showsGroundPlane: Bool
@@ -53,6 +55,7 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     public var minimumFrameDuration: Double?
 
     var usesRayTracing: Bool { lightingMode == .qualityBeta }
+    var usesDiffuseGI: Bool { usesRayTracing && diffuseGlobalIllumination }
     var usesHDR: Bool { screenSpaceReflections || usesRayTracing }
 
     public init(
@@ -65,7 +68,8 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         showsGroundPlane: Bool = true,
         minimumFrameDuration: Double? = nil,
         lightingMode: GPUSimLightingMode = .lightweight,
-        edgeAntialiasing: Bool = true
+        edgeAntialiasing: Bool = true,
+        diffuseGlobalIllumination: Bool = true
     ) {
         self.lightingMode = lightingMode
         self.colorMode = colorMode
@@ -75,6 +79,7 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         self.contactShadows = contactShadows
         self.screenSpaceReflections = screenSpaceReflections
         self.edgeAntialiasing = edgeAntialiasing
+        self.diffuseGlobalIllumination = diffuseGlobalIllumination
         self.showsGroundPlane = showsGroundPlane
         self.minimumFrameDuration = minimumFrameDuration
     }
@@ -580,6 +585,8 @@ struct Uniforms {
     float4x4 prevInvViewProj;
     float4 effects; // x: HDR output, y: contact distance, z: SSR distance, w: max SSR roughness
     float4 rayTracing; // x: world visibility, y: screen reflection shortcut enabled
+    float4 rayScene; // x: analytic built-in ground enabled
+    float4 diffuse; // x: world diffuse lighting enabled, y: fresh history weight
     float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
 };
 
@@ -975,7 +982,8 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> reflection [[texture(2)]],
                              texture2d<float> screenNormal [[texture(3)]],
                              depth2d<float> screenDepthTexture [[texture(4)]],
-                             texture2d<float> screenMaterial [[texture(5)]])
+                             texture2d<float> screenMaterial [[texture(5)]],
+                             texture2d<float> diffuse [[texture(6)]])
 {
     constexpr sampler smp(filter::linear);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : aoTex.sample(smp, in.position.xy / U.screen.xy).rg;
@@ -985,6 +993,11 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
     float rough = specularRoughness(n,clamp(in.pbr.x,0.02,1.0),1.0);
     float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
+    if (U.diffuse.x > 0 && U.rayTracing.z == 0 && in.pbr.y < 0.99) {
+        float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,n,U,diffuse,screenNormal,screenDepthTexture);
+        lit += (max(diffuseAmbient(n)+indirect.rgb,float3(0))-diffuseAmbient(n)*ao)
+            * in.albedo*(1-saturate(in.pbr.y))*indirect.a;
+    }
     float3 correction = float3(0);
     if (U.rayTracing.w > 0 && U.rayTracing.z == 0) {
         // Resolve against this fragment's surface before MSAA coverage is
@@ -1015,7 +1028,10 @@ fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
 fragment float4 soft_fragment(VOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
                               texture2d<float> aoTex [[texture(0)]],
-                              depth2d<float> shadowTex [[texture(1)]])
+                              depth2d<float> shadowTex [[texture(1)]],
+                               texture2d<float> screenNormal [[texture(3)]],
+                               depth2d<float> screenDepthTexture [[texture(4)]],
+                               texture2d<float> diffuse [[texture(6)]])
 {
     constexpr sampler smp(filter::linear);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : aoTex.sample(smp, in.position.xy / U.screen.xy).rg;
@@ -1032,6 +1048,11 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     if (dot(n, V) < 0.0) n = -n;
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
     float3 lit = clothRadiance(in.albedo,in.emissive,n,V,ao,shadow,U);
+    if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
+        float3 N = n;
+        float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
+        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-(diffuseAmbient(n)*1.15)*ao)*in.albedo*indirect.a;
+    }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
     return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
@@ -1141,7 +1162,10 @@ fragment FloorPre floor_prepass_fragment(FloorOut in [[stage_in]]) {
 fragment float4 floor_fragment(FloorOut in [[stage_in]],
                                constant Uniforms& U [[buffer(1)]],
                                texture2d<float> aoTex [[texture(0)]],
-                               depth2d<float> shadowTex [[texture(1)]])
+                               depth2d<float> shadowTex [[texture(1)]],
+                               texture2d<float> screenNormal [[texture(3)]],
+                               depth2d<float> screenDepthTexture [[texture(4)]],
+                               texture2d<float> diffuse [[texture(6)]])
 {
     constexpr sampler smp(filter::linear);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : aoTex.sample(smp, in.position.xy / U.screen.xy).rg;
@@ -1171,6 +1195,11 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     float3 lit = albedo * (SKY_IRR * 1.1 * ao
                          + SUN_COL / M_PI_F * NdL * 0.85 * shadow);
 
+    if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
+        float3 N = float3(0,0,1);
+        float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
+        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-(SKY_IRR*1.1)*ao)*albedo*indirect.a;
+    }
     float fog = horizonFog(d);
     lit = mix(lit, HORIZON_LIN, fog);
     return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), 1);
@@ -1193,6 +1222,8 @@ struct Uniforms {
     var prevInvViewProj: simd_float4x4
     var effects = SIMD4<Float>(repeating: 0)
     var rayTracing = SIMD4<Float>(repeating: 0)
+    var rayScene = SIMD4<Float>.zero
+    var diffuse = SIMD4<Float>.zero
     var aoProjection: SIMD4<Float>
 }
 
@@ -2036,6 +2067,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          rayTracing: SIMD4(activeOptions.usesRayTracing ? 1 : 0,
                                            activeOptions.screenSpaceReflections ? 1 : 0, 0,
                                            activeOptions.usesRayTracing && !activeOptions.screenSpaceReflections ? 1 : 0),
+                         diffuse: SIMD4(activeOptions.usesDiffuseGI ? 1 : 0,0,0,0),
                          aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                              1 / projection.columns.0.x, 1 / projection.columns.1.y))
         func bindAppearance(
@@ -2051,11 +2083,12 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 &hasAppearance, length: 4, index: 5)
         }
 
-        func bindReflections(_ encoder: MTLRenderCommandEncoder) {
+        func bindSurfaceLighting(_ encoder: MTLRenderCommandEncoder) {
             encoder.setFragmentTexture(screenSpace.reflection ?? visibilityTex, index: 2)
             encoder.setFragmentTexture(normTex, index: 3)
             encoder.setFragmentTexture(preDepthTex, index: 4)
             encoder.setFragmentTexture(screenSpace.material ?? visibilityTex, index: 5)
+            encoder.setFragmentTexture(screenSpace.diffuse ?? visibilityTex, index: 6)
         }
         var Uh = U
         Uh.screen = SIMD4(Float(aoSize.x), Float(aoSize.y),
@@ -2238,6 +2271,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             try rayWorld?.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
                 instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: false)
             try screenSpace.encodeBeforeLighting(command: cmd, uniforms: Uh, options: activeOptions)
+            if activeOptions.usesDiffuseGI, let rayWorld {
+                try rayWorld.encodeDiffuse(command: cmd, uniforms: Uh, screen: screenSpace,
+                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides)
+                try screenSpace.encodeDiffuseFilter(command: cmd, uniforms: Uh)
+            }
             if Uh.rayTracing.w > 0, let rayWorld {
                 try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
                     instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
@@ -2255,7 +2293,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             return
         }
         enc.label = "Main PBR pass"
-        bindReflections(enc)
+        bindSurfaceLighting(enc)
         enc.setViewport(screenViewport)
         enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
         func scenePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
@@ -2372,7 +2410,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     try screenSpace.encodeReflectionFilter(command: cmd, uniforms: Uh)
                 }
                 enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U)
-                bindReflections(enc)
+                bindSurfaceLighting(enc)
             } catch {
                 reportFailure("screen-space reflections failed: \(error)")
                 return

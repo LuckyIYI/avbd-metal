@@ -106,7 +106,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
     private func render(_ fixture: Fixture, harness h: Harness, eye: SIMD3<Float> = .zero,
                         world: RayTracingScene? = nil, rayScene: RaySceneFixture? = nil,
                         auxiliary: [GPUSimRenderInstance] = [], appearances: [Int: GPUSimRenderAppearance] = [:],
-                        lightDirection: SIMD3<Float>? = nil, screenShortcut: Bool = false) throws -> ([Float], [SIMD4<Float>]) {
+                        lightDirection: SIMD3<Float>? = nil, screenShortcut: Bool = false, diffuseFrame: Int? = nil) throws -> ([Float], [SIMD4<Float>]) {
         let e = h.effects
         var options = GPUSimRenderOptions(ambientOcclusion: false, screenSpaceReflections: world == nil || screenShortcut)
         if world != nil { options.lightingMode = .qualityBeta }
@@ -114,6 +114,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
         var U = uniforms(width: e.halfSize.x, height: e.halfSize.y, eye: eye)
         if let lightDirection { U.lightDir = SIMD4(normalize(lightDirection), 0) }
         U.rayTracing = SIMD4(world == nil ? 0 : 1, screenShortcut ? 1 : 0, 0, 0)
+        if let frame = diffuseFrame { U.temporal = SIMD4((Float(frame)*0.6180339887).truncatingRemainder(dividingBy: 1),frame==0 ? 1 : 0.2,0,0) }
         var F = fixture
         let cmd = try XCTUnwrap((world?.queue ?? h.queue).makeCommandBuffer())
         var rayInstances: MTLBuffer?
@@ -158,6 +159,11 @@ final class ScreenSpaceLightingTests: XCTestCase {
             try world.encodeLighting(command: cmd, uniforms: U, screen: e, instances: rayInstances,
                                      auxiliary: auxiliaryBuffer, appearances: appearanceBuffer, reflections: true)
             try e.encodeReflectionFilter(command: cmd, uniforms: U)
+            if diffuseFrame != nil {
+                try world.encodeDiffuse(command: cmd, uniforms: U, screen: e, instances: rayInstances,
+                                        auxiliary: auxiliaryBuffer, appearances: appearanceBuffer)
+                try e.encodeDiffuseFilter(command: cmd, uniforms: U)
+            }
         } else {
             try e.encodeReflections(command: cmd, uniforms: U)
         }
@@ -348,6 +354,81 @@ final class ScreenSpaceLightingTests: XCTestCase {
             b.copy(from: data, sourceOffset: 0, to: instances, destinationOffset: 0, size: data.length)
             b.endEncoding()
         }
+    }
+
+    func testDiffuseBounceIntegratesOffscreenRadianceAndRejectsStaleLighting() throws {
+        let h = try Harness(source: fixtureSource, width: 257, height: 193)
+        let device = h.effects.device
+        guard device.supportsRaytracing else { throw XCTSkip("Metal ray tracing unavailable") }
+        let scene = RaySceneFixture(device: device,values: [])
+        let world = try RayTracingScene.shared(scene: scene)
+        var f = Fixture(); f.boxMin.w=0; f.plane=SIMD4(0,0,1,-3)
+        f.material=SIMD4(0.6,0.6,0.6,0); f.parameters.x=1
+        func sample(frame: Int = 0) throws -> SIMD3<Float> {
+            try world.prepare(scene: scene,revision: 0,auxiliary: [],ground: false)
+            _ = try render(f,harness: h,world: world,rayScene: scene,diffuseFrame: frame)
+            let bytes = try read(h.effects.diffuse!,queue: h.queue,bytesPerPixel: 8)
+            var total = SIMD3<Float>.zero
+            let w=h.effects.diffuse!.width, hgt=h.effects.diffuse!.height
+            bytes.withUnsafeBytes { data in
+                let values=data.bindMemory(to: UInt16.self)
+                for y in 8..<(hgt-8) { for x in 8..<(w-8) {
+                    let i=(y*w+x)*4
+                    total += SIMD3(Float(Float16(bitPattern: values[i])),Float(Float16(bitPattern: values[i+1])),Float(Float16(bitPattern: values[i+2])))
+                } }
+            }
+            return total/Float((w-16)*(hgt-16))+SIMD3(0.30,0.33,0.38)
+        }
+        let open=try sample()
+        XCTAssertEqual(open,SIMD3(0.30,0.33,0.38),"Open sky integrates analytically without stochastic noise")
+        // An effectively infinite constant-radiance plane behind the camera.
+        // Lambert's cosine integral / pi is exactly that incoming radiance.
+        scene.values=[GPUSimRenderInstance(primitive: .box(size: SIMD3(10000,10000,0.01)),
+            position: SIMD3(0,0,1),color: .zero,emissive: SIMD3(1.5,0.1,0.05))]
+        for frame in 0..<8 { _ = try sample(frame: frame) }
+        let red=try sample(frame: 8)
+        XCTAssertEqual(red.x,1.5,accuracy: 0.025)
+        XCTAssertEqual(red.y,0.1,accuracy: 0.01)
+        XCTAssertEqual(red.z,0.05,accuracy: 0.01)
+        scene.values[0].material=SIMD4(0.05,0.1,1.5,1)
+        let blue=try sample(frame: 9)
+        XCTAssertLessThan(blue.x,0.08,"Lighting changes must clip away old red history immediately")
+        XCTAssertGreaterThan(blue.z,1.45)
+        scene.values.append(GPUSimRenderInstance(primitive: .box(size: SIMD3(10000,10000,0.01)),
+            position: SIMD3(0,0,-1),color: .zero))
+        let blocked=try sample(frame: 10)
+        XCTAssertLessThan(simd_reduce_max(blocked),0.012,"A thin opaque wall must block the offscreen emitter")
+        scene.values=[]
+        let reset=try sample(frame: 11)
+        XCTAssertLessThan(simd_length(reset-open),0.012,"A reset must discard stale occluded lighting")
+        var options=GPUSimRenderOptions.qualityBeta; options.diffuseGlobalIllumination=false
+        try h.effects.prepare(size: CGSize(width: 257,height: 193),options: options)
+        XCTAssertNil(h.effects.diffuse); XCTAssertNil(h.effects.diffuseRaw); XCTAssertNil(h.effects.diffuseSurface)
+        try h.effects.prepare(size: CGSize(width: 131,height: 97),options: .lightweight)
+        XCTAssertNil(h.effects.diffuse,"Fast does not allocate GI textures")
+    }
+
+    func testDiffuseHistoryRejectsAReceiverDepthChange() throws {
+        let h = try Harness(source: fixtureSource,width: 257,height: 193)
+        let device=h.effects.device
+        guard device.supportsRaytracing else { throw XCTSkip("Metal ray tracing unavailable") }
+        let scene=RaySceneFixture(device: device,values: [GPUSimRenderInstance(
+            primitive: .box(size: SIMD3(3,3,0.1)),position: SIMD3(0,0,1),color: .zero,emissive: SIMD3(2,0.02,0.01))])
+        let world=try RayTracingScene.shared(scene: scene)
+        try world.prepare(scene: scene,revision: 0,auxiliary: [],ground: false)
+        var f=Fixture(); f.boxMin.w=0; f.plane=SIMD4(0,0,1,-1); f.material=SIMD4(0.5,0.5,0.5,0); f.parameters.x=1
+        for frame in 0..<12 { _ = try render(f,harness: h,world: world,rayScene: scene,diffuseFrame: frame) }
+        let old=try read(h.effects.diffuse!,queue: h.queue,bytesPerPixel: 8)
+        f.plane.w = -3
+        _ = try render(f,harness: h,world: world,rayScene: scene,diffuseFrame: 12)
+        let moved=try read(h.effects.diffuse!,queue: h.queue,bytesPerPixel: 8)
+        var disabled=GPUSimRenderOptions.qualityBeta; disabled.diffuseGlobalIllumination=false
+        try h.effects.prepare(size: CGSize(width: 257,height: 193),options: disabled)
+        // Same phase and geometry, with independently empty lighting history.
+        _ = try render(f,harness: h,world: world,rayScene: scene,diffuseFrame: 12)
+        let fresh=try read(h.effects.diffuse!,queue: h.queue,bytesPerPixel: 8)
+        XCTAssertEqual(moved,fresh,"A moved receiver must use fresh irradiance, not another surface's history")
+        XCTAssertNotEqual(old,fresh,"The fixture must expose a real lighting change")
     }
 
     func testQualityBetaTracesOffscreenGeometryAndUpdatesRigidTransforms() throws {
@@ -605,6 +686,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
         let h = try Harness(source: fixtureSource, width: 2240, height: 1520)
         let e = h.effects, device = e.device
         guard device.supportsRaytracing else { throw XCTSkip("Metal ray tracing is unavailable") }
+        try e.prepare(size: CGSize(width: 2240,height: 1520),options: .qualityBeta)
         let scene = RaySceneFixture(device: device, values: [])
         let world = try RayTracingScene.shared(scene: scene)
         try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: true)
@@ -632,6 +714,11 @@ final class ScreenSpaceLightingTests: XCTestCase {
             U.camRight = inverseView.columns.0; U.camUp = -inverseView.columns.1
             let cmd = try XCTUnwrap(world.queue.makeCommandBuffer())
             try world.encodeUpdate(command: cmd, scene: scene, instances: instances, auxiliary: nil, appearances: nil)
+            let materialClear = MTLRenderPassDescriptor()
+            materialClear.colorAttachments[0].texture = e.material
+            materialClear.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,0)
+            materialClear.colorAttachments[0].loadAction = .clear; materialClear.colorAttachments[0].storeAction = .store
+            let clearEncoder = try XCTUnwrap(cmd.makeRenderCommandEncoder(descriptor: materialClear)); clearEncoder.endEncoding()
             let pass = MTLRenderPassDescriptor()
             pass.colorAttachments[0].texture = e.normal
             pass.colorAttachments[0].loadAction = .clear; pass.colorAttachments[0].storeAction = .store
@@ -643,11 +730,21 @@ final class ScreenSpaceLightingTests: XCTestCase {
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: floorVertexCount); enc.endEncoding()
             try world.encodeLighting(command: cmd, uniforms: U, screen: e, instances: instances,
                                      auxiliary: nil, appearances: nil, reflections: false)
+            try world.encodeDiffuse(command: cmd,uniforms: U,screen: e,instances: instances,auxiliary: nil,appearances: nil)
             cmd.commit(); cmd.waitUntilCompleted()
             XCTAssertEqual(cmd.status, .completed, "\(String(describing: cmd.error))")
             let visibility = try read(e.directVisibilityRaw!, queue: world.queue, bytesPerPixel: 1)
             let falseShadows = visibility.filter { $0 < 255 }.count
             XCTAssertEqual(falseShadows, 0, "An empty ground plane cannot cast shadows on itself; camera x=\(offset)")
+            let bounce = try read(e.diffuseRaw!,queue: world.queue,bytesPerPixel: 8)
+            bounce.withUnsafeBytes { raw in
+                let values = raw.bindMemory(to: UInt16.self)
+                let falseBounces = stride(from: 0,to: values.count,by: 4).filter {
+                    values[$0] != 0 || values[$0+1] != 0 || values[$0+2] != 0
+                }.count
+                XCTAssertGreaterThan(stride(from: 0,to: values.count,by: 4).filter { values[$0+3] != 0 }.count,1000)
+                XCTAssertEqual(falseBounces,0,"An open floor must receive analytic sky, without self-bounce noise; camera x=\(offset)")
+            }
             let depthData = try read(e.depth!, queue: world.queue, bytesPerPixel: 4)
             depthData.withUnsafeBytes { raw in
                 let depths = raw.bindMemory(to: Float.self)
@@ -675,6 +772,35 @@ final class ScreenSpaceLightingTests: XCTestCase {
         }
     }
 
+
+    func testAnalyticGroundParticipatesInClosestHitsAndVisibility() throws {
+        let h = try Harness(source: fixtureSource, width: 257, height: 193)
+        guard h.effects.device.supportsRaytracing else { throw XCTSkip("Metal ray tracing unavailable") }
+        let scene = RaySceneFixture(device: h.effects.device, values: [])
+        let world = try RayTracingScene.shared(scene: scene)
+        // A mirror below the floor sees it behind the camera. A nearer red
+        // emitter then replaces that ground hit, exercising closest-hit order.
+        var fixture = Fixture(); fixture.boxMin.w = 0
+        fixture.plane = SIMD4(0,0,1,-3); fixture.parameters.x = 0.02
+        try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: true)
+        let floor = try render(fixture, harness: h, world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+        XCTAssertTrue(floor.0.allSatisfy { $0 < 0.5 }, "The ground blocks rays crossing its plane")
+        XCTAssertGreaterThan(floor.1.filter { $0.w > 0.9 }.count, floor.1.count*9/10)
+        scene.values = [GPUSimRenderInstance(primitive: .box(size: SIMD3(100,100,0.01)),
+            position: SIMD3(0,0,-1), color: .zero, emissive: SIMD3(3,0,0))]
+        try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: true)
+        let closer = try render(fixture, harness: h, world: world, rayScene: scene)
+        XCTAssertGreaterThan(closer.1.filter { $0.x > 0.5 && $0.y < 0 && $0.w > 0.9 }.count, closer.1.count*9/10,
+                             "Closer world geometry must replace the analytic ground radiance")
+        scene.values = []
+        for enabled in [false, true] {
+            try world.prepare(scene: scene, revision: 0, auxiliary: [], ground: enabled)
+            let empty = try render(fixture, harness: h, eye: SIMD3(enabled ? 4500 : 0,0,0),
+                world: world, rayScene: scene, lightDirection: SIMD3(0,0,-1))
+            XCTAssertTrue(empty.0.allSatisfy { $0 == 1 })
+            XCTAssertTrue(empty.1.allSatisfy { $0 == .zero }, "Disabled ground and rays outside its finite bounds must miss")
+        }
+    }
 
     func testRayTracingUpdatesRigidMeshesAndRefitsDeformingSurfaces() throws {
         let h = try Harness(source: fixtureSource, width: 255, height: 191)

@@ -102,7 +102,7 @@ final class AntialiasingTests: XCTestCase {
             var U = uniforms(width: width,height: height); U.rayTracing.w = reflection ? 1 : 0
             encoder.setRenderPipelineState(pipeline)
             encoder.setFragmentBytes(&U,length: MemoryLayout<Uniforms>.stride,index: 1)
-            for (i,texture) in [effects.visibility!,effects.depth!,effects.reflection!,effects.normal!,effects.depth!,effects.material!].enumerated() {
+            for (i,texture) in [effects.visibility!,effects.depth!,effects.reflection!,effects.normal!,effects.depth!,effects.material!,effects.diffuse!].enumerated() {
                 encoder.setFragmentTexture(texture,index: i)
             }
             encoder.drawPrimitives(type: .triangle,vertexStart: 0,vertexCount: 3); encoder.endEncoding()

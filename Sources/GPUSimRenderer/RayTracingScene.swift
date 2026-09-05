@@ -16,7 +16,7 @@ final class RayTracingScene {
     }
     struct Object {
         var vertexStart: UInt32
-        var source: UInt32 // 0 rigid primitive, 1 auxiliary, 2 rigid mesh, 3 world-space mesh, 4 ground
+        var source: UInt32 // 0 rigid primitive, 1 auxiliary, 2 rigid mesh, 3 world-space mesh
         var index: UInt32
         var asset: UInt32
     }
@@ -44,7 +44,7 @@ final class RayTracingScene {
     weak var scene: (any GPUSimRenderableScene)?
     let device: MTLDevice
     let queue: MTLCommandQueue
-    private let instancesPipeline, deformationPipeline, shadowPipeline, reflectionPipeline: MTLComputePipelineState
+    private let instancesPipeline, deformationPipeline, shadowPipeline, reflectionPipeline, diffusePipeline: MTLComputePipelineState
     private var assets: [Asset] = []
     private(set) var vertices, objects, descriptors: MTLBuffer!
     private(set) var structure: MTLAccelerationStructure!
@@ -55,6 +55,7 @@ final class RayTracingScene {
     private var updateCount = 0
     private var topologyKey = ""
     private var objectCount = 0
+    private var hasGround = false
     private var auxiliaryState = Data()
     private struct UpdateKey: Equatable {
         let revision: UInt64
@@ -89,6 +90,7 @@ final class RayTracingScene {
         deformationPipeline = try pipeline("rt_deform")
         shadowPipeline = try pipeline("rt_shadows")
         reflectionPipeline = try pipeline("rt_reflections")
+        diffusePipeline = try pipeline("rt_diffuse")
     }
 
     private func buffer<T>(_ values: [T], label: String) throws -> MTLBuffer {
@@ -185,11 +187,6 @@ final class RayTracingScene {
             let asset = addAsset(Array(repeating: vertex, count: count*3), deformation: deformation)
             allObjects.append(Object(vertexStart: UInt32(ranges[asset].start), source: 3, index: 0, asset: UInt32(asset)))
         }
-        if ground {
-            let data = [SIMD3<Float>(-4000,-4000,0.005), SIMD3(4000,-4000,0.005), SIMD3(4000,4000,0.005), SIMD3(-4000,-4000,0.005), SIMD3(4000,4000,0.005), SIMD3(-4000,4000,0.005)]
-            let asset = addAsset(data.map { Vertex(position: SIMD4($0,1), normal: SIMD4(0,0,1,1), albedo: SIMD4(0.4,0.4,0.4,0)) })
-            allObjects.append(Object(vertexStart: UInt32(ranges[asset].start), source: 4, index: 0, asset: UInt32(asset)))
-        }
         // A masked degenerate instance supports empty scenes without invalid zero-count AS builds.
         if allObjects.isEmpty {
             let asset = addAsset(Array(repeating: Vertex(position: .zero, normal: .zero, albedo: .zero), count: 3))
@@ -236,6 +233,7 @@ final class RayTracingScene {
         topBuilt = false
         updateCount = 0
         lastUpdateKey = nil
+        hasGround = ground
         topologyKey = key
     }
 
@@ -322,13 +320,30 @@ final class RayTracingScene {
 
     func encodeLighting(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
                         instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?, reflections: Bool) throws {
+        try encodeRays(command: command, uniforms: uniforms, screen: screen, instances: instances,
+            auxiliary: auxiliary, appearances: appearances, pipeline: reflections ? reflectionPipeline : shadowPipeline,
+            output: (reflections ? screen.reflectionRaw : screen.directVisibilityRaw)!,
+            label: reflections ? "Selective world reflections" : "World directional visibility")
+    }
+
+    func encodeDiffuse(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
+                       instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?) throws {
+        try encodeRays(command: command, uniforms: uniforms, screen: screen, instances: instances,
+            auxiliary: auxiliary, appearances: appearances, pipeline: diffusePipeline,
+            output: screen.diffuseRaw!, label: "World diffuse bounce")
+    }
+
+    private func encodeRays(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
+                            instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?,
+                            pipeline: MTLComputePipelineState, output: MTLTexture, label: String) throws {
         guard let e = command.makeComputeCommandEncoder() else { throw Failure.allocation("ray lighting encoder") }
-        e.label = reflections ? "Selective world reflections" : "World directional visibility"
-        e.setComputePipelineState(reflections ? reflectionPipeline : shadowPipeline)
+        e.label = label
+        e.setComputePipelineState(pipeline)
         e.setAccelerationStructure(structure, bufferIndex: 0)
         e.useResource(structure, usage: .read)
         for asset in assets { e.useResource(asset.structure, usage: .read) }
         var u = uniforms
+        u.rayScene.x = hasGround ? 1 : 0
         e.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
         e.setBuffer(vertices, offset: 0, index: 2)
         e.setBuffer(objects, offset: 0, index: 3)
@@ -340,12 +355,10 @@ final class RayTracingScene {
         e.setBytes(&hasAppearance, length: 4, index: 8)
         e.setTexture(screen.depth, index: 0)
         e.setTexture(screen.normal, index: 1)
-        e.setTexture(reflections ? screen.reflectionRaw : screen.directVisibilityRaw, index: 2)
-        if reflections {
-            e.setTexture(screen.material, index: 3)
-            e.setTexture(screen.visibility, index: 4)
-        }
-        e.dispatchThreads(MTLSize(width: screen.halfSize.x, height: screen.halfSize.y, depth: 1),
+        e.setTexture(output, index: 2)
+        e.setTexture(screen.material, index: 3)
+        e.setTexture(pipeline === diffusePipeline ? screen.diffuseSurface : screen.visibility, index: 4)
+        e.dispatchThreads(MTLSize(width: output.width, height: output.height, depth: 1),
                           threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         e.endEncoding()
     }

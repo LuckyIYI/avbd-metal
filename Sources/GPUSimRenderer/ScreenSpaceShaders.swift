@@ -88,6 +88,7 @@ inline float3 surfaceReflection(float2 uv, float3 P, float3 N, float rough, floa
     return weight > 1e-5 ? sum/weight*reflectionFactor(P,N,rough,albedo,metal,U)*saturate(weight*4) : float3(0);
 }
 
+""" + diffuseCommonShaderSource + """
 inline float3 pbrRadiance(float3 albedo, float rough, float metal, float3 emissive,
                          float3 n, float3 V, float ao, float shadow, constant Uniforms& U) {
     float3 L = -U.lightDir.xyz;
@@ -446,4 +447,4 @@ fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Unifor
     }
     return float4(displayColorSRGB8(acesTonemap(max(color, 0.0)), in.position.xy), 1);
 }
-""" + antialiasingShaderSource
+""" + antialiasingShaderSource + diffuseFilterShaderSource

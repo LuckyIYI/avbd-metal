@@ -201,7 +201,7 @@ struct RenderingModePicker: View {
                 .pickerStyle(.segmented)
                 .disabled(!supportsRayTracing)
                 Text(!supportsRayTracing ? "Ray tracing is unavailable on this Mac."
-                     : rayTracingEnabled ? "Ray-traced shadows and reflections. Experimental."
+                     : rayTracingEnabled ? "Ray-traced shadows, reflections and bounced light. Experimental."
                      : "Raster shadows and ambient occlusion.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

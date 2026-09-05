@@ -2,14 +2,15 @@ import Metal
 import Foundation
 import simd
 
-/// Owns shared surfaces and the two screen-space stages: visibility before
-/// lighting, then radiance effects before display conversion. Geometry stays
+/// Owns camera surfaces, visibility and radiance reconstruction. Geometry stays
 /// with the renderer; effects share projection, allocation and pass encoding.
 final class ScreenSpacePipeline {
     enum Failure: Error { case allocation(String), encoder(String), shaderFunction(String) }
     let device: MTLDevice
     private let aoPipeline, temporalPipeline, visibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
+    private let diffuseTemporalPipeline: MTLRenderPipelineState
+    private let diffuseFilterPipeline: MTLRenderPipelineState
     private let antialiasingPipeline: MTLRenderPipelineState
     private let depthCopyPipeline, depthReducePipeline: MTLComputePipelineState
     private var depthLevels: [MTLTexture] = []
@@ -22,6 +23,9 @@ final class ScreenSpacePipeline {
     private(set) var visibility, aoRaw, aoResolved, aoHistory, previousDepth: MTLTexture?
     private(set) var directVisibilityRaw, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth: MTLTexture?
     private(set) var reflectionScratch: MTLTexture?
+    private(set) var diffuse, diffuseRaw, diffuseScratch, diffuseSurface: MTLTexture?
+    private var diffuseHistory, diffusePreviousSurface: MTLTexture?
+    private var diffuseHistoryValid = false
     private(set) var displayColor: MTLTexture?
     private var displayEncoded: MTLTexture?
     private(set) var aoIsWhite = false
@@ -52,6 +56,8 @@ final class ScreenSpacePipeline {
         reflectionPipeline = try pipeline("reflection_fragment", format: .rgba16Float)
         reflectionFilterPipeline = try pipeline("reflection_filter_fragment", format: .rgba16Float)
         compositePipeline = try pipeline("screen_composite_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
+        diffuseTemporalPipeline = try pipeline("diffuse_temporal_fragment", format: .rgba16Float)
+        diffuseFilterPipeline = try pipeline("diffuse_filter_fragment", format: .rgba16Float)
         antialiasingPipeline = try pipeline("edge_antialiasing_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
         let ds = MTLDepthStencilDescriptor()
         ds.depthCompareFunction = .always
@@ -71,7 +77,7 @@ final class ScreenSpacePipeline {
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format,
             width: width, height: height, mipmapped: mipmapped)
         d.usage = [.renderTarget, .shaderRead]
-        if format == .r8Unorm || format == .rgba16Float { d.usage.insert(.shaderWrite) }
+        if format == .r8Unorm || format == .rgba16Float || format == .rgba32Float { d.usage.insert(.shaderWrite) }
         d.storageMode = .private
         if samples > 1 {
             d.textureType = .type2DMultisample
@@ -104,6 +110,8 @@ final class ScreenSpacePipeline {
             reflectionScratch = nil
             sceneColor = nil; sceneMSAA = nil; sceneDepth = nil; depthHierarchy = nil; depthLevels = []
             displayColor = nil; displayEncoded = nil
+            diffuse = nil; diffuseRaw = nil; diffuseScratch = nil
+            diffuseSurface = nil; diffusePreviousSurface = nil; diffuseHistory = nil; diffuseHistoryValid = false
             aoIsWhite = false
             visibilityIsWhite = false
         }
@@ -141,6 +149,21 @@ final class ScreenSpacePipeline {
         if options.usesRayTracing, reflectionScratch == nil {
             reflectionScratch = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection filter scratch")
         } else if !options.usesRayTracing { reflectionScratch = nil }
+        if options.usesDiffuseGI, diffuse == nil {
+            let width = (halfSize.x+1)/2, height = (halfSize.y+1)/2
+            let a = try texture(.rgba16Float, width: width, height: height, label: "Diffuse irradiance correction")
+            let b = try texture(.rgba16Float, width: width, height: height, label: "Raw diffuse irradiance")
+            let c = try texture(.rgba16Float, width: width, height: height, label: "Diffuse filter scratch")
+            let h = try texture(.rgba16Float, width: width, height: height, label: "Diffuse lighting history")
+            let g = try texture(.rgba32Float, width: width, height: height, label: "Diffuse receiver geometry")
+            let p = try texture(.rgba32Float, width: width, height: height, label: "Previous diffuse receivers")
+            (diffuse, diffuseRaw, diffuseScratch) = (a,b,c)
+            (diffuseHistory, diffuseSurface, diffusePreviousSurface) = (h,g,p)
+            diffuseHistoryValid = false
+        } else if !options.usesDiffuseGI {
+            diffuse = nil; diffuseRaw = nil; diffuseScratch = nil
+            diffuseSurface = nil; diffusePreviousSurface = nil; diffuseHistory = nil; diffuseHistoryValid = false
+        }
         if options.edgeAntialiasing, displayColor == nil {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: size.x, height: size.y, mipmapped: false)
             d.usage = [.renderTarget, .shaderRead, .pixelFormatView]
@@ -222,6 +245,23 @@ final class ScreenSpacePipeline {
         }
         aoIsWhite = !options.ambientOcclusion
         visibilityIsWhite = !options.ambientOcclusion && !options.contactShadows && !options.usesRayTracing
+    }
+
+    func encodeDiffuseFilter(command: MTLCommandBuffer, uniforms: Uniforms) throws {
+        for (step, source, destination) in [(1, diffuseRaw!, diffuse!), (2, diffuse!, diffuseScratch!), (4, diffuseScratch!, diffuse!)] {
+            try pass(diffuseFilterPipeline, command: command, output: destination,
+                     inputs: [source, depth!, normal!], uniforms: uniforms, parameters: SIMD4(Float(step),0,0,0))
+        }
+        var u = uniforms
+        u.diffuse.y = !diffuseHistoryValid || u.temporal.y>=1 ? 1 : 0.2
+        try pass(diffuseTemporalPipeline, command: command, output: diffuseScratch!,
+                 inputs: [diffuse!, diffuseHistory!, diffusePreviousSurface!, diffuseSurface!], uniforms: u)
+        swap(&diffuse, &diffuseScratch)
+        guard let blit = command.makeBlitCommandEncoder() else { throw Failure.encoder("diffuse history") }
+        blit.copy(from: diffuse!, to: diffuseHistory!)
+        blit.copy(from: diffuseSurface!, to: diffusePreviousSurface!)
+        blit.endEncoding()
+        diffuseHistoryValid = true
     }
 
     func scenePass(using destination: MTLRenderPassDescriptor) -> MTLRenderPassDescriptor {

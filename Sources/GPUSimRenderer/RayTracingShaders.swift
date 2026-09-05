@@ -73,8 +73,18 @@ kernel void rt_deform(device RTVertex* output [[buffer(0)]], device const uint* 
     }
     output[i] = v;
 }
-inline float rtVisibility(float3 P, float3 N, float3 L, float bias, instance_acceleration_structure scene) {
+// The 8 km built-in floor is analytic. Huge triangles can produce positive
+// near-zero hit distances even for rays leaving their plane on Metal hardware.
+inline float rtGroundDistance(ray r, constant Uniforms& U) {
+    if (U.rayScene.x==0 || abs(r.direction.z)<1e-12) return -1;
+    float t = (0.005-r.origin.z)/r.direction.z;
+    float2 p = r.origin.xy+r.direction.xy*t;
+    return t>=r.min_distance && t<=r.max_distance && all(abs(p)<=4000) ? t : -1;
+}
+inline float rtVisibility(float3 P, float3 N, float3 L, float bias,
+                          constant Uniforms& U, instance_acceleration_structure scene) {
     ray r; r.origin = P + N*bias; r.direction = L; r.min_distance = bias*0.25; r.max_distance = 1000;
+    if (rtGroundDistance(r,U)>=0) return 0.16;
     intersector<triangle_data, instancing> query;
     query.assume_geometry_type(geometry_type::triangle);
     query.force_opacity(forced_opacity::opaque);
@@ -92,17 +102,74 @@ kernel void rt_shadows(instance_acceleration_structure scene [[buffer(0)]], cons
         float2 uv = (float2(pixel)+0.5)/float2(output.get_width(),output.get_height());
         float3 P = worldFromDepth(uv,d,U.invViewProj);
         float bias = max(0.0001, screenDepth(d,U)/U.screen.z*0.02);
-        visibility = rtVisibility(P,normalize(N),L,bias,scene);
+        visibility = rtVisibility(P,normalize(N),L,bias,U,scene);
     }
     output.write(float4(visibility),pixel);
 }
 inline float3 rtLit(float3 P, float3 N, float3 V, float3 albedo, float rough, float metal,
                     float3 emissive, uint source, constant Uniforms& U, instance_acceleration_structure scene) {
     float3 L = -U.lightDir.xyz;
-    float visibility = dot(N,L) > 0 ? rtVisibility(P,N,L,0.0002,scene) : 1;
+    float visibility = dot(N,L) > 0 ? rtVisibility(P,N,L,0.0002,U,scene) : 1;
     if (source == 3) return clothRadiance(albedo,emissive,N,V,1,visibility,U);
     if (source == 4) return albedo*(SKY_IRR*1.1+SUN_COL/M_PI_F*max(L.z,0.0)*0.85*visibility);
     return pbrRadiance(albedo,rough,metal,emissive,N,V,1,visibility,U);
+}
+inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant Uniforms& U,
+    device const RTVertex* vertices, device const RTObject* objects, device const RTInstance* instances,
+    device const RenderInstance* rigid, device const RenderInstance* auxiliary,
+    device const RenderAppearance* appearances, uint hasAppearance, bool diffuseOnly = false) {
+    float groundDistance = rtGroundDistance(r,U);
+    if (groundDistance>=0) r.max_distance = groundDistance;
+    intersector<triangle_data,instancing> query;
+    query.assume_geometry_type(geometry_type::triangle);
+    query.force_opacity(forced_opacity::opaque);
+    auto hit = query.intersect(r,scene,2);
+    if (hit.type == intersection_type::none) {
+        if (groundDistance<0) return float4(0);
+        float3 P = r.origin+r.direction*groundDistance, N = float3(0,0,r.direction.z<0 ? 1 : -1);
+        float checker = float((int(floor(P.x))+int(floor(P.y))) & 1);
+        float3 albedo = mix(srgbToLin(float3(0.93,0.93,0.94)),srgbToLin(float3(0.62,0.66,0.72)),checker);
+        return float4(rtLit(P,N,-r.direction,albedo,1,0,float3(0),4,U,scene),1);
+    }
+    RTObject object = objects[hit.instance_id];
+    uint base = object.vertexStart + hit.primitive_id*3;
+    float3 bary = float3(1-hit.triangle_barycentric_coord.x-hit.triangle_barycentric_coord.y,hit.triangle_barycentric_coord);
+    RTVertex a = vertices[base], b = vertices[base+1], c = vertices[base+2];
+    float4 nm = a.normal*bary.x+b.normal*bary.y+c.normal*bary.z;
+    float4 mat = a.albedo*bary.x+b.albedo*bary.y+c.albedo*bary.z;
+    float3 emission = a.emissive.rgb*bary.x+b.emissive.rgb*bary.y+c.emissive.rgb*bary.z;
+    float3 R = r.direction;
+    float3 hitP = r.origin + R*hit.distance;
+    float3 e1 = rtVector(instances[hit.instance_id],b.position.xyz-a.position.xyz);
+    float3 e2 = rtVector(instances[hit.instance_id],c.position.xyz-a.position.xyz);
+    float3 geomN = normalize(cross(e1,e2));
+    float3 hitN = normalize(rtNormal(instances[hit.instance_id],nm.xyz));
+    if (object.source == 3 && a.emissive.w > 0.5) hitN = geomN;
+    if (dot(hitN,-R) < 0) hitN = -hitN;
+    if (dot(geomN,hitN) < 0) geomN = -geomN;
+    if (object.source <= 1) {
+        RenderInstance instance = object.source == 0 ? rigid[object.index] : auxiliary[object.index];
+        mat.rgb = srgbToLin(instance.color.rgb); emission = instance.material.rgb;
+    } else if (object.source == 2 && hasAppearance != 0) {
+        RenderAppearance appearance = appearances[object.index];
+        if (appearance.albedo.w > 0) mat.rgb = srgbToLin(appearance.albedo.rgb);
+        emission = appearance.emissive.rgb;
+    }
+    if (diffuseOnly) {
+        // This pass transports diffuse bounce light, excluding the sparse
+        // specular-caustic paths that require a different sampling strategy.
+        float3 L = -U.lightDir.xyz, halfVector = L-R;
+        float3 H = halfVector*rsqrt(max(dot(halfVector,halfVector),1e-8));
+        float visibility = dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
+        float3 F0 = mix(float3(0.04),mat.rgb,mat.a);
+        float3 F = F0+(1-F0)*pow(1-saturate(dot(L,H)),5.0);
+        float3 bounce = mat.rgb*(1-mat.a)*(diffuseAmbient(hitN)
+            +SUN_COL/M_PI_F*saturate(dot(hitN,L))*visibility*(1-F));
+        if (object.source==3) bounce = mat.rgb*(diffuseAmbient(hitN)*1.15
+            +SUN_COL/M_PI_F*max((dot(hitN,L)+0.35)/1.35,0.0)*visibility);
+        return float4(bounce+emission,1);
+    }
+    return float4(rtLit(hitP+geomN*0.0001,hitN,-R,mat.rgb,clamp(nm.w,0.02,1.0),mat.a,emission,object.source,U,scene),1);
 }
 // Visible-normal GGX sampling: stretch the view, sample the projected
 // hemisphere, then transform the normal back (Heitz 2018, JCGT 7(4):1).
@@ -158,38 +225,9 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     if (NdR <= 0) continue;
     float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
     ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
-    intersector<triangle_data,instancing> query;
-    query.assume_geometry_type(geometry_type::triangle);
-    query.force_opacity(forced_opacity::opaque);
-    auto hit = query.intersect(r,scene,2);
-    if (hit.type == intersection_type::none) continue;
-    RTObject object = objects[hit.instance_id];
-    uint base = object.vertexStart + hit.primitive_id*3;
-    float3 bary = float3(1-hit.triangle_barycentric_coord.x-hit.triangle_barycentric_coord.y,hit.triangle_barycentric_coord);
-    RTVertex a = vertices[base], b = vertices[base+1], c = vertices[base+2];
-    float4 nm = a.normal*bary.x+b.normal*bary.y+c.normal*bary.z;
-    float4 mat = a.albedo*bary.x+b.albedo*bary.y+c.albedo*bary.z;
-    float3 emission = a.emissive.rgb*bary.x+b.emissive.rgb*bary.y+c.emissive.rgb*bary.z;
-    float3 hitP = r.origin + R*hit.distance;
-    float3 e1 = rtVector(instances[hit.instance_id],b.position.xyz-a.position.xyz);
-    float3 e2 = rtVector(instances[hit.instance_id],c.position.xyz-a.position.xyz);
-    float3 geomN = normalize(cross(e1,e2));
-    float3 hitN = normalize(rtNormal(instances[hit.instance_id],nm.xyz));
-    if (object.source == 3 && a.emissive.w > 0.5) hitN = geomN;
-    if (dot(hitN,-R) < 0) hitN = -hitN;
-    if (dot(geomN,hitN) < 0) geomN = -geomN;
-    if (object.source <= 1) {
-        RenderInstance instance = object.source == 0 ? rigid[object.index] : auxiliary[object.index];
-        mat.rgb = srgbToLin(instance.color.rgb); emission = instance.material.rgb;
-    } else if (object.source == 2 && hasAppearance != 0) {
-        RenderAppearance appearance = appearances[object.index];
-        if (appearance.albedo.w > 0) mat.rgb = srgbToLin(appearance.albedo.rgb);
-        emission = appearance.emissive.rgb;
-    } else if (object.source == 4) {
-        float checker = float((int(floor(hitP.x))+int(floor(hitP.y))) & 1);
-        mat.rgb = mix(srgbToLin(float3(0.93,0.93,0.94)),srgbToLin(float3(0.62,0.66,0.72)),checker);
-    }
-    float3 incoming = rtLit(hitP+geomN*0.0001,hitN,-R,mat.rgb,clamp(nm.w,0.02,1.0),mat.a,emission,object.source,U,scene);
+    float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance);
+    if (hit.w == 0) continue;
+    float3 incoming = hit.rgb;
     float viewLambda = rtSmithLambda(localV.z,alpha);
     float masking = (1+viewLambda)/(1+viewLambda+rtSmithLambda(NdR,alpha));
     // BRDF*cos/pdf for visible-normal sampling simplifies to Fresnel*G2/G1.
@@ -202,4 +240,4 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     correctionSum *= (1.0/float(sampleCount))*(1-horizonFog(length(P-U.eye.xyz)))*confidence;
     output.write(float4(correctionSum,coverage/float(sampleCount)*confidence),pixel);
 }
-"""
+""" + diffuseRayShaderSource
