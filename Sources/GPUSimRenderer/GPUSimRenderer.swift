@@ -1039,8 +1039,10 @@ fragment float4 convex_debug_wire_fragment(VOut in [[stage_in]])
 // ---------------------------------------------------------------------------
 \(screenSpaceCommonShaderSource)
 
-// PBR main fragment (samples the GTAO texture)
+// PBR main fragment (samples ambient and direct visibility)
 // ---------------------------------------------------------------------------
+\(surfaceVisibilityShaderSource)
+
 fragment float4 pbr_fragment(VOut in [[stage_in]],
                              constant Uniforms& U [[buffer(1)]],
                              texture2d<float> aoTex [[texture(0)]],
@@ -1051,11 +1053,9 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenMaterial [[texture(5)]],
                              texture2d<float> diffuse [[texture(6)]])
 {
-    constexpr sampler smp(filter::linear);
-    float2 visibility = U.rayTracing.z > 0 ? float2(1) : aoTex.sample(smp, in.position.xy / U.screen.xy).rg;
-    float ao = visibility.r;
-
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
+    float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
+    float ao = visibility.r;
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
     float rough = specularRoughness(n,clamp(in.pbr.x,0.02,1.0),1.0);
     float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
@@ -1090,6 +1090,15 @@ fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
     return o;
 }
 
+// Imported surfaces are already rendered double-sided and can mix triangle
+// winding within one mesh. Classify exits using the geometric plane oriented
+// by the authored outward normal instead of relying on raster front-face flags.
+fragment void gtao_back_depth_fragment(VOut in [[stage_in]],
+    constant Uniforms& U [[buffer(1)]]) {
+    float3 plane = cross(dfdx(in.world), dfdy(in.world));
+    if (dot(plane, in.normal) * dot(plane, U.eye.xyz - in.world) >= 0.0) discard_fragment();
+}
+
 // Thin sheets are double-sided: shade with the normal facing the viewer.
 fragment float4 soft_fragment(VOut in [[stage_in]],
                               constant Uniforms& U [[buffer(1)]],
@@ -1099,10 +1108,6 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
                                texture2d<float> diffuse [[texture(6)]])
 {
-    constexpr sampler smp(filter::linear);
-    float2 visibility = U.rayTracing.z > 0 ? float2(1) : aoTex.sample(smp, in.position.xy / U.screen.xy).rg;
-    float ao = visibility.r;
-
     float3 n = normalize(in.normal);
     if (in.flatShade > 0.5) {
         // sharp-edged soft solids (tet boundaries): per-pixel face normal
@@ -1112,6 +1117,8 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     }
     float3 V = normalize(U.eye.xyz - in.world);
     if (dot(n, V) < 0.0) n = -n;
+    float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
+    float ao = visibility.r;
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
     float3 lit = clothRadiance(in.albedo,in.emissive,n,V,ao,shadow,U);
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
@@ -1168,7 +1175,7 @@ fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// GTAO (horizon-based estimator over screen-space slices)
+// Finite-thickness ambient occlusion over screen-space slices
 // ---------------------------------------------------------------------------
 \(ambientOcclusionShaderSource)
 
@@ -1256,10 +1263,8 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
                                texture2d<float> diffuse [[texture(6)]])
 {
-    constexpr sampler smp(filter::linear);
-    float2 visibility = U.rayTracing.z > 0 ? float2(1) : aoTex.sample(smp, in.position.xy / U.screen.xy).rg;
+    float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,float3(0,0,1),U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
-
     float3 albedo = floorAlbedo(in.world, U);
 
     float3 L = -U.lightDir.xyz;
@@ -1278,7 +1283,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), 1);
 }
 
-""" + screenSpaceShaderSource
+""" + screenSpaceShaderSource + gtaoDepthShaderSource
 }
 
 struct Uniforms {
@@ -1383,6 +1388,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var temporalPipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
     private var guidePipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
     private var hdrPipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
+    private var backDepthPipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
     private var surfacePipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
     var prevVP: simd_float4x4?
     var frameIdx: UInt32 = 0
@@ -1517,7 +1523,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
         func depthPipe(_ vertex: String) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
-            d.label = "Directional shadow: \(vertex)"
+            d.label = "Depth only: \(vertex)"
             guard let function = lib.makeFunction(name: vertex) else {
                 throw GPUSimRendererError.shaderFunction(vertex)
             }
@@ -1525,7 +1531,14 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             d.fragmentFunction = nil
             d.depthAttachmentPixelFormat = .depth32Float
             d.rasterSampleCount = 1
-            return try device.makeRenderPipelineState(descriptor: d)
+            let result = try device.makeRenderPipelineState(descriptor: d)
+            guard let fragment = lib.makeFunction(name: "gtao_back_depth_fragment") else {
+                throw GPUSimRendererError.shaderFunction("gtao_back_depth_fragment")
+            }
+            d.fragmentFunction = fragment
+            d.label = "AO back depth: \(vertex)"
+            backDepthPipelines[ObjectIdentifier(result)] = try device.makeRenderPipelineState(descriptor: d)
+            return result
         }
 
         boxP = try pipe("box_vertex", "pbr_fragment")
@@ -1657,7 +1670,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         lastSceneIdentity = nil
     }
 
-    /// Discards temporal AO history, for example after a camera teleport.
+    /// Discards HQ reconstruction history, for example after a camera teleport.
     public func resetTemporalHistory() {
         prevVP = nil
     }
@@ -2161,16 +2174,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                                      width: Double(aoSize.x),
                                      height: Double(aoSize.y),
                                      znear: 0, zfar: 1)
-        // AO re-enabled after a disabled stretch: the frozen history and
-        // the stale previous-frame matrices must fall together, and BEFORE
-        // the uniforms capture prevVP and the temporal blend for this frame
-        if activeOptions.ambientOcclusion, screenSpace.aoIsWhite { prevVP = nil }
+        // Fast visibility is spatial and independent of frame history.
         var temporal = SIMD4<Float>(0, 1, 0, 0)
-        if activeOptions.ambientOcclusion {
-            temporal.x = (Float(frameIdx % 64) * 0.6180339887).truncatingRemainder(dividingBy: 1)
-            temporal.y = prevVP == nil ? 1 : 0.2
-            temporal.z = Float(frameIdx % 64)
-        }
         if metalFX != nil {
             temporal.x = (Float(frameIdx % 1024) * 0.6180339887).truncatingRemainder(dividingBy: 1)
         }
@@ -2480,6 +2485,77 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.endEncoding()
             }
 
+        }
+        if metalFX == nil && activeOptions.ambientOcclusion {
+            let backPass = MTLRenderPassDescriptor()
+            backPass.depthAttachment.texture = screenSpace.aoBackDepth
+            backPass.depthAttachment.loadAction = .clear
+            backPass.depthAttachment.clearDepth = 1
+            backPass.depthAttachment.storeAction = .store
+            guard let back = cmd.makeRenderCommandEncoder(descriptor: backPass) else {
+                reportFailure("could not create the AO backface depth encoder")
+                return
+            }
+            back.label = "AO nearest backfaces"
+            back.setViewport(aoViewport)
+            back.setDepthStencilState(depthState)
+            back.setCullMode(.none)
+            back.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+            back.setFragmentBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
+            func backPipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
+                backDepthPipelines[ObjectIdentifier(pipeline)]!
+            }
+            // Use the same vertex transforms and immutable geometry as the
+            // front pass. Fragment classification also handles meshes whose
+            // triangle winding differs from their authored outward normals.
+            let primitiveDepthPipelines = [
+                (boxShadow!, 36), (sphereShadow!, SPHV),
+                (torusShadow!, TORV), (capsuleShadow!, CAPV)
+            ]
+            if rigidCount > 0 {
+                for (pipeline, vertices) in primitiveDepthPipelines {
+                    back.setRenderPipelineState(backPipeline(pipeline))
+                    back.setVertexBuffer(instances, offset: 0, index: 0)
+                    back.drawPrimitives(type: .triangle, vertexStart: 0,
+                        vertexCount: vertices, instanceCount: rigidCount)
+                }
+            }
+            if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
+                for (pipeline, vertices) in primitiveDepthPipelines {
+                    back.setRenderPipelineState(backPipeline(pipeline))
+                    back.setVertexBuffer(auxiliaryBatch.buffer, offset: 0, index: 0)
+                    back.drawPrimitives(type: .triangle, vertexStart: 0,
+                        vertexCount: vertices, instanceCount: auxiliaryBatch.opaqueCount)
+                }
+            }
+            if let surf = renderScene.softRenderSurface {
+                // Match the existing front-only soft prepass. Open sheets
+                // have no exit; the AO estimator handles the clear sentinel.
+                back.setRenderPipelineState(backPipeline(softShadow))
+                back.setVertexBuffer(surf.triangles, offset: 0, index: 0)
+                back.setVertexBuffer(surf.positions, offset: 0, index: 2)
+                back.setVertexBuffer(surf.normals, offset: 0, index: 3)
+                back.drawPrimitives(type: .triangle, vertexStart: 0,
+                    vertexCount: surf.triangleCount * 3)
+            }
+            if let skin = renderScene.skinnedRenderSurface {
+                back.setRenderPipelineState(backPipeline(skinShadow))
+                back.setVertexBuffer(skin.triangles, offset: 0, index: 0)
+                back.setVertexBuffer(skin.vertices, offset: 0, index: 2)
+                back.drawPrimitives(type: .triangle, vertexStart: 0,
+                    vertexCount: skin.triangleCount * 3)
+            }
+            if let mesh = renderScene.rigidMeshRenderSurface {
+                back.setRenderPipelineState(backPipeline(rigidMeshShadow))
+                back.setVertexBuffer(mesh.vertices, offset: 0, index: 0)
+                back.setVertexBuffer(mesh.positions, offset: 0, index: 2)
+                back.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
+                bindAppearance(back)
+                back.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
+                    indexType: .uint32, indexBuffer: mesh.indices, indexBufferOffset: 0)
+            }
+            // The built-in floor is a single plane and has no finite exit.
+            back.endEncoding()
         }
         do {
             try rayWorld?.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,

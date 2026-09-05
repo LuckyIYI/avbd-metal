@@ -352,6 +352,8 @@ fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U 
     if (d >= 1.0) return float4(1);
     float3 P = screenPosition(in.uv, d, U), N = screenVector(normal.read(pixel).xyz, U);
     float tolerance = max(0.003, P.z / U.screen.z * 1.5);
+    float3 planeN = gtaoGeometricNormal(pixel, P, N, U, depth);
+    float planeTolerance = max(0.00025, P.z / U.screen.z * 0.25);
     float2 sum = float2(0); float2 weights = float2(0);
     int2 size = int2(depth.get_width(), depth.get_height());
     constexpr sampler nearest(filter::nearest);
@@ -363,11 +365,18 @@ fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U 
         float2 uv = (float2(q) + 0.5) / float2(size);
         float3 Q = screenPosition(uv, dq, U), QN = screenVector(normal.read(uint2(q)).xyz, U);
         float w = screenFilterWeight(P, N, Q, QN, tolerance) * float((3-abs(x))*(3-abs(y)));
-        // AO keeps its thirteen-tap bilateral reconstruction; contact shadows
-        // use their tighter plane-distance filter independently.
-        float aw = abs(x) + abs(y) <= 2
-            ? exp(-0.5 * float(x*x+y*y)) * exp(-dot(Q-P,Q-P)*8.0)
-                * pow(saturate(dot(N,QN)),12.0) : 0.0;
+        // A centered width-four box is the average of four adjacent 4x4
+        // boxes: weights [.5,1,1,1,.5] on each axis. It cancels our complete
+        // 4x4 sampling lattice without shifting AO by half a texel. Gaussian
+        // weights would leave unequal angular coverage and visible grain.
+        float agreement = saturate(dot(N, QN));
+        float3 delta = Q-P;
+        float distanceToPlane = abs(dot(delta, planeN));
+        float tangentDistance = length(delta - planeN * dot(delta, planeN));
+        float curvatureTolerance = tangentDistance * 0.5 * sqrt(1.0 - agreement);
+        float aw = (abs(x) == 2 ? 0.5 : 1.0) * (abs(y) == 2 ? 0.5 : 1.0);
+        aw *= saturate(1.0 - distanceToPlane / (planeTolerance + curvatureTolerance))
+            * smoothstep(0.5, 0.9, agreement);
         float a = ambient.sample(nearest, uv).r;
         float c = U.effects.y > 0.0 ? contact.read(uint2(q)).r : 1.0;
         sum += float2(a * aw, c * w); weights += float2(aw, w);

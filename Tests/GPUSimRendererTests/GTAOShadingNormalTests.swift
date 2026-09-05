@@ -57,6 +57,24 @@ final class GTAOShadingNormalTests: XCTestCase {
             }
             return out;
         }
+        struct ShadingNormalBackOut { float depth [[depth(any)]]; };
+        fragment ShadingNormalBackOut shading_normal_fixture_back(FSOut in [[stage_in]],
+            constant Uniforms& U [[buffer(1)]], constant uint& blocker [[buffer(2)]]) {
+            ShadingNormalBackOut out;
+            out.depth = 1.0;
+            if (blocker == 0) return out;
+            float3 ray = normalize(worldFromDepth(in.uv, 0.0, U.invViewProj) - U.eye.xyz);
+            float3 a = (float3(-0.3, -0.65, -3.0) - U.eye.xyz) / ray;
+            float3 b = (float3(0.3, 0.65, -2.65) - U.eye.xyz) / ray;
+            float3 lo = min(a, b), hi = max(a, b);
+            float entry = max(lo.x, max(lo.y, lo.z));
+            float leave = min(hi.x, min(hi.y, hi.z));
+            if (leave > max(entry, 0.0)) {
+                float4 clip = U.viewProj * float4(U.eye.xyz + ray * leave, 1);
+                if (clip.z >= 0.0 && clip.z < clip.w) out.depth = clip.z / clip.w;
+            }
+            return out;
+        }
         """
         let library = try device.makeLibrary(source: shader, options: nil)
         func pipeline(_ fragment: String, _ format: MTLPixelFormat, depth: Bool = false) throws -> MTLRenderPipelineState {
@@ -67,16 +85,15 @@ final class GTAOShadingNormalTests: XCTestCase {
             if depth { descriptor.depthAttachmentPixelFormat = .depth32Float }
             return try device.makeRenderPipelineState(descriptor: descriptor)
         }
-        func texture(_ format: MTLPixelFormat) throws -> MTLTexture {
-            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: format, width: width, height: height, mipmapped: false)
-            descriptor.storageMode = .private
-            descriptor.usage = [.renderTarget, .shaderRead]
-            return try XCTUnwrap(device.makeTexture(descriptor: descriptor))
-        }
         let fixture = try pipeline("shading_normal_fixture", .rgba16Float, depth: true)
-        let aoPipeline = try pipeline("gtao_fragment", .r8Unorm)
-        let depth = try texture(.depth32Float), normal = try texture(.rgba16Float), ao = try texture(.r8Unorm)
+        let backFixture = try pipeline("shading_normal_fixture_back", .invalid, depth: true)
+        let effects = try ScreenSpacePipeline(device: device, library: library)
+        let options = GPUSimRenderOptions(ambientOcclusion: true, contactShadows: false)
+        try effects.prepare(size: CGSize(width: width * 2, height: height * 2), options: options)
+        let depth = try XCTUnwrap(effects.depth)
+        let backDepth = try XCTUnwrap(effects.aoBackDepth)
+        let normal = try XCTUnwrap(effects.normal)
+        let ao = try XCTUnwrap(effects.aoRaw)
         let descriptor = MTLDepthStencilDescriptor()
         descriptor.isDepthWriteEnabled = true
         descriptor.depthCompareFunction = .always
@@ -111,17 +128,21 @@ final class GTAOShadingNormalTests: XCTestCase {
         pre.setFragmentBytes(&blocker, length: MemoryLayout<UInt32>.stride, index: 2)
         pre.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         pre.endEncoding()
-        let aoPass = MTLRenderPassDescriptor()
-        aoPass.colorAttachments[0].texture = ao
-        aoPass.colorAttachments[0].loadAction = .dontCare
-        aoPass.colorAttachments[0].storeAction = .store
-        let encoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: aoPass))
-        encoder.setRenderPipelineState(aoPipeline)
-        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
-        encoder.setFragmentTexture(depth, index: 0)
-        encoder.setFragmentTexture(normal, index: 1)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        encoder.endEncoding()
+        let backPass = MTLRenderPassDescriptor()
+        backPass.depthAttachment.texture = backDepth
+        backPass.depthAttachment.loadAction = .clear
+        backPass.depthAttachment.clearDepth = 1
+        backPass.depthAttachment.storeAction = .store
+        let back = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: backPass))
+        back.setRenderPipelineState(backFixture)
+        back.setDepthStencilState(depthState)
+        back.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        back.setFragmentBytes(&blocker, length: MemoryLayout<UInt32>.stride, index: 2)
+        back.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        back.endEncoding()
+        // Use the shipped chain so this also exercises its linear-depth mip
+        // preparation. Read the raw estimator before any bilateral filtering.
+        try effects.encodeBeforeLighting(command: command, uniforms: uniforms, options: options)
         let stride = 256
         let output = try XCTUnwrap(device.makeBuffer(length: stride * height, options: .storageModeShared))
         let blit = try XCTUnwrap(command.makeBlitCommandEncoder())

@@ -329,7 +329,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
         }
     }
 
-    func testDisablingEffectsReleasesOptionalTargetsAndResizeInvalidatesAO() throws {
+    func testDisablingEffectsReleasesOptionalTargetsAndResizeRecreatesAODepth() throws {
         let h = try Harness(source: fixtureSource, width: 512, height: 384)
         let e = h.effects
         _ = try render(Fixture(), harness: h)
@@ -339,6 +339,11 @@ final class ScreenSpaceLightingTests: XCTestCase {
         XCTAssertTrue(try e.prepare(size: CGSize(width: 319, height: 201), options: GPUSimRenderOptions(screenSpaceReflections: true)))
         XCTAssertFalse(e.aoIsWhite)
         XCTAssertEqual(e.depth?.width, 159); XCTAssertEqual(e.depth?.height, 100)
+        XCTAssertEqual(e.aoDepth?.pixelFormat, .rg32Float)
+        XCTAssertEqual(e.aoDepth?.mipmapLevelCount, 1)
+        XCTAssertEqual(e.aoBackDepth?.pixelFormat, .depth32Float)
+        XCTAssertEqual(e.aoBackDepth?.width, 159); XCTAssertEqual(e.aoBackDepth?.height, 100)
+        XCTAssertEqual(e.aoDepth?.width, 159); XCTAssertEqual(e.aoDepth?.height, 100)
         XCTAssertEqual(e.sceneColor?.width, 319); XCTAssertEqual(e.sceneDepth?.height, 201)
     }
 
@@ -497,8 +502,21 @@ final class ScreenSpaceLightingTests: XCTestCase {
             try e.prepare(size: CGSize(width: 319,height: 201), options: options)
             XCTAssertEqual(e.sceneColor != nil, options.usesHDR)
             XCTAssertEqual(e.aoRaw == nil, options.usesRayTracing)
-            XCTAssertEqual(e.aoHistory == nil, options.usesRayTracing)
-            XCTAssertEqual(e.aoPreviousDepth == nil, options.usesRayTracing)
+            XCTAssertEqual(e.aoSpatial == nil, options.usesRayTracing)
+            XCTAssertEqual(e.aoBackDepth == nil, options.usesRayTracing)
+            XCTAssertEqual(e.aoDepth == nil, options.usesRayTracing)
+            if !options.usesRayTracing {
+                XCTAssertEqual(e.aoSpatial?.pixelFormat, .r16Float)
+                XCTAssertEqual(e.aoSpatial?.width, e.depth?.width)
+                XCTAssertEqual(e.aoSpatial?.height, e.depth?.height)
+                XCTAssertEqual(e.aoBackDepth?.pixelFormat, .depth32Float)
+                XCTAssertEqual(e.aoBackDepth?.width, e.depth?.width)
+                XCTAssertEqual(e.aoBackDepth?.height, e.depth?.height)
+                XCTAssertEqual(e.aoDepth?.pixelFormat, .rg32Float)
+                XCTAssertEqual(e.aoDepth?.mipmapLevelCount, 1)
+                XCTAssertEqual(e.aoDepth?.width, e.depth?.width)
+                XCTAssertEqual(e.aoDepth?.height, e.depth?.height)
+            }
             XCTAssertEqual(e.depthHierarchy != nil, options.screenSpaceReflections)
             XCTAssertNotNil(e.directVisibilityRaw)
         }
