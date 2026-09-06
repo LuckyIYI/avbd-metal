@@ -9,6 +9,11 @@ final class FrameReadback {
 
     func copy(_ source: MTLTexture, command: MTLCommandBuffer) throws -> MTLTexture {
         guard !source.isFramebufferOnly else { throw Failure.framebufferOnly }
+        // A resize must not leave the idle pool full of unusable textures,
+        // preventing completed captures at the new size from being retained.
+        available.removeAll {
+            $0.width != source.width || $0.height != source.height || $0.pixelFormat != source.pixelFormat
+        }
         let texture: MTLTexture
         if let index = available.firstIndex(where: {
             $0.width == source.width && $0.height == source.height && $0.pixelFormat == source.pixelFormat

@@ -34,5 +34,21 @@ final class FrameReadbackTests: XCTestCase {
         XCTAssertTrue(delayed.contains { $0 === reused }, "Completed callbacks should release textures for reuse")
         command.commit(); command.waitUntilCompleted()
         XCTAssertEqual(command.status, .completed)
+
+        // Fill all idle slots at the old size, then resize. The new size
+        // must reuse its completed texture rather than allocate every frame.
+        readback.recycle(reused)
+        d.width = 8
+        let resizedSurface = try XCTUnwrap(device.makeTexture(descriptor: d))
+        let resizeCommand = try XCTUnwrap(queue.makeCommandBuffer())
+        let resized = try readback.copy(resizedSurface, command: resizeCommand)
+        resizeCommand.commit(); resizeCommand.waitUntilCompleted()
+        XCTAssertEqual(resizeCommand.status, .completed)
+        readback.recycle(resized)
+        let nextCommand = try XCTUnwrap(queue.makeCommandBuffer())
+        let next = try readback.copy(resizedSurface, command: nextCommand)
+        XCTAssertTrue(next === resized, "Resizing must not turn pooled capture into a per-frame allocation")
+        nextCommand.commit(); nextCommand.waitUntilCompleted()
+        XCTAssertEqual(nextCommand.status, .completed)
     }
 }
