@@ -47,7 +47,13 @@ public final class GPUSolver {
     public let device: MTLDevice
     let queue: MTLCommandQueue
 
-    public var settings = SimSettings()
+    public var settings = SimSettings() {
+        didSet {
+            if settings.clothRenderScale != oldValue.clothRenderScale {
+                invalidateGeometryState()
+            }
+        }
+    }
 
     // Capacities
     let numBodies: Int
@@ -438,6 +444,14 @@ public final class GPUSolver {
     // Start pessimistic so the first frame covers every possible color.
     public internal(set) var lastMaxColorUsed: Int = AVBD_MAX_COLORS - 1
     public private(set) var frameIndex: Int = 0
+    /// Monotonic geometry state, including pose edits and checkpoint restores
+    /// that do not advance simulation time. Consumers may reuse derived data
+    /// while this value is unchanged.
+    public private(set) var geometryStateRevision: UInt64 = 0
+
+    /// Call after external writes to exposed position, rotation, or deformed
+    /// surface buffers. Solver mutation APIs advance the revision themselves.
+    public func invalidateGeometryState() { geometryStateRevision &+= 1 }
     /// Legacy position-servo targets advanced each step as `(joint, rad/s)`.
     private var rateMotors: [(Int, Float)] = []
 
@@ -3712,6 +3726,7 @@ public final class GPUSolver {
         let planarDATCapacity: Int
     }
     private var inflight: [StepSubmission] = []
+    private var renderSnapshotSubmission: MTLCommandBuffer?
     private let statsLock = NSLock()
     private let failureLock = NSLock()
     private var latchedRuntimeFailure: RuntimeFailure?
@@ -3962,6 +3977,7 @@ public final class GPUSolver {
     public func setBodyStates(_ updates: [BodyStateUpdate]) {
         guard !updates.isEmpty else { return }
         sync()
+        invalidateGeometryState()
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let vl = velLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -4051,6 +4067,7 @@ public final class GPUSolver {
     public func setDrivenBodyStates(_ updates: [BodyStateUpdate]) {
         guard !updates.isEmpty else { return }
         sync()
+        invalidateGeometryState()
         let pl = posLin.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(
@@ -4744,6 +4761,24 @@ public final class GPUSolver {
         }
     }
 
+    /// Submit a short read/copy of presentation data on the physics queue.
+    /// Subsequent GPU steps follow it in queue order. CPU mutation APIs that
+    /// synchronize also retire this copy, never the consumer's render frame.
+    /// The closure must finish encoding without committing the command buffer.
+    public func submitRenderSnapshot(
+        _ encode: (MTLCommandBuffer) throws -> Void
+    ) throws -> MTLCommandBuffer {
+        try synchronize()
+        guard let command = queue.makeCommandBuffer() else {
+            throw RuntimeFailure.commandBufferCreation(operation: "render snapshot", frame: frameIndex)
+        }
+        command.label = "AVBD render snapshot"
+        try encode(command)
+        renderSnapshotSubmission = command
+        command.commit()
+        return command
+    }
+
     /// Wait for every submitted physics frame, validate Metal completion,
     /// then publish frame-owned statistics. The earliest failure is sticky
     /// and permanently invalidates this solver instance.
@@ -4757,6 +4792,11 @@ public final class GPUSolver {
             } catch let failure as RuntimeFailure {
                 if observedFailure == nil { observedFailure = failure }
             }
+        }
+        if let snapshot = renderSnapshotSubmission {
+            renderSnapshotSubmission = nil
+            do { try waitForCompletion(snapshot, operation: "render snapshot", frame: frameIndex) }
+            catch let failure as RuntimeFailure { if observedFailure == nil { observedFailure = failure } }
         }
         if let failure = observedFailure ?? runtimeFailure { throw failure }
     }
@@ -4896,6 +4936,7 @@ public final class GPUSolver {
         restore(snapshot.colorsB, to: colorsB)
         restore(snapshot.counters, to: counters)
         frameIndex = snapshot.frameIndex
+        invalidateGeometryState()
         statsLock.lock()
         lastColorCounts = snapshot.lastColorCounts
         lastNumPairs = snapshot.lastNumPairs
@@ -6792,6 +6833,7 @@ public final class GPUSolver {
         // simulation time or move spinners.
         advanceSpinners()
         frameIndex = submittedFrame
+        invalidateGeometryState()
         let submission = StepSubmission(
             commandBuffer: cmd1, counterSnapshot: counterSnapshot,
             frame: submittedFrame,
@@ -7084,9 +7126,10 @@ public final class GPUSolver {
             enc.setBuffer(colliderRenderColor, offset: 0, index: 12)
             // Metal validates every reflected buffer binding even when the
             // runtime flag prevents a read. Reuse a guaranteed live buffer
-            // as the disabled placeholder instead of binding nil.
+            // as the disabled placeholder instead of binding nil. The instance
+            // stride exceeds the 32-byte appearance ABI even for one body.
             enc.setBuffer(
-                appearanceOverrides ?? colliderRenderColor,
+                appearanceOverrides ?? instances,
                 offset: 0, index: 13)
             enc.setBytes(&hasAppearanceOverrides, length: 4, index: 14)
             noteDispatch("raw")

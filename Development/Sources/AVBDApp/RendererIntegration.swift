@@ -10,6 +10,8 @@ import GPUSimRenderer
 protocol RenderableModel: GPUSimRendererSource {
     nonisolated var captureID: String { get }
     var solver: GPUSolver? { get }
+    var rayTracingEnabled: Bool { get }
+    var screenSpaceReflectionsEnabled: Bool { get }
     var colorByGraphColor: Bool { get }
     var showConvexCollisionGeometry: Bool { get }
     var convexCollisionWireframe: Bool { get }
@@ -22,13 +24,18 @@ protocol RenderableModel: GPUSimRendererSource {
 extension RenderableModel {
     var showConvexCollisionGeometry: Bool { false }
     var convexCollisionWireframe: Bool { true }
+    var supportsRayTracing: Bool {
+        (solver?.device ?? MTLCreateSystemDefaultDevice()).map { GPUSimRenderer.supportsHQ(device: $0) } ?? false
+    }
 
     var renderScene: (any GPUSimRenderableScene)? { solver }
     var rendererOptions: GPUSimRenderOptions {
         GPUSimRenderOptions(
             colorMode: colorByGraphColor ? .constraintGraph : .bodyIndex,
             showConvexCollisionGeometry: showConvexCollisionGeometry,
-            convexCollisionWireframe: convexCollisionWireframe
+            convexCollisionWireframe: convexCollisionWireframe,
+            screenSpaceReflections: screenSpaceReflectionsEnabled,
+            lightingMode: rayTracingEnabled ? .qualityBeta : .lightweight
         )
     }
 

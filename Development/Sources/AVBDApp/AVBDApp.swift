@@ -58,6 +58,9 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 Text("AVBD Metal").font(.title2).bold()
+                RenderingModePicker(rayTracingEnabled: $model.rayTracingEnabled,
+                                    screenSpaceReflectionsEnabled: $model.screenSpaceReflectionsEnabled,
+                                    supportsRayTracing: model.supportsRayTracing)
 
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
@@ -180,6 +183,34 @@ struct ContentView: View {
                 ), in: Foundation.log10(range.lowerBound)...Foundation.log10(range.upperBound))
             } else {
                 Slider(value: value, in: range)
+            }
+        }
+    }
+}
+
+struct RenderingModePicker: View {
+    @Binding var rayTracingEnabled: Bool
+    @Binding var screenSpaceReflectionsEnabled: Bool
+    let supportsRayTracing: Bool
+
+    var body: some View {
+        GroupBox("Rendering") {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Rendering", selection: $rayTracingEnabled) {
+                    Text("Fast").tag(false)
+                    Text("HQ Beta").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .disabled(!supportsRayTracing)
+                if !rayTracingEnabled {
+                    Toggle("Screen-space reflections", isOn: $screenSpaceReflectionsEnabled)
+                }
+                Text(!supportsRayTracing ? "HQ requires ray tracing and MetalFX denoising support."
+                     : rayTracingEnabled ? "Ray-traced lighting with MetalFX denoising and upscaling. Experimental."
+                     : "Raster shadows, GTAO and contact shadows.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

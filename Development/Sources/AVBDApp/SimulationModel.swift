@@ -33,6 +33,8 @@ final class SimulationModel: ObservableObject, RenderableModel {
         Demos.tunables(name).reduce(into: [:]) { $0[$1.key] = $1.def }
     }
     @Published var running = true
+    @Published var rayTracingEnabled = false
+    @Published var screenSpaceReflectionsEnabled = false
     @Published var colorByGraphColor = false
     @Published var showConvexCollisionGeometry = false
     @Published var convexCollisionWireframe = true
@@ -157,9 +159,9 @@ final class SimulationModel: ObservableObject, RenderableModel {
                 stepAccumulator -= dt
                 steps += 1
             }
-            // Physics and rendering use separate Metal queues. Retiring the
-            // submitted steps here is the explicit cross-queue boundary and
-            // prevents rendering partially updated shared poses.
+            // Retire physics for CPU observations and the next presentation
+            // snapshot. The previous render uses immutable buffers and can
+            // continue concurrently on its own queue.
             try solver.synchronize()
             if steps > 0 {
                 let ms = (CACurrentMediaTime() - batchStart) * 1000
