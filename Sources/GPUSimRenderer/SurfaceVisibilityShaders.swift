@@ -4,6 +4,13 @@ let surfaceVisibilityShaderSource = """
 inline float2 surfaceVisibility(float2 uv, float3 P, float3 N, constant Uniforms& U,
     texture2d<float> visibility, depth2d<float> depth, texture2d<float> normal) {
     float2 size = float2(depth.get_width(), depth.get_height());
+    // HQ guides, world rays and single-sample opaque shading share the same
+    // jittered projection and pixel grid. uv comes from fragment position /
+    // U.screen.xy, so this receiver's visibility is already at its pixel.
+    if (U.reconstruction.x > 0 && all(U.screen.xy == size)) {
+        uint2 pixel = min(uint2(uv * size), uint2(size) - 1u);
+        return visibility.read(pixel).rg;
+    }
     float2 location = uv * size - 0.5;
     float2 fraction = fract(location);
     int2 base = int2(floor(location));

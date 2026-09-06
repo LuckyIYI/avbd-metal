@@ -7,9 +7,9 @@ import simd
 final class ScreenSpacePipeline {
     enum Failure: Error { case allocation(String), encoder(String), shaderFunction(String) }
     let device: MTLDevice
-    private let aoPipeline, aoDepthPipeline, aoSpatialPipeline, visibilityPipeline: MTLRenderPipelineState
+    private let aoPipeline, aoDepthPipeline, aoSpatialPipeline, visibilityPipeline, directVisibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
-    private let reconstructionDisplayPipeline: MTLRenderPipelineState
+    private let reconstructionDisplayPipeline, reconstructionSingleDisplayPipeline: MTLRenderPipelineState
     private let reconstructedDepth: MTLDepthStencilState
     private let antialiasingPipeline: MTLRenderPipelineState
     private let depthCopyPipeline, depthReducePipeline: MTLComputePipelineState
@@ -37,28 +37,31 @@ final class ScreenSpacePipeline {
             guard let result = library.makeFunction(name: name) else { throw Failure.shaderFunction(name) }
             return result
         }
-        func pipeline(_ name: String, format: MTLPixelFormat, samples: Int = 1) throws -> MTLRenderPipelineState {
+        func pipeline(_ name: String, format: MTLPixelFormat, samples: Int = 1,
+                      depth: Bool = false) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
             d.label = name
             d.vertexFunction = try function("fs_vertex")
             d.fragmentFunction = try function(name)
             d.colorAttachments[0].pixelFormat = format
             d.rasterSampleCount = samples
-            if samples > 1 { d.depthAttachmentPixelFormat = .depth32Float }
+            if samples > 1 || depth { d.depthAttachmentPixelFormat = .depth32Float }
             return try device.makeRenderPipelineState(descriptor: d)
         }
         depthCopyPipeline = try device.makeComputePipelineState(function: function("screen_depth_copy"))
         depthReducePipeline = try device.makeComputePipelineState(function: function("screen_depth_reduce"))
         aoPipeline = try pipeline("gtao_fragment", format: .r8Unorm)
         aoDepthPipeline = try pipeline("gtao_depth_fragment", format: .rg32Float)
-        aoSpatialPipeline = try pipeline("visibility_fragment", format: .r16Float)
+        aoSpatialPipeline = try pipeline("ambient_visibility_fragment", format: .r16Float)
         visibilityPipeline = try pipeline("visibility_fragment", format: .rg8Unorm)
+        directVisibilityPipeline = try pipeline("direct_visibility_fragment", format: .rg8Unorm)
         contactPipeline = try pipeline("contact_fragment", format: .r8Unorm)
         reflectionPipeline = try pipeline("reflection_fragment", format: .rgba16Float)
         reflectionFilterPipeline = try pipeline("reflection_filter_fragment", format: .rgba16Float)
         compositePipeline = try pipeline("screen_composite_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
-        antialiasingPipeline = try pipeline("edge_antialiasing_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
+        antialiasingPipeline = try pipeline("edge_antialiasing_fragment", format: .bgra8Unorm_srgb)
         reconstructionDisplayPipeline = try pipeline("reconstruction_display_fragment", format: .bgra8Unorm_srgb, samples: GPUSimRenderer.sampleCount)
+        reconstructionSingleDisplayPipeline = try pipeline("reconstruction_display_fragment", format: .bgra8Unorm_srgb, depth: true)
         let reconstructedDS = MTLDepthStencilDescriptor()
         reconstructedDS.depthCompareFunction = .always; reconstructedDS.isDepthWriteEnabled = true
         guard let rd = device.makeDepthStencilState(descriptor: reconstructedDS) else { throw Failure.allocation("reconstructed depth state") }
@@ -129,7 +132,7 @@ final class ScreenSpacePipeline {
             let r = try reconstructs ? nil : texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Reflection radiance correction")
             let raw = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Raw reflected radiance")
             let c = try texture(.rgba16Float, width: size.x, height: size.y, label: "HDR scene", mipmapped: options.screenSpaceReflections)
-            let s = try texture(.rgba16Float, width: size.x, height: size.y, label: "Transient HDR MSAA", samples: GPUSimRenderer.sampleCount)
+            let s = try reconstructs ? nil : texture(.rgba16Float, width: size.x, height: size.y, label: "Transient HDR MSAA", samples: GPUSimRenderer.sampleCount)
             let d = try texture(.depth32Float, width: size.x, height: size.y, label: "Resolved scene depth")
             var hierarchy: MTLTexture?
             var levels: [MTLTexture] = []
@@ -177,9 +180,14 @@ final class ScreenSpacePipeline {
     }
 
     func encodeAntialiasing(command: MTLCommandBuffer, destination: MTLRenderPassDescriptor) throws {
-        let d = destination.copy() as! MTLRenderPassDescriptor
+        // Geometry has already resolved its multisample coverage. Every
+        // fullscreen AA output sample would be identical, so store it once.
+        guard let target = destination.colorAttachments[0].resolveTexture ?? destination.colorAttachments[0].texture,
+              target.sampleCount == 1 else { throw Failure.allocation("single-sample edge AA output") }
+        let d = MTLRenderPassDescriptor()
+        d.colorAttachments[0].texture = target
         d.colorAttachments[0].loadAction = .dontCare
-        d.depthAttachment.loadAction = .dontCare
+        d.colorAttachments[0].storeAction = .store
         guard let e = command.makeRenderCommandEncoder(descriptor: d) else { throw Failure.encoder("edge AA") }
         e.label = "Display edge antialiasing"
         e.setRenderPipelineState(antialiasingPipeline)
@@ -228,7 +236,8 @@ final class ScreenSpacePipeline {
             try pass(contactPipeline, command: command, output: directVisibilityRaw!, inputs: [depth!, normal!], uniforms: uniforms)
         }
         if options.ambientOcclusion || options.contactShadows || options.usesRayTracing {
-            try pass(visibilityPipeline, command: command, output: visibility!,
+            try pass(options.ambientOcclusion ? visibilityPipeline : directVisibilityPipeline,
+                command: command, output: visibility!,
                 inputs: [options.ambientOcclusion ? aoSpatial! : white, directVisibilityRaw ?? white, depth!, normal!], uniforms: uniforms)
         } else if !visibilityIsWhite {
             // A fullscreen clear initializes both ambient and direct visibility channels.
@@ -303,7 +312,9 @@ final class ScreenSpacePipeline {
         d.depthAttachment.loadAction = reconstructed == nil ? .load : .clear
         guard let e = command.makeRenderCommandEncoder(descriptor: d) else { throw Failure.encoder("display composite") }
         e.label = "Reflections and display composite"
-        e.setRenderPipelineState(reconstructed == nil ? compositePipeline : reconstructionDisplayPipeline)
+        let reconstructionPipeline = d.colorAttachments[0].texture?.sampleCount == 1
+            ? reconstructionSingleDisplayPipeline : reconstructionDisplayPipeline
+        e.setRenderPipelineState(reconstructed == nil ? compositePipeline : reconstructionPipeline)
         e.setDepthStencilState(reconstructed == nil ? noDepth : reconstructedDepth)
         var u = uniforms
         e.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)

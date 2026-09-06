@@ -145,6 +145,14 @@ final class AntialiasingTests: XCTestCase {
         let multisample = try effects.texture(.bgra8Unorm_srgb, width: width, height: height, label: "AA samples", samples: 4)
         let depth = try effects.texture(.depth32Float, width: width, height: height, label: "AA depth", samples: 4)
         let output = try effects.texture(.bgra8Unorm_srgb, width: width, height: height, label: "AA output")
+        let resolvedReference = try effects.texture(.bgra8Unorm_srgb, width: width, height: height, label: "Identical-sample AA reference")
+        let legacy = MTLRenderPipelineDescriptor()
+        legacy.vertexFunction = library.makeFunction(name: "fs_vertex")
+        legacy.fragmentFunction = library.makeFunction(name: "edge_antialiasing_fragment")
+        legacy.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+        legacy.depthAttachmentPixelFormat = .depth32Float; legacy.rasterSampleCount = 4
+        let legacyPipeline = try device.makeRenderPipelineState(descriptor: legacy)
+        let encoded = try XCTUnwrap(effects.displayColor!.makeTextureView(pixelFormat: .bgra8Unorm))
         var beforeError = 0.0, afterError = 0.0
         for slope in [0.37, -0.61, 1.4] {
             var pixels = [UInt8](repeating: 255, count: row*height)
@@ -165,6 +173,7 @@ final class AntialiasingTests: XCTestCase {
             } }
             let upload = try XCTUnwrap(pixels.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) })
             let readback = try XCTUnwrap(device.makeBuffer(length: row*height, options: .storageModeShared))
+            let referenceReadback = try XCTUnwrap(device.makeBuffer(length: row*height, options: .storageModeShared))
             let command = try XCTUnwrap(queue.makeCommandBuffer())
             let uploadEncoder = try XCTUnwrap(command.makeBlitCommandEncoder())
             uploadEncoder.copy(from: upload, sourceOffset: 0, sourceBytesPerRow: row, sourceBytesPerImage: row*height,
@@ -177,14 +186,32 @@ final class AntialiasingTests: XCTestCase {
             pass.colorAttachments[0].storeAction = .multisampleResolve
             pass.depthAttachment.texture = depth
             try effects.encodeAntialiasing(command: command, destination: pass)
+            // Compare with the former four-identical-samples presentation.
+            // Coverage AA has already happened before either presentation.
+            pass.colorAttachments[0].resolveTexture = resolvedReference
+            pass.colorAttachments[0].loadAction = .dontCare
+            pass.depthAttachment.loadAction = .dontCare
+            let legacyEncoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: pass))
+            legacyEncoder.setRenderPipelineState(legacyPipeline)
+            legacyEncoder.setFragmentTexture(encoded, index: 0)
+            legacyEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            legacyEncoder.endEncoding()
             let readEncoder = try XCTUnwrap(command.makeBlitCommandEncoder())
             readEncoder.copy(from: output, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(),
                 sourceSize: MTLSize(width: width,height: height,depth: 1), to: readback, destinationOffset: 0,
+                destinationBytesPerRow: row, destinationBytesPerImage: row*height)
+            readEncoder.copy(from: resolvedReference, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(),
+                sourceSize: MTLSize(width: width,height: height,depth: 1), to: referenceReadback, destinationOffset: 0,
                 destinationBytesPerRow: row, destinationBytesPerImage: row*height)
             readEncoder.endEncoding()
             command.commit(); command.waitUntilCompleted()
             XCTAssertEqual(command.status, .completed, "\(String(describing: command.error))")
             let values = readback.contents().assumingMemoryBound(to: UInt8.self)
+            let legacyValues = referenceReadback.contents().assumingMemoryBound(to: UInt8.self)
+            for y in 0..<height { for x in 0..<(width*4) {
+                XCTAssertEqual(values[y*row+x], legacyValues[y*row+x],
+                    "Direct presentation must match resolving four identical fullscreen samples")
+            } }
             for y in 3..<(height-3) { for x in 3..<(width-3) {
                 let expected = reference[y*width+x], i = y*row+x*4
                 beforeError += pow(Double(pixels[i])-expected,2)

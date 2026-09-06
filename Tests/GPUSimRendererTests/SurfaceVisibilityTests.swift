@@ -46,9 +46,24 @@ final class SurfaceVisibilityTests: XCTestCase {
         }
     }
 
-    private func render(mode: UInt32) throws -> [SIMD4<Float>] {
+    func testHQVisibilityMatchesItsPixelAcrossJitterAndOddTargetSizes() throws {
+        for size in [SIMD2(32,16), SIMD2(35,19)] {
+            for frame: UInt32 in [0,17,31] {
+                let pixels = try render(mode: 4, size: size,
+                    jitter: MetalFXReconstruction.sampleJitter(frame), reconstructs: true)
+                for pixel in pixels {
+                    XCTAssertEqual(pixel.x,pixel.z)
+                    XCTAssertEqual(pixel.y,pixel.w,
+                        "Matching HQ guide and shading grids must retain exact per-pixel visibility at discontinuities")
+                }
+            }
+        }
+    }
+
+    private func render(mode: UInt32, size: SIMD2<Int> = SIMD2(32,16),
+                        jitter: SIMD2<Float> = .zero, reconstructs: Bool = false) throws -> [SIMD4<Float>] {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal is unavailable") }
-        let width = 32, height = 16
+        let width = size.x, height = size.y
         let source = renderShaderSource + """
         struct VisibilityFixtureOut {
             float4 normal [[color(0)]];
@@ -71,6 +86,13 @@ final class SurfaceVisibilityTests: XCTestCase {
                 out.normal.xyz = normalize(float3(0.7, 0.3, 0.65));
                 out.visibility = float2(0.1 + 0.8 * in.uv.x, 0.4);
             }
+            if (mode == 4) {
+                bool even = ((uint(in.position.x) + uint(in.position.y)) & 1u) == 0;
+                float4 surface = U.viewProj * float4(0,0,even ? -2.0 : -4.0,1);
+                out.depth = surface.z / surface.w;
+                out.normal.xyz = even ? float3(0,0,1) : normalize(float3(0.8,0.1,0.6));
+                out.visibility = even ? float2(0.2,0.3) : float2(0.8,0.9);
+            }
             return out;
         }
         fragment float4 visibility_reconstruction_fixture(FSOut in [[stage_in]],
@@ -82,9 +104,15 @@ final class SurfaceVisibilityTests: XCTestCase {
             float4 clip = U.viewProj * float4(0, 0, -2, 1);
             float3 P = worldFromDepth(in.uv, clip.z / clip.w, U.invViewProj);
             float3 N = mode == 3 ? normalize(float3(0.7, 0.3, 0.65)) : float3(0, 0, 1);
+            if (mode == 4) {
+                P = worldFromDepth(in.uv,depth.read(uint2(in.position.xy)),U.invViewProj);
+                N = normal.read(uint2(in.position.xy)).xyz;
+            }
             constexpr sampler linearSampler(filter::linear, address::clamp_to_edge);
             float2 reconstructed = surfaceVisibility(in.uv, P, N, U, visibility, depth, normal);
-            return float4(reconstructed, visibility.sample(linearSampler, in.uv).rg);
+            float2 control = mode == 4 ? visibility.read(uint2(in.position.xy)).rg
+                                      : visibility.sample(linearSampler, in.uv).rg;
+            return float4(reconstructed, control);
         }
         """
         let library = try device.makeLibrary(source: source, options: nil)
@@ -108,22 +136,29 @@ final class SurfaceVisibilityTests: XCTestCase {
         }
         let fixturePipeline = try pipeline("visibility_fixture", fixture: true)
         let reconstructionPipeline = try pipeline("visibility_reconstruction_fixture", fixture: false)
-        let normal = try texture(.rgba16Float, width: width / 2, height: height / 2)
-        let visibility = try texture(.rg32Float, width: width / 2, height: height / 2)
-        let depth = try texture(.depth32Float, width: width / 2, height: height / 2)
+        let guideWidth = reconstructs ? width : width / 2
+        let guideHeight = reconstructs ? height : height / 2
+        let normal = try texture(.rgba16Float, width: guideWidth, height: guideHeight)
+        let visibility = try texture(.rg32Float, width: guideWidth, height: guideHeight)
+        let depth = try texture(.depth32Float, width: guideWidth, height: guideHeight)
         let result = try texture(.rgba32Float, width: width, height: height)
         let y: Float = 1 / tan(25 * .pi / 180), near: Float = 0.1, far: Float = 100
         let projection = simd_float4x4(columns: (
             SIMD4(y * Float(height) / Float(width), 0, 0, 0), SIMD4(0, y, 0, 0),
             SIMD4(0, 0, far / (near - far), -1), SIMD4(0, 0, near * far / (near - far), 0)))
-        var uniforms = Uniforms(viewProj: projection, lightDir: .zero, eye: .zero,
+        var jittered = projection
+        jittered.columns.2.x -= 2 * jitter.x / Float(width)
+        jittered.columns.2.y += 2 * jitter.y / Float(height)
+        var uniforms = Uniforms(viewProj: jittered, lightDir: .zero, eye: .zero,
             screen: SIMD4(Float(width), Float(height), Float(height) * y * 0.5, 0),
             camRight: SIMD4(1, 0, 0, 0), camUp: SIMD4(0, -1, 0, 0),
             prevViewProj: projection, temporal: .zero,
             shadowViewProj: matrix_identity_float4x4, shadowParams: .zero,
-            invViewProj: projection.inverse, prevInvViewProj: projection.inverse,
+            invViewProj: jittered.inverse, prevInvViewProj: jittered.inverse,
             aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                 1 / projection.columns.0.x, 1 / projection.columns.1.y))
+        uniforms.reconstruction = SIMD4(reconstructs ? 1 : 0,
+            jitter.x / Float(width),jitter.y / Float(height),0)
         var fixtureMode = mode
         let queue = try XCTUnwrap(device.makeCommandQueue())
         let command = try XCTUnwrap(queue.makeCommandBuffer())
@@ -161,7 +196,7 @@ final class SurfaceVisibilityTests: XCTestCase {
         encoder.setFragmentTexture(normal, index: 2)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
-        let stride = width * MemoryLayout<SIMD4<Float>>.stride
+        let stride = (width * MemoryLayout<SIMD4<Float>>.stride + 255) / 256 * 256
         let buffer = try XCTUnwrap(device.makeBuffer(length: stride * height, options: .storageModeShared))
         let blit = try XCTUnwrap(command.makeBlitCommandEncoder())
         blit.copy(from: result, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(),
@@ -171,7 +206,9 @@ final class SurfaceVisibilityTests: XCTestCase {
         command.commit()
         command.waitUntilCompleted()
         XCTAssertEqual(command.status, .completed, "\(String(describing: command.error))")
-        return Array(UnsafeBufferPointer(start: buffer.contents().assumingMemoryBound(to: SIMD4<Float>.self),
-            count: width * height))
+        return (0..<height).flatMap { y in
+            Array(UnsafeBufferPointer(start: buffer.contents().advanced(by: y * stride)
+                .assumingMemoryBound(to: SIMD4<Float>.self), count: width))
+        }
     }
 }

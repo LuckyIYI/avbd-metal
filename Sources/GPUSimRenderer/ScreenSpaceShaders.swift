@@ -338,22 +338,26 @@ fragment float4 reflection_fragment(FSOut in [[stage_in]], constant Uniforms& U 
     return float4(correction * confidence, confidence);
 }
 
-// One spatial resolve per signal. A 5x5 tent averages stochastic visibility
-// without a preferred axis; plane/normal weights preserve contact boundaries.
-inline float screenFilterWeight(float3 P, float3 N, float3 Q, float3 QN, float tolerance) {
-    float agreement = max(dot(N, QN), 0.0);
-    return pow(agreement, 16.0) * saturate(1.0 - abs(dot(Q-P, N)) / tolerance);
-}
-fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
-    texture2d<float> ambient [[texture(0)]], texture2d<float> contact [[texture(1)]],
-    depth2d<float> depth [[texture(2)]], texture2d<float> normal [[texture(3)]]) {
+// Plane/normal weights preserve contact boundaries. Direct visibility uses
+// a 5x5 tent; AO uses the centered box matched to its fixed sampling pattern.
+// Specialize the channels at compile time: the first AO pass writes only R,
+// while HQ reconstructs only direct visibility. All three paths share weights.
+template <bool wantAmbient, bool wantDirect>
+inline float4 filterVisibility(FSOut in, constant Uniforms& U,
+    texture2d<float> ambient, texture2d<float> contact,
+    depth2d<float> depth, texture2d<float> normal) {
     uint2 pixel = uint2(in.position.xy);
     float d = depth.read(pixel);
-    if (d >= 1.0) return float4(1);
-    float3 P = screenPosition(in.uv, d, U), N = screenVector(normal.read(pixel).xyz, U);
-    float tolerance = max(0.003, P.z / U.screen.z * 1.5);
-    float3 planeN = gtaoGeometricNormal(pixel, P, N, U, depth);
-    float planeTolerance = max(0.00025, P.z / U.screen.z * 0.25);
+    if (d >= 1.0 || (!wantAmbient && U.effects.y <= 0.0)) return float4(1);
+    float3 NW = normal.read(pixel).xyz;
+    float3 P = screenPosition(in.uv, d, U), N = screenVector(NW, U);
+    float tolerance = 0.0, planeTolerance = 0.0;
+    float3 planeN = float3(0);
+    if (wantDirect) tolerance = max(0.003, P.z / U.screen.z * 1.5);
+    if (wantAmbient) {
+        planeN = gtaoGeometricNormal(pixel, P, N, U, depth);
+        planeTolerance = max(0.00025, P.z / U.screen.z * 0.25);
+    }
     float2 sum = float2(0); float2 weights = float2(0);
     int2 size = int2(depth.get_width(), depth.get_height());
     constexpr sampler nearest(filter::nearest);
@@ -363,25 +367,47 @@ fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U 
         float dq = depth.read(uint2(q));
         if (dq >= 1.0) continue;
         float2 uv = (float2(q) + 0.5) / float2(size);
-        float3 Q = screenPosition(uv, dq, U), QN = screenVector(normal.read(uint2(q)).xyz, U);
-        float w = screenFilterWeight(P, N, Q, QN, tolerance) * float((3-abs(x))*(3-abs(y)));
+        float3 Q = screenPosition(uv, dq, U), QNW = normal.read(uint2(q)).xyz;
+        float w = 0.0, aw = 0.0, a = 1.0, c = 1.0;
+        // The camera basis is orthonormal, so agreement can stay in world
+        // space; only the center normal needs the view-space transform.
+        if (wantDirect) w = (pow(max(dot(NW, QNW), 0.0), 16.0)
+            * saturate(1.0 - abs(dot(Q-P, N)) / tolerance)) * float((3-abs(x))*(3-abs(y)));
         // A centered width-four box is the average of four adjacent 4x4
         // boxes: weights [.5,1,1,1,.5] on each axis. It cancels our complete
         // 4x4 sampling lattice without shifting AO by half a texel. Gaussian
         // weights would leave unequal angular coverage and visible grain.
-        float agreement = saturate(dot(N, QN));
-        float3 delta = Q-P;
-        float distanceToPlane = abs(dot(delta, planeN));
-        float tangentDistance = length(delta - planeN * dot(delta, planeN));
-        float curvatureTolerance = tangentDistance * 0.5 * sqrt(1.0 - agreement);
-        float aw = (abs(x) == 2 ? 0.5 : 1.0) * (abs(y) == 2 ? 0.5 : 1.0);
-        aw *= saturate(1.0 - distanceToPlane / (planeTolerance + curvatureTolerance))
-            * smoothstep(0.5, 0.9, agreement);
-        float a = ambient.sample(nearest, uv).r;
-        float c = U.effects.y > 0.0 ? contact.read(uint2(q)).r : 1.0;
+        if (wantAmbient) {
+            float agreement = saturate(dot(NW, QNW));
+            float3 delta = Q-P;
+            float distanceToPlane = abs(dot(delta, planeN));
+            float3 tangent = delta - planeN * dot(delta, planeN);
+            // Both factors are nonnegative: combine their square roots.
+            float curvatureTolerance = 0.5 * sqrt(dot(tangent, tangent) * (1.0 - agreement));
+            aw = (abs(x) == 2 ? 0.5 : 1.0) * (abs(y) == 2 ? 0.5 : 1.0);
+            aw *= saturate(1.0 - distanceToPlane / (planeTolerance + curvatureTolerance))
+                * smoothstep(0.5, 0.9, agreement);
+            a = ambient.sample(nearest, uv).r;
+        }
+        if (wantDirect) c = U.effects.y > 0.0 ? contact.read(uint2(q)).r : 1.0;
         sum += float2(a * aw, c * w); weights += float2(aw, w);
     }
     return float4(select(float2(1), sum / max(weights, float2(1e-8)), weights > 0.0), 0, 1);
+}
+fragment float4 visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
+    texture2d<float> ambient [[texture(0)]], texture2d<float> contact [[texture(1)]],
+    depth2d<float> depth [[texture(2)]], texture2d<float> normal [[texture(3)]]) {
+    return filterVisibility<true, true>(in, U, ambient, contact, depth, normal);
+}
+fragment float4 ambient_visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
+    texture2d<float> ambient [[texture(0)]], depth2d<float> depth [[texture(2)]],
+    texture2d<float> normal [[texture(3)]]) {
+    return filterVisibility<true, false>(in, U, ambient, ambient, depth, normal);
+}
+fragment float4 direct_visibility_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
+    texture2d<float> contact [[texture(1)]], depth2d<float> depth [[texture(2)]],
+    texture2d<float> normal [[texture(3)]]) {
+    return filterVisibility<false, true>(in, U, contact, contact, depth, normal);
 }
 inline float3 reflectionModulation(float3 P, float4 nr, float4 material, constant Uniforms& U) {
     float NdV = saturate(dot(screenVector(nr.xyz, U), normalize(-P)));

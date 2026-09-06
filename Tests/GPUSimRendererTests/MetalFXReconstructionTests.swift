@@ -101,7 +101,10 @@ final class MetalFXReconstructionTests: XCTestCase {
             let current = try buffer(skin ? (0..<3).flatMap { [p[$0],n[$0]] } : p)
             let previous = try buffer(skin ? (0..<3).flatMap { [old[$0],n[$0]] } : old)
             let d = MTLRenderPipelineDescriptor()
-            d.vertexFunction = lib.makeFunction(name: skin ? "skin_vertex" : "soft_vertex")
+            // Select the vertex function through the renderer's actual guide
+            // routing: Fast uses the reduced front-only cloth prepass.
+            d.vertexFunction = lib.makeFunction(name: GPUSimRenderer.reconstructionVertexName(
+                for: skin ? "skin_vertex" : "soft_vertex_front"))
             d.fragmentFunction = lib.makeFunction(name: "soft_reconstruction_fragment")
             for (i,format) in MetalFXReconstruction.guideFormats.enumerated() { d.colorAttachments[i].pixelFormat = format }
             d.depthAttachmentPixelFormat = .depth32Float
@@ -117,11 +120,15 @@ final class MetalFXReconstructionTests: XCTestCase {
             e.drawPrimitives(type: .triangle,vertexStart: 0,vertexCount: 3); e.endEncoding(); command.commit(); command.waitUntilCompleted()
             XCTAssertEqual(command.status,.completed)
             let values = try read(fx.motion,device: device,channels: 2)
+            let albedo = try read(fx.diffuseAlbedo,device: device)
             for y in 28..<34 { for x in 30..<34 {
                 let worldY = 1-(Float(y)+0.5)/32
                 let expectedY = 8*(worldY+0.6)/1.2
                 XCTAssertEqual(Float(values[(y*64+x)*2]),-4,accuracy: 0.01)
                 XCTAssertEqual(Float(values[(y*64+x)*2+1]),expectedY,accuracy: 0.01)
+                let material = (y*64+x)*4
+                XCTAssertGreaterThan(Float(albedo[material])+Float(albedo[material+1])+Float(albedo[material+2]),0.1,
+                    "Motion guides must retain the visible cloth's material instead of the Fast depth-only defaults")
             } }
         }
     }

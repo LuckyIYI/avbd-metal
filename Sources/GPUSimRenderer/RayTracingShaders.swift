@@ -158,6 +158,9 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
     if (diffuseOnly) {
         // This pass transports diffuse bounce light, excluding the sparse
         // specular-caustic paths that require a different sampling strategy.
+        // A fully metallic surface has no diffuse lobe. Its emission is
+        // independent of direct visibility, so it needs no secondary shadow ray.
+        if (mat.a == 1.0 && object.source != 3) return float4(emission,1);
         float3 L = -U.lightDir.xyz, halfVector = L-R;
         float3 H = halfVector*rsqrt(max(dot(halfVector,halfVector),1e-8));
         float visibility = dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
@@ -191,15 +194,12 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     device const RTInstance* instances [[buffer(4)]], device const RenderInstance* rigid [[buffer(5)]],
     device const RenderInstance* auxiliary [[buffer(6)]], device const RenderAppearance* appearances [[buffer(7)]],
     constant uint& hasAppearance [[buffer(8)]], depth2d<float,access::read> depth [[texture(0)]],
-    texture2d<float,access::read> normal [[texture(1)]], texture2d<float,access::read_write> output [[texture(2)]],
+    texture2d<float,access::read> normal [[texture(1)]], texture2d<float,access::write> output [[texture(2)]],
     texture2d<float,access::read> material [[texture(3)]], texture2d<float,access::read> visibility [[texture(4)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= uint2(output.get_width(),output.get_height()))) return;
     float d = depth.read(pixel); float4 nr = normal.read(pixel);
     if (d >= 1 || nr.w >= U.effects.w) { output.write(float4(0),pixel); return; }
-    // A confident current-frame screen hit may avoid the world ray. Partial
-    // screen hits are replaced by a fresh world result, without history reuse.
-    if (U.rayTracing.y > 0 && nr.w < 0.15 && output.read(pixel).a > 0.95) return;
     float2 uv = (float2(pixel)+0.5)/float2(output.get_width(),output.get_height());
     float3 P = worldFromDepth(uv,d,U.invViewProj), N = normalize(nr.xyz), V = normalize(U.eye.xyz-P);
     if (dot(N,V) <= 0) { output.write(float4(0),pixel); return; }
@@ -210,41 +210,32 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     float4 receiver = material.read(pixel);
     float3 F0 = mix(float3(0.04),receiver.rgb,receiver.a);
     float3 correctionSum = float3(0); float coverage = 0;
-    // Stratified samples, followed by a surface-aware spatial resolve.
-    // A fixed seed prevents idle flicker and requires no stale frame history.
-    // Spend extra rays where low-sample variance is most visible; matte
-    // dielectrics and near mirrors retain the cheaper four-sample budget.
-    const uint sampleCount = U.reconstruction.x > 0 ? 1u : (receiver.a > 0.5 && nr.w >= 0.08 ? 8u : 4u);
-    for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
-    float2 random = float2((float(sampleIndex)+screenNoise(pixel+uint2(0,17)))/float(sampleCount),
-                          fract(screenNoise(pixel+uint2(31,0))+float(sampleIndex)*0.6180339887));
-    if (U.reconstruction.x > 0) {
-        uint frame = uint(U.reconstruction.w);
-        random = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
-    }
+    // HQ always reconstructs one frame-sampled GGX ray with MetalFX.
+    uint frame = uint(U.reconstruction.w);
+    float2 random = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),
+                           screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
     float3 localH = rtGlossyNormal(localV,alpha,random);
     float3 H = tangent*localH.x+bitangent*localH.y+N*localH.z;
     float3 R = reflect(-V,H);
     float NdR = dot(N,R);
-    if (NdR <= 0) continue;
-    float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
-    ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
-    float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance);
-    if (hit.w == 0 && U.reconstruction.x == 0) continue;
-    float3 incoming = hit.w > 0 ? hit.rgb : screenEnvironment(R);
-    float viewLambda = rtSmithLambda(localV.z,alpha);
-    float masking = (1+viewLambda)/(1+viewLambda+rtSmithLambda(NdR,alpha));
-    // BRDF*cos/pdf for visible-normal sampling simplifies to Fresnel*G2/G1.
-    // Retain the raster environment's gain while replacing covered radiance.
-    float3 response = (F0+(1-F0)*pow(1-saturate(dot(V,H)),5.0))*masking*mix(0.50,0.20,nr.w);
-    correctionSum += (U.reconstruction.x > 0 ? incoming : incoming-screenEnvironment(R))*response;
-    coverage += 1;
+    if (NdR > 0) {
+        float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
+        ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
+        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance);
+        float3 incoming = hit.w > 0 ? hit.rgb : screenEnvironment(R);
+        float viewLambda = rtSmithLambda(localV.z,alpha);
+        float masking = (1+viewLambda)/(1+viewLambda+rtSmithLambda(NdR,alpha));
+        // BRDF*cos/pdf for visible-normal sampling simplifies to Fresnel*G2/G1.
+        // Retain the raster environment's gain while replacing covered radiance.
+        float3 response = (F0+(1-F0)*pow(1-saturate(dot(V,H)),5.0))*masking*mix(0.50,0.20,nr.w);
+        correctionSum += incoming*response;
+        coverage += 1;
     }
-    if (U.reconstruction.x > 0) {
-        correctionSum -= float(sampleCount)*screenEnvironment(reflect(-V,N))*reflectionFactor(P,N,nr.w,receiver.rgb,receiver.a,U);
-    }
+    // A below-surface sample has zero incoming radiance, but still replaces
+    // the analytic raster environment, exactly like every other HQ sample.
+    correctionSum -= screenEnvironment(reflect(-V,N))*reflectionFactor(P,N,nr.w,receiver.rgb,receiver.a,U);
     float confidence = 1-smoothstep(U.effects.w-0.15,U.effects.w,nr.w);
-    correctionSum *= (1.0/float(sampleCount))*(1-horizonFog(length(P-U.eye.xyz)))*confidence;
-    output.write(float4(correctionSum,coverage/float(sampleCount)*confidence),pixel);
+    correctionSum *= (1-horizonFog(length(P-U.eye.xyz)))*confidence;
+    output.write(float4(correctionSum,coverage*confidence),pixel);
 }
 """ + diffuseRayShaderSource

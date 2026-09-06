@@ -44,8 +44,8 @@ final class GPUSimRendererTests: XCTestCase {
         renderer.configure(view, preferredFramesPerSecond: 45)
 
         XCTAssertEqual(view.colorPixelFormat, GPUSimRenderer.colorFormat)
-        XCTAssertEqual(view.depthStencilPixelFormat, .depth32Float)
-        XCTAssertEqual(view.sampleCount, GPUSimRenderer.sampleCount)
+        XCTAssertEqual(view.depthStencilPixelFormat, .invalid)
+        XCTAssertEqual(view.sampleCount, 1)
         XCTAssertEqual(view.preferredFramesPerSecond, 45)
         XCTAssertTrue(view.delegate === renderer)
     }

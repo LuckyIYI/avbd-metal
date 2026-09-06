@@ -1381,6 +1381,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
     var shadowTex: MTLTexture?
     var screenSpace: ScreenSpacePipeline!
+    private var presentationColor, presentationDepth: MTLTexture?
     private var rayWorld: RayTracingScene?
     public private(set) var activeReconstruction: GPUSimReconstruction = .legacy
     public private(set) var activeLightingMode: GPUSimLightingMode = .lightweight
@@ -1407,6 +1408,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var lastSubmittedFrame: MTLCommandBuffer?
     private var renderSnapshots: [RenderSnapshot?] = [nil, nil, nil]
 
+    // Metal callbacks run on an unspecified thread. Keep resource access on
+    // the renderer actor; the callback only relays this actor-isolated value.
+    @MainActor private struct CompletedFrameResources {
+        let texture: MTLTexture
+        let snapshot: MTLCommandBuffer?
+    }
+
     /// Orbit azimuth in radians.
     public var azimuth: Float = 0.9
     /// Orbit elevation in radians.
@@ -1425,6 +1433,40 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private var framesDrawn = 0
     private var lastCameraEpoch: Int = -1
     private var lastSceneIdentity: ObjectIdentifier?
+    private struct HistoryTopology: Equatable {
+        struct Surface: Equatable {
+            let vertices: ObjectIdentifier?
+            let indices: ObjectIdentifier
+            let count: Int
+        }
+        let revision: UInt64
+        let primitiveCount: Int
+        let mesh, soft, skin: Surface?
+
+        init(_ scene: any GPUSimRenderableScene) {
+            revision = scene.renderGeometryRevision
+            primitiveCount = scene.renderRigidInstanceCount
+            mesh = scene.rigidMeshRenderSurface.map {
+                Surface(vertices: ObjectIdentifier($0.vertices), indices: ObjectIdentifier($0.indices), count: $0.indexCount)
+            }
+            soft = scene.softRenderSurface.map {
+                Surface(vertices: nil, indices: ObjectIdentifier($0.triangles), count: $0.triangleCount)
+            }
+            skin = scene.skinnedRenderSurface.map {
+                Surface(vertices: nil, indices: ObjectIdentifier($0.triangles), count: $0.triangleCount)
+            }
+        }
+    }
+    private var historyTopology: HistoryTopology?
+
+    func updateHistoryTopology(_ originalScene: any GPUSimRenderableScene) {
+        let current = HistoryTopology(originalScene)
+        if current != historyTopology {
+            prevVP = nil
+            historyTopology = current
+        }
+    }
+
     public private(set) var runtimeFailure: String?
     /// GPU time of the most recently completed frame, milliseconds.
     public private(set) var lastFrameGPUMilliseconds: Double = 0
@@ -1514,7 +1556,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 d.fragmentFunction = lib.makeFunction(name: surfaceName)
                 d.colorAttachments[1].pixelFormat = .rgba8Unorm
                 surfacePipelines[ObjectIdentifier(result)] = try device.makeRenderPipelineState(descriptor: d)
-                d.vertexFunction = motionLib.makeFunction(name: v)
+                d.vertexFunction = motionLib.makeFunction(name: Self.reconstructionVertexName(for: v))
                 d.fragmentFunction = lib.makeFunction(name: f == "floor_prepass_fragment" ? "floor_reconstruction_fragment" : (f == "soft_prepass_fragment" ? "soft_reconstruction_fragment" : "reconstruction_fragment"))
                 for (i, format) in MetalFXReconstruction.guideFormats.enumerated() { d.colorAttachments[i].pixelFormat = format }
                 guidePipelines[ObjectIdentifier(result)] = try device.makeRenderPipelineState(descriptor: d)
@@ -1643,8 +1685,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public func configure(_ view: MTKView, preferredFramesPerSecond: Int? = nil) {
         view.device = device
         view.colorPixelFormat = Self.colorFormat
-        view.depthStencilPixelFormat = .depth32Float
-        view.sampleCount = Self.sampleCount
+        // Own transient attachments so Apple GPUs can keep MSAA in tile memory.
+        // MTKView has no storage-mode setting for its multisample color texture.
+        view.depthStencilPixelFormat = .invalid
+        view.sampleCount = 1
         if let preferredFramesPerSecond {
             view.preferredFramesPerSecond = preferredFramesPerSecond
         }
@@ -1653,6 +1697,53 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             Float(max(view.drawableSize.height, 1))
         )
         view.delegate = self
+    }
+
+    func presentationPass(using destination: MTLRenderPassDescriptor,
+                          options: GPUSimRenderOptions, hasNativeOverlays: Bool) throws -> MTLRenderPassDescriptor {
+        guard let drawable = destination.colorAttachments[0].texture else {
+            throw ScreenSpacePipeline.Failure.allocation("presentation drawable")
+        }
+        let samples = options.usesRayTracing && !hasNativeOverlays ? 1 : Self.sampleCount
+        let supportsMemoryless = device.supportsFamily(.apple1)
+        // SSR loads native MSAA depth again for overlays after its lighting
+        // passes. Other paths consume native depth within one render pass.
+        let depthMode: MTLStorageMode = supportsMemoryless && !options.screenSpaceReflections ? .memoryless : .private
+        func matches(_ texture: MTLTexture?, _ format: MTLPixelFormat, _ storage: MTLStorageMode) -> Bool {
+            texture?.width == drawable.width && texture?.height == drawable.height
+                && texture?.sampleCount == samples && texture?.pixelFormat == format
+                && texture?.storageMode == storage
+        }
+        func attachment(_ format: MTLPixelFormat, _ storage: MTLStorageMode, _ label: String) throws -> MTLTexture {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format,
+                width: drawable.width, height: drawable.height, mipmapped: false)
+            if samples > 1 { d.textureType = .type2DMultisample; d.sampleCount = samples }
+            d.storageMode = storage; d.usage = .renderTarget
+            guard let result = device.makeTexture(descriptor: d) else { throw ScreenSpacePipeline.Failure.allocation(label) }
+            result.label = label
+            return result
+        }
+        let pass = destination.copy() as! MTLRenderPassDescriptor
+        if samples > 1 {
+            let colorMode: MTLStorageMode = supportsMemoryless ? .memoryless : .private
+            if !matches(presentationColor, drawable.pixelFormat, colorMode) {
+                presentationColor = try attachment(drawable.pixelFormat, colorMode, "Native MSAA color")
+            }
+            pass.colorAttachments[0].texture = presentationColor
+            pass.colorAttachments[0].resolveTexture = drawable
+            pass.colorAttachments[0].storeAction = .multisampleResolve
+        } else {
+            presentationColor = nil
+            pass.colorAttachments[0].resolveTexture = nil
+            pass.colorAttachments[0].storeAction = .store
+        }
+        if !matches(presentationDepth, .depth32Float, depthMode) {
+            presentationDepth = try attachment(.depth32Float, depthMode, "Native presentation depth")
+        }
+        pass.depthAttachment.texture = presentationDepth
+        pass.depthAttachment.loadAction = .clear
+        pass.depthAttachment.storeAction = .dontCare
+        return pass
     }
 
     /// Replaces the fixed scene. Set `resetCamera` when this is a different
@@ -1919,9 +2010,21 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         device.supportsRaytracing && MetalFXReconstruction.supports(device: device, denoising: true)
     }
 
+    nonisolated static func reconstructionVertexName(for prepassVertex: String) -> String {
+        // Fast's cloth prepass excludes back/rim layers and material data.
+        // HQ guides must describe the same surface and motion as main shading.
+        prepassVertex == "soft_vertex_front" ? "soft_vertex" : prepassVertex
+    }
+
+    func setOpaqueAuxiliaryDepth(on encoder: MTLRenderCommandEncoder) {
+        // Both guides and shading must choose the auxiliary receiver on a
+        // depth tie; otherwise its material, motion and visibility disagree.
+        encoder.setDepthStencilState(auxiliaryOpaqueDepthState)
+    }
+
     public func draw(in view: MTKView) {
         guard runtimeFailure == nil else { return }
-        guard let rpd = view.currentRenderPassDescriptor,
+        guard let destination = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable else { return }
 
         source?.rendererWillDrawFrame()
@@ -1943,6 +2046,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let activeAuxiliaryInstances = source?.rendererAuxiliaryInstances
             ?? auxiliaryInstances
         let activeSceneRevision = source?.rendererSceneRevision ?? sceneRevision
+
+        let hasNativeOverlays = activeOptions.showConvexCollisionGeometry || activeAuxiliaryInstances.contains {
+            $0.material.w > 0 && $0.material.w < 1
+        }
+        let rpd: MTLRenderPassDescriptor
+        do { rpd = try presentationPass(using: destination, options: activeOptions, hasNativeOverlays: hasNativeOverlays) }
+        catch { reportFailure("could not prepare presentation attachments: \(error)"); return }
 
         let frameQueue: MTLCommandQueue
         do {
@@ -2068,6 +2178,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             return
         }
 
+        let originalScene = renderScene
         if let solver = renderScene as? GPUSolver {
             do {
                 if renderSnapshots[frameSlot] == nil { renderSnapshots[frameSlot] = try RenderSnapshot(device: device) }
@@ -2096,6 +2207,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             reportFailure("instance-build encoder failed: \(error.localizedDescription)")
             return
         }
+
+        // Topology edits invalidate vertex correspondence even when buffer
+        // lengths and scene identity stay fixed. Read the original scene after
+        // its refresh; rotating frame-owned snapshot buffers are not topology.
+        if metalFX != nil { updateHistoryTopology(originalScene) }
 
         do {
             try rayWorld?.encodeUpdate(command: cmd, scene: renderScene, instances: instances,
@@ -2384,6 +2500,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         indexBufferOffset: 0)
                 }
                 if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
+                    setOpaqueAuxiliaryDepth(on: enc)
                     enc.setVertexBuffer(previous["auxiliary"], offset: 0, index: 6)
                     for (p, vertices) in [(boxPre!, 36), (spherePre!, SPHV), (torusPre!, TORV), (capsulePre!, CAPV)] {
                         enc.setRenderPipelineState(guidePipeline(p))
@@ -2662,7 +2779,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             // only the opaque draws - instanceCount 0 is a Metal validation
             // failure - while its translucent pieces still render.
             if auxiliaryBatch.opaqueCount > 0 {
-                enc.setDepthStencilState(auxiliaryOpaqueDepthState)
+                setOpaqueAuxiliaryDepth(on: enc)
                 for (pipeline, vertices) in [
                     (boxP!, 36),
                     (sphereP!, SPHV),
@@ -2799,7 +2916,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let retire = renderScene.renderSceneRequiresFrameRetirement
         framesDrawn += 1
         let frameNumber = framesDrawn
-        let completedTexture = drawable.texture
+        let completed = CompletedFrameResources(texture: drawable.texture, snapshot: snapshotSubmission)
         let inFlight = inFlightFrames
         cmd.addCompletedHandler { [weak self] finished in
             inFlight.signal()
@@ -2811,13 +2928,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             let ms = (finished.gpuEndTime - finished.gpuStartTime) * 1000
             let status = finished.status
             let error = finished.error as NSError?
-            let snapshotFailure = snapshotSubmission?.status == .error
-                ? "render snapshot command failed: \(String(describing: snapshotSubmission?.error))" : nil
             Task { @MainActor in
                 guard let self else { return }
                 self.lastFrameGPUMilliseconds = ms
-                if let snapshotFailure {
-                    self.reportFailure(snapshotFailure)
+                if completed.snapshot?.status == .error {
+                    self.reportFailure("render snapshot command failed: \(String(describing: completed.snapshot?.error))")
                     return
                 }
                 if status != .completed || error != nil {
@@ -2828,7 +2943,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         "Metal command ended with status \(detail)")
                     return
                 }
-                self.frameCompletionHandler?(completedTexture, frameNumber)
+                self.frameCompletionHandler?(completed.texture, frameNumber)
             }
         }
         releasedByCompletion = true
@@ -2847,7 +2962,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 reportFailure(failure)
                 return
             }
-            frameCompletionHandler?(completedTexture, frameNumber)
+            frameCompletionHandler?(completed.texture, frameNumber)
         }
 
         prevVP = vp

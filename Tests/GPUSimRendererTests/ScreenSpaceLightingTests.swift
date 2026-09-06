@@ -498,9 +498,12 @@ final class ScreenSpaceLightingTests: XCTestCase {
         XCTAssertFalse(GPUSimRenderOptions.qualityBeta.screenSpaceReflections, "SSR is an optional shortcut, separate from world RT")
         let h = try Harness(source: fixtureSource, width: 319, height: 201)
         let e = h.effects
-        for options in [GPUSimRenderOptions.lightweight, .qualityBeta, .lightweight, .qualityBeta] {
+        for options in [GPUSimRenderOptions.lightweight, .qualityBeta,
+                        GPUSimRenderOptions(screenSpaceReflections: true), .qualityBeta, .lightweight] {
             try e.prepare(size: CGSize(width: 319,height: 201), options: options)
             XCTAssertEqual(e.sceneColor != nil, options.usesHDR)
+            XCTAssertEqual(e.sceneMSAA != nil, options.screenSpaceReflections && !options.usesRayTracing,
+                "Only Fast SSR uses an intermediate multisample HDR target; HQ shades once before MetalFX")
             XCTAssertEqual(e.aoRaw == nil, options.usesRayTracing)
             XCTAssertEqual(e.aoSpatial == nil, options.usesRayTracing)
             XCTAssertEqual(e.aoBackDepth == nil, options.usesRayTracing)
