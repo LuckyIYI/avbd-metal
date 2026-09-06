@@ -4,6 +4,36 @@ import XCTest
 @testable import GPUSimRenderer
 
 final class MetalFXReconstructionTests: XCTestCase {
+    func testAuxiliaryHistoryUsesLiveBytesAcrossUnequalRingCapacities() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
+        else { throw XCTSkip("MetalFX unavailable") }
+        let fx = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: false)
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let stride = MemoryLayout<GPUSimRenderInstance>.stride
+        let ring = try [18,20,22].map { try XCTUnwrap(device.makeBuffer(length: $0 * stride, options: .storageModeShared)) }
+        var retained: MTLBuffer?
+        for frame in 0..<9 {
+            let source = ring[frame % 3]
+            memset(source.contents(), Int32(frame + 1), source.length)
+            let command = try XCTUnwrap(queue.makeCommandBuffer())
+            // A correspondence reset must also seed previous transforms from
+            // this frame, even when the active byte length has not changed.
+            _ = fx.beginFrame(camera: matrix_identity_float4x4, options: .qualityBeta, invalidate: frame == 6)
+            let previous = try fx.previous(source, key: "auxiliary", command: command, byteCount: 9 * stride)
+            XCTAssertEqual(fx.reset, frame == 0 || frame == 6)
+            XCTAssertEqual(previous.length, 9 * stride)
+            if let retained { XCTAssertTrue(previous === retained) }
+            retained = previous
+            let readback = try XCTUnwrap(device.makeBuffer(length: previous.length, options: .storageModeShared))
+            let blit = try XCTUnwrap(command.makeBlitCommandEncoder())
+            blit.copy(from: previous, sourceOffset: 0, to: readback, destinationOffset: 0, size: previous.length)
+            blit.endEncoding()
+            command.commit(); command.waitUntilCompleted()
+            XCTAssertEqual(command.status, .completed)
+            XCTAssertEqual(readback.contents().load(as: UInt8.self), frame < 6 ? 1 : 7)
+        }
+    }
+
     func testNeuralReconstructionReducesFreshNoiseAndResetsHistory() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: true) else { throw XCTSkip("MetalFX denoising unavailable") }
         let size = SIMD2(128, 96)

@@ -15,7 +15,7 @@ final class MetalFXReconstruction {
     private let device: MTLDevice
     private let encodeScaler: (MTLCommandBuffer, MTLTexture, SIMD2<Float>, Bool, simd_float4x4, simd_float4x4) -> Void
     private var snapshots: [String: MTLBuffer] = [:]
-    private var sources: [String: MTLBuffer] = [:]
+    private var sources: [String: (buffer: MTLBuffer, count: Int)] = [:]
     private(set) var reset = true
     private var frame: UInt32 = 0
     private var view = matrix_identity_float4x4
@@ -129,14 +129,23 @@ final class MetalFXReconstruction {
         return shift * camera
     }
 
-    func previous(_ source: MTLBuffer, key: String, command: MTLCommandBuffer) throws -> MTLBuffer {
-        sources[key] = source
-        if snapshots[key]?.length != source.length {
-            guard let buffer = device.makeBuffer(length: source.length, options: .storageModePrivate),
-                  let b = command.makeBlitCommandEncoder() else { throw Failure.allocation("previous geometry") }
+    /// Snapshot only live geometry, independent of a staging ring's spare capacity.
+    func previous(_ source: MTLBuffer, key: String, command: MTLCommandBuffer,
+                  byteCount: Int? = nil) throws -> MTLBuffer {
+        let count = byteCount ?? source.length
+        precondition(count > 0 && count <= source.length)
+        sources[key] = (source, count)
+        if snapshots[key]?.length != count {
+            guard let buffer = device.makeBuffer(length: count, options: .storageModePrivate)
+            else { throw Failure.allocation("previous geometry") }
             buffer.label = "Previous rendered \(key)"
-            b.copy(from: source, sourceOffset: 0, to: buffer, destinationOffset: 0, size: source.length)
-            b.endEncoding(); snapshots[key] = buffer; reset = true
+            snapshots[key] = buffer
+            reset = true
+        }
+        if reset {
+            guard let b = command.makeBlitCommandEncoder() else { throw Failure.encoder }
+            b.copy(from: source, sourceOffset: 0, to: snapshots[key]!, destinationOffset: 0, size: count)
+            b.endEncoding()
         }
         return snapshots[key]!
     }
@@ -146,7 +155,7 @@ final class MetalFXReconstruction {
         guard let b = command.makeBlitCommandEncoder() else { throw Failure.encoder }
         b.label = "Retain previous rendered geometry"
         for (key, source) in sources {
-            b.copy(from: source, sourceOffset: 0, to: snapshots[key]!, destinationOffset: 0, size: source.length)
+            b.copy(from: source.buffer, sourceOffset: 0, to: snapshots[key]!, destinationOffset: 0, size: source.count)
         }
         b.endEncoding()
         snapshots = snapshots.filter { sources[$0.key] != nil }

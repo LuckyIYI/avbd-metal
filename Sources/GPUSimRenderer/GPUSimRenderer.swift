@@ -1124,7 +1124,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = n;
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-(diffuseAmbient(n)*1.15)*ao)*in.albedo*indirect.a;
+        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-diffuseAmbient(n)*ao)*1.15*in.albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
@@ -1276,7 +1276,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = float3(0,0,1);
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-(SKY_IRR*1.1)*ao)*albedo*indirect.a;
+        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-SKY_IRR*ao)*1.1*albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world.xy - U.eye.xy));
     lit = mix(lit, HORIZON_LIN, fog);
@@ -1362,7 +1362,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public private(set) var sceneRevision = 0
     /// Called after a frame completes. This is useful for screenshots,
     /// telemetry, and embedding without coupling the package to app policy.
-    /// Set the view's `framebufferOnly` to `false` before reading texture bytes.
+    /// Installing a handler enables drawable readback (`framebufferOnly = false`).
+    /// The CPU-readable copy is valid for the duration of the callback; copy
+    /// its contents if they must outlive the callback.
     /// Bytes are sRGB encoded; Metal sampling decodes them. A Core Image
     /// texture import must use `linearSRGB` as its input color space, then
     /// export to `sRGB`, to preserve the displayed brightness.
@@ -1410,8 +1412,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
     // Metal callbacks run on an unspecified thread. Keep resource access on
     // the renderer actor; the callback only relays this actor-isolated value.
+    private let frameReadback = FrameReadback()
     @MainActor private struct CompletedFrameResources {
-        let texture: MTLTexture
+        let texture: MTLTexture?
         let snapshot: MTLCommandBuffer?
     }
 
@@ -1865,6 +1868,22 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 translucent.map(\.instance))
     }
 
+    // Source indices are the auxiliary API's implicit identities. Record each
+    // entry's classification before the caster partition, excluding its pose.
+    private var auxiliaryCorrespondence: [SIMD4<Float>] = []
+    func updateAuxiliaryHistory(_ values: [GPUSimRenderInstance]) {
+        let correspondence = values.map { instance -> SIMD4<Float> in
+            let opacity = instance.material.w
+            let category: Float = !opacity.isFinite || opacity <= 0 ? 0
+                : opacity < 1 ? 1 : instance.parameters.w > 0.5 ? 2 : 3
+            return SIMD4(instance.color.w, instance.parameters.x, instance.parameters.y, category)
+        }
+        if correspondence != auxiliaryCorrespondence {
+            prevVP = nil
+            auxiliaryCorrespondence = correspondence
+        }
+    }
+
     private func prepareAuxiliaryInstanceBuffer(
         _ values: [GPUSimRenderInstance],
         viewedFrom eye: F3
@@ -2024,6 +2043,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
     public func draw(in view: MTKView) {
         guard runtimeFailure == nil else { return }
+        let completionHandler = frameCompletionHandler
+        if completionHandler != nil { view.framebufferOnly = false }
         guard let destination = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable else { return }
 
@@ -2171,6 +2192,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let hasVisibleAuxiliary = activeAuxiliaryInstances.contains {
             $0.material.w.isFinite && $0.material.w > 0
         }
+        updateAuxiliaryHistory(activeAuxiliaryInstances)
         let auxiliaryBatch = prepareAuxiliaryInstanceBuffer(
             activeAuxiliaryInstances, viewedFrom: activeEye)
         if hasVisibleAuxiliary && auxiliaryBatch == nil {
@@ -2431,7 +2453,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             do {
                 var previous: [String: MTLBuffer] = [:]
                 let geometry: [(String, MTLBuffer?)] = [
-                    ("instances", instances), ("auxiliary", auxiliaryBatch?.buffer),
+                    ("instances", instances),
                     ("softPosition", renderScene.softRenderSurface?.positions),
                     ("softNormal", renderScene.softRenderSurface?.normals),
                     ("skin", renderScene.skinnedRenderSurface?.vertices),
@@ -2439,6 +2461,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     ("meshRotation", renderScene.rigidMeshRenderSurface?.rotations)
                 ]
                 for (key, buffer) in geometry { if let buffer { previous[key] = try metalFX.previous(buffer, key: key, command: cmd) } }
+                if let batch = auxiliaryBatch, batch.opaqueCount > 0 {
+                    previous["auxiliary"] = try metalFX.previous(batch.buffer, key: "auxiliary", command: cmd,
+                        byteCount: batch.opaqueCount * MemoryLayout<GPUSimRenderInstance>.stride)
+                }
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: metalFX.guidePass()) else { throw MetalFXReconstruction.Failure.encoder }
                 enc.label = "Reconstruction motion and material guides"
                 enc.setViewport(screenViewport)
@@ -2902,6 +2928,14 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             catch { reportFailure("edge antialiasing failed: \(error)"); return }
         }
 
+        let completedTexture: MTLTexture?
+        do {
+            completedTexture = completionHandler == nil ? nil : try frameReadback.copy(drawable.texture, command: cmd)
+        } catch {
+            reportFailure("could not preserve completed frame: \(error)")
+            return
+        }
+
         #if targetEnvironment(simulator)
         // the simulator SDK has no present(afterMinimumDuration:); pacing is
         // a device concern anyway
@@ -2916,7 +2950,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let retire = renderScene.renderSceneRequiresFrameRetirement
         framesDrawn += 1
         let frameNumber = framesDrawn
-        let completed = CompletedFrameResources(texture: drawable.texture, snapshot: snapshotSubmission)
+        let completed = CompletedFrameResources(texture: completedTexture, snapshot: snapshotSubmission)
         let inFlight = inFlightFrames
         cmd.addCompletedHandler { [weak self] finished in
             inFlight.signal()
@@ -2930,6 +2964,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             let error = finished.error as NSError?
             Task { @MainActor in
                 guard let self else { return }
+                defer { if let texture = completed.texture { self.frameReadback.recycle(texture) } }
                 self.lastFrameGPUMilliseconds = ms
                 if completed.snapshot?.status == .error {
                     self.reportFailure("render snapshot command failed: \(String(describing: completed.snapshot?.error))")
@@ -2943,7 +2978,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         "Metal command ended with status \(detail)")
                     return
                 }
-                self.frameCompletionHandler?(completed.texture, frameNumber)
+                if let texture = completed.texture { completionHandler?(texture, frameNumber) }
             }
         }
         releasedByCompletion = true
@@ -2953,6 +2988,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         // Solver-backed frames now own immutable snapshots. Conservative
         // third-party scenes may still require retirement of their live buffers.
         if retire {
+            defer { if let texture = completed.texture { frameReadback.recycle(texture) } }
             cmd.waitUntilCompleted()
             // the frame is complete: timing is current, and the completion
             // callback runs with finished pixels, before this call returns
@@ -2962,7 +2998,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 reportFailure(failure)
                 return
             }
-            frameCompletionHandler?(completed.texture, frameNumber)
+            if let texture = completed.texture { completionHandler?(texture, frameNumber) }
         }
 
         prevVP = vp

@@ -22,6 +22,33 @@ final class TopologyHistoryTests: XCTestCase {
                                    colorMode: GPUSimRenderColorMode, appearanceOverrides: MTLBuffer?) throws {}
     }
 
+    func testAuxiliaryRemovalAndCasterPartitionResetHistoryButMotionDoesNot() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+        let renderer = try GPUSimRenderer(device: device)
+        var values = (0..<10).map { i in
+            GPUSimRenderInstance(model: matrix_identity_float4x4, color: SIMD4(1,1,1,0),
+                                 parameters: SIMD4(0,0,1,Float(i % 2)))
+        }
+        renderer.updateAuxiliaryHistory(values)
+        func check(_ reset: Bool) {
+            renderer.prevVP = matrix_identity_float4x4
+            renderer.updateAuxiliaryHistory(values)
+            XCTAssertEqual(renderer.prevVP == nil, reset)
+        }
+        values[0].model.columns.3.x += 1
+        check(false)
+        values.removeFirst()
+        check(true)
+        check(false)
+        values[0].parameters.w = 1 - values[0].parameters.w
+        check(true)
+        values[0].material.w = 0.5
+        check(true)
+        values.removeAll()
+        check(true)
+        check(false)
+    }
+
     func testSameSizeTopologyEditsResetHistoryButMotionKeepsIt() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
         let scene = Scene(device), renderer = try GPUSimRenderer(device: device)

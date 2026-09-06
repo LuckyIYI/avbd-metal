@@ -186,20 +186,21 @@ model as well as the renderer.
   built with `castsShadow: true` (a visual skeleton, for example) joins
   the directional-shadow pass and expands the fitted light volume.
 - `renderSceneRequiresFrameRetirement` (scene protocol, default `true`)
-  keeps the synchronous frame wait GPUSolver requires. A scene whose
-  buffers are all triple-buffered or written inside the frame's own
-  command buffer may return `false`; CPU and GPU then pipeline, and
-  `frameCompletionHandler` fires from the command buffer's completion
-  instead of before `draw` returns - in both modes it runs only after
-  the frame's pixels are final.
+  retires frames synchronously for scenes exposing live mutable buffers.
+  Solver scenes use immutable render snapshots and pipeline their frames;
+  other scenes with independently owned frame resources may return `false`.
+  `frameCompletionHandler` runs on the main actor after GPU completion and
+  receives an owned CPU-readable copy, valid until the callback returns.
+  Installing a handler enables `framebufferOnly = false` and adds a copy;
+  no readback copy is made without a handler.
 - `rendererBodyAppearances` supplies per-frame body color/emission overrides.
 - `rendererAuxiliaryInstances` supplies per-frame app-owned world geometry.
 - `rendererDidFail(_:)` lets the host stop its loop and present the error.
 
-Physics and rendering currently use separate Metal command queues. The AVBD
-adapter synchronizes before rendering, and the renderer retires its frame
-before returning, preventing either queue from mutating shared pose buffers
-while the other reads them.
+Physics and rendering use separate Metal command queues. Solver snapshots
+copy pose data on the physics queue and signal a shared event; rendering
+waits for that event before reading the immutable snapshot. The solver can
+then advance while rendering proceeds without modifying the rendered pose.
 
 ## Other GPU backends
 
