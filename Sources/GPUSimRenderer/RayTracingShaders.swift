@@ -137,10 +137,6 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
     RTVertex a = vertices[base], b = vertices[base+1], c = vertices[base+2];
     float4 nm = a.normal*bary.x+b.normal*bary.y+c.normal*bary.z;
     float4 mat = a.albedo*bary.x+b.albedo*bary.y+c.albedo*bary.z;
-    float3 materialP = a.position.xyz*bary.x+b.position.xyz*bary.y+c.position.xyz*bary.z;
-    float pattern = materialPattern(materialP, a.surfaceDetail, max(hit.distance/U.screen.z, diffuseOnly ? 0.02 : 0.003));
-    float4 material = applyMaterialPattern(pattern, a.surfaceDetail, mat.rgb, nm.w);
-    mat.rgb = material.rgb; nm.w = material.w;
     float3 emission = a.emissive.rgb*bary.x+b.emissive.rgb*bary.y+c.emissive.rgb*bary.z;
     float3 R = r.direction;
     float3 hitP = r.origin + R*hit.distance;
@@ -159,6 +155,10 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
         if (appearance.albedo.w > 0) mat.rgb = srgbToLin(appearance.albedo.rgb);
         emission = appearance.emissive.rgb;
     }
+    float3 materialP = a.position.xyz*bary.x+b.position.xyz*bary.y+c.position.xyz*bary.z;
+    float pattern = materialPattern(materialP, a.surfaceDetail, max(hit.distance/U.screen.z, diffuseOnly ? 0.02 : 0.003));
+    float4 material = applyMaterialPattern(pattern, a.surfaceDetail, mat.rgb, nm.w);
+    mat.rgb = material.rgb; nm.w = material.w;
     if (diffuseOnly) {
         // This pass transports diffuse bounce light, excluding the sparse
         // specular-caustic paths that require a different sampling strategy.
