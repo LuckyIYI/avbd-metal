@@ -94,8 +94,8 @@ final class MetalFXReconstructionTests: XCTestCase {
         let pipeline = try device.makeRenderPipelineState(descriptor: d)
         let fx = try MetalFXReconstruction(device: device,size: SIMD2(64,64),denoising: false)
         func buffer<T>(_ values: [T]) throws -> MTLBuffer { try XCTUnwrap(values.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!,length: $0.count,options: .storageModeShared) }) }
-        // Each rigid vertex is three float4 values, with body ID 0 packed in position.w.
-        let vertices = try buffer([SIMD4<Float>(-0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4(0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4(0,0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0)])
+        // Each rigid vertex is four float4 values, with body ID 0 packed in position.w.
+        let vertices = try buffer([SIMD4<Float>(-0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4<Float>.zero, SIMD4(0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4<Float>.zero, SIMD4(0,0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4<Float>.zero])
         let current = try buffer([SIMD4<Float>(0.125,0,0,0)]), previous = try buffer([SIMD4<Float>.zero]), rotation = try buffer([SIMD4<Float>(0,0,0,1)])
         var camera = matrix_identity_float4x4; camera.columns.3.y = 0.125
         var guide = MetalFXReconstruction.GuideUniforms(current: camera,previous: matrix_identity_float4x4,size: SIMD4(64,64,0,0))

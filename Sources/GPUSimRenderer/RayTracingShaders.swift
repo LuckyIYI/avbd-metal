@@ -1,7 +1,7 @@
 let rayTracingShaderSource = """
 #include <metal_raytracing>
 using namespace raytracing;
-struct RTVertex { float4 position; float4 normal; float4 albedo; float4 emissive; };
+struct RTVertex { float4 position; float4 normal; float4 albedo; float4 emissive; float4 surfaceDetail; };
 struct RTObject { uint vertexStart; uint source; uint index; uint asset; };
 struct RTInstance {
     packed_float3 transform[4];
@@ -50,7 +50,7 @@ kernel void rt_deform(device RTVertex* output [[buffer(0)]], device const uint* 
     uint i [[thread_position_in_grid]]) {
     if (i >= config.x) return;
     uint packed = corners[i], comp = packed >> 24;
-    RTVertex v; v.emissive = float4(0);
+    RTVertex v; v.emissive = float4(0); v.surfaceDetail = float4(0);
     if (config.y == 1) {
         uint body = packed & 0x001FFFFFu, side = (packed >> 23) & 1u, rim = (packed >> 22) & 1u;
         float4 nt = normals[body];
@@ -137,6 +137,10 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
     RTVertex a = vertices[base], b = vertices[base+1], c = vertices[base+2];
     float4 nm = a.normal*bary.x+b.normal*bary.y+c.normal*bary.z;
     float4 mat = a.albedo*bary.x+b.albedo*bary.y+c.albedo*bary.z;
+    float3 materialP = a.position.xyz*bary.x+b.position.xyz*bary.y+c.position.xyz*bary.z;
+    float pattern = materialPattern(materialP, a.surfaceDetail, max(hit.distance/U.screen.z, diffuseOnly ? 0.02 : 0.003));
+    float4 material = applyMaterialPattern(pattern, a.surfaceDetail, mat.rgb, nm.w);
+    mat.rgb = material.rgb; nm.w = material.w;
     float3 emission = a.emissive.rgb*bary.x+b.emissive.rgb*bary.y+c.emissive.rgb*bary.z;
     float3 R = r.direction;
     float3 hitP = r.origin + R*hit.distance;
@@ -166,9 +170,9 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
         float visibility = dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
         float3 F0 = mix(float3(0.04),mat.rgb,mat.a);
         float3 F = F0+(1-F0)*pow(1-saturate(dot(L,H)),5.0);
-        float3 bounce = mat.rgb*(1-mat.a)*(diffuseAmbient(hitN)
+        float3 bounce = mat.rgb*(1-mat.a)*(diffuseAmbient(hitN,U)
             +SUN_COL/M_PI_F*saturate(dot(hitN,L))*visibility*(1-F));
-        if (object.source==3) bounce = mat.rgb*(diffuseAmbient(hitN)*1.15
+        if (object.source==3) bounce = mat.rgb*(diffuseAmbient(hitN,U)*1.15
             +SUN_COL/M_PI_F*max((dot(hitN,L)+0.35)/1.35,0.0)*visibility);
         return float4(bounce+emission,1);
     }
@@ -222,7 +226,7 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
         ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
         float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance);
-        float3 incoming = hit.w > 0 ? hit.rgb : screenEnvironment(R);
+        float3 incoming = hit.w > 0 ? hit.rgb : screenEnvironment(R,U);
         float viewLambda = rtSmithLambda(localV.z,alpha);
         float masking = (1+viewLambda)/(1+viewLambda+rtSmithLambda(NdR,alpha));
         // BRDF*cos/pdf for visible-normal sampling simplifies to Fresnel*G2/G1.
@@ -233,7 +237,7 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     }
     // A below-surface sample has zero incoming radiance, but still replaces
     // the analytic raster environment, exactly like every other HQ sample.
-    correctionSum -= screenEnvironment(reflect(-V,N))*reflectionFactor(P,N,nr.w,receiver.rgb,receiver.a,U);
+    correctionSum -= screenEnvironment(reflect(-V,N),U)*reflectionFactor(P,N,nr.w,receiver.rgb,receiver.a,U);
     float confidence = 1-smoothstep(U.effects.w-0.15,U.effects.w,nr.w);
     correctionSum *= (1-horizonFog(length(P-U.eye.xyz)))*confidence;
     output.write(float4(correctionSum,coverage*confidence),pixel);

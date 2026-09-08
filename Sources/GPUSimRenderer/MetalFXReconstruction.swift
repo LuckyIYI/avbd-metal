@@ -197,6 +197,7 @@ inline ReconstructionOut reconstructionGuides(float3 world, float3 previous, flo
 }
 fragment ReconstructionOut reconstruction_fragment(VOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
                                                      constant ReconstructionUniforms& R [[buffer(2)]]) {
+    in = texturedSurface(in);
     float3 n = normalize(in.normal);
     if (in.flatShade > 0.5) n = normalize(cross(dfdx(in.world), dfdy(in.world)));
     if (dot(n, U.eye.xyz-in.world)<0) n = -n;

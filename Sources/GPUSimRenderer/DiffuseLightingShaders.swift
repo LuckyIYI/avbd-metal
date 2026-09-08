@@ -1,8 +1,8 @@
 /// Diffuse radiance is stored without receiver albedo so spatial reconstruction
 /// cannot smear material colors. Rays use world geometry, including offscreen hits.
 let diffuseCommonShaderSource = """
-inline float3 diffuseAmbient(float3 N) { return mix(GND_IRR,SKY_IRR,N.z*0.5+0.5); }
-inline float3 diffuseEnvironment(float3 R) {
+inline float3 diffuseAmbient(float3 N, constant Uniforms& U) { return mix(GND_IRR,SKY_IRR,N.z*0.5+0.5); }
+inline float3 diffuseEnvironment(float3 R, constant Uniforms& U) {
     // The cosine-weighted integral of R is 2/3 N. This linear environment
     // therefore integrates to the renderer's existing analytic diffuse sky.
     return mix(GND_IRR,SKY_IRR,R.z*0.75+0.5);
@@ -104,8 +104,8 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
             // negative. Clipping that before denoising would bias dark rooms
             // brighter. Sample nonnegative incoming radiance instead, then
             // subtract the exact baseline expected by the compositor.
-            sum += (hit.w>0 ? hit.rgb : diffuseEnvironment(R))-diffuseAmbient(N);
-        } else if (hit.w>0) sum += hit.rgb-diffuseEnvironment(R);
+            sum += (hit.w>0 ? hit.rgb : diffuseEnvironment(R,U))-diffuseAmbient(N,U);
+        } else if (hit.w>0) sum += hit.rgb-diffuseEnvironment(R,U);
     }
     // cos(theta)/pi cancels the cosine-hemisphere PDF: no extra pi or albedo.
     output.write(float4(sum/float(samples),1),pixel);

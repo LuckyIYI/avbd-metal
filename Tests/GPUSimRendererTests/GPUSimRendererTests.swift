@@ -21,7 +21,7 @@ final class GPUSimRendererTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GPUSimRenderInstance>.stride, 112)
         XCTAssertEqual(MemoryLayout<GPUSimRenderAppearance>.stride, 32)
         XCTAssertEqual(MemoryLayout<GPUSimSkinRenderVertex>.stride, 32)
-        XCTAssertEqual(MemoryLayout<GPUSimRigidMeshRenderVertex>.stride, 48)
+        XCTAssertEqual(MemoryLayout<GPUSimRigidMeshRenderVertex>.stride, 64)
     }
 
     func testLiveSourceDefaultsRequireOnlyAScene() {

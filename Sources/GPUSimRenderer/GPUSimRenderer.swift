@@ -31,6 +31,8 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// World-space direction in which sunlight travels (not toward the sun).
     /// Normalized at render time. Zero/nonfinite inputs fall back to the default.
     /// Shared by raster shadows, contact shadows, HQ rays and material shading.
+    /// Indirect sky/ground exposure in stops, clamped to -4...4. Zero preserves the default.
+    public var ambientExposure: Float = 0
     public var sunDirection: F3
     public var lightingMode: GPUSimLightingMode
     public var colorMode: GPUSimRenderColorMode
@@ -72,6 +74,8 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
 
     func resolved(supportsHQ: Bool) -> Self {
         var result = self
+        result.ambientExposure = ambientExposure.isFinite ? min(ambientExposure, 4) : 0
+        result.ambientExposure = max(result.ambientExposure, -4)
         let magnitude = max(abs(sunDirection.x), max(abs(sunDirection.y), abs(sunDirection.z)))
         if sunDirection.x.isFinite && sunDirection.y.isFinite && sunDirection.z.isFinite && magnitude > 0 {
             result.sunDirection = normalize(sunDirection / magnitude)
@@ -297,12 +301,16 @@ public struct GPUSimRigidMeshRenderVertex {
     public var positionBody: SIMD4<Float>
     public var normal: SIMD4<Float>
     public var color: SIMD4<Float>
+    /// xyz: procedural kind (0 none, 1 stone, 2 wood, 3 ceramic), scale, strength; w: bump metres.
+    public var surfaceDetail: SIMD4<Float>
 
     public init(
         positionBody: SIMD4<Float>,
         normal: SIMD4<Float>,
-        color: SIMD4<Float>
+        color: SIMD4<Float>,
+        surfaceDetail: SIMD4<Float> = .zero
     ) {
+        self.surfaceDetail = surfaceDetail
         self.positionBody = positionBody
         self.normal = normal
         self.color = color
@@ -602,6 +610,7 @@ struct RigidMeshVertex {
     float4 positionBody; // xyz body-local; w stores uint body id bits
     float4 normal;
     float4 color;
+    float4 surfaceDetail;
 };
 
 struct Uniforms {
@@ -646,13 +655,15 @@ struct VOut {
     float3 emissive;
     float opacity;
     float flatShade;
+    float3 materialPosition;
+    float4 surfaceDetail;
     float2 pbr; // perceptual roughness, metallic
 };
 
 #define HORIZON_LIN float3(0.78, 0.81, 0.85)
 #define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4)
-#define SKY_IRR float3(0.30, 0.33, 0.38)
-#define GND_IRR float3(0.20, 0.185, 0.17)
+#define SKY_IRR (float3(0.30, 0.33, 0.38) * exp2(U.rayScene.y))
+#define GND_IRR (float3(0.20, 0.185, 0.17) * exp2(U.rayScene.y))
 
 inline float3 srgbToLin(float3 c) { return c * c * (0.7 + 0.3 * c); } // fast approx
 
@@ -791,6 +802,7 @@ constant float3 cubeNormals[6] = {
 inline VOut collapse() {
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = float4(0, 0, -2, 1);
     o.normal = float3(0); o.world = float3(0); o.albedo = float3(0);
@@ -806,6 +818,7 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
                             normalize(inst.model[2].xyz));
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * world;
     o.normal = rot * n;
@@ -951,6 +964,7 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * (side == 0 ? 1.0 : -1.0) * 0.95);
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
@@ -984,6 +998,7 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     SkinRenderVertex sv = verts[v];
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(sv.position.xyz, 1);
     o.world = sv.position.xyz;
@@ -1017,11 +1032,14 @@ vertex VOut rigid_mesh_vertex(
     float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(world, 1);
     o.world = world;
     o.previousWorld = writesMotion ? previousPrimary[body].xyz + rigidMeshRotate(previousSecondary[body], v.positionBody.xyz) : world;
     o.normal = normalize(rigidMeshRotate(q, v.normal.xyz));
+    o.materialPosition = v.positionBody.xyz;
+    o.surfaceDetail = v.surfaceDetail;
     o.albedo = srgbToLin(v.color.rgb);
     if (v.normal.w > 0.0) o.pbr = float2(clamp(v.normal.w, 0.02, 1.0),
                                        clamp(v.color.w, 0.0, 1.0));
@@ -1049,6 +1067,7 @@ fragment float4 convex_debug_wire_fragment(VOut in [[stage_in]])
 }
 
 // ---------------------------------------------------------------------------
+\(proceduralMaterialShaderSource)
 \(screenSpaceCommonShaderSource)
 
 // PBR main fragment (samples ambient and direct visibility)
@@ -1065,6 +1084,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenMaterial [[texture(5)]],
                              texture2d<float> diffuse [[texture(6)]])
 {
+    in = texturedSurface(in);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
@@ -1073,7 +1093,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
     if (U.diffuse.x > 0 && U.rayTracing.z == 0 && in.pbr.y < 0.99) {
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,n,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(n)+indirect.rgb,float3(0))-diffuseAmbient(n)*ao)
+        lit += (max(diffuseAmbient(n,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)
             * in.albedo*(1-saturate(in.pbr.y))*indirect.a;
     }
     float3 correction = float3(0);
@@ -1097,6 +1117,7 @@ struct PreOut {
 };
 
 fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
+    in = texturedSurface(in);
     PreOut o;
     o.norm = float4(normalize(in.normal), clamp(in.pbr.x, 0.02, 1.0));
     return o;
@@ -1136,7 +1157,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = n;
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-diffuseAmbient(n)*ao)*1.15*in.albedo*indirect.a;
+        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)*1.15*in.albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
@@ -1160,6 +1181,7 @@ vertex VOut soft_vertex_front(uint vid [[vertex_id]],
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * 0.95);
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
@@ -1288,7 +1310,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = float3(0,0,1);
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-SKY_IRR*ao)*1.1*albedo*indirect.a;
+        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-SKY_IRR*ao)*1.1*albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world.xy - U.eye.xy));
     lit = mix(lit, HORIZON_LIN, fog);
@@ -2352,6 +2374,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          diffuse: SIMD4(activeOptions.usesDiffuseGI ? 1 : 0,0,0,0),
                          aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                              1 / projection.columns.0.x, 1 / projection.columns.1.y))
+        U.rayScene.y = activeOptions.ambientExposure
         if let metalFX { U.reconstruction = SIMD4(1, metalFX.jitter.x / renderSize.x, metalFX.jitter.y / renderSize.y, Float(frameIdx % 4096)) }
         func bindAppearance(
             _ encoder: MTLRenderCommandEncoder,

@@ -138,6 +138,7 @@ public struct RigidMeshVertexGPU {
     public var positionBody: SIMD4<Float> = .zero
     public var normal: SIMD4<Float> = .zero
     public var color: SIMD4<Float> = .zero
+    public var surfaceDetail: SIMD4<Float> = .zero
 }
 
 public struct SoftContactGPU {

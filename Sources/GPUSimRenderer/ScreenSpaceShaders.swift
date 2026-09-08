@@ -33,8 +33,8 @@ inline float screenNoise(uint2 p) {
     h ^= h >> 14;
     return float(h & 65535u) / 65536.0;
 }
-inline float3 screenEnvironment(float3 R) {
-    return mix(HORIZON_LIN, float3(0.42, 0.48, 0.58), clamp(R.z, 0.0, 1.0));
+inline float3 screenEnvironment(float3 R, constant Uniforms& U) {
+    return mix(HORIZON_LIN, float3(0.42, 0.48, 0.58), clamp(R.z, 0.0, 1.0)) * exp2(U.rayScene.y);
 }
 
 // Tokuyoshi/Kaplanyan (I3D 2019), normal-based isotropic NDF filtering.
@@ -112,7 +112,7 @@ inline float3 pbrRadiance(float3 albedo, float rough, float metal, float3 emissi
     float3 irr = mix(GND_IRR, SKY_IRR, n.z * 0.5 + 0.5);
     float3 ambient = albedo * irr * (1.0 - metal) * ao;
     float3 R = reflect(-V, n);
-    float3 skyRef = screenEnvironment(R);
+    float3 skyRef = screenEnvironment(R,U);
     ambient += skyRef * (F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0))
         * mix(0.50, 0.20, rough) * specularOcclusion(NdV,ao,rough,U);
 
@@ -157,6 +157,8 @@ struct SurfaceOut { float4 normal [[color(0)]]; float4 material [[color(1)]]; };
 fragment SurfaceOut surface_fragment(VOut in [[stage_in]]) {
     SurfaceOut o;
     float3 n = normalize(in.normal);
+    in = texturedSurface(in);
+    n = normalize(in.normal);
     o.normal = float4(n, specularRoughness(n,clamp(in.pbr.x,0.02,1.0),0.5));
     o.material = float4(in.albedo, saturate(in.pbr.y));
     return o;
@@ -332,7 +334,7 @@ fragment float4 reflection_fragment(FSOut in [[stage_in]], constant Uniforms& U 
                             + P.z * cross(U.camRight.xyz, U.camUp.xyz))), normalize(nr.xyz));
     // Replace the covered portion of the existing environment term instead
     // of adding a second copy of specular illumination.
-    float3 correction = (incoming - screenEnvironment(worldR)) * response
+    float3 correction = (incoming - screenEnvironment(worldR,U)) * response
         * specularOcclusion(NdV,ao.read(pixel).r,rough,U);
     correction *= 1.0 - horizonFog(length(P));
     return float4(correction * confidence, confidence);

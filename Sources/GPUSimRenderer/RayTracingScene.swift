@@ -13,6 +13,7 @@ final class RayTracingScene {
         var normal: SIMD4<Float> // w = roughness
         var albedo: SIMD4<Float> // w = metallic
         var emissive = SIMD4<Float>.zero
+        var surfaceDetail = SIMD4<Float>.zero
     }
     struct Object {
         var vertexStart: UInt32
@@ -175,7 +176,7 @@ final class RayTracingScene {
                     let metal = input.normal.w > 0 ? max(0, min(input.color.w, 1)) : 0
                     groups[body, default: []].append(Vertex(position: SIMD4(input.positionBody.x, input.positionBody.y, input.positionBody.z, 1),
                         normal: SIMD4(input.normal.x, input.normal.y, input.normal.z, rough),
-                        albedo: SIMD4(c*c*(SIMD3(repeating: 0.7)+c*0.3), metal)))
+                        albedo: SIMD4(c*c*(SIMD3(repeating: 0.7)+c*0.3), metal), surfaceDetail: input.surfaceDetail))
                 }
             }
             for body in groups.keys.sorted() {
