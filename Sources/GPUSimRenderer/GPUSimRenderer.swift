@@ -301,7 +301,7 @@ public struct GPUSimRigidMeshRenderVertex {
     public var positionBody: SIMD4<Float>
     public var normal: SIMD4<Float>
     public var color: SIMD4<Float>
-    /// xyz: procedural kind (0 none, 1 stone, 2 wood, 3 ceramic), scale, strength; w: bump metres.
+    /// xyz: procedural kind (0 none, 1 stone, 2 wood, 3 ceramic, 4/5 wood Y/Z), scale, strength; w: bump metres.
     public var surfaceDetail: SIMD4<Float>
 
     public init(

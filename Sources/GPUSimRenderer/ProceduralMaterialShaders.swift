@@ -25,13 +25,16 @@ inline float materialPattern(float3 p, float4 detail, float footprint) {
         float pore = smoothstep(0.73,0.87,filteredMaterialNoise(p*420,footprint*420));
         return clamp(0.5+(cloud-0.5)*0.7+(grain-0.5)*0.9-pore*0.7,0.0,1.0);
     }
-    if (detail.x < 2.5) {
-        // Oak along local X. Broad growth bands and fine wandering fibres.
-        float warp = materialNoise(p*float3(1.6,8,8));
-        float bands = sin(p.y*160 + p.z*85 + warp*12)*0.5+0.5;
-        bands = mix(bands,0.5,smoothstep(0.3,1.2,footprint*30));
-        float fibres = filteredMaterialNoise(p*float3(3,360,140),footprint*360);
-        return clamp(0.18+bands*0.48+fibres*0.34,0.0,1.0);
+    if (detail.x < 2.5 || detail.x > 3.5) {
+        // Grain axes: 2 local X, 4 local Y, 5 local Z. Irregular fibres avoid
+        // repeating sine-wave stripes on long joinery pieces.
+        if (detail.x > 4.5) p = p.zyx;
+        else if (detail.x > 3.5) p = p.yxz;
+        float warp = materialNoise(p*float3(1.4,5,5));
+        float3 q = p + float3(0,warp*0.009,warp*0.006);
+        float growth = filteredMaterialNoise(q*float3(1.8,48,48),footprint*48);
+        float fibres = filteredMaterialNoise(q*float3(4,380,120),footprint*380);
+        return clamp(growth*0.65+fibres*0.35,0.0,1.0);
     }
     return 0.5+(filteredMaterialNoise(p*95,footprint*95)-0.5)*0.6;
 }

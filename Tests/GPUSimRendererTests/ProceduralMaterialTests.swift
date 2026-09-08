@@ -14,10 +14,13 @@ final class ProceduralMaterialTests: XCTestCase {
             float3 base = pbrRadiance(float3(0.5),0.6,0,float3(0),float3(0,0,-1),normalize(float3(0.1,0,-1)),1,0,lighting[0]);
             float3 bright = pbrRadiance(float3(0.5),0.6,0,float3(0),float3(0,0,-1),normalize(float3(0.1,0,-1)),1,0,lighting[1]);
             out[i] = float4(fine,coarse,base.x,bright.x);
+            out[128+i] = float4(materialPattern(p,float4(2,1,0.3,0),0.0001),
+                materialPattern(p.yxz,float4(4,1,0.3,0),0.0001),
+                materialPattern(p.zyx,float4(5,1,0.3,0),0.0001),0);
         }
         """, options: nil)
         let state = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "material_probe")))
-        let output = try XCTUnwrap(device.makeBuffer(length: 128*16, options: .storageModeShared))
+        let output = try XCTUnwrap(device.makeBuffer(length: 256*16, options: .storageModeShared))
         let uniforms = try XCTUnwrap(device.makeBuffer(length: MemoryLayout<Uniforms>.stride*2, options: .storageModeShared))
         memset(uniforms.contents(),0,uniforms.length)
         let u = uniforms.contents().bindMemory(to: Uniforms.self, capacity: 2)
@@ -29,10 +32,12 @@ final class ProceduralMaterialTests: XCTestCase {
         encoder.dispatchThreads(MTLSize(width: 128,height: 1,depth: 1), threadsPerThreadgroup: MTLSize(width: 32,height: 1,depth: 1))
         encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
         XCTAssertEqual(command.status, .completed)
-        let pixels = output.contents().bindMemory(to: SIMD4<Float>.self, capacity: 128)
+        let pixels = output.contents().bindMemory(to: SIMD4<Float>.self, capacity: 256)
         let values = (0..<128).map { pixels[$0].x }
         XCTAssertGreaterThan(values.max()!-values.min()!, 0.2)
         for i in 0..<128 {
+            XCTAssertEqual(pixels[128+i].x,pixels[128+i].y,accuracy: 1e-6)
+            XCTAssertEqual(pixels[128+i].x,pixels[128+i].z,accuracy: 1e-6)
             XCTAssertEqual(pixels[i].y,0.5)
             XCTAssertEqual(pixels[i].w,pixels[i].z*4,accuracy: 1e-5)
         }
