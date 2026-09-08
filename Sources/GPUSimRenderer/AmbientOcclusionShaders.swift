@@ -2,13 +2,14 @@
 /// GTAO slice integration: Jimenez et al. 2016.
 /// Finite intervals: Therrien et al. 2023, https://arxiv.org/abs/2301.11376.
 let ambientOcclusionShaderSource = gtaoSamplingShaderSource + """
-inline float3 gtaoGeometricNormal(uint2 pixel, float3 P, float3 N,
+inline float3 gtaoGeometricNormal(uint2 pixel, float centerDepth, float3 P, float3 N,
     constant Uniforms& U, depth2d<float> depthTex) {
     float centerZ = P.z;
     float2 pixelToView = 2.0 * U.aoProjection.zw / U.screen.xy;
-    // Reconstruct the geometric plane from the closest depth neighbor on
-    // each axis. Quad derivatives can span silhouettes and invent a plane
-    // between different objects. Smoothed normals remain the shading basis.
+    // A closer depth can belong to the other face of a concave crease.
+    // Select the side whose two depths extrapolate back to this receiver.
+    // Hardware depth is affine over a projected plane; linear view Z is not.
+    // Smoothed normals remain the shading basis.
     float3 neighbors[4];
     constexpr int2 axisOffsets[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
     float distances[4];
@@ -20,7 +21,12 @@ inline float3 gtaoGeometricNormal(uint2 pixel, float3 P, float3 N,
         float zq = valid ? U.aoProjection.y / (dq - U.aoProjection.x) : centerZ;
         neighbors[i] = float3((float2(q) + 0.5 - U.reconstruction.yz * U.screen.xy)
             * pixelToView - U.aoProjection.zw, 1.0) * zq;
-        distances[i] = valid ? abs(zq - centerZ) : INFINITY;
+        int2 q2 = int2(pixel) + axisOffsets[i] * 2;
+        bool valid2 = all(q2 >= 0) && all(q2 < int2(U.screen.xy));
+        float d2 = valid2 ? depthTex.read(uint2(q2)) : 1.0;
+        valid2 = valid2 && d2 < 1.0;
+        distances[i] = valid ? (valid2 ? abs((2.0 * dq - d2) - centerDepth)
+                                                     : abs(dq - centerDepth)) : INFINITY;
     }
     float3 dx = distances[0] < distances[1] ? P-neighbors[0] : neighbors[1]-P;
     float3 dy = distances[2] < distances[3] ? P-neighbors[2] : neighbors[3]-P;
@@ -79,7 +85,7 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     // instead of letting a few-pixel march invent large-scale occlusion
     float farFade = saturate((pxRadius - 2.5) / 6.0);
     if (farFade <= 0.0) return float4(1);
-    float3 geometricN = gtaoGeometricNormal(uint2(in.position.xy), P, N, U, depthTex);
+    float3 geometricN = gtaoGeometricNormal(uint2(in.position.xy), dC, P, N, U, depthTex);
     pxRadius = min(pxRadius, 96.0);
     // the falloff must use the radius we ACTUALLY march (post-clamp), or
     // near-camera AO reaches past its sampled range and over-darkens
