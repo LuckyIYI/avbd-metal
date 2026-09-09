@@ -357,7 +357,7 @@ inline float4 filterVisibility(FSOut in, constant Uniforms& U,
     float3 planeN = float3(0);
     if (wantDirect) tolerance = max(0.003, P.z / U.screen.z * 1.5);
     if (wantAmbient) {
-        planeN = gtaoGeometricNormal(pixel, P, N, U, depth);
+        planeN = gtaoGeometricNormal(pixel, d, P, N, U, depth);
         planeTolerance = max(0.00025, P.z / U.screen.z * 0.25);
     }
     float2 sum = float2(0); float2 weights = float2(0);
