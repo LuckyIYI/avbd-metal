@@ -28,6 +28,10 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// Linear internal resolution for MetalFX, clamped to 0.5...1.
     public var reconstructionScale: Float
     public var reconstruction: GPUSimReconstruction { usesRayTracing ? .metalFX : .legacy }
+    /// World-space direction in which sunlight travels (not toward the sun).
+    /// Normalized at render time. Zero/nonfinite inputs fall back to the default.
+    /// Shared by raster shadows, contact shadows, HQ rays and material shading.
+    public var sunDirection: F3
     public var lightingMode: GPUSimLightingMode
     public var colorMode: GPUSimRenderColorMode
     public var showConvexCollisionGeometry: Bool
@@ -68,6 +72,12 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
 
     func resolved(supportsHQ: Bool) -> Self {
         var result = self
+        let magnitude = max(abs(sunDirection.x), max(abs(sunDirection.y), abs(sunDirection.z)))
+        if sunDirection.x.isFinite && sunDirection.y.isFinite && sunDirection.z.isFinite && magnitude > 0 {
+            result.sunDirection = normalize(sunDirection / magnitude)
+        } else {
+            result.sunDirection = normalize(F3(0.4, 0.25, -0.85))
+        }
         if usesRayTracing && !supportsHQ { result.lightingMode = .lightweight }
         if result.usesRayTracing {
             result.ambientOcclusion = false
@@ -89,8 +99,10 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         minimumFrameDuration: Double? = nil,
         lightingMode: GPUSimLightingMode = .lightweight,
         edgeAntialiasing: Bool = true,
-        reconstructionScale: Float = 0.67
+        reconstructionScale: Float = 0.67,
+        sunDirection: F3 = F3(0.4, 0.25, -0.85)
     ) {
+        self.sunDirection = sunDirection
         self.reconstructionScale = reconstructionScale
         self.lightingMode = lightingMode
         self.colorMode = colorMode
@@ -2254,7 +2266,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let projection = projectionMatrix(aspect: aspect)
         let unjitteredVP = projection * viewMatrix
         let vp = metalFX?.beginFrame(camera: unjitteredVP, view: viewMatrix, projection: projection, options: activeOptions, invalidate: prevVP == nil) ?? unjitteredVP
-        let lightDirection = normalize(F3(0.4, 0.25, -0.85))
+        let lightDirection = activeOptions.sunDirection
 
         // A camera-targeted, texel-stabilized orthographic light projection.
         // This keeps articulated robot detail crisp while preventing shadows
@@ -2289,7 +2301,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let shadowExtent = shadowFollowsContent
             ? max(1.0, contentBounds!.radius * 1.15)
             : max(1.5, min(length(activeFocus - activeEye) * 0.9, 40.0))
-        let lightUp = F3(0, 1, 0)
+        let lightUp = abs(lightDirection.y) > 0.95 ? F3(0, 0, 1) : F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
         let texelWorld = (2 * shadowExtent) / Float(GPUSimRenderer.shadowMapSize)
