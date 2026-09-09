@@ -64,7 +64,7 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
     device const RTVertex* vertices [[buffer(2)]], device const RTObject* objects [[buffer(3)]],
     device const RTInstance* instances [[buffer(4)]], device const RenderInstance* rigid [[buffer(5)]],
     device const RenderInstance* auxiliary [[buffer(6)]], device const RenderAppearance* appearances [[buffer(7)]],
-    constant uint& hasAppearance [[buffer(8)]], depth2d<float,access::read> depth [[texture(0)]],
+    constant uint& hasAppearance [[buffer(8)]], constant MaterialResources& materials [[buffer(10)]], depth2d<float,access::read> depth [[texture(0)]],
     texture2d<float,access::read> normal [[texture(1)]], texture2d<float,access::write> output [[texture(2)]],
     texture2d<float,access::read> material [[texture(3)]],
     texture2d<float,access::read> visibility [[texture(4)]],
@@ -96,7 +96,7 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
         float3 R = tangent*(sqrt(xi.x)*cos(phi))+bitangent*(sqrt(xi.x)*sin(phi))+N*sqrt(1-xi.x);
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
         ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
-        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,true);
+        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,true);
         // Control variate: open sky is integrated analytically and contributes
         // exactly zero noise. Only geometry changes the diffuse lighting.
         if (U.reconstruction.x > 0) {

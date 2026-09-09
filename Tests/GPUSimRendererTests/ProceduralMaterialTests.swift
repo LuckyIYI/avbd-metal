@@ -1,45 +1,88 @@
 import Metal
-import simd
 import XCTest
+import simd
+
 @testable import GPUSimRenderer
 
+@MainActor
 final class ProceduralMaterialTests: XCTestCase {
-    func testTextureVariationFilteringAndAmbientExposureOnGPU() throws {
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let library = try device.makeLibrary(source: renderShaderSource + """
-        kernel void material_probe(device float4* out [[buffer(0)]], constant Uniforms* lighting [[buffer(1)]], uint i [[thread_position_in_grid]]) {
-            float3 p = float3(float(i)*0.0037, float(i)*0.0071, 0.8225);
-            float4 d = float4(1,1,0.5,0.0002);
-            float fine = materialPattern(p,d,0.0001), coarse = filteredMaterialNoise(p*180,4);
-            float3 base = pbrRadiance(float3(0.5),0.6,0,float3(0),float3(0,0,-1),normalize(float3(0.1,0,-1)),1,0,lighting[0]);
-            float3 bright = pbrRadiance(float3(0.5),0.6,0,float3(0),float3(0,0,-1),normalize(float3(0.1,0,-1)),1,0,lighting[1]);
-            out[i] = float4(fine,coarse,base.x,bright.x);
-            out[128+i] = float4(materialPattern(p,float4(2,1,0.3,0),0.0001),
-                materialPattern(p.yxz,float4(4,1,0.3,0),0.0001),
-                materialPattern(p.zyx,float4(5,1,0.3,0),0.0001),0);
-        }
-        """, options: nil)
-        let state = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "material_probe")))
-        let output = try XCTUnwrap(device.makeBuffer(length: 256*16, options: .storageModeShared))
-        let uniforms = try XCTUnwrap(device.makeBuffer(length: MemoryLayout<Uniforms>.stride*2, options: .storageModeShared))
-        memset(uniforms.contents(),0,uniforms.length)
-        let u = uniforms.contents().bindMemory(to: Uniforms.self, capacity: 2)
-        u[0].lightDir = SIMD4(0,0,-1,0); u[1].lightDir = SIMD4(0,0,-1,0); u[1].rayScene.y = 2
-        let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
-        let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
-        encoder.setBuffer(uniforms, offset: 0, index: 1)
-        encoder.setComputePipelineState(state); encoder.setBuffer(output, offset: 0, index: 0)
-        encoder.dispatchThreads(MTLSize(width: 128,height: 1,depth: 1), threadsPerThreadgroup: MTLSize(width: 32,height: 1,depth: 1))
-        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
-        XCTAssertEqual(command.status, .completed)
-        let pixels = output.contents().bindMemory(to: SIMD4<Float>.self, capacity: 256)
-        let values = (0..<128).map { pixels[$0].x }
-        XCTAssertGreaterThan(values.max()!-values.min()!, 0.2)
-        for i in 0..<128 {
-            XCTAssertEqual(pixels[128+i].x,pixels[128+i].y,accuracy: 1e-6)
-            XCTAssertEqual(pixels[128+i].x,pixels[128+i].z,accuracy: 1e-6)
-            XCTAssertEqual(pixels[i].y,0.5)
-            XCTAssertEqual(pixels[i].w,pixels[i].z*4,accuracy: 1e-5)
-        }
+  func testImageChannelsAndInjectedProgramOnGPU() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let desc = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba8Unorm_srgb, width: 2, height: 2, mipmapped: false)
+    desc.usage = .shaderRead
+    desc.storageMode = .shared
+    let texture = try XCTUnwrap(device.makeTexture(descriptor: desc))
+    let pixels: [UInt8] = [128, 0, 0, 255, 128, 0, 0, 255, 128, 0, 0, 255, 128, 0, 0, 255]
+    pixels.withUnsafeBytes {
+      texture.replace(
+        region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0, withBytes: $0.baseAddress!,
+        bytesPerRow: 8)
     }
+    var image = GPUSimSurfaceMaterial()
+    image.baseColorTexture = texture
+    image.roughness = 0.37
+    var custom = image
+    custom.program = 1
+    custom.parameters = SIMD4(0.3, 0.7, 0.2, 0)
+    let programs = [
+      GPUSimMaterialProgram(
+        body: "surface.color = tint(context.parameters.xyz); surface.metallic = 0.8;",
+        supportingSource: "inline float3 tint(float3 value) { return value; }"),
+      GPUSimMaterialProgram(
+        body: "surface.color = tint(context.parameters.xyz);",
+        supportingSource: "inline float3 tint(float3 value) { return value * 0.5; }"),
+    ]
+    let resources = try GPUSimMaterialLibrary(
+      device: device, materials: [image, custom], programs: programs)
+    XCTAssertEqual(resources.textures.count, 1)
+    let source =
+      makeRenderShaderSource(programs: programs) + """
+        kernel void probe(device float4* output [[buffer(0)]], constant MaterialResources& resources [[buffer(10)]], uint i [[thread_position_in_grid]]) {
+            MaterialContext context = { float3(0),float2(0.5),0,float4(0) };
+            MaterialSample surface = {float3(0.9),0.6,0,float3(0),float3(0,0,1)};
+            surface = evaluateMaterial(i,context,surface,resources);
+            output[i] = float4(surface.color,surface.roughness);
+            output[4+i] = float4(surface.metallic);
+        }
+        """
+    let library = try device.makeLibrary(source: source, options: nil)
+    let pipeline = try device.makeComputePipelineState(
+      function: XCTUnwrap(library.makeFunction(name: "probe")))
+    let out = try XCTUnwrap(device.makeBuffer(length: 8 * 16, options: .storageModeShared))
+    let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+    let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+    encoder.setComputePipelineState(pipeline)
+    encoder.setBuffer(out, offset: 0, index: 0)
+    resources.bind(encoder)
+    encoder.dispatchThreads(
+      MTLSize(width: 4, height: 1, depth: 1),
+      threadsPerThreadgroup: MTLSize(width: 4, height: 1, depth: 1))
+    encoder.endEncoding()
+    command.commit()
+    command.waitUntilCompleted()
+    XCTAssertEqual(command.status, .completed, "\(String(describing: command.error))")
+    let result = out.contents().bindMemory(to: SIMD4<Float>.self, capacity: 8)
+    XCTAssertEqual(result[0].x, 0.9, accuracy: 0.0001)
+    XCTAssertEqual(result[1].x, 0.21586 * 0.9, accuracy: 0.003)  // hardware sRGB decode, not a gamma approximation
+    XCTAssertEqual(result[1].w, 0.37, accuracy: 0.0001)
+    XCTAssertEqual(result[2].x, 0.3, accuracy: 0.0001)
+    XCTAssertEqual(result[2].y, 0.7, accuracy: 0.0001)
+    XCTAssertEqual(result[6].x, 0.8, accuracy: 0.0001)
+    XCTAssertEqual(result[3].x, 0.9, accuracy: 0.0001)  // unknown ID is a safe vertex-material fallback
+    _ = try GPUSimRenderer(device: device, materials: resources)
+  }
+
+  func testInvalidMaterialAndProgramFailBeforeRendering() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    var m = GPUSimSurfaceMaterial()
+    m.roughness = .nan
+    XCTAssertThrowsError(try GPUSimMaterialLibrary(device: device, materials: [m]))
+    m.roughness = 0.5
+    m.program = 1
+    XCTAssertThrowsError(try GPUSimMaterialLibrary(device: device, materials: [m]))
+    let bad = try GPUSimMaterialLibrary(
+      device: device, programs: [.init(body: "this is not valid Metal;")])
+    XCTAssertThrowsError(try GPUSimRenderer(device: device, materials: bad))
+  }
 }

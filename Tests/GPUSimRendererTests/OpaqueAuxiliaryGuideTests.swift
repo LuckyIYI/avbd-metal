@@ -56,6 +56,7 @@ final class OpaqueAuxiliaryGuideTests: XCTestCase {
             pass.depthAttachment.loadAction = .clear; pass.depthAttachment.clearDepth = 1
             pass.depthAttachment.storeAction = .dontCare
             let encoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: pass))
+            try GPUSimMaterialLibrary(device: device).bind(encoder)
             encoder.setRenderPipelineState(guides ? guidePipeline : mainPipeline)
             encoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
             encoder.setFragmentBytes(&reconstruction, length: MemoryLayout<MetalFXReconstruction.GuideUniforms>.stride, index: 2)

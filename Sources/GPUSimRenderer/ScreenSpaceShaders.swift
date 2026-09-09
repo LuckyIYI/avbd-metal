@@ -154,10 +154,10 @@ inline float3 clothRadiance(float3 albedo, float3 emissive, float3 n, float3 V,
 
 let screenSpaceShaderSource = """
 struct SurfaceOut { float4 normal [[color(0)]]; float4 material [[color(1)]]; };
-fragment SurfaceOut surface_fragment(VOut in [[stage_in]]) {
+fragment SurfaceOut surface_fragment(VOut in [[stage_in]], constant MaterialResources& materials [[buffer(10)]]) {
     SurfaceOut o;
     float3 n = normalize(in.normal);
-    in = texturedSurface(in);
+    in = texturedSurface(in, materials);
     n = normalize(in.normal);
     o.normal = float4(n, specularRoughness(n,clamp(in.pbr.x,0.02,1.0),0.5));
     o.material = float4(in.albedo, saturate(in.pbr.y));

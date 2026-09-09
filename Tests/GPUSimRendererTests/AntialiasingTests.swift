@@ -100,6 +100,7 @@ final class AntialiasingTests: XCTestCase {
             pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,0); pass.colorAttachments[0].storeAction = .multisampleResolve
             let encoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: pass))
             var U = uniforms(width: width,height: height); U.rayTracing.w = reflection ? 1 : 0
+            try GPUSimMaterialLibrary(device: device).bind(encoder)
             encoder.setRenderPipelineState(pipeline)
             encoder.setFragmentBytes(&U,length: MemoryLayout<Uniforms>.stride,index: 1)
             for (i,texture) in [effects.visibility!,effects.depth!,effects.reflection!,effects.normal!,effects.depth!,effects.material!,effects.diffuse!].enumerated() {

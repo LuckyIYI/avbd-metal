@@ -257,3 +257,10 @@ its vertices; both paths then produce matching geometry. Hulls collide with
 hulls, boxes, spheres, capsules, and deformable triangle/tet surfaces. Torus is
 non-convex: any potentially colliding torus-hull pair is rejected explicitly
 when either CPU or GPU solver is constructed rather than silently omitted.
+
+## Render materials
+
+[Surface materials and asset import](MATERIALS.md) covers image PBR maps, caller-authored
+Metal material programs, resource limits, and the Model I/O OBJ/USD import path.
+[Material preview](Examples/Materials/README.md) renders a reproducible image-texture
+example in Fast and HQ modes without embedding scene-specific texture types in the engine.

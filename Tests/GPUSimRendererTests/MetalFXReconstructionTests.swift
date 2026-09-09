@@ -3,6 +3,7 @@ import simd
 import XCTest
 @testable import GPUSimRenderer
 
+@MainActor
 final class MetalFXReconstructionTests: XCTestCase {
     func testAuxiliaryHistoryUsesLiveBytesAcrossUnequalRingCapacities() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
@@ -104,6 +105,7 @@ final class MetalFXReconstructionTests: XCTestCase {
         u.viewProj.columns.3.x += 0.4/32; u.viewProj.columns.3.y -= 0.3/32
         let queue = try XCTUnwrap(device.makeCommandQueue()), command = try XCTUnwrap(queue.makeCommandBuffer())
         let e = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: fx.guidePass()))
+        try GPUSimMaterialLibrary(device: device).bind(e)
         e.setRenderPipelineState(pipeline)
         e.setVertexBuffer(vertices,offset: 0,index: 0); e.setVertexBytes(&u,length: MemoryLayout<Uniforms>.stride,index: 1)
         e.setVertexBuffer(current,offset: 0,index: 2); e.setVertexBuffer(rotation,offset: 0,index: 3)
@@ -141,6 +143,7 @@ final class MetalFXReconstructionTests: XCTestCase {
             let pipeline = try device.makeRenderPipelineState(descriptor: d)
             let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
             let e = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: fx.guidePass()))
+            try GPUSimMaterialLibrary(device: device).bind(e)
             e.setRenderPipelineState(pipeline); e.setVertexBuffer(corners,offset: 0,index: 0)
             e.setVertexBytes(&u,length: MemoryLayout<Uniforms>.stride,index: 1)
             e.setVertexBuffer(current,offset: 0,index: 2); e.setVertexBuffer(normals,offset: 0,index: 3)

@@ -13,7 +13,7 @@ final class RayTracingScene {
         var normal: SIMD4<Float> // w = roughness
         var albedo: SIMD4<Float> // w = metallic
         var emissive = SIMD4<Float>.zero
-        var surfaceDetail = SIMD4<Float>.zero
+        var uvMaterial = SIMD4<Float>.zero
     }
     struct Object {
         var vertexStart: UInt32
@@ -32,17 +32,20 @@ final class RayTracingScene {
         weak var value: RayTracingScene?
         init(_ value: RayTracingScene) { self.value = value }
     }
-    private static var worlds: [ObjectIdentifier: WeakEntry] = [:]
-    static func shared(scene: any GPUSimRenderableScene) throws -> RayTracingScene {
+    private struct Key: Hashable { let scene: ObjectIdentifier; let materials: ObjectIdentifier? }
+    private static var worlds: [Key: WeakEntry] = [:]
+    static func shared(scene: any GPUSimRenderableScene, materials: GPUSimMaterialLibrary? = nil) throws -> RayTracingScene {
+        let materialKey = materials.flatMap { $0.materialCount == 0 && $0.programs.isEmpty ? nil : ObjectIdentifier($0) }
         worlds = worlds.filter { $0.value.value?.scene != nil }
-        let key = ObjectIdentifier(scene)
+        let key = Key(scene: ObjectIdentifier(scene), materials: materialKey)
         if let existing = worlds[key]?.value { return existing }
-        let result = try RayTracingScene(scene: scene)
+        let result = try RayTracingScene(scene: scene, materials: materials ?? GPUSimMaterialLibrary(device: scene.renderDevice))
         worlds[key] = WeakEntry(result)
         return result
     }
 
     weak var scene: (any GPUSimRenderableScene)?
+    let materials: GPUSimMaterialLibrary
     let device: MTLDevice
     let queue: MTLCommandQueue
     private let instancesPipeline, deformationPipeline, shadowPipeline, reflectionPipeline, diffusePipeline: MTLComputePipelineState
@@ -74,7 +77,8 @@ final class RayTracingScene {
     private(set) var lastUpdate = UpdateStatistics()
     private let dummy: MTLBuffer
 
-    private init(scene: any GPUSimRenderableScene) throws {
+    private init(scene: any GPUSimRenderableScene, materials: GPUSimMaterialLibrary) throws {
+        self.materials = materials
         let device = scene.renderDevice
         guard device.supportsRaytracing else { throw Failure.unavailable }
         self.scene = scene
@@ -83,7 +87,7 @@ final class RayTracingScene {
               let dummy = device.makeBuffer(length: 256, options: .storageModeShared) else { throw Failure.allocation("ray tracing queue") }
         self.queue = queue
         self.dummy = dummy
-        let library = try device.makeLibrary(source: renderShaderSource + "\n" + rayTracingShaderSource, options: nil)
+        let library = try materials.shaderLibrary(rays: true)
         func pipeline(_ name: String) throws -> MTLComputePipelineState {
             guard let f = library.makeFunction(name: name) else { throw GPUSimRendererError.shaderFunction(name) }
             return try device.makeComputePipelineState(function: f)
@@ -176,7 +180,7 @@ final class RayTracingScene {
                     let metal = input.normal.w > 0 ? max(0, min(input.color.w, 1)) : 0
                     groups[body, default: []].append(Vertex(position: SIMD4(input.positionBody.x, input.positionBody.y, input.positionBody.z, 1),
                         normal: SIMD4(input.normal.x, input.normal.y, input.normal.z, rough),
-                        albedo: SIMD4(c*c*(SIMD3(repeating: 0.7)+c*0.3), metal), surfaceDetail: input.surfaceDetail))
+                        albedo: SIMD4(c*c*(SIMD3(repeating: 0.7)+c*0.3), metal), uvMaterial: input.uvMaterial))
                 }
             }
             for body in groups.keys.sorted() {
@@ -343,6 +347,7 @@ final class RayTracingScene {
         guard let e = command.makeComputeCommandEncoder() else { throw Failure.allocation("ray lighting encoder") }
         e.label = label
         e.setComputePipelineState(pipeline)
+        materials.bind(e)
         e.setAccelerationStructure(structure, bufferIndex: 0)
         e.useResource(structure, usage: .read)
         for asset in assets { e.useResource(asset.structure, usage: .read) }

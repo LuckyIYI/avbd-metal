@@ -3286,7 +3286,8 @@ public final class GPUSolver {
                         mesh.localRotation.act(mesh.normals[index]))
                     vertex.positionBody = SIMD4(position, bodyBits)
                     vertex.normal = SIMD4(normal, min(max(mesh.roughness, 0.02), 1))
-                    vertex.surfaceDetail = mesh.surfaceDetail
+                    let uv = mesh.textureCoordinates.isEmpty ? SIMD2<Float>.zero : mesh.textureCoordinates[index]
+                    vertex.uvMaterial = SIMD4(uv.x, uv.y, Float(mesh.materialID), 0)
                     vertex.color = color
                     vertices.append(vertex)
                 }

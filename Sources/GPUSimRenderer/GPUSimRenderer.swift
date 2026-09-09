@@ -301,16 +301,16 @@ public struct GPUSimRigidMeshRenderVertex {
     public var positionBody: SIMD4<Float>
     public var normal: SIMD4<Float>
     public var color: SIMD4<Float>
-    /// xyz: procedural kind (0 none, 1 stone, 2 wood, 3 ceramic, 4/5 wood Y/Z), scale, strength; w: bump metres.
-    public var surfaceDetail: SIMD4<Float>
+    /// xy: texture UV, z: one-based material ID (0 vertex appearance), w reserved.
+    public var uvMaterial: SIMD4<Float>
 
     public init(
         positionBody: SIMD4<Float>,
         normal: SIMD4<Float>,
         color: SIMD4<Float>,
-        surfaceDetail: SIMD4<Float> = .zero
+        uvMaterial: SIMD4<Float> = .zero
     ) {
-        self.surfaceDetail = surfaceDetail
+        self.uvMaterial = uvMaterial
         self.positionBody = positionBody
         self.normal = normal
         self.color = color
@@ -584,7 +584,7 @@ public extension GPUSimRendererSource {
 
 let renderShaderSource = makeRenderShaderSource()
 
-func makeRenderShaderSource(motionGuides: Bool = false) -> String {
+func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = []) -> String {
 """
 #include <metal_stdlib>
 using namespace metal;
@@ -610,7 +610,7 @@ struct RigidMeshVertex {
     float4 positionBody; // xyz body-local; w stores uint body id bits
     float4 normal;
     float4 color;
-    float4 surfaceDetail;
+    float4 uvMaterial;
 };
 
 struct Uniforms {
@@ -656,7 +656,7 @@ struct VOut {
     float opacity;
     float flatShade;
     float3 materialPosition;
-    float4 surfaceDetail;
+    float4 uvMaterial;
     float2 pbr; // perceptual roughness, metallic
 };
 
@@ -802,7 +802,7 @@ constant float3 cubeNormals[6] = {
 inline VOut collapse() {
     VOut o;
     o.previousWorld = float3(0);
-    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = float4(0, 0, -2, 1);
     o.normal = float3(0); o.world = float3(0); o.albedo = float3(0);
@@ -818,7 +818,7 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
                             normalize(inst.model[2].xyz));
     VOut o;
     o.previousWorld = float3(0);
-    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * world;
     o.normal = rot * n;
@@ -964,7 +964,7 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * (side == 0 ? 1.0 : -1.0) * 0.95);
     VOut o;
     o.previousWorld = float3(0);
-    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
@@ -998,7 +998,7 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     SkinRenderVertex sv = verts[v];
     VOut o;
     o.previousWorld = float3(0);
-    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(sv.position.xyz, 1);
     o.world = sv.position.xyz;
@@ -1032,14 +1032,14 @@ vertex VOut rigid_mesh_vertex(
     float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
     VOut o;
     o.previousWorld = float3(0);
-    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(world, 1);
     o.world = world;
     o.previousWorld = writesMotion ? previousPrimary[body].xyz + rigidMeshRotate(previousSecondary[body], v.positionBody.xyz) : world;
     o.normal = normalize(rigidMeshRotate(q, v.normal.xyz));
     o.materialPosition = v.positionBody.xyz;
-    o.surfaceDetail = v.surfaceDetail;
+    o.uvMaterial = v.uvMaterial;
     o.albedo = srgbToLin(v.color.rgb);
     if (v.normal.w > 0.0) o.pbr = float2(clamp(v.normal.w, 0.02, 1.0),
                                        clamp(v.color.w, 0.0, 1.0));
@@ -1067,7 +1067,7 @@ fragment float4 convex_debug_wire_fragment(VOut in [[stage_in]])
 }
 
 // ---------------------------------------------------------------------------
-\(proceduralMaterialShaderSource)
+\(makeSurfaceMaterialShaderSource(programs: programs))
 \(screenSpaceCommonShaderSource)
 
 // PBR main fragment (samples ambient and direct visibility)
@@ -1082,9 +1082,9 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenNormal [[texture(3)]],
                              depth2d<float> screenDepthTexture [[texture(4)]],
                              texture2d<float> screenMaterial [[texture(5)]],
-                             texture2d<float> diffuse [[texture(6)]])
+                             texture2d<float> diffuse [[texture(6)]], constant MaterialResources& materials [[buffer(10)]])
 {
-    in = texturedSurface(in);
+    in = texturedSurface(in, materials);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
@@ -1116,8 +1116,8 @@ struct PreOut {
     float4 norm [[color(0)]];
 };
 
-fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
-    in = texturedSurface(in);
+fragment PreOut prepass_fragment(VOut in [[stage_in]], constant MaterialResources& materials [[buffer(10)]]) {
+    in = texturedSurface(in, materials);
     PreOut o;
     o.norm = float4(normalize(in.normal), clamp(in.pbr.x, 0.02, 1.0));
     return o;
@@ -1181,7 +1181,7 @@ vertex VOut soft_vertex_front(uint vid [[vertex_id]],
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * 0.95);
     VOut o;
     o.previousWorld = float3(0);
-    o.materialPosition = float3(0); o.surfaceDetail = float4(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
@@ -1418,6 +1418,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var shadowTex: MTLTexture?
     var screenSpace: ScreenSpacePipeline!
     private var presentationColor, presentationDepth: MTLTexture?
+    private let materialLibrary: GPUSimMaterialLibrary
     private var rayWorld: RayTracingScene?
     public private(set) var activeReconstruction: GPUSimReconstruction = .legacy
     public private(set) var activeLightingMode: GPUSimLightingMode = .lightweight
@@ -1537,12 +1538,16 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// scene will be supplied later with ``setScene(_:resetCamera:)``.
     public init(
         device: MTLDevice,
-        scene: (any GPUSimRenderableScene)? = nil
+        scene: (any GPUSimRenderableScene)? = nil,
+        materials: GPUSimMaterialLibrary? = nil
     ) throws {
         if let scene, scene.renderDevice.registryID != device.registryID {
             throw GPUSimRendererError.sceneDeviceMismatch
         }
         self.device = device
+        let materials = try materials ?? GPUSimMaterialLibrary(device: device)
+        guard materials.device.registryID == device.registryID else { throw GPUSimRendererError.sceneDeviceMismatch }
+        self.materialLibrary = materials
         guard let queue = device.makeCommandQueue() else {
             throw GPUSimRendererError.commandQueue
         }
@@ -1550,8 +1555,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         self.scene = scene
         super.init()
 
-        let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
-        let motionLib = try device.makeLibrary(source: makeRenderShaderSource(motionGuides: true), options: nil)
+        let lib = try materials.shaderLibrary()
+        let motionLib = try materials.shaderLibrary(motionGuides: true)
         screenSpace = try ScreenSpacePipeline(device: device, library: lib)
         func pipe(_ v: String, _ f: String,
                   samples: Int = GPUSimRenderer.sampleCount,
@@ -2111,7 +2116,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let frameQueue: MTLCommandQueue
         do {
-            let nextWorld = activeOptions.usesRayTracing ? try RayTracingScene.shared(scene: renderScene) : nil
+            let nextWorld = activeOptions.usesRayTracing ? try RayTracingScene.shared(scene: renderScene, materials: materialLibrary) : nil
             frameQueue = nextWorld?.queue ?? queue
             // The ring semaphore limits outstanding frames, but does not order
             // different queues. Retire the old queue before even preparing the
@@ -2501,6 +2506,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         byteCount: batch.opaqueCount * MemoryLayout<GPUSimRenderInstance>.stride)
                 }
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: metalFX.guidePass()) else { throw MetalFXReconstruction.Failure.encoder }
+                materialLibrary.bind(enc)
                 enc.label = "Reconstruction motion and material guides"
                 enc.setViewport(screenViewport)
                 enc.setDepthStencilState(depthState)
@@ -2599,6 +2605,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             do {
                 let enc = prepassEncoder
+                materialLibrary.bind(enc)
                 enc.label = "Shared screen-space surfaces"
                 func surfacePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
                     activeOptions.usesHDR ? surfacePipelines[ObjectIdentifier(pipeline)]! : pipeline
@@ -2758,6 +2765,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             reportFailure("could not create the main render encoder")
             return
         }
+        materialLibrary.bind(enc)
         enc.label = "Main PBR pass"
         bindSurfaceLighting(enc)
         enc.setViewport(screenViewport)
