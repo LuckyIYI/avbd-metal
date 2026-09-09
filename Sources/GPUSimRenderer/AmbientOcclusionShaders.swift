@@ -12,7 +12,8 @@ inline float3 gtaoGeometricNormal(uint2 pixel, float centerDepth, float3 P, floa
     // Smoothed normals remain the shading basis.
     float3 neighbors[4];
     constexpr int2 axisOffsets[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
-    float distances[4];
+    float distances[4], adjacentErrors[4];
+    bool hasSecond[4];
     for (int i = 0; i < 4; ++i) {
         int2 q = int2((float2(pixel) + 0.5)) + axisOffsets[i];
         bool valid = all(q >= 0) && all(q < int2(U.screen.xy));
@@ -25,8 +26,19 @@ inline float3 gtaoGeometricNormal(uint2 pixel, float centerDepth, float3 P, floa
         bool valid2 = all(q2 >= 0) && all(q2 < int2(U.screen.xy));
         float d2 = valid2 ? depthTex.read(uint2(q2)) : 1.0;
         valid2 = valid2 && d2 < 1.0;
-        distances[i] = valid ? (valid2 ? abs((2.0 * dq - d2) - centerDepth)
-                                                     : abs(dq - centerDepth)) : INFINITY;
+        adjacentErrors[i] = valid ? abs(dq - centerDepth) : INFINITY;
+        hasSecond[i] = valid && valid2;
+        distances[i] = hasSecond[i] ? abs((2.0 * dq - d2) - centerDepth) : INFINITY;
+    }
+    // Compare like metrics within each axis. An extrapolation residual on
+    // an unrelated plane can be zero; it must not outrank an adjacent-depth
+    // difference merely because the other second tap is off-screen or empty.
+    for (int axis = 0; axis < 2; ++axis) {
+        int a = axis * 2, b = a + 1;
+        if (!(hasSecond[a] && hasSecond[b])) {
+            distances[a] = adjacentErrors[a];
+            distances[b] = adjacentErrors[b];
+        }
     }
     float3 dx = distances[0] < distances[1] ? P-neighbors[0] : neighbors[1]-P;
     float3 dy = distances[2] < distances[3] ? P-neighbors[2] : neighbors[3]-P;
