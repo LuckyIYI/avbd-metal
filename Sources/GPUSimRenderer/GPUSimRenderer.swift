@@ -28,11 +28,11 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// Linear internal resolution for MetalFX, clamped to 0.5...1.
     public var reconstructionScale: Float
     public var reconstruction: GPUSimReconstruction { usesRayTracing ? .metalFX : .legacy }
+    /// Indirect sky/ground exposure in stops, clamped to -4...4. Zero preserves the default.
+    public var ambientExposure: Float = 0
     /// World-space direction in which sunlight travels (not toward the sun).
     /// Normalized at render time. Zero/nonfinite inputs fall back to the default.
     /// Shared by raster shadows, contact shadows, HQ rays and material shading.
-    /// Indirect sky/ground exposure in stops, clamped to -4...4. Zero preserves the default.
-    public var ambientExposure: Float = 0
     public var sunDirection: F3
     public var lightingMode: GPUSimLightingMode
     public var colorMode: GPUSimRenderColorMode
