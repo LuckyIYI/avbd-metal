@@ -114,7 +114,7 @@ final class MaterialTextureTests: XCTestCase {
     defer { try? FileManager.default.removeItem(at: directory) }
     try image(at: directory.appendingPathComponent("color.png"))
     let mtl = directory.appendingPathComponent("fixture.mtl")
-    try "newmtl Image\nKd 1 1 1\nmap_Kd color.png\n".write(
+    try "newmtl Image\nKd 0.5 0.25 0.75\nmap_Kd color.png\n".write(
       to: mtl, atomically: true, encoding: .utf8)
     let obj = directory.appendingPathComponent("fixture.obj")
     try """
@@ -131,16 +131,26 @@ final class MaterialTextureTests: XCTestCase {
     let asset = try GPUSimAssetImporter.load(url: obj, device: device)
     let material = try XCTUnwrap(asset.materials.first)
     let texture = try XCTUnwrap(material.baseColorTexture)
+    XCTAssertEqual(material.baseColor, SIMD3<Float>(0.5, 0.25, 0.75), "OBJ Kd multiplies map_Kd")
     XCTAssertEqual(texture.width, 4)
     XCTAssertEqual(texture.mipmapLevelCount, 3)
     XCTAssertTrue([MTLPixelFormat.rgba8Unorm_srgb, .bgra8Unorm_srgb].contains(texture.pixelFormat))
+    // Black is an authored tint, not a missing-factor sentinel; white keeps
+    // the texture unchanged. Exercise both ends as well as the colored factor.
+    for value: Float in [0, 1] {
+      try "newmtl Image\nKd \(value) \(value) \(value)\nmap_Kd color.png\n".write(
+        to: mtl, atomically: true, encoding: .utf8)
+      let tinted = try GPUSimAssetImporter.load(url: obj, device: device)
+      XCTAssertEqual(tinted.materials.first?.baseColor, SIMD3<Float>(repeating: value))
+      XCTAssertNotNil(tinted.materials.first?.baseColorTexture)
+    }
     try "newmtl Image\nKd 1 1 1\nmap_Kd missing.png\n".write(
       to: mtl, atomically: true, encoding: .utf8)
     XCTAssertThrowsError(try GPUSimAssetImporter.load(url: obj, device: device)) { error in
       XCTAssertNotNil(error as? GPUSimAssetImporter.Failure, "importer errors use one enum: \(error)")
     }
     // Library validation failures are reported through the importer's enum too.
-    try "newmtl Image\nKd 1 1 1\nmap_Kd color.png\n".write(
+    try "newmtl Image\nKd 0.5 0.25 0.75\nmap_Kd color.png\n".write(
       to: mtl, atomically: true, encoding: .utf8)
     XCTAssertThrowsError(
       try GPUSimAssetImporter.load(url: obj, device: device, textureBudget: 1)

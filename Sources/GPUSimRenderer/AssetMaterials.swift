@@ -174,6 +174,11 @@ public enum GPUSimAssetImporter {
       }
       var m = GPUSimSurfaceMaterial()
       m.baseColor = color(factor(.baseColor), fallback: SIMD3(repeating: 1))
+      // Model I/O retains OBJ Kd on the texture property's float3Value.
+      // Unlike a USD connection, map_Kd multiplies this authored constant.
+      if url.pathExtension.lowercased() == "obj", let map = image(.baseColor) {
+        m.baseColor = map.float3Value
+      }
       m.roughness = min(max(scalar(factor(.roughness), fallback: image(.roughness) == nil ? 0.5 : 1), 0), 1)
       m.metallic = min(max(scalar(factor(.metallic), fallback: image(.metallic) == nil ? 0 : 1), 0), 1)
       m.emission = color(factor(.emission), fallback: .zero)

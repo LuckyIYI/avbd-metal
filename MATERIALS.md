@@ -120,9 +120,9 @@ The Model I/O path preserves triangle submeshes, material assignment, UVs, norma
 and flattened hierarchy transforms at time zero. Inverse-transpose normals and
 reversed winding handle mirrored/nonuniform transforms. It imports base color,
 roughness, metallic, tangent normal and emission maps/factors, deduplicating textures.
-An imported map replaces the constant for its channel (factor 1), matching USD
-connection semantics; authored USD inputs take precedence over Model I/O's
-default-named material properties, and out-of-range scalars are clamped to 0...1.
+An imported USD map replaces the constant for its channel (factor 1), matching USD
+connection semantics. OBJ color maps multiply the authored `Kd` tint. Authored USD
+inputs take precedence over Model I/O's default-named material properties, and out-of-range scalars are clamped to 0...1.
 Missing textured UVs, nontriangle topology, singular transforms, excessive geometry,
 and explicit nonopaque materials fail with errors. Every error thrown by `load` is a
 `GPUSimAssetImporter.Failure`; library and image-loader failures are mapped onto it.
