@@ -4,9 +4,11 @@ import simd
 
 /// Owns camera surfaces, visibility and radiance reconstruction. Geometry stays
 /// with the renderer; effects share projection, allocation and pass encoding.
+@MainActor
 final class ScreenSpacePipeline {
     enum Failure: Error { case allocation(String), encoder(String), shaderFunction(String) }
     let device: MTLDevice
+    private let materials: GPUSimMaterialLibrary
     private let aoPipeline, aoDepthPipeline, aoSpatialPipeline, visibilityPipeline, directVisibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
     private let reconstructionDisplayPipeline, reconstructionSingleDisplayPipeline: MTLRenderPipelineState
@@ -25,14 +27,16 @@ final class ScreenSpacePipeline {
     private(set) var aoBackDepth: MTLTexture?
     private(set) var directVisibilityRaw, reflection, reflectionRaw, sceneColor, sceneMSAA, sceneDepth: MTLTexture?
     private(set) var diffuse, diffuseRaw: MTLTexture?
+    private(set) var areaDirect: MTLTexture?
     private(set) var displayColor: MTLTexture?
     private var displayEncoded: MTLTexture?
     private(set) var aoIsWhite = false
     private var visibilityIsWhite = false
     private var reconstructs = false
 
-    init(device: MTLDevice, library: MTLLibrary) throws {
+    init(device: MTLDevice, library: MTLLibrary, materials: GPUSimMaterialLibrary? = nil) throws {
         self.device = device
+        self.materials = try materials ?? GPUSimMaterialLibrary(device: device)
         func function(_ name: String) throws -> MTLFunction {
             guard let result = library.makeFunction(name: name) else { throw Failure.shaderFunction(name) }
             return result
@@ -120,7 +124,7 @@ final class ScreenSpacePipeline {
             directVisibilityRaw = nil; material = nil; reflection = nil; reflectionRaw = nil
             sceneColor = nil; sceneMSAA = nil; sceneDepth = nil; depthHierarchy = nil; depthLevels = []
             displayColor = nil; displayEncoded = nil
-            diffuse = nil; diffuseRaw = nil
+            diffuse = nil; diffuseRaw = nil; areaDirect = nil
             aoIsWhite = false
             visibilityIsWhite = false
         }
@@ -159,8 +163,11 @@ final class ScreenSpacePipeline {
             let raw = try texture(.rgba16Float, width: halfSize.x, height: halfSize.y, label: "Raw diffuse irradiance")
             diffuseRaw = raw; diffuse = raw
         } else if !options.usesDiffuseGI {
-            diffuse = nil; diffuseRaw = nil
+            diffuse = nil; diffuseRaw = nil; areaDirect = nil
         }
+        if options.usesRayTracing && !options.areaLights.isEmpty {
+            if areaDirect == nil { areaDirect = try texture(.rgba16Float, width: size.x, height: size.y, label: "Finite area light radiance") }
+        } else { areaDirect = nil }
         if options.edgeAntialiasing, displayColor == nil {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: size.x, height: size.y, mipmapped: false)
             d.usage = [.renderTarget, .shaderRead, .pixelFormatView]
@@ -209,6 +216,7 @@ final class ScreenSpacePipeline {
         guard let e = command.makeRenderCommandEncoder(descriptor: d) else { throw Failure.encoder(pipeline.label ?? "effect") }
         e.label = pipeline.label
         e.setRenderPipelineState(pipeline)
+        materials.bind(e)
         var u = uniforms
         e.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
         if var parameters { e.setFragmentBytes(&parameters, length: MemoryLayout<SIMD4<Float>>.stride, index: 2) }

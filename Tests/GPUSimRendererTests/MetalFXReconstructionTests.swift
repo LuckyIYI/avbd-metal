@@ -166,6 +166,26 @@ final class MetalFXReconstructionTests: XCTestCase {
         }
     }
 
+    func testBypassDoesNotRunTheScalerOrModifyRawHDR() throws {
+        let device=try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        guard MetalFXReconstruction.supports(device:device,denoising:false) else {throw XCTSkip("MetalFX unavailable")}
+        let fx=try MetalFXReconstruction(device:device,size:SIMD2(64,64),denoising:false)
+        let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba16Float,width:64,height:64,mipmapped:false)
+        descriptor.usage=[.renderTarget,.shaderRead];descriptor.storageMode = .private
+        let raw=try XCTUnwrap(device.makeTexture(descriptor:descriptor))
+        let command=try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+        for (texture,level) in [(raw,0.75),(fx.output,0.125)] {
+            let pass=MTLRenderPassDescriptor();pass.colorAttachments[0].texture=texture
+            pass.colorAttachments[0].loadAction = .clear;pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor=MTLClearColor(red:level,green:level,blue:level,alpha:1)
+            try XCTUnwrap(command.makeRenderCommandEncoder(descriptor:pass)).endEncoding()
+        }
+        try fx.finishFrame(command:command,color:raw,reconstruct:false)
+        command.commit();command.waitUntilCompleted();XCTAssertEqual(command.status,.completed)
+        XCTAssertEqual(Float(try read(raw,device:device)[0]),0.75)
+        XCTAssertEqual(Float(try read(fx.output,device:device)[0]),0.125,"The scaler output sentinel must remain untouched")
+    }
+
     private func read(_ texture: MTLTexture, device: MTLDevice, channels: Int = 4) throws -> [Float16] {
         let bytesPerRow = ((texture.width*channels*2+255)/256)*256
         let buffer = try XCTUnwrap(device.makeBuffer(length: bytesPerRow*texture.height,options: .storageModeShared))

@@ -100,7 +100,7 @@ final class RendererRegressionTests: XCTestCase {
             "Sources/GPUSimRenderer/GPUSimRenderer.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("inline float3 displayColorSRGB8"))
         XCTAssertEqual(
-            source.components(separatedBy: "displayColorSRGB8(acesTonemap(").count - 1,
+            source.components(separatedBy: "displayColorSRGB8(displayTonemap(").count - 1,
             4)
         XCTAssertTrue(source.contains("static let colorFormat = MTLPixelFormat.bgra8Unorm_srgb"))
     }

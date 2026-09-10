@@ -58,7 +58,11 @@ inline float2 diffuseSample(uint2 pixel, uint i, uint frame, float phase) {
 inline float2 sparseDiffuseSample(uint2 pixel, uint i, uint samples, uint frame) {
     float2 xi = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),
                        screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
-    return samples == 4u ? (float2(i&1u,i>>1u)+xi)*0.5 : xi;
+    if (samples==1u) return xi;
+    // Preserve the original four-ray pattern. Arbitrary caller budgets use
+    // a shifted Hammersley set, avoiding a partly filled (biased) square grid.
+    if (samples==4u) return (float2(i&1u,i>>1u)+xi)*0.5;
+    return fract(float2(float(i)/float(samples),float(reverse_bits(i))*2.3283064365386963e-10)+xi);
 }
 kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], constant Uniforms& U [[buffer(1)]],
     device const RTVertex* vertices [[buffer(2)]], device const RTObject* objects [[buffer(3)]],
@@ -87,9 +91,10 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
         float direct = max(dot(N,-U.lightDir.xyz),0.0)*visibility.read(s).g;
         samples = direct < 0.2 ? 4u : 1u;
     }
+    if (U.rayBudget.z>0) samples=uint(U.rayBudget.z);
     for (uint i=0;i<samples;++i) {
         float2 xi = diffuseSample(pixel,i,uint(max(U.temporal.z-1,0.0)),U.temporal.x);
-        if (U.reconstruction.x > 0) {
+        if (U.reconstruction.x > 0 || U.rayBudget.z>0) {
             xi = sparseDiffuseSample(pixel,i,samples,uint(U.reconstruction.w));
         }
         float phi = 2*M_PI_F*xi.y;
@@ -104,8 +109,8 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
             // negative. Clipping that before denoising would bias dark rooms
             // brighter. Sample nonnegative incoming radiance instead, then
             // subtract the exact baseline expected by the compositor.
-            sum += (hit.w>0 ? hit.rgb : diffuseEnvironment(R,U))-diffuseAmbient(N,U);
-        } else if (hit.w>0) sum += hit.rgb-diffuseEnvironment(R,U);
+            sum += (hit.w>0 ? hit.rgb : materialDiffuseEnvironment(R,U,materials))-materialDiffuseAmbient(N,U,materials);
+        } else if (hit.w>0) sum += hit.rgb-materialDiffuseEnvironment(R,U,materials);
     }
     // cos(theta)/pi cancels the cosine-hemisphere PDF: no extra pi or albedo.
     output.write(float4(sum/float(samples),1),pixel);

@@ -1,0 +1,109 @@
+{
+  "fast": {
+    "baseline": [
+      {
+        "gpu_ms": 2.426,
+        "synchronized_ms": 8.44
+      },
+      {
+        "gpu_ms": 3.507,
+        "synchronized_ms": 8.65
+      },
+      {
+        "gpu_ms": 2.399,
+        "synchronized_ms": 8.48
+      }
+    ],
+    "patched": [
+      {
+        "gpu_ms": 3.272,
+        "synchronized_ms": 8.71
+      },
+      {
+        "gpu_ms": 3.495,
+        "synchronized_ms": 8.71
+      },
+      {
+        "gpu_ms": 3.558,
+        "synchronized_ms": 8.72
+      }
+    ],
+    "pixel_difference": {
+      "mean_8bit_codes": 0.0,
+      "max_8bit_codes": 0.0
+    }
+  },
+  "hq": {
+    "baseline": [
+      {
+        "gpu_ms": 3.881,
+        "synchronized_ms": 8.62
+      },
+      {
+        "gpu_ms": 3.744,
+        "synchronized_ms": 8.61
+      },
+      {
+        "gpu_ms": 3.989,
+        "synchronized_ms": 8.7
+      }
+    ],
+    "patched": [
+      {
+        "gpu_ms": 5.945,
+        "synchronized_ms": 9.62
+      },
+      {
+        "gpu_ms": 4.07,
+        "synchronized_ms": 8.76
+      },
+      {
+        "gpu_ms": 3.762,
+        "synchronized_ms": 8.59
+      }
+    ],
+    "pixel_difference": {
+      "mean_8bit_codes": 0.0036160151163736978,
+      "max_8bit_codes": 1.0
+    }
+  },
+  "fast_600_frames": {
+    "baseline": [
+      {
+        "gpu_ms": 3.025,
+        "synchronized_ms": 8.61
+      },
+      {
+        "gpu_ms": 3.21,
+        "synchronized_ms": 8.66
+      },
+      {
+        "gpu_ms": 3.226,
+        "synchronized_ms": 8.62
+      }
+    ],
+    "patched": [
+      {
+        "gpu_ms": 2.999,
+        "synchronized_ms": 8.55
+      },
+      {
+        "gpu_ms": 2.995,
+        "synchronized_ms": 8.56
+      },
+      {
+        "gpu_ms": 3.274,
+        "synchronized_ms": 8.54
+      }
+    ]
+  },
+  "metadata": {
+    "device": "Apple M5",
+    "os": "27.0",
+    "date": "2026-09-10",
+    "upstream_commit": "4f5be0581a2b6aa7e408a125c37a89bfef7f1344",
+    "fixture": "material-preview, default material, 1024x768 output",
+    "build": "Swift debug, same toolchain for both revisions",
+    "trials": "Three sequential alternating trials per mode; fast/hq use 60 frames, fast_600_frames uses 600 frames. GPU times are means within each trial. No thermal/frequency lock."
+  }
+}

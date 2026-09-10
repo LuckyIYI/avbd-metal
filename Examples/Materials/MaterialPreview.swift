@@ -58,13 +58,31 @@
           body: body, mesh: mesh, color: F3(repeating: 1),
           textureCoordinates: [SIMD2(0, 1), SIMD2(1, 1), SIMD2(1, 0), SIMD2(0, 0)], materialID: 1))
     }
+    let environment: GPUSimEnvironmentLight?
+    if let path = value("--environment") {
+      let texture = try GPUSimMaterialLibrary.loadTexture(
+        device: device, url: URL(fileURLWithPath: path), sRGB: args.contains("--environment-srgb"))
+      environment = try GPUSimEnvironmentLight(device: device, texture: texture)
+    } else { environment = nil }
     let resources = try GPUSimMaterialLibrary(
-      device: device, materials: materials, programs: programs)
+      device: device, materials: materials, programs: programs, environment: environment)
     let solver = try GPUSolver(scene: scene, device: device)
     let renderer = try GPUSimRenderer(device: device, scene: solver, materials: resources)
     renderer.automaticallyFramesScene = false
     renderer.options = args.contains("--fast") ? .lightweight : .qualityBeta
     renderer.options.showsGroundPlane = false
+    renderer.options.rayTracingDenoising = !args.contains("--no-denoise")
+    switch value("--quality") {
+    case "high": renderer.options.rayTracingQuality = .high
+    case "balanced": renderer.options.rayTracingQuality = .balanced
+    default: break
+    }
+    if args.contains("--area-light") {
+      renderer.options.areaLights = [try GPUSimAreaLight(
+        position: F3(1, -1, 3), normal: F3(-1, 1, -3),
+        size: SIMD2(2, 2), radiance: F3(8, 7, 6), shape: .disk)]
+      renderer.options.sunIntensity = 0
+    }
     renderer.options.sunDirection = normalize(F3(-0.6, 0.25, -0.6))
     renderer.setCamera(position: F3(0, -1.5, 2.6), target: .zero, up: F3(0, 0, 1))
     let width = 1024

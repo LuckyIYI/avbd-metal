@@ -33,6 +33,20 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// specular environment seen in reflections are not scaled, so reflections
     /// always match the drawn sky.
     public var ambientExposure: Float = 0
+    /// Display exposure in stops, applied to linear HDR before the existing
+    /// tone curve. Zero preserves the default; finite values clamp to -16...16.
+    public var displayExposure: Float = 0
+    public var rayTracingQuality = GPUSimRayTracingQuality.realtime
+    /// HQ neural denoising and temporal reconstruction. Disable to inspect the
+    /// unfiltered HDR lighting at native resolution with the same ray budgets.
+    /// This diagnostic output retains surface-aware visibility reconstruction.
+    public var rayTracingDenoising: Bool = true
+    /// Up to eight finite emitters; additional entries are ignored at resolution.
+    public var areaLights: [GPUSimAreaLight] = []
+    /// Directional-light radiance multiplier. Zero allows environment-only lighting.
+    public var sunIntensity: Float = 1
+    /// HQ directional-light angular radius in radians. Zero preserves hard shadows.
+    public var sunAngularRadius: Float = 0
     /// World-space direction in which sunlight travels (not toward the sun).
     /// Normalized at render time. Zero/nonfinite inputs fall back to the default.
     /// Shared by raster shadows, contact shadows, HQ rays and material shading.
@@ -79,6 +93,11 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         var result = self
         result.ambientExposure = ambientExposure.isFinite ? min(ambientExposure, 4) : 0
         result.ambientExposure = max(result.ambientExposure, -4)
+        result.displayExposure = displayExposure.isFinite ? max(-16, min(16, displayExposure)) : 0
+        result.sunAngularRadius = sunAngularRadius.isFinite ? max(0, min(0.5, sunAngularRadius)) : 0
+        result.sunIntensity = sunIntensity.isFinite ? max(0, min(100, sunIntensity)) : 1
+        result.rayTracingQuality = rayTracingQuality.resolved
+        result.areaLights = Array(areaLights.prefix(GPUSimAreaLight.maximumCount))
         let magnitude = max(abs(sunDirection.x), max(abs(sunDirection.y), abs(sunDirection.z)))
         if sunDirection.x.isFinite && sunDirection.y.isFinite && sunDirection.z.isFinite && magnitude > 0 {
             result.sunDirection = normalize(sunDirection / magnitude)
@@ -616,6 +635,7 @@ struct RigidMeshVertex {
     float4 uvMaterial;
 };
 
+struct AreaLight { float4 position; float4 right; float4 up; float4 radiance; };
 struct Uniforms {
     float4x4 viewProj;
     float4 lightDir;    // xyz
@@ -632,8 +652,12 @@ struct Uniforms {
     float4 effects; // x: HDR output, y: contact distance, z: SSR distance, w: max SSR roughness
     float4 rayTracing; // x: world visibility, y: screen reflection shortcut enabled
     float4 rayScene; // x: analytic built-in ground enabled
+    float4 rayBudget; // shadow, reflection, diffuse (0 adaptive), transmission interfaces (0 absent)
     float4 diffuse; // x: world diffuse lighting enabled
     float4 reconstruction; // x: MetalFX, yz: normalized projection jitter, w: sample index
+    float4 areaSettings; // count, samples per emitter, reserved
+    float4 displaySettings; // x: display exposure in stops
+    AreaLight areaLights[8];
     float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
 };
 
@@ -664,7 +688,7 @@ struct VOut {
 };
 
 #define HORIZON_LIN float3(0.78, 0.81, 0.85)
-#define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4)
+#define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4 * (1+U.rayScene.z))
 #define SKY_IRR (float3(0.30, 0.33, 0.38) * exp2(U.rayScene.y))
 #define GND_IRR (float3(0.20, 0.185, 0.17) * exp2(U.rayScene.y))
 
@@ -678,6 +702,10 @@ inline float horizonFog(float d) {
 inline float3 acesTonemap(float3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+inline float3 displayTonemap(float3 radiance, constant Uniforms& U) {
+    return acesTonemap(radiance * exp2(U.displaySettings.x));
 }
 
 // The drawable is an 8-bit sRGB target. A smooth near-white lighting ramp
@@ -1085,7 +1113,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenNormal [[texture(3)]],
                              depth2d<float> screenDepthTexture [[texture(4)]],
                              texture2d<float> screenMaterial [[texture(5)]],
-                             texture2d<float> diffuse [[texture(6)]], constant MaterialResources& materials [[buffer(10)]])
+                             texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]])
 {
     in = texturedSurface(in, materials);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
@@ -1093,23 +1121,36 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float ao = visibility.r;
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
     float rough = specularRoughness(n,clamp(in.pbr.x,0.02,1.0),1.0);
-    float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
+    float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U,materials);
     if (U.diffuse.x > 0 && U.rayTracing.z == 0 && in.pbr.y < 0.99) {
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,n,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(n,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)
+        lit += (max(materialDiffuseAmbient(n,U,materials)+indirect.rgb,float3(0))-materialDiffuseAmbient(n,U,materials)*ao)
             * in.albedo*(1-saturate(in.pbr.y))*indirect.a;
     }
+    if (U.areaSettings.x>0) lit += U.rayTracing.x>0 ? areaDirect.read(uint2(in.position.xy)).rgb
+        : rasterAreaLighting(in.world,n,V,in.albedo,rough,saturate(in.pbr.y),U);
     float3 correction = float3(0);
+    float2 lobes = materialLobes(materialIndex(in.uvMaterial.z),materials);
+    if (lobes.x>0) {
+        lit *= 1-0.04*lobes.x;
+        lit += lobes.x*pbrRadiance(float3(0),0.13,0,float3(0),n,V,ao,shadow,U,materials);
+    }
+    if (lobes.y>0) lit += in.albedo*lobes.y*pow(1-saturate(dot(n,V)),5.0)*0.35;
     if (U.rayTracing.w > 0 && U.rayTracing.z == 0) {
         // Resolve against this fragment's surface before MSAA coverage is
         // averaged. A half-resolution neighbour cannot tint another object.
         correction = surfaceReflection(in.position.xy/U.screen.xy,in.world,n,rough,in.albedo,saturate(in.pbr.y),
-            U,reflection,screenNormal,screenDepthTexture,screenMaterial);
+            U,reflection,screenNormal,screenDepthTexture,screenMaterial,
+            U.rayTracing.x > 0 && U.rayBudget.w > 0 && materialOptics(materialIndex(in.uvMaterial.z),materials).x > 0);
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
+    // The HQ ray buffer replaces the transmitted portion with refracted radiance.
+    // Keep the legacy opaque result in lighting modes without world-space rays.
+    if (U.rayTracing.x > 0 && U.rayBudget.w > 0 && U.rayTracing.w > 0 && U.rayTracing.z == 0)
+        lit *= 1-materialOptics(materialIndex(in.uvMaterial.z),materials).x;
     lit += correction; // The reflection buffer already carries distance fog.
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U), in.position.xy), in.opacity);
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,7 +1183,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
                               depth2d<float> shadowTex [[texture(1)]],
                                texture2d<float> screenNormal [[texture(3)]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
-                               texture2d<float> diffuse [[texture(6)]])
+                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]])
 {
     float3 n = normalize(in.normal);
     if (in.flatShade > 0.5) {
@@ -1156,15 +1197,17 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
-    float3 lit = clothRadiance(in.albedo,in.emissive,n,V,ao,shadow,U);
+    float3 lit = clothRadiance(in.albedo,in.emissive,n,V,ao,shadow,U,materials);
+    if (U.areaSettings.x>0) lit += U.rayTracing.x>0 ? areaDirect.read(uint2(in.position.xy)).rgb
+        : rasterAreaLighting(in.world,n,V,in.albedo,0.72,0,U);
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = n;
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)*1.15*in.albedo*indirect.a;
+        lit += (max(materialDiffuseAmbient(N,U,materials)+indirect.rgb,float3(0))-materialDiffuseAmbient(n,U,materials)*ao)*1.15*in.albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U), in.position.xy), in.opacity);
 }
 
 // Prepass variant: only the FRONT layer reaches the AO/depth buffers. The
@@ -1219,7 +1262,7 @@ fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
 // ---------------------------------------------------------------------------
 // Sky (whitish) and floor (AA checker, melts then fogs)
 // ---------------------------------------------------------------------------
-fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]]) {
+fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],constant MaterialResources& materials [[buffer(10)]]) {
     float t = 1.0 - in.uv.y;
     float3 horizon = HORIZON_LIN;
     float3 zenith  = float3(0.50, 0.56, 0.66);
@@ -1227,7 +1270,16 @@ fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffe
     float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
     float glow = exp(-3.0 * distance(ndc, float2(-0.45, 0.55)));
     c += float3(0.30, 0.25, 0.16) * glow;
-    return float4(U.effects.x > 0.5 ? c : displayColorSRGB8(acesTonemap(c), in.position.xy), 1);
+    if (environmentBackground(materials)) {
+        float3 direction=normalize(worldFromDepth(in.uv,0.999,U.invViewProj)-U.eye.xyz);
+        c=materialEnvironment(direction,U,materials);
+    }
+    if (U.areaSettings.x>0) {
+        float3 direction=normalize(worldFromDepth(in.uv,0.999,U.invViewProj)-U.eye.xyz);
+        float4 emitter=areaIntersection(U.eye.xyz,direction,U);
+        if (emitter.w<1e19) c=emitter.rgb;
+    }
+    return float4(U.effects.x > 0.5 ? c : displayColorSRGB8(displayTonemap(c, U), in.position.xy), 1);
 }
 
 struct FloorOut { float4 position [[position]]; float3 world; };
@@ -1298,7 +1350,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
                                depth2d<float> shadowTex [[texture(1)]],
                                texture2d<float> screenNormal [[texture(3)]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
-                               texture2d<float> diffuse [[texture(6)]])
+                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]])
 {
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,float3(0,0,1),U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
@@ -1307,17 +1359,19 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     float3 L = -U.lightDir.xyz;
     float NdL = max(L.z, 0.0);
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world, float3(0, 0, 1), U, shadowTex), visibility.g);
-    float3 lit = albedo * (SKY_IRR * 1.1 * ao
+    float3 lit = albedo * (materialDiffuseAmbient(float3(0,0,1),U,materials) * 1.1 * ao
                          + SUN_COL / M_PI_F * NdL * 0.85 * shadow);
 
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = float3(0,0,1);
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-SKY_IRR*ao)*1.1*albedo*indirect.a;
+        lit += (max(materialDiffuseAmbient(N,U,materials)+indirect.rgb,float3(0))-materialDiffuseAmbient(N,U,materials)*ao)*1.1*albedo*indirect.a;
     }
+    if (U.areaSettings.x>0) lit += U.rayTracing.x>0 ? areaDirect.read(uint2(in.position.xy)).rgb
+        : rasterAreaLighting(in.world,float3(0,0,1),normalize(U.eye.xyz-in.world),albedo,1,0,U);
     float fog = horizonFog(length(in.world.xy - U.eye.xy));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), 1);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U), in.position.xy), 1);
 }
 
 """ + screenSpaceShaderSource + gtaoDepthShaderSource
@@ -1339,8 +1393,12 @@ struct Uniforms {
     var effects = SIMD4<Float>(repeating: 0)
     var rayTracing = SIMD4<Float>(repeating: 0)
     var rayScene = SIMD4<Float>.zero
+    var rayBudget = SIMD4<Float>.zero
     var diffuse = SIMD4<Float>.zero
     var reconstruction = SIMD4<Float>.zero
+    var areaSettings = SIMD4<Float>.zero
+    var displaySettings = SIMD4<Float>.zero
+    var areaLights = (AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord())
     var aoProjection: SIMD4<Float>
 }
 
@@ -1560,7 +1618,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let lib = try materials.shaderLibrary()
         let motionLib = try materials.shaderLibrary(motionGuides: true)
-        screenSpace = try ScreenSpacePipeline(device: device, library: lib)
+        screenSpace = try ScreenSpacePipeline(device: device, library: lib, materials: materials)
         func pipe(_ v: String, _ f: String,
                   samples: Int = GPUSimRenderer.sampleCount,
                   colorFormats: [MTLPixelFormat] = [GPUSimRenderer.colorFormat],
@@ -1814,7 +1872,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     @discardableResult
     private func ensureTargets(_ size: CGSize, options: GPUSimRenderOptions) -> Bool {
         do {
-            let scale = options.reconstruction == .metalFX ? (options.reconstructionScale.isFinite ? max(0.5, min(options.reconstructionScale, 1)) : 1) : 1
+            let scale = options.reconstruction == .metalFX && options.rayTracingDenoising ? (options.reconstructionScale.isFinite ? max(0.5, min(options.reconstructionScale, 1)) : 1) : 1
             let requested = CGSize(width: max(4, (Int(Float(size.width) * scale) / 2) * 2), height: max(4, (Int(Float(size.height) * scale) / 2) * 2))
             let resized = try screenSpace.prepare(size: options.reconstruction == .metalFX ? requested : size, options: options)
             targetSize = screenSpace.size
@@ -2039,8 +2097,20 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         if resetTemporalHistory { self.resetTemporalHistory() }
     }
 
+    /// Vertical camera field of view in degrees; 50 preserves the default view.
+    public var verticalFieldOfView: Float = 50 {
+        didSet { resetTemporalHistory() }
+    }
+    /// Camera clipping distances in world units. Bringing the near plane toward
+    /// distant subjects improves depth precision without changing the lens.
+    public var nearClipDistance: Float = 0.1 { didSet { prevVP = nil } }
+    public var farClipDistance: Float = 1000 { didSet { prevVP = nil } }
+
     public func projectionMatrix(aspect: Float) -> simd_float4x4 {
-        perspective(fovY: 50 * .pi / 180, aspect: aspect, near: 0.1, far: 1000)
+        let angle = verticalFieldOfView.isFinite ? min(120,max(1,verticalFieldOfView)) : 50
+        let near = nearClipDistance.isFinite ? max(0.0001,min(1e6,nearClipDistance)) : 0.1
+        let far = farClipDistance.isFinite ? max(near*1.001,min(1e8,farClipDistance)) : max(1000,near*1.001)
+        return perspective(fovY: angle * .pi / 180, aspect: aspect, near: near, far: far)
     }
 
     /// Builds a world ray from a pixel point whose origin is the view's
@@ -2176,8 +2246,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         do {
             if activeOptions.reconstruction == .metalFX {
-                if metalFX?.size != targetSize || metalFX?.outputSize != SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)) || metalFX?.denoising != activeOptions.usesRayTracing {
-                    metalFX = try MetalFXReconstruction(device: device, size: targetSize, denoising: activeOptions.usesRayTracing, outputSize: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)), sharedDepth: screenSpace.depth, sharedNormal: screenSpace.normal, sharedMaterial: screenSpace.material)
+                let denoising = activeOptions.usesRayTracing && activeOptions.rayTracingDenoising
+                if metalFX?.size != targetSize || metalFX?.outputSize != SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)) || metalFX?.denoising != denoising {
+                    metalFX = try MetalFXReconstruction(device: device, size: targetSize, denoising: denoising, outputSize: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)), sharedDepth: screenSpace.depth, sharedNormal: screenSpace.normal, sharedMaterial: screenSpace.material)
                 }
             } else { metalFX = nil }
         } catch {
@@ -2288,7 +2359,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
         let renderSize = SIMD2<Float>(Float(targetSize.x), Float(targetSize.y))
-        let pxPerUnit = renderSize.y * 0.5 / tan(25 * Float.pi / 180)
+        let pxPerUnit = renderSize.y * 0.5 * projectionMatrix(aspect: aspect).columns.1.y
         let activeFocus = cameraFocus
         let fwd = normalize(activeFocus - activeEye)
         let camR = normalize(cross(fwd, cameraUp))
@@ -2383,6 +2454,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                              1 / projection.columns.0.x, 1 / projection.columns.1.y))
         U.rayScene.y = activeOptions.ambientExposure
+        U.rayScene.z = activeOptions.sunIntensity-1
+        U.rayScene.w = activeOptions.sunAngularRadius
+        let quality = activeOptions.rayTracingQuality
+        U.rayBudget = SIMD4(Float(quality.shadowSamples),Float(quality.reflectionSamples),
+                           Float(quality.diffuseSamples),materialLibrary.hasTransmission ? Float(quality.transmissionInterfaces) : 0)
+        U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),0,0)
+        U.displaySettings.x = activeOptions.displayExposure
+        withUnsafeMutableBytes(of: &U.areaLights) { bytes in
+            let records=bytes.bindMemory(to: AreaLightRecord.self)
+            for (i, light) in activeOptions.areaLights.enumerated() { records[i]=light.record }
+        }
         if let metalFX { U.reconstruction = SIMD4(1, metalFX.jitter.x / renderSize.x, metalFX.jitter.y / renderSize.y, Float(frameIdx % 4096)) }
         func bindAppearance(
             _ encoder: MTLRenderCommandEncoder,
@@ -2403,6 +2485,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             encoder.setFragmentTexture(preDepthTex, index: 4)
             encoder.setFragmentTexture(screenSpace.material ?? visibilityTex, index: 5)
             encoder.setFragmentTexture((metalFX != nil ? screenSpace.diffuseRaw : screenSpace.diffuse) ?? visibilityTex, index: 6)
+            encoder.setFragmentTexture(screenSpace.areaDirect ?? visibilityTex, index: 7)
         }
         var Uh = U
         Uh.screen = SIMD4(Float(aoSize.x), Float(aoSize.y),
@@ -2749,6 +2832,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             try rayWorld?.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
                 instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: false)
             try screenSpace.encodeBeforeLighting(command: cmd, uniforms: Uh, options: activeOptions)
+            if !activeOptions.areaLights.isEmpty, let rayWorld {
+                try rayWorld.encodeAreaLighting(command: cmd, uniforms: Uh, screen: screenSpace,
+                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides)
+            }
             if activeOptions.usesDiffuseGI, let rayWorld {
                 try rayWorld.encodeDiffuse(command: cmd, uniforms: Uh, screen: screenSpace,
                     instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides)
@@ -2886,8 +2973,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
                     try screenSpace.encodeReflectionFilter(command: cmd, uniforms: Uh)
                 }
-                if let metalFX { try metalFX.finishFrame(command: cmd, color: screenSpace.sceneColor!) }
-                enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U, reconstructed: metalFX?.output)
+                if let metalFX { try metalFX.finishFrame(command: cmd, color: screenSpace.sceneColor!, reconstruct: activeOptions.rayTracingDenoising) }
+                let reconstructed = metalFX.map { activeOptions.rayTracingDenoising ? $0.output : screenSpace.sceneColor! }
+                enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U, reconstructed: reconstructed)
                 // The translucent auxiliary pipelines below use pbr_fragment,
                 // which reads the material argument buffer; the fresh encoder
                 // needs the same binding as the main pass.

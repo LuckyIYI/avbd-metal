@@ -1,6 +1,6 @@
 /// Camera-space coordinates use screen right, screen down and camera forward.
 /// Shared reconstruction keeps every depth lookup tied to its texel center.
-let screenSpaceCommonShaderSource = """
+let screenSpaceCommonShaderSource = areaLightingShaderSource + """
 struct FSOut { float4 position [[position]]; float2 uv; };
 
 vertex FSOut fs_vertex(uint vid [[vertex_id]]) {
@@ -67,8 +67,8 @@ inline float specularOcclusion(float NdV, float ao, float rough, constant Unifor
 
 inline float3 surfaceReflection(float2 uv, float3 P, float3 N, float rough, float3 albedo, float metal,
     constant Uniforms& U, texture2d<float> reflection, texture2d<float> normal,
-    depth2d<float> depth, texture2d<float> material) {
-    if (rough >= U.effects.w) return float3(0);
+    depth2d<float> depth, texture2d<float> material, bool transmission = false) {
+    if (!transmission && rough >= U.effects.w) return float3(0);
     float2 size = float2(depth.get_width(),depth.get_height());
     float2 p = uv*size-0.5, f = fract(p);
     int2 base = int2(floor(p));
@@ -79,16 +79,18 @@ inline float3 surfaceReflection(float2 uv, float3 P, float3 N, float rough, floa
         int2 q = base+int2(x,y);
         if (any(q<0) || any(q>=int2(size))) continue;
         float d = depth.read(uint2(q)); float4 nr = normal.read(uint2(q));
-        if (d>=1 || abs(nr.w-rough)>0.08) continue;
+        if (d>=1 || (!transmission && abs(nr.w-rough)>0.08)) continue;
         float3 Q = worldFromDepth((float2(q)+0.5)/size,d,U.invViewProj);
         float plane = max(abs(dot(Q-P,N)),abs(dot(Q-P,nr.xyz)));
         float w = (x ? f.x : 1-f.x)*(y ? f.y : 1-f.y);
         w *= saturate(1-plane/tolerance)*pow(saturate(dot(N,nr.xyz)),32.0);
         float4 mat = material.read(uint2(q));
-        sum += reflection.read(uint2(q)).rgb/reflectionFactor(Q,nr.xyz,nr.w,mat.rgb,mat.a,U)*w;
+        float3 factor = transmission ? float3(1) : reflectionFactor(Q,nr.xyz,nr.w,mat.rgb,mat.a,U);
+        sum += reflection.read(uint2(q)).rgb/factor*w;
         weight += w;
     }
-    return weight > 1e-5 ? sum/weight*reflectionFactor(P,N,rough,albedo,metal,U)*saturate(weight*4) : float3(0);
+    float3 factor = transmission ? float3(1) : reflectionFactor(P,N,rough,albedo,metal,U);
+    return weight > 1e-5 ? sum/weight*factor*saturate(weight*4) : float3(0);
 }
 
 """ + diffuseCommonShaderSource + """
@@ -122,6 +124,17 @@ inline float3 pbrRadiance(float3 albedo, float rough, float metal, float3 emissi
     return direct + ambient + emissive;
 }
 
+inline float3 pbrRadiance(float3 albedo,float rough,float metal,float3 emissive,
+    float3 n,float3 V,float ao,float shadow,constant Uniforms& U,constant MaterialResources& materials) {
+    float3 color=pbrRadiance(albedo,rough,metal,emissive,n,V,ao,shadow,U);
+    if (!hasEnvironment(materials)) return color;
+    color += albedo*(1-metal)*ao*(materialDiffuseAmbient(n,U,materials)-diffuseAmbient(n,U));
+    float3 R=reflect(-V,n),F0=mix(float3(0.04),albedo,metal);
+    float3 response=(F0+(1-F0)*pow(1-saturate(dot(n,V)),5.0))*mix(0.50,0.20,rough);
+    color += (materialEnvironment(R,U,materials,rough)-screenEnvironment(R,U))*response*specularOcclusion(saturate(dot(n,V)),ao,rough,U);
+    return color;
+}
+
 inline float3 clothRadiance(float3 albedo, float3 emissive, float3 n, float3 V,
                            float ao, float shadow, constant Uniforms& U) {
     float3 L = -U.lightDir.xyz;
@@ -151,6 +164,12 @@ inline float3 clothRadiance(float3 albedo, float3 emissive, float3 n, float3 V,
 
     return direct + ambient + emissive;
 }
+inline float3 clothRadiance(float3 albedo,float3 emissive,float3 n,float3 V,
+    float ao,float shadow,constant Uniforms& U,constant MaterialResources& materials) {
+    return clothRadiance(albedo,emissive,n,V,ao,shadow,U)
+        +albedo*ao*1.15*(materialDiffuseAmbient(n,U,materials)-diffuseAmbient(n,U));
+}
+
 
 
 """
@@ -249,7 +268,7 @@ fragment float4 reflection_fragment(FSOut in [[stage_in]], constant Uniforms& U 
     depth2d<float> depth [[texture(0)]], texture2d<float> normal [[texture(1)]],
     texture2d<float> material [[texture(2)]], texture2d<float> scene [[texture(3)]],
     depth2d<float> sceneDepth [[texture(4)]], texture2d<float> ao [[texture(5)]],
-    texture2d<float> hierarchy [[texture(6)]]) {
+    texture2d<float> hierarchy [[texture(6)]], constant MaterialResources& materials [[buffer(10)]]) {
     uint2 pixel = uint2(in.position.xy);
     float d = depth.read(pixel);
     float4 nr = normal.read(pixel);
@@ -337,7 +356,7 @@ fragment float4 reflection_fragment(FSOut in [[stage_in]], constant Uniforms& U 
                             + P.z * cross(U.camRight.xyz, U.camUp.xyz))), normalize(nr.xyz));
     // Replace the covered portion of the existing environment term instead
     // of adding a second copy of specular illumination.
-    float3 correction = (incoming - screenEnvironment(worldR,U)) * response
+    float3 correction = (incoming - materialEnvironment(worldR,U,materials,rough)) * response
         * specularOcclusion(NdV,ao.read(pixel).r,rough,U);
     correction *= 1.0 - horizonFog(length(P));
     return float4(correction * confidence, confidence);
@@ -490,6 +509,6 @@ fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Unifor
         }
         if (weight > 1e-5) color += sum / weight;
     }
-    return float4(displayColorSRGB8(acesTonemap(max(color, 0.0)), in.position.xy), 1);
+    return float4(displayColorSRGB8(displayTonemap(max(color, 0.0), U), in.position.xy), 1);
 }
 """ + antialiasingShaderSource + reconstructionShaderSource

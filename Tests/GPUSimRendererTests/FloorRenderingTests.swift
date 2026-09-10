@@ -3,6 +3,7 @@ import simd
 import XCTest
 @testable import GPUSimRenderer
 
+@MainActor
 final class FloorRenderingTests: XCTestCase {
     /// Integrate by splitting the pixel interval at actual one-metre tile
     /// boundaries, independently of the shader's periodic filter formula.
@@ -63,6 +64,7 @@ final class FloorRenderingTests: XCTestCase {
             pass.colorAttachments[0].texture = target
             pass.colorAttachments[0].loadAction = .dontCare; pass.colorAttachments[0].storeAction = .store
             let encoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: pass))
+                try GPUSimMaterialLibrary(device: device).bind(encoder)
             var U = Uniforms(viewProj: matrix_identity_float4x4, lightDir: SIMD4(0, 0, -1, 0),
                 eye: SIMD4(sample.x, sample.y, 1, 0), screen: SIMD4(4, 4, 1, 0), camRight: .zero, camUp: .zero,
                 prevViewProj: matrix_identity_float4x4, temporal: .zero,

@@ -91,7 +91,27 @@ inline float rtVisibility(float3 P, float3 N, float3 L, float bias,
     query.accept_any_intersection(true);
     return query.intersect(r, scene, 1).type == intersection_type::none ? 1.0 : 0.16;
 }
+inline float rtTransparentVisibility(ray r, instance_acceleration_structure scene,
+    device const RTVertex* vertices, device const RTObject* objects, constant MaterialResources& materials) {
+    intersector<triangle_data,instancing> query;
+    query.assume_geometry_type(geometry_type::triangle);
+    query.force_opacity(forced_opacity::opaque);
+    float visibility = 1;
+    for (uint i=0;i<12;++i) {
+        auto hit=query.intersect(r,scene,1);
+        if (hit.type==intersection_type::none) return visibility;
+        uint base=objects[hit.instance_id].vertexStart+hit.primitive_id*3;
+        float t=materialOptics(materialIndex(vertices[base].uvMaterial.z),materials).x;
+        if (t<=0) return 0.16;
+        visibility *= mix(0.16,0.98,t);
+        r.origin += r.direction*(hit.distance+0.00002);
+        r.min_distance=0.00002;
+    }
+    return 0.16;
+}
 kernel void rt_shadows(instance_acceleration_structure scene [[buffer(0)]], constant Uniforms& U [[buffer(1)]],
+    device const RTVertex* vertices [[buffer(2)]], device const RTObject* objects [[buffer(3)]],
+    constant MaterialResources& materials [[buffer(10)]],
     depth2d<float,access::read> depth [[texture(0)]], texture2d<float,access::read> normal [[texture(1)]],
     texture2d<float,access::write> output [[texture(2)]], uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= uint2(output.get_width(),output.get_height()))) return;
@@ -102,22 +122,45 @@ kernel void rt_shadows(instance_acceleration_structure scene [[buffer(0)]], cons
         float2 uv = (float2(pixel)+0.5)/float2(output.get_width(),output.get_height());
         float3 P = worldFromDepth(uv,d,U.invViewProj);
         float bias = max(0.0001, screenDepth(d,U)/U.screen.z*0.02);
-        visibility = rtVisibility(P,normalize(N),L,bias,U,scene);
+        if (U.rayScene.w<=0 && U.rayBudget.w<=0) visibility = rtVisibility(P,normalize(N),L,bias,U,scene);
+        else {
+            float3 tangent=normalize(cross(abs(L.z)<0.99 ? float3(0,0,1) : float3(0,1,0),L));
+            float3 bitangent=cross(L,tangent);
+            float angle=screenNoise(pixel)*2*M_PI_F;
+            visibility=0;
+            uint shadowSamples=uint(max(U.rayBudget.x,1.0));
+            for (uint i=0;i<shadowSamples;++i) {
+                float a=float(i)*2.39996323+angle;
+                float2 disk=sqrt((float(i)+0.5)/float(shadowSamples))*float2(cos(a),sin(a));
+                ray r; r.origin=P+normalize(N)*bias;
+                r.direction=normalize(L+tan(U.rayScene.w)*(tangent*disk.x+bitangent*disk.y));
+                r.min_distance=bias*0.25; r.max_distance=1000;
+                float sampleVisibility;
+                if (U.rayBudget.w<=0) sampleVisibility=rtVisibility(P,normalize(N),r.direction,bias,U,scene);
+                else sampleVisibility=rtGroundDistance(r,U)>=0 ? 0.16 : rtTransparentVisibility(r,scene,vertices,objects,materials);
+                visibility += sampleVisibility/float(shadowSamples);
+            }
+        }
     }
     output.write(float4(visibility),pixel);
 }
+""" + areaRayShaderSource + """
 inline float3 rtLit(float3 P, float3 N, float3 V, float3 albedo, float rough, float metal,
-                    float3 emissive, uint source, constant Uniforms& U, instance_acceleration_structure scene) {
+                    float3 emissive, uint source, constant Uniforms& U, instance_acceleration_structure scene, constant MaterialResources& materials) {
     float3 L = -U.lightDir.xyz;
     float visibility = dot(N,L) > 0 ? rtVisibility(P,N,L,0.0002,U,scene) : 1;
-    if (source == 3) return clothRadiance(albedo,emissive,N,V,1,visibility,U);
-    if (source == 4) return albedo*(SKY_IRR*1.1+SUN_COL/M_PI_F*max(L.z,0.0)*0.85*visibility);
-    return pbrRadiance(albedo,rough,metal,emissive,N,V,1,visibility,U);
+    float3 area=rtAreaLighting(P,N,V,albedo,rough,metal,scene,U,uint2(abs(P.xy)*4096));
+    if (source == 3) return area+clothRadiance(albedo,emissive,N,V,1,visibility,U,materials);
+    if (source == 4) return area+albedo*(materialDiffuseAmbient(N,U,materials)*1.1+SUN_COL/M_PI_F*max(L.z,0.0)*0.85*visibility);
+    return area+pbrRadiance(albedo,rough,metal,emissive,N,V,1,visibility,U,materials);
 }
 inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant Uniforms& U,
     device const RTVertex* vertices, device const RTObject* objects, device const RTInstance* instances,
     device const RenderInstance* rigid, device const RenderInstance* auxiliary,
-    device const RenderAppearance* appearances, uint hasAppearance, constant MaterialResources& materials, bool diffuseOnly = false) {
+    device const RenderAppearance* appearances, uint hasAppearance, constant MaterialResources& materials, bool diffuseOnly = false, bool includeEmitters = true) {
+    float4 emitter=areaIntersection(r.origin,r.direction,U);
+    bool lightHit=emitter.w<r.max_distance;
+    if (lightHit) r.max_distance=emitter.w;
     float groundDistance = rtGroundDistance(r,U);
     if (groundDistance>=0) r.max_distance = groundDistance;
     intersector<triangle_data,instancing> query;
@@ -125,11 +168,13 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
     query.force_opacity(forced_opacity::opaque);
     auto hit = query.intersect(r,scene,2);
     if (hit.type == intersection_type::none) {
-        if (groundDistance<0) return float4(0);
+        // Direct emitter lighting is sampled separately at opaque receivers.
+        // Do not count a second BSDF-hit estimator without MIS weighting.
+        if (groundDistance<0) return lightHit ? float4(includeEmitters && !diffuseOnly ? emitter.rgb : float3(0),1) : float4(0);
         float3 P = r.origin+r.direction*groundDistance, N = float3(0,0,r.direction.z<0 ? 1 : -1);
         float checker = float((int(floor(P.x))+int(floor(P.y))) & 1);
         float3 albedo = mix(srgbToLin(float3(0.93,0.93,0.94)),srgbToLin(float3(0.62,0.66,0.72)),checker);
-        return float4(rtLit(P,N,-r.direction,albedo,1,0,float3(0),4,U,scene),1);
+        return float4(rtLit(P,N,-r.direction,albedo,1,0,float3(0),4,U,scene,materials),1);
     }
     RTObject object = objects[hit.instance_id];
     uint base = object.vertexStart + hit.primitive_id*3;
@@ -180,13 +225,76 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
         float visibility = dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
         float3 F0 = mix(float3(0.04),mat.rgb,mat.a);
         float3 F = F0+(1-F0)*pow(1-saturate(dot(L,H)),5.0);
-        float3 bounce = mat.rgb*(1-mat.a)*(diffuseAmbient(hitN,U)
+        float3 bounce = mat.rgb*(1-mat.a)*(materialDiffuseAmbient(hitN,U,materials)
             +SUN_COL/M_PI_F*saturate(dot(hitN,L))*visibility*(1-F));
-        if (object.source==3) bounce = mat.rgb*(diffuseAmbient(hitN,U)*1.15
+        if (object.source==3) bounce = mat.rgb*(materialDiffuseAmbient(hitN,U,materials)*1.15
             +SUN_COL/M_PI_F*max((dot(hitN,L)+0.35)/1.35,0.0)*visibility);
+        bounce += rtAreaLighting(hitP+geomN*0.0001,hitN,-R,mat.rgb,nm.w,mat.a,scene,U,uint2(abs(hitP.xy)*4096),true);
         return float4(bounce+emission,1);
     }
-    return float4(rtLit(hitP+geomN*0.0001,hitN,-R,mat.rgb,clamp(nm.w,0.02,1.0),mat.a,emission,object.source,U,scene),1);
+    return float4(rtLit(hitP+geomN*0.0001,hitN,-R,mat.rgb,clamp(nm.w,0.02,1.0),mat.a,emission,object.source,U,scene,materials),1);
+}
+// Bounded preview dielectric transport: one transmitted camera path through up
+// to the configured interface budget, plus first-interface Fresnel reflection.
+// This does not transport caustics, nested media, rough transmission or colored
+// transparent shadows. Default opaque materials take the unchanged shading path.
+inline float4 rtTransmission(ray r, instance_acceleration_structure scene, constant Uniforms& U,
+    device const RTVertex* vertices, device const RTObject* objects, device const RTInstance* instances,
+    device const RenderInstance* rigid, device const RenderInstance* auxiliary,
+    device const RenderAppearance* appearances, uint hasAppearance, constant MaterialResources& materials) {
+    intersector<triangle_data,instancing> query;
+    query.assume_geometry_type(geometry_type::triangle);
+    query.force_opacity(forced_opacity::opaque);
+    float3 result = float3(0), throughput = float3(1);
+    float transmission = 0;
+    uint interfaces=uint(U.rayBudget.w>0 ? U.rayBudget.w : 12);
+    for (uint boundary=0; boundary<interfaces; ++boundary) {
+        auto hit = query.intersect(r,scene,2);
+        float ground = rtGroundDistance(r,U);
+        if (hit.type == intersection_type::none || (ground>=0 && ground<hit.distance)) {
+            if (boundary==0) return float4(0);
+            float4 background = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials);
+            return float4(result+throughput*(background.w>0 ? background.rgb : materialEnvironment(r.direction,U,materials)),transmission);
+        }
+        RTObject object = objects[hit.instance_id];
+        uint base = object.vertexStart+hit.primitive_id*3;
+        RTVertex a=vertices[base], b=vertices[base+1], c=vertices[base+2];
+        float2 optics=materialOptics(materialIndex(a.uvMaterial.z),materials);
+        if (optics.x<=0) {
+            if (boundary==0) return float4(0);
+            float4 background=rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials);
+            return float4(result+throughput*background.rgb,transmission);
+        }
+        if (boundary==0) transmission=optics.x;
+        float3 bary=float3(1-hit.triangle_barycentric_coord.x-hit.triangle_barycentric_coord.y,hit.triangle_barycentric_coord);
+        float3 N=normalize(rtNormal(instances[hit.instance_id],a.normal.xyz*bary.x+b.normal.xyz*bary.y+c.normal.xyz*bary.z));
+        bool entering=dot(r.direction,N)<0;
+        float3 faceN=entering ? N : -N;
+        float eta=entering ? 1/optics.y : optics.y;
+        float3 P=r.origin+r.direction*hit.distance;
+        float3 T=refract(r.direction,faceN,eta);
+        float f0=pow((optics.y-1)/(optics.y+1),2.0);
+        float fresnel=f0+(1-f0)*pow(1-saturate(dot(-r.direction,faceN)),5.0);
+        const float bias=0.00002;
+        if (dot(T,T)<1e-10) {
+            r.direction=reflect(r.direction,faceN);
+            r.origin=P+faceN*bias;
+        } else {
+            if (boundary==0) {
+                ray reflected; reflected.origin=P+faceN*bias; reflected.direction=reflect(r.direction,faceN);
+                reflected.min_distance=bias; reflected.max_distance=100;
+                float4 light=rtIncoming(reflected,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials);
+                result += throughput*fresnel*(light.w>0 ? light.rgb : materialEnvironment(reflected.direction,U,materials));
+            }
+            throughput *= 1-fresnel;
+            // A subtle per-entry tint, without pretending to be volumetric absorption.
+            if (entering) throughput *= mix(float3(1),clamp(a.albedo.rgb*bary.x+b.albedo.rgb*bary.y+c.albedo.rgb*bary.z,0.0,1.0),0.035);
+            r.direction=normalize(T); r.origin=P-faceN*bias;
+        }
+        r.min_distance=bias; r.max_distance=100;
+    }
+    // Truncated internally trapped paths contribute no invented background light.
+    return float4(result,transmission);
 }
 // Visible-normal GGX sampling: stretch the view, sample the projected
 // hemisphere, then transform the normal back (Heitz 2018, JCGT 7(4):1).
@@ -213,10 +321,18 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= uint2(output.get_width(),output.get_height()))) return;
     float d = depth.read(pixel); float4 nr = normal.read(pixel);
-    if (d >= 1 || nr.w >= U.effects.w) { output.write(float4(0),pixel); return; }
+    if (d >= 1) { output.write(float4(0),pixel); return; }
     float2 uv = (float2(pixel)+0.5)/float2(output.get_width(),output.get_height());
     float3 P = worldFromDepth(uv,d,U.invViewProj), N = normalize(nr.xyz), V = normalize(U.eye.xyz-P);
-    if (dot(N,V) <= 0) { output.write(float4(0),pixel); return; }
+    ray cameraRay; cameraRay.origin=U.eye.xyz; cameraRay.direction=-V;
+    cameraRay.min_distance=0.001; cameraRay.max_distance=100;
+    float4 transmitted=U.rayBudget.w>0 ? rtTransmission(cameraRay,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials) : float4(0);
+    if (transmitted.a>0) {
+        float fog=horizonFog(length(P-U.eye.xyz));
+        output.write(float4(mix(transmitted.rgb,HORIZON_LIN,fog)*transmitted.a,1),pixel);
+        return;
+    }
+    if (nr.w >= U.effects.w || dot(N,V) <= 0) { output.write(float4(0),pixel); return; }
     float3 tangent = normalize(cross(abs(N.z) < 0.99 ? float3(0,0,1) : float3(0,1,0),N));
     float3 bitangent = cross(N,tangent);
     float3 localV = float3(dot(V,tangent),dot(V,bitangent),dot(V,N));
@@ -224,8 +340,10 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     float4 receiver = material.read(pixel);
     float3 F0 = mix(float3(0.04),receiver.rgb,receiver.a);
     float3 correctionSum = float3(0); float coverage = 0;
-    // HQ always reconstructs one frame-sampled GGX ray with MetalFX.
-    uint frame = uint(U.reconstruction.w);
+    // One ray preserves the real-time default; callers can spend more within a frame.
+    uint reflectionSamples=uint(max(U.rayBudget.y,1.0));
+    for(uint sample=0;sample<reflectionSamples;++sample) {
+    uint frame = uint(U.reconstruction.w)+sample*193u;
     float2 random = float2(screenNoise(pixel+uint2(frame*103u,frame*71u)),
                            screenNoise(pixel+uint2(frame*53u+231u,frame*97u+17u)));
     float3 localH = rtGlossyNormal(localV,alpha,random);
@@ -235,8 +353,8 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     if (NdR > 0) {
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
         ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
-        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials);
-        float3 incoming = hit.w > 0 ? hit.rgb : screenEnvironment(R,U);
+        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,false,false);
+        float3 incoming = hit.w > 0 ? hit.rgb : materialEnvironment(R,U,materials);
         float viewLambda = rtSmithLambda(localV.z,alpha);
         float masking = (1+viewLambda)/(1+viewLambda+rtSmithLambda(NdR,alpha));
         // BRDF*cos/pdf for visible-normal sampling simplifies to Fresnel*G2/G1.
@@ -245,9 +363,11 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
         correctionSum += incoming*response;
         coverage += 1;
     }
+    }
+    correctionSum /= float(reflectionSamples); coverage /= float(reflectionSamples);
     // A below-surface sample has zero incoming radiance, but still replaces
     // the analytic raster environment, exactly like every other HQ sample.
-    correctionSum -= screenEnvironment(reflect(-V,N),U)*reflectionFactor(P,N,nr.w,receiver.rgb,receiver.a,U);
+    correctionSum -= materialEnvironment(reflect(-V,N),U,materials,nr.w)*reflectionFactor(P,N,nr.w,receiver.rgb,receiver.a,U);
     float confidence = 1-smoothstep(U.effects.w-0.15,U.effects.w,nr.w);
     correctionSum *= (1-horizonFog(length(P-U.eye.xyz)))*confidence;
     output.write(float4(correctionSum,coverage*confidence),pixel);

@@ -224,3 +224,10 @@ buffer. Backends copy those overrides into their public 112-byte instance ABI;
 rigid mesh shaders consume the same buffer directly.
 All buffers must belong to the scene's `renderDevice`; the renderer rejects a
 scene from a different Metal device before encoding it.
+
+## Optional studio lighting and ray budgets
+
+See [configurable environment and finite-area lighting](StudioLighting.md) for
+HDR environment maps, finite disk/rectangle emitters, per-frame ray budgets,
+dielectric preview materials, clipping controls and a MetalFX bypass comparison.
+These features are opt-in; the default light setup and real-time budgets remain.

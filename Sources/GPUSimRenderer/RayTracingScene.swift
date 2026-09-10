@@ -35,7 +35,7 @@ final class RayTracingScene {
     private struct Key: Hashable { let scene: ObjectIdentifier; let materials: ObjectIdentifier? }
     private static var worlds: [Key: WeakEntry] = [:]
     static func shared(scene: any GPUSimRenderableScene, materials: GPUSimMaterialLibrary? = nil) throws -> RayTracingScene {
-        let materialKey = materials.flatMap { $0.materialCount == 0 && $0.programs.isEmpty ? nil : ObjectIdentifier($0) }
+        let materialKey = materials.flatMap { $0.materialCount == 0 && $0.programs.isEmpty && $0.environment == nil ? nil : ObjectIdentifier($0) }
         worlds = worlds.filter { $0.value.value?.scene != nil }
         let key = Key(scene: ObjectIdentifier(scene), materials: materialKey)
         if let existing = worlds[key]?.value { return existing }
@@ -48,7 +48,7 @@ final class RayTracingScene {
     let materials: GPUSimMaterialLibrary
     let device: MTLDevice
     let queue: MTLCommandQueue
-    private let instancesPipeline, deformationPipeline, shadowPipeline, reflectionPipeline, diffusePipeline: MTLComputePipelineState
+    private let instancesPipeline, deformationPipeline, shadowPipeline, reflectionPipeline, diffusePipeline, areaPipeline: MTLComputePipelineState
     private var assets: [Asset] = []
     private(set) var vertices, objects, descriptors: MTLBuffer!
     private(set) var structure: MTLAccelerationStructure!
@@ -97,6 +97,7 @@ final class RayTracingScene {
         shadowPipeline = try pipeline("rt_shadows")
         reflectionPipeline = try pipeline("rt_reflections")
         diffusePipeline = try pipeline("rt_diffuse")
+        areaPipeline = try pipeline("rt_area_lighting")
     }
 
     private func buffer<T>(_ values: [T], label: String) throws -> MTLBuffer {
@@ -331,6 +332,14 @@ final class RayTracingScene {
             auxiliary: auxiliary, appearances: appearances, pipeline: reflections ? reflectionPipeline : shadowPipeline,
             output: (reflections ? screen.reflectionRaw : screen.directVisibilityRaw)!,
             label: reflections ? "Selective world reflections" : "World directional visibility")
+    }
+
+    func encodeAreaLighting(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
+                            instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?) throws {
+        guard let output = screen.areaDirect else { return }
+        try encodeRays(command: command, uniforms: uniforms, screen: screen, instances: instances,
+            auxiliary: auxiliary, appearances: appearances, pipeline: areaPipeline,
+            output: output, label: "Finite area lighting and visibility")
     }
 
     func encodeDiffuse(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
