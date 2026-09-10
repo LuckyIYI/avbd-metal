@@ -9,6 +9,7 @@ final class ScreenSpacePipeline {
     enum Failure: Error { case allocation(String), encoder(String), shaderFunction(String) }
     let device: MTLDevice
     private let materials: GPUSimMaterialLibrary
+    var displayTransform: GPUSimDisplayTransform?
     private let aoPipeline, aoDepthPipeline, aoSpatialPipeline, visibilityPipeline, directVisibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
     private let reconstructionDisplayPipeline, reconstructionSingleDisplayPipeline: MTLRenderPipelineState
@@ -320,6 +321,7 @@ final class ScreenSpacePipeline {
         d.depthAttachment.loadAction = reconstructed == nil ? .load : .clear
         guard let e = command.makeRenderCommandEncoder(descriptor: d) else { throw Failure.encoder("display composite") }
         e.label = "Reflections and display composite"
+        e.setFragmentTexture(displayTransform?.texture, index: 8)
         let reconstructionPipeline = d.colorAttachments[0].texture?.sampleCount == 1
             ? reconstructionSingleDisplayPipeline : reconstructionDisplayPipeline
         e.setRenderPipelineState(reconstructed == nil ? compositePipeline : reconstructionPipeline)

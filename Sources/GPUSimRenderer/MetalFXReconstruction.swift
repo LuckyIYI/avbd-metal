@@ -218,9 +218,9 @@ fragment ReconstructionOut floor_reconstruction_fragment(FloorOut in [[stage_in]
 }
 struct ReconstructionDisplayOut { float4 color [[color(0)]]; float depth [[depth(any)]]; };
 fragment ReconstructionDisplayOut reconstruction_display_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
-    texture2d<float> color [[texture(0)]], depth2d<float> depth [[texture(4)]]) {
+    texture2d<float> color [[texture(0)]], depth2d<float> depth [[texture(4)]], texture3d<float> displayLUT [[texture(8)]]) {
     ReconstructionDisplayOut o;
-    o.color = float4(displayColorSRGB8(displayTonemap(max(color.read(uint2(in.position.xy)).rgb,0.0), U),in.position.xy),1);
+    o.color = float4(displayColorSRGB8(displayTonemap(max(color.read(uint2(in.position.xy)).rgb,0.0), U, displayLUT),in.position.xy),1);
     // Restore opaque depth for native-resolution diagnostic/translucent overlays.
     float2 uv = clamp(in.uv + U.reconstruction.yz, 0.0, 1.0);
     uint2 p = min(uint2(uv*float2(depth.get_width(),depth.get_height())),uint2(depth.get_width()-1,depth.get_height()-1));

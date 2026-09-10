@@ -32,8 +32,9 @@ display encoding. Do not add another gamma conversion to saved BGRA images.
 `renderer.options.displayExposure` adjusts exposure in stops before the existing
 ACES-style tone curve, independently of lighting and reconstruction history.
 It defaults to zero; finite inputs clamp to -16...16 and nonfinite inputs resolve
-to zero. It changes overall brightness, not the display transform: exposure alone
-does not reproduce Blender's AgX highlight colors or contrast.
+to zero. Callers can also supply an optional [display program and 3D lookup
+table](DisplayTransforms.md), including an OCIO-exported AgX processor, without
+changing the ray budget. Exposure alone does not reproduce AgX.
 
 The equirectangular map uses longitude `atan2(y,x)` and latitude `acos(z)` with
 north at +Z and a top-left UV origin. Positive `rotation` rotates the map around
@@ -132,5 +133,5 @@ This is a bounded hybrid renderer, not Cycles parity. Three-band SH cannot resol
 all high-frequency diffuse environment detail, ordinary box mipmaps are not a GGX
 prefilter, and uniform finite-emitter sampling can be noisy for sharp highlights.
 More rays and denoising trade throughput for quality; they do not add missing
-light paths. The existing ACES-style display curve is unchanged, so matching
-Blender's AgX output also requires a corresponding display transform.
+light paths. The default ACES-style display curve remains available; a caller's
+display program can match Blender's AgX independently of those transport limits.

@@ -606,7 +606,7 @@ public extension GPUSimRendererSource {
 
 let renderShaderSource = makeRenderShaderSource()
 
-func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = [], argumentBuffers: Bool = true) -> String {
+func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = [], argumentBuffers: Bool = true, displayProgram: GPUSimDisplayProgram? = nil) -> String {
 """
 #include <metal_stdlib>
 using namespace metal;
@@ -656,7 +656,7 @@ struct Uniforms {
     float4 diffuse; // x: world diffuse lighting enabled
     float4 reconstruction; // x: MetalFX, yz: normalized projection jitter, w: sample index
     float4 areaSettings; // count, samples per emitter, reserved
-    float4 displaySettings; // x: display exposure in stops
+    float4 displaySettings; // exposure, custom display transform enabled, reserved
     AreaLight areaLights[8];
     float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
 };
@@ -738,6 +738,8 @@ inline float3 displayColorSRGB8(float3 toneMappedLinear, float2 pixel) {
     encoded = clamp(encoded + noise / 255.0, 0.0, 1.0);
     return sRGBToLinearExact(encoded);
 }
+
+\(makeDisplayTransformShaderSource(displayProgram))
 
 // Three-by-three comparison-filtered directional shadow. The light projection
 // follows the camera target, so the useful texel density stays around the robot
@@ -1113,7 +1115,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenNormal [[texture(3)]],
                              depth2d<float> screenDepthTexture [[texture(4)]],
                              texture2d<float> screenMaterial [[texture(5)]],
-                             texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]])
+                             texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
     in = texturedSurface(in, materials);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
@@ -1150,7 +1152,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     if (U.rayTracing.x > 0 && U.rayBudget.w > 0 && U.rayTracing.w > 0 && U.rayTracing.z == 0)
         lit *= 1-materialOptics(materialIndex(in.uvMaterial.z),materials).x;
     lit += correction; // The reflection buffer already carries distance fog.
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U), in.position.xy), in.opacity);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), in.opacity);
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,7 +1185,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
                               depth2d<float> shadowTex [[texture(1)]],
                                texture2d<float> screenNormal [[texture(3)]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
-                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]])
+                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
     float3 n = normalize(in.normal);
     if (in.flatShade > 0.5) {
@@ -1207,7 +1209,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U), in.position.xy), in.opacity);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), in.opacity);
 }
 
 // Prepass variant: only the FRONT layer reaches the AO/depth buffers. The
@@ -1262,7 +1264,7 @@ fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
 // ---------------------------------------------------------------------------
 // Sky (whitish) and floor (AA checker, melts then fogs)
 // ---------------------------------------------------------------------------
-fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],constant MaterialResources& materials [[buffer(10)]]) {
+fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]]) {
     float t = 1.0 - in.uv.y;
     float3 horizon = HORIZON_LIN;
     float3 zenith  = float3(0.50, 0.56, 0.66);
@@ -1279,7 +1281,7 @@ fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffe
         float4 emitter=areaIntersection(U.eye.xyz,direction,U);
         if (emitter.w<1e19) c=emitter.rgb;
     }
-    return float4(U.effects.x > 0.5 ? c : displayColorSRGB8(displayTonemap(c, U), in.position.xy), 1);
+    return float4(U.effects.x > 0.5 ? c : displayColorSRGB8(displayTonemap(c, U, displayLUT), in.position.xy), 1);
 }
 
 struct FloorOut { float4 position [[position]]; float3 world; };
@@ -1350,7 +1352,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
                                depth2d<float> shadowTex [[texture(1)]],
                                texture2d<float> screenNormal [[texture(3)]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
-                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]])
+                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,float3(0,0,1),U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
@@ -1371,7 +1373,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
         : rasterAreaLighting(in.world,float3(0,0,1),normalize(U.eye.xyz-in.world),albedo,1,0,U);
     float fog = horizonFog(length(in.world.xy - U.eye.xy));
     lit = mix(lit, HORIZON_LIN, fog);
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U), in.position.xy), 1);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), 1);
 }
 
 """ + screenSpaceShaderSource + gtaoDepthShaderSource
@@ -1480,6 +1482,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var screenSpace: ScreenSpacePipeline!
     private var presentationColor, presentationDepth: MTLTexture?
     private let materialLibrary: GPUSimMaterialLibrary
+    public private(set) var displayTransform: GPUSimDisplayTransform?
+    private let compiledDisplayProgram: GPUSimDisplayProgram?
     private var rayWorld: RayTracingScene?
     public private(set) var activeReconstruction: GPUSimReconstruction = .legacy
     public private(set) var activeLightingMode: GPUSimLightingMode = .lightweight
@@ -1600,7 +1604,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public init(
         device: MTLDevice,
         scene: (any GPUSimRenderableScene)? = nil,
-        materials: GPUSimMaterialLibrary? = nil
+        materials: GPUSimMaterialLibrary? = nil,
+        displayTransform: GPUSimDisplayTransform? = nil
     ) throws {
         if let scene, scene.renderDevice.registryID != device.registryID {
             throw GPUSimRendererError.sceneDeviceMismatch
@@ -1609,6 +1614,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let materials = try materials ?? GPUSimMaterialLibrary(device: device)
         guard materials.device.registryID == device.registryID else { throw GPUSimRendererError.sceneDeviceMismatch }
         self.materialLibrary = materials
+        self.compiledDisplayProgram = displayTransform?.program
         guard let queue = device.makeCommandQueue() else {
             throw GPUSimRendererError.commandQueue
         }
@@ -1616,9 +1622,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         self.scene = scene
         super.init()
 
-        let lib = try materials.shaderLibrary()
-        let motionLib = try materials.shaderLibrary(motionGuides: true)
+        let lib = try materials.shaderLibrary(displayProgram: compiledDisplayProgram)
+        let motionLib = try materials.shaderLibrary(motionGuides: true, displayProgram: compiledDisplayProgram)
         screenSpace = try ScreenSpacePipeline(device: device, library: lib, materials: materials)
+        try setDisplayTransform(displayTransform)
         func pipe(_ v: String, _ f: String,
                   samples: Int = GPUSimRenderer.sampleCount,
                   colorFormats: [MTLPixelFormat] = [GPUSimRenderer.colorFormat],
@@ -1867,6 +1874,19 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// Discards HQ reconstruction history, for example after a camera teleport.
     public func resetTemporalHistory() {
         prevVP = nil
+    }
+
+    /// Switches only the display transform. HDR reconstruction history remains
+    /// valid because exposure and the LUT are applied after reconstruction.
+    public func setDisplayTransform(_ transform: GPUSimDisplayTransform?) throws {
+        if let transform, transform.device.registryID != device.registryID {
+            throw GPUSimRendererError.sceneDeviceMismatch
+        }
+        if let transform, transform.program != compiledDisplayProgram {
+            throw GPUSimDisplayTransform.Failure.programMismatch
+        }
+        displayTransform = transform
+        screenSpace.displayTransform = transform
     }
 
     @discardableResult
@@ -2461,6 +2481,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                            Float(quality.diffuseSamples),materialLibrary.hasTransmission ? Float(quality.transmissionInterfaces) : 0)
         U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),0,0)
         U.displaySettings.x = activeOptions.displayExposure
+        U.displaySettings.y = displayTransform == nil ? 0 : 1
         withUnsafeMutableBytes(of: &U.areaLights) { bytes in
             let records=bytes.bindMemory(to: AreaLightRecord.self)
             for (i, light) in activeOptions.areaLights.enumerated() { records[i]=light.record }
@@ -2593,6 +2614,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 }
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: metalFX.guidePass()) else { throw MetalFXReconstruction.Failure.encoder }
                 materialLibrary.bind(enc)
+                enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 enc.label = "Reconstruction motion and material guides"
                 enc.setViewport(screenViewport)
                 enc.setDepthStencilState(depthState)
@@ -2692,6 +2714,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             do {
                 let enc = prepassEncoder
                 materialLibrary.bind(enc)
+                enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 enc.label = "Shared screen-space surfaces"
                 func surfacePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
                     activeOptions.usesHDR ? surfacePipelines[ObjectIdentifier(pipeline)]! : pipeline
@@ -2856,6 +2879,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             return
         }
         materialLibrary.bind(enc)
+        enc.setFragmentTexture(displayTransform?.texture, index: 8)
         enc.label = "Main PBR pass"
         bindSurfaceLighting(enc)
         enc.setViewport(screenViewport)
@@ -2980,6 +3004,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 // which reads the material argument buffer; the fresh encoder
                 // needs the same binding as the main pass.
                 materialLibrary.bind(enc)
+                enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 if metalFX != nil {
                     U.viewProj = unjitteredVP; U.invViewProj = unjitteredVP.inverse
                     U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, 0)

@@ -481,7 +481,7 @@ fragment float4 reflection_filter_fragment(FSOut in [[stage_in]], constant Unifo
 fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],
     texture2d<float> scene [[texture(0)]], texture2d<float> reflection [[texture(1)]],
     depth2d<float> depth [[texture(2)]], texture2d<float> normal [[texture(3)]],
-    depth2d<float> fullDepth [[texture(4)]]) {
+    depth2d<float> fullDepth [[texture(4)]], texture3d<float> displayLUT [[texture(8)]]) {
     uint2 pixel = uint2(in.position.xy);
     float3 color = scene.read(pixel).rgb;
     float d = fullDepth.read(pixel);
@@ -509,6 +509,6 @@ fragment float4 screen_composite_fragment(FSOut in [[stage_in]], constant Unifor
         }
         if (weight > 1e-5) color += sum / weight;
     }
-    return float4(displayColorSRGB8(displayTonemap(max(color, 0.0), U), in.position.xy), 1);
+    return float4(displayColorSRGB8(displayTonemap(max(color, 0.0), U, displayLUT), in.position.xy), 1);
 }
 """ + antialiasingShaderSource + reconstructionShaderSource

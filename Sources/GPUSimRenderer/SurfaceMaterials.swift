@@ -91,13 +91,14 @@ public final class GPUSimMaterialLibrary {
   /// False on argument-buffer Tier 1 devices, where the shader declares a stub
   /// resource struct and the library must stay empty.
   let usesArgumentBuffers: Bool
-  private var shaderLibraries: [String: MTLLibrary] = [:]
-  func shaderLibrary(motionGuides: Bool = false, rays: Bool = false) throws -> MTLLibrary {
-    let key = "\(motionGuides):\(rays)"
+  private struct ShaderKey: Hashable { let motionGuides, rays: Bool; let displayProgram: GPUSimDisplayProgram? }
+  private var shaderLibraries: [ShaderKey: MTLLibrary] = [:]
+  func shaderLibrary(motionGuides: Bool = false, rays: Bool = false, displayProgram: GPUSimDisplayProgram? = nil) throws -> MTLLibrary {
+    let key = ShaderKey(motionGuides: motionGuides, rays: rays, displayProgram: displayProgram)
     if let library = shaderLibraries[key] { return library }
     let source =
       makeRenderShaderSource(
-        motionGuides: motionGuides, programs: programs, argumentBuffers: usesArgumentBuffers)
+        motionGuides: motionGuides, programs: programs, argumentBuffers: usesArgumentBuffers, displayProgram: displayProgram)
       + (rays ? "\n" + rayTracingShaderSource : "")
     let library = try device.makeLibrary(source: source, options: nil)
     shaderLibraries[key] = library
