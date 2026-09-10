@@ -24,6 +24,13 @@ inline float3 screenPosition(float2 uv, float d, constant Uniforms& U) {
 inline float2 screenProject(float3 p, constant Uniforms& U) {
     return (p.xy / (p.z * U.aoProjection.zw)) * 0.5 + 0.5 + U.reconstruction.yz;
 }
+// Clip planes are perpendicular to camera forward, while ray distances are radial.
+inline float2 cameraRayInterval(float3 direction, constant Uniforms& U) {
+    float forward = dot(direction,cross(U.camRight.xyz,U.camUp.xyz));
+    float nearPlane = -U.aoProjection.y/U.aoProjection.x;
+    float farPlane = U.aoProjection.y/(1-U.aoProjection.x);
+    return float2(nearPlane,farPlane)/max(forward,1e-8);
+}
 inline bool screenInside(float2 uv) { return all(uv >= 0.0) && all(uv < 1.0); }
 inline float screenNoise(uint2 p) {
     uint h = p.x + p.y * 65537u;

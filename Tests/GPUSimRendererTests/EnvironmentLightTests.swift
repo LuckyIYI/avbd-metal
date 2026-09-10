@@ -1,4 +1,6 @@
 import Metal
+import PhysicsAVBD
+import SimCore
 import XCTest
 
 @testable import GPUSimRenderer
@@ -23,8 +25,9 @@ final class EnvironmentLightTests: XCTestCase {
   func testConstantHDRPreservesLinearRadianceAndDiffuseEnergy() throws {
     let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
     let tex = try texture(device, color: SIMD4(0.1, 0.3, 4, 1))
-    let environment = try GPUSimEnvironmentLight(device: device, texture: tex, intensity: 2)
-    let resources = try GPUSimMaterialLibrary(device: device, environment: environment)
+    let environment = try GPUSimEnvironmentLight(device: device, texture: tex)
+    let materials = try GPUSimMaterialLibrary(device: device)
+    let resources = try GPUSimLightingBindings(materials: materials, environment: environment)
     let source =
       renderShaderSource + """
         kernel void environment_probe(device float4* out [[buffer(0)]],constant Uniforms& u [[buffer(1)]],constant MaterialResources& resources [[buffer(10)]]) {
@@ -42,6 +45,7 @@ final class EnvironmentLightTests: XCTestCase {
     let uniforms = try XCTUnwrap(
       device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared))
     memset(uniforms.contents(), 0, uniforms.length)
+    uniforms.contents().assumingMemoryBound(to: Uniforms.self).pointee.environmentSettings.x = 1
     e.setComputePipelineState(p)
     e.setBuffer(out, offset: 0, index: 0)
     e.setBuffer(uniforms, offset: 0, index: 1)
@@ -66,20 +70,41 @@ final class EnvironmentLightTests: XCTestCase {
   func testEnvironmentValidationAndSharedTextureBudget() throws {
     let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
     let tex = try texture(device, color: SIMD4(repeating: 1))
-    for intensity: Float in [-1, .nan, .infinity] {
-      XCTAssertThrowsError(
-        try GPUSimEnvironmentLight(device: device, texture: tex, intensity: intensity))
-    }
-    XCTAssertThrowsError(try GPUSimEnvironmentLight(device: device, texture: tex, rotation: .nan))
     XCTAssertThrowsError(
       try GPUSimEnvironmentLight(device: device, texture: tex, diffuseSamples: 1))
     let environment = try GPUSimEnvironmentLight(device: device, texture: tex)
     XCTAssertThrowsError(
-      try GPUSimMaterialLibrary(device: device, textureBudget: 1, environment: environment))
+      try GPUSimLightingBindings(materials: GPUSimMaterialLibrary(device: device, textureBudget: 1), environment: environment))
     var m = GPUSimSurfaceMaterial()
     m.baseColorTexture = tex
-    let shared = try GPUSimMaterialLibrary(device: device, materials: [m], environment: environment)
+    let shared = try GPUSimLightingBindings(materials: GPUSimMaterialLibrary(device: device, materials: [m]), environment: environment)
     XCTAssertEqual(shared.textureBytes, tex.allocatedSize, "A shared texture is budgeted once")
+  }
+
+  func testEnvironmentReplacementKeepsMaterialsAndRayWorld() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let a = try GPUSimEnvironmentLight(device: device, texture: texture(device, color: SIMD4(1,0,0,1)))
+    let b = try GPUSimEnvironmentLight(device: device, texture: texture(device, color: SIMD4(0,1,0,1)))
+    let materials = try GPUSimMaterialLibrary(device: device)
+    let shader = try materials.shaderLibrary()
+    let renderer = try GPUSimRenderer(device: device, materials: materials, environment: a)
+    let first = try GPUSimLightingBindings(materials: materials, environment: a)
+    let oldArguments = Data(bytes: first.arguments.contents(), count: first.arguments.length)
+    try renderer.setEnvironment(b)
+    XCTAssertTrue(renderer.environment === b)
+    XCTAssertTrue(try materials.shaderLibrary() === shader)
+    XCTAssertEqual(Data(bytes: first.arguments.contents(), count: first.arguments.length), oldArguments,
+                   "An in-flight binding must remain immutable after another camera swaps lighting")
+    if device.supportsRaytracing {
+      let solver = try GPUSolver(scene: PhysicsScene(name: "Environment ownership"), device: device)
+      let world = try RayTracingScene.shared(scene: solver, materials: materials)
+      try renderer.setEnvironment(a)
+      XCTAssertTrue(try RayTracingScene.shared(scene: solver, materials: materials) === world)
+    }
+    let limited = try GPUSimRenderer(device: device,
+      materials: GPUSimMaterialLibrary(device: device, textureBudget: 0))
+    XCTAssertThrowsError(try limited.setEnvironment(a))
+    XCTAssertNil(limited.environment, "Rejected lighting changes leave the renderer unchanged")
   }
 
   func testDefaultQualityAndBoundedOverrides() {

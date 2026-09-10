@@ -31,7 +31,7 @@ func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram], argument
       inline float2 materialOptics(uint id, constant MaterialResources& resources) { return float2(0,1.5); }
       inline float2 materialLobes(uint id, constant MaterialResources& resources) { return float2(0); }
       inline bool hasEnvironment(constant MaterialResources& resources) { return false; }
-      inline bool environmentBackground(constant MaterialResources& resources) { return false; }
+      inline bool environmentBackground(constant Uniforms& U,constant MaterialResources& resources) { return false; }
       inline float3 materialEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources,float rough=0) { return screenEnvironment(R,U); }
       inline float3 materialDiffuseAmbient(float3 N,constant Uniforms& U,constant MaterialResources& resources) { return diffuseAmbient(N,U); }
       inline float3 materialDiffuseEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources) { return diffuseEnvironment(R,U); }
@@ -52,26 +52,26 @@ func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram], argument
     };
     \(GPUSimEnvironmentLight.basisSource)
     inline bool hasEnvironment(constant MaterialResources& resources) { return resources.environmentSettings.w>0; }
-    inline bool environmentBackground(constant MaterialResources& resources) { return hasEnvironment(resources) && resources.environmentSettings.z>0; }
-    inline float3 environmentDirection(float3 R,constant MaterialResources& resources) {
-        float a=resources.environmentSettings.y,c=cos(a),s=sin(a);
+    inline bool environmentBackground(constant Uniforms& U,constant MaterialResources& resources) { return hasEnvironment(resources) && U.environmentSettings.z==0; }
+    inline float3 environmentDirection(float3 R,constant Uniforms& U) {
+        float a=U.environmentSettings.y,c=cos(a),s=sin(a);
         return float3(c*R.x+s*R.y,-s*R.x+c*R.y,R.z);
     }
     inline float3 materialEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources,float rough=0) {
         if (!hasEnvironment(resources)) return screenEnvironment(R,U);
-        R=environmentDirection(normalize(R),resources);
+        R=environmentDirection(normalize(R),U);
         float2 uv=float2(atan2(R.y,R.x)/(2*M_PI_F)+0.5,acos(clamp(R.z,-1.0,1.0))/M_PI_F);
         constexpr sampler s(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear);
         float lod=rough*rough*float(resources.environmentMap.get_num_mip_levels()-1);
         float3 color=resources.environmentMap.sample(s,uv,level(lod)).rgb;
-        return max(select(float3(0),color,isfinite(color)),float3(0))*resources.environmentSettings.x;
+        return max(select(float3(0),color,isfinite(color)),float3(0))*(1+U.environmentSettings.x);
     }
     inline float3 materialDiffuseAmbient(float3 N,constant Uniforms& U,constant MaterialResources& resources) {
         if (!hasEnvironment(resources)) return diffuseAmbient(N,U);
-        N=environmentDirection(normalize(N),resources);
+        N=environmentDirection(normalize(N),U);
         float3 color=float3(0);
         for(uint i=0;i<9;++i) color+=resources.environmentSH[i].rgb*environmentBasis(i,N);
-        return max(color,float3(0))*resources.environmentSettings.x;
+        return max(color,float3(0))*(1+U.environmentSettings.x);
     }
     inline float3 materialDiffuseEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources) {
         return hasEnvironment(resources) ? materialEnvironment(R,U,resources) : diffuseEnvironment(R,U);

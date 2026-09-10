@@ -6,20 +6,22 @@ diffuse budget. A caller can opt into richer lighting independently of physics,
 asset import, or procedural material authoring. No images are downloaded and no
 studio preset is embedded in the renderer.
 
-See [measured costs and validation](StudioLightingBenchmarks.md) for default-mode
-comparisons and a consumer batch-rendering example.
-
 ## HDR environment
 
 ```swift
 let image = try GPUSimMaterialLibrary.loadTexture(
     device: device, url: environmentURL, sRGB: false)
 let environment = try GPUSimEnvironmentLight(
-    device: device, texture: image,
-    intensity: 1, rotation: .pi / 4, showsBackground: true)
+    device: device, texture: image)
 let materials = try GPUSimMaterialLibrary(
-    device: device, materials: authoredMaterials, environment: environment)
-let renderer = try GPUSimRenderer(device: device, scene: scene, materials: materials)
+    device: device, materials: authoredMaterials)
+let renderer = try GPUSimRenderer(
+    device: device, scene: scene, materials: materials, environment: environment)
+renderer.options.environmentIntensity = 1
+renderer.options.environmentRotation = .pi / 4
+renderer.options.showsEnvironmentBackground = true
+// Swapping lighting preserves material shaders and geometry acceleration structures.
+try renderer.setEnvironment(anotherPreparedEnvironment)
 ```
 
 Use a linear floating-point texture for HDR radiance. Encoded SDR images should
@@ -37,8 +39,8 @@ table](DisplayTransforms.md), including an OCIO-exported AgX processor, without
 changing the ray budget. Exposure alone does not reproduce AgX.
 
 The equirectangular map uses longitude `atan2(y,x)` and latitude `acos(z)` with
-north at +Z and a top-left UV origin. Positive `rotation` rotates the map around
-world +Z. `showsBackground` changes camera visibility independently of lighting.
+north at +Z and a top-left UV origin. Positive `environmentRotation` rotates the map around
+world +Z. `showsEnvironmentBackground` changes camera visibility independently of lighting.
 Intensity scales both diffuse and specular environment radiance.
 
 Nine cosine-convolved spherical-harmonic coefficients are prepared once from
@@ -47,8 +49,12 @@ only that preparation cost. The result approximates irradiance divided by pi;
 floating-point HDR values above one are retained. Diffuse lighting uses those
 coefficients for rigid, soft and floor surfaces. Raster specular fallback uses
 the caller's mip chain; HQ uses GGX ray sampling and actual scene intersections.
-Environment textures participate in the material library's existing deduplicated
-texture budget. Argument-buffer Tier 2 is required.
+Each renderer combines shared material resources with its own immutable environment
+bindings. Environment textures participate in the combined deduplicated texture
+budget; rejected replacements leave existing lighting unchanged. Submitted frames
+retain their original bindings. Image/SH preparation happens once; intensity and
+rotation are per-frame settings. Lighting changes reset HQ history, while display
+exposure does not. Argument-buffer Tier 2 is required.
 
 ## Finite emitters
 
@@ -69,7 +75,8 @@ it does not change when the emitter grows. For total radiant power `P`, a
 one-sided diffuse emitter of area `A` has radiance `P / (pi * A)`. Scale each RGB
 channel by the light color. `twoSided` enables emission on both sides at the same
 radiance. Invalid and degenerate frames are rejected. Up to eight emitters are
-used; the options resolver takes the first eight entries.
+supported. `options.validateLighting()` throws for an excess count; drawing an
+invalid configuration reports a renderer failure rather than silently dropping lights.
 
 HQ evaluates finite distance, emitter orientation, GGX response, and bounded
 shadow rays toward samples on each emitter. Emitters are visible in the sky
@@ -111,11 +118,12 @@ resolution and scene state. The default remains denoising enabled.
 `verticalFieldOfView` defaults to 50 degrees. `nearClipDistance` and
 `farClipDistance` default to 0.1 and 1000 world units. A narrow lens aimed at a
 distant subject benefits from moving the near clip plane forward. All camera
-changes reset reconstruction history; focal scale follows the selected lens.
+changes reset reconstruction history; focal scale follows the selected lens. Primary
+ray queries respect the same clip planes, including off-axis ray distances.
 
 ## Material additions and limits
 
-`GPUSimSurfaceMaterial.transmission` defaults to zero. HQ can follow a camera ray
+`GPUSimSurfaceMaterial.previewOptics.transmission` defaults to zero. HQ can follow a camera ray
 through closed air/material interfaces with the configured index of refraction,
 Snell refraction, total internal reflection, and first-interface Fresnel
 reflection. Interface count bounds the work; zero disables dielectric camera transport. It is a preview dielectric model:
@@ -124,7 +132,7 @@ or caustics. Lightweight rendering retains the opaque appearance. Area shadow
 rays currently treat material boundaries as opaque; the directional path has a
 bounded straight-ray transmission approximation.
 
-`clearcoat` and `sheen` are optional approximate preview lobes on primary surfaces,
+`previewOptics.clearcoat` and `previewOptics.sheen` are optional approximate preview lobes on primary surfaces,
 not a complete layered BSDF. Their default weights are zero. Existing texture
 maps and caller-authored programs continue to supply detailed color, roughness,
 metallicity, emission and normal perturbations.

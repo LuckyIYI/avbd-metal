@@ -115,7 +115,7 @@ final class MetalFXReconstruction {
 
     func beginFrame(camera: simd_float4x4, view: simd_float4x4 = matrix_identity_float4x4, projection: simd_float4x4 = matrix_identity_float4x4, options: GPUSimRenderOptions, invalidate: Bool) -> simd_float4x4 {
         self.view = view; self.projection = projection
-        reset = invalidate || previousCamera == nil || previousOptions != options
+        reset = invalidate || previousCamera == nil || previousOptions?.linearHistoryOptions != options.linearHistoryOptions
         if reset { frame = 0 }
         sources.removeAll(keepingCapacity: true)
         jitter = Self.sampleJitter(frame)

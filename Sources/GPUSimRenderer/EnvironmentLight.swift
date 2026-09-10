@@ -1,7 +1,7 @@
 import Metal
 import simd
 
-/// Immutable image-based lighting, shared by all renderers using a material library.
+/// Immutable prepared image-based lighting, independently shared across renderers.
 /// The texture is an equirectangular radiance map: longitude atan2(y,x), north +Z,
 /// top-left UV origin. Floating-point formats preserve HDR; sRGB textures decode
 /// through Metal's sampler. Intensity multiplies linear radiance, not encoded RGB.
@@ -12,28 +12,20 @@ public final class GPUSimEnvironmentLight {
     case preparation(String)
   }
   public let texture: MTLTexture
-  public let intensity: Float
-  public let rotation: Float
-  public let showsBackground: Bool
   let irradiance: MTLBuffer
 
   /// Nine cosine-convolved spherical-harmonic coefficients are computed once.
   /// `diffuseSamples` affects environment preparation only, never per-frame cost.
   public init(
-    device: MTLDevice, texture: MTLTexture, intensity: Float = 1,
-    rotation: Float = 0, showsBackground: Bool = true, diffuseSamples: Int = 4096
+    device: MTLDevice, texture: MTLTexture, diffuseSamples: Int = 4096
   ) throws {
     guard texture.device.registryID == device.registryID, texture.textureType == .type2D,
       texture.sampleCount == 1, texture.storageMode != .memoryless,
       texture.usage == .unknown || texture.usage.contains(.shaderRead)
     else { throw Failure.invalidTexture }
-    guard intensity.isFinite, intensity >= 0, rotation.isFinite,
-      (64...65536).contains(diffuseSamples)
+    guard (64...65536).contains(diffuseSamples)
     else { throw Failure.invalidParameters }
     self.texture = texture
-    self.intensity = intensity
-    self.rotation = rotation
-    self.showsBackground = showsBackground
     guard let buffer = device.makeBuffer(length: 9 * 16, options: .storageModeShared),
       let queue = device.makeCommandQueue(), let command = queue.makeCommandBuffer()
     else { throw Failure.allocation }
@@ -95,4 +87,58 @@ public final class GPUSimEnvironmentLight {
         result[coefficient]=float4(total*(4*M_PI_F/float(count))*convolution,0);
     }
     """
+}
+
+/// Per-renderer bindings combine shared materials with independently owned lighting.
+/// They are immutable, so replacing lighting cannot alter a submitted GPU frame.
+@MainActor
+final class GPUSimLightingBindings {
+  let materials: GPUSimMaterialLibrary
+  let environment: GPUSimEnvironmentLight?
+  let arguments: MTLBuffer
+  let textures: [MTLTexture]
+  let textureBytes: Int
+
+  init(materials: GPUSimMaterialLibrary, environment: GPUSimEnvironmentLight?) throws {
+    self.materials = materials
+    self.environment = environment
+    var textures = materials.textures
+    var bytes = materials.textureBytes
+    if let environment {
+      guard materials.usesArgumentBuffers else { throw GPUSimMaterialLibrary.Failure.unsupportedDevice }
+      guard environment.texture.device.registryID == materials.device.registryID else {
+        throw GPUSimRendererError.sceneDeviceMismatch
+      }
+      if !textures.contains(where: { $0 === environment.texture }) {
+        guard environment.texture.allocatedSize <= max(0, materials.textureBudget - bytes) else {
+          throw GPUSimMaterialLibrary.Failure.textureBudgetExceeded
+        }
+        textures.append(environment.texture)
+        bytes += environment.texture.allocatedSize
+      }
+      arguments = try GPUSimMaterialLibrary.makeArguments(device: materials.device,
+        records: materials.records, textures: materials.textures, count: materials.materialCount,
+        environmentIrradiance: materials.environmentIrradiance, environment: environment)
+    } else {
+      arguments = materials.arguments
+    }
+    self.textures = textures
+    textureBytes = bytes
+  }
+
+  func bind(_ encoder: MTLRenderCommandEncoder) {
+    encoder.setFragmentBuffer(arguments, offset: 0, index: 10)
+    guard materials.usesArgumentBuffers else { return }
+    encoder.useResource(materials.records, usage: .read, stages: .fragment)
+    encoder.useResource(environment?.irradiance ?? materials.environmentIrradiance, usage: .read, stages: .fragment)
+    if !textures.isEmpty { encoder.useResources(textures, usage: .read, stages: .fragment) }
+  }
+
+  func bind(_ encoder: MTLComputeCommandEncoder) {
+    encoder.setBuffer(arguments, offset: 0, index: 10)
+    guard materials.usesArgumentBuffers else { return }
+    encoder.useResource(materials.records, usage: .read)
+    encoder.useResource(environment?.irradiance ?? materials.environmentIrradiance, usage: .read)
+    if !textures.isEmpty { encoder.useResources(textures, usage: .read) }
+  }
 }

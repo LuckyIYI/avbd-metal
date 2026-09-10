@@ -65,9 +65,9 @@
       environment = try GPUSimEnvironmentLight(device: device, texture: texture)
     } else { environment = nil }
     let resources = try GPUSimMaterialLibrary(
-      device: device, materials: materials, programs: programs, environment: environment)
+      device: device, materials: materials, programs: programs)
     let solver = try GPUSolver(scene: scene, device: device)
-    let renderer = try GPUSimRenderer(device: device, scene: solver, materials: resources)
+    let renderer = try GPUSimRenderer(device: device, scene: solver, materials: resources, environment: environment)
     renderer.automaticallyFramesScene = false
     renderer.options = args.contains("--fast") ? .lightweight : .qualityBeta
     renderer.options.showsGroundPlane = false

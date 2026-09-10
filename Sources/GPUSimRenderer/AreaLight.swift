@@ -5,7 +5,7 @@ import simd
 /// Emitters illuminate and appear in HQ reflections; they are not physics bodies.
 public struct GPUSimAreaLight: Sendable, Equatable {
   public enum Shape: UInt32, Sendable { case rectangle, disk }
-  public enum Failure: Error { case invalidParameters }
+  public enum Failure: Error { case invalidParameters, tooManyLights }
   public static let maximumCount = 8
   public let position, normal, up, radiance: SIMD3<Float>
   /// Full width/height in world units. A disk with unequal axes is an ellipse.

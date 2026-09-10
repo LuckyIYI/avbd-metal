@@ -36,12 +36,16 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// Display exposure in stops, applied to linear HDR before the existing
     /// tone curve. Zero preserves the default; finite values clamp to -16...16.
     public var displayExposure: Float = 0
+    /// Settings for the renderer's independently prepared environment image.
+    public var environmentIntensity: Float = 1
+    public var environmentRotation: Float = 0
+    public var showsEnvironmentBackground: Bool = true
     public var rayTracingQuality = GPUSimRayTracingQuality.realtime
     /// HQ neural denoising and temporal reconstruction. Disable to inspect the
     /// unfiltered HDR lighting at native resolution with the same ray budgets.
     /// This diagnostic output retains surface-aware visibility reconstruction.
     public var rayTracingDenoising: Bool = true
-    /// Up to eight finite emitters; additional entries are ignored at resolution.
+    /// Up to eight finite emitters. Excess entries fail validation rather than disappearing.
     public var areaLights: [GPUSimAreaLight] = []
     /// Directional-light radiance multiplier. Zero allows environment-only lighting.
     public var sunIntensity: Float = 1
@@ -85,19 +89,38 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// cadence. Set it to the loop's frame period to pin the cadence.
     public var minimumFrameDuration: Double?
 
+    /// Validates scene lighting limits before rendering or importing a light rig.
+    public func validateLighting() throws {
+        guard areaLights.count <= GPUSimAreaLight.maximumCount else {
+            throw GPUSimAreaLight.Failure.tooManyLights
+        }
+    }
+
+    // New lighting options invalidate conservatively; presentation-only controls
+    // are stripped because they do not change the accumulated linear radiance.
+    var linearHistoryOptions: Self {
+        var result = self
+        result.displayExposure = 0
+        result.minimumFrameDuration = nil
+        result.showConvexCollisionGeometry = false
+        result.convexCollisionWireframe = false
+        return result
+    }
+
     var usesRayTracing: Bool { lightingMode == .qualityBeta }
     var usesDiffuseGI: Bool { usesRayTracing }
     var usesHDR: Bool { screenSpaceReflections || usesRayTracing || reconstruction == .metalFX }
 
     func resolved(supportsHQ: Bool) -> Self {
         var result = self
+        result.environmentIntensity = environmentIntensity.isFinite ? max(0, environmentIntensity) : 1
+        result.environmentRotation = environmentRotation.isFinite ? environmentRotation.truncatingRemainder(dividingBy: 2 * .pi) : 0
         result.ambientExposure = ambientExposure.isFinite ? min(ambientExposure, 4) : 0
         result.ambientExposure = max(result.ambientExposure, -4)
         result.displayExposure = displayExposure.isFinite ? max(-16, min(16, displayExposure)) : 0
         result.sunAngularRadius = sunAngularRadius.isFinite ? max(0, min(0.5, sunAngularRadius)) : 0
         result.sunIntensity = sunIntensity.isFinite ? max(0, min(100, sunIntensity)) : 1
         result.rayTracingQuality = rayTracingQuality.resolved
-        result.areaLights = Array(areaLights.prefix(GPUSimAreaLight.maximumCount))
         let magnitude = max(abs(sunDirection.x), max(abs(sunDirection.y), abs(sunDirection.z)))
         if sunDirection.x.isFinite && sunDirection.y.isFinite && sunDirection.z.isFinite && magnitude > 0 {
             result.sunDirection = normalize(sunDirection / magnitude)
@@ -656,6 +679,7 @@ struct Uniforms {
     float4 diffuse; // x: world diffuse lighting enabled
     float4 reconstruction; // x: MetalFX, yz: normalized projection jitter, w: sample index
     float4 areaSettings; // count, samples per emitter, reserved
+    float4 environmentSettings; // intensity minus one, rotation, hide background, reserved
     float4 displaySettings; // exposure, custom display transform enabled, reserved
     AreaLight areaLights[8];
     float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
@@ -1272,7 +1296,7 @@ fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffe
     float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
     float glow = exp(-3.0 * distance(ndc, float2(-0.45, 0.55)));
     c += float3(0.30, 0.25, 0.16) * glow;
-    if (environmentBackground(materials)) {
+    if (environmentBackground(U,materials)) {
         float3 direction=normalize(worldFromDepth(in.uv,0.999,U.invViewProj)-U.eye.xyz);
         c=materialEnvironment(direction,U,materials);
     }
@@ -1399,6 +1423,7 @@ struct Uniforms {
     var diffuse = SIMD4<Float>.zero
     var reconstruction = SIMD4<Float>.zero
     var areaSettings = SIMD4<Float>.zero
+    var environmentSettings = SIMD4<Float>.zero
     var displaySettings = SIMD4<Float>.zero
     var areaLights = (AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord())
     var aoProjection: SIMD4<Float>
@@ -1482,6 +1507,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var screenSpace: ScreenSpacePipeline!
     private var presentationColor, presentationDepth: MTLTexture?
     private let materialLibrary: GPUSimMaterialLibrary
+    private var lightingBindings: GPUSimLightingBindings!
+    public private(set) var environment: GPUSimEnvironmentLight?
     public private(set) var displayTransform: GPUSimDisplayTransform?
     private let compiledDisplayProgram: GPUSimDisplayProgram?
     private var rayWorld: RayTracingScene?
@@ -1516,6 +1543,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     @MainActor private struct CompletedFrameResources {
         let texture: MTLTexture?
         let snapshot: MTLCommandBuffer?
+        let lighting: GPUSimLightingBindings
     }
 
     /// Orbit azimuth in radians.
@@ -1605,7 +1633,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         device: MTLDevice,
         scene: (any GPUSimRenderableScene)? = nil,
         materials: GPUSimMaterialLibrary? = nil,
-        displayTransform: GPUSimDisplayTransform? = nil
+        displayTransform: GPUSimDisplayTransform? = nil,
+        environment: GPUSimEnvironmentLight? = nil
     ) throws {
         if let scene, scene.renderDevice.registryID != device.registryID {
             throw GPUSimRendererError.sceneDeviceMismatch
@@ -1626,6 +1655,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let motionLib = try materials.shaderLibrary(motionGuides: true, displayProgram: compiledDisplayProgram)
         screenSpace = try ScreenSpacePipeline(device: device, library: lib, materials: materials)
         try setDisplayTransform(displayTransform)
+        try setEnvironment(environment)
         func pipe(_ v: String, _ f: String,
                   samples: Int = GPUSimRenderer.sampleCount,
                   colorFormats: [MTLPixelFormat] = [GPUSimRenderer.colorFormat],
@@ -1874,6 +1904,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// Discards HQ reconstruction history, for example after a camera teleport.
     public func resetTemporalHistory() {
         prevVP = nil
+    }
+
+    /// Switches the prepared environment without rebuilding materials, shaders,
+    /// or acceleration structures. Submitted frames retain their own bindings.
+    public func setEnvironment(_ environment: GPUSimEnvironmentLight?) throws {
+        if lightingBindings != nil, self.environment === environment { return }
+        let bindings = try GPUSimLightingBindings(materials: materialLibrary, environment: environment)
+        self.environment = environment
+        lightingBindings = bindings
+        screenSpace.lightingBindings = bindings
+        resetTemporalHistory()
     }
 
     /// Switches only the display transform. HDR reconstruction history remains
@@ -2191,6 +2232,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         var activeOptions = source?.rendererOptions ?? options
+        do { try activeOptions.validateLighting() }
+        catch { reportFailure("Scene exceeds the supported limit of \(GPUSimAreaLight.maximumCount) area lights"); return }
         activeOptions = activeOptions.resolved(supportsHQ: Self.supportsHQ(device: device))
         activeLightingMode = activeOptions.lightingMode
         guard renderScene.rendererStateIsValid else { return }
@@ -2480,6 +2523,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         U.rayBudget = SIMD4(Float(quality.shadowSamples),Float(quality.reflectionSamples),
                            Float(quality.diffuseSamples),materialLibrary.hasTransmission ? Float(quality.transmissionInterfaces) : 0)
         U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),0,0)
+        U.environmentSettings = SIMD4(activeOptions.environmentIntensity-1,activeOptions.environmentRotation,activeOptions.showsEnvironmentBackground ? 0 : 1,0)
         U.displaySettings.x = activeOptions.displayExposure
         U.displaySettings.y = displayTransform == nil ? 0 : 1
         withUnsafeMutableBytes(of: &U.areaLights) { bytes in
@@ -2613,7 +2657,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         byteCount: batch.opaqueCount * MemoryLayout<GPUSimRenderInstance>.stride)
                 }
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: metalFX.guidePass()) else { throw MetalFXReconstruction.Failure.encoder }
-                materialLibrary.bind(enc)
+                lightingBindings.bind(enc)
                 enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 enc.label = "Reconstruction motion and material guides"
                 enc.setViewport(screenViewport)
@@ -2713,7 +2757,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             do {
                 let enc = prepassEncoder
-                materialLibrary.bind(enc)
+                lightingBindings.bind(enc)
                 enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 enc.label = "Shared screen-space surfaces"
                 func surfacePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
@@ -2878,7 +2922,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             reportFailure("could not create the main render encoder")
             return
         }
-        materialLibrary.bind(enc)
+        lightingBindings.bind(enc)
         enc.setFragmentTexture(displayTransform?.texture, index: 8)
         enc.label = "Main PBR pass"
         bindSurfaceLighting(enc)
@@ -3003,7 +3047,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 // The translucent auxiliary pipelines below use pbr_fragment,
                 // which reads the material argument buffer; the fresh encoder
                 // needs the same binding as the main pass.
-                materialLibrary.bind(enc)
+                lightingBindings.bind(enc)
                 enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 if metalFX != nil {
                     U.viewProj = unjitteredVP; U.invViewProj = unjitteredVP.inverse
@@ -3113,7 +3157,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let retire = renderScene.renderSceneRequiresFrameRetirement
         framesDrawn += 1
         let frameNumber = framesDrawn
-        let completed = CompletedFrameResources(texture: completedTexture, snapshot: snapshotSubmission)
+        let completed = CompletedFrameResources(texture: completedTexture, snapshot: snapshotSubmission, lighting: lightingBindings)
         let inFlight = inFlightFrames
         cmd.addCompletedHandler { [weak self] finished in
             inFlight.signal()

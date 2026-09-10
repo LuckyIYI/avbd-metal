@@ -27,12 +27,8 @@ public struct GPUSimSurfaceMaterial {
   public var baseColor = SIMD3<Float>(repeating: 1)
   public var roughness: Float = 1
   public var metallic: Float = 0
-  /// Camera-ray transmission in qualityBeta. Lightweight rendering stays opaque.
-  /// Closed, consistently outward-normalled meshes are required for refraction.
-  public var transmission: Float = 0
-  public var indexOfRefraction: Float = 1.5
-  public var clearcoat: Float = 0
-  public var sheen: Float = 0
+  /// Experimental optical approximations, separate from the shared opaque PBR model.
+  public var previewOptics = GPUSimPreviewOptics()
   public var emission = SIMD3<Float>.zero
   public var normalScale: Float = 1
   /// Select packed scalar channels (0 red, 1 green, 2 blue, 3 alpha).
@@ -82,9 +78,9 @@ public final class GPUSimMaterialLibrary {
   }
   let device: MTLDevice
   let programs: [GPUSimMaterialProgram]
-  public let environment: GPUSimEnvironmentLight?
   public let hasTransmission: Bool
-  private let environmentIrradiance: MTLBuffer
+  let environmentIrradiance: MTLBuffer
+  let textureBudget: Int
   let records: MTLBuffer
   let textures: [MTLTexture]
   let arguments: MTLBuffer
@@ -115,8 +111,8 @@ public final class GPUSimMaterialLibrary {
   }
 
   /// Validates material records, programs, and their textures without creating
-  /// GPU resources. Environment validation and its combined texture budget are
-  /// checked by ``init`` when an environment is supplied.
+  /// GPU resources. A renderer validates its environment and the combined texture
+  /// budget separately when installing lighting.
   public static func validate(
     materials: [GPUSimSurfaceMaterial], programs: [GPUSimMaterialProgram] = [],
     device: MTLDevice, textureBudget: Int = 512 * 1024 * 1024
@@ -158,13 +154,13 @@ public final class GPUSimMaterialLibrary {
         m.emission.x, m.emission.y, m.emission.z, m.normalScale,
         m.uvScale.x, m.uvScale.y, m.uvOffset.x, m.uvOffset.y,
         m.parameters.x, m.parameters.y, m.parameters.z, m.parameters.w,
-        m.transmission, m.indexOfRefraction,
-        m.clearcoat, m.sheen,
+        m.previewOptics.transmission, m.previewOptics.indexOfRefraction,
+        m.previewOptics.clearcoat, m.previewOptics.sheen,
       ]
       guard floats.allSatisfy({ $0.isFinite }), (0...1).contains(m.roughness),
         (0...1).contains(m.metallic), m.program <= programs.count,
-        (0...1).contains(m.transmission), (1...3).contains(m.indexOfRefraction),
-        (0...1).contains(m.clearcoat), (0...1).contains(m.sheen),
+        (0...1).contains(m.previewOptics.transmission), (1...3).contains(m.previewOptics.indexOfRefraction),
+        (0...1).contains(m.previewOptics.clearcoat), (0...1).contains(m.previewOptics.sheen),
         m.roughnessChannel < 4, m.metallicChannel < 4,
         m.baseColor.min() >= 0, m.emission.min() >= 0, m.normalScale >= 0
       else {
@@ -181,44 +177,28 @@ public final class GPUSimMaterialLibrary {
             index(m.emissionTexture), m.program, m.normalScale.bitPattern, m.clampToEdge ? 1 : 0),
           parameters: m.parameters,
           channels: SIMD4(m.roughnessChannel, m.metallicChannel, m.invertNormalGreen ? 1 : 0, 0),
-          optics: SIMD4(m.transmission, m.indexOfRefraction, m.clearcoat, m.sheen)))
+          optics: SIMD4(m.previewOptics.transmission, m.previewOptics.indexOfRefraction, m.previewOptics.clearcoat, m.previewOptics.sheen)))
     }
     return Prepared(records: values, textures: textures, bytes: bytes)
   }
 
   public init(
     device: MTLDevice, materials: [GPUSimSurfaceMaterial] = [],
-    programs: [GPUSimMaterialProgram] = [], textureBudget: Int = 512 * 1024 * 1024,
-    environment: GPUSimEnvironmentLight? = nil
+    programs: [GPUSimMaterialProgram] = [], textureBudget: Int = 512 * 1024 * 1024
   ) throws {
     let tier2 = device.argumentBuffersSupport == .tier2
-    guard (materials.isEmpty && environment == nil) || tier2 else { throw Failure.unsupportedDevice }
+    guard materials.isEmpty || tier2 else { throw Failure.unsupportedDevice }
     self.device = device
     self.programs = programs
-    self.environment = environment
-    hasTransmission = materials.contains { $0.transmission > 0 }
+    self.textureBudget = textureBudget
+    hasTransmission = materials.contains { $0.previewOptics.transmission > 0 }
     usesArgumentBuffers = tier2
     materialCount = materials.count
-    var prepared = try GPUSimMaterialLibrary.prepare(
+    let prepared = try GPUSimMaterialLibrary.prepare(
       materials: materials, programs: programs, device: device, textureBudget: textureBudget)
-    if let environment {
-      guard environment.texture.device.registryID == device.registryID else {
-        throw Failure.incompatibleTexture("Environment belongs to another device")
-      }
-      if !prepared.textures.contains(where: { $0 === environment.texture }) {
-        guard prepared.textures.count < Self.textureCapacity else { throw Failure.tooManyTextures }
-        guard environment.texture.allocatedSize <= max(0,textureBudget-prepared.bytes) else {
-          throw Failure.textureBudgetExceeded
-        }
-        prepared.textures.append(environment.texture)
-        prepared.bytes += environment.texture.allocatedSize
-      }
-      environmentIrradiance = environment.irradiance
-    } else {
-      guard let empty = device.makeBuffer(length: 9*16, options: .storageModeShared) else { throw Failure.allocation }
-      memset(empty.contents(),0,empty.length)
-      environmentIrradiance = empty
-    }
+    guard let empty = device.makeBuffer(length: 9*16, options: .storageModeShared) else { throw Failure.allocation }
+    memset(empty.contents(),0,empty.length)
+    environmentIrradiance = empty
     textures = prepared.textures
     textureBytes = prepared.bytes
     var values = prepared.records
@@ -243,6 +223,13 @@ public final class GPUSimMaterialLibrary {
       arguments = stub
       return
     }
+    arguments = try Self.makeArguments(device: device, records: records, textures: textures,
+      count: materials.count, environmentIrradiance: empty, environment: nil)
+  }
+
+  static func makeArguments(device: MTLDevice, records: MTLBuffer, textures: [MTLTexture],
+                            count materialCount: Int, environmentIrradiance: MTLBuffer,
+                            environment: GPUSimEnvironmentLight?) throws -> MTLBuffer {
     // The same argument layout is used in every fragment and compute pipeline.
     let capacity = GPUSimMaterialLibrary.textureCapacity
     let maps = MTLArgumentDescriptor()
@@ -272,13 +259,12 @@ public final class GPUSimMaterialLibrary {
     encoder.setArgumentBuffer(args, offset: 0)
     for (i, t) in textures.enumerated() { encoder.setTexture(t, index: i) }
     encoder.setBuffer(records, offset: 0, index: capacity)
-    encoder.constantData(at: capacity + 1).storeBytes(of: UInt32(materials.count), as: UInt32.self)
+    encoder.constantData(at: capacity + 1).storeBytes(of: UInt32(materialCount), as: UInt32.self)
     encoder.setTexture(environment?.texture, index: capacity+2)
-    encoder.setBuffer(environmentIrradiance, offset: 0, index: capacity+3)
+    encoder.setBuffer(environment?.irradiance ?? environmentIrradiance, offset: 0, index: capacity+3)
     encoder.constantData(at: capacity+4).storeBytes(of:
-      SIMD4<Float>(environment?.intensity ?? 0,environment?.rotation ?? 0,
-                   environment?.showsBackground == true ? 1 : 0,environment == nil ? 0 : 1), as: SIMD4<Float>.self)
-    arguments = args
+      SIMD4<Float>(1,0,1,environment == nil ? 0 : 1), as: SIMD4<Float>.self)
+    return args
   }
 
   func bind(_ encoder: MTLRenderCommandEncoder) {

@@ -81,6 +81,26 @@ let areaRayShaderSource = """
       }
       return total;
   }
+  inline float3 rtPrimaryPosition(float3 P,instance_acceleration_structure scene,constant Uniforms& U) {
+      // A depth32 camera buffer can quantize a distant surface behind its actual
+      // triangle. Recover the primary intersection before shadow rays rather than
+      // increasing the normal bias until thin contacts lose their shadows.
+      ray camera;camera.origin=U.eye.xyz;camera.direction=normalize(P-U.eye.xyz);
+      float2 clip=cameraRayInterval(camera.direction,U);
+      // Restrict recovery to the raster receiver's depth neighborhood, so a
+      // different surface cannot supply its position with this receiver's material.
+      float expected=length(P-U.eye.xyz), tolerance=max(0.001,expected*0.001);
+      camera.min_distance=max(clip.x,expected-tolerance);
+      camera.max_distance=min(clip.y,expected+tolerance);
+      if (camera.max_distance<=camera.min_distance) return P;
+      intersector<triangle_data,instancing> primary;
+      primary.assume_geometry_type(geometry_type::triangle);primary.force_opacity(forced_opacity::opaque);
+      auto hit=primary.intersect(camera,scene,2);
+      float ground=rtGroundDistance(camera,U);
+      float distance=hit.type==intersection_type::none ? 1e20 : hit.distance;
+      if (ground>=0) distance=min(distance,ground);
+      return distance<1e19 ? camera.origin+camera.direction*distance : P;
+  }
   kernel void rt_area_lighting(instance_acceleration_structure scene [[buffer(0)]],constant Uniforms& U [[buffer(1)]],
       depth2d<float,access::read> depth [[texture(0)]],texture2d<float,access::read> normal [[texture(1)]],
       texture2d<float,access::write> output [[texture(2)]],texture2d<float,access::read> material [[texture(3)]],
@@ -91,17 +111,7 @@ let areaRayShaderSource = """
       float2 uv=(float2(pixel)+0.5)/float2(depth.get_width(),depth.get_height());
       float3 P=worldFromDepth(uv,d,U.invViewProj);float4 nr=normal.read(pixel),m=material.read(pixel);
       float3 N=normalize(nr.xyz),V=normalize(U.eye.xyz-P);
-      // A depth32 camera buffer can quantize a distant surface behind its actual
-      // triangle. Recover the primary intersection before shadow rays rather than
-      // increasing the normal bias until thin contacts lose their shadows.
-      ray camera;camera.origin=U.eye.xyz;camera.direction=-V;camera.min_distance=0.001;camera.max_distance=1000;
-      intersector<triangle_data,instancing> primary;
-      primary.assume_geometry_type(geometry_type::triangle);primary.force_opacity(forced_opacity::opaque);
-      auto hit=primary.intersect(camera,scene,2);
-      float ground=rtGroundDistance(camera,U);
-      float distance=hit.type==intersection_type::none ? 1e20 : hit.distance;
-      if (ground>=0) distance=min(distance,ground);
-      if (distance<1e19) P=camera.origin+camera.direction*distance;
+      P=rtPrimaryPosition(P,scene,U);
       output.write(float4(rtAreaLighting(P,N,V,m.rgb,nr.w,m.a,scene,U,pixel),1),pixel);
   }
   """

@@ -5,6 +5,23 @@ import XCTest
 
 @MainActor
 final class MetalFXReconstructionTests: XCTestCase {
+    func testDisplayExposurePreservesLinearHistory() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
+        else { throw XCTSkip("MetalFX unavailable") }
+        let fx = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: false)
+        var options = GPUSimRenderOptions.qualityBeta
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        XCTAssertFalse(fx.reset)
+        options.displayExposure = 1
+        options.minimumFrameDuration = 1.0/30.0
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        XCTAssertFalse(fx.reset)
+        options.environmentRotation = 0.5
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        XCTAssertTrue(fx.reset, "Lighting changes invalidate accumulated radiance")
+    }
+
     func testAuxiliaryHistoryUsesLiveBytesAcrossUnequalRingCapacities() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
         else { throw XCTSkip("MetalFX unavailable") }

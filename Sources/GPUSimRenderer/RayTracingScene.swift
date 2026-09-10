@@ -35,7 +35,7 @@ final class RayTracingScene {
     private struct Key: Hashable { let scene: ObjectIdentifier; let materials: ObjectIdentifier? }
     private static var worlds: [Key: WeakEntry] = [:]
     static func shared(scene: any GPUSimRenderableScene, materials: GPUSimMaterialLibrary? = nil) throws -> RayTracingScene {
-        let materialKey = materials.flatMap { $0.materialCount == 0 && $0.programs.isEmpty && $0.environment == nil ? nil : ObjectIdentifier($0) }
+        let materialKey = materials.flatMap { $0.materialCount == 0 && $0.programs.isEmpty ? nil : ObjectIdentifier($0) }
         worlds = worlds.filter { $0.value.value?.scene != nil }
         let key = Key(scene: ObjectIdentifier(scene), materials: materialKey)
         if let existing = worlds[key]?.value { return existing }
@@ -356,7 +356,7 @@ final class RayTracingScene {
         guard let e = command.makeComputeCommandEncoder() else { throw Failure.allocation("ray lighting encoder") }
         e.label = label
         e.setComputePipelineState(pipeline)
-        materials.bind(e)
+        if let bindings = screen.lightingBindings { bindings.bind(e) } else { materials.bind(e) }
         e.setAccelerationStructure(structure, bufferIndex: 0)
         e.useResource(structure, usage: .read)
         for asset in assets { e.useResource(asset.structure, usage: .read) }

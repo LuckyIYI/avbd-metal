@@ -10,16 +10,16 @@ final class TransmissionTests: XCTestCase {
   func testOpticsValidationAndDefaultOpaqueABI() throws {
     let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
     let base = GPUSimSurfaceMaterial()
-    XCTAssertEqual(base.transmission, 0)
+    XCTAssertEqual(base.previewOptics.transmission, 0)
     XCTAssertEqual(MemoryLayout<GPUSimMaterialLibrary.Record>.stride, 128)
     for value: Float in [-0.1, 1.1, .nan, .infinity] {
       var m = base
-      m.transmission = value
+      m.previewOptics.transmission = value
       XCTAssertThrowsError(try GPUSimMaterialLibrary.validate(materials: [m], device: device))
     }
     for value: Float in [0.9, 3.1, .nan, .infinity] {
       var m = base
-      m.indexOfRefraction = value
+      m.previewOptics.indexOfRefraction = value
       XCTAssertThrowsError(try GPUSimMaterialLibrary.validate(materials: [m], device: device))
     }
   }
@@ -49,8 +49,8 @@ final class TransmissionTests: XCTestCase {
     var results = [SIMD4<Float>]()
     for mode in 0..<3 {
       var glass = GPUSimSurfaceMaterial()
-      glass.transmission = mode == 0 ? 0 : 1
-      glass.indexOfRefraction = mode == 2 ? 1.5 : 1
+      glass.previewOptics.transmission = mode == 0 ? 0 : 1
+      glass.previewOptics.indexOfRefraction = mode == 2 ? 1.5 : 1
       var target = GPUSimSurfaceMaterial()
       target.baseColor = .zero
       target.metallic = 1

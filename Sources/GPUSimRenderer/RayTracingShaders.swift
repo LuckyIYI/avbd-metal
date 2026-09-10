@@ -325,7 +325,8 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     float2 uv = (float2(pixel)+0.5)/float2(output.get_width(),output.get_height());
     float3 P = worldFromDepth(uv,d,U.invViewProj), N = normalize(nr.xyz), V = normalize(U.eye.xyz-P);
     ray cameraRay; cameraRay.origin=U.eye.xyz; cameraRay.direction=-V;
-    cameraRay.min_distance=0.001; cameraRay.max_distance=100;
+    float2 cameraClip=cameraRayInterval(cameraRay.direction,U);
+    cameraRay.min_distance=cameraClip.x; cameraRay.max_distance=cameraClip.y;
     float4 transmitted=U.rayBudget.w>0 ? rtTransmission(cameraRay,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials) : float4(0);
     if (transmitted.a>0) {
         float fog=horizonFog(length(P-U.eye.xyz));

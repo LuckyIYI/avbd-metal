@@ -9,6 +9,7 @@ final class ScreenSpacePipeline {
     enum Failure: Error { case allocation(String), encoder(String), shaderFunction(String) }
     let device: MTLDevice
     private let materials: GPUSimMaterialLibrary
+    var lightingBindings: GPUSimLightingBindings?
     var displayTransform: GPUSimDisplayTransform?
     private let aoPipeline, aoDepthPipeline, aoSpatialPipeline, visibilityPipeline, directVisibilityPipeline: MTLRenderPipelineState
     private let contactPipeline, reflectionPipeline, reflectionFilterPipeline, compositePipeline: MTLRenderPipelineState
@@ -217,7 +218,7 @@ final class ScreenSpacePipeline {
         guard let e = command.makeRenderCommandEncoder(descriptor: d) else { throw Failure.encoder(pipeline.label ?? "effect") }
         e.label = pipeline.label
         e.setRenderPipelineState(pipeline)
-        materials.bind(e)
+        if let lightingBindings { lightingBindings.bind(e) } else { materials.bind(e) }
         var u = uniforms
         e.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
         if var parameters { e.setFragmentBytes(&parameters, length: MemoryLayout<SIMD4<Float>>.stride, index: 2) }

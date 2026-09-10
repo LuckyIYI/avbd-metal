@@ -23,7 +23,8 @@ final class AreaLightTests: XCTestCase {
     XCTAssertEqual(light.normal, SIMD3(0, 0, -1))
     var options = GPUSimRenderOptions()
     options.areaLights = Array(repeating: light, count: 20)
-    XCTAssertEqual(options.resolved(supportsHQ: true).areaLights.count, 8)
+    XCTAssertThrowsError(try options.validateLighting())
+    XCTAssertEqual(options.resolved(supportsHQ: true).areaLights.count, 20)
     for size: SIMD2<Float> in [
       .zero, SIMD2(-1, 1), SIMD2(.nan, 1), SIMD2(repeating: .greatestFiniteMagnitude),
     ] {
@@ -51,6 +52,7 @@ final class AreaLightTests: XCTestCase {
             output[1]=float4(rasterAreaLighting(float3(0,0,-3),float3(0,0,1),float3(0,0,1),float3(0.6),1,0,U),1);
             output[2]=areaIntersection(float3(0),float3(0,0,1),U);
             output[3]=areaIntersection(float3(0,0,6),float3(0,0,-1),U);
+            output[4]=float4(cameraRayInterval(float3(0,0,1),U),cameraRayInterval(normalize(float3(1,0,1)),U));
         }
         """, options: nil)
     let pipeline = try device.makeComputePipelineState(
@@ -64,7 +66,10 @@ final class AreaLightTests: XCTestCase {
     let values = u.contents().assumingMemoryBound(to: Uniforms.self)
     values.pointee.areaSettings = SIMD4(1, 64, 0, 0)
     values.pointee.areaLights.0 = light.record
-    let output = try XCTUnwrap(device.makeBuffer(length: 64, options: .storageModeShared))
+    values.pointee.camRight = SIMD4(1,0,0,0)
+    values.pointee.camUp = SIMD4(0,1,0,0)
+    values.pointee.aoProjection = SIMD4(1.25,-2.5,1,1)
+    let output = try XCTUnwrap(device.makeBuffer(length: 80, options: .storageModeShared))
     let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
     let e = try XCTUnwrap(command.makeComputeCommandEncoder())
     e.setComputePipelineState(pipeline)
@@ -83,6 +88,10 @@ final class AreaLightTests: XCTestCase {
     XCTAssertEqual(result[1].x / result[0].x, 0.25, accuracy: 0.0001)
     XCTAssertEqual(result[2], SIMD4(100, 100, 100, 3))
     XCTAssertGreaterThan(result[3].w, 1e10, "A one-sided emitter is invisible from behind")
+    XCTAssertEqual(result[4].x, 2, accuracy: 0.0001)
+    XCTAssertEqual(result[4].y, 10, accuracy: 0.0001)
+    XCTAssertEqual(result[4].z, 2 * sqrt(2), accuracy: 0.0001)
+    XCTAssertEqual(result[4].w, 10 * sqrt(2), accuracy: 0.0001)
   }
 
   func testWorldGeometryOccludesFiniteEmitter() throws {
@@ -105,6 +114,7 @@ final class AreaLightTests: XCTestCase {
       source: renderShaderSource + "\n" + rayTracingShaderSource + """
         kernel void area_shadow_probe(instance_acceleration_structure scene [[buffer(0)]],constant Uniforms& U [[buffer(1)]],device float4* out [[buffer(9)]]) {
             out[0]=float4(rtAreaLighting(float3(0),float3(0,0,1),float3(0,0,1),float3(0.6),0.7,0,scene,U,uint2(0)),1);
+            out[2]=float4(rtPrimaryPosition(float3(0,0,3),scene,U),1);
             out[1]=float4(rtAreaLighting(float3(2,0,0),float3(0,0,1),normalize(float3(-2,0,3)),float3(0.6),0.7,0,scene,U,uint2(1)),1);
         }
         """, options: nil)
@@ -128,7 +138,13 @@ final class AreaLightTests: XCTestCase {
       position: F3(0, 0, 3), normal: F3(0, 0, -1), up: F3(0, 1, 0), size: SIMD2(repeating: 0.4),
       radiance: F3(repeating: 20), shape: .disk
     ).record
-    let output = try XCTUnwrap(device.makeBuffer(length: 32, options: .storageModeShared))
+    // A second visible plane lies beyond a near-clipped foreground plane.
+    // The recovery helper must not replace its position with the plane at z=1.
+    values.pointee.eye = .zero
+    values.pointee.camRight = SIMD4(1,0,0,0)
+    values.pointee.camUp = SIMD4(0,1,0,0)
+    values.pointee.aoProjection = SIMD4(1.25,-2.5,1,1) // near=2, far=10
+    let output = try XCTUnwrap(device.makeBuffer(length: 48, options: .storageModeShared))
     let e = try XCTUnwrap(command.makeComputeCommandEncoder())
     e.setComputePipelineState(pipeline)
     e.setAccelerationStructure(world.structure, bufferIndex: 0)
@@ -146,5 +162,6 @@ final class AreaLightTests: XCTestCase {
     XCTAssertEqual(
       result[0].x, 0, accuracy: 0.000001, "Opaque geometry must fully occlude this small disk")
     XCTAssertGreaterThan(result[1].x, 0.01, "An unobstructed receiver must see the finite emitter")
+    XCTAssertEqual(result[2].z, 3, accuracy: 0.0001, "Near-clipped geometry cannot replace the raster receiver")
   }
 }
