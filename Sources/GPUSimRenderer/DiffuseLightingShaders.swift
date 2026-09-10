@@ -1,8 +1,8 @@
 /// Diffuse radiance is stored without receiver albedo so spatial reconstruction
 /// cannot smear material colors. Rays use world geometry, including offscreen hits.
 let diffuseCommonShaderSource = """
-inline float3 diffuseAmbient(float3 N) { return mix(GND_IRR,SKY_IRR,N.z*0.5+0.5); }
-inline float3 diffuseEnvironment(float3 R) {
+inline float3 diffuseAmbient(float3 N, constant Uniforms& U) { return mix(GND_IRR,SKY_IRR,N.z*0.5+0.5); }
+inline float3 diffuseEnvironment(float3 R, constant Uniforms& U) {
     // The cosine-weighted integral of R is 2/3 N. This linear environment
     // therefore integrates to the renderer's existing analytic diffuse sky.
     return mix(GND_IRR,SKY_IRR,R.z*0.75+0.5);
@@ -64,7 +64,7 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
     device const RTVertex* vertices [[buffer(2)]], device const RTObject* objects [[buffer(3)]],
     device const RTInstance* instances [[buffer(4)]], device const RenderInstance* rigid [[buffer(5)]],
     device const RenderInstance* auxiliary [[buffer(6)]], device const RenderAppearance* appearances [[buffer(7)]],
-    constant uint& hasAppearance [[buffer(8)]], depth2d<float,access::read> depth [[texture(0)]],
+    constant uint& hasAppearance [[buffer(8)]], constant MaterialResources& materials [[buffer(10)]], depth2d<float,access::read> depth [[texture(0)]],
     texture2d<float,access::read> normal [[texture(1)]], texture2d<float,access::write> output [[texture(2)]],
     texture2d<float,access::read> material [[texture(3)]],
     texture2d<float,access::read> visibility [[texture(4)]],
@@ -96,7 +96,7 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
         float3 R = tangent*(sqrt(xi.x)*cos(phi))+bitangent*(sqrt(xi.x)*sin(phi))+N*sqrt(1-xi.x);
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
         ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
-        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,true);
+        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,true);
         // Control variate: open sky is integrated analytically and contributes
         // exactly zero noise. Only geometry changes the diffuse lighting.
         if (U.reconstruction.x > 0) {
@@ -104,8 +104,8 @@ kernel void rt_diffuse(instance_acceleration_structure scene [[buffer(0)]], cons
             // negative. Clipping that before denoising would bias dark rooms
             // brighter. Sample nonnegative incoming radiance instead, then
             // subtract the exact baseline expected by the compositor.
-            sum += (hit.w>0 ? hit.rgb : diffuseEnvironment(R))-diffuseAmbient(N);
-        } else if (hit.w>0) sum += hit.rgb-diffuseEnvironment(R);
+            sum += (hit.w>0 ? hit.rgb : diffuseEnvironment(R,U))-diffuseAmbient(N,U);
+        } else if (hit.w>0) sum += hit.rgb-diffuseEnvironment(R,U);
     }
     // cos(theta)/pi cancels the cosine-hemisphere PDF: no extra pi or albedo.
     output.write(float4(sum/float(samples),1),pixel);

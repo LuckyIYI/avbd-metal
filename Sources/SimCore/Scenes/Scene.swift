@@ -473,12 +473,15 @@ public struct SceneRigidMesh {
     public var color: F3
     public var roughness: Float
     public var metallic: Float
+    public var textureCoordinates: [SIMD2<Float>]
+    public var materialID: UInt32
 
     public init(body: Int, mesh: SurfaceMesh,
                 localPosition: F3 = .zero,
                 localRotation: Quat = Quat(real: 1, imag: .zero),
                 color: F3 = F3(0.24, 0.28, 0.34),
-                roughness: Float = 0.45, metallic: Float = 0) {
+                roughness: Float = 0.45, metallic: Float = 0,
+                textureCoordinates: [SIMD2<Float>] = [], materialID: UInt32 = 0) {
         precondition(body >= 0)
         precondition(roughness.isFinite && metallic.isFinite
             && (0...1).contains(roughness) && (0...1).contains(metallic),
@@ -490,6 +493,10 @@ public struct SceneRigidMesh {
         self.localPosition = localPosition
         self.localRotation = localRotation.normalized
         self.color = color
+        precondition(textureCoordinates.isEmpty || textureCoordinates.count == mesh.vertices.count)
+        precondition(materialID <= 16_777_216)
+        self.textureCoordinates = textureCoordinates
+        self.materialID = materialID
         self.roughness = roughness
         self.metallic = metallic
     }

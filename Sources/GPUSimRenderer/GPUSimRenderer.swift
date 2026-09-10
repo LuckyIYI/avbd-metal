@@ -28,6 +28,11 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// Linear internal resolution for MetalFX, clamped to 0.5...1.
     public var reconstructionScale: Float
     public var reconstruction: GPUSimReconstruction { usesRayTracing ? .metalFX : .legacy }
+    /// Indirect diffuse sky/ground irradiance exposure in stops, clamped to
+    /// -4...4. Zero preserves the default. The sky dome, horizon fog and the
+    /// specular environment seen in reflections are not scaled, so reflections
+    /// always match the drawn sky.
+    public var ambientExposure: Float = 0
     /// World-space direction in which sunlight travels (not toward the sun).
     /// Normalized at render time. Zero/nonfinite inputs fall back to the default.
     /// Shared by raster shadows, contact shadows, HQ rays and material shading.
@@ -72,6 +77,8 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
 
     func resolved(supportsHQ: Bool) -> Self {
         var result = self
+        result.ambientExposure = ambientExposure.isFinite ? min(ambientExposure, 4) : 0
+        result.ambientExposure = max(result.ambientExposure, -4)
         let magnitude = max(abs(sunDirection.x), max(abs(sunDirection.y), abs(sunDirection.z)))
         if sunDirection.x.isFinite && sunDirection.y.isFinite && sunDirection.z.isFinite && magnitude > 0 {
             result.sunDirection = normalize(sunDirection / magnitude)
@@ -297,12 +304,16 @@ public struct GPUSimRigidMeshRenderVertex {
     public var positionBody: SIMD4<Float>
     public var normal: SIMD4<Float>
     public var color: SIMD4<Float>
+    /// xy: texture UV, z: one-based material ID (0 vertex appearance), w reserved.
+    public var uvMaterial: SIMD4<Float>
 
     public init(
         positionBody: SIMD4<Float>,
         normal: SIMD4<Float>,
-        color: SIMD4<Float>
+        color: SIMD4<Float>,
+        uvMaterial: SIMD4<Float> = .zero
     ) {
+        self.uvMaterial = uvMaterial
         self.positionBody = positionBody
         self.normal = normal
         self.color = color
@@ -576,7 +587,7 @@ public extension GPUSimRendererSource {
 
 let renderShaderSource = makeRenderShaderSource()
 
-func makeRenderShaderSource(motionGuides: Bool = false) -> String {
+func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = [], argumentBuffers: Bool = true) -> String {
 """
 #include <metal_stdlib>
 using namespace metal;
@@ -602,6 +613,7 @@ struct RigidMeshVertex {
     float4 positionBody; // xyz body-local; w stores uint body id bits
     float4 normal;
     float4 color;
+    float4 uvMaterial;
 };
 
 struct Uniforms {
@@ -646,13 +658,15 @@ struct VOut {
     float3 emissive;
     float opacity;
     float flatShade;
+    float3 materialPosition;
+    float4 uvMaterial;
     float2 pbr; // perceptual roughness, metallic
 };
 
 #define HORIZON_LIN float3(0.78, 0.81, 0.85)
 #define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4)
-#define SKY_IRR float3(0.30, 0.33, 0.38)
-#define GND_IRR float3(0.20, 0.185, 0.17)
+#define SKY_IRR (float3(0.30, 0.33, 0.38) * exp2(U.rayScene.y))
+#define GND_IRR (float3(0.20, 0.185, 0.17) * exp2(U.rayScene.y))
 
 inline float3 srgbToLin(float3 c) { return c * c * (0.7 + 0.3 * c); } // fast approx
 
@@ -791,6 +805,7 @@ constant float3 cubeNormals[6] = {
 inline VOut collapse() {
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = float4(0, 0, -2, 1);
     o.normal = float3(0); o.world = float3(0); o.albedo = float3(0);
@@ -806,6 +821,7 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
                             normalize(inst.model[2].xyz));
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * world;
     o.normal = rot * n;
@@ -951,6 +967,7 @@ vertex VOut soft_vertex(uint vid [[vertex_id]],
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * (side == 0 ? 1.0 : -1.0) * 0.95);
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
@@ -984,6 +1001,7 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     SkinRenderVertex sv = verts[v];
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(sv.position.xyz, 1);
     o.world = sv.position.xyz;
@@ -1017,11 +1035,14 @@ vertex VOut rigid_mesh_vertex(
     float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(world, 1);
     o.world = world;
     o.previousWorld = writesMotion ? previousPrimary[body].xyz + rigidMeshRotate(previousSecondary[body], v.positionBody.xyz) : world;
     o.normal = normalize(rigidMeshRotate(q, v.normal.xyz));
+    o.materialPosition = v.positionBody.xyz;
+    o.uvMaterial = v.uvMaterial;
     o.albedo = srgbToLin(v.color.rgb);
     if (v.normal.w > 0.0) o.pbr = float2(clamp(v.normal.w, 0.02, 1.0),
                                        clamp(v.color.w, 0.0, 1.0));
@@ -1049,6 +1070,7 @@ fragment float4 convex_debug_wire_fragment(VOut in [[stage_in]])
 }
 
 // ---------------------------------------------------------------------------
+\(makeSurfaceMaterialShaderSource(programs: programs, argumentBuffers: argumentBuffers))
 \(screenSpaceCommonShaderSource)
 
 // PBR main fragment (samples ambient and direct visibility)
@@ -1063,8 +1085,9 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenNormal [[texture(3)]],
                              depth2d<float> screenDepthTexture [[texture(4)]],
                              texture2d<float> screenMaterial [[texture(5)]],
-                             texture2d<float> diffuse [[texture(6)]])
+                             texture2d<float> diffuse [[texture(6)]], constant MaterialResources& materials [[buffer(10)]])
 {
+    in = texturedSurface(in, materials);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
@@ -1073,7 +1096,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
     if (U.diffuse.x > 0 && U.rayTracing.z == 0 && in.pbr.y < 0.99) {
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,n,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(n)+indirect.rgb,float3(0))-diffuseAmbient(n)*ao)
+        lit += (max(diffuseAmbient(n,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)
             * in.albedo*(1-saturate(in.pbr.y))*indirect.a;
     }
     float3 correction = float3(0);
@@ -1096,7 +1119,8 @@ struct PreOut {
     float4 norm [[color(0)]];
 };
 
-fragment PreOut prepass_fragment(VOut in [[stage_in]]) {
+fragment PreOut prepass_fragment(VOut in [[stage_in]], constant MaterialResources& materials [[buffer(10)]]) {
+    in = texturedSurface(in, materials);
     PreOut o;
     o.norm = float4(normalize(in.normal), clamp(in.pbr.x, 0.02, 1.0));
     return o;
@@ -1136,7 +1160,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = n;
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-diffuseAmbient(n)*ao)*1.15*in.albedo*indirect.a;
+        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)*1.15*in.albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
     lit = mix(lit, HORIZON_LIN, fog);
@@ -1160,6 +1184,7 @@ vertex VOut soft_vertex_front(uint vid [[vertex_id]],
     float3 w = posLin[body].xyz + nt.xyz * (nt.w * 0.95);
     VOut o;
     o.previousWorld = float3(0);
+    o.materialPosition = float3(0); o.uvMaterial = float4(0);
     o.pbr = float2(0.45, 0.0);
     o.position = U.viewProj * float4(w, 1);
     o.world = w;
@@ -1288,7 +1313,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = float3(0,0,1);
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N)+indirect.rgb,float3(0))-SKY_IRR*ao)*1.1*albedo*indirect.a;
+        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-SKY_IRR*ao)*1.1*albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world.xy - U.eye.xy));
     lit = mix(lit, HORIZON_LIN, fog);
@@ -1396,6 +1421,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var shadowTex: MTLTexture?
     var screenSpace: ScreenSpacePipeline!
     private var presentationColor, presentationDepth: MTLTexture?
+    private let materialLibrary: GPUSimMaterialLibrary
     private var rayWorld: RayTracingScene?
     public private(set) var activeReconstruction: GPUSimReconstruction = .legacy
     public private(set) var activeLightingMode: GPUSimLightingMode = .lightweight
@@ -1515,12 +1541,16 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// scene will be supplied later with ``setScene(_:resetCamera:)``.
     public init(
         device: MTLDevice,
-        scene: (any GPUSimRenderableScene)? = nil
+        scene: (any GPUSimRenderableScene)? = nil,
+        materials: GPUSimMaterialLibrary? = nil
     ) throws {
         if let scene, scene.renderDevice.registryID != device.registryID {
             throw GPUSimRendererError.sceneDeviceMismatch
         }
         self.device = device
+        let materials = try materials ?? GPUSimMaterialLibrary(device: device)
+        guard materials.device.registryID == device.registryID else { throw GPUSimRendererError.sceneDeviceMismatch }
+        self.materialLibrary = materials
         guard let queue = device.makeCommandQueue() else {
             throw GPUSimRendererError.commandQueue
         }
@@ -1528,8 +1558,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         self.scene = scene
         super.init()
 
-        let lib = try device.makeLibrary(source: renderShaderSource, options: nil)
-        let motionLib = try device.makeLibrary(source: makeRenderShaderSource(motionGuides: true), options: nil)
+        let lib = try materials.shaderLibrary()
+        let motionLib = try materials.shaderLibrary(motionGuides: true)
         screenSpace = try ScreenSpacePipeline(device: device, library: lib)
         func pipe(_ v: String, _ f: String,
                   samples: Int = GPUSimRenderer.sampleCount,
@@ -2089,7 +2119,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let frameQueue: MTLCommandQueue
         do {
-            let nextWorld = activeOptions.usesRayTracing ? try RayTracingScene.shared(scene: renderScene) : nil
+            let nextWorld = activeOptions.usesRayTracing ? try RayTracingScene.shared(scene: renderScene, materials: materialLibrary) : nil
             frameQueue = nextWorld?.queue ?? queue
             // The ring semaphore limits outstanding frames, but does not order
             // different queues. Retire the old queue before even preparing the
@@ -2352,6 +2382,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          diffuse: SIMD4(activeOptions.usesDiffuseGI ? 1 : 0,0,0,0),
                          aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                              1 / projection.columns.0.x, 1 / projection.columns.1.y))
+        U.rayScene.y = activeOptions.ambientExposure
         if let metalFX { U.reconstruction = SIMD4(1, metalFX.jitter.x / renderSize.x, metalFX.jitter.y / renderSize.y, Float(frameIdx % 4096)) }
         func bindAppearance(
             _ encoder: MTLRenderCommandEncoder,
@@ -2478,6 +2509,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         byteCount: batch.opaqueCount * MemoryLayout<GPUSimRenderInstance>.stride)
                 }
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: metalFX.guidePass()) else { throw MetalFXReconstruction.Failure.encoder }
+                materialLibrary.bind(enc)
                 enc.label = "Reconstruction motion and material guides"
                 enc.setViewport(screenViewport)
                 enc.setDepthStencilState(depthState)
@@ -2576,6 +2608,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             do {
                 let enc = prepassEncoder
+                materialLibrary.bind(enc)
                 enc.label = "Shared screen-space surfaces"
                 func surfacePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
                     activeOptions.usesHDR ? surfacePipelines[ObjectIdentifier(pipeline)]! : pipeline
@@ -2735,6 +2768,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             reportFailure("could not create the main render encoder")
             return
         }
+        materialLibrary.bind(enc)
         enc.label = "Main PBR pass"
         bindSurfaceLighting(enc)
         enc.setViewport(screenViewport)
@@ -2854,6 +2888,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 }
                 if let metalFX { try metalFX.finishFrame(command: cmd, color: screenSpace.sceneColor!) }
                 enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U, reconstructed: metalFX?.output)
+                // The translucent auxiliary pipelines below use pbr_fragment,
+                // which reads the material argument buffer; the fresh encoder
+                // needs the same binding as the main pass.
+                materialLibrary.bind(enc)
                 if metalFX != nil {
                     U.viewProj = unjitteredVP; U.invViewProj = unjitteredVP.inverse
                     U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, 0)

@@ -3,6 +3,7 @@ import simd
 import XCTest
 @testable import GPUSimRenderer
 
+@MainActor
 final class MetalFXReconstructionTests: XCTestCase {
     func testAuxiliaryHistoryUsesLiveBytesAcrossUnequalRingCapacities() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
@@ -94,8 +95,8 @@ final class MetalFXReconstructionTests: XCTestCase {
         let pipeline = try device.makeRenderPipelineState(descriptor: d)
         let fx = try MetalFXReconstruction(device: device,size: SIMD2(64,64),denoising: false)
         func buffer<T>(_ values: [T]) throws -> MTLBuffer { try XCTUnwrap(values.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!,length: $0.count,options: .storageModeShared) }) }
-        // Each rigid vertex is three float4 values, with body ID 0 packed in position.w.
-        let vertices = try buffer([SIMD4<Float>(-0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4(0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4(0,0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0)])
+        // Each rigid vertex is four float4 values, with body ID 0 packed in position.w.
+        let vertices = try buffer([SIMD4<Float>(-0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4<Float>.zero, SIMD4(0.6,-0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4<Float>.zero, SIMD4(0,0.6,0.5,0),SIMD4(0,0,1,0.5),SIMD4(0.7,0.7,0.7,0), SIMD4<Float>.zero])
         let current = try buffer([SIMD4<Float>(0.125,0,0,0)]), previous = try buffer([SIMD4<Float>.zero]), rotation = try buffer([SIMD4<Float>(0,0,0,1)])
         var camera = matrix_identity_float4x4; camera.columns.3.y = 0.125
         var guide = MetalFXReconstruction.GuideUniforms(current: camera,previous: matrix_identity_float4x4,size: SIMD4(64,64,0,0))
@@ -104,6 +105,7 @@ final class MetalFXReconstructionTests: XCTestCase {
         u.viewProj.columns.3.x += 0.4/32; u.viewProj.columns.3.y -= 0.3/32
         let queue = try XCTUnwrap(device.makeCommandQueue()), command = try XCTUnwrap(queue.makeCommandBuffer())
         let e = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: fx.guidePass()))
+        try GPUSimMaterialLibrary(device: device).bind(e)
         e.setRenderPipelineState(pipeline)
         e.setVertexBuffer(vertices,offset: 0,index: 0); e.setVertexBytes(&u,length: MemoryLayout<Uniforms>.stride,index: 1)
         e.setVertexBuffer(current,offset: 0,index: 2); e.setVertexBuffer(rotation,offset: 0,index: 3)
@@ -141,6 +143,7 @@ final class MetalFXReconstructionTests: XCTestCase {
             let pipeline = try device.makeRenderPipelineState(descriptor: d)
             let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
             let e = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: fx.guidePass()))
+            try GPUSimMaterialLibrary(device: device).bind(e)
             e.setRenderPipelineState(pipeline); e.setVertexBuffer(corners,offset: 0,index: 0)
             e.setVertexBytes(&u,length: MemoryLayout<Uniforms>.stride,index: 1)
             e.setVertexBuffer(current,offset: 0,index: 2); e.setVertexBuffer(normals,offset: 0,index: 3)

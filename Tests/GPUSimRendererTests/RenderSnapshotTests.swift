@@ -99,6 +99,12 @@ final class RenderSnapshotTests: XCTestCase {
         let solver = try GPUSolver(scene: scene, device: device)
         let world = device.supportsRaytracing ? try RayTracingScene.shared(scene: solver) : nil
         let renderer = try GPUSimRenderer(device: device, solver: solver)
+        // A translucent auxiliary is drawn on the HDR composite encoder with the
+        // PBR fragment shader, which reads the material argument buffer; under
+        // Metal API validation a missing binding there fails the frame.
+        renderer.auxiliaryInstances = [
+            GPUSimRenderInstance(primitive: .sphere(radius: 0.3), position: F3(0.5,0,2), color: F3(1,0.5,0.2), opacity: 0.5)
+        ]
         let view = MTKView(frame: CGRect(x: 0,y: 0,width: 128,height: 96),device: device)
         renderer.configure(view); view.isPaused = true
         let completed = expectation(description: "snapshot frames complete")
