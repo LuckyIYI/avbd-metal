@@ -1,24 +1,45 @@
 /// One material evaluator shared by raster surfaces, reconstruction guides and
 /// secondary rays. Scene-specific patterns live in caller programs, not here.
-func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram]) -> String {
+///
+/// `argumentBuffers: false` emits a stub `MaterialResources` with no texture
+/// table for argument-buffer Tier 1 devices. Such libraries cannot hold
+/// materials (see `GPUSimMaterialLibrary.init`), so the evaluator is the
+/// identity there and every pipeline stays within Tier 1 resource limits.
+func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram], argumentBuffers: Bool = true) -> String {
+  let capacity = GPUSimMaterialLibrary.textureCapacity
   let functions = programs.enumerated().map { index, program in
     "namespace materialProgram\(index + 1) {\n\(program.supportingSource)\ninline void evaluate(MaterialContext context, thread MaterialSample& surface) {\n\(program.body)\n}\n}"
   }.joined(separator: "\n")
   let cases = programs.indices.map {
     "case \($0 + 1): materialProgram\($0 + 1)::evaluate(context,surface); break;"
   }.joined(separator: "\n")
-  return """
+  let common = """
     struct MaterialRecord { float4 color; float4 emission; float4 uv; uint4 maps; uint4 extra; float4 parameters; uint4 channels; };
-    struct MaterialResources {
-        array<texture2d<float>,128> maps [[id(0)]];
-        device const MaterialRecord* records [[id(128)]];
-        uint count [[id(129)]];
-    };
     struct MaterialContext { float3 position; float2 uv; float footprint; float4 parameters; };
     struct MaterialSample { float3 color; float roughness; float metallic; float3 emission; float3 normal; };
+    // Material IDs travel through the rasterizer as an interpolated float; round
+    // so a sub-ulp interpolation error cannot select the previous material.
+    inline uint materialIndex(float encoded) { return uint(max(encoded, 0.0) + 0.5); }
+    """
+  guard argumentBuffers else {
+    return common + """
+
+      struct MaterialResources { uint4 info; };
+      inline MaterialSample evaluateMaterial(uint id, MaterialContext context, MaterialSample surface, constant MaterialResources& resources) { return surface; }
+      inline float3 materialNormal(float3 n, float3 t, float3 b, float3 map) { return n; }
+      inline VOut texturedSurface(VOut input, constant MaterialResources& resources) { return input; }
+      """
+  }
+  return common + """
+
+    struct MaterialResources {
+        array<texture2d<float>,\(capacity)> maps [[id(0)]];
+        device const MaterialRecord* records [[id(\(capacity))]];
+        uint count [[id(\(capacity + 1))]];
+    };
     \(functions)
     inline float4 materialTex(uint index, MaterialContext context, uint clampUV, constant MaterialResources& resources) {
-        if (index == 0xffffffffu || index >= 128) return float4(1);
+        if (index == 0xffffffffu || index >= \(capacity)) return float4(1);
         constexpr sampler repeatSampler(coord::normalized,address::repeat,filter::linear,mip_filter::linear);
         constexpr sampler clampSampler(coord::normalized,address::clamp_to_edge,filter::linear,mip_filter::linear);
         float size = max(resources.maps[index].get_width(),resources.maps[index].get_height());
@@ -56,16 +77,21 @@ func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram]) -> Strin
         return normalize(t*map.x+bitangent*map.y+n*map.z);
     }
     inline VOut texturedSurface(VOut input, constant MaterialResources& resources) {
-        if (input.uvMaterial.z < 1) return input;
-        MaterialContext context = { input.materialPosition,input.uvMaterial.xy,
-            max(length(dfdx(input.uvMaterial.xy)),length(dfdy(input.uvMaterial.xy))),float4(0) };
-        MaterialSample surface = { input.albedo,input.pbr.x,input.pbr.y,input.emissive,float3(0,0,1) };
-        surface = evaluateMaterial(uint(input.uvMaterial.z),context,surface,resources);
-        input.albedo = surface.color; input.pbr = float2(surface.roughness,surface.metallic); input.emissive = surface.emission;
+        uint id = materialIndex(input.uvMaterial.z);
+        if (id == 0) return input;
+        // Derivatives are taken before any data-dependent branch so they stay
+        // defined when a caller program perturbs the normal per pixel.
         float2 u = dfdx(input.uvMaterial.xy), v = dfdy(input.uvMaterial.xy);
+        float3 dx = dfdx(input.world), dy = dfdy(input.world);
+        MaterialContext context = { input.materialPosition,input.uvMaterial.xy,max(length(u),length(v)),float4(0) };
+        MaterialSample surface = { input.albedo,input.pbr.x,input.pbr.y,input.emissive,float3(0,0,1) };
+        surface = evaluateMaterial(id,context,surface,resources);
+        input.albedo = surface.color; input.pbr = float2(surface.roughness,surface.metallic); input.emissive = surface.emission;
+        // An unperturbed tangent normal leaves the geometric normal unchanged;
+        // skip the tangent-frame reconstruction for records without a normal map.
+        if (all(surface.normal == float3(0,0,1))) return input;
         float determinant = u.x*v.y-u.y*v.x;
         if (abs(determinant)>1e-12) {
-            float3 dx = dfdx(input.world), dy = dfdy(input.world);
             input.normal = materialNormal(normalize(input.normal),(dx*v.y-dy*u.y)/determinant,(dy*u.x-dx*v.x)/determinant,surface.normal);
         }
         return input;

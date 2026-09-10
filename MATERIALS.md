@@ -79,14 +79,23 @@ MSL. No phone asset-transfer protocol is supplied by this renderer API.
 
 ## Resources and limits
 
-The argument buffer supports 128 distinct texture objects per library; the same
-image reused by multiple channels/materials is bound once. This is an explicit
-limit with an error, not silent truncation. Textured materials require Metal
-argument-buffer tier 2. All textures must belong to the render device, be sampled
+The argument buffer supports 128 distinct texture objects per library
+(`GPUSimMaterialLibrary.textureCapacity`); the same image reused by multiple
+channels/materials is bound once. This is an explicit limit with an error, not
+silent truncation. Textured materials require Metal argument-buffer tier 2; on
+tier 1 devices the shaders compile with a stub resource block so a material-free
+renderer still runs. All textures must belong to the render device, be sampled
 2D resources, and fit the configurable allocation budget (default 512 MiB). Ordinary
-image dimensions are checked before decoding with a conservative RGBA32F+mips
-estimate. The loader still checks actual allocated bytes afterward. Compressed
-containers not understood by ImageIO only get the post-load check.
+image dimensions (at most 16384 per side) are checked before decoding with an
+estimate that follows the source bit depth: RGBA8 for 8-bit images, RGBA16 for
+deeper integer images, RGBA32F for floating-point sources, each with mips. The
+loader still checks actual allocated bytes afterward. Compressed containers not
+understood by ImageIO only get the post-load check. `GPUSimMaterialLibrary.validate`
+runs the same material checks without allocating GPU resources.
+
+`GPUSimRenderOptions.ambientExposure` scales the indirect diffuse sky/ground
+irradiance only. The sky dome, horizon fog and the specular environment seen in
+reflections keep their brightness so a mirror always matches the drawn sky.
 
 Resources are registered on every consuming render/compute encoder. Shader libraries
 and acceleration structures are cached across cameras sharing the same material
@@ -111,9 +120,13 @@ The Model I/O path preserves triangle submeshes, material assignment, UVs, norma
 and flattened hierarchy transforms at time zero. Inverse-transpose normals and
 reversed winding handle mirrored/nonuniform transforms. It imports base color,
 roughness, metallic, tangent normal and emission maps/factors, deduplicating textures.
+An imported map replaces the constant for its channel (factor 1), matching USD
+connection semantics; authored USD inputs take precedence over Model I/O's
+default-named material properties, and out-of-range scalars are clamped to 0...1.
 Missing textured UVs, nontriangle topology, singular transforms, excessive geometry,
-and explicit nonopaque materials fail with errors. Unsupported per-map samplers,
-transforms and displacement are reported in diagnostics.
+and explicit nonopaque materials fail with errors. Every error thrown by `load` is a
+`GPUSimAssetImporter.Failure`; library and image-loader failures are mapped onto it.
+Unsupported per-map samplers, transforms and displacement are reported in diagnostics.
 
 OBJ and USD have executable fixtures. `canImport` reports actual platform Model I/O
 capability. **There is no native FBX decoder in this contribution**: convert FBX to

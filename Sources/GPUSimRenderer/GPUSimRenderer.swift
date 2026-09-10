@@ -28,7 +28,10 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// Linear internal resolution for MetalFX, clamped to 0.5...1.
     public var reconstructionScale: Float
     public var reconstruction: GPUSimReconstruction { usesRayTracing ? .metalFX : .legacy }
-    /// Indirect sky/ground exposure in stops, clamped to -4...4. Zero preserves the default.
+    /// Indirect diffuse sky/ground irradiance exposure in stops, clamped to
+    /// -4...4. Zero preserves the default. The sky dome, horizon fog and the
+    /// specular environment seen in reflections are not scaled, so reflections
+    /// always match the drawn sky.
     public var ambientExposure: Float = 0
     /// World-space direction in which sunlight travels (not toward the sun).
     /// Normalized at render time. Zero/nonfinite inputs fall back to the default.
@@ -584,7 +587,7 @@ public extension GPUSimRendererSource {
 
 let renderShaderSource = makeRenderShaderSource()
 
-func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = []) -> String {
+func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = [], argumentBuffers: Bool = true) -> String {
 """
 #include <metal_stdlib>
 using namespace metal;
@@ -1067,7 +1070,7 @@ fragment float4 convex_debug_wire_fragment(VOut in [[stage_in]])
 }
 
 // ---------------------------------------------------------------------------
-\(makeSurfaceMaterialShaderSource(programs: programs))
+\(makeSurfaceMaterialShaderSource(programs: programs, argumentBuffers: argumentBuffers))
 \(screenSpaceCommonShaderSource)
 
 // PBR main fragment (samples ambient and direct visibility)
@@ -2885,6 +2888,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 }
                 if let metalFX { try metalFX.finishFrame(command: cmd, color: screenSpace.sceneColor!) }
                 enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U, reconstructed: metalFX?.output)
+                // The translucent auxiliary pipelines below use pbr_fragment,
+                // which reads the material argument buffer; the fresh encoder
+                // needs the same binding as the main pass.
+                materialLibrary.bind(enc)
                 if metalFX != nil {
                     U.viewProj = unjitteredVP; U.invViewProj = unjitteredVP.inverse
                     U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, 0)

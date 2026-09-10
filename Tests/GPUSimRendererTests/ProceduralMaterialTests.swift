@@ -73,6 +73,22 @@ final class ProceduralMaterialTests: XCTestCase {
     _ = try GPUSimRenderer(device: device, materials: resources)
   }
 
+  /// Argument-buffer Tier 1 devices get a stub resource block; every pipeline
+  /// entry point must still compile from that source.
+  func testTierOneShaderVariantCompilesWithoutArgumentBuffers() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let source =
+      makeRenderShaderSource(programs: [], argumentBuffers: false) + "\n" + rayTracingShaderSource
+    XCTAssertFalse(source.contains("[[id(0)]]"))
+    let library = try device.makeLibrary(source: source, options: nil)
+    for name in ["pbr_fragment", "prepass_fragment", "surface_fragment", "rt_reflections", "rt_diffuse"] {
+      XCTAssertNotNil(library.makeFunction(name: name), name)
+    }
+    let guides = makeRenderShaderSource(motionGuides: true, programs: [], argumentBuffers: false)
+    XCTAssertNotNil(
+      try device.makeLibrary(source: guides, options: nil).makeFunction(name: "reconstruction_fragment"))
+  }
+
   func testInvalidMaterialAndProgramFailBeforeRendering() throws {
     let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
     var m = GPUSimSurfaceMaterial()

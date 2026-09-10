@@ -2,6 +2,7 @@ import Foundation
 import ImageIO
 import Metal
 import MetalKit
+import ModelIO
 import simd
 
 /// A trusted, caller-authored Metal function body. Programs are compiled once with
@@ -56,6 +57,12 @@ public final class GPUSimMaterialLibrary {
     case incompatibleTexture(String)
     case textureBudgetExceeded
   }
+  /// Distinct texture objects one library can bind. The argument-buffer layout,
+  /// the MSL texture array and the validation guard all derive from this value.
+  public nonisolated static let textureCapacity = 128
+  /// Largest image dimension accepted by the loaders before decoding.
+  public nonisolated static let maximumImageDimension = 16384
+  /// Mirrors MSL `MaterialRecord` in `makeSurfaceMaterialShaderSource`; 112 bytes.
   struct Record {
     var color: SIMD4<Float>
     var emission: SIMD4<Float>
@@ -70,12 +77,16 @@ public final class GPUSimMaterialLibrary {
   let records: MTLBuffer
   let textures: [MTLTexture]
   let arguments: MTLBuffer
+  /// False on argument-buffer Tier 1 devices, where the shader declares a stub
+  /// resource struct and the library must stay empty.
+  let usesArgumentBuffers: Bool
   private var shaderLibraries: [String: MTLLibrary] = [:]
   func shaderLibrary(motionGuides: Bool = false, rays: Bool = false) throws -> MTLLibrary {
     let key = "\(motionGuides):\(rays)"
     if let library = shaderLibraries[key] { return library }
     let source =
-      makeRenderShaderSource(motionGuides: motionGuides, programs: programs)
+      makeRenderShaderSource(
+        motionGuides: motionGuides, programs: programs, argumentBuffers: usesArgumentBuffers)
       + (rays ? "\n" + rayTracingShaderSource : "")
     let library = try device.makeLibrary(source: source, options: nil)
     shaderLibraries[key] = library
@@ -84,16 +95,27 @@ public final class GPUSimMaterialLibrary {
   public let materialCount: Int
   public let textureBytes: Int
 
-  public init(
-    device: MTLDevice, materials: [GPUSimSurfaceMaterial] = [],
-    programs: [GPUSimMaterialProgram] = [], textureBudget: Int = 512 * 1024 * 1024
+  /// Validated, deduplicated library contents. Allocates no Metal objects.
+  struct Prepared {
+    var records: [Record]
+    var textures: [MTLTexture]
+    var bytes: Int
+  }
+
+  /// Runs every material, texture and budget check that ``init`` performs
+  /// without creating GPU resources. Throws ``Failure`` with the same cases.
+  public static func validate(
+    materials: [GPUSimSurfaceMaterial], programs: [GPUSimMaterialProgram] = [],
+    device: MTLDevice, textureBudget: Int = 512 * 1024 * 1024
   ) throws {
-    guard materials.isEmpty || device.argumentBuffersSupport == .tier2 else {
-      throw Failure.unsupportedDevice
-    }
-    self.device = device
-    self.programs = programs
-    materialCount = materials.count
+    _ = try prepare(
+      materials: materials, programs: programs, device: device, textureBudget: textureBudget)
+  }
+
+  static func prepare(
+    materials: [GPUSimSurfaceMaterial], programs: [GPUSimMaterialProgram],
+    device: MTLDevice, textureBudget: Int
+  ) throws -> Prepared {
     var textures: [MTLTexture] = []
     var indices: [ObjectIdentifier: UInt32] = [:]
     var bytes = 0
@@ -106,7 +128,7 @@ public final class GPUSimMaterialLibrary {
       else {
         throw Failure.incompatibleTexture(texture.label ?? "unnamed texture")
       }
-      guard textures.count < 128 else { throw Failure.tooManyTextures }
+      guard textures.count < textureCapacity else { throw Failure.tooManyTextures }
       guard texture.allocatedSize <= max(0, textureBudget - bytes) else {
         throw Failure.textureBudgetExceeded
       }
@@ -143,8 +165,24 @@ public final class GPUSimMaterialLibrary {
           parameters: m.parameters,
           channels: SIMD4(m.roughnessChannel, m.metallicChannel, m.invertNormalGreen ? 1 : 0, 0)))
     }
-    self.textures = textures
-    textureBytes = bytes
+    return Prepared(records: values, textures: textures, bytes: bytes)
+  }
+
+  public init(
+    device: MTLDevice, materials: [GPUSimSurfaceMaterial] = [],
+    programs: [GPUSimMaterialProgram] = [], textureBudget: Int = 512 * 1024 * 1024
+  ) throws {
+    let tier2 = device.argumentBuffersSupport == .tier2
+    guard materials.isEmpty || tier2 else { throw Failure.unsupportedDevice }
+    self.device = device
+    self.programs = programs
+    usesArgumentBuffers = tier2
+    materialCount = materials.count
+    let prepared = try GPUSimMaterialLibrary.prepare(
+      materials: materials, programs: programs, device: device, textureBudget: textureBudget)
+    textures = prepared.textures
+    textureBytes = prepared.bytes
+    var values = prepared.records
     if values.isEmpty {
       values.append(
         Record(
@@ -157,19 +195,29 @@ public final class GPUSimMaterialLibrary {
       })
     else { throw Failure.allocation }
     self.records = records
+    guard tier2 else {
+      // Tier 1 shaders declare `struct MaterialResources { uint4 info; }`.
+      guard let stub = device.makeBuffer(length: 16, options: .storageModeShared) else {
+        throw Failure.allocation
+      }
+      memset(stub.contents(), 0, stub.length)
+      arguments = stub
+      return
+    }
     // The same argument layout is used in every fragment and compute pipeline.
+    let capacity = GPUSimMaterialLibrary.textureCapacity
     let maps = MTLArgumentDescriptor()
     maps.index = 0
     maps.dataType = .texture
     maps.textureType = .type2D
-    maps.arrayLength = 128
+    maps.arrayLength = capacity
     maps.access = .readOnly
     let table = MTLArgumentDescriptor()
-    table.index = 128
+    table.index = capacity
     table.dataType = .pointer
     table.access = .readOnly
     let count = MTLArgumentDescriptor()
-    count.index = 129
+    count.index = capacity + 1
     count.dataType = .uint
     guard let encoder = device.makeArgumentEncoder(arguments: [maps, table, count]),
       let args = device.makeBuffer(length: encoder.encodedLength, options: .storageModeShared)
@@ -177,20 +225,51 @@ public final class GPUSimMaterialLibrary {
     memset(args.contents(), 0, args.length)
     encoder.setArgumentBuffer(args, offset: 0)
     for (i, t) in textures.enumerated() { encoder.setTexture(t, index: i) }
-    encoder.setBuffer(records, offset: 0, index: 128)
-    encoder.constantData(at: 129).storeBytes(of: UInt32(materials.count), as: UInt32.self)
+    encoder.setBuffer(records, offset: 0, index: capacity)
+    encoder.constantData(at: capacity + 1).storeBytes(of: UInt32(materials.count), as: UInt32.self)
     arguments = args
   }
 
   func bind(_ encoder: MTLRenderCommandEncoder) {
     encoder.setFragmentBuffer(arguments, offset: 0, index: 10)
+    guard usesArgumentBuffers else { return }
     encoder.useResource(records, usage: .read, stages: .fragment)
-    for t in textures { encoder.useResource(t, usage: .read, stages: .fragment) }
+    if !textures.isEmpty { encoder.useResources(textures, usage: .read, stages: .fragment) }
   }
   func bind(_ encoder: MTLComputeCommandEncoder) {
     encoder.setBuffer(arguments, offset: 0, index: 10)
+    guard usesArgumentBuffers else { return }
     encoder.useResource(records, usage: .read)
-    for t in textures { encoder.useResource(t, usage: .read) }
+    if !textures.isEmpty { encoder.useResources(textures, usage: .read) }
+  }
+
+  /// Upper bound on the bytes `MTKTextureLoader` allocates for a decoded image
+  /// with a full mip chain: 8-bit sources decode to RGBA8, deeper integer
+  /// sources to RGBA16, and floating-point sources are bounded by RGBA32F.
+  public nonisolated static func decodedByteEstimate(
+    width: Int, height: Int, bitsPerComponent: Int, isFloat: Bool
+  ) -> Int {
+    let bytesPerPixel = isFloat ? 16 : (bitsPerComponent > 8 ? 8 : 4)
+    return Int((Double(width) * Double(height) * Double(bytesPerPixel) * 4 / 3).rounded(.up))
+  }
+
+  static func textureLoaderOptions(sRGB: Bool) -> [MTKTextureLoader.Option: Any] {
+    [
+      .SRGB: sRGB, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
+      .textureUsage: MTLTextureUsage.shaderRead.rawValue,
+      .textureStorageMode: MTLStorageMode.private.rawValue,
+    ]
+  }
+
+  /// Dimension and decode-budget check shared by the file and Model I/O loaders.
+  static func checkDecodeBudget(
+    width: Int, height: Int, bitsPerComponent: Int, isFloat: Bool, maximumDecodedBytes: Int
+  ) throws {
+    guard width > 0, height > 0, width <= maximumImageDimension, height <= maximumImageDimension,
+      decodedByteEstimate(
+        width: width, height: height, bitsPerComponent: bitsPerComponent, isFloat: isFloat)
+        <= maximumDecodedBytes
+    else { throw Failure.textureBudgetExceeded }
   }
 
   /// Decode an image once, with an explicit channel color space and a mip chain.
@@ -198,24 +277,46 @@ public final class GPUSimMaterialLibrary {
     device: MTLDevice, url: URL, sRGB: Bool,
     maximumDecodedBytes: Int = 512 * 1024 * 1024
   ) throws -> MTLTexture {
-    guard url.isFileURL, maximumDecodedBytes > 0 else { throw Failure.invalidImage }
+    guard url.isFileURL else { throw Failure.invalidImage }
+    guard maximumDecodedBytes > 0 else { throw Failure.textureBudgetExceeded }
     // Reject oversized ordinary images from metadata before allocating pixels.
     if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
       let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
       let width = properties[kCGImagePropertyPixelWidth] as? Int,
       let height = properties[kCGImagePropertyPixelHeight] as? Int
     {
-      guard width > 0, height > 0, width <= 16384, height <= 16384,
-        Double(width) * Double(height) * 16 * 4 / 3 <= Double(maximumDecodedBytes)
-      else { throw Failure.textureBudgetExceeded }
+      try checkDecodeBudget(
+        width: width, height: height,
+        bitsPerComponent: properties[kCGImagePropertyDepth] as? Int ?? 8,
+        isFloat: properties[kCGImagePropertyIsFloat] as? Bool ?? false,
+        maximumDecodedBytes: maximumDecodedBytes)
     }
     let result = try MTKTextureLoader(device: device).newTexture(
-      URL: url,
-      options: [
-        .SRGB: sRGB, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
-        .textureUsage: MTLTextureUsage.shaderRead.rawValue,
-        .textureStorageMode: MTLStorageMode.private.rawValue,
-      ])
+      URL: url, options: textureLoaderOptions(sRGB: sRGB))
+    guard result.allocatedSize <= maximumDecodedBytes else { throw Failure.textureBudgetExceeded }
+    return result
+  }
+
+  /// Decode an image embedded in a Model I/O asset with the same policy as ``loadTexture(device:url:sRGB:maximumDecodedBytes:)``.
+  public static func loadTexture(
+    device: MTLDevice, texture: MDLTexture, sRGB: Bool,
+    maximumDecodedBytes: Int = 512 * 1024 * 1024
+  ) throws -> MTLTexture {
+    guard maximumDecodedBytes > 0 else { throw Failure.textureBudgetExceeded }
+    let bits: Int
+    let isFloat: Bool
+    switch texture.channelEncoding {
+    case .uInt8: bits = 8; isFloat = false
+    case .uInt16: bits = 16; isFloat = false
+    case .uInt24, .uInt32: bits = 32; isFloat = false
+    case .float16, .float16SR, .float32: bits = 32; isFloat = true
+    @unknown default: bits = 32; isFloat = true
+    }
+    try checkDecodeBudget(
+      width: Int(texture.dimensions.x), height: Int(texture.dimensions.y),
+      bitsPerComponent: bits, isFloat: isFloat, maximumDecodedBytes: maximumDecodedBytes)
+    let result = try MTKTextureLoader(device: device).newTexture(
+      texture: texture, options: textureLoaderOptions(sRGB: sRGB))
     guard result.allocatedSize <= maximumDecodedBytes else { throw Failure.textureBudgetExceeded }
     return result
   }
@@ -224,10 +325,11 @@ public final class GPUSimMaterialLibrary {
 extension GPUSimMaterialLibrary.Failure: CustomStringConvertible {
   public var description: String {
     switch self {
-    case .invalidImage: return "Material image must be a local file with a positive decode budget"
+    case .invalidImage: return "Material image must be a local file"
     case .unsupportedDevice: return "Surface materials require Metal argument-buffer tier 2"
     case .allocation: return "Metal could not allocate material resources"
-    case .tooManyTextures: return "Material library exceeds 128 distinct textures"
+    case .tooManyTextures:
+      return "Material library exceeds \(GPUSimMaterialLibrary.textureCapacity) distinct textures"
     case .invalidMaterial(let index):
       return "Invalid factors, channels or program index in material \(index + 1)"
     case .incompatibleTexture(let name):

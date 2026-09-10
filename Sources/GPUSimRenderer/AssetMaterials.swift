@@ -43,6 +43,24 @@ public enum GPUSimAssetImporter {
     case unsupportedFormat(String), emptyAsset, invalidGeometry(String), unsupportedTopology(
       String), unsupportedOpacity(String), missingUV(String), missingTexture(String),
       textureBudgetExceeded
+    /// A material or image failed ``GPUSimMaterialLibrary`` validation; the
+    /// payload is that failure's description.
+    case invalidMaterial(String)
+  }
+  /// Every error thrown by ``load`` is a ``Failure``; library and loader errors
+  /// are mapped so callers can switch on one enum.
+  static func mapped(_ error: Error, texture name: String? = nil) -> Failure {
+    if let failure = error as? Failure { return failure }
+    if let failure = error as? GPUSimMaterialLibrary.Failure {
+      switch failure {
+      case .textureBudgetExceeded: return .textureBudgetExceeded
+      case .invalidImage, .incompatibleTexture:
+        return .missingTexture(name.map { "\($0): \(failure.description)" } ?? failure.description)
+      default: return .invalidMaterial(failure.description)
+      }
+    }
+    if let name { return .missingTexture("\(name): \(error.localizedDescription)") }
+    return .invalidMaterial(error.localizedDescription)
   }
   /// Model I/O capability, not an assertion that every material/animation in a
   /// format is supported. In particular FBX requires conversion on platforms
@@ -59,7 +77,12 @@ public enum GPUSimAssetImporter {
   ) throws -> GPUSimImportedAsset {
     guard canImport(url.pathExtension) else { throw Failure.unsupportedFormat(url.pathExtension) }
     let asset = MDLAsset(url: url)
-    let loader = MTKTextureLoader(device: device)
+    // Model I/O seeds every material with default-named properties (for example
+    // a grey `baseColor`) alongside the authored inputs of USD materials. Those
+    // names let the importer prefer authored constants over the defaults.
+    let template = MDLMaterial(
+      name: "", scatteringFunction: MDLPhysicallyPlausibleScatteringFunction())
+    let defaultNames = Set((0..<template.count).compactMap { template[$0]?.name })
     var parts: [GPUSimImportedAsset.Part] = []
     var materials: [GPUSimSurfaceMaterial] = []
     var diagnostics: [String] = []
@@ -86,28 +109,21 @@ public enum GPUSimAssetImporter {
       let key =
         "\(source?.absoluteString ?? p.textureSamplerValue?.texture.map { String(describing:ObjectIdentifier($0)) } ?? "none"):\(srgb)"
       if let cached = textureCache[key] { return cached }
+      let remaining = textureBudget - bytes
+      guard remaining > 0 else { throw Failure.textureBudgetExceeded }
       let result: MTLTexture
-      if let source {
-        result = try GPUSimMaterialLibrary.loadTexture(
-          device: device, url: source, sRGB: srgb,
-          maximumDecodedBytes: max(0, textureBudget - bytes))
-      } else if let embedded = p.textureSamplerValue?.texture {
-        guard embedded.dimensions.x > 0, embedded.dimensions.y > 0,
-          Double(embedded.dimensions.x) * Double(embedded.dimensions.y) * 16 * 4 / 3
-            <= Double(max(0, textureBudget - bytes))
-        else { throw Failure.textureBudgetExceeded }
-        result = try loader.newTexture(
-          texture: embedded,
-          options: [
-            .SRGB: srgb, .generateMipmaps: true, .origin: MTKTextureLoader.Origin.topLeft,
-            .textureUsage: MTLTextureUsage.shaderRead.rawValue,
-            .textureStorageMode: MTLStorageMode.private.rawValue,
-          ])
-      } else {
-        throw Failure.missingTexture(p.name)
-      }
-      guard result.allocatedSize <= max(0, textureBudget - bytes) else {
-        throw Failure.textureBudgetExceeded
+      do {
+        if let source {
+          result = try GPUSimMaterialLibrary.loadTexture(
+            device: device, url: source, sRGB: srgb, maximumDecodedBytes: remaining)
+        } else if let embedded = p.textureSamplerValue?.texture {
+          result = try GPUSimMaterialLibrary.loadTexture(
+            device: device, texture: embedded, sRGB: srgb, maximumDecodedBytes: remaining)
+        } else {
+          throw Failure.missingTexture(p.name)
+        }
+      } catch {
+        throw mapped(error, texture: source?.lastPathComponent ?? p.name)
       }
       bytes += result.allocatedSize
       textureCache[key] = result
@@ -142,18 +158,24 @@ public enum GPUSimAssetImporter {
       {
         throw Failure.unsupportedOpacity(mdl.name)
       }
-      func factor(_ semantic: MDLMaterialSemantic) -> MDLMaterialProperty? {
-        mdl.properties(with: semantic).first {
-          [.float, .float3, .float4, .color].contains($0.type)
-        }
-      }
       func image(_ semantic: MDLMaterialSemantic) -> MDLMaterialProperty? {
         mdl.properties(with: semantic).first { [.URL, .string, .texture].contains($0.type) }
       }
+      /// The constant for a semantic. An image replaces any constant (USD
+      /// connections override their fallback value, and Model I/O still
+      /// reports its own default grey next to a connected map), and an authored
+      /// USD input is preferred over Model I/O's default-named property.
+      func factor(_ semantic: MDLMaterialSemantic) -> MDLMaterialProperty? {
+        guard image(semantic) == nil else { return nil }
+        let constants = mdl.properties(with: semantic).filter {
+          [.float, .float3, .float4, .color].contains($0.type)
+        }
+        return constants.first { !defaultNames.contains($0.name) } ?? constants.first
+      }
       var m = GPUSimSurfaceMaterial()
       m.baseColor = color(factor(.baseColor), fallback: SIMD3(repeating: 1))
-      m.roughness = scalar(factor(.roughness), fallback: image(.roughness) == nil ? 0.5 : 1)
-      m.metallic = scalar(factor(.metallic), fallback: image(.metallic) == nil ? 0 : 1)
+      m.roughness = min(max(scalar(factor(.roughness), fallback: image(.roughness) == nil ? 0.5 : 1), 0), 1)
+      m.metallic = min(max(scalar(factor(.metallic), fallback: image(.metallic) == nil ? 0 : 1), 0), 1)
       m.emission = color(factor(.emission), fallback: .zero)
       m.baseColorTexture = try texture(image(.baseColor), srgb: true)
       m.roughnessTexture = try texture(image(.roughness), srgb: false)
@@ -161,7 +183,7 @@ public enum GPUSimAssetImporter {
       m.normalTexture = try texture(image(.tangentSpaceNormal), srgb: false)
       m.invertNormalGreen = true  // UV origin was flipped on import.
       m.emissionTexture = try texture(image(.emission), srgb: true)
-      if m.emissionTexture != nil, m.emission == .zero { m.emission = SIMD3(repeating: 1) }
+      if m.emissionTexture != nil { m.emission = SIMD3(repeating: 1) }
       for i in 0..<mdl.count {
         guard let p = mdl[i], let sampler = p.textureSamplerValue else { continue }
         if sampler.transform != nil || sampler.hardwareFilter != nil {
@@ -271,9 +293,13 @@ public enum GPUSimAssetImporter {
     }
     for i in 0..<asset.count { try visit(asset.object(at: i)) }
     guard !parts.isEmpty else { throw Failure.emptyAsset }
-    // Apply the same validation as renderer resources before returning an asset.
-    _ = try GPUSimMaterialLibrary(
-      device: device, materials: materials, textureBudget: textureBudget)
+    // Apply the same validation as renderer resources without allocating them.
+    do {
+      try GPUSimMaterialLibrary.validate(
+        materials: materials, device: device, textureBudget: textureBudget)
+    } catch {
+      throw mapped(error)
+    }
     return GPUSimImportedAsset(
       parts: parts, materials: materials, diagnostics: Array(Set(diagnostics)).sorted())
   }
@@ -292,6 +318,7 @@ extension GPUSimAssetImporter.Failure: CustomStringConvertible {
     case .missingUV(let name): return "Textured mesh has no UVs: \(name)"
     case .missingTexture(let name): return "Material image could not be resolved: \(name)"
     case .textureBudgetExceeded: return "Imported images exceed the configured texture budget"
+    case .invalidMaterial(let reason): return "Imported material rejected: \(reason)"
     }
   }
 }

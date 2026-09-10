@@ -33,8 +33,11 @@ inline float screenNoise(uint2 p) {
     h ^= h >> 14;
     return float(h & 65535u) / 65536.0;
 }
+// The specular environment is the sky dome seen in reflections, so it follows
+// HORIZON_LIN and sky_fragment rather than the indirect-irradiance exposure:
+// a mirror must reflect the horizon at the brightness the sky pass draws it.
 inline float3 screenEnvironment(float3 R, constant Uniforms& U) {
-    return mix(HORIZON_LIN, float3(0.42, 0.48, 0.58), clamp(R.z, 0.0, 1.0)) * exp2(U.rayScene.y);
+    return mix(HORIZON_LIN, float3(0.42, 0.48, 0.58), clamp(R.z, 0.0, 1.0));
 }
 
 // Tokuyoshi/Kaplanyan (I3D 2019), normal-based isotropic NDF filtering.

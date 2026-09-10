@@ -1,3 +1,5 @@
+import CoreGraphics
+import ImageIO
 import Metal
 import ModelIO
 import XCTest
@@ -58,6 +60,103 @@ final class AssetMaterialTests: XCTestCase {
       XCTAssertEqual(part.rigidMesh(body: 0).materialID, part.materialID)
     }
     XCTAssertThrowsError(try GPUSimAssetImporter.load(url: url, device: device, vertexBudget: 1))
+  }
+
+  private func writeImage(to url: URL, value: UInt8) throws {
+    let pixels = Data((0..<16).flatMap { _ in [value, value, value, 255] })
+    let provider = try XCTUnwrap(CGDataProvider(data: pixels as CFData))
+    let image = try XCTUnwrap(
+      CGImage(
+        width: 4, height: 4, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 16,
+        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider,
+        decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+    let target = try XCTUnwrap(
+      CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+    CGImageDestinationAddImage(target, image, nil)
+    XCTAssertTrue(CGImageDestinationFinalize(target))
+  }
+
+  private func usdPreviewSurface(body: String) -> String {
+    """
+    #usda 1.0
+    (upAxis = "Z")
+    def Xform "Root" {
+        def Mesh "Tri" (prepend apiSchemas = ["MaterialBindingAPI"]) {
+            point3f[] points = [(0,0,0),(1,0,0),(0,1,0)]
+            int[] faceVertexCounts = [3]
+            int[] faceVertexIndices = [0,1,2]
+            texCoord2f[] primvars:st = [(0,0),(1,0),(0,1)] (interpolation = "vertex")
+            uniform token subdivisionScheme = "none"
+            rel material:binding = </Root/Mat>
+        }
+        def Material "Mat" {
+            token outputs:surface.connect = </Root/Mat/PBR.outputs:surface>
+            def Shader "PBR" {
+                uniform token info:id = "UsdPreviewSurface"
+    \(body)
+                token outputs:surface
+            }
+            def Shader "Reader" {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                token inputs:varname = "st"
+                float2 outputs:result
+            }
+            def Shader "ColorTex" {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @color.png@
+                float2 inputs:st.connect = </Root/Mat/Reader.outputs:result>
+                float3 outputs:rgb
+            }
+            def Shader "RoughTex" {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @rough.png@
+                float2 inputs:st.connect = </Root/Mat/Reader.outputs:result>
+                float outputs:r
+            }
+        }
+    }
+    """
+  }
+
+  /// Model I/O reports its own default grey `baseColor` beside a connected USD
+  /// diffuse map; the importer must treat the map as replacing every constant.
+  func testUSDTexturedMaterialUsesUnitFactorsAndConstantsPreferAuthoredInputs() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try writeImage(to: directory.appendingPathComponent("color.png"), value: 200)
+    try writeImage(to: directory.appendingPathComponent("rough.png"), value: 90)
+    let textured = directory.appendingPathComponent("textured.usda")
+    try usdPreviewSurface(
+      body: """
+                color3f inputs:diffuseColor = (1, 1, 1)
+                color3f inputs:diffuseColor.connect = </Root/Mat/ColorTex.outputs:rgb>
+                float inputs:roughness = 0.5
+                float inputs:roughness.connect = </Root/Mat/RoughTex.outputs:r>
+        """).write(to: textured, atomically: true, encoding: .utf8)
+    let asset = try GPUSimAssetImporter.load(url: textured, device: device)
+    let material = try XCTUnwrap(asset.materials.first)
+    XCTAssertNotNil(material.baseColorTexture)
+    XCTAssertNotNil(material.roughnessTexture)
+    XCTAssertEqual(material.baseColor, SIMD3(repeating: 1), "a connected map replaces the constant")
+    XCTAssertEqual(material.roughness, 1)
+    XCTAssertEqual(material.metallic, 0)
+
+    let constant = directory.appendingPathComponent("constant.usda")
+    try usdPreviewSurface(
+      body: """
+                color3f inputs:diffuseColor = (0.9, 0.2, 0.1)
+                float inputs:roughness = 0.25
+                float inputs:metallic = 1.5
+        """).write(to: constant, atomically: true, encoding: .utf8)
+    let plain = try XCTUnwrap(try GPUSimAssetImporter.load(url: constant, device: device).materials.first)
+    XCTAssertNil(plain.baseColorTexture)
+    XCTAssertEqual(plain.baseColor.x, 0.9, accuracy: 0.001, "authored input beats Model I/O's default grey")
+    XCTAssertEqual(plain.baseColor.y, 0.2, accuracy: 0.001)
+    XCTAssertEqual(plain.roughness, 0.25, accuracy: 0.001)
+    XCTAssertEqual(plain.metallic, 1, "out-of-range authored scalars are clamped, not rejected")
   }
 
   func testUSDHierarchyAndCapabilityReporting() throws {

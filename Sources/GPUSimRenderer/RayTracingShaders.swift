@@ -162,7 +162,7 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
     float uvDensity = abs(detUV)>1e-10 ? max(length(uv1)/max(length(e1),1e-8),length(uv2)/max(length(e2),1e-8)) : 0;
     MaterialContext context = { materialP, uvMaterial.xy, max(hit.distance/U.screen.z, diffuseOnly ? 0.02 : 0.003)*uvDensity, float4(0) };
     MaterialSample surface = { mat.rgb, nm.w, mat.a, emission, float3(0,0,1) };
-    surface = evaluateMaterial(uint(a.uvMaterial.z),context,surface,materials);
+    surface = evaluateMaterial(materialIndex(a.uvMaterial.z),context,surface,materials);
     mat.rgb = surface.color; nm.w = surface.roughness; mat.a = surface.metallic; emission = surface.emission;
     if (abs(detUV)>1e-10) {
         float3 tangent = (e1*uv2.y-e2*uv1.y)/detUV;

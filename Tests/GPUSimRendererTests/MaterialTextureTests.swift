@@ -78,6 +78,35 @@ final class MaterialTextureTests: XCTestCase {
     XCTAssertEqual(result.w, -(128.0 / 255 * 2 - 1), accuracy: 0.008)
   }
 
+  func testDecodeBudgetEstimateFollowsSourceBitDepth() throws {
+    // 8-bit sources decode to RGBA8, so an 8k map fits the default budget.
+    let rgba8 = GPUSimMaterialLibrary.decodedByteEstimate(
+      width: 8192, height: 4096, bitsPerComponent: 8, isFloat: false)
+    func mipped(_ bytes: Int) -> Int { Int((Double(bytes) * 4 / 3).rounded(.up)) }
+    XCTAssertEqual(rgba8, mipped(8192 * 4096 * 4))
+    XCTAssertLessThan(rgba8, 512 * 1024 * 1024)
+    XCTAssertEqual(
+      GPUSimMaterialLibrary.decodedByteEstimate(
+        width: 16, height: 16, bitsPerComponent: 16, isFloat: false), mipped(16 * 16 * 8))
+    XCTAssertEqual(
+      GPUSimMaterialLibrary.decodedByteEstimate(
+        width: 16, height: 16, bitsPerComponent: 32, isFloat: true), mipped(16 * 16 * 16))
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString + ".png")
+    defer { try? FileManager.default.removeItem(at: url) }
+    try image(at: url)
+    // An exhausted budget is a budget error, not an invalid image.
+    XCTAssertThrowsError(
+      try GPUSimMaterialLibrary.loadTexture(
+        device: device, url: url, sRGB: false, maximumDecodedBytes: 0)
+    ) { error in
+      guard case GPUSimMaterialLibrary.Failure.textureBudgetExceeded? =
+        error as? GPUSimMaterialLibrary.Failure
+      else { return XCTFail("unexpected \(error)") }
+    }
+  }
+
   func testOBJLoadsRelativeImageAndRejectsMissingTexture() throws {
     let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -107,6 +136,18 @@ final class MaterialTextureTests: XCTestCase {
     XCTAssertTrue([MTLPixelFormat.rgba8Unorm_srgb, .bgra8Unorm_srgb].contains(texture.pixelFormat))
     try "newmtl Image\nKd 1 1 1\nmap_Kd missing.png\n".write(
       to: mtl, atomically: true, encoding: .utf8)
-    XCTAssertThrowsError(try GPUSimAssetImporter.load(url: obj, device: device))
+    XCTAssertThrowsError(try GPUSimAssetImporter.load(url: obj, device: device)) { error in
+      XCTAssertNotNil(error as? GPUSimAssetImporter.Failure, "importer errors use one enum: \(error)")
+    }
+    // Library validation failures are reported through the importer's enum too.
+    try "newmtl Image\nKd 1 1 1\nmap_Kd color.png\n".write(
+      to: mtl, atomically: true, encoding: .utf8)
+    XCTAssertThrowsError(
+      try GPUSimAssetImporter.load(url: obj, device: device, textureBudget: 1)
+    ) { error in
+      guard case GPUSimAssetImporter.Failure.textureBudgetExceeded? =
+        error as? GPUSimAssetImporter.Failure
+      else { return XCTFail("unexpected \(error)") }
+    }
   }
 }
