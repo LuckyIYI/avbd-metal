@@ -6,6 +6,7 @@ on:
     # or unrelated renderer/robotics change. Apply the same filter on main.
     paths: &cable_paths
       - "Package.swift"
+      - "Makefile"
       - "Sources/SimCore/Scenes/Cable.swift"
       - "Sources/SimCore/Scenes/Scene.swift"
       - "Sources/SimCore/Scenes/SceneReplication.swift"
@@ -49,13 +50,14 @@ jobs:
           swift test -c release --filter
           'CableAuthoringTests|CableDemoTests|CableContactTests|testFullForceGradientMatchesEnergyOnBothBodies|testCapsuleBoxContactNormalInBothOrders|testDemoMetadataAndJointABI'
       - name: Standalone interactive demos
-        run: swift build -c release --product cable-playground
+        run: make cable-app
       # Hosted runners need not expose a Metal device. Metal physics and
       # performance checks also run locally via cable-validation --benchmark.
       - name: CPU physical validation
         run: swift run -c release cable-validation --cpu-only
       - name: Damping, plasticity and contact regressions
         run: |
+          swift run -c release cable-validation --ethernet-authoring
           swift run -c release cable-validation --cpu-only --materials
           swift run -c release cable-validation --cpu-only --rigid-contact
           swift run -c release cable-validation --cpu-only --collision-stress

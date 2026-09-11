@@ -9,7 +9,7 @@ import PhysicsAVBD
 import GPUSimDemos
 import GPUSimRenderer
 
-private let demoNames = ["cablethreading", "cabletwisting", "cablegrippers", "cableplastic"]
+private let demoNames = ["cableethernet", "cabletwisting", "cablegrippers", "cableplastic"]
 
 @MainActor
 final class Playground: ObservableObject, GPUSimRendererSource {
@@ -107,7 +107,7 @@ final class CableView: MTKView {
         renderer.automaticallyFramesScene = false
         renderer.azimuth = model.name == "cablegrippers" ? -2.25 : -1.85
         renderer.elevation = model.name == "cablegrippers" ? 0.24 : 0.5
-        renderer.distance = model.name == "cablethreading" ? 4.8 : 4.2
+        renderer.distance = model.name == "cableethernet" ? 3.0 : 4.2
         renderer.target = F3(-0.2, 0, (model.name == "cablegrippers" || model.name == "cableplastic") ? 1.5 : 0.8)
     }
 
@@ -227,7 +227,7 @@ private func showWindow(_ model: Playground) {
 
 @MainActor
 private func snapshot(_ model: Playground, path: String, steps: Int,
-                      bendRelease: Bool) async throws {
+                      bendRelease: Bool, insert: Bool) async throws {
     model.running = false
     if bendRelease && model.name == "cableplastic" {
         // Reproducible visual comparison using the same spring as mouse input.
@@ -247,6 +247,19 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
             model.endDrag()
         }
     }
+    if insert && model.name == "cableethernet" {
+        let cable = Demos.make(model.name)!.cables[0]
+        let body = cable.bodyIDs.last!
+        for _ in 0..<240 { try model.solver.submitStep() }
+        let initial = model.solver.bodyPosition(body) + model.solver.bodyRotation(body).act(cable.endAnchor)
+        for frame in 0..<360 {
+            let t = min(Float(frame+1) / 288, 1)
+            model.solver.setDrag(jointIndex: model.dragSlot, body: body,
+                worldTarget: mix(initial, F3(0.22,0,initial.z), t: F3(repeating: t)),
+                localAnchor: cable.endAnchor, stiffness: 50)
+            for _ in 0..<4 { try model.solver.submitStep() }
+        }
+    }
     for _ in 0..<steps { try model.solver.submitStep() }
     try model.solver.synchronize()
     let renderer = try GPUSimRenderer(device: model.solver.device, source: model)
@@ -254,6 +267,8 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
     renderer.automaticallyFramesScene = false
     if model.name == "cablegrippers" || model.name == "cableplastic" {
         renderer.setCamera(position: F3(-1.5, -4.0, 2.4), target: F3(-0.1, 0, 1.5), up: F3(0, 0, 1))
+    } else if model.name == "cableethernet" {
+        renderer.setCamera(position: F3(-1.8, -2.5, 2.3), target: F3(-0.45, 0, 0.86), up: F3(0, 0, 1))
     } else {
         renderer.setCamera(position: F3(-2.3, -3.8, 3.0), target: F3(-0.25, 0, 0.8), up: F3(0, 0, 1))
     }
@@ -296,7 +311,7 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
     @MainActor static func main() async throws {
         let args = CommandLine.arguments
         if args.contains("--help") {
-            print("cable-playground [cablethreading|cabletwisting|cablegrippers|cableplastic] [--snapshot /path/image.png --steps 120] [--bend-release]")
+            print("cable-playground [cableethernet|cabletwisting|cablegrippers|cableplastic] [--snapshot /path/image.png --steps 120] [--bend-release] [--insert]")
             return
         }
         let name = args.dropFirst().first(where: { demoNames.contains($0) }) ?? "cablegrippers"
@@ -304,7 +319,7 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
         if let index = args.firstIndex(of: "--snapshot"), index + 1 < args.count {
             let steps = args.firstIndex(of: "--steps").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 120
             try await snapshot(model, path: args[index + 1], steps: max(0, steps),
-                               bendRelease: args.contains("--bend-release"))
+                               bendRelease: args.contains("--bend-release"), insert: args.contains("--insert"))
         } else { showWindow(model) }
     }
 }

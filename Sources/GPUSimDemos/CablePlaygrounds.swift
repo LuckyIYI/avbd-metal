@@ -4,7 +4,7 @@ import simd
 public extension Demos {
     static func cableDemoTitle(_ name: String) -> String? {
         switch name {
-        case "cablethreading": return "Thread the Needle"
+        case "cableethernet": return "Ethernet Insertion"
         case "cabletwisting": return "Twist Laboratory"
         case "cablegrippers": return "Snap-fit Cable Routing"
         case "cableplastic": return "Bend & Keep"
@@ -14,8 +14,8 @@ public extension Demos {
 
     static func cableDemoInstructions(_ name: String) -> String? {
         switch name {
-        case "cablethreading":
-            return "Grab the gold tip and feed it through the three guide rings. Orbit to line up the holes; pull it back to try again."
+        case "cableethernet":
+            return "Drag the ribbed blue boot toward the socket. The plug and latch deform against its rigid walls. Pull back to unplug; grab the plug itself to test its compliance."
         case "cabletwisting":
             return "The left chuck winds two striped cables together. Watch the stripes carry the twist. Grab a strand to deflect it, or set Turns / s to zero."
         case "cablegrippers":
@@ -24,37 +24,6 @@ public extension Demos {
             return "Bend and release the gold tips. The blue cable springs back; the copper cable keeps bends past its yield threshold. Reset restores both. Drag acts on both cables; damping absorbs internal vibration."
         default: return nil
         }
-    }
-
-    static func cableThreading(segments: Int = 40, holeRadius: Float = 0.13,
-                                dampingTime: Float = 0.12, drag: Float = 0.8) -> PhysicsScene {
-        precondition(segments >= 12 && holeRadius >= 0.08 && holeRadius.isFinite)
-        var s = cableBench("Thread the Needle", length: 6.4, drag: drag)
-        let tube: Float = 0.045, height: Float = 0.86
-        let rotation = Quat(angle: .pi / 2, axis: F3(0, 1, 0))
-        for (i, x) in [Float(0), 0.65, 1.3].enumerated() {
-            let color = [F3(0.95, 0.42, 0.14), F3(0.32, 0.63, 0.93), F3(0.46, 0.80, 0.55)][i]
-            let ring = s.addTorus(major: holeRadius + tube, minor: tube,
-                density: 0, friction: 0.25, position: F3(x, 0, height), rotation: rotation)
-            paintBody(&s, ring, color)
-            for sign: Float in [-1, 1] {
-                _ = coloredBox(&s, size: F3(0.12, 0.08, 0.26),
-                    position: F3(x, sign * (holeRadius + tube), 0.73), color: color)
-            }
-            _ = coloredBox(&s, size: F3(0.24, 0.62, 0.045),
-                position: F3(x, 0, 0.635), color: F3(0.12, 0.16, 0.22))
-        }
-        let points = (0...segments).map { i -> F3 in
-            let t = Float(i) / Float(segments)
-            return F3(-2.65 + 2.35 * t, 0.07 * sin(2 * .pi * t),
-                      0.69 + 0.17 * pow(t, 6))
-        }
-        let cable = try! s.addCable(points: points, radius: 0.03, density: 160,
-            material: CableMaterial(stretchRigidity: 2500, shearRigidity: 1500,
-                bendRigidity: 0.018, twistRigidity: 0.015, dampingTime: dampingTime), friction: 0.35)
-        stripedCable(&s, cable, color: F3(0.06, 0.55, 0.62))
-        addGrabBead(&s, cable: cable, atStart: false)
-        return s
     }
 
     static func cableTwisting(segments: Int = 40, turnRate: Float = 0.10,
@@ -179,7 +148,7 @@ public extension Demos {
 
 }
 
-private func cableBench(_ name: String, length: Float, drag: Float = 0.8) -> PhysicsScene {
+func cableBench(_ name: String, length: Float, drag: Float = 0.8) -> PhysicsScene {
     precondition(drag >= 0 && drag.isFinite)
     var s = PhysicsScene(name: name)
     s.settings.dt = 1 / 120
@@ -266,7 +235,7 @@ private func coloredBox(_ s: inout PhysicsScene, size: F3, position: F3, color: 
     return body
 }
 
-private func paintBody(_ s: inout PhysicsScene, _ body: Int, _ color: F3) {
+func paintBody(_ s: inout PhysicsScene, _ body: Int, _ color: F3) {
     for i in s.colliders.indices where s.colliders[i].body == body {
         s.colliders[i].renderColor = color
     }
@@ -280,7 +249,7 @@ private func addGrabBead(_ s: inout PhysicsScene, cable: SceneCable, atStart: Bo
         localPosition: anchor, shape: .sphere, renderColor: F3(1, 0.65, 0.16))
 }
 
-private func stripedCable(_ s: inout PhysicsScene, _ cable: SceneCable, color: F3) {
+func stripedCable(_ s: inout PhysicsScene, _ cable: SceneCable, color: F3) {
     for (i, body) in cable.bodyIDs.enumerated() {
         paintBody(&s, body, color)
         // A narrow longitudinal surface strip follows the material frame.

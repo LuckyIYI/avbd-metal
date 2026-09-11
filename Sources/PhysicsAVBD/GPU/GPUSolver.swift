@@ -2040,6 +2040,13 @@ public final class GPUSolver {
         }
         source = "#include <metal_stdlib>\nusing namespace metal;\n"
             + preamble + source
+        // A development app must never silently interpret a newer resource
+        // bundle using an older host-side joint layout. These checks compile
+        // away; an incompatible bundle fails at load time, before simulation.
+        source += """
+        \nstatic_assert(sizeof(JointGPU) == \(MemoryLayout<JointGPU>.stride), "Swift/Metal joint stride mismatch; rebuild the app with its shader bundle");
+        static_assert(JOINT_CABLE == \(JointGPU.cableFlag)u, "Swift/Metal cable flag mismatch; rebuild the app with its shader bundle");
+        """
         let options = MTLCompileOptions()
         let fastMath = ProcessInfo.processInfo.environment["AVBD_SAFE_MATH"] == nil
         if #available(macOS 15.0, iOS 18.0, *) {
@@ -7086,6 +7093,30 @@ public final class GPUSolver {
                     worldHit - F3(pl[body].x, pl[body].y, pl[body].z))
                 best = (body, bodyLocal)
             }
+        }
+        // Soft volumes render a continuous boundary, while their nodal
+        // spheres can be much smaller than a face. Pick that boundary so a
+        // visible plug/clip face is draggable between vertices as well.
+        // This walk runs only on mouse-down, never during a simulation step.
+        let corners = surfTriBuf.contents().bindMemory(to: UInt32.self,
+                                                       capacity: max(1, surfaceTriCount * 3))
+        for triangle in 0..<surfaceTriCount {
+            let ids = (0..<3).map { Int(corners[triangle * 3 + $0] & 0x001F_FFFF) }
+            let p = ids.map { F3(pl[$0].x, pl[$0].y, pl[$0].z) }
+            let e1 = p[1] - p[0], e2 = p[2] - p[0], h = cross(dir, e2)
+            let det = dot(e1, h)
+            guard abs(det) > 1e-7 * length(e1) * length(e2) else { continue }
+            let offset = origin - p[0], u = dot(offset, h) / det
+            guard u >= 0 && u <= 1 else { continue }
+            let q = cross(offset, e1), v = dot(dir, q) / det
+            guard v >= 0 && u + v <= 1 else { continue }
+            let t = dot(e2, q) / det
+            guard t >= 0 && t < bestT else { continue }
+            let weights: [Float] = [1 - u - v, u, v]
+            guard let corner = (0..<3).filter({ pl[ids[$0]].w > 0 })
+                .max(by: { weights[$0] < weights[$1] }) else { continue }
+            bestT = t
+            best = (ids[corner], origin + dir * t - p[corner])
         }
         return best
     }

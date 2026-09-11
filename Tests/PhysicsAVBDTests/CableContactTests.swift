@@ -33,10 +33,10 @@ final class CableContactTests: XCTestCase {
                 friction: 0, position: F3(x,0,0), shape: .capsule, collisionEnabled: false)
             scene.addCollider(body: body, size: F3(0.2,0.03,0), shape: .capsule)
         }
-        var joint = SceneJoint(bodyA: 1, bodyB: 2, stiffnessLin: 0, stiffnessAng: 0)
+        var joint = SceneJoint(bodyA: 1, bodyB: 2, rA: .zero, rB: .zero, stiffnessLin: 0, stiffnessAng: 0)
         joint.cable = CableJointMaterial(material: material, restLength: 0.2)
         scene.addJoint(joint)
-        scene.addJoint(SceneJoint(bodyA: 2, bodyB: 3)) // ordinary attachment
+        scene.addJoint(SceneJoint(bodyA: 2, bodyB: 3, rA: .zero, rB: .zero)) // ordinary attachment
         XCTAssertEqual(scene.cableContactBodies, [0,1,2])
         XCTAssertEqual(try scene.makeCPUSolverChecked().cableContactBodies, [0,1,2])
         XCTAssertEqual(scene.replicated(count: 2, spacing: F3(8,0,0)).scene.cableContactBodies,

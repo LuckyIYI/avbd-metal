@@ -42,7 +42,7 @@ public enum Demos {
     }
 
     public static var all: [String] {
-        ["cablethreading", "cabletwisting", "cablegrippers", "cableplastic", "cables", "gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+        ["cableethernet", "cabletwisting", "cablegrippers", "cableplastic", "cables", "gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
          "convexdecomp", "classicrigids",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
@@ -56,7 +56,7 @@ public enum Demos {
     /// Whether the global stress-test size selector changes this demo.
     /// Fixed showcases keep one copy of each expensive detailed visual mesh.
     public static func supportsScale(_ name: String) -> Bool {
-        !["classicrigids", "cablethreading", "cabletwisting", "cablegrippers", "cableplastic"].contains(name)
+        !["classicrigids", "cableethernet", "cabletwisting", "cablegrippers", "cableplastic"].contains(name)
     }
 
     /// Tunable parameters per demo (empty = none). Keys are looked up in
@@ -70,7 +70,7 @@ public enum Demos {
         let cableDamping = [DemoParam("damping", "Damping time (s)", 0...0.25, 0.12),
                             DemoParam("drag", "Drag /s", 0...2, 0.8)]
         switch name {
-        case "cablethreading": return cableDamping + [DemoParam("clearance", "Hole radius", 0.08...0.20, 0.13)]
+        case "cableethernet": return cableDamping + [DemoParam("plugMu", "Plug stiffness", 2500...60000, 15000)]
         case "cabletwisting": return cableDamping + [DemoParam("turnRate", "Turns / s", 0...0.25, 0.10)]
         case "cablegrippers": return cableDamping + [
             DemoParam("gripMu", "Clip stiffness", 10000...60000, 30000),
@@ -138,7 +138,7 @@ public enum Demos {
             }
         }
         switch name {
-        case "cablethreading": return cableThreading(segments: res ?? 40, holeRadius: p("clearance", 0.13), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
+        case "cableethernet": return cableEthernet(segments: res ?? 32, plugStiffness: p("plugMu", 15000), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
         case "cabletwisting": return cableTwisting(segments: res ?? 40, turnRate: p("turnRate", 0.10), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
         case "cablegrippers": return cableGrippers(segments: res ?? 64, padStiffness: p("gripMu", 30000), friction: p("friction", 0.8), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
         case "cableplastic": return cablePlastic(segments: res ?? 24, yieldCurvature: p("yield", 1.5), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))

@@ -154,6 +154,24 @@ app: workspace-build
 	  $(ATOMIC_APP_PUBLISH) "$$staged_app" AVBD.app; \
 	  echo "built AVBD.app"
 
+# Keep the executable and its shader ABI in one immutable, signed app bundle.
+.PHONY: cable-app
+cable-app:
+	swift build -c release --product cable-playground
+	@set -eu; \
+	  staging_root="$$(mktemp -d .build/cable-app-stage.XXXXXX)"; \
+	  staged_app="$$staging_root/Cable Lab.app"; \
+	  trap 'rm -rf "$$staging_root"' EXIT HUP INT TERM; \
+	  mkdir -p "$$staged_app/Contents/MacOS" "$$staged_app/Contents/Resources"; \
+	  cp .build/release/cable-playground "$$staged_app/Contents/MacOS/"; \
+	  cp -R .build/release/$(PHYSICS_RESOURCE_BUNDLE) \
+	    .build/release/$(DEMOS_RESOURCE_BUNDLE) "$$staged_app/Contents/Resources/"; \
+	  python3 -c 'import plistlib,sys; plistlib.dump(dict(CFBundleName="Cable Lab", CFBundleDisplayName="Cable Lab", CFBundleIdentifier="dev.avbd.cable-lab", CFBundleExecutable="cable-playground", CFBundlePackageType="APPL", CFBundleShortVersionString="1.0", NSHighResolutionCapable=True, LSMinimumSystemVersion="14.0"), open(sys.argv[1], "wb"))' "$$staged_app/Contents/Info.plist"; \
+	  codesign --force --deep --sign - "$$staged_app"; \
+	  codesign --verify --deep --strict "$$staged_app"; \
+	  $(ATOMIC_APP_PUBLISH) "$$staged_app" ".build/Cable Lab.app"; \
+	  echo "built .build/Cable Lab.app"
+
 bench: workspace-build
 	$(DEV_BUILD_DIR)/release/avbd bench boxpile --frames 100 --scale 3
 

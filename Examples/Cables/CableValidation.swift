@@ -317,6 +317,18 @@ func benchmark() throws {
             try validateTwistingContact()
             return
         }
+        if CommandLine.arguments.contains("--routing-soak") {
+            try validateRoutingSoak()
+            return
+        }
+        if CommandLine.arguments.contains("--ethernet-authoring") {
+            try validateEthernetTopology()
+            return
+        }
+        if CommandLine.arguments.contains("--ethernet") {
+            try validateEthernetDemo()
+            return
+        }
         if CommandLine.arguments.contains("--demos") {
             try validateCableDemos()
             return

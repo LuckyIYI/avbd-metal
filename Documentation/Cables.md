@@ -133,18 +133,37 @@ also lists them.
 
 | Scene ID | Interaction |
 |---|---|
-| `cablethreading` | Feed the gold tip through three rigid torus guides. |
+| `cableethernet` | Feed a deformable Ethernet plug into a rigid socket by dragging its ribbed boot. |
 | `cabletwisting` | Two clamped, striped strands wind into a braid. |
 | `cablegrippers` | Pull a routed cable out of four white C clips on a grooved L frame. |
 | `cableplastic` | Bend the blue elastic and copper plastic cantilevers; release to compare spring-back. |
+
+![Deformable Ethernet plug and rigid socket](Images/Cables/ethernet.png)
+
+The Ethernet plug is an enlarged RJ45-shaped demonstrator: 573 dynamic
+particles and 1,800 conforming tetrahedra form its body, eight raised contact
+strips, and underside cantilever latch. Fifteen material-point bonds attach
+its rear cross-section to the cable boot. The socket is a single static
+compound body with a beveled mouth, separate walls, a back stop, and a latch
+channel. There is no kinematic insertion constraint. The plug's Neo-Hookean
+stiffness is adjustable; geometry, density and compliance are illustrative,
+not certified connector dimensions or measured plastic properties. The
+latch flexes, but this demo does not model a locking hook or electrical mating.
+The bed supports the plug under gravity while leaving the latch channel open.
+
+Build a self-contained macOS app with `make cable-app`; the result is
+`.build/Cable Lab.app`. This packages the executable with its matching shader
+resources. Copying only the executable can accidentally load a newer SwiftPM
+build bundle with an incompatible joint ABI. The solver now rejects cable
+flag or joint-stride mismatches during shader compilation. A two-minute
+unattended routing regression also checks every step for detached links.
 
 ![Cable braid after 20 seconds](Images/Cables/braid.png)
 
 ![Routed cable in four deformable snap clips](Images/Cables/snap-clips.png)
 
 Left-drag a cable to grab it. Option-drag or drag empty space to orbit,
-right-drag to pan, and scroll to zoom. Space pauses; R resets. The gold ends
-are pickable. Clips are conforming tetrahedral soft bodies with pinned rear
+right-drag to pan, and scroll to zoom. Space pauses; R resets. The gold ends and blue Ethernet boot are pickable. Clips are conforming tetrahedral soft bodies with pinned rear
 surfaces and freely deforming lips. Retention and release come from contact,
 without cable-to-clip joints. The clip scene enables contact-aware coloring.
 
@@ -353,3 +372,20 @@ It does not add test kernels to the shipped solver library. CPU ownership
 regressions also cover single segments, custom cable joints, replication,
 and ordinary authored capsules. The focused CI workflow follows cable files
 and their shared solver dependencies on both PRs and pushes to main.
+
+Additional demo checks:
+
+```sh
+swift run -c release cable-validation --ethernet-authoring
+swift run -c release cable-validation --ethernet
+swift run -c release cable-validation --routing-soak
+```
+
+The Metal insertion regression pushes the plug into the jack and withdraws
+it using the viewer's 50 N/m spring. It checks cable continuity, positive tet
+volumes, back-wall clearance, and a second, off-axis push against the socket
+face using an independent oriented-box penetration oracle. On the M5 the
+aligned sequence retained at least 46% of each tet's rest volume; the off-axis
+nose stopped at the face with no vertex penetration at the final sample.
+These are finite-step regressions, not a guarantee against arbitrary-speed
+continuous collision or every possible drag path.
