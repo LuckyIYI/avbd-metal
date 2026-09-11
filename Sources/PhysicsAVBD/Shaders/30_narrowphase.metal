@@ -473,6 +473,53 @@ inline void npcSwap(thread NPCVertex& a, thread NPCVertex& b) {
     b = t;
 }
 
+// A support point whose perpendicular projection lies strictly inside a
+// box face supplies an exact separated closest-point pair: the face normal
+// is a separating axis and the witness reaches that lower distance bound.
+// This bounded feature query also works inside the speculative contact band.
+inline NPCResult npcBoxFaceWitness(
+    thread const NPCShape& shape, thread const NPCShape& box,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices)
+{
+    NPCResult out; out.valid = false; out.overlap = false;
+    if (box.kind != 0u) return out;
+    NPCShape localBox, localShape;
+    float3 origin; float4 rotation;
+    npcMakeAFrame(box, shape, localBox, localShape, origin, rotation);
+    float3 halfExtent = localBox.dimensions.xyz * 0.5f;
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        for (uint side = 0u; side < 2u; ++side) {
+            float3 normal = float3(0);
+            normal[axis] = side == 0u ? -1.0f : 1.0f;
+            NPCShapePoint point = npcShapeSupport(localShape, -normal,
+                colliderHullRange, convexHullVertices);
+            float gap = dot(point.point, normal) - halfExtent[axis];
+            float error = 1.0e-5f + 32.0f * FLT_EPSILON
+                * (length(point.point) + length(localShape.center)
+                   + length(shape.dimensions.xyz) + length(box.dimensions.xyz));
+            if (!finite3(point.point) || !finite_bits(gap)
+                || !finite_bits(error) || gap <= error) continue;
+            float3 projected = point.point - normal * gap;
+            uint u = (axis + 1u) % 3u, v = (axis + 2u) % 3u;
+            if (fabs(projected[u]) >= halfExtent[u] - error
+                || fabs(projected[v]) >= halfExtent[v] - error) continue;
+            out.valid = true;
+            out.pointA = point.point; out.pointB = projected;
+            out.normalAB = -normal; out.signedDistance = gap;
+            out.featureA = point.feature;
+            // Box-face feature namespace used by the manifold helpers below.
+            out.featureB = 0x20000000u | (2u * axis + side);
+            NPCResult world = npcResultFromAFrame(out, origin, rotation);
+            world.valid = finite3(world.pointA) && finite3(world.pointB)
+                && finite3(world.normalAB)
+                && fabs(dot(world.normalAB, world.normalAB) - 1.0f) <= 5.0e-5f;
+            return world;
+        }
+    }
+    return out;
+}
+
 // Port of Newton/Jitter's XenoCollide portal refinement. It supplies stable
 // penetration witnesses directly, avoiding EPA's unbounded face expansion.
 inline NPCResult npcMPRWithEnlargeLocal(
@@ -1978,6 +2025,22 @@ inline void npCollidePass(
                         result = retry;
                         recovered = true;
                     }
+                }
+                if (!recovered) {
+                    NPCResult face = npcBoxFaceWitness(convexA, convexB,
+                        colliderHullRange, convexHullVertices);
+                    if (!face.valid) {
+                        face = npcBoxFaceWitness(convexB, convexA,
+                            colliderHullRange, convexHullVertices);
+                        if (face.valid) {
+                            NPCResult mapped = face;
+                            mapped.pointA = face.pointB; mapped.pointB = face.pointA;
+                            mapped.normalAB = -face.normalAB;
+                            mapped.featureA = face.featureB; mapped.featureB = face.featureA;
+                            face = mapped;
+                        }
+                    }
+                    if (face.valid) { result = face; recovered = true; }
                 }
                 if (!recovered) {
                     latchConvexQueryFailure(counters, convexQueryPoison);
