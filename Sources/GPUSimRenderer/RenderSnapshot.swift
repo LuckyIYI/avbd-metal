@@ -1,15 +1,22 @@
 import Metal
 import PhysicsAVBD
 
+/// GPU producers whose failures must be checked before publishing a frame.
+protocol RenderSubmissionProvider {
+    var renderSubmissions: [MTLCommandBuffer] { get }
+}
+
 /// One frame-owned copy of every buffer rasterization and RT may read.
 /// Slots are recycled only after the consuming render command completes.
-final class RenderSnapshot: GPUSimRenderableScene {
+final class RenderSnapshot: GPUSimRenderableScene, RenderSubmissionProvider {
+    var renderSubmissions: [MTLCommandBuffer] { submission.map { [$0] } ?? [] }
     enum Failure: Error { case allocation, encoder }
     let renderDevice: MTLDevice
     let ready: MTLSharedEvent
     private var generation: UInt64 = 0
     private var buffers: [ObjectIdentifier: MTLBuffer] = [:]
     private var primitiveInstances: MTLBuffer?
+    private var appearanceSlice: MTLBuffer?
     private(set) var submission: MTLCommandBuffer?
     private(set) var renderBodyCount = 0
     private(set) var renderRigidInstanceCount = 0
@@ -30,8 +37,10 @@ final class RenderSnapshot: GPUSimRenderableScene {
         ready = event
     }
 
+    // Environment batches own their validated topology separately and request
+    // only pose copies. Borrowed topology in that mode must never be drawn.
     func capture(solver: GPUSolver, colorMode: GPUSimRenderColorMode,
-                 appearances: MTLBuffer?, includeDebug: Bool = false) throws {
+                 appearances: MTLBuffer?, includeDebug: Bool = false, copyRigidGeometry: Bool = true, appearanceOffset: Int = 0) throws {
         let length = max(1, solver.renderRigidInstanceCount) * MemoryLayout<GPUSimRenderInstance>.stride
         if primitiveInstances?.length != length {
             primitiveInstances = renderDevice.makeBuffer(length: length, options: .storageModePrivate)
@@ -46,8 +55,18 @@ final class RenderSnapshot: GPUSimRenderableScene {
             renderStateRevision = solver.renderStateRevision
             renderCameraHint = solver.renderCameraHint
             renderContentBounds = solver.renderContentBounds
+            var localAppearances = appearances
+            if let appearances, appearanceOffset > 0 {
+                let length = renderBodyCount * MemoryLayout<GPUSimRenderAppearance>.stride
+                if appearanceSlice?.length != length {
+                    appearanceSlice = renderDevice.makeBuffer(length: max(1,length), options: .storageModePrivate)
+                }
+                guard let slice = appearanceSlice, let blit = command.makeBlitCommandEncoder() else { throw Failure.encoder }
+                blit.copy(from: appearances, sourceOffset: appearanceOffset, to: slice, destinationOffset: 0, size: length)
+                blit.endEncoding(); localAppearances = slice
+            }
             try solver.encodeRenderInstances(command, instances: primitives, colorMode: colorMode,
-                                             appearanceOverrides: appearances)
+                                             appearanceOverrides: localAppearances)
             do {
                 guard let blit = command.makeBlitCommandEncoder() else { throw Failure.encoder }
                 blit.label = "Copy immutable render surfaces"
@@ -76,7 +95,7 @@ final class RenderSnapshot: GPUSimRenderableScene {
                     try .init(triangles: copy($0.triangles), triangleCount: $0.triangleCount, vertices: copy($0.vertices))
                 }
                 rigidMeshRenderSurface = try solver.rigidMeshRenderSurface.map {
-                    try .init(vertices: copy($0.vertices), indices: copy($0.indices), indexCount: $0.indexCount,
+                    try .init(vertices: copyRigidGeometry ? copy($0.vertices) : $0.vertices, indices: copyRigidGeometry ? copy($0.indices) : $0.indices, indexCount: $0.indexCount,
                               positions: copy($0.positions), rotations: copy($0.rotations))
                 }
                 convexDebugRenderSurface = try (includeDebug ? solver.convexDebugRenderSurface : nil).map {

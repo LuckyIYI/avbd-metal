@@ -4,6 +4,7 @@ import simd
 import XCTest
 @testable import GPUSimRenderer
 
+@MainActor
 final class GTAOShadingNormalTests: XCTestCase {
     func testSmoothShadingNormalsDoNotMakeAPlaneOccludeItself() throws {
         let image = try renderPlane()

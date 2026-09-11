@@ -1,0 +1,254 @@
+{
+  "base_commit": "792ab62409d14f999b0d555b9b7144d180a82b4f",
+  "device": "Apple M5",
+  "method": "Saved timings are render_seconds plus JPEG write seconds; first record excluded from warm statistics. Ten repeated cabinet views or fifteen different construction review views. Scene generation and process startup excluded. No guarantee across hardware/scenes.",
+  "runs": [
+    {
+      "run": "base-fast",
+      "images": 15,
+      "warm_images": 14,
+      "gpu_frame_median_ms": 18.727041664533317,
+      "saved_median_ms": 52.22398042678833,
+      "saved_max_ms": 57.312965393066406,
+      "first_render_ms": 158.78701210021973,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 2,
+        "quality": "realtime",
+        "scale": 0.5,
+        "area_rays": 4,
+        "secondaryAreaLightSamples": 0,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "base-high",
+      "images": 10,
+      "warm_images": 9,
+      "gpu_frame_median_ms": 1446.6228750534356,
+      "saved_median_ms": 1459.6120119094849,
+      "saved_max_ms": 1514.2830610275269,
+      "first_render_ms": 2983.912944793701,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 1,
+        "quality": "high",
+        "scale": 1,
+        "area_rays": 64,
+        "secondaryAreaLightSamples": 0,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "base-high-v2",
+      "images": 5,
+      "warm_images": 4,
+      "gpu_frame_median_ms": 1470.1944375410676,
+      "saved_median_ms": 1479.7029495239258,
+      "saved_max_ms": 1496.973991394043,
+      "first_render_ms": 1644.0479755401611,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 1,
+        "quality": "high",
+        "scale": 1,
+        "area_rays": 64,
+        "secondaryAreaLightSamples": 0,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "exact-high",
+      "images": 10,
+      "warm_images": 9,
+      "gpu_frame_median_ms": 1432.4405833613127,
+      "saved_median_ms": 1446.3200569152832,
+      "saved_max_ms": 1633.7790489196777,
+      "first_render_ms": 1593.9960479736328,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 1,
+        "quality": "high",
+        "scale": 1,
+        "area_rays": 64,
+        "secondaryAreaLightSamples": 0,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "initial experiment"
+    },
+    {
+      "run": "exact-high-v2",
+      "images": 5,
+      "warm_images": 4,
+      "gpu_frame_median_ms": 1489.382104249671,
+      "saved_median_ms": 1498.2290267944336,
+      "saved_max_ms": 1576.5470266342163,
+      "first_render_ms": 2953.1019926071167,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 1,
+        "quality": "high",
+        "scale": 1,
+        "area_rays": 64,
+        "secondaryAreaLightSamples": 0,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "final-secondary-high",
+      "images": 10,
+      "warm_images": 9,
+      "gpu_frame_median_ms": 289.4742500502616,
+      "saved_median_ms": 299.62289333343506,
+      "saved_max_ms": 379.2301416397095,
+      "first_render_ms": 542.544960975647,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 1,
+        "quality": "high",
+        "scale": 1,
+        "area_rays": 64,
+        "secondaryAreaLightSamples": 1,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "final-selected-fast",
+      "images": 15,
+      "warm_images": 14,
+      "gpu_frame_median_ms": 19.07484367256984,
+      "saved_median_ms": 52.09106206893921,
+      "saved_max_ms": 61.8058443069458,
+      "first_render_ms": 140.11406898498535,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 2,
+        "quality": "realtime",
+        "scale": 0.5,
+        "area_rays": 4,
+        "secondaryAreaLightSamples": 1,
+        "areaLightSampling": "powerWeighted"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "optimized-fast",
+      "images": 15,
+      "warm_images": 14,
+      "gpu_frame_median_ms": 17.04420824535191,
+      "saved_median_ms": 47.38056659698486,
+      "saved_max_ms": 58.493971824645996,
+      "first_render_ms": 139.5200490951538,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 2,
+        "quality": "realtime",
+        "scale": 0.5,
+        "area_rays": 4,
+        "secondaryAreaLightSamples": 1,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "initial experiment"
+    },
+    {
+      "run": "quality-balanced",
+      "images": 15,
+      "warm_images": 14,
+      "gpu_frame_median_ms": 24.739177199080586,
+      "saved_median_ms": 62.92104721069336,
+      "saved_max_ms": 77.96299457550049,
+      "first_render_ms": 151.29005908966064,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 2,
+        "quality": "balanced",
+        "scale": 0.5,
+        "area_rays": 8,
+        "secondaryAreaLightSamples": 1,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "quality-under-100",
+      "images": 15,
+      "warm_images": 14,
+      "gpu_frame_median_ms": 55.1599896280095,
+      "saved_median_ms": 124.02600049972534,
+      "saved_max_ms": 146.2838649749756,
+      "first_render_ms": 227.24294662475586,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 2,
+        "quality": "high",
+        "scale": 0.5,
+        "area_rays": 16,
+        "secondaryAreaLightSamples": 1,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "final branch or PR-head baseline"
+    },
+    {
+      "run": "secondary-high",
+      "images": 10,
+      "warm_images": 9,
+      "gpu_frame_median_ms": 300.04183342680335,
+      "saved_median_ms": 309.75496768951416,
+      "saved_max_ms": 336.3410234451294,
+      "first_render_ms": 1732.0480346679688,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 1,
+        "quality": "high",
+        "scale": 1,
+        "area_rays": 64,
+        "secondaryAreaLightSamples": 1,
+        "areaLightSampling": "allLights"
+      },
+      "implementation": "initial experiment"
+    },
+    {
+      "run": "selected-fast",
+      "images": 15,
+      "warm_images": 14,
+      "gpu_frame_median_ms": 12.904104252811521,
+      "saved_median_ms": 38.8144850730896,
+      "saved_max_ms": 45.35794258117676,
+      "first_render_ms": 130.6319236755371,
+      "settings": {
+        "width": 1600,
+        "height": 1200,
+        "samples": 2,
+        "quality": "realtime",
+        "scale": 0.5,
+        "area_rays": 4,
+        "secondaryAreaLightSamples": 1,
+        "areaLightSampling": "powerWeighted"
+      },
+      "implementation": "initial experiment"
+    }
+  ],
+  "limitations": [
+    "Local generated asset fixtures are not part of AVBD. These are exploratory application measurements, not a portable benchmark suite.",
+    "Warm GPU timing is whole frame, not per-pass profiling.",
+    "Comparisons with changed sample budgets trade variance for throughput.",
+    "The selector did not show a repeatable benefit on the three-light low-budget fixture.",
+    "Low-budget renders still contain visible grain; no noise-free claim."
+  ]
+}

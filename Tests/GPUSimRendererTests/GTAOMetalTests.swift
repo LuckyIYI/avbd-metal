@@ -9,6 +9,7 @@ import XCTest
 /// Execute the shipped shader, including depth reconstruction and the real
 /// R8 AO and bilateral filtering targets. A CPU port with ideal positions misses sampling
 /// and precision errors in the production G-buffer path.
+@MainActor
 final class GTAOMetalTests: XCTestCase {
     private struct Fixture {
         var plane: SIMD4<Float>

@@ -3,6 +3,7 @@ import simd
 import XCTest
 @testable import GPUSimRenderer
 
+@MainActor
 final class AmbientCompositionTests: XCTestCase {
     func testClothAndFloorPreserveAmbientWhenHQCorrectionIsZero() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
@@ -47,6 +48,7 @@ final class AmbientCompositionTests: XCTestCase {
                 pass.colorAttachments[0].texture = target; pass.colorAttachments[0].storeAction = .store
                 let command = try XCTUnwrap(queue.makeCommandBuffer())
                 let encoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: pass))
+                try GPUSimMaterialLibrary(device: device).bind(encoder)
                 var u = Uniforms(viewProj: matrix_identity_float4x4, lightDir: SIMD4(0,0,1,0),
                     eye: SIMD4(0.5,0.5,1,0), screen: SIMD4(4,4,1,0), camRight: .zero, camUp: .zero,
                     prevViewProj: matrix_identity_float4x4, temporal: .zero,
