@@ -79,6 +79,8 @@ public final class GPUSimMaterialLibrary {
   let device: MTLDevice
   let programs: [GPUSimMaterialProgram]
   public let hasTransmission: Bool
+  /// Per material (one-based id minus one): whether HQ camera transport applies.
+  let transmissiveMaterials: [Bool]
   let environmentIrradiance: MTLBuffer
   let textureBudget: Int
   let records: MTLBuffer
@@ -191,7 +193,8 @@ public final class GPUSimMaterialLibrary {
     self.device = device
     self.programs = programs
     self.textureBudget = textureBudget
-    hasTransmission = materials.contains { $0.previewOptics.transmission > 0 }
+    transmissiveMaterials = materials.map { $0.previewOptics.transmission > 0 }
+    hasTransmission = transmissiveMaterials.contains(true)
     usesArgumentBuffers = tier2
     materialCount = materials.count
     let prepared = try GPUSimMaterialLibrary.prepare(

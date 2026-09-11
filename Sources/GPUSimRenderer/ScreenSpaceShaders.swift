@@ -92,8 +92,10 @@ inline float3 surfaceReflection(float2 uv, float3 P, float3 N, float rough, floa
         float w = (x ? f.x : 1-f.x)*(y ? f.y : 1-f.y);
         w *= saturate(1-plane/tolerance)*pow(saturate(dot(N,nr.xyz)),32.0);
         float4 mat = material.read(uint2(q));
-        float3 factor = transmission ? float3(1) : reflectionFactor(Q,nr.xyz,nr.w,mat.rgb,mat.a,U);
-        sum += reflection.read(uint2(q)).rgb/factor*w;
+        // Every texel is stored in Fresnel-scaled units (rt_reflections scales
+        // transmitted radiance the same way), so neighbours of either class divide
+        // out their own factor and no glass/opaque boundary is amplified.
+        sum += reflection.read(uint2(q)).rgb/reflectionFactor(Q,nr.xyz,nr.w,mat.rgb,mat.a,U)*w;
         weight += w;
     }
     float3 factor = transmission ? float3(1) : reflectionFactor(P,N,rough,albedo,metal,U);

@@ -37,6 +37,7 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// tone curve. Zero preserves the default; finite values clamp to -16...16.
     public var displayExposure: Float = 0
     /// Settings for the renderer's independently prepared environment image.
+    /// Intensity is a linear multiplier clamped to 0...100; nonfinite resolves to 1.
     public var environmentIntensity: Float = 1
     public var environmentRotation: Float = 0
     public var showsEnvironmentBackground: Bool = true
@@ -113,7 +114,7 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
 
     func resolved(supportsHQ: Bool) -> Self {
         var result = self
-        result.environmentIntensity = environmentIntensity.isFinite ? max(0, environmentIntensity) : 1
+        result.environmentIntensity = environmentIntensity.isFinite ? max(0, min(100, environmentIntensity)) : 1
         result.environmentRotation = environmentRotation.isFinite ? environmentRotation.truncatingRemainder(dividingBy: 2 * .pi) : 0
         result.ambientExposure = ambientExposure.isFinite ? min(ambientExposure, 4) : 0
         result.ambientExposure = max(result.ambientExposure, -4)
@@ -688,13 +689,13 @@ struct Uniforms {
     float4x4 prevInvViewProj;
     float4 effects; // x: HDR output, y: contact distance, z: SSR distance, w: max SSR roughness
     float4 rayTracing; // x: world visibility, y: screen reflection shortcut enabled
-    float4 rayScene; // x: analytic built-in ground enabled
+    float4 rayScene; // x: analytic built-in ground enabled, y: ambient exposure (stops), z: sun intensity multiplier, w: sun angular radius
     float4 rayBudget; // shadow, reflection, diffuse (0 adaptive), transmission interfaces (0 absent)
     float4 diffuse; // x: world diffuse lighting enabled; y: ray pass writes specular distance
     float4 reconstruction; // x: MetalFX, yz: normalized projection jitter, w: sample index
     float4 areaSettings; // count, samples per emitter, reserved
     uint4 instancing; // x: rigid mesh body stride between environment instances
-    float4 environmentSettings; // intensity minus one, rotation, hide background, reserved
+    float4 environmentSettings; // intensity multiplier, rotation, hide background, reserved
     float4 displaySettings; // exposure, custom display transform enabled, reserved
     AreaLight areaLights[8];
     float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
@@ -727,7 +728,7 @@ struct VOut {
 };
 
 #define HORIZON_LIN float3(0.78, 0.81, 0.85)
-#define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4 * (1+U.rayScene.z))
+#define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4 * U.rayScene.z)
 #define SKY_IRR (float3(0.30, 0.33, 0.38) * exp2(U.rayScene.y))
 #define GND_IRR (float3(0.20, 0.185, 0.17) * exp2(U.rayScene.y))
 
@@ -1225,7 +1226,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
             U.rayTracing.x > 0 && U.rayBudget.w > 0 && materialOptics(materialIndex(in.uvMaterial.z),materials).x > 0);
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
-    lit = mix(lit, HORIZON_LIN, fog);
+    lit = mix(lit, materialHorizon(in.world - U.eye.xyz, U, materials), fog);
     // The HQ ray buffer replaces the transmitted portion with refracted radiance.
     // Keep the legacy opaque result in lighting modes without world-space rays.
     if (U.rayTracing.x > 0 && U.rayBudget.w > 0 && U.rayTracing.w > 0 && U.rayTracing.z == 0)
@@ -1287,7 +1288,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
         lit += (max(materialDiffuseAmbient(N,U,materials)+indirect.rgb,float3(0))-materialDiffuseAmbient(n,U,materials)*ao)*1.15*in.albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
-    lit = mix(lit, HORIZON_LIN, fog);
+    lit = mix(lit, materialHorizon(in.world - U.eye.xyz, U, materials), fog);
     return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), in.opacity);
 }
 
@@ -1451,7 +1452,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     if (U.areaSettings.x>0) lit += U.rayTracing.x>0 ? areaDirect.read(uint2(in.position.xy)).rgb
         : rasterAreaLighting(in.world,float3(0,0,1),normalize(U.eye.xyz-in.world),albedo,1,0,U);
     float fog = horizonFog(length(in.world.xy - U.eye.xy));
-    lit = mix(lit, HORIZON_LIN, fog);
+    lit = mix(lit, materialHorizon(in.world - U.eye.xyz, U, materials), fog);
     return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), 1);
 }
 
@@ -1473,13 +1474,13 @@ struct Uniforms {
     var prevInvViewProj: simd_float4x4
     var effects = SIMD4<Float>(repeating: 0)
     var rayTracing = SIMD4<Float>(repeating: 0)
-    var rayScene = SIMD4<Float>.zero
+    var rayScene = SIMD4<Float>(0, 0, 1, 0)
     var rayBudget = SIMD4<Float>.zero
     var diffuse = SIMD4<Float>.zero
     var reconstruction = SIMD4<Float>.zero
     var areaSettings = SIMD4<Float>.zero
     var instancing = SIMD4<UInt32>.zero
-    var environmentSettings = SIMD4<Float>.zero
+    var environmentSettings = SIMD4<Float>(1, 0, 0, 0)
     var displaySettings = SIMD4<Float>.zero
     var areaLights = (AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord())
     var aoProjection: SIMD4<Float>
@@ -2001,7 +2002,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private func ensureTargets(_ size: CGSize, options: GPUSimRenderOptions) -> Bool {
         do {
             let scale = options.reconstruction == .metalFX && options.rayTracingDenoising ? (options.reconstructionScale.isFinite ? max(0.5, min(options.reconstructionScale, 1)) : 1) : 1
-            let requested = CGSize(width: max(4, (Int(Float(size.width) * scale) / 2) * 2), height: max(4, (Int(Float(size.height) * scale) / 2) * 2))
+            // Even dimensions are a scaler requirement; the raw diagnostic path
+            // displays the render target directly and must match the drawable.
+            let requested = options.rayTracingDenoising
+                ? CGSize(width: max(4, (Int(Float(size.width) * scale) / 2) * 2), height: max(4, (Int(Float(size.height) * scale) / 2) * 2))
+                : size
             let resized = try screenSpace.prepare(size: options.reconstruction == .metalFX ? requested : size, options: options)
             targetSize = screenSpace.size
             if resized { prevVP = nil }
@@ -2608,15 +2613,15 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                              1 / projection.columns.0.x, 1 / projection.columns.1.y))
         U.rayScene.y = activeOptions.ambientExposure
-        U.rayScene.z = activeOptions.sunIntensity-1
+        U.rayScene.z = activeOptions.sunIntensity
         U.rayScene.w = activeOptions.sunAngularRadius
         let quality = activeOptions.rayTracingQuality
         U.rayBudget = SIMD4(Float(quality.shadowSamples),Float(quality.reflectionSamples),
-                           Float(quality.diffuseSamples),materialLibrary.hasTransmission ? Float(quality.transmissionInterfaces) : 0)
+                           Float(quality.diffuseSamples),(rayWorld?.usesTransmission ?? materialLibrary.hasTransmission) ? Float(quality.transmissionInterfaces) : 0)
         U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),
             Float(quality.secondaryAreaLightSamples),quality.areaLightSampling == .powerWeighted ? 1 : 0)
         U.instancing.x = UInt32(renderScene.rigidMeshRenderSurface?.bodiesPerInstance ?? 0)
-        U.environmentSettings = SIMD4(activeOptions.environmentIntensity-1,activeOptions.environmentRotation,activeOptions.showsEnvironmentBackground ? 0 : 1,0)
+        U.environmentSettings = SIMD4(activeOptions.environmentIntensity,activeOptions.environmentRotation,activeOptions.showsEnvironmentBackground ? 0 : 1,0)
         U.displaySettings.x = activeOptions.displayExposure
         U.displaySettings.y = displayTransform == nil ? 0 : 1
         withUnsafeMutableBytes(of: &U.areaLights) { bytes in

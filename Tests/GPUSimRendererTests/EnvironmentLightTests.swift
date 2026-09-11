@@ -45,7 +45,8 @@ final class EnvironmentLightTests: XCTestCase {
     let uniforms = try XCTUnwrap(
       device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared))
     memset(uniforms.contents(), 0, uniforms.length)
-    uniforms.contents().assumingMemoryBound(to: Uniforms.self).pointee.environmentSettings.x = 1
+    // Intensity 2 doubles the constant map, which the assertions below expect.
+    uniforms.contents().assumingMemoryBound(to: Uniforms.self).pointee.environmentSettings.x = 2
     e.setComputePipelineState(p)
     e.setBuffer(out, offset: 0, index: 0)
     e.setBuffer(uniforms, offset: 0, index: 1)
@@ -163,8 +164,13 @@ final class EnvironmentLightTests: XCTestCase {
     var invalid = options
     invalid.sunAngularRadius = .nan
     invalid.sunIntensity = .nan
+    invalid.environmentIntensity = .nan
     let resolved = invalid.resolved(supportsHQ: true)
     XCTAssertEqual(resolved.sunAngularRadius, 0)
     XCTAssertEqual(resolved.sunIntensity, 1)
+    XCTAssertEqual(resolved.environmentIntensity, 1)
+    var loud = options
+    loud.environmentIntensity = .greatestFiniteMagnitude
+    XCTAssertEqual(loud.resolved(supportsHQ: true).environmentIntensity, 100, "finite HDR targets cannot hold an unbounded multiplier")
   }
 }

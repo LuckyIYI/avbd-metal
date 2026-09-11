@@ -59,18 +59,21 @@ let areaLightingShaderSource = """
       }
       return result;
   }
-  inline float3 areaBRDF(float3 albedo,float rough,float metal,float3 N,float3 V,float3 L,bool diffuseOnly) {
+  // `specular` scales the GGX lobe (0 diffuse only, 1 full). Primary receivers
+  // whose specular is already carried by BSDF-sampled reflection rays pass the
+  // complementary weight so emitters are not counted by both estimators.
+  inline float3 areaBRDF(float3 albedo,float rough,float metal,float3 N,float3 V,float3 L,float specular) {
       float nl=saturate(dot(N,L)),nv=max(dot(N,V),1e-4);
       if (nl<=0) return float3(0);
       float3 sum=L+V,H=sum*rsqrt(max(dot(sum,sum),1e-8));
       float nh=saturate(dot(N,H)),vh=saturate(dot(V,H));
       float3 f0=mix(float3(0.04),albedo,metal),F=f0+(1-f0)*pow(1-vh,5.0);
       float3 diffuse=albedo*(1-metal)*(1-F)/M_PI_F;
-      if (diffuseOnly) return diffuse*nl;
+      if (specular<=0) return diffuse*nl;
       float a2=max(rough*rough*rough*rough,1e-8),den=nh*nh*(a2-1)+1;
       float D=a2/(M_PI_F*den*den),k=(rough+1)*(rough+1)/8;
       float G=nv/(nv*(1-k)+k)*nl/(nl*(1-k)+k);
-      return (diffuse+D*G*F/max(4*nv*nl,1e-4))*nl;
+      return (diffuse+specular*D*G*F/max(4*nv*nl,1e-4))*nl;
   }
   // Fast-mode fallback: fixed quadrature of finite emitters, without area shadows.
   inline float3 rasterAreaLighting(float3 P,float3 N,float3 V,float3 albedo,float rough,float metal,constant Uniforms& U) {
@@ -82,7 +85,7 @@ let areaLightingShaderSource = """
               float d2=max(dot(delta,delta),1e-8);float3 L=delta*rsqrt(d2);
               float cosine=dot(areaNormal(light),-L);
               cosine=light.radiance.w>0 ? abs(cosine) : max(cosine,0.0);
-              total+=areaBRDF(albedo,rough,metal,N,V,L,false)*light.radiance.rgb*(cosine*areaSize(light)/(4*d2));
+              total+=areaBRDF(albedo,rough,metal,N,V,L,1)*light.radiance.rgb*(cosine*areaSize(light)/(4*d2));
           }
       }
       return total;
@@ -91,7 +94,7 @@ let areaLightingShaderSource = """
 
 let areaRayShaderSource = """
   __attribute__((noinline)) float3 rtSelectedAreaLighting(float3 P,float3 N,float3 V,float3 albedo,float rough,float metal,
-      instance_acceleration_structure scene,constant Uniforms& U,uint2 pixel,bool diffuseOnly=false,bool secondary=false) {
+      instance_acceleration_structure scene,constant Uniforms& U,uint2 pixel,float specular=1,bool secondary=false) {
       float3 total=float3(0);
       uint lights=uint(U.areaSettings.x);
       if(lights==0) return total;
@@ -123,14 +126,14 @@ let areaRayShaderSource = """
               if (cosine<=0 || dot(N,L)<=0) continue;
               ray r;r.origin=P+N*0.0001;r.direction=L;r.min_distance=0.00002;r.max_distance=max(0.00003,distance-0.0002);
               if (rtGroundDistance(r,U)>=0 || query.intersect(r,scene,1).type!=intersection_type::none) continue;
-              total+=areaBRDF(albedo,rough,metal,N,V,L,diffuseOnly)*light.radiance.rgb*(cosine*areaSize(light)/(d2*float(count)*probability));
+              total+=areaBRDF(albedo,rough,metal,N,V,L,specular)*light.radiance.rgb*(cosine*areaSize(light)/(d2*float(count)*probability));
           }
       }
       return total;
   }
   inline float3 rtAreaLighting(float3 P,float3 N,float3 V,float3 albedo,float rough,float metal,
-      instance_acceleration_structure scene,constant Uniforms& U,uint2 pixel,bool diffuseOnly=false,bool secondary=false) {
-      if(U.areaSettings.w>0) return rtSelectedAreaLighting(P,N,V,albedo,rough,metal,scene,U,pixel,diffuseOnly,secondary);
+      instance_acceleration_structure scene,constant Uniforms& U,uint2 pixel,float specular=1,bool secondary=false) {
+      if(U.areaSettings.w>0) return rtSelectedAreaLighting(P,N,V,albedo,rough,metal,scene,U,pixel,specular,secondary);
       float3 total=float3(0);
       uint count=uint(max(secondary && U.areaSettings.z>0 ? U.areaSettings.z : U.areaSettings.y,1.0));
       uint frame=uint(U.reconstruction.w);
@@ -151,7 +154,7 @@ let areaRayShaderSource = """
               if (cosine<=0 || dot(N,L)<=0) continue;
               ray r;r.origin=P+N*0.0001;r.direction=L;r.min_distance=0.00002;r.max_distance=max(0.00003,distance-0.0002);
               if (rtGroundDistance(r,U)>=0 || query.intersect(r,scene,1).type!=intersection_type::none) continue;
-              total+=areaBRDF(albedo,rough,metal,N,V,L,diffuseOnly)*light.radiance.rgb*(cosine*areaSize(light)/(d2*float(count)));
+              total+=areaBRDF(albedo,rough,metal,N,V,L,specular)*light.radiance.rgb*(cosine*areaSize(light)/(d2*float(count)));
           }
       }
       return total;
@@ -187,6 +190,10 @@ let areaRayShaderSource = """
       float3 P=worldFromDepth(uv,d,U.invViewProj);float4 nr=normal.read(pixel),m=material.read(pixel);
       float3 N=normalize(nr.xyz),V=normalize(U.eye.xyz-P);
       P=rtPrimaryPosition(P,scene,U);
-      output.write(float4(rtAreaLighting(P,N,V,m.rgb,nr.w,m.a,scene,U,pixel),1),pixel);
+      // Where reflection rays are traced (smooth receivers) they carry the
+      // emitters' specular image; light sampling supplies it only as that
+      // coverage fades out toward the roughness cutoff.
+      float specular=U.rayTracing.w>0 ? smoothstep(U.effects.w-0.15,U.effects.w,nr.w) : 1;
+      output.write(float4(rtAreaLighting(P,N,V,m.rgb,nr.w,m.a,scene,U,pixel,specular),1),pixel);
   }
   """
