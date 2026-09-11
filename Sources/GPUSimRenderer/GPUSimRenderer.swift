@@ -33,6 +33,25 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// specular environment seen in reflections are not scaled, so reflections
     /// always match the drawn sky.
     public var ambientExposure: Float = 0
+    /// Display exposure in stops, applied to linear HDR before the existing
+    /// tone curve. Zero preserves the default; finite values clamp to -16...16.
+    public var displayExposure: Float = 0
+    /// Settings for the renderer's independently prepared environment image.
+    /// Intensity is a linear multiplier clamped to 0...100; nonfinite resolves to 1.
+    public var environmentIntensity: Float = 1
+    public var environmentRotation: Float = 0
+    public var showsEnvironmentBackground: Bool = true
+    public var rayTracingQuality = GPUSimRayTracingQuality.realtime
+    /// HQ neural denoising and temporal reconstruction. Disable to inspect the
+    /// unfiltered HDR lighting at native resolution with the same ray budgets.
+    /// This diagnostic output retains surface-aware visibility reconstruction.
+    public var rayTracingDenoising: Bool = true
+    /// Up to eight finite emitters. Excess entries fail validation rather than disappearing.
+    public var areaLights: [GPUSimAreaLight] = []
+    /// Directional-light radiance multiplier. Zero allows environment-only lighting.
+    public var sunIntensity: Float = 1
+    /// HQ directional-light angular radius in radians. Zero preserves hard shadows.
+    public var sunAngularRadius: Float = 0
     /// World-space direction in which sunlight travels (not toward the sun).
     /// Normalized at render time. Zero/nonfinite inputs fall back to the default.
     /// Shared by raster shadows, contact shadows, HQ rays and material shading.
@@ -71,14 +90,38 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
     /// cadence. Set it to the loop's frame period to pin the cadence.
     public var minimumFrameDuration: Double?
 
+    /// Validates scene lighting limits before rendering or importing a light rig.
+    public func validateLighting() throws {
+        guard areaLights.count <= GPUSimAreaLight.maximumCount else {
+            throw GPUSimAreaLight.Failure.tooManyLights
+        }
+    }
+
+    // New lighting options invalidate conservatively; presentation-only controls
+    // are stripped because they do not change the accumulated linear radiance.
+    var linearHistoryOptions: Self {
+        var result = self
+        result.displayExposure = 0
+        result.minimumFrameDuration = nil
+        result.showConvexCollisionGeometry = false
+        result.convexCollisionWireframe = false
+        return result
+    }
+
     var usesRayTracing: Bool { lightingMode == .qualityBeta }
     var usesDiffuseGI: Bool { usesRayTracing }
     var usesHDR: Bool { screenSpaceReflections || usesRayTracing || reconstruction == .metalFX }
 
     func resolved(supportsHQ: Bool) -> Self {
         var result = self
+        result.environmentIntensity = environmentIntensity.isFinite ? max(0, min(100, environmentIntensity)) : 1
+        result.environmentRotation = environmentRotation.isFinite ? environmentRotation.truncatingRemainder(dividingBy: 2 * .pi) : 0
         result.ambientExposure = ambientExposure.isFinite ? min(ambientExposure, 4) : 0
         result.ambientExposure = max(result.ambientExposure, -4)
+        result.displayExposure = displayExposure.isFinite ? max(-16, min(16, displayExposure)) : 0
+        result.sunAngularRadius = sunAngularRadius.isFinite ? max(0, min(0.5, sunAngularRadius)) : 0
+        result.sunIntensity = sunIntensity.isFinite ? max(0, min(100, sunIntensity)) : 1
+        result.rayTracingQuality = rayTracingQuality.resolved
         let magnitude = max(abs(sunDirection.x), max(abs(sunDirection.y), abs(sunDirection.z)))
         if sunDirection.x.isFinite && sunDirection.y.isFinite && sunDirection.z.isFinite && magnitude > 0 {
             result.sunDirection = normalize(sunDirection / magnitude)
@@ -366,19 +409,27 @@ public struct GPUSimRigidMeshRenderSurface {
     public let indexCount: Int
     public let positions: MTLBuffer
     public let rotations: MTLBuffer
+    /// Shared topology is drawn once per environment. Pose arrays are packed
+    /// with this body stride; vertex body IDs remain local to the topology.
+    public let instanceCount: Int
+    public let bodiesPerInstance: Int
 
     public init(
         vertices: MTLBuffer,
         indices: MTLBuffer,
         indexCount: Int,
         positions: MTLBuffer,
-        rotations: MTLBuffer
+        rotations: MTLBuffer,
+        instanceCount: Int = 1,
+        bodiesPerInstance: Int = 0
     ) {
         self.vertices = vertices
         self.indices = indices
         self.indexCount = indexCount
         self.positions = positions
         self.rotations = rotations
+        self.instanceCount = instanceCount
+        self.bodiesPerInstance = bodiesPerInstance
     }
 }
 
@@ -426,6 +477,8 @@ public protocol GPUSimRenderableScene: AnyObject {
     /// to reuse a scene's acceleration-structure update. Nil updates every draw.
     var renderStateRevision: UInt64? { get }
     var rendererStateIsValid: Bool { get }
+    /// False for raster-only scene representations. HQ must not silently omit geometry.
+    var renderSupportsRayTracing: Bool { get }
     var renderCameraHint: GPUSimRenderCameraHint { get }
     var softRenderSurface: GPUSimSoftRenderSurface? { get }
     var skinnedRenderSurface: GPUSimSkinnedRenderSurface? { get }
@@ -449,6 +502,10 @@ public protocol GPUSimRenderableScene: AnyObject {
         colorMode: GPUSimRenderColorMode,
         appearanceOverrides: MTLBuffer?
     ) throws
+}
+
+extension GPUSimRenderableScene {
+    public var renderSupportsRayTracing: Bool { true }
 }
 
 extension GPUSolver: GPUSimRenderableScene {
@@ -587,7 +644,7 @@ public extension GPUSimRendererSource {
 
 let renderShaderSource = makeRenderShaderSource()
 
-func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = [], argumentBuffers: Bool = true) -> String {
+func makeRenderShaderSource(motionGuides: Bool = false, programs: [GPUSimMaterialProgram] = [], argumentBuffers: Bool = true, displayProgram: GPUSimDisplayProgram? = nil) -> String {
 """
 #include <metal_stdlib>
 using namespace metal;
@@ -616,6 +673,7 @@ struct RigidMeshVertex {
     float4 uvMaterial;
 };
 
+struct AreaLight { float4 position; float4 right; float4 up; float4 radiance; };
 struct Uniforms {
     float4x4 viewProj;
     float4 lightDir;    // xyz
@@ -631,9 +689,15 @@ struct Uniforms {
     float4x4 prevInvViewProj;
     float4 effects; // x: HDR output, y: contact distance, z: SSR distance, w: max SSR roughness
     float4 rayTracing; // x: world visibility, y: screen reflection shortcut enabled
-    float4 rayScene; // x: analytic built-in ground enabled
-    float4 diffuse; // x: world diffuse lighting enabled
+    float4 rayScene; // x: analytic built-in ground enabled, y: ambient exposure (stops), z: sun intensity multiplier, w: sun angular radius
+    float4 rayBudget; // shadow, reflection, diffuse (0 adaptive), transmission interfaces (0 absent)
+    float4 diffuse; // x: world diffuse lighting enabled; y: ray pass writes specular distance
     float4 reconstruction; // x: MetalFX, yz: normalized projection jitter, w: sample index
+    float4 areaSettings; // count, samples per emitter, reserved
+    uint4 instancing; // x: rigid mesh body stride between environment instances
+    float4 environmentSettings; // intensity multiplier, rotation, hide background, reserved
+    float4 displaySettings; // exposure, custom display transform enabled, reserved
+    AreaLight areaLights[8];
     float4 aoProjection; // xy: depth A/B (deviceDepth=A+B/viewZ); zw: inverse focal scales
 };
 
@@ -664,7 +728,7 @@ struct VOut {
 };
 
 #define HORIZON_LIN float3(0.78, 0.81, 0.85)
-#define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4)
+#define SUN_COL (float3(1.0, 0.95, 0.86) * 3.4 * U.rayScene.z)
 #define SKY_IRR (float3(0.30, 0.33, 0.38) * exp2(U.rayScene.y))
 #define GND_IRR (float3(0.20, 0.185, 0.17) * exp2(U.rayScene.y))
 
@@ -678,6 +742,10 @@ inline float horizonFog(float d) {
 inline float3 acesTonemap(float3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+inline float3 displayTonemap(float3 radiance, constant Uniforms& U) {
+    return acesTonemap(radiance * exp2(U.displaySettings.x));
 }
 
 // The drawable is an 8-bit sRGB target. A smooth near-white lighting ramp
@@ -710,6 +778,8 @@ inline float3 displayColorSRGB8(float3 toneMappedLinear, float2 pixel) {
     encoded = clamp(encoded + noise / 255.0, 0.0, 1.0);
     return sRGBToLinearExact(encoded);
 }
+
+\(makeDisplayTransformShaderSource(displayProgram))
 
 // Three-by-three comparison-filtered directional shadow. The light projection
 // follows the camera target, so the useful texel density stays around the robot
@@ -833,11 +903,11 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
     return o;
 }
 
-vertex VOut box_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                       device const RenderInstance* instances [[buffer(0)]],
-                       constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut box_geometry(uint vid, uint iid,
+                       device const RenderInstance* instances,
+                       constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 0.0) return collapse();
@@ -845,14 +915,24 @@ vertex VOut box_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     o.previousWorld = writesMotion ? (previousPrimary[iid].model * float4(cubeVerts[vid], 1)).xyz : o.world;
     return o;
 }
+vertex VOut box_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                       device const RenderInstance* instances [[buffer(0)]],
+                       constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return box_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut box_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                       device const RenderInstance* instances [[buffer(0)]],
+                       constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return box_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 #define SPH_STACKS 12
 #define SPH_SLICES 18
-vertex VOut sphere_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                          device const RenderInstance* instances [[buffer(0)]],
-                          constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut sphere_geometry(uint vid, uint iid,
+                          device const RenderInstance* instances,
+                          constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 1.0) return collapse();
@@ -867,14 +947,24 @@ vertex VOut sphere_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     o.previousWorld = writesMotion ? (previousPrimary[iid].model * float4(n * 0.5, 1)).xyz : o.world;
     return o;
 }
+vertex VOut sphere_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                          device const RenderInstance* instances [[buffer(0)]],
+                          constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return sphere_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut sphere_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                          device const RenderInstance* instances [[buffer(0)]],
+                          constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return sphere_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 #define TOR_RINGS 24
 #define TOR_SIDES 12
-vertex VOut torus_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                         device const RenderInstance* instances [[buffer(0)]],
-                         constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut torus_geometry(uint vid, uint iid,
+                         device const RenderInstance* instances,
+                         constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 2.0) return collapse();
@@ -895,14 +985,24 @@ vertex VOut torus_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     }
     return o;
 }
+vertex VOut torus_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                         device const RenderInstance* instances [[buffer(0)]],
+                         constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return torus_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut torus_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                         device const RenderInstance* instances [[buffer(0)]],
+                         constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return torus_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 #define CAP_SLICES 16
 #define CAP_STACKS 6
-vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                           device const RenderInstance* instances [[buffer(0)]],
-                           constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut capsule_geometry(uint vid, uint iid,
+                           device const RenderInstance* instances,
+                           constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 3.0) return collapse();
@@ -931,6 +1031,16 @@ vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     }
     return o;
 }
+vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                           device const RenderInstance* instances [[buffer(0)]],
+                           constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return capsule_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut capsule_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                           device const RenderInstance* instances [[buffer(0)]],
+                           constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return capsule_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 // ---------------------------------------------------------------------------
 // Soft surface meshes (cloth sheets, tet-body boundaries): vertices live in
@@ -1022,7 +1132,7 @@ inline float3 rigidMeshRotate(float4 q, float3 v) {
 }
 
 vertex VOut rigid_mesh_vertex(
-    uint vid [[vertex_id]],
+    uint vid [[vertex_id]], uint iid [[instance_id]],
     device const RigidMeshVertex* vertices [[buffer(0)]],
     constant Uniforms& U [[buffer(1)]],
     device const float4* posLin [[buffer(2)]],
@@ -1033,7 +1143,7 @@ vertex VOut rigid_mesh_vertex(
     device const float4* previousSecondary [[buffer(7)]])
 {
     RigidMeshVertex v = vertices[vid];
-    uint body = as_type<uint>(v.positionBody.w);
+    uint body = as_type<uint>(v.positionBody.w) + iid*U.instancing.x;
     float4 q = posAng[body];
     float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
     VOut o;
@@ -1088,7 +1198,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenNormal [[texture(3)]],
                              depth2d<float> screenDepthTexture [[texture(4)]],
                              texture2d<float> screenMaterial [[texture(5)]],
-                             texture2d<float> diffuse [[texture(6)]], constant MaterialResources& materials [[buffer(10)]])
+                             texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
     in = texturedSurface(in, materials);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
@@ -1096,23 +1206,36 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
     float ao = visibility.r;
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
     float rough = specularRoughness(n,clamp(in.pbr.x,0.02,1.0),1.0);
-    float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U);
+    float3 lit = pbrRadiance(in.albedo,rough,saturate(in.pbr.y),in.emissive,n,V,ao,shadow,U,materials);
     if (U.diffuse.x > 0 && U.rayTracing.z == 0 && in.pbr.y < 0.99) {
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,n,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(n,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)
+        lit += (max(materialDiffuseAmbient(n,U,materials)+indirect.rgb,float3(0))-materialDiffuseAmbient(n,U,materials)*ao)
             * in.albedo*(1-saturate(in.pbr.y))*indirect.a;
     }
+    if (U.areaSettings.x>0) lit += U.rayTracing.x>0 ? areaDirect.read(uint2(in.position.xy)).rgb
+        : rasterAreaLighting(in.world,n,V,in.albedo,rough,saturate(in.pbr.y),U);
     float3 correction = float3(0);
+    float2 lobes = materialLobes(materialIndex(in.uvMaterial.z),materials);
+    if (lobes.x>0) {
+        lit *= 1-0.04*lobes.x;
+        lit += lobes.x*pbrRadiance(float3(0),0.13,0,float3(0),n,V,ao,shadow,U,materials);
+    }
+    if (lobes.y>0) lit += in.albedo*lobes.y*pow(1-saturate(dot(n,V)),5.0)*0.35;
     if (U.rayTracing.w > 0 && U.rayTracing.z == 0) {
         // Resolve against this fragment's surface before MSAA coverage is
         // averaged. A half-resolution neighbour cannot tint another object.
         correction = surfaceReflection(in.position.xy/U.screen.xy,in.world,n,rough,in.albedo,saturate(in.pbr.y),
-            U,reflection,screenNormal,screenDepthTexture,screenMaterial);
+            U,reflection,screenNormal,screenDepthTexture,screenMaterial,
+            U.rayTracing.x > 0 && U.rayBudget.w > 0 && materialOptics(materialIndex(in.uvMaterial.z),materials).x > 0);
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
-    lit = mix(lit, HORIZON_LIN, fog);
+    lit = mix(lit, materialHorizon(in.world - U.eye.xyz, U, materials), fog);
+    // The HQ ray buffer replaces the transmitted portion with refracted radiance.
+    // Keep the legacy opaque result in lighting modes without world-space rays.
+    if (U.rayTracing.x > 0 && U.rayBudget.w > 0 && U.rayTracing.w > 0 && U.rayTracing.z == 0)
+        lit *= 1-materialOptics(materialIndex(in.uvMaterial.z),materials).x;
     lit += correction; // The reflection buffer already carries distance fog.
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), in.opacity);
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,7 +1268,7 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
                               depth2d<float> shadowTex [[texture(1)]],
                                texture2d<float> screenNormal [[texture(3)]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
-                               texture2d<float> diffuse [[texture(6)]])
+                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
     float3 n = normalize(in.normal);
     if (in.flatShade > 0.5) {
@@ -1159,15 +1282,17 @@ fragment float4 soft_fragment(VOut in [[stage_in]],
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world,n,U,shadowTex),visibility.g);
-    float3 lit = clothRadiance(in.albedo,in.emissive,n,V,ao,shadow,U);
+    float3 lit = clothRadiance(in.albedo,in.emissive,n,V,ao,shadow,U,materials);
+    if (U.areaSettings.x>0) lit += U.rayTracing.x>0 ? areaDirect.read(uint2(in.position.xy)).rgb
+        : rasterAreaLighting(in.world,n,V,in.albedo,0.72,0,U);
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = n;
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-diffuseAmbient(n,U)*ao)*1.15*in.albedo*indirect.a;
+        lit += (max(materialDiffuseAmbient(N,U,materials)+indirect.rgb,float3(0))-materialDiffuseAmbient(n,U,materials)*ao)*1.15*in.albedo*indirect.a;
     }
     float fog = horizonFog(length(in.world - U.eye.xyz));
-    lit = mix(lit, HORIZON_LIN, fog);
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), in.opacity);
+    lit = mix(lit, materialHorizon(in.world - U.eye.xyz, U, materials), fog);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), in.opacity);
 }
 
 // Prepass variant: only the FRONT layer reaches the AO/depth buffers. The
@@ -1222,7 +1347,7 @@ fragment PreOut soft_prepass_fragment(VOut in [[stage_in]],
 // ---------------------------------------------------------------------------
 // Sky (whitish) and floor (AA checker, melts then fogs)
 // ---------------------------------------------------------------------------
-fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]]) {
+fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffer(1)]],constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]]) {
     float t = 1.0 - in.uv.y;
     float3 horizon = HORIZON_LIN;
     float3 zenith  = float3(0.50, 0.56, 0.66);
@@ -1230,7 +1355,16 @@ fragment float4 sky_fragment(FSOut in [[stage_in]], constant Uniforms& U [[buffe
     float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
     float glow = exp(-3.0 * distance(ndc, float2(-0.45, 0.55)));
     c += float3(0.30, 0.25, 0.16) * glow;
-    return float4(U.effects.x > 0.5 ? c : displayColorSRGB8(acesTonemap(c), in.position.xy), 1);
+    if (environmentBackground(U,materials)) {
+        float3 direction=normalize(worldFromDepth(in.uv,0.999,U.invViewProj)-U.eye.xyz);
+        c=materialEnvironment(direction,U,materials);
+    }
+    if (U.areaSettings.x>0) {
+        float3 direction=normalize(worldFromDepth(in.uv,0.999,U.invViewProj)-U.eye.xyz);
+        float4 emitter=areaIntersection(U.eye.xyz,direction,U);
+        if (emitter.w<1e19) c=emitter.rgb;
+    }
+    return float4(U.effects.x > 0.5 ? c : displayColorSRGB8(displayTonemap(c, U, displayLUT), in.position.xy), 1);
 }
 
 struct FloorOut { float4 position [[position]]; float3 world; };
@@ -1301,7 +1435,7 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
                                depth2d<float> shadowTex [[texture(1)]],
                                texture2d<float> screenNormal [[texture(3)]],
                                depth2d<float> screenDepthTexture [[texture(4)]],
-                               texture2d<float> diffuse [[texture(6)]])
+                               texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,float3(0,0,1),U,aoTex,screenDepthTexture,screenNormal);
     float ao = visibility.r;
@@ -1310,17 +1444,19 @@ fragment float4 floor_fragment(FloorOut in [[stage_in]],
     float3 L = -U.lightDir.xyz;
     float NdL = max(L.z, 0.0);
     float shadow = U.rayTracing.x > 0 ? visibility.g : min(shadowVisibility(in.world, float3(0, 0, 1), U, shadowTex), visibility.g);
-    float3 lit = albedo * (SKY_IRR * 1.1 * ao
+    float3 lit = albedo * (materialDiffuseAmbient(float3(0,0,1),U,materials) * 1.1 * ao
                          + SUN_COL / M_PI_F * NdL * 0.85 * shadow);
 
     if (U.diffuse.x > 0 && U.rayTracing.z == 0) {
         float3 N = float3(0,0,1);
         float4 indirect = surfaceDiffuse(in.position.xy/U.screen.xy,in.world,N,U,diffuse,screenNormal,screenDepthTexture);
-        lit += (max(diffuseAmbient(N,U)+indirect.rgb,float3(0))-SKY_IRR*ao)*1.1*albedo*indirect.a;
+        lit += (max(materialDiffuseAmbient(N,U,materials)+indirect.rgb,float3(0))-materialDiffuseAmbient(N,U,materials)*ao)*1.1*albedo*indirect.a;
     }
+    if (U.areaSettings.x>0) lit += U.rayTracing.x>0 ? areaDirect.read(uint2(in.position.xy)).rgb
+        : rasterAreaLighting(in.world,float3(0,0,1),normalize(U.eye.xyz-in.world),albedo,1,0,U);
     float fog = horizonFog(length(in.world.xy - U.eye.xy));
-    lit = mix(lit, HORIZON_LIN, fog);
-    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(acesTonemap(lit), in.position.xy), 1);
+    lit = mix(lit, materialHorizon(in.world - U.eye.xyz, U, materials), fog);
+    return float4(U.effects.x > 0.5 ? lit : displayColorSRGB8(displayTonemap(lit, U, displayLUT), in.position.xy), 1);
 }
 
 """ + screenSpaceShaderSource + gtaoDepthShaderSource
@@ -1341,9 +1477,15 @@ struct Uniforms {
     var prevInvViewProj: simd_float4x4
     var effects = SIMD4<Float>(repeating: 0)
     var rayTracing = SIMD4<Float>(repeating: 0)
-    var rayScene = SIMD4<Float>.zero
+    var rayScene = SIMD4<Float>(0, 0, 1, 0)
+    var rayBudget = SIMD4<Float>.zero
     var diffuse = SIMD4<Float>.zero
     var reconstruction = SIMD4<Float>.zero
+    var areaSettings = SIMD4<Float>.zero
+    var instancing = SIMD4<UInt32>.zero
+    var environmentSettings = SIMD4<Float>(1, 0, 0, 0)
+    var displaySettings = SIMD4<Float>.zero
+    var areaLights = (AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord())
     var aoProjection: SIMD4<Float>
 }
 
@@ -1415,6 +1557,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// export to `sRGB`, to preserve the displayed brightness.
     public var frameCompletionHandler: (@MainActor (MTLTexture, Int) -> Void)?
 
+    private var compactPipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
+    private var primitiveBatch: PrimitiveBatch?
+    // Internal switch used by the matched rendering regression/benchmark.
+    var enablesPrimitiveBatching = true
     var boxP, sphereP, torusP, capsuleP, softP, skinP, rigidMeshP: MTLRenderPipelineState!
     var boxAuxP, sphereAuxP, torusAuxP, capsuleAuxP: MTLRenderPipelineState!
     var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre,
@@ -1430,6 +1576,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     var screenSpace: ScreenSpacePipeline!
     private var presentationColor, presentationDepth: MTLTexture?
     private let materialLibrary: GPUSimMaterialLibrary
+    private var lightingBindings: GPUSimLightingBindings!
+    public private(set) var environment: GPUSimEnvironmentLight?
+    public private(set) var displayTransform: GPUSimDisplayTransform?
+    private let compiledDisplayProgram: GPUSimDisplayProgram?
     private var rayWorld: RayTracingScene?
     public private(set) var activeReconstruction: GPUSimReconstruction = .legacy
     public private(set) var activeLightingMode: GPUSimLightingMode = .lightweight
@@ -1461,7 +1611,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private let frameReadback = FrameReadback()
     @MainActor private struct CompletedFrameResources {
         let texture: MTLTexture?
-        let snapshot: MTLCommandBuffer?
+        let snapshots: [MTLCommandBuffer]
+        let lighting: GPUSimLightingBindings
     }
 
     /// Orbit azimuth in radians.
@@ -1550,7 +1701,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public init(
         device: MTLDevice,
         scene: (any GPUSimRenderableScene)? = nil,
-        materials: GPUSimMaterialLibrary? = nil
+        materials: GPUSimMaterialLibrary? = nil,
+        displayTransform: GPUSimDisplayTransform? = nil,
+        environment: GPUSimEnvironmentLight? = nil
     ) throws {
         if let scene, scene.renderDevice.registryID != device.registryID {
             throw GPUSimRendererError.sceneDeviceMismatch
@@ -1559,6 +1712,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let materials = try materials ?? GPUSimMaterialLibrary(device: device)
         guard materials.device.registryID == device.registryID else { throw GPUSimRendererError.sceneDeviceMismatch }
         self.materialLibrary = materials
+        self.compiledDisplayProgram = displayTransform?.program
         guard let queue = device.makeCommandQueue() else {
             throw GPUSimRendererError.commandQueue
         }
@@ -1566,9 +1720,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         self.scene = scene
         super.init()
 
-        let lib = try materials.shaderLibrary()
-        let motionLib = try materials.shaderLibrary(motionGuides: true)
-        screenSpace = try ScreenSpacePipeline(device: device, library: lib)
+        let lib = try materials.shaderLibrary(displayProgram: compiledDisplayProgram)
+        let motionLib = try materials.shaderLibrary(motionGuides: true, displayProgram: compiledDisplayProgram)
+        screenSpace = try ScreenSpacePipeline(device: device, library: lib, materials: materials)
+        try setDisplayTransform(displayTransform)
+        try setEnvironment(environment)
         func pipe(_ v: String, _ f: String,
                   samples: Int = GPUSimRenderer.sampleCount,
                   colorFormats: [MTLPixelFormat] = [GPUSimRenderer.colorFormat],
@@ -1672,6 +1828,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         skinPre = try pipe("skin_vertex", "soft_prepass_fragment", samples: 1, colorFormats: preFmt)
         rigidMeshPre = try pipe("rigid_mesh_vertex", "prepass_fragment",
                                 samples: 1, colorFormats: preFmt)
+        for (name, main, pre, shadow) in [("box",boxP!,boxPre!,boxShadow!),
+                ("sphere",sphereP!,spherePre!,sphereShadow!), ("torus",torusP!,torusPre!,torusShadow!),
+                ("capsule",capsuleP!,capsulePre!,capsuleShadow!)] {
+            compactPipelines[ObjectIdentifier(main)] = try pipe(name+"_compact_vertex", "pbr_fragment")
+            compactPipelines[ObjectIdentifier(pre)] = try pipe(name+"_compact_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+            compactPipelines[ObjectIdentifier(shadow)] = try depthPipe(name+"_compact_vertex")
+        }
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
@@ -1819,11 +1982,39 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         prevVP = nil
     }
 
+    /// Switches the prepared environment without rebuilding materials, shaders,
+    /// or acceleration structures. Submitted frames retain their own bindings.
+    public func setEnvironment(_ environment: GPUSimEnvironmentLight?) throws {
+        if lightingBindings != nil, self.environment === environment { return }
+        let bindings = try GPUSimLightingBindings(materials: materialLibrary, environment: environment)
+        self.environment = environment
+        lightingBindings = bindings
+        screenSpace.lightingBindings = bindings
+        resetTemporalHistory()
+    }
+
+    /// Switches only the display transform. HDR reconstruction history remains
+    /// valid because exposure and the LUT are applied after reconstruction.
+    public func setDisplayTransform(_ transform: GPUSimDisplayTransform?) throws {
+        if let transform, transform.device.registryID != device.registryID {
+            throw GPUSimRendererError.sceneDeviceMismatch
+        }
+        if let transform, transform.program != compiledDisplayProgram {
+            throw GPUSimDisplayTransform.Failure.programMismatch
+        }
+        displayTransform = transform
+        screenSpace.displayTransform = transform
+    }
+
     @discardableResult
     private func ensureTargets(_ size: CGSize, options: GPUSimRenderOptions) -> Bool {
         do {
-            let scale = options.reconstruction == .metalFX ? (options.reconstructionScale.isFinite ? max(0.5, min(options.reconstructionScale, 1)) : 1) : 1
-            let requested = CGSize(width: max(4, (Int(Float(size.width) * scale) / 2) * 2), height: max(4, (Int(Float(size.height) * scale) / 2) * 2))
+            let scale = options.reconstruction == .metalFX && options.rayTracingDenoising ? (options.reconstructionScale.isFinite ? max(0.5, min(options.reconstructionScale, 1)) : 1) : 1
+            // Even dimensions are a scaler requirement; the raw diagnostic path
+            // displays the render target directly and must match the drawable.
+            let requested = options.rayTracingDenoising
+                ? CGSize(width: max(4, (Int(Float(size.width) * scale) / 2) * 2), height: max(4, (Int(Float(size.height) * scale) / 2) * 2))
+                : size
             let resized = try screenSpace.prepare(size: options.reconstruction == .metalFX ? requested : size, options: options)
             targetSize = screenSpace.size
             if resized { prevVP = nil }
@@ -2047,8 +2238,20 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         if resetTemporalHistory { self.resetTemporalHistory() }
     }
 
+    /// Vertical camera field of view in degrees; 50 preserves the default view.
+    public var verticalFieldOfView: Float = 50 {
+        didSet { resetTemporalHistory() }
+    }
+    /// Camera clipping distances in world units. Bringing the near plane toward
+    /// distant subjects improves depth precision without changing the lens.
+    public var nearClipDistance: Float = 0.1 { didSet { prevVP = nil } }
+    public var farClipDistance: Float = 1000 { didSet { prevVP = nil } }
+
     public func projectionMatrix(aspect: Float) -> simd_float4x4 {
-        perspective(fovY: 50 * .pi / 180, aspect: aspect, near: 0.1 * sceneLengthScale, far: 1000 * sceneLengthScale)
+        let angle = verticalFieldOfView.isFinite ? min(120,max(1,verticalFieldOfView)) : 50
+        let near = nearClipDistance.isFinite ? max(0.0001,min(1e6,nearClipDistance)) : 0.1
+        let far = farClipDistance.isFinite ? max(near*1.001,min(1e8,farClipDistance)) : max(1000,near*1.001)
+        return perspective(fovY: angle * .pi / 180, aspect: aspect, near: near * sceneLengthScale, far: far * sceneLengthScale)
     }
 
     /// Builds a world ray from a pixel point whose origin is the view's
@@ -2109,7 +2312,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         }
 
         var activeOptions = source?.rendererOptions ?? options
+        do { try activeOptions.validateLighting() }
+        catch { reportFailure("Scene exceeds the supported limit of \(GPUSimAreaLight.maximumCount) area lights"); return }
         activeOptions = activeOptions.resolved(supportsHQ: Self.supportsHQ(device: device))
+        guard !activeOptions.usesRayTracing || (renderScene.renderSupportsRayTracing && (renderScene.rigidMeshRenderSurface?.instanceCount ?? 1) == 1) else {
+            reportFailure("This scene representation supports Fast rendering only")
+            return
+        }
         activeLightingMode = activeOptions.lightingMode
         guard renderScene.rendererStateIsValid else { return }
         let activeBodyAppearances = source?.rendererBodyAppearances
@@ -2184,8 +2393,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         do {
             if activeOptions.reconstruction == .metalFX {
-                if metalFX?.size != targetSize || metalFX?.outputSize != SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)) || metalFX?.denoising != activeOptions.usesRayTracing {
-                    metalFX = try MetalFXReconstruction(device: device, size: targetSize, denoising: activeOptions.usesRayTracing, outputSize: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)), sharedDepth: screenSpace.depth, sharedNormal: screenSpace.normal, sharedMaterial: screenSpace.material)
+                let denoising = activeOptions.usesRayTracing && activeOptions.rayTracingDenoising
+                if metalFX?.size != targetSize || metalFX?.outputSize != SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)) || metalFX?.denoising != denoising {
+                    metalFX = try MetalFXReconstruction(device: device, size: targetSize, denoising: denoising, outputSize: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)), sharedDepth: screenSpace.depth, sharedNormal: screenSpace.normal, sharedMaterial: screenSpace.material, enableSpecularHitDistance: denoising)
                 }
             } else { metalFX = nil }
         } catch {
@@ -2264,7 +2474,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 return
             }
         }
-        let snapshotSubmission = (renderScene as? RenderSnapshot)?.submission
 
         do {
             try renderScene.encodeRenderInstances(
@@ -2278,6 +2487,27 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             guard renderScene.rendererStateIsValid else { return }
             reportFailure("instance-build encoder failed: \(error.localizedDescription)")
             return
+        }
+
+        let compactPrimitives = enablesPrimitiveBatching && !activeOptions.usesRayTracing && activeOptions.reconstruction != .metalFX && rigidCount >= 64
+        do {
+            if compactPrimitives {
+                if primitiveBatch == nil { primitiveBatch = try PrimitiveBatch(device: device) }
+                try primitiveBatch!.encode(command: cmd, instances: instances, count: rigidCount)
+            }
+        } catch { reportFailure("primitive batching failed: \(error)"); return }
+
+        func primitivePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
+            compactPrimitives ? compactPipelines[ObjectIdentifier(pipeline)]! : pipeline
+        }
+        func drawRigid(_ encoder: MTLRenderCommandEncoder, vertices: Int) {
+            if compactPrimitives, let batch = primitiveBatch {
+                encoder.setVertexBuffer(batch.indices, offset: 0, index: 8)
+                let shape = [36, SPHV, TORV, CAPV].firstIndex(of: vertices)!
+                encoder.drawPrimitives(type: .triangle, indirectBuffer: batch.arguments, indirectBufferOffset: shape*16)
+            } else {
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices, instanceCount: rigidCount)
+            }
         }
 
         // Topology edits invalidate vertex correspondence even when buffer
@@ -2296,7 +2526,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
         let aspect = viewportSize.x / max(viewportSize.y, 1)
         let renderSize = SIMD2<Float>(Float(targetSize.x), Float(targetSize.y))
-        let pxPerUnit = renderSize.y * 0.5 / tan(25 * Float.pi / 180)
+        let pxPerUnit = renderSize.y * 0.5 * projectionMatrix(aspect: aspect).columns.1.y
         let activeFocus = cameraFocus
         let fwd = normalize(activeFocus - activeEye)
         let camR = normalize(cross(fwd, cameraUp))
@@ -2391,6 +2621,21 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          aoProjection: SIMD4(-projection.columns.2.z, projection.columns.3.z,
                                              1 / projection.columns.0.x, 1 / projection.columns.1.y))
         U.rayScene.y = activeOptions.ambientExposure
+        U.rayScene.z = activeOptions.sunIntensity
+        U.rayScene.w = activeOptions.sunAngularRadius
+        let quality = activeOptions.rayTracingQuality
+        U.rayBudget = SIMD4(Float(quality.shadowSamples),Float(quality.reflectionSamples),
+                           Float(quality.diffuseSamples),(rayWorld?.usesTransmission ?? materialLibrary.hasTransmission) ? Float(quality.transmissionInterfaces) : 0)
+        U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),
+            Float(quality.secondaryAreaLightSamples),quality.areaLightSampling == .powerWeighted ? 1 : 0)
+        U.instancing.x = UInt32(renderScene.rigidMeshRenderSurface?.bodiesPerInstance ?? 0)
+        U.environmentSettings = SIMD4(activeOptions.environmentIntensity,activeOptions.environmentRotation,activeOptions.showsEnvironmentBackground ? 0 : 1,0)
+        U.displaySettings.x = activeOptions.displayExposure
+        U.displaySettings.y = displayTransform == nil ? 0 : 1
+        withUnsafeMutableBytes(of: &U.areaLights) { bytes in
+            let records=bytes.bindMemory(to: AreaLightRecord.self)
+            for (i, light) in activeOptions.areaLights.enumerated() { records[i]=light.record }
+        }
         if let metalFX { U.reconstruction = SIMD4(1, metalFX.jitter.x / renderSize.x, metalFX.jitter.y / renderSize.y, Float(frameIdx % 4096)) }
         func bindAppearance(
             _ encoder: MTLRenderCommandEncoder,
@@ -2411,6 +2656,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             encoder.setFragmentTexture(preDepthTex, index: 4)
             encoder.setFragmentTexture(screenSpace.material ?? visibilityTex, index: 5)
             encoder.setFragmentTexture((metalFX != nil ? screenSpace.diffuseRaw : screenSpace.diffuse) ?? visibilityTex, index: 6)
+            encoder.setFragmentTexture(screenSpace.areaDirect ?? visibilityTex, index: 7)
         }
         var Uh = U
         Uh.screen = SIMD4(Float(aoSize.x), Float(aoSize.y),
@@ -2446,11 +2692,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 if rigidCount > 0 {
                     for (p, verts) in [(boxShadow!, 36), (sphereShadow!, SPHV),
                                        (torusShadow!, TORV), (capsuleShadow!, CAPV)] {
-                        enc.setRenderPipelineState(p)
+                        enc.setRenderPipelineState(primitivePipeline(p))
                         enc.setVertexBuffer(instances, offset: 0, index: 0)
                         enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                           vertexCount: verts, instanceCount: rigidCount)
+                        drawRigid(enc, vertices: verts)
                     }
                 }
                 if let auxiliaryBatch, auxiliaryBatch.casterCount > 0 {
@@ -2494,7 +2739,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.drawIndexedPrimitives(
                         type: .triangle, indexCount: mesh.indexCount,
                         indexType: .uint32, indexBuffer: mesh.indices,
-                        indexBufferOffset: 0)
+                        indexBufferOffset: 0, instanceCount: mesh.instanceCount)
                 }
                 enc.endEncoding()
             }
@@ -2517,7 +2762,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         byteCount: batch.opaqueCount * MemoryLayout<GPUSimRenderInstance>.stride)
                 }
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: metalFX.guidePass()) else { throw MetalFXReconstruction.Failure.encoder }
-                materialLibrary.bind(enc)
+                lightingBindings.bind(enc)
+                enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 enc.label = "Reconstruction motion and material guides"
                 enc.setViewport(screenViewport)
                 enc.setDepthStencilState(depthState)
@@ -2537,8 +2783,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         enc.setVertexBuffer(instances, offset: 0, index: 0)
                         enc.setVertexBuffer(previous["instances"], offset: 0, index: 6)
                         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                           vertexCount: verts, instanceCount: rigidCount)
+                        drawRigid(enc, vertices: verts)
                     }
                 }
                 if let surf = renderScene.softRenderSurface {
@@ -2575,7 +2820,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.drawIndexedPrimitives(
                         type: .triangle, indexCount: mesh.indexCount,
                         indexType: .uint32, indexBuffer: mesh.indices,
-                        indexBufferOffset: 0)
+                        indexBufferOffset: 0, instanceCount: mesh.instanceCount)
                 }
                 if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
                     setOpaqueAuxiliaryDepth(on: enc)
@@ -2616,7 +2861,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             do {
                 let enc = prepassEncoder
-                materialLibrary.bind(enc)
+                lightingBindings.bind(enc)
+                enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 enc.label = "Shared screen-space surfaces"
                 func surfacePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
                     activeOptions.usesHDR ? surfacePipelines[ObjectIdentifier(pipeline)]! : pipeline
@@ -2632,11 +2878,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 if rigidCount > 0 {
                     for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
                                        (torusPre!, TORV), (capsulePre!, CAPV)] {
-                        enc.setRenderPipelineState(surfacePipeline(p))
+                        enc.setRenderPipelineState(surfacePipeline(primitivePipeline(p)))
                         enc.setVertexBuffer(instances, offset: 0, index: 0)
                         enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                           vertexCount: verts, instanceCount: rigidCount)
+                        drawRigid(enc, vertices: verts)
                     }
                 }
                 if let surf = renderScene.softRenderSurface {
@@ -2667,7 +2912,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.drawIndexedPrimitives(
                         type: .triangle, indexCount: mesh.indexCount,
                         indexType: .uint32, indexBuffer: mesh.indices,
-                        indexBufferOffset: 0)
+                        indexBufferOffset: 0, instanceCount: mesh.instanceCount)
                 }
                 if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
                     for (p, vertices) in [(boxPre!, 36), (spherePre!, SPHV), (torusPre!, TORV), (capsulePre!, CAPV)] {
@@ -2710,10 +2955,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             ]
             if rigidCount > 0 {
                 for (pipeline, vertices) in primitiveDepthPipelines {
-                    back.setRenderPipelineState(backPipeline(pipeline))
+                    back.setRenderPipelineState(backPipeline(primitivePipeline(pipeline)))
                     back.setVertexBuffer(instances, offset: 0, index: 0)
-                    back.drawPrimitives(type: .triangle, vertexStart: 0,
-                        vertexCount: vertices, instanceCount: rigidCount)
+                    drawRigid(back, vertices: vertices)
                 }
             }
             if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
@@ -2748,7 +2992,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 back.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
                 bindAppearance(back)
                 back.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
-                    indexType: .uint32, indexBuffer: mesh.indices, indexBufferOffset: 0)
+                    indexType: .uint32, indexBuffer: mesh.indices, indexBufferOffset: 0, instanceCount: mesh.instanceCount)
             }
             // The built-in floor is a single plane and has no finite exit.
             back.endEncoding()
@@ -2757,13 +3001,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             try rayWorld?.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
                 instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: false)
             try screenSpace.encodeBeforeLighting(command: cmd, uniforms: Uh, options: activeOptions)
+            if !activeOptions.areaLights.isEmpty, let rayWorld {
+                try rayWorld.encodeAreaLighting(command: cmd, uniforms: Uh, screen: screenSpace,
+                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides)
+            }
             if activeOptions.usesDiffuseGI, let rayWorld {
                 try rayWorld.encodeDiffuse(command: cmd, uniforms: Uh, screen: screenSpace,
                     instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides)
             }
             if Uh.rayTracing.w > 0, let rayWorld {
                 try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
-                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
+                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true, specularHitDistance: metalFX?.specularHitDistance)
             }
         } catch {
             reportFailure("screen-space lighting failed: \(error)")
@@ -2776,7 +3024,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             reportFailure("could not create the main render encoder")
             return
         }
-        materialLibrary.bind(enc)
+        lightingBindings.bind(enc)
+        enc.setFragmentTexture(displayTransform?.texture, index: 8)
         enc.label = "Main PBR pass"
         bindSurfaceLighting(enc)
         enc.setViewport(screenViewport)
@@ -2802,14 +3051,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         enc.setDepthStencilState(depthState)
         if rigidCount > 0 {
             for (p, verts) in [(boxP!, 36), (sphereP!, SPHV), (torusP!, TORV), (capsuleP!, CAPV)] {
-                enc.setRenderPipelineState(scenePipeline(p))
+                enc.setRenderPipelineState(scenePipeline(primitivePipeline(p)))
                 enc.setVertexBuffer(instances, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentTexture(visibilityTex, index: 0)
                 enc.setFragmentTexture(shadowTex, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: verts, instanceCount: rigidCount)
+                drawRigid(enc, vertices: verts)
             }
         }
         if let surf = renderScene.softRenderSurface {
@@ -2849,7 +3097,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             enc.drawIndexedPrimitives(
                 type: .triangle, indexCount: mesh.indexCount,
                 indexType: .uint32, indexBuffer: mesh.indices,
-                indexBufferOffset: 0)
+                indexBufferOffset: 0, instanceCount: mesh.instanceCount)
         }
         if let auxiliaryBatch {
             // Opaque auxiliary geometry participates in depth just like the
@@ -2891,15 +3139,17 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 }
                 if U.rayTracing.w == 0, let rayWorld {
                     try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
-                        instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
+                        instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true, specularHitDistance: metalFX?.specularHitDistance)
                     try screenSpace.encodeReflectionFilter(command: cmd, uniforms: Uh)
                 }
-                if let metalFX { try metalFX.finishFrame(command: cmd, color: screenSpace.sceneColor!) }
-                enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U, reconstructed: metalFX?.output)
+                if let metalFX { try metalFX.finishFrame(command: cmd, color: screenSpace.sceneColor!, reconstruct: activeOptions.rayTracingDenoising) }
+                let reconstructed = metalFX.map { activeOptions.rayTracingDenoising ? $0.output : screenSpace.sceneColor! }
+                enc = try screenSpace.beginComposite(command: cmd, destination: displayPass, uniforms: U, reconstructed: reconstructed)
                 // The translucent auxiliary pipelines below use pbr_fragment,
                 // which reads the material argument buffer; the fresh encoder
                 // needs the same binding as the main pass.
-                materialLibrary.bind(enc)
+                lightingBindings.bind(enc)
+                enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 if metalFX != nil {
                     U.viewProj = unjitteredVP; U.invViewProj = unjitteredVP.inverse
                     U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, 0)
@@ -3008,7 +3258,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let retire = renderScene.renderSceneRequiresFrameRetirement
         framesDrawn += 1
         let frameNumber = framesDrawn
-        let completed = CompletedFrameResources(texture: completedTexture, snapshot: snapshotSubmission)
+        let completed = CompletedFrameResources(texture: completedTexture, snapshots: (renderScene as? RenderSubmissionProvider)?.renderSubmissions ?? [], lighting: lightingBindings)
         let inFlight = inFlightFrames
         cmd.addCompletedHandler { [weak self] finished in
             inFlight.signal()
@@ -3024,8 +3274,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 guard let self else { return }
                 defer { if let texture = completed.texture { self.frameReadback.recycle(texture) } }
                 self.lastFrameGPUMilliseconds = ms
-                if completed.snapshot?.status == .error {
-                    self.reportFailure("render snapshot command failed: \(String(describing: completed.snapshot?.error))")
+                if let failed = completed.snapshots.first(where: { $0.status == .error }) {
+                    self.reportFailure("render snapshot command failed: \(String(describing: failed.error))")
                     return
                 }
                 if status != .completed || error != nil {
@@ -3052,6 +3302,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             // callback runs with finished pixels, before this call returns
             lastFrameGPUMilliseconds =
                 (cmd.gpuEndTime - cmd.gpuStartTime) * 1000
+            if let failed = completed.snapshots.first(where: { $0.status == .error }) {
+                reportFailure("render snapshot command failed: \(String(describing: failed.error))")
+                return
+            }
             if let failure = commandFailureDescription(cmd) {
                 reportFailure(failure)
                 return

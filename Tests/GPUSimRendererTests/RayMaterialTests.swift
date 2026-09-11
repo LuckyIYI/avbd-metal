@@ -60,7 +60,12 @@ final class RayMaterialTests: XCTestCase {
               device const RTInstance* instances [[buffer(4)]],device const RenderInstance* rigid [[buffer(5)]],
               device const RenderAppearance* overrides [[buffer(6)]], device float4* result [[buffer(9)]],constant MaterialResources& materials [[buffer(10)]]) {
               ray r; r.origin=float3(-0.5,-0.5,1); r.direction=float3(0,0,-1); r.min_distance=0.001; r.max_distance=2;
-              result[0]=rtIncoming(r,scene,U,vertices,objects,instances,rigid,rigid,overrides,1,materials);
+              float distance=0;
+              result[0]=rtIncoming(r,scene,U,vertices,objects,instances,rigid,rigid,overrides,1,materials,false,true,&distance);
+              result[1]=float4(distance);
+              r.direction=float3(0,0,1);
+              rtIncoming(r,scene,U,vertices,objects,instances,rigid,rigid,overrides,1,materials,false,true,&distance);
+              result[2]=float4(distance);
           }
           """
       let lib = try device.makeLibrary(source: source, options: nil)
@@ -80,7 +85,7 @@ final class RayMaterialTests: XCTestCase {
       memset(u.contents(), 0, u.length)
       u.contents().assumingMemoryBound(to: Uniforms.self).pointee.screen.z = 1000
       u.contents().assumingMemoryBound(to: Uniforms.self).pointee.lightDir = SIMD4(0, 0, -1, 0)
-      let output = try XCTUnwrap(device.makeBuffer(length: 16, options: .storageModeShared))
+      let output = try XCTUnwrap(device.makeBuffer(length: 48, options: .storageModeShared))
       let e = try XCTUnwrap(command.makeComputeCommandEncoder())
       e.setComputePipelineState(pipeline)
       e.setAccelerationStructure(world.structure, bufferIndex: 0)
@@ -103,6 +108,9 @@ final class RayMaterialTests: XCTestCase {
       XCTAssertEqual(command.status, .completed, "\(String(describing:command.error))")
       let result = output.contents().assumingMemoryBound(to: SIMD4<Float>.self).pointee
       XCTAssertEqual(result.w, 1)
+      let distances = output.contents().assumingMemoryBound(to: SIMD4<Float>.self)
+      XCTAssertEqual(distances[1].x, 1, accuracy: 0.0001, "Distance starts at the specular ray origin")
+      XCTAssertEqual(distances[2].x, 2, accuracy: 0.0001, "Misses retain the finite ray horizon")
       let expected: F3 =
         mode == 2
         ? F3(0.8 * 0.8 * 0.94 * 0.5, 0.6 * 0.6 * 0.88 * 0.25, 0.4 * 0.4 * 0.82 * 0.75)

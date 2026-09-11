@@ -32,12 +32,12 @@ ASSET_KIND = "avbd.convex-compound"
 BUILTIN_HULL_BACKEND = "avbd-incremental-hull"
 BUILTIN_HULL_VERSION = "1"
 DEFAULT_MAX_VERTICES_PER_HULL = 64
-MAX_VERTICES_PER_HULL = 64
-MAX_TRIANGLES_PER_HULL = 124  # 2V - 4 for a closed triangular convex polytope.
-MAX_EDGES_PER_HULL = 186  # 3V - 6 for the same topology.
+MAX_VERTICES_PER_HULL = 256
+MAX_TRIANGLES_PER_HULL = 508  # 2V - 4 for a closed triangular convex polytope.
+MAX_EDGES_PER_HULL = 762  # 3V - 6 for the same topology.
 # Clipping one face by another may need the sum of both boundary sizes in the
-# Metal kernel's fixed 32-vertex workspace.
-MAX_FACE_VERTICES = 16
+# Metal kernel's scene-selected workspace (32, 64 or 128 vertices).
+MAX_FACE_VERTICES = 64
 MAX_HULLS = 256
 MAX_ASSET_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_URI_BYTES = 4096

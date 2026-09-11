@@ -7,12 +7,12 @@ public enum ConvexAssetLimits {
     public static let maximumEncodedBytes = 16 * 1024 * 1024
     public static let maximumSourceURIBytes = 4_096
     public static let maximumParts = 256
-    public static let maximumVerticesPerHull = 64
-    public static let maximumTrianglesPerHull = 124
-    public static let maximumEdgesPerHull = 186
+    public static let maximumVerticesPerHull = 256
+    public static let maximumTrianglesPerHull = 508
+    public static let maximumEdgesPerHull = 762
     /// Per-input-face cap: clipping two faces may consume their combined
-    /// boundary size in the Metal kernel's fixed 32-vertex workspace.
-    public static let maximumFaceVertices = 16
+    /// boundary size. The solver selects a scene-specific Metal workspace.
+    public static let maximumFaceVertices = 64
 }
 
 /// A malformed or incompatible offline-cooked convex asset.
@@ -139,7 +139,7 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
             )
         }
         guard vertices.count <= ConvexAssetLimits.maximumVerticesPerHull else {
-            throw ConvexAssetValidationError("convex hull exceeds the 64-vertex runtime limit")
+            throw ConvexAssetValidationError("convex hull exceeds the \(ConvexAssetLimits.maximumVerticesPerHull)-vertex runtime limit")
         }
         guard triangles.count >= 4 else {
             throw ConvexAssetValidationError("convex hull requires at least four triangles")
@@ -235,26 +235,27 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
             throw ConvexAssetValidationError("convex hull stored radius is incorrect")
         }
 
-        var volume6: Float = 0
-        var localCentroidNumerator = F3.zero
-        // Root signed tetrahedra at a hull vertex. Computing about the source
-        // origin catastrophically cancels for ordinary geometry translated far
-        // from zero (for example CAD coordinates near 1e6).
-        let volumeReference = boundsCenter
+        var volume6: Double = 0
+        var localCentroidNumerator = SIMD3<Double>.zero
+        // Offline metadata integrates the stored Float vertices in Double.
+        // Match that arithmetic here: thin, oblique cells can lose their
+        // centroid to cancellation in Float even when centred near zero.
+        // This changes precision, not any geometric acceptance tolerance.
+        let volumeReference = (SIMD3<Double>(computedBoundsMin) + SIMD3<Double>(computedBoundsMax)) * 0.5
         var derivedEdges: [EdgeKey: [UInt32]] = [:]
         for (faceIndex, triangle) in triangles.enumerated() {
-            let a = vertices[Int(triangle.x)]
-            let b = vertices[Int(triangle.y)]
-            let c = vertices[Int(triangle.z)]
+            let a = SIMD3<Double>(vertices[Int(triangle.x)])
+            let b = SIMD3<Double>(vertices[Int(triangle.y)])
+            let c = SIMD3<Double>(vertices[Int(triangle.z)])
             let normal = simd_cross(b - a, c - a)
             let normalLength = simd_length(normal)
-            guard normalLength > tolerance * tolerance else {
+            guard normalLength > Double(tolerance) * Double(tolerance) else {
                 throw ConvexAssetValidationError(
                     "convex hull triangle \(faceIndex) is geometrically degenerate"
                 )
             }
             for point in vertices {
-                guard simd_dot(normal, point - a) <= tolerance * normalLength else {
+                guard simd_dot(normal, SIMD3<Double>(point) - a) <= Double(tolerance) * normalLength else {
                     throw ConvexAssetValidationError(
                         "convex hull triangle \(faceIndex) has a vertex outside its plane"
                     )
@@ -279,9 +280,8 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
         guard volume6 > 0, volume6.isFinite else {
             throw ConvexAssetValidationError("convex hull winding does not enclose positive volume")
         }
-        let computedVolume = volume6 / 6
-        let computedCentroid = volumeReference
-            + localCentroidNumerator / (4 * volume6)
+        let computedVolume = Float(volume6 / 6)
+        let computedCentroid = F3(volumeReference + localCentroidNumerator / (4 * volume6))
         // Volume needs a cubic tolerance. Reusing the positional tolerance
         // lets tiny hulls claim masses many orders of magnitude too large.
         // Eight Float ulps of the hull-scale cube covers the arithmetic floor;
@@ -560,9 +560,9 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
 
     /// Mirrors `GPUSolver.makeConvexPolygonTopology`: maximal coplanar faces
     /// are the actual clipping features, so their loops must fit the Metal
-    /// kernel's fixed 32-vertex workspace even when the triangle soup and the
-    /// whole hull fit their independent limits. Each input is capped at 16
-    /// because clipping two faces can require their combined boundary size.
+    /// kernel's selected workspace even when the triangle soup and the
+    /// whole hull fit their independent limits. Clipping two faces can
+    /// require their combined boundary size.
     static func validateMergedFaceLoops(
         vertices: [F3], triangles: [SIMD3<UInt32>]
     ) throws {
@@ -570,14 +570,14 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
         let hi = vertices.reduce(F3(repeating: -.infinity), simd.max)
         let scale = max(simd_length(hi - lo), 1e-4)
         let planeTolerance = max(scale * 2e-6, 1e-7)
-        let normalTolerance: Float = 5e-5
+        let normalTolerance: Double = 5e-5
         var groups: [PlaneGroup] = []
         groups.reserveCapacity(triangles.count)
 
         for (triangleIndex, triangle) in triangles.enumerated() {
-            let a = vertices[Int(triangle.x)]
-            let b = vertices[Int(triangle.y)]
-            let c = vertices[Int(triangle.z)]
+            let a = SIMD3<Double>(vertices[Int(triangle.x)])
+            let b = SIMD3<Double>(vertices[Int(triangle.y)])
+            let c = SIMD3<Double>(vertices[Int(triangle.z)])
             let crossValue = simd_cross(b - a, c - a)
             let crossLength = simd_length(crossValue)
             guard crossLength.isFinite, crossLength > 1e-12 else {
@@ -590,7 +590,7 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
             if let groupIndex = groups.firstIndex(where: {
                 simd_dot($0.normal, normal) > 0
                     && simd_length(simd_cross($0.normal, normal)) <= normalTolerance
-                    && abs($0.distance - distance) <= planeTolerance
+                    && abs($0.distance - distance) <= Double(planeTolerance)
             }) {
                 groups[groupIndex].triangles.append(triangle)
             } else {
@@ -706,8 +706,8 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
     }
 
     private struct PlaneGroup {
-        let normal: F3
-        let distance: Float
+        let normal: SIMD3<Double>
+        let distance: Double
         var triangles: [SIMD3<UInt32>]
     }
 }

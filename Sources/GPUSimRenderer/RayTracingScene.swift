@@ -48,7 +48,7 @@ final class RayTracingScene {
     let materials: GPUSimMaterialLibrary
     let device: MTLDevice
     let queue: MTLCommandQueue
-    private let instancesPipeline, deformationPipeline, shadowPipeline, reflectionPipeline, diffusePipeline: MTLComputePipelineState
+    private let instancesPipeline, deformationPipeline, shadowPipeline, reflectionPipeline, diffusePipeline, areaPipeline: MTLComputePipelineState
     private var assets: [Asset] = []
     private(set) var vertices, objects, descriptors: MTLBuffer!
     private(set) var structure: MTLAccelerationStructure!
@@ -75,6 +75,9 @@ final class RayTracingScene {
         var instanceRefits = 0
     }
     private(set) var lastUpdate = UpdateStatistics()
+    /// True when any built rigid-mesh vertex references a transmissive material,
+    /// so opaque scenes never pay for dielectric camera transport.
+    private(set) var usesTransmission = false
     private let dummy: MTLBuffer
 
     private init(scene: any GPUSimRenderableScene, materials: GPUSimMaterialLibrary) throws {
@@ -97,6 +100,7 @@ final class RayTracingScene {
         shadowPipeline = try pipeline("rt_shadows")
         reflectionPipeline = try pipeline("rt_reflections")
         diffusePipeline = try pipeline("rt_diffuse")
+        areaPipeline = try pipeline("rt_area_lighting")
     }
 
     private func buffer<T>(_ values: [T], label: String) throws -> MTLBuffer {
@@ -166,6 +170,7 @@ final class RayTracingScene {
             let v = meshVertices.contents().assumingMemoryBound(to: GPUSimRigidMeshRenderVertex.self)
             let indices = meshIndices.contents().assumingMemoryBound(to: UInt32.self)
             var groups: [UInt32: [Vertex]] = [:]
+            var transmissive = false
             for triangle in stride(from: 0, to: mesh.indexCount, by: 3) {
                 guard triangle + 2 < mesh.indexCount else { throw Failure.invalidGeometry }
                 let ids = (0..<3).map { Int(indices[triangle + $0]) }
@@ -175,6 +180,8 @@ final class RayTracingScene {
                 guard ids.allSatisfy({ v[$0].positionBody.w.bitPattern == body }) else { throw Failure.invalidGeometry }
                 for id in ids {
                     let input = v[id]
+                    let material = Int((max(input.uvMaterial.z, 0) + 0.5).rounded(.down))
+                    if material > 0, material <= materials.transmissiveMaterials.count, materials.transmissiveMaterials[material - 1] { transmissive = true }
                     let c = SIMD3(input.color.x, input.color.y, input.color.z)
                     let rough = input.normal.w > 0 ? max(0.02, min(input.normal.w, 1)) : 0.45
                     let metal = input.normal.w > 0 ? max(0, min(input.color.w, 1)) : 0
@@ -183,6 +190,7 @@ final class RayTracingScene {
                         albedo: SIMD4(c*c*(SIMD3(repeating: 0.7)+c*0.3), metal), uvMaterial: input.uvMaterial))
                 }
             }
+            usesTransmission = transmissive
             for body in groups.keys.sorted() {
                 let asset = addAsset(groups[body]!)
                 allObjects.append(Object(vertexStart: UInt32(ranges[asset].start), source: 2, index: body, asset: UInt32(asset)))
@@ -326,11 +334,19 @@ final class RayTracingScene {
     }
 
     func encodeLighting(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
-                        instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?, reflections: Bool) throws {
+                        instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?, reflections: Bool, specularHitDistance: MTLTexture? = nil) throws {
         try encodeRays(command: command, uniforms: uniforms, screen: screen, instances: instances,
             auxiliary: auxiliary, appearances: appearances, pipeline: reflections ? reflectionPipeline : shadowPipeline,
             output: (reflections ? screen.reflectionRaw : screen.directVisibilityRaw)!,
-            label: reflections ? "Selective world reflections" : "World directional visibility")
+            label: reflections ? "Selective world reflections" : "World directional visibility", specularHitDistance: specularHitDistance)
+    }
+
+    func encodeAreaLighting(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
+                            instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?) throws {
+        guard let output = screen.areaDirect else { return }
+        try encodeRays(command: command, uniforms: uniforms, screen: screen, instances: instances,
+            auxiliary: auxiliary, appearances: appearances, pipeline: areaPipeline,
+            output: output, label: "Finite area lighting and visibility")
     }
 
     func encodeDiffuse(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
@@ -343,16 +359,17 @@ final class RayTracingScene {
 
     private func encodeRays(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
                             instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?,
-                            pipeline: MTLComputePipelineState, output: MTLTexture, label: String) throws {
+                            pipeline: MTLComputePipelineState, output: MTLTexture, label: String, specularHitDistance: MTLTexture? = nil) throws {
         guard let e = command.makeComputeCommandEncoder() else { throw Failure.allocation("ray lighting encoder") }
         e.label = label
         e.setComputePipelineState(pipeline)
-        materials.bind(e)
+        if let bindings = screen.lightingBindings { bindings.bind(e) } else { materials.bind(e) }
         e.setAccelerationStructure(structure, bufferIndex: 0)
         e.useResource(structure, usage: .read)
         for asset in assets { e.useResource(asset.structure, usage: .read) }
         var u = uniforms
         u.rayScene.x = hasGround ? 1 : 0
+        u.diffuse.y = specularHitDistance == nil ? 0 : 1
         e.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
         e.setBuffer(vertices, offset: 0, index: 2)
         e.setBuffer(objects, offset: 0, index: 3)
@@ -367,6 +384,7 @@ final class RayTracingScene {
         e.setTexture(output, index: 2)
         e.setTexture(screen.material, index: 3)
         e.setTexture(screen.visibility, index: 4)
+        e.setTexture(specularHitDistance ?? screen.directVisibilityRaw, index: 5)
         e.dispatchThreads(MTLSize(width: output.width, height: output.height, depth: 1),
                           threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         e.endEncoding()

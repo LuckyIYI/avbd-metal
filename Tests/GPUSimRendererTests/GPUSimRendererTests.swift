@@ -23,7 +23,7 @@ final class GPUSimRendererTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GPUSimSkinRenderVertex>.stride, 32)
         XCTAssertEqual(MemoryLayout<GPUSimRigidMeshRenderVertex>.stride, 64)
         // Mirrors MSL `MaterialRecord`; the GPU indexes records[id-1] by this stride.
-        XCTAssertEqual(MemoryLayout<GPUSimMaterialLibrary.Record>.stride, 112)
+        XCTAssertEqual(MemoryLayout<GPUSimMaterialLibrary.Record>.stride, 128)
     }
 
     func testLiveSourceDefaultsRequireOnlyAScene() {

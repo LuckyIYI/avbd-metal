@@ -1,13 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ============================================================================
-// AVBD Metal — common types, math, and constants.
+// =====================================================================// AVBD Metal — common types, math, and constants.
 // Shader files are concatenated in filename order and compiled at runtime.
 // All struct layouts are float4/uint4-granular and mirrored in Swift
 // (GPUTypes.swift); any change here must be reflected there.
-// ============================================================================
-
+// =====================================================================
 #define PENALTY_MIN 1.0f
 #define PENALTY_MAX 1.0e10f
 // Tangential (friction) penalty cap: friction force is cone-bounded, so
@@ -352,7 +350,7 @@ struct JointGPU {
     float4 translationLimits; // x/y: metres, z: enabled, w: warm-start stop (-1/0/+1)
     float4 motor;       // x = angle/velocity target, y = effort limit,
                         // z = pad, w = position-PD kp (zero for velocity)
-    float4 limits;      // x/y = twist range, z = kd, w = pad
+    float4 limits;      // x/y = twist range, z = kd, w = stop stiffness
     float4 dynamics;    // x = armature, y = inertial-predicted twist,
                         // z = start-of-step explicit effort
     // JOINT_CABLE tagged layout: motor.xyz = linear stiffness,
@@ -360,6 +358,9 @@ struct JointGPU {
     // C0Lin/Ang.xyz = initial strain; other motor/constraint state is inactive.
     // limits.w = bend yield angle (0 disables); lambdaAng.xyz = committed
     // plastic bending coordinates. These are material state, not AL duals.
+    float4 response; // count, damping, effort cap, initial coordinate
+    float4 breakLoad; // force, torque, enabled force/torque bits, pad
+    float4 responseKnots[16];
 };
 
 struct CableRotationLog { float3 value; M3 derivative; };
@@ -569,7 +570,9 @@ struct NPCResult {
 #define NPC_FEATURE_SMOOTH 0xF0000000u
 #define NPC_MPR_ITERATIONS 30
 #define NPC_GJK_ITERATIONS 30
+#ifndef NPC_MAX_FACE_VERTICES
 #define NPC_MAX_FACE_VERTICES 32
+#endif
 
 struct ManifoldGPU {
     uint4 header;       // bodyA, bodyB, numContacts, active/anchor flags

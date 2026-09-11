@@ -76,7 +76,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
                                 1/projection.columns.0.x, 1/projection.columns.1.y))
     }
 
-    private final class Harness {
+    @MainActor private final class Harness {
         let effects: ScreenSpacePipeline
         let surface, color: MTLRenderPipelineState
         let queue: MTLCommandQueue

@@ -834,6 +834,7 @@ final class ConvexDeformableCollisionTests: XCTestCase {
             to: SIMD4<Float>.self, capacity: solver.numBodies)
         let initialPosition = positions[moving]
         let initialRotation = rotations[moving]
+        XCTAssertNil(solver.convexFailureEvidence())
         solver.convexQueryFailureForTesting = true
 
         try solver.submitStep()
@@ -854,6 +855,15 @@ final class ConvexDeformableCollisionTests: XCTestCase {
                 code, GPUSolver.RuntimeFailure.convexQueryInconclusiveCode)
             XCTAssertTrue(message.contains("trustworthy collision witness"))
         }
+
+        let captured = try XCTUnwrap(solver.convexFailureEvidence())
+        let shapes = try XCTUnwrap(captured["shapes"] as? [[String: Any]])
+        XCTAssertEqual(shapes.count, 2)
+        XCTAssertEqual(shapes[0]["center_kind"] as? [Float], [0, 0, 0, 0])
+        XCTAssertEqual(shapes[1]["center_kind"] as? [Float], [2, 0, 0, 0])
+        XCTAssertEqual(shapes[0]["rotation"] as? [Float], [0, 0, 0, 1])
+        XCTAssertEqual(shapes[0]["vertices"] as? [[Float]], [])
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: captured))
 
         XCTAssertEqual(positions[moving].x, initialPosition.x, accuracy: 1e-7)
         XCTAssertEqual(positions[moving].y, initialPosition.y, accuracy: 1e-7)

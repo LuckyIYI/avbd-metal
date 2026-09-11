@@ -14,17 +14,28 @@ func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram], argument
     "case \($0 + 1): materialProgram\($0 + 1)::evaluate(context,surface); break;"
   }.joined(separator: "\n")
   let common = """
-    struct MaterialRecord { float4 color; float4 emission; float4 uv; uint4 maps; uint4 extra; float4 parameters; uint4 channels; };
+    struct MaterialRecord { float4 color; float4 emission; float4 uv; uint4 maps; uint4 extra; float4 parameters; uint4 channels; float4 optics; };
     struct MaterialContext { float3 position; float2 uv; float footprint; float4 parameters; };
     struct MaterialSample { float3 color; float roughness; float metallic; float3 emission; float3 normal; };
     // Material IDs travel through the rasterizer as an interpolated float; round
     // so a sub-ulp interpolation error cannot select the previous material.
     inline uint materialIndex(float encoded) { return uint(max(encoded, 0.0) + 0.5); }
+    inline float3 screenEnvironment(float3 R, constant Uniforms& U);
+    inline float3 diffuseAmbient(float3 N, constant Uniforms& U);
+    inline float3 diffuseEnvironment(float3 R, constant Uniforms& U);
     """
   guard argumentBuffers else {
     return common + """
 
       struct MaterialResources { uint4 info; };
+      inline float2 materialOptics(uint id, constant MaterialResources& resources) { return float2(0,1.5); }
+      inline float2 materialLobes(uint id, constant MaterialResources& resources) { return float2(0); }
+      inline bool hasEnvironment(constant MaterialResources& resources) { return false; }
+      inline bool environmentBackground(constant Uniforms& U,constant MaterialResources& resources) { return false; }
+      inline float3 materialEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources,float rough=0) { return screenEnvironment(R,U); }
+      inline float3 materialDiffuseAmbient(float3 N,constant Uniforms& U,constant MaterialResources& resources) { return diffuseAmbient(N,U); }
+      inline float3 materialDiffuseEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources) { return diffuseEnvironment(R,U); }
+      inline float3 materialHorizon(float3 direction,constant Uniforms& U,constant MaterialResources& resources) { return HORIZON_LIN; }
       inline MaterialSample evaluateMaterial(uint id, MaterialContext context, MaterialSample surface, constant MaterialResources& resources) { return surface; }
       inline float3 materialNormal(float3 n, float3 t, float3 b, float3 map) { return n; }
       inline VOut texturedSurface(VOut input, constant MaterialResources& resources) { return input; }
@@ -36,8 +47,52 @@ func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram], argument
         array<texture2d<float>,\(capacity)> maps [[id(0)]];
         device const MaterialRecord* records [[id(\(capacity))]];
         uint count [[id(\(capacity + 1))]];
+        texture2d<float> environmentMap [[id(\(capacity + 2))]];
+        device const float4* environmentSH [[id(\(capacity + 3))]];
+        float4 environmentSettings [[id(\(capacity + 4))]];
     };
+    \(GPUSimEnvironmentLight.basisSource)
+    inline bool hasEnvironment(constant MaterialResources& resources) { return resources.environmentSettings.w>0; }
+    inline bool environmentBackground(constant Uniforms& U,constant MaterialResources& resources) { return hasEnvironment(resources) && U.environmentSettings.z==0; }
+    inline float3 environmentDirection(float3 R,constant Uniforms& U) {
+        float a=U.environmentSettings.y,c=cos(a),s=sin(a);
+        return float3(c*R.x+s*R.y,-s*R.x+c*R.y,R.z);
+    }
+    inline float3 materialEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources,float rough=0) {
+        if (!hasEnvironment(resources)) return screenEnvironment(R,U);
+        R=environmentDirection(normalize(R),U);
+        float2 uv=float2(atan2(R.y,R.x)/(2*M_PI_F)+0.5,acos(clamp(R.z,-1.0,1.0))/M_PI_F);
+        constexpr sampler s(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear);
+        float lod=rough*rough*float(resources.environmentMap.get_num_mip_levels()-1);
+        float3 color=resources.environmentMap.sample(s,uv,level(lod)).rgb;
+        return max(select(float3(0),color,isfinite(color)),float3(0))*U.environmentSettings.x;
+    }
+    inline float3 materialDiffuseAmbient(float3 N,constant Uniforms& U,constant MaterialResources& resources) {
+        if (!hasEnvironment(resources)) return diffuseAmbient(N,U);
+        N=environmentDirection(normalize(N),U);
+        float3 color=float3(0);
+        for(uint i=0;i<9;++i) color+=resources.environmentSH[i].rgb*environmentBasis(i,N);
+        return max(color,float3(0))*U.environmentSettings.x;
+    }
+    inline float3 materialDiffuseEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources) {
+        return hasEnvironment(resources) ? materialEnvironment(R,U,resources) : diffuseEnvironment(R,U);
+    }
+    // Distance fog target: the drawn sky at the horizon in this direction. With
+    // an environment background that is a coarse environment sample, so fogged
+    // geometry meets the sky without a band; otherwise the analytic horizon.
+    inline float3 materialHorizon(float3 direction,constant Uniforms& U,constant MaterialResources& resources) {
+        if (!environmentBackground(U,resources)) return HORIZON_LIN;
+        float2 flat=direction.xy;
+        if (dot(flat,flat)<1e-8) flat=float2(1,0);
+        return materialEnvironment(float3(normalize(flat),0),U,resources,0.8);
+    }
     \(functions)
+    inline float2 materialOptics(uint id, constant MaterialResources& resources) {
+        return id > 0 && id <= resources.count ? resources.records[id-1].optics.xy : float2(0,1.5);
+    }
+    inline float2 materialLobes(uint id, constant MaterialResources& resources) {
+        return id > 0 && id <= resources.count ? resources.records[id-1].optics.zw : float2(0);
+    }
     inline float4 materialTex(uint index, MaterialContext context, uint clampUV, constant MaterialResources& resources) {
         if (index == 0xffffffffu || index >= \(capacity)) return float4(1);
         constexpr sampler repeatSampler(coord::normalized,address::repeat,filter::linear,mip_filter::linear);

@@ -43,7 +43,8 @@ let package = Package(
         ),
         .testTarget(
             name: "PhysicsAVBDTests",
-            dependencies: ["SimCore", "PhysicsAVBD", "GPUSimDemos"]
+            dependencies: ["SimCore", "PhysicsAVBD", "GPUSimDemos"],
+            resources: [.copy("Fixtures/ConvexCapacity")]
         ),
         .testTarget(
             name: "GPUSimTests",

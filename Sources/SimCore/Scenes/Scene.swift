@@ -301,6 +301,10 @@ public struct SceneJoint {
     /// without limits a decelerating arm can tumble over the top and wedge.
     public var limitLo: Float
     public var limitHi: Float
+    /// GPU hinge stop stiffness (N m / rad); preserve the historical default.
+    public var limitStiffness: Float = 4.0e4
+    public var response: JointResponse? = nil
+    public var breakLoad: JointBreakLoad? = nil
 
     @_disfavoredOverload
     public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
@@ -944,8 +948,8 @@ public struct PhysicsScene {
         isRendered: Bool = false
     ) -> Int {
         precondition(bodies.indices.contains(body), "collider owner out of range")
-        precondition(vertices.count >= 4 && vertices.count <= 64,
-                     "convex collider requires 4...64 cooked hull vertices")
+        precondition(vertices.count >= 4 && vertices.count <= ConvexAssetLimits.maximumVerticesPerHull,
+                     "convex collider requires 4...\(ConvexAssetLimits.maximumVerticesPerHull) cooked hull vertices")
         var lo = F3(repeating: .greatestFiniteMagnitude)
         var hi = F3(repeating: -.greatestFiniteMagnitude)
         for vertex in vertices {

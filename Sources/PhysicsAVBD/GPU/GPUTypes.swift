@@ -112,8 +112,27 @@ public struct JointGPU {
     public var prismaticAxis: SIMD4<Float> = .zero
     public var translationLimits: SIMD4<Float> = .zero // lo, hi, enabled, warm-start stop (-1/0/+1)
     public var motor: SIMD4<Float> = .zero       // target, effort cap, pad, gain
-    public var limits: SIMD4<Float> = .zero      // lo, hi, position-PD kd, pad
+    public var limits: SIMD4<Float> = .zero      // lo, hi, position-PD kd, stop stiffness
     public var dynamics: SIMD4<Float> = .zero    // armature, predicted twist, explicit effort, pad
+    public var response: SIMD4<Float> = .zero // count, damping, effort cap, initial coordinate
+    public var breakLoad: SIMD4<Float> = .zero // force, torque, enabled force/torque bits, pad
+    public var responseKnot0: SIMD4<Float> = .zero
+    public var responseKnot1: SIMD4<Float> = .zero
+    public var responseKnot2: SIMD4<Float> = .zero
+    public var responseKnot3: SIMD4<Float> = .zero
+    public var responseKnot4: SIMD4<Float> = .zero
+    public var responseKnot5: SIMD4<Float> = .zero
+    public var responseKnot6: SIMD4<Float> = .zero
+    public var responseKnot7: SIMD4<Float> = .zero
+    public var responseKnot8: SIMD4<Float> = .zero
+    public var responseKnot9: SIMD4<Float> = .zero
+    public var responseKnot10: SIMD4<Float> = .zero
+    public var responseKnot11: SIMD4<Float> = .zero
+    public var responseKnot12: SIMD4<Float> = .zero
+    public var responseKnot13: SIMD4<Float> = .zero
+    public var responseKnot14: SIMD4<Float> = .zero
+    public var responseKnot15: SIMD4<Float> = .zero
+
 }
 
 public struct TetGPU {
@@ -194,12 +213,18 @@ public struct ConvexHullGPU {
     /// Maximum polygon loop accepted from either a cooked asset or the legacy
     /// inline-hull reconstruction path. Keep this in sync with SimCore's
     /// public asset contract.
-    public static let maximumSourceFaceVertices = 16
+    public static let maximumSourceFaceVertices = ConvexAssetLimits.maximumFaceVertices
 
     /// Per-thread Sutherland-Hodgman workspace. Clipping a valid source face
     /// can temporarily add vertices, so this is deliberately larger than the
     /// authored/cooked face limit and remains a shader implementation detail.
-    public static let maximumClipWorkspaceVertices = 32
+    public static let maximumClipWorkspaceVertices = 2 * maximumSourceFaceVertices
+
+    /// Small scenes retain the existing 32-entry kernel and its register cost.
+    public static func clipWorkspaceVertices(largestSourceFace: Int) -> Int {
+        precondition((0...maximumSourceFaceVertices).contains(largestSourceFace))
+        return largestSourceFace <= 16 ? 32 : (largestSourceFace <= 32 ? 64 : 128)
+    }
 
     /// Optional supporting-edge manifold enrichment is bounded per pair.
     /// The certified MPR/face witness remains the fallback above this budget.
@@ -235,6 +260,7 @@ public struct ConvexEdgeGPU {
 /// bits 2–5 leaf ordinal within its bounded proxy subtree).
 public struct ColliderBVHNodeGPU {
     public var centerRadius: SIMD4<Float> = .zero
+    public var halfExtent: SIMD4<Float> = .zero
     public var links: SIMD4<UInt32> = .zero
 
     public init() {}

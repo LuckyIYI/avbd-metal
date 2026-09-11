@@ -5,6 +5,94 @@ import XCTest
 
 @MainActor
 final class MetalFXReconstructionTests: XCTestCase {
+    func testSpecularDistanceAllocationIsOptional() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: true)
+        else { throw XCTSkip("MetalFX denoising unavailable") }
+        let disabled = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: true)
+        XCTAssertNil(disabled.specularHitDistance)
+        let enabled = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: true, enableSpecularHitDistance: true)
+        let distance = try XCTUnwrap(enabled.specularHitDistance)
+        XCTAssertEqual(distance.pixelFormat, .r16Float)
+        XCTAssertEqual(distance.width, 64)
+        XCTAssertTrue(distance.usage.contains(.shaderWrite))
+    }
+
+    func testSpecularGuideIncludesViewDependentFresnel() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let source = makeRenderShaderSource(motionGuides: true) + """
+        kernel void probe(constant ReconstructionUniforms& R [[buffer(0)]], device float4* result [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+            float3 view = i%2==0 ? float3(0,0,1) : float3(sqrt(0.99),0,0.1);
+            auto guide=reconstructionGuides(float3(0),float3(0),float3(0,0,1),float3(0.2,0.4,0.6),0.3,i>=2 ? 1.0 : 0.0,view,R);
+            result[i]=guide.specular;
+        }
+        """
+        let library = try device.makeLibrary(source: source, options: nil)
+        let pipeline = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "probe")))
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        let output = try XCTUnwrap(device.makeBuffer(length: 64, options: .storageModeShared))
+        let uniforms = try XCTUnwrap(device.makeBuffer(length: 144, options: .storageModeShared))
+        memset(uniforms.contents(), 0, uniforms.length)
+        let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(uniforms, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        encoder.dispatchThreads(MTLSize(width: 4,height: 1,depth: 1), threadsPerThreadgroup: MTLSize(width: 4,height: 1,depth: 1))
+        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+        XCTAssertEqual(command.status, .completed, "\(String(describing: command.error))")
+        let values = output.contents().assumingMemoryBound(to: SIMD4<Float>.self)
+        for i in 0..<4 { for channel in 0..<3 {
+            let f0: Float = i<2 ? 0.04 : [0.2,0.4,0.6][channel]
+            let expected = i%2==0 ? f0 : f0+(1-f0)*pow(Float(0.9),5)
+            XCTAssertEqual(values[i][channel], expected, accuracy: 0.0001)
+        } }
+    }
+
+    func testRawLightingKeepsCameraStableAndRestartsReconstruction() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
+        else { throw XCTSkip("MetalFX unavailable") }
+        let fx = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: false)
+        var options = GPUSimRenderOptions.qualityBeta
+        var camera = matrix_identity_float4x4
+        camera.columns.0.x = 1.7
+        camera.columns.3 = SIMD4(0.25, -0.5, 0.75, 1)
+        let first = fx.beginFrame(camera: camera, options: options, invalidate: false)
+        XCTAssertNotEqual(first, camera)
+        options.rayTracingDenoising = false
+        for frame in 0..<40 {
+            let raw = fx.beginFrame(camera: camera, options: options, invalidate: false)
+            XCTAssertEqual(raw, camera, "Raw lighting must stay on the unjittered pixel grid")
+            XCTAssertEqual(fx.jitter, .zero)
+            XCTAssertEqual(fx.guideUniforms.current, camera)
+            XCTAssertEqual(fx.guideUniforms.previous, camera)
+            XCTAssertEqual(fx.reset, frame == 0)
+        }
+        options.rayTracingDenoising = true
+        XCTAssertEqual(fx.beginFrame(camera: camera, options: options, invalidate: false), first)
+        XCTAssertTrue(fx.reset, "Re-enabling reconstruction must discard stale history")
+        XCTAssertEqual(fx.jitter, MetalFXReconstruction.sampleJitter(0))
+        let next = fx.beginFrame(camera: camera, options: options, invalidate: false)
+        XCTAssertNotEqual(next, first)
+        XCTAssertFalse(fx.reset)
+    }
+
+    func testDisplayExposurePreservesLinearHistory() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
+        else { throw XCTSkip("MetalFX unavailable") }
+        let fx = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: false)
+        var options = GPUSimRenderOptions.qualityBeta
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        XCTAssertFalse(fx.reset)
+        options.displayExposure = 1
+        options.minimumFrameDuration = 1.0/30.0
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        XCTAssertFalse(fx.reset)
+        options.environmentRotation = 0.5
+        _ = fx.beginFrame(camera: matrix_identity_float4x4, options: options, invalidate: false)
+        XCTAssertTrue(fx.reset, "Lighting changes invalidate accumulated radiance")
+    }
+
     func testAuxiliaryHistoryUsesLiveBytesAcrossUnequalRingCapacities() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
         else { throw XCTSkip("MetalFX unavailable") }
@@ -164,6 +252,26 @@ final class MetalFXReconstructionTests: XCTestCase {
                     "Motion guides must retain the visible cloth's material instead of the Fast depth-only defaults")
             } }
         }
+    }
+
+    func testBypassDoesNotRunTheScalerOrModifyRawHDR() throws {
+        let device=try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        guard MetalFXReconstruction.supports(device:device,denoising:false) else {throw XCTSkip("MetalFX unavailable")}
+        let fx=try MetalFXReconstruction(device:device,size:SIMD2(64,64),denoising:false)
+        let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba16Float,width:64,height:64,mipmapped:false)
+        descriptor.usage=[.renderTarget,.shaderRead];descriptor.storageMode = .private
+        let raw=try XCTUnwrap(device.makeTexture(descriptor:descriptor))
+        let command=try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+        for (texture,level) in [(raw,0.75),(fx.output,0.125)] {
+            let pass=MTLRenderPassDescriptor();pass.colorAttachments[0].texture=texture
+            pass.colorAttachments[0].loadAction = .clear;pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor=MTLClearColor(red:level,green:level,blue:level,alpha:1)
+            try XCTUnwrap(command.makeRenderCommandEncoder(descriptor:pass)).endEncoding()
+        }
+        try fx.finishFrame(command:command,color:raw,reconstruct:false)
+        command.commit();command.waitUntilCompleted();XCTAssertEqual(command.status,.completed)
+        XCTAssertEqual(Float(try read(raw,device:device)[0]),0.75)
+        XCTAssertEqual(Float(try read(fx.output,device:device)[0]),0.125,"The scaler output sentinel must remain untouched")
     }
 
     private func read(_ texture: MTLTexture, device: MTLDevice, channels: Int = 4) throws -> [Float16] {
