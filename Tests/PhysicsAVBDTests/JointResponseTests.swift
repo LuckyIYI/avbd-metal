@@ -4,7 +4,7 @@ import simd
 @testable import PhysicsAVBD
 
 final class JointResponseTests: XCTestCase {
-    func slide(response: JointResponse?, mass: Float=1, breakForce: Float?=nil, gravity: Float=0, dt: Float=1/120) throws -> GPUSolver {
+    func slide(response: JointResponse?, mass: Float=1, breakForce: Float?=nil, fracture: Float?=nil, gravity: Float=0, dt: Float=1/120) throws -> GPUSolver {
         var scene=PhysicsScene(name:"passive slide")
         scene.settings.dt=dt;scene.settings.iterations=24;scene.settings.gravity=gravity
         let b=scene.addBody(size:F3(0.1,0.1,0.1),density:0,friction:0,position:F3(0,0,1),mass:mass,diagonalInertia:F3(repeating:0.01),collisionEnabled:false)
@@ -12,6 +12,7 @@ final class JointResponseTests: XCTestCase {
         j.prismaticAxis=F3(1,0,0);j.translationLimits = -0.01...1.1
         j.response=response
         if let breakForce {j.breakLoad=JointBreakLoad(force:breakForce)}
+        if let fracture {j.fracture=fracture;j.fractureLinear=true}
         scene.addJoint(j)
         return try GPUSolver(scene:scene)
     }
@@ -52,6 +53,16 @@ final class JointResponseTests: XCTestCase {
         let z=weak.bodyPosition(0).z;try run(weak,30);XCTAssertLessThan(weak.bodyPosition(0).z,z)
         weak.repairJoints();XCTAssertTrue(weak.brokenJointIndices().isEmpty)
         let strong=try slide(response:nil,breakForce:40,gravity:-9.81)
+        try run(strong,120);XCTAssertTrue(strong.brokenJointIndices().isEmpty)
+        XCTAssertEqual(strong.bodyPosition(0).z,1,accuracy:0.005)
+    }
+    func testScalarFractureStillAppliesAlongsideBreakLoads() throws {
+        // Both criteria are authored; the weaker one decides.
+        let weakScalar=try slide(response:nil,breakForce:40,fracture:2,gravity:-9.81)
+        try run(weakScalar,60);XCTAssertEqual(weakScalar.brokenJointIndices(),[0],"scalar fracture must not be ignored when break loads exist")
+        let weakLoad=try slide(response:nil,breakForce:2,fracture:40,gravity:-9.81)
+        try run(weakLoad,60);XCTAssertEqual(weakLoad.brokenJointIndices(),[0])
+        let strong=try slide(response:nil,breakForce:40,fracture:40,gravity:-9.81)
         try run(strong,120);XCTAssertTrue(strong.brokenJointIndices().isEmpty)
         XCTAssertEqual(strong.bodyPosition(0).z,1,accuracy:0.005)
     }

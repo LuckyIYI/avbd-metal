@@ -27,7 +27,9 @@ joint.response = JointResponse(
 `SceneJoint.breakLoad = JointBreakLoad(force:torque:)` specifies optional reaction
 thresholds in N and N·m. Thresholds apply to constraint reactions, excluding
 passive/motor effort and lever-arm torque from linear reaction. A broken joint
-stays broken until repaired/reset. Existing `fracture` behavior remains available.
+stays broken until repaired/reset. Existing `fracture` behavior remains available;
+when a joint authors both, either criterion breaks it. A joint that breaks
+mid-step stops applying its passive response for the rest of that step.
 Fixed joints may have break loads but cannot have a scalar response curve.
 
 Stateful push-push latches and audio are not represented by a passive effort

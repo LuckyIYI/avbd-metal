@@ -935,7 +935,9 @@ inline void stampJoint(device const JointGPU& j, uint self,
     bool isA = self == a;
     float torqueArm = j.C0Lin.w;
 
-    if (j.response.x > 0.0f) {
+    // A joint that broke earlier in this step keeps its adjacency for the
+    // remaining primal iterations; it must not keep transferring effort.
+    if (j.response.x > 0.0f && j.header.z == 0) {
         float4 qA=a==WORLD_BODY ? float4(0,0,0,1) : posAng[a];
         if (j.prismaticAxis.w != 0) {
             float3 xA=a==WORLD_BODY ? float3(0) : posLin[a].xyz;
@@ -2859,7 +2861,10 @@ static inline void dual_joint_one(
         uint channels=uint(j.breakLoad.z);
         failed=((channels&1) && length(reactionLin)>j.breakLoad.x)
             || ((channels&2) && length(torque)>j.breakLoad.y);
-    } else if (j.header.w & 4) failed=dot(la,la)+lin2>fracture*fracture;
+    }
+    // A finite scalar fracture threshold (bit 128) applies alongside physical
+    // break loads, so authoring both cannot silently disable either criterion.
+    if (!failed && (j.header.w & 128)) failed=dot(la,la)+lin2>fracture*fracture;
     if (failed) {
         j.penaltyLin = float4(0);
         j.penaltyAng = float4(0);
