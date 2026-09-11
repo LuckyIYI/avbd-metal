@@ -243,6 +243,7 @@ struct MetalView: NSViewRepresentable {
         }
         do {
             let renderer = try GPUSimRenderer(device: device, source: model)
+            renderer.sceneLengthScale = model.demoName == "cableethernet" ? 0.01 : 1
             configureAppCapture(renderer: renderer, model: model)
             renderer.configure(view, preferredFramesPerSecond: 60)
             context.coordinator.renderer = renderer
@@ -254,7 +255,9 @@ struct MetalView: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ view: InteractiveMTKView, context: Context) {}
+    func updateNSView(_ view: InteractiveMTKView, context: Context) {
+        context.coordinator.renderer?.sceneLengthScale = model.demoName == "cableethernet" ? 0.01 : 1
+    }
 
     final class Coordinator {
         let model: SimulationModel
@@ -328,6 +331,6 @@ final class InteractiveMTKView: MTKView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let r = coordinator?.renderer else { return }
-        r.distance = min(max(r.distance * (1 - Float(event.scrollingDeltaY) * 0.02), 2), 400)
+        r.distance = min(max(r.distance * (1 - Float(event.scrollingDeltaY) * 0.02), 2 * r.sceneLengthScale), 400 * r.sceneLengthScale)
     }
 }

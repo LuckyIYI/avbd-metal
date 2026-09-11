@@ -70,7 +70,7 @@ public enum Demos {
         let cableDamping = [DemoParam("damping", "Damping time (s)", 0...0.25, 0.12),
                             DemoParam("drag", "Drag /s", 0...2, 0.8)]
         switch name {
-        case "cableethernet": return cableDamping + [DemoParam("plugMu", "Plug stiffness", 2500...60000, 15000)]
+        case "cableethernet": return [DemoParam("youngMPa", "Housing E (MPa)", 1800...2800, 2400), DemoParam("offsetMM", "Lateral error (mm)", 0...1.2, 0), DemoParam("yawDeg", "Yaw error (°)", 0...5, 0)]
         case "cabletwisting": return cableDamping + [DemoParam("turnRate", "Turns / s", 0...0.25, 0.10)]
         case "cablegrippers": return cableDamping + [
             DemoParam("gripMu", "Clip stiffness", 10000...60000, 30000),
@@ -138,7 +138,7 @@ public enum Demos {
             }
         }
         switch name {
-        case "cableethernet": return cableEthernet(segments: res ?? 32, plugStiffness: p("plugMu", 15000), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
+        case "cableethernet": return cableEthernet(segments: res ?? 32, youngModulus: p("youngMPa", 2400)*1e6, lateralError: p("offsetMM", 0)*0.001, yawError: p("yawDeg", 0)*Float.pi/180)
         case "cabletwisting": return cableTwisting(segments: res ?? 40, turnRate: p("turnRate", 0.10), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
         case "cablegrippers": return cableGrippers(segments: res ?? 64, padStiffness: p("gripMu", 30000), friction: p("friction", 0.8), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
         case "cableplastic": return cablePlastic(segments: res ?? 24, yieldCurvature: p("yield", 1.5), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))

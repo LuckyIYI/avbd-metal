@@ -22,6 +22,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
     /// Bumped only when the demo changes; the renderer reframes the camera
     /// on epoch change (reset/size/param rebuilds keep the user's view).
     private(set) var cameraEpoch = 0
+    private var ethernetRun: EthernetInsertionRun?
     @Published var scale = Int(ProcessInfo.processInfo.environment["AVBD_SIZE"] ?? "") ?? 1 {
         didSet { reset() }
     }
@@ -86,7 +87,11 @@ final class SimulationModel: ObservableObject, RenderableModel {
         lastStepTime = CACurrentMediaTime()
 
         DispatchQueue.global(qos: .userInitiated).async {
-            guard var scene = Demos.make(name, scale: sceneScale, params: params) else {
+            let task = name == "cableethernet" ? Demos.ethernetInsertionTask(
+                youngModulus: (params["youngMPa"] ?? 2400) * 1e6,
+                lateralError: (params["offsetMM"] ?? 0) * 0.001,
+                yawError: (params["yawDeg"] ?? 0) * Float.pi / 180) : nil
+            guard var scene = task?.scene ?? Demos.make(name, scale: sceneScale, params: params) else {
                 DispatchQueue.main.async {
                     guard generation == self.resetGeneration else { return }
                     self.statsText = "unknown demo: \(name)"
@@ -127,6 +132,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
                         self.adopting = false
                     }
                     self.solver = newSolver
+                    self.ethernetRun = task.map { EthernetInsertionRun(task: $0) }
                     self.rendererBodyAppearances = authoredAppearances
                     self.dragJoint = dragSlot
                     self.dragBody = nil
@@ -165,7 +171,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
         do {
             let batchStart = CACurrentMediaTime()
             while stepAccumulator >= dt && steps < 4 {
-                try solver.submitStep()
+                try advancePhysics(solver)
                 stepAccumulator -= dt
                 steps += 1
             }
@@ -191,6 +197,10 @@ final class SimulationModel: ObservableObject, RenderableModel {
             statsText = String(
                 format: "%d bodies   %.2f ms/step   %d pairs   %d colors",
                 solver.bodyCount, msEMA, solver.lastNumPairs, colors)
+            if let run = ethernetRun {
+                statsText += String(format: "   %@   %.2f mm   %.2f N / 20 N",
+                    run.phase, run.noseCenter.x * 1000, length(run.force))
+            }
             if solver.uniqueConvexAssetCount > 0 {
                 statsText += "   \(solver.uniqueConvexAssetCount) shared hulls"
             }
@@ -202,11 +212,24 @@ final class SimulationModel: ObservableObject, RenderableModel {
         running = false
         guard let solver else { return }
         do {
-            try solver.submitStep()
+            try advancePhysics(solver)
             try solver.synchronize()
         } catch {
             statsText = "solver stopped: \(error.localizedDescription)"
         }
+    }
+
+    private func advancePhysics(_ solver: GPUSolver) throws {
+        guard var run = ethernetRun else { try solver.submitStep(); return }
+        let task = run.task, command = run.command
+        solver.setDrivenBodyStates([.init(body: task.wristBody, position: command.position,
+            rotation: command.rotation, linearVelocity: command.linearVelocity,
+            angularVelocity: command.angularVelocity)])
+        try solver.submitStep()
+        let nose = task.noseNodes.reduce(F3.zero) { $0 + solver.bodyPosition($1) } / Float(task.noseNodes.count)
+        run.observe(toolPosition: solver.bodyPosition(task.toolBody),
+                    toolRotation: solver.bodyRotation(task.toolBody), noseCenter: nose)
+        ethernetRun = run
     }
 
     // MARK: - Mouse dragging

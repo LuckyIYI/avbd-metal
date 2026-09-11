@@ -157,116 +157,140 @@ func validateRoutingSoak() throws {
 }
 
 func validateEthernetDemo() throws {
-    try validateEthernetTopology()
-    var scene = Demos.cableEthernet()
-    let slot = scene.addDragSlot()
+    let env = ProcessInfo.processInfo.environment
+    let offset = env["ETHERNET_OFFSET_MM"].flatMap(Float.init) ?? 0
+    var task = Demos.ethernetInsertionTask(lateralError: offset * 0.001)
+    if let v = env["ETHERNET_ITERS"].flatMap(Int.init) { task.scene.settings.iterations = v }
+    if let v = env["ETHERNET_DT"].flatMap(Float.init) { task.scene.settings.dt = v }
+    let scene = task.scene
     let solver = try GPUSolver(scene: scene)
-    let cable = scene.cables[0], boot = cable.bodyIDs.last!
-    let nodes = scene.bodies.indices.filter { scene.bodies[$0].isParticle }
-    let hit = solver.pick(origin: F3(-0.477, -0.059, 1.4), dir: F3(0,0,-1))
-    try require(hit.map { scene.bodies[$0.body].isParticle } == true,
-                "visible soft plug faces must be pickable between tiny nodal spheres")
-    let nose = nodes.filter { scene.bodies[$0].position.x > -0.29 }
-    func tip() -> F3 { nose.reduce(F3.zero) { $0 + solver.bodyPosition($1) } / Float(nose.count) }
-    var minJ: Float = 1, peakGap: Float = 0
-    func check() throws {
-        peakGap = max(peakGap, try checkState(solver, scene))
-        for tet in scene.tets {
-            let ids = [tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3]
-            let p = ids.map { solver.bodyPosition($0) }, r = ids.map { scene.bodies[$0].position }
-            let j = dot(p[1]-p[0], cross(p[2]-p[0], p[3]-p[0]))
-                / dot(r[1]-r[0], cross(r[2]-r[0], r[3]-r[0]))
-            minJ = min(minJ, j)
-            try require(j > 0.1, "Ethernet tet inversion/collapse: J=\(j)")
+    var run = EthernetInsertionRun(task: task)
+    let begin = ProcessInfo.processInfo.systemUptime
+    var minJ: Float = 1, peakPenetration: Float = 0, peakGap: Float = 0
+    let bonds = scene.joints.filter { Set(task.plugNodes).contains($0.bodyB) }
+    var trace = ["time_s,command_x_m,nose_x_m,nose_y_m,nose_z_m,fx_N,fy_N,fz_N,stopped"]
+    var stoppedFrames = 0
+    for step in 0..<Int(ceil(EthernetInsertionTask.duration / scene.settings.dt)) {
+        let c = run.command
+        solver.setDrivenBodyStates([.init(body: task.wristBody, position: c.position,
+            rotation: c.rotation, linearVelocity: c.linearVelocity, angularVelocity: c.angularVelocity)])
+        try solver.submitStep()
+        let nose = task.noseNodes.reduce(F3.zero) { $0 + solver.bodyPosition($1) } / Float(task.noseNodes.count)
+        run.observe(toolPosition: solver.bodyPosition(task.toolBody),
+                    toolRotation: solver.bodyRotation(task.toolBody), noseCenter: nose)
+        trace.append("\(Float(step)*scene.settings.dt),\(c.position.x),\(nose.x),\(nose.y),\(nose.z),\(run.force.x),\(run.force.y),\(run.force.z),\(run.stopped)")
+        if step % 120 == 119 || run.stopped {
+            let positions = scene.bodies.indices.map { solver.bodyPosition($0) }
+            for tet in scene.tets {
+                let ids = [tet.ids.0,tet.ids.1,tet.ids.2,tet.ids.3]
+                let p = ids.map { positions[$0] }, r = ids.map { scene.bodies[$0].position }
+                let j = dot(p[1]-p[0],cross(p[2]-p[0],p[3]-p[0])) / dot(r[1]-r[0],cross(r[2]-r[0],r[3]-r[0]))
+                minJ = min(minJ,j)
+            }
+            for bond in bonds {
+                peakGap = max(peakGap, length(positions[bond.bodyA]
+                    + solver.bodyRotation(bond.bodyA).act(bond.rA) - positions[bond.bodyB]))
+            }
+            // Independent analytic signed distances, including the particles'
+            // contact skin and the socket's rounded latch entry lip.
+            for collider in scene.colliders where collider.body == task.socketBody && collider.collisionEnabled {
+                let center = scene.bodies[task.socketBody].position + collider.localPosition
+                for id in task.plugNodes {
+                    let local = collider.localRotation.inverse.act(positions[id]-center)
+                    let distance: Float
+                    if collider.shape == .capsule {
+                        let q=F3(0,0,min(max(local.z,-collider.size.x/2),collider.size.x/2))
+                        distance=length(local-q)-collider.size.y
+                    } else {
+                        let q=abs(local)-collider.size/2
+                        distance=length(max(q,F3.zero))+min(0,q.max())
+                    }
+                    peakPenetration=max(peakPenetration,max(0,scene.bodies[id].size.x/2-distance))
+                }
+            }
+            if step % 120 == 119 {
+                print("ETHERNET t=\(Float(step+1)*scene.settings.dt) phase=\(run.phase) depth_mm=\(nose.x*1000) force_N=\(length(run.force)) peak_N=\(run.peakForce) minJ=\(minJ) penetration_um=\(peakPenetration*1e6) bond_um=\(peakGap*1e6)")
+            }
+            try require(minJ > 0.98, "excessive PC compression or inversion: J=\(minJ)")
+            let cableGap = try checkState(solver,scene)
+            try require(cableGap < 0.00025,"Ethernet cable link gap exceeds 0.25 mm")
+        }
+        if run.stopped {
+            stoppedFrames += 1
+            if stoppedFrames >= Int(0.25/scene.settings.dt) { break }
         }
     }
-    func drag(_ target: F3, frames: Int) throws {
-        let start = endpoint(solver, cable, start: false)
-        for frame in 0..<frames {
-            let t = min(Float(frame+1) / Float(frames) * 1.25, 1)
-            solver.setDrag(jointIndex: slot, body: boot,
-                worldTarget: mix(start, target, t: F3(repeating: t)),
-                localAnchor: cable.endAnchor, stiffness: 50)
-            for _ in 0..<4 { try solver.submitStep() }
-            if frame % 30 == 29 { try check() }
+    let tracePath = "/tmp/ethernet-trace-\(offset)-\(scene.settings.iterations)-\(scene.settings.dt).csv"
+    try trace.joined(separator: "\n").write(toFile: tracePath, atomically: true, encoding: .utf8)
+    print("ETHERNET result phase=\(run.phase) nose=\(run.noseCenter) peak_N=\(run.peakForce) minJ=\(minJ) penetration_um=\(peakPenetration*1e6) wall_s=\(ProcessInfo.processInfo.systemUptime-begin) trace=\(tracePath)")
+    if offset == 0 {
+        try require(run.seated, "nominal insertion must seat without exceeding the force limit")
+        try require(peakPenetration < 0.00005, "socket penetration including contact skins: \(peakPenetration)m")
+        let deflections = task.contactWires.map { wire -> Float in
+            let b = wire.bodyIDs[0]
+            let current = solver.bodyPosition(b) + solver.bodyRotation(b).act(wire.endAnchor)
+            let initial = scene.bodies[b].position + scene.bodies[b].rotation.act(wire.endAnchor)
+            return current.z-initial.z
         }
-        print("ETHERNET target=\(target) boot=\(endpoint(solver, cable, start: false)) nose=\(tip()) minJ=\(minJ)")
+        print("CONTACT spring deflections_mm=\(deflections.map { $0*1000 })")
+        try require(deflections.allSatisfy { $0 > 0.00015 && $0 < 0.002 }, "all eight contacts must physically deflect")
+        // A wire may lift its tip while its middle still tunnels into the PC.
+        // Check sampled axes against independently inverted world-space tets.
+        let tets = scene.tets.map { t -> (F3,simd_float3x3) in
+            let p=[t.ids.0,t.ids.1,t.ids.2,t.ids.3].map { solver.bodyPosition($0) }
+            return (p[0],simd_float3x3(columns:(p[1]-p[0],p[2]-p[0],p[3]-p[0])).inverse)
+        }
+        for wire in task.contactWires {
+            let a=endpoint(solver,wire,start:true), b=endpoint(solver,wire,start:false)
+            for i in 0...64 {
+                let point=a+(b-a)*(Float(i)/64)
+                for (origin,inv) in tets {
+                    let v=inv*(point-origin)
+                    try require(!(v.min()>0.0001 && v.x+v.y+v.z<0.9999),
+                                "contact wire axis entered the PC housing")
+                }
+            }
+        }
+        let toolP=solver.bodyPosition(task.toolBody), toolQ=solver.bodyRotation(task.toolBody)
+        let latchBend=task.latchNodes.map { id -> Float in
+            let rest=scene.bodies[task.toolBody].rotation.inverse.act(
+                scene.bodies[id].position-scene.bodies[task.toolBody].position)
+            return length(solver.bodyPosition(id)-toolP-toolQ.act(rest))
+        }.max()!
+        print("LATCH deformation_mm=\(latchBend*1000)")
+        try require(latchBend>0.00008 && latchBend<0.002,"latch must bend under insertion contact")
+    } else {
+        try require(run.stopped && !run.seated && run.noseCenter.x < 0.010,
+                    "misalignment must stop before seating")
     }
-    for _ in 0..<240 { try solver.submitStep() }
-    try check()
-    print("ETHERNET settled nose=\(tip()) boot=\(endpoint(solver, cable, start: false))")
-    let initial = endpoint(solver, cable, start: false)
-    try drag(F3(0.22, 0, initial.z), frames: 360)
-    try require(tip().x > 0.50, "Ethernet plug must enter the rigid socket: \(tip())")
-    try require(nose.allSatisfy { solver.bodyPosition($0).x < 0.622 }, "plug passed through back wall")
-    try drag(initial, frames: 360)
-    try require(tip().x < -0.20, "plug must withdraw intact: \(tip())")
-    solver.setDrag(jointIndex: slot, body: nil, worldTarget: .zero, localAnchor: .zero)
-    for _ in 0..<480 { try solver.submitStep() }
-    try check()
-    try require(minJ < 0.95, "soft plug must actually deform under contact")
-    try validateEthernetBlockedInsertion()
-    print("PASS DEMO cableethernet insertion/withdrawal nodes=\(nodes.count) tets=\(scene.tets.count) minJ=\(minJ) gap=\(peakGap)")
+    print("PASS Ethernet offset=\(offset)mm iterations=\(scene.settings.iterations)")
 }
 
 func validateEthernetTopology() throws {
-    let scene = Demos.cableEthernet()
-    var faces: [[Int]: Int] = [:]
-    var volume: Float = 0
-    for tet in scene.tets {
-        let ids = [tet.ids.0,tet.ids.1,tet.ids.2,tet.ids.3]
-        let p = ids.map { scene.bodies[$0].position }
-        let v = abs(dot(p[1]-p[0], cross(p[2]-p[0],p[3]-p[0]))) / 6
-        try require(v > 1e-9, "degenerate Ethernet tet")
+    let task=Demos.ethernetInsertionTask(), scene=task.scene
+    var faces:[[Int]:Int]=[:]
+    var volume:Float=0
+    for t in scene.tets {
+        let ids=[t.ids.0,t.ids.1,t.ids.2,t.ids.3], p=ids.map{scene.bodies[$0].position}
+        let v=abs(dot(p[1]-p[0],cross(p[2]-p[0],p[3]-p[0])))/6
+        try require(v>1e-15,"degenerate SI plug tet")
         volume += v
-        for omitted in 0..<4 {
-            faces[ids.enumerated().filter { $0.offset != omitted }.map(\.element).sorted(), default: 0] += 1
-        }
+        for o in 0..<4 {faces[ids.enumerated().filter{$0.offset != o}.map(\.element).sorted(),default:0] += 1}
     }
-    try require(faces.values.allSatisfy { $0 == 1 || $0 == 2 }, "nonmanifold plug faces")
-    var edges: [[Int]: Int] = [:]
-    for (face,count) in faces where count == 1 {
-        for (a,b) in [(0,1),(1,2),(2,0)] { edges[[face[a],face[b]].sorted(), default: 0] += 1 }
+    var edges:[[Int]:Int]=[:]
+    for (face,count) in faces {
+        try require(count<=2,"nonmanifold face")
+        if count==1 {for (a,b) in [(0,1),(1,2),(2,0)] {edges[[face[a],face[b]].sorted(),default:0] += 1}}
     }
-    try require(edges.values.allSatisfy { $0 == 2 }, "plug/ribs/latch boundary must be watertight")
-    let nodes = scene.bodies.filter(\.isParticle)
-    let mass = nodes.reduce(Float(0)) { $0 + $1.density * (4 * .pi / 3) * pow($1.size.x/2, 3) }
-    try require(abs(mass-volume*30) < 0.001, "tet mass must follow rest volume")
-    print("PASS Ethernet conforming topology, volume=\(volume)m3 mass=\(mass)kg")
-}
-
-private func validateEthernetBlockedInsertion() throws {
-    var scene = Demos.cableEthernet()
-    // Hold the entire cable/plug assembly off-axis, with gravity disabled to
-    // isolate the socket wall response from a fall off the insertion bed.
-    scene.settings.gravity = 0
-    for i in scene.bodies.indices where scene.bodies[i].isDynamic {
-        scene.bodies[i].position.y += 0.22
+    try require(edges.values.allSatisfy{$0==2},"open/nonmanifold plug boundary")
+    let mass=task.plugNodes.reduce(Float(0)){sum,i in
+        let b=scene.bodies[i],r=b.size.x/2
+        return sum+b.density*(4 * .pi/3)*r*r*r
     }
-    let slot = scene.addDragSlot(), cable = scene.cables[0]
-    let solver = try GPUSolver(scene: scene)
-    let nose = scene.bodies.indices.filter { scene.bodies[$0].isParticle && scene.bodies[$0].position.x > -0.29 }
-    for frame in 0..<240 {
-        let t = min(Float(frame+1)/180, 1)
-        solver.setDrag(jointIndex: slot, body: cable.bodyIDs.last!,
-            worldTarget: F3(-0.72 + 0.94*t, 0.22, 0.9), localAnchor: cable.endAnchor, stiffness: 50)
-        for _ in 0..<4 { try solver.submitStep() }
-        if frame % 30 == 29 { _ = try checkState(solver, scene) }
+    let latchVolume = scene.tris.reduce(Float(0)) { sum, tri in
+        let p = [tri.ids.0,tri.ids.1,tri.ids.2].map { scene.bodies[$0].position }
+        return sum + length(cross(p[1]-p[0],p[2]-p[0]))/2 * 0.00047
     }
-    let center = nose.reduce(F3.zero) { $0 + solver.bodyPosition($1) } / Float(nose.count)
-    try require(center.x < 0.30, "misaligned plug passed through socket face: \(center)")
-    // Independent oriented-box point oracle over all soft vertices. The
-    // allowed 6 mm includes contact tolerance and discretization, not a wall.
-    var penetration: Float = 0
-    for id in scene.bodies.indices where scene.bodies[id].isParticle {
-        let p = solver.bodyPosition(id)
-        for c in scene.colliders where !scene.bodies[c.body].isDynamic && c.collisionEnabled && c.shape == .box {
-            let b = scene.bodies[c.body]
-            let local = c.localRotation.inverse.act(b.rotation.inverse.act(p-b.position)-c.localPosition)
-            let inside = c.size/2 - abs(local)
-            penetration = max(penetration, min(inside.x,min(inside.y,inside.z)))
-        }
-    }
-    try require(penetration < 0.006, "soft plug penetrated rigid wall by \(penetration)m")
-    print("PASS off-axis insertion blocked: nose=\(center), max wall penetration=\(penetration)m")
+    try require(abs(mass-(volume+latchVolume)*1200)<1e-7,"SI nodal mass mismatch")
+    print("PASS SI plug nodes=\(task.plugNodes.count) tets=\(scene.tets.count) latch_triangles=\(scene.tris.count) mass_g=\(mass*1000)")
 }

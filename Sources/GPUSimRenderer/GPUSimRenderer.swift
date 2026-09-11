@@ -1008,7 +1008,10 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     o.previousWorld = writesMotion ? previousPrimary[v].position.xyz : o.world;
     o.normal = normalize(sv.normal.xyz);
     o.flatShade = 0.0;
-    o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 5u + 11u), 0.76));
+    uint skinColor = as_type<uint>(sv.normal.w);
+    o.albedo = srgbToLin(skinColor != 0u
+        ? float3((skinColor >> 16u) & 255u, (skinColor >> 8u) & 255u, skinColor & 255u) / 255.0f
+        : mix(float3(0.90), softPalette(comp * 5u + 11u), 0.76));
     o.emissive = float3(0);
     o.opacity = 1;
     return o;
@@ -1389,6 +1392,11 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public weak var source: (any GPUSimRendererSource)?
     public private(set) var scene: (any GPUSimRenderableScene)?
     public var options = GPUSimRenderOptions()
+    /// Presentation length reference for small SI-unit scenes. Scales camera
+    /// clipping and light-map minimum extent, never simulation coordinates.
+    public var sceneLengthScale: Float = 1 {
+        didSet { precondition(sceneLengthScale.isFinite && sceneLengthScale > 0) }
+    }
     /// Presentation-only overrides keyed by simulation body index. A live
     /// source's `rendererBodyAppearances` takes precedence when present.
     public var bodyAppearances: [Int: GPUSimRenderAppearance] = [:]
@@ -2040,7 +2048,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     }
 
     public func projectionMatrix(aspect: Float) -> simd_float4x4 {
-        perspective(fovY: 50 * .pi / 180, aspect: aspect, near: 0.1, far: 1000)
+        perspective(fovY: 50 * .pi / 180, aspect: aspect, near: 0.1 * sceneLengthScale, far: 1000 * sceneLengthScale)
     }
 
     /// Builds a world ray from a pixel point whose origin is the view's
@@ -2329,8 +2337,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let shadowFocus = shadowFollowsContent
             ? contentBounds!.center : activeFocus
         let shadowExtent = shadowFollowsContent
-            ? max(1.0, contentBounds!.radius * 1.15)
-            : max(1.5, min(length(activeFocus - activeEye) * 0.9, 40.0))
+            ? max(sceneLengthScale, contentBounds!.radius * 1.15)
+            : max(1.5 * sceneLengthScale, min(length(activeFocus - activeEye) * 0.9, 40.0 * sceneLengthScale))
         let lightUp = abs(lightDirection.y) > 0.95 ? F3(0, 0, 1) : F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
@@ -2344,7 +2352,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let shadowVP = metalOrthographicProjection(
             left: -shadowExtent, right: shadowExtent,
             bottom: -shadowExtent, top: shadowExtent,
-            near: 0.1, far: shadowExtent * 5.0)
+            near: 0.1 * sceneLengthScale, far: shadowExtent * 5.0)
             * lookAt(eye: lightEye, center: shadowCenter, up: lightUp)
         let screenViewport = MTLViewport(originX: 0, originY: 0,
                                          width: Double(targetSize.x),
@@ -2374,8 +2382,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          invViewProj: vp.inverse,
                          prevInvViewProj: (prevVP ?? vp).inverse,
                          effects: SIMD4(activeOptions.usesHDR ? 1 : 0,
-                                        activeOptions.contactShadows || activeOptions.usesRayTracing ? 0.2 : 0,
-                                        activeOptions.screenSpaceReflections ? 4 : 0, 0.65),
+                                        activeOptions.contactShadows || activeOptions.usesRayTracing ? 0.2 * sceneLengthScale : 0,
+                                        activeOptions.screenSpaceReflections ? 4 * sceneLengthScale : 0, 0.65),
                          rayTracing: SIMD4(activeOptions.usesRayTracing ? 1 : 0,
                                            activeOptions.screenSpaceReflections ? 1 : 0, 0,
                                            activeOptions.usesRayTracing && !activeOptions.screenSpaceReflections ? 1 : 0),

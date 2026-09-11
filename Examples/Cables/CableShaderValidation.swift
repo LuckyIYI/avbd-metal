@@ -27,6 +27,14 @@ func validateCableShaders() throws {
             .replacingOccurrences(of: "using namespace metal;", with: "") + "\n"
     }
     source += """
+    kernel void cable_surface_probe(device const float4* input [[buffer(0)]],
+        device float4* output [[buffer(1)]], uint gid [[thread_position_in_grid]]) {
+        uint k=gid*5;
+        float3 a=input[k+2].xyz,b=input[k+3].xyz,c=input[k+4].xyz,bary;
+        float3 p=cableTriangleAxisWitness(input[k].xyz,input[k+1].xyz,a,b,c);
+        float3 q=closestPtTriangle(p,a,b,c,bary);
+        output[gid]=float4(p,distance(p,q));
+    }
     kernel void cable_review_probe(
         device const ManifoldGPU* m [[buffer(0)]],
         device const float4* pos [[buffer(1)]],
@@ -96,5 +104,7 @@ func validateCableShaders() throws {
     try require(values[0].z == 1 && values[1].z == 0,
                 "zero-shear cable adjacency or break-load flag alias")
     try require(values[0].w == Float(MemoryLayout<JointGPU>.stride), "Swift/Metal joint stride mismatch")
+    try validateCableSurfaceWitnesses(device: device, library: library)
+    try validateCableSurfaceContact()
     print("PASS Metal torsional primal/dual contact bounds, legacy policy, explicit cable adjacency and joint ABI")
 }

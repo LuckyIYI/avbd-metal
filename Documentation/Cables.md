@@ -133,23 +133,20 @@ also lists them.
 
 | Scene ID | Interaction |
 |---|---|
-| `cableethernet` | Feed a deformable Ethernet plug into a rigid socket by dragging its ribbed boot. |
+| `cableethernet` | Watch a compliant tool physically insert a deformable Ethernet plug; vary alignment or replay the task. |
 | `cabletwisting` | Two clamped, striped strands wind into a braid. |
 | `cablegrippers` | Pull a routed cable out of four white C clips on a grooved L frame. |
 | `cableplastic` | Bend the blue elastic and copper plastic cantilevers; release to compare spring-back. |
 
 ![Deformable Ethernet plug and rigid socket](Images/Cables/ethernet.png)
 
-The Ethernet plug is an enlarged RJ45-shaped demonstrator: 573 dynamic
-particles and 1,800 conforming tetrahedra form its body, eight raised contact
-strips, and underside cantilever latch. Fifteen material-point bonds attach
-its rear cross-section to the cable boot. The socket is a single static
-compound body with a beveled mouth, separate walls, a back stop, and a latch
-channel. There is no kinematic insertion constraint. The plug's Neo-Hookean
-stiffness is adjustable; geometry, density and compliance are illustrative,
-not certified connector dimensions or measured plastic properties. The
-latch flexes, but this demo does not model a locking hook or electrical mating.
-The bed supports the plug under gravity while leaving the latch channel open.
+The Ethernet task uses a 22.48 × 11.68 × 6.60 mm plug, a polycarbonate FEM
+housing, a bending latch, eight spring contacts, and a rigid shielded socket
+on a PCB fixture. An automatic wrist trajectory acts through a compliant tool
+holding the rear boot. Plug deformation and seating come from the physical
+solve. The display reports insertion depth, tool load and task phase; an
+excessive load stops the drive. See [the task model and calibration assumptions](EthernetInsertion.md)
+for dimensions, material references, force limits and headless qualification.
 
 Build a self-contained macOS app with `make cable-app`; the result is
 `.build/Cable Lab.app`. This packages the executable with its matching shader
@@ -241,13 +238,13 @@ keep their interior witnesses.
 |---|---|
 | Cable / cable, including distant self-contact | Corrected segment query, consistent contact frame, local rest-arclength exclusions. |
 | Cable / box, sphere, torus, convex hull | Consistent contact frame; existing shape-specific collision geometry remains. |
-| Cable / soft body | Existing rigid-to-triangle path. Capsules use three sphere samples on the centreline; coverage is approximate, particularly with long segments. |
+| Cable / soft body | Native cables use a full-axis closest witness against triangle interiors and edges; closed tet boundaries use outward contact normals. Ordinary rigid capsules retain three sphere samples. |
 
-The soft-body path is not upgraded to exact swept-capsule/triangle collision
-by this change. Clip retention, lip deformation, and mouse release are tested
-for the supplied mesh and cable resolution. This is not a general no-crossing
-guarantee for thin or rapidly moving soft surfaces. Discrete rigid contact
-also permits solver slop and can tunnel under sufficiently large motion.
+Full-axis coverage is spatial, not a sweep through time. Clip retention, lip
+deformation, mouse release and millimetre-scale contact wires are tested.
+This is not a general no-crossing guarantee for thin or rapidly moving soft
+surfaces. Discrete contact permits solver slop and can tunnel under sufficiently
+large motion.
 
 ## Validation and performance
 
@@ -259,6 +256,8 @@ swift run -c release cable-validation --benchmark
 swift run -c release cable-validation --materials
 swift run -c release cable-validation --rigid-contact
 swift run -c release cable-validation --shader-regressions
+swift run -c release cable-validation --motion-groups
+swift run -c release cable-validation --ethernet
 swift run -c release cable-validation --collision-stress
 swift run -c release cable-validation --collision-stress --segments 80
 swift run -c release cable-validation --collision-stress --mixed

@@ -1,170 +1,481 @@
 import SimCore
 import simd
 
-public extension Demos {
-    /// Enlarged, compliant RJ45-shaped demonstrator, not a connector tolerance
-    /// model. All plug volume, contact ribs and the underside latch are tets.
-    /// Only the cable's ribbed strain relief is rigid. The socket is one fixed
-    /// compound body with an open rectangular throat and a latch channel.
-    static func cableEthernet(segments: Int = 32, plugStiffness: Float = 15000,
-                              dampingTime: Float = 0.12, drag: Float = 0.8) -> PhysicsScene {
-        precondition(segments >= 12 && plugStiffness.isFinite && plugStiffness > 0)
-        var s = cableBench("Ethernet Insertion", length: 4.6, drag: drag)
-        s.settings.dt = 1 / 240
-        s.settings.iterations = 32
-        s.settings.deterministic = true
-        s.settings.particleDamping = 1.5
-        s.settings.deformableCollisionMargin = 0.001
-        s.settings.cameraTargetZ = 0.9
-        s.settings.cameraDistance = 3.0
-        let blue = F3(0.045, 0.38, 0.76), shell = F3(0.68, 0.84, 0.88)
-        let gold = F3(1.0, 0.66, 0.13), metal = F3(0.64, 0.68, 0.72)
-        func box(_ size: F3, _ p: F3, _ color: F3) {
-            let body = s.addBody(size: size, density: 0, friction: 0.22, position: p)
-            paintBody(&s, body, color)
+/// SI-unit connector insertion task. The tool is an already-closed, no-slip
+/// grasp of the strain relief. A floating tool couples to the commanded wrist
+/// through three finite springs. The plug is a tetrahedral solid; its thin
+/// latch uses membrane and plate-bending elements with the same PC material.
+/// Sources and uncalibrated parameters: Documentation/EthernetInsertion.md.
+public struct EthernetInsertionTask {
+    public static let plugLength: Float = 0.02248
+    public static let plugWidth: Float = 0.01168
+    public static let plugHeight: Float = 0.00660
+    public static let contactPitch: Float = 0.00102
+    public static let seatDepth: Float = 0.0148
+    public static let axisHeight: Float = 0.033
+    public static let duration: Float = 8
+    public static let couplingStiffness: Float = 8000  // each of three springs, N/m
+    public static let forceLimit: Float = 20
+    public var scene: PhysicsScene
+    public var socketBody: Int
+    public var contactWires: [SceneCable]
+    public var wristBody: Int
+    public var toolBody: Int
+    public var noseNodes: [Int]
+    public var plugNodes: [Int]
+    public var latchNodes: [Int]
+    public var couplingAnchors: [F3]
+    public var lateralError: Float
+    public var yawError: Float
+    public var plugRearInTool: Float = 0.008
+
+    public struct Command {
+        public var position: F3
+        public var rotation: Quat
+        public var linearVelocity: F3
+        public var angularVelocity: F3
+        public var phase: String
+    }
+    public func command(at time: Float) -> Command {
+        func blend(_ t: Float) -> Float {
+            let u = min(max(t, 0), 1)
+            return u * u * u * (10 + u * (-15 + 6 * u))
         }
-        // Elevated insertion bed with a gap for the underside latch. These
-        // support the plug under gravity without pinning it or guiding a joint.
-        for y: Float in [-0.119, 0.119] {
-            box(F3(1.03, 0.065, 0.20), F3(-0.335, y, 0.717), F3(0.22, 0.27, 0.33))
-        }
-        // A panel-mounted jack. Its back wall owns all five throat pieces;
-        // there is no hidden box filling the insertion cavity.
-        let socket = s.addBody(size: F3(0.08, 0.55, 0.43), density: 0,
-                               friction: 0.22, position: F3(0.65, 0, 0.855))
-        paintBody(&s, socket, F3(0.10, 0.14, 0.19))
-        func wall(_ size: F3, _ p: F3, _ color: F3 = F3(0.64, 0.68, 0.72)) {
-            _ = s.addCollider(body: socket, size: size, friction: 0.22,
-                localPosition: p - s.bodies[socket].position, renderColor: color)
-        }
-        for sign: Float in [-1, 1] {
-            wall(F3(0.29, 0.085, 0.26), F3(0.465, sign * 0.20, 0.90))
-            _ = s.addCollider(body: socket, size: F3(0.155, 0.085, 0.26), friction: 0.22,
-                localPosition: F3(0.247, sign * 0.221, 0.90) - s.bodies[socket].position,
-                localRotation: Quat(angle: -sign * 0.30, axis: F3(0,0,1)), renderColor: metal)
-            wall(F3(0.43, 0.10, 0.06), F3(0.395, sign * 0.1075, 0.782))
-            // Mounting ears and dark screw recesses dress the same rigid body.
-            wall(F3(0.055, 0.14, 0.36), F3(0.205, sign * 0.31, 0.86), metal)
-            _ = s.addCollider(body: socket, size: F3(repeating: 0.035),
-                localPosition: F3(0.17, sign * 0.32, 0.86) - s.bodies[socket].position,
-                shape: .sphere, collisionEnabled: false, renderColor: F3(0.07, 0.08, 0.10))
-        }
-        wall(F3(0.43, 0.315, 0.06), F3(0.395, 0, 1.025))
-        wall(F3(0.43, 0.115, 0.045), F3(0.395, 0, 0.7325), F3(0.17, 0.20, 0.23))
-        // Short entry lip in the latch channel, followed by a relief pocket.
-        wall(F3(0.055, 0.105, 0.023), F3(0.21, 0, 0.7665))
-        for i in 0..<8 {
-            wall(F3(0.24, 0.010, 0.006), F3(0.465, -0.119 + Float(i) * 0.034, 0.991), gold)
-        }
-        // Status lights, separate from the contact geometry.
-        for (y, color) in [(Float(-0.20), F3(0.2, 0.9, 0.44)), (Float(0.20), gold)] {
-            _ = s.addCollider(body: socket, size: F3(0.009, 0.035, 0.018),
-                localPosition: F3(0.171, y, 1.005) - s.bodies[socket].position,
-                collisionEnabled: false, renderColor: color)
-        }
-        let points = (0...segments).map { i -> F3 in
-            let t = Float(i) / Float(segments)
-            return F3(-2.08 + 1.36 * t, -0.12 * pow(sin(.pi * t), 2),
-                      0.655 + 0.245 * pow(t, 5))
-        }
-        let cable = try! s.addCable(points: points, radius: 0.028, density: 80,
-            material: CableMaterial(stretchRigidity: 3500, shearRigidity: 1800,
-                bendRigidity: 0.025, twistRigidity: 0.02, dampingTime: dampingTime), friction: 0.3)
-        stripedCable(&s, cable, color: blue)
-        let end = cable.bodyIDs.last!, endPose = s.bodies[cable.bodyIDs.last!]
-        // The boot is a compound collider on the last link. No extra inertia
-        // or kinematic drag proxy; pulling it transmits force through the cable.
-        let bootCenter = F3(-0.80, 0, 0.90)
-        _ = s.addCollider(body: end, size: F3(0.16, 0.35, 0.18), friction: 0.3,
-            localPosition: endPose.rotation.inverse.act(bootCenter - endPose.position),
-            localRotation: endPose.rotation.inverse, renderColor: blue)
-        for i in 0..<5 {
-            _ = s.addCollider(body: end, size: F3(0.014, 0.36, 0.19),
-                localPosition: endPose.rotation.inverse.act(bootCenter + F3(-0.06 + Float(i) * 0.03, 0, 0) - endPose.position),
-                localRotation: endPose.rotation.inverse, collisionEnabled: false,
-                renderColor: F3(0.075, 0.49, 0.87))
-        }
-        // Cable links inside the enlarged strain relief are one physical
-        // jacket. Exclude only those buried neighbours, whose artificial
-        // capsule/boot contacts would otherwise fight the cable joints.
-        for body in cable.bodyIDs.dropLast() where s.bodies[body].position.x > -0.95 {
-            s.addJoint(SceneJoint(bodyA: end, bodyB: body, rA: .zero, rB: .zero,
-                                  stiffnessLin: 0, stiffnessAng: 0))
-        }
-        // Structured, conforming lattice with eight narrow contact ribs.
-        // Shared base vertices bond the ribs/latch to the plug; no overlapping
-        // independent soft blocks or visual-only replacement of contact shape.
-        var builder = EthernetTetBuilder(scene: s)
-        let nx = 9, ny = 17, nz = 3
-        var nodes = [Int](repeating: 0, count: nx * ny * nz)
-        func offset(_ x: Int, _ y: Int, _ z: Int) -> Int { (x * ny + y) * nz + z }
-        for x in 0..<nx { for y in 0..<ny { for z in 0..<nz {
-            let taper: Float = x == nx - 1 ? 0.92 : 1
-            let p = F3(-0.72 + Float(x) * 0.055, (Float(y) - 8) * 0.017 * taper,
-                       0.82 + Float(z) * 0.08 - (x == nx - 1 ? Float(z) * 0.004 : 0))
-            nodes[offset(x,y,z)] = builder.node(p, shell)
-        } } }
-        func n(_ x: Int, _ y: Int, _ z: Int) -> Int { nodes[offset(x,y,z)] }
-        for x in 0..<(nx-1) { for y in 0..<(ny-1) { for z in 0..<(nz-1) {
-            builder.cell([n(x,y,z), n(x+1,y,z), n(x+1,y+1,z), n(x,y+1,z),
-                          n(x,y,z+1), n(x+1,y,z+1), n(x+1,y+1,z+1), n(x,y+1,z+1)], mu: plugStiffness)
-        } } }
-        for y in stride(from: 0, to: ny-1, by: 2) {
-            var upper: [Int: Int] = [:]
-            for x in 5..<nx { for j in [y, y+1] {
-                let base = n(x,j,nz-1)
-                upper[base] = builder.node(builder.scene.bodies[base].position + F3(0,0,0.005), gold)
-            } }
-            for x in 5..<(nx-1) {
-                let base = [n(x,y,2), n(x+1,y,2), n(x+1,y+1,2), n(x,y+1,2)]
-                builder.cell(base + base.map { upper[$0]! }, mu: plugStiffness)
+        func pose(_ t: Float) -> (F3, Quat, String) {
+            let start = F3(-0.058, 0.004, Self.axisHeight + 0.005)
+            let aligned = F3(
+                -Self.plugLength - plugRearInTool - 0.003,
+                lateralError, Self.axisHeight)
+            let yaw0: Float = 6 * .pi / 180
+            if t < 0.5 { return (start, Quat(angle: yaw0, axis: F3(0, 0, 1)), "Settle") }
+            if t < 2.5 {
+                let u = blend((t - 0.5) / 2)
+                return (
+                    mix(start, aligned, t: F3(repeating: u)),
+                    Quat(angle: yaw0 + (yawError - yaw0) * u, axis: F3(0, 0, 1)), "Approach & align"
+                )
             }
+            let seated = F3(
+                Self.seatDepth - Self.plugLength - plugRearInTool,
+                lateralError, Self.axisHeight)
+            let u = blend((t - 2.5) / 4)
+            return (
+                mix(aligned, seated, t: F3(repeating: u)),
+                Quat(angle: yawError, axis: F3(0, 0, 1)), t < 6.5 ? "Insert" : "Seat & hold"
+            )
         }
-        // Underside cantilever latch, bonded along two nose rows. Its root
-        // shares every face vertex with the plug, with no overlapping tets.
-        var latch: [Int] = []
-        for x in 3..<9 { for y in 6...10 {
-            let p = builder.scene.bodies[n(x,y,0)].position
-            let depth: Float = x >= 7 ? 0 : (x == 6 ? 0.016 : 0.024)
-            latch.append(builder.node(p - F3(0,0,depth + 0.012), shell))
-            latch.append(x >= 7 ? n(x,y,0) : builder.node(p - F3(0,0,depth), shell))
-        } }
-        func l(_ x: Int, _ y: Int, _ z: Int) -> Int { latch[(x * 5 + y) * 2 + z] }
-        for x in 0..<5 { for y in 0..<4 {
-            builder.cell([l(x,y,0),l(x+1,y,0),l(x+1,y+1,0),l(x,y+1,0),
-                          l(x,y,1),l(x+1,y,1),l(x+1,y+1,1),l(x,y+1,1)], mu: plugStiffness * 0.35)
-        } }
-        // Rear cross-section bonded to the boot at distributed material
-        // points. All other plug nodes remain dynamic and freely deformable.
-        for y in stride(from: 0, to: ny, by: 4) { for z in 0..<nz {
-            let node = n(0,y,z), p = builder.scene.bodies[node].position
-            builder.scene.addJoint(SceneJoint(bodyA: end, bodyB: node,
-                rA: endPose.rotation.inverse.act(p - endPose.position), rB: .zero))
-        } }
-        return builder.scene
+        let (p, q, phase) = pose(time)
+        let h: Float = 0.0005
+        let (before, qb, _) = pose(max(time - h, 0))
+        let (after, qa, _) = pose(time + h)
+        return Command(
+            position: p, rotation: q, linearVelocity: (after - before) / (2 * h),
+            angularVelocity: quatSub(qa, qb) / (2 * h), phase: phase)
+    }
+    /// Reaction of the physical wrist/tool coupling, not a contact-force guess.
+    public func couplingForce(
+        wristPosition: F3, wristRotation: Quat,
+        toolPosition: F3, toolRotation: Quat
+    ) -> F3 {
+        couplingAnchors.reduce(F3.zero) { force, a in
+            force + Self.couplingStiffness
+                * (wristPosition + wristRotation.act(a)
+                    - toolPosition - toolRotation.act(a))
+        }
     }
 }
 
-/// Local authoring helper. Lump density * rest volume onto the four vertices;
-/// changing tessellation does not silently change the plug's mass.
-private struct EthernetTetBuilder {
+extension Demos {
+    public static func cableEthernet(
+        segments: Int = 32, youngModulus: Float = 2.4e9,
+        dampingTime: Float = 0.03, drag: Float = 0.1,
+        lateralError: Float = 0, yawError: Float = 0
+    ) -> PhysicsScene {
+        ethernetInsertionTask(
+            segments: segments, youngModulus: youngModulus,
+            dampingTime: dampingTime, drag: drag, lateralError: lateralError,
+            yawError: yawError
+        ).scene
+    }
+
+    public static func ethernetInsertionTask(
+        segments: Int = 32, youngModulus: Float = 2.4e9,
+        dampingTime: Float = 0.03, drag: Float = 0.1,
+        lateralError: Float = 0, yawError: Float = 0
+    ) -> EthernetInsertionTask {
+        precondition(segments >= 16 && youngModulus.isFinite && youngModulus > 0)
+        let pc = F3(0.79, 0.85, 0.87)
+        let blue = F3(0.025, 0.30, 0.67)
+        let dark = F3(0.055, 0.065, 0.08)
+        let steel = F3(0.57, 0.62, 0.66)
+        let gold = F3(0.94, 0.62, 0.16)
+        let z = EthernetInsertionTask.axisHeight
+        var s = PhysicsScene(name: "Ethernet — Robotic Insertion")
+        s.settings.dt = 1 / 480
+        s.settings.iterations = 48
+        s.settings.gravity = -9.81
+        s.settings.collisionMargin = 0.000025
+        s.settings.deformableCollisionMargin = 0.000015
+        s.settings.deterministic = true
+        s.settings.particleDamping = 20
+        s.settings.clothRenderScale = 1
+        s.settings.alpha = 0.9
+        // Keep finite tool, boot and contact-root springs at their authored
+        // physical stiffness. Gamma decay is an AL convergence heuristic.
+        s.settings.gamma = 1
+        s.settings.betaLin = 100000
+        s.settings.rigidLinearDamping = drag
+        s.settings.rigidAngularDamping = drag
+        s.settings.cameraDistance = 0.13
+        s.settings.cameraTargetZ = 0.034
+        s.settings.cameraTargetX = -0.013
+        s.settings.cameraTargetY = 0
+        s.settings.cameraAzimuth = -2.35
+        s.settings.cameraElevation = 0.38
+        func box(_ size: F3, _ p: F3, _ color: F3, density: Float = 0) -> Int {
+            let b = s.addBody(size: size, density: density, friction: 0.25, position: p)
+            paintBody(&s, b, color)
+            return b
+        }
+        func part(
+            _ body: Int, _ size: F3, _ local: F3, _ color: F3,
+            collision: Bool = true, rotation: Quat = Quat(real: 1, imag: .zero)
+        ) {
+            _ = s.addCollider(
+                body: body, size: size, friction: 0.25,
+                localPosition: local, localRotation: rotation, collisionEnabled: collision, renderColor: color
+            )
+        }
+        // Machined fixture, PCB and shielded panel jack. No guide rails or
+        // supporting track touches the flying connector during insertion.
+        let table = box(F3(0.30, 0.18, 0.006), F3(-0.07, 0, -0.003), F3(0.21, 0.24, 0.28))
+        _ = box(F3(0.043, 0.050, 0.020), F3(0.027, 0, 0.010), steel)
+        let board = box(F3(0.060, 0.048, 0.0016), F3(0.031, 0, 0.0208), F3(0.025, 0.24, 0.18))
+        for y: Float in [-0.019, 0.019] {
+            for x: Float in [0.009, 0.052] {
+                _ = s.addCollider(
+                    body: board, size: F3(repeating: 0.0025), localPosition: F3(x - 0.031, y, 0.0011),
+                    shape: .sphere, collisionEnabled: false, renderColor: steel)
+            }
+        }
+        let socket = box(F3(0.002, 0.018, 0.013), F3(0.0162, 0, z - 0.001), dark)
+        let socketOrigin = s.bodies[socket].position
+        func wall(
+            _ size: F3, _ p: F3, _ color: F3 = F3(0.065, 0.075, 0.09),
+            rotation: Quat = Quat(real: 1, imag: .zero), collision: Bool = true
+        ) {
+            part(socket, size, p - socketOrigin, color, collision: collision, rotation: rotation)
+        }
+        for sign: Float in [-1, 1] {
+            // 0.16 mm total lateral clearance; real geometry handles alignment.
+            wall(F3(0.014, 0.002, 0.0090), F3(0.008, sign * 0.00692, z))
+            wall(
+                F3(0.0016, 0.0016, 0.0090), F3(0.00035, sign * 0.00705, z),
+                rotation: Quat(angle: -sign * 0.26, axis: F3(0, 0, 1)))
+            // Bottom ledges leave a narrow keyway for the compliant latch.
+            wall(F3(0.015, 0.0042, 0.0015), F3(0.0075, sign * 0.00382, z - 0.00414))
+            wall(F3(0.016, 0.00035, 0.011), F3(0.0075, sign * 0.0091, z - 0.0004), steel)
+            wall(F3(0.00035, 0.0021, 0.011), F3(-0.0003, sign * 0.0082, z - 0.0004), steel)
+        }
+        wall(F3(0.015, 0.01184, 0.0014), F3(0.0075, 0, z + 0.00412))
+        wall(F3(0.016, 0.01855, 0.00035), F3(0.0075, 0, z + 0.00528), steel)
+        wall(F3(0.016, 0.01855, 0.00035), F3(0.0075, 0, z - 0.0060), steel)
+        // Rounded molded entry lip and relief behind it. The soft tab bends
+        // over this cam; a sharp leading box face would catch its underside.
+        _ = s.addCollider(
+            body: socket, size: F3(0.0022, 0.0006, 0), friction: 0.25,
+            localPosition: F3(0.0007, 0, z - 0.0047) - socketOrigin,
+            localRotation: Quat(angle: .pi / 2, axis: F3(1, 0, 0)), shape: .capsule, renderColor: dark)
+        wall(F3(0.011, 0.0034, 0.0006), F3(0.0092, 0, z - 0.0052))
+        // Termination pins and PCB traces are display geometry on the jack.
+        for i in 0..<8 {
+            wall(
+                F3(0.002, 0.00042, 0.001), F3(0.018, Float(i) * 0.00102 - 0.00357, 0.0222), gold,
+                collision: false)
+        }
+        let initial = F3(-0.058, 0.004, z + 0.005)
+        let rotation = Quat(angle: 6 * .pi / 180, axis: F3(0, 0, 1))
+        let wrist = box(F3(0.008, 0.024, 0.024), initial, F3(0.88, 0.40, 0.07))
+        s.bodies[wrist].rotation = rotation
+        for i in s.colliders.indices where s.colliders[i].body == wrist {
+            s.colliders[i].localPosition.z = 0.026
+        }
+        part(wrist, F3(0.021, 0.016, 0.016), F3(-0.014, 0, 0.026), steel)
+        part(wrist, F3(0.055, 0.006, 0.006), F3(-0.034, 0, 0.038), dark)
+        part(wrist, F3(0.006, 0.0006, 0.020), F3(0, -0.0122, 0.026), dark, collision: false)
+        for x: Float in [-0.002, 0.002] {
+            for dz: Float in [0.0175, 0.0345] {
+                _ = s.addCollider(
+                    body: wrist, size: F3(repeating: 0.0014),
+                    localPosition: F3(x, -0.0126, dz), shape: .sphere, collisionEnabled: false,
+                    renderColor: steel)
+            }
+        }
+        for y: Float in [-0.0075, 0.0075] {
+            _ = s.addCollider(
+                body: wrist, size: F3(0.010, 0.0015, 0), localPosition: F3(0, y, 0.014),
+                shape: .capsule, collisionEnabled: false, renderColor: steel)
+        }
+        let tool = box(F3(0.009, 0.027, 0.018), initial, F3(0.14, 0.17, 0.21), density: 15000)
+        s.bodies[tool].rotation = rotation
+        for i in s.colliders.indices where s.colliders[i].body == tool {
+            s.colliders[i].collisionEnabled = false
+            s.colliders[i].isRendered = false
+        }
+        part(tool, F3(0.009, 0.027, 0.006), F3(0, 0, 0.012), dark)
+        for sign: Float in [-1, 1] { part(tool, F3(0.009, 0.005, 0.022), F3(0, sign * 0.011, 0.001), dark) }
+        // The moving carriage and grip jaws form one inertial tool body.
+        for sign: Float in [-1, 1] {
+            part(tool, F3(0.012, 0.003, 0.012), F3(0.0015, sign * 0.0085, 0), steel)
+            part(tool, F3(0.007, 0.001, 0.009), F3(0.0035, sign * 0.0065, 0), dark)
+            for x: Float in [-0.002, 0.005] {
+                _ = s.addCollider(
+                    body: tool, size: F3(repeating: 0.0017), localPosition: F3(x, sign * 0.0102, 0.002),
+                    shape: .sphere, collisionEnabled: false, renderColor: dark)
+            }
+        }
+        let anchors = [F3(0, 0.008, 0), F3(0, -0.004, 0.00693), F3(0, -0.004, -0.00693)]
+        for a in anchors {
+            s.addJoint(
+                SceneJoint(
+                    bodyA: wrist, bodyB: tool, rA: a, rB: a,
+                    stiffnessLin: EthernetInsertionTask.couplingStiffness))
+        }
+        // The wrist is compliant in translation but maintains orientation,
+        // as a robot insertion tool does. Generic AVBD angular joints square
+        // their size-dependent torque arm in the energy; convert Nm/rad here.
+        let wristArm2 = length_squared(s.bodies[wrist].size + s.bodies[tool].size)
+        s.addJoint(
+            SceneJoint(
+                bodyA: wrist, bodyB: tool, rA: .zero, rB: .zero,
+                stiffnessLin: 0, stiffnessAng: 15 / (wristArm2 * wristArm2)))
+        // Chamfered rubber boot in the established grasp, with five fine ribs.
+        part(tool, F3(0.0118, 0.0119, 0.0088), F3(0.0019, 0, 0), blue)
+        for i in 0..<5 {
+            part(
+                tool, F3(0.00065, 0.0121, 0.0090), F3(-0.002 + Float(i) * 0.002, 0, 0), blue, collision: false
+            )
+        }
+        let cableEnd = initial + rotation.act(F3(-0.004, 0, 0))
+        let points = (0...segments).map { i -> F3 in
+            let t = Float(i) / Float(segments)
+            return F3(
+                -0.235 + (cableEnd.x + 0.235) * t,
+                cableEnd.y * t - 0.025 * pow(sin(.pi * t), 2),
+                0.003 + pow(t, 4) * (cableEnd.z - 0.003))
+        }
+        let cable = try! s.addCable(
+            points: points, radius: 0.00273, density: 1450,
+            material: CableMaterial(
+                stretchRigidity: 3000, shearRigidity: 1200,
+                bendRigidity: 0.002, twistRigidity: 0.001, dampingTime: dampingTime), friction: 0.35)
+        stripedCable(&s, cable, color: blue)
+        let end = cable.bodyIDs.last!
+        let bootArm2 = length_squared(s.bodies[tool].size + s.bodies[end].size)
+        s.addJoint(
+            SceneJoint(
+                bodyA: tool, bodyB: end, rA: F3(-0.004, 0, 0), rB: cable.endAnchor,
+                stiffnessLin: 1e6, stiffnessAng: 50 / (bootArm2 * bootArm2)))
+        for body in cable.bodyIDs.dropLast() where length(s.bodies[body].position - cableEnd) < 0.020 {
+            s.collisionExclusions.append(SceneCollisionExclusion(bodyA: tool, bodyB: body))
+        }
+        // Eight round phosphor-bronze spring contacts. Each is a single
+        // native rod with one bending mode at its root: k_tip = 3 E I / L^3.
+        // Continuous capsule/triangle witnesses cover the entire wire length.
+        let leafLength: Float = 0.008
+        let wireRadius: Float = 0.00015
+        let wireI = Float.pi * pow(wireRadius, 4) / 4
+        let leafEI: Float = 110e9 * wireI
+        for i in 0..<8 {
+            let root = F3(0.006, Float(i) * 0.00102 - 0.00357, z + 0.00365)
+            let tip = root + Quat(angle: 0.137, axis: F3(0, 1, 0)).act(F3(leafLength, 0, 0))
+            let wire = try! s.addCable(
+                points: [root, tip], radius: wireRadius, density: 8800,
+                material: CableMaterial(
+                    stretchRigidity: 110e9 * Float.pi * wireRadius * wireRadius,
+                    shearRigidity: 41e9 * Float.pi * wireRadius * wireRadius, bendRigidity: leafEI,
+                    twistRigidity: 82e9 * wireI), friction: 0.25)
+            let leaf = wire.bodyIDs[0]
+            paintBody(&s, leaf, gold)
+            let arm2 = length_squared(s.bodies[socket].size + s.bodies[leaf].size)
+            s.addJoint(
+                SceneJoint(
+                    bodyA: socket, bodyB: leaf, rA: root - socketOrigin,
+                    rB: wire.startAnchor, stiffnessLin: 1e6,
+                    stiffnessAng: (3 * leafEI / leafLength) / (arm2 * arm2)))
+        }
+        // Thin-walled PC housing with a rear crimp cavity. More elements are
+        // placed near the contact face and latch; mass is volume-lumped.
+        let xs: [Float] = [-0.02248, -0.018, -0.013, -0.008, -0.005, -0.002, -0.00035, 0]
+        let ys: [Float] = [-0.00584, -0.00514, -0.00134, 0, 0.00134, 0.00514, 0.00584]
+        let zs: [Float] = [-0.0033, -0.00265, 0.00265, 0.0033]
+        var mesh = EthernetSolid(
+            scene: s, origin: initial + rotation.act(F3(0.008 + EthernetInsertionTask.plugLength, 0, 0)),
+            rotation: rotation,
+            youngModulus: youngModulus)
+        let nx = xs.count
+        let ny = ys.count
+        let nz = zs.count
+        var nodes: [Int: Int] = [:]
+        func key(_ x: Int, _ y: Int, _ z: Int) -> Int { (x * ny + y) * nz + z }
+        func n(_ x: Int, _ y: Int, _ z: Int) -> Int {
+            let k = key(x, y, z)
+            if let id = nodes[k] { return id }
+            let chamfer: Float = x == nx - 1 ? 0.000136 : 0
+            let p = F3(xs[x], ys[y] * (1 - chamfer / 0.00584), zs[z] * (1 - chamfer / 0.0033))
+            let id = mesh.node(p, pc)
+            nodes[k] = id
+            return id
+        }
+        for x in 0..<nx - 1 {
+            for y in 0..<ny - 1 {
+                for k in 0..<nz - 1 {
+                    let hollow = x < 3 && y > 0 && y < ny - 2 && k == 1
+                    if hollow { continue }
+                    let vertices = [
+                        n(x, y, k), n(x + 1, y, k), n(x + 1, y + 1, k), n(x, y + 1, k),
+                        n(x, y, k + 1), n(x + 1, y, k + 1), n(x + 1, y + 1, k + 1), n(x, y + 1, k + 1),
+                    ]
+                    mesh.cell(vertices)
+                }
+            }
+        }
+        let latchYs = ys.indices.filter { abs(ys[$0]) <= 0.001341 }
+        var latch: [[Int]] = []
+        // A 0.47 mm sheet is a bending-dominated member. Use plane-stress
+        // shell elements instead of one layer of locking linear tetrahedra.
+        // Two rows share housing vertices and clamp the root orientation.
+        let latchXs: [Float] = [-0.018, -0.014, -0.010, -0.006, -0.002, 0]
+        for x in latchXs.indices {
+            var row: [Int] = []
+            for y in latchYs {
+                if x >= latchXs.count - 2 {
+                    row.append(n(x == latchXs.count - 1 ? nx - 1 : nx - 3, y, 0))
+                } else {
+                    // Contact thickness rounds the free boundary. Inset the
+                    // midsurface so its outer envelope stays 3.15 mm wide.
+                    let p = F3(
+                        latchXs[x], ys[y],
+                        -0.0033 + 0.068 * (latchXs[x] + 0.002))
+                    row.append(mesh.node(p, pc, radius: 0.000235))
+                }
+            }
+            latch.append(row)
+        }
+        for x in 0..<latch.count - 1 {
+            for y in 0..<latchYs.count - 1 {
+                let a = latch[x]
+                let b = latch[x + 1]
+                mesh.shell((a[y], b[y + 1], b[y]), thickness: 0.00047)
+                mesh.shell((a[y], a[y + 1], b[y + 1]), thickness: 0.00047)
+            }
+        }
+        let latchIDs = Array(Set(latch.flatMap { $0 })).sorted()
+        // Rear housing lip bonded to the held boot. The rest of the housing
+        // and the entire free latch remain deformable under jack contact.
+        // Stable attachment order also makes the solver's graph identical
+        // across processes with different Swift dictionary hash seeds.
+        for k in nodes.keys.sorted() where k / (ny * nz) == 0 {
+            let id = nodes[k]!
+            let p = mesh.scene.bodies[id].position
+            mesh.scene.addJoint(
+                SceneJoint(
+                    bodyA: tool, bodyB: id, rA: rotation.inverse.act(p - initial), rB: .zero,
+                    stiffnessLin: 1e5))
+        }
+        // Thin gold plating is a material skin, embedded in the actual FEM
+        // tetrahedra. It follows deformation without sliver volume elements.
+        var platedVertices: [SceneSkinnedVertex] = []
+        var platedTris: [(Int, Int, Int)] = []
+        for i in 0..<8 {
+            let c = Float(i) * 0.00102 - 0.00357
+            for x in 4..<nx - 1 {
+                let base = platedVertices.count
+                for (px, py) in [
+                    (xs[x], c - 0.00023), (xs[x + 1], c - 0.00023),
+                    (xs[x + 1], c + 0.00023), (xs[x], c + 0.00023),
+                ] {
+                    let top: Float = px == 0 ? 0.003164 : 0.0033
+                    let target = mesh.origin + rotation.act(F3(px, py, top + 0.000060))
+                    var best: (Float, SceneSkinnedVertex)?
+                    for tet in mesh.scene.tets {
+                        let ids = [tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3]
+                        let p = ids.map { mesh.scene.bodies[$0].position }
+                        let inv = simd_float3x3(columns: (p[1] - p[0], p[2] - p[0], p[3] - p[0])).inverse
+                        let v = inv * (target - p[0])
+                        let w = SIMD4<Float>(1 - v.x - v.y - v.z, v.x, v.y, v.z)
+                        let score = max(0, -w.min())
+                        if best == nil || score < best!.0 {
+                            best = (
+                                score,
+                                SceneSkinnedVertex(
+                                    ids: tet.ids, weights: w,
+                                    restNormal: rotation.act(F3(0, 0, 1)),
+                                    restInv0: F3(inv.columns.0.x, inv.columns.1.x, inv.columns.2.x),
+                                    restInv1: F3(inv.columns.0.y, inv.columns.1.y, inv.columns.2.y),
+                                    restInv2: F3(inv.columns.0.z, inv.columns.1.z, inv.columns.2.z),
+                                    color: gold)
+                            )
+                        }
+                    }
+                    platedVertices.append(best!.1)
+                }
+                platedTris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+            }
+        }
+        mesh.scene.addSkinnedMesh(SceneSkinnedMesh(vertices: platedVertices, triangles: platedTris))
+        EthernetVisuals.finish(&mesh.scene, bodies: [table, board, wrist, tool], table: table)
+        mesh.scene.rigidMotionGroups = [[tool] + mesh.nodes]
+        let nose = nodes.filter { $0.key / (ny * nz) == nx - 1 }.map(\.value).sorted()
+        return EthernetInsertionTask(
+            scene: mesh.scene, socketBody: socket, contactWires: Array(mesh.scene.cables.dropFirst()),
+            wristBody: wrist, toolBody: tool, noseNodes: nose,
+            plugNodes: mesh.nodes, latchNodes: latchIDs, couplingAnchors: anchors, lateralError: lateralError,
+            yawError: yawError)
+    }
+}
+
+private struct EthernetSolid {
     var scene: PhysicsScene
-    mutating func node(_ p: F3, _ color: F3) -> Int {
-        let id = scene.addParticle(radius: 0.002, mass: 0.000001, friction: 0.25, position: p)
+    var origin: F3
+    var rotation: Quat
+    var youngModulus: Float
+    var nodes: [Int] = []
+    mutating func node(_ p: F3, _ color: F3, radius: Float = 0.000025) -> Int {
+        let id = scene.addParticle(
+            radius: radius, mass: 0, friction: 0.25, position: origin + rotation.act(p))
         paintBody(&scene, id, color)
+        nodes.append(id)
         return id
     }
-    mutating func cell(_ v: [Int], mu: Float) {
-        for t in [(0,1,2,6),(0,2,3,6),(0,3,7,6),(0,7,4,6),(0,4,5,6),(0,5,1,6)] {
-            let ids = [v[t.0],v[t.1],v[t.2],v[t.3]]
+    mutating func shell(_ ids: (Int, Int, Int), thickness: Float) {
+        let poisson: Float = 0.37
+        let p = [ids.0, ids.1, ids.2].map { scene.bodies[$0].position }
+        let area = length(cross(p[1] - p[0], p[2] - p[0])) / 2
+        for id in [ids.0, ids.1, ids.2] {
+            let r = scene.bodies[id].size.x / 2
+            scene.bodies[id].density += (1200 * area * thickness / 3) / (4 * .pi / 3 * r * r * r)
+        }
+        scene.addTri(
+            SceneTri(
+                ids: ids, mu: youngModulus * thickness / (2 * (1 + poisson)),
+                lambda: youngModulus * thickness * poisson / (1 - poisson * poisson),
+                bend: youngModulus * pow(thickness, 3) / (12 * (1 - poisson * poisson)),
+                selfCollisionEnabled: false))
+    }
+    mutating func cell(_ v: [Int]) {
+        let poisson: Float = 0.37
+        let mu = youngModulus / (2 * (1 + poisson))
+        let lambda = youngModulus * poisson / ((1 + poisson) * (1 - 2 * poisson))
+        for t in [(0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6), (0, 7, 4, 6), (0, 4, 5, 6), (0, 5, 1, 6)] {
+            let ids = [v[t.0], v[t.1], v[t.2], v[t.3]]
             let p = ids.map { scene.bodies[$0].position }
-            let mass = 30 * abs(dot(p[1]-p[0], cross(p[2]-p[0], p[3]-p[0]))) / 24
+            let mass = 1200 * abs(dot(p[1] - p[0], cross(p[2] - p[0], p[3] - p[0]))) / 24
             for id in ids {
-                // addParticle uses a sphere density to encode nodal mass.
-                let r = scene.bodies[id].size.x * 0.5
+                let r = scene.bodies[id].size.x / 2
                 scene.bodies[id].density += mass / (4 * .pi / 3 * r * r * r)
             }
-            scene.addTet(SceneTet(ids: (ids[0],ids[1],ids[2],ids[3]), mu: mu, lambda: 5*mu))
+            scene.addTet(SceneTet(ids: (ids[0], ids[1], ids[2], ids[3]), mu: mu, lambda: lambda))
         }
     }
 }

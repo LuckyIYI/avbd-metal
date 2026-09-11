@@ -299,5 +299,5 @@ kernel void skin_deform(
     if (length(n) < 1e-10f) n = n0;
 
     out[gid].position = float4(p, 1);
-    out[gid].normal = float4(softSafeNormalize(n), 0);
+    out[gid].normal = float4(softSafeNormalize(n), b.restNormal.w);
 }

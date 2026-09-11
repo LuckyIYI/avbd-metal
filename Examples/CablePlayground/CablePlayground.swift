@@ -18,6 +18,11 @@ final class Playground: ObservableObject, GPUSimRendererSource {
     @Published var failure: String?
     @Published var parameters: [String: Float] = [:]
     var solver: GPUSolver!
+    var ethernetTask: EthernetInsertionTask?
+    var ethernetRun: EthernetInsertionRun?
+    @Published var taskPhase = "Settle"
+    @Published var insertionDepth: Float = 0
+    @Published var toolForce: Float = 0
     var dragSlot = 0
     var grab: (body: Int, local: F3)?
     var rendererSceneRevision = 0
@@ -38,7 +43,13 @@ final class Playground: ObservableObject, GPUSimRendererSource {
     }
 
     func load() throws {
-        var scene = Demos.make(name, params: parameters)!
+        ethernetTask = name == "cableethernet" ? Demos.ethernetInsertionTask(
+            youngModulus: (parameters["youngMPa"] ?? 2400)*1e6,
+            lateralError: (parameters["offsetMM"] ?? 0)*0.001,
+            yawError: (parameters["yawDeg"] ?? 0)*Float.pi/180) : nil
+        var scene = ethernetTask?.scene ?? Demos.make(name, params: parameters)!
+        ethernetRun = ethernetTask.map { EthernetInsertionRun(task: $0) }; taskPhase = "Settle"
+        insertionDepth = 0; toolForce = 0
         dragSlot = scene.addDragSlot()
         solver = try GPUSolver(scene: scene)
         timestep = Double(scene.settings.dt)
@@ -66,10 +77,31 @@ final class Playground: ObservableObject, GPUSimRendererSource {
         accumulator += min(now - lastTime, 0.05)
         do {
             while accumulator >= timestep {
-                try solver.submitStep()
+                try advancePhysics()
                 accumulator -= timestep
             }
         } catch { rendererDidFail(error.localizedDescription) }
+    }
+
+    /// The same authored wrist command is used by the headless task test.
+    /// Only the wrist is driven. Plug, latch, cable and tool remain dynamic.
+    func advancePhysics() throws {
+        if var run = ethernetRun {
+            let task = run.task, command = run.command
+            solver.setDrivenBodyStates([.init(body:task.wristBody,position:command.position,
+                rotation:command.rotation,linearVelocity:command.linearVelocity,
+                angularVelocity:command.angularVelocity)])
+            try solver.submitStep()
+            let nose = task.noseNodes.reduce(F3.zero) { $0 + solver.bodyPosition($1) } / Float(task.noseNodes.count)
+            run.observe(toolPosition:solver.bodyPosition(task.toolBody),
+                        toolRotation:solver.bodyRotation(task.toolBody),noseCenter:nose)
+            ethernetRun = run
+            if run.step % 16 == 0 || run.stopped {
+                toolForce = length(run.force)
+                insertionDepth = run.noseCenter.x
+                taskPhase = run.phase
+            }
+        } else {try solver.submitStep()}
     }
 
     func rendererDidFail(_ message: String) { failure = message; running = false }
@@ -82,7 +114,7 @@ final class Playground: ObservableObject, GPUSimRendererSource {
     func updateDrag(origin: F3, direction: F3) {
         guard let grab else { return }
         let anchor = solver.bodyPosition(grab.body) + solver.bodyRotation(grab.body).act(grab.local)
-        let depth = max(dot(anchor - origin, direction), 1)
+        let depth = max(dot(anchor - origin, direction), name == "cableethernet" ? 0.001 : 1)
         solver.setDrag(jointIndex: dragSlot, body: grab.body,
             worldTarget: origin + direction * depth, localAnchor: grab.local,
             stiffness: 50 * max(1, solver.bodyMass(grab.body)))
@@ -105,10 +137,11 @@ final class CableView: MTKView {
         guard renderer != nil, framedName != model.name else { return }
         framedName = model.name
         renderer.automaticallyFramesScene = false
-        renderer.azimuth = model.name == "cablegrippers" ? -2.25 : -1.85
-        renderer.elevation = model.name == "cablegrippers" ? 0.24 : 0.5
-        renderer.distance = model.name == "cableethernet" ? 3.0 : 4.2
-        renderer.target = F3(-0.2, 0, (model.name == "cablegrippers" || model.name == "cableplastic") ? 1.5 : 0.8)
+        renderer.sceneLengthScale = model.name == "cableethernet" ? 0.01 : 1
+        renderer.azimuth = model.name == "cableethernet" ? -2.35 : model.name == "cablegrippers" ? -2.25 : -1.85
+        renderer.elevation = model.name == "cableethernet" ? 0.38 : model.name == "cablegrippers" ? 0.24 : 0.5
+        renderer.distance = model.name == "cableethernet" ? 0.13 : 4.2
+        renderer.target = model.name == "cableethernet" ? F3(-0.013,0,0.034) : F3(-0.2, 0, (model.name == "cablegrippers" || model.name == "cableplastic") ? 1.5 : 0.8)
     }
 
     func ray(_ event: NSEvent) -> (F3, F3) {
@@ -138,7 +171,7 @@ final class CableView: MTKView {
         renderer.target.z += Float(event.deltaY) * scale
     }
     override func scrollWheel(with event: NSEvent) {
-        renderer.distance = min(max(renderer.distance * (1 - Float(event.scrollingDeltaY) * 0.02), 0.6), 30)
+        renderer.distance = min(max(renderer.distance * (1 - Float(event.scrollingDeltaY) * 0.02), model.name == "cableethernet" ? 0.025 : 0.6), 30)
     }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 49 { model.running.toggle() }
@@ -177,9 +210,16 @@ struct PlaygroundContent: View {
                     }
                     Spacer()
                     Button(model.running ? "Pause" : "Play") { model.running.toggle() }
-                    Button("Reset") { model.reset() }
+                    Button(model.name == "cableethernet" ? "Replay" : "Reset") { model.reset(); model.running = true }
                 }
                 Text(Demos.cableDemoInstructions(model.name) ?? "").font(.callout)
+                if model.name == "cableethernet" {
+                    HStack(spacing: 24) {
+                        Text(model.taskPhase).font(.headline).foregroundStyle(model.ethernetRun?.stopped == true ? .red : .primary)
+                        Text(String(format:"Depth  %.2f mm", model.insertionDepth*1000))
+                        Text(String(format:"Tool load  %.2f N / 20 N", model.toolForce))
+                    }.font(.callout.monospacedDigit())
+                }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 320))], alignment: .leading, spacing: 8) {
                     ForEach(Demos.tunables(model.name)) { parameter in
                         HStack {
@@ -247,20 +287,8 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
             model.endDrag()
         }
     }
-    if insert && model.name == "cableethernet" {
-        let cable = Demos.make(model.name)!.cables[0]
-        let body = cable.bodyIDs.last!
-        for _ in 0..<240 { try model.solver.submitStep() }
-        let initial = model.solver.bodyPosition(body) + model.solver.bodyRotation(body).act(cable.endAnchor)
-        for frame in 0..<360 {
-            let t = min(Float(frame+1) / 288, 1)
-            model.solver.setDrag(jointIndex: model.dragSlot, body: body,
-                worldTarget: mix(initial, F3(0.22,0,initial.z), t: F3(repeating: t)),
-                localAnchor: cable.endAnchor, stiffness: 50)
-            for _ in 0..<4 { try model.solver.submitStep() }
-        }
-    }
-    for _ in 0..<steps { try model.solver.submitStep() }
+    let count = insert && model.name == "cableethernet" ? max(steps,3840) : steps
+    for _ in 0..<count { try model.advancePhysics() }
     try model.solver.synchronize()
     let renderer = try GPUSimRenderer(device: model.solver.device, source: model)
     renderer.options = model.rendererOptions
@@ -268,7 +296,8 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
     if model.name == "cablegrippers" || model.name == "cableplastic" {
         renderer.setCamera(position: F3(-1.5, -4.0, 2.4), target: F3(-0.1, 0, 1.5), up: F3(0, 0, 1))
     } else if model.name == "cableethernet" {
-        renderer.setCamera(position: F3(-1.8, -2.5, 2.3), target: F3(-0.45, 0, 0.86), up: F3(0, 0, 1))
+        renderer.sceneLengthScale = 0.01
+        renderer.setCamera(position: F3(-0.082,-0.10,0.080), target: F3(-0.013,0,0.034), up: F3(0,0,1))
     } else {
         renderer.setCamera(position: F3(-2.3, -3.8, 3.0), target: F3(-0.25, 0, 0.8), up: F3(0, 0, 1))
     }

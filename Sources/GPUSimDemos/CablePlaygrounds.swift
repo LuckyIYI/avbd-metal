@@ -4,7 +4,7 @@ import simd
 public extension Demos {
     static func cableDemoTitle(_ name: String) -> String? {
         switch name {
-        case "cableethernet": return "Ethernet Insertion"
+        case "cableethernet": return "Ethernet — Robotic Insertion"
         case "cabletwisting": return "Twist Laboratory"
         case "cablegrippers": return "Snap-fit Cable Routing"
         case "cableplastic": return "Bend & Keep"
@@ -15,7 +15,7 @@ public extension Demos {
     static func cableDemoInstructions(_ name: String) -> String? {
         switch name {
         case "cableethernet":
-            return "Drag the ribbed blue boot toward the socket. The plug and latch deform against its rigid walls. Pull back to unplug; grab the plug itself to test its compliance."
+            return "Watch the tool align and physically insert a deformable Ethernet plug. A 20 N force limit stops a jam. Change alignment error to challenge the insertion; Replay starts a fresh attempt."
         case "cabletwisting":
             return "The left chuck winds two striped cables together. Watch the stripes carry the twist. Grab a strand to deflect it, or set Turns / s to zero."
         case "cablegrippers":

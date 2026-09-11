@@ -55,6 +55,11 @@ public final class GPUSolver {
         }
     }
 
+    private var rigidMotionMembers: MTLBuffer?
+    private var rigidMotionOwners: MTLBuffer?
+    private var rigidMotionMass: MTLBuffer?
+    private var rigidMotionRanges: [SIMD2<UInt32>] = []
+
     // Capacities
     let numBodies: Int
     let numColliders: Int
@@ -1734,6 +1739,7 @@ public final class GPUSolver {
             scene: scene, convexUpload: convexUpload,
             rigidHierarchy: rigidHierarchy,
             broadphaseItemCount: broadphaseItemCount)
+        try prepareRigidMotionGroups(scene)
         // This CSR is only a high-color optimization. If Metal cannot
         // reserve it, retain the placeholder and use the global reducer.
         if effectiveSurfaceTruncationMode == .planarDAT,
@@ -1759,6 +1765,82 @@ public final class GPUSolver {
         let sv = spinVel.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         for sp in scene.spinners {
             sv[sp.body] = SIMD4(sp.axis * sp.omega, 1)
+        }
+    }
+
+    public enum RigidMotionGroupError: Error, LocalizedError {
+        case unsupported(String)
+        public var errorDescription: String? {
+            switch self {
+            case .unsupported(let reason):
+                return "Unsupported rigid motion solver group: \(reason)"
+            }
+        }
+    }
+
+    private func prepareRigidMotionGroups(_ scene: PhysicsScene) throws {
+        guard !scene.rigidMotionGroups.isEmpty else { return }
+        var owners = [UInt32](repeating: 0, count: numBodies)
+        var members: [UInt32] = []
+        var groupMass: [Float] = [0]
+        let positions = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        for (index, group) in scene.rigidMotionGroups.enumerated() {
+            guard !group.isEmpty else { throw RigidMotionGroupError.unsupported("empty block") }
+            let start = members.count
+            var mass: Float = 0
+            for body in group {
+                guard scene.bodies.indices.contains(body), scene.bodies[body].isDynamic,
+                    owners[body] == 0
+                else {
+                    throw RigidMotionGroupError.unsupported("invalid, static or repeated member")
+                }
+                owners[body] = UInt32(index + 1); members.append(UInt32(body)); mass += positions[body].w
+            }
+            rigidMotionRanges.append(SIMD2(UInt32(start), UInt32(group.count)))
+            groupMass.append(mass)
+        }
+        for tet in scene.tets {
+            let groups = Set([tet.ids.0, tet.ids.1, tet.ids.2, tet.ids.3].map { owners[$0] })
+            guard groups.count == 1 else { throw RigidMotionGroupError.unsupported("partial tetrahedron") }
+        }
+        for tri in scene.tris {
+            let groups = Set([tri.ids.0, tri.ids.1, tri.ids.2].map { owners[$0] })
+            guard groups.count == 1 else { throw RigidMotionGroupError.unsupported("partial membrane") }
+        }
+        guard !hasVolumetricSelfCollision, !hasTorsionalFriction else {
+            throw RigidMotionGroupError.unsupported("volume self-contact or torsional contact")
+        }
+        for j in scene.joints where j.bodyA >= 0 && owners[j.bodyA] != 0 && owners[j.bodyA] == owners[j.bodyB]
+        {
+            guard j.cable == nil, j.stiffnessAng == 0, j.hingeAxis == nil,
+                j.prismaticAxis == nil, j.motorTorque == 0
+            else {
+                throw RigidMotionGroupError.unsupported("internal joint must be a ball attachment")
+            }
+        }
+        for spring in scene.springs where spring.bodyA >= 0 && owners[spring.bodyA] != 0 {
+            guard owners[spring.bodyA] != owners[spring.bodyB] else {
+                throw RigidMotionGroupError.unsupported("internal distance spring")
+            }
+        }
+        rigidMotionMembers = device.makeBuffer(
+            bytes: members, length: members.count * 4, options: .storageModeShared)
+        rigidMotionOwners = device.makeBuffer(
+            bytes: owners, length: owners.count * 4, options: .storageModeShared)
+        rigidMotionMass = device.makeBuffer(
+            bytes: groupMass, length: groupMass.count * 4, options: .storageModeShared)
+        guard rigidMotionMembers != nil && rigidMotionOwners != nil && rigidMotionMass != nil else {
+            throw AVBDError.allocFailed("rigid motion groups")
+        }
+        // Isolate optional code from established fast-math shader compilation.
+        let urls = try Self.shaderResourceURLs().filter {
+            $0.lastPathComponent != Self.hierarchyShaderName
+                && $0.lastPathComponent != Self.optimizedConvexShaderName
+        }
+        let lib = try Self.compileLibrary(device: device, urls: urls)
+        for name in ["rigid_motion_solve", "rigid_motion_contact_penalties"] {
+            guard let fn = lib.makeFunction(name: name) else { throw AVBDError.kernelMissing(name) }
+            pso[name] = try device.makeComputePipelineState(function: fn)
         }
     }
 
@@ -2065,6 +2147,7 @@ public final class GPUSolver {
         let urls = try shaderResourceURLs().filter {
             $0.lastPathComponent != hierarchyShaderName
                 && $0.lastPathComponent != optimizedConvexShaderName
+                && $0.lastPathComponent != "45_rigid_motion.metal"
         }
         return try compileLibrary(device: device, urls: urls)
     }
@@ -2094,6 +2177,7 @@ public final class GPUSolver {
         let urls = try shaderResourceURLs().filter {
             $0.lastPathComponent != hierarchyShaderName
                 && $0.lastPathComponent != "30_narrowphase.metal"
+                && $0.lastPathComponent != "45_rigid_motion.metal"
         }
         return try compileLibrary(
             device: device, urls: urls,
@@ -2654,7 +2738,9 @@ public final class GPUSolver {
         var maxCollisionParticleRadius: Float = 0
         for (i, ids) in collTris.enumerated() {
             let (a, b, c) = ids
-            tp4[i] = SIMD4(UInt32(a), UInt32(b), UInt32(c), 0)
+            // Closed tet faces have certified outward winding. Native cable
+            // contacts use it instead of a two-sided shell's side memory.
+            tp4[i] = SIMD4(UInt32(a), UInt32(b), UInt32(c), i >= scene.tris.count ? 1 : 0)
             let emitsEE = i < scene.tris.count
             for (u, v) in [(a, b), (b, c), (a, c)] {
                 let key = UInt64(min(u, v)) << 32 | UInt64(max(u, v))
@@ -2863,7 +2949,7 @@ public final class GPUSolver {
             // explicitly author self-collision. Inter-component soft contact
             // remains unconditional in the pair kernels.
             var selfCollisionRoots = Set<Int>()
-            for tri in scene.tris {
+            for tri in scene.tris where tri.selfCollisionEnabled {
                 selfCollisionRoots.insert(findCollisionRoot(tri.ids.0))
             }
             for tet in scene.tets where tet.selfCollisionEnabled {
@@ -3250,7 +3336,12 @@ public final class GPUSolver {
                     g.weights = v.weights
                     let n = length_squared(v.restNormal) > 1e-12
                         ? normalize(v.restNormal) : F3(0, 0, 1)
-                    g.restNormal = SIMD4(n, 0)
+                    var packedColor: UInt32 = 0
+                    if let color = v.color {
+                        let rgb = simd_clamp(color, .zero, F3(repeating: 1)) * 255
+                        packedColor = 0x01000000 | (UInt32(rgb.x) << 16) | (UInt32(rgb.y) << 8) | UInt32(rgb.z)
+                    }
+                    g.restNormal = SIMD4(n, Float(bitPattern: packedColor))
                     if length_squared(v.restInv0) + length_squared(v.restInv1)
                         + length_squared(v.restInv2) > 1e-16 {
                         g.inv0 = SIMD4(v.restInv0, 0)
@@ -5222,6 +5313,9 @@ public final class GPUSolver {
         var nExcl = numExclusions
         let isPlanarDAT = P.surfaceTruncationMode
             == SurfaceTruncationMode.planarDAT.rawValue
+        if !rigidMotionRanges.isEmpty && isPlanarDAT {
+            throw RigidMotionGroupError.unsupported("Planar-DAT")
+        }
         // Both kernels implement the same fixed-plane reduction. A global
         // pair-parallel pass is cheaper for the 2-3 color palettes typical
         // of thin shells; a body-incidence pass avoids rereading the stream
@@ -6254,7 +6348,7 @@ public final class GPUSolver {
 
         let noRSplit = ProcessInfo.processInfo.environment[
             "AVBD_NO_RSPLIT"] != nil
-        let useCompactManifoldSolve = usesDynamicColoring
+        let useCompactManifoldSolve = rigidMotionRanges.isEmpty && usesDynamicColoring
             && numParticles == 0
             && numBodies > Self.orderedColoringBodyLimit
             && !hasTorsionalFriction
@@ -6380,6 +6474,16 @@ public final class GPUSolver {
                 dynColorSrc = finalColors
             }
         }
+        if !rigidMotionRanges.isEmpty {
+            dispatchIndirect(enc, "rigid_motion_contact_penalties", argsOffset: 6) { e in
+                e.setBuffer(self.manifolds, offset: 0, index: 0)
+                e.setBuffer(self.softContacts, offset: 0, index: 1)
+                e.setBuffer(self.rigidMotionOwners, offset: 0, index: 2)
+                e.setBuffer(self.rigidMotionMass, offset: 0, index: 3)
+                e.setBuffer(self.counters, offset: 0, index: 4)
+                e.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 5)
+            }
+        }
         // Narrowphase is finished with prevManifolds at this point. Reuse
         // that 704-byte/slot buffer for a 48-byte header stream followed by
         // eight slot-major 64-byte contact streams. This gives the repeated
@@ -6426,7 +6530,7 @@ public final class GPUSolver {
             || (ProcessInfo.processInfo.environment["AVBD_PERSIST"] != nil
                 && ProcessInfo.processInfo.environment[
                     "AVBD_NO_PERSIST"] == nil)
-        if multiOK && !isPlanarDAT && !hasTorsionalFriction
+        if multiOK && rigidMotionRanges.isEmpty && !isPlanarDAT && !hasTorsionalFriction
             && numBodies <= 4096 {
             let tgW = min(256, multiPSO.maxTotalThreadsPerThreadgroup)
             var ntg = UInt32(min(8, max(1, (numBodies + tgW - 1) / tgW + 1)))
@@ -6460,7 +6564,7 @@ public final class GPUSolver {
             noteDispatch("raw")
             enc.dispatchThreadgroups(MTLSize(width: Int(ntg), height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
-        } else if persistentRequested && !isPlanarDAT
+        } else if persistentRequested && rigidMotionRanges.isEmpty && !isPlanarDAT
                     && numBodies <= persistPSO.maxTotalThreadsPerThreadgroup {
             // small scene: the whole solve loop in ONE dispatch — hundreds
             // of per-dispatch launch/barrier latencies become threadgroup
@@ -6695,6 +6799,26 @@ public final class GPUSolver {
                     MTLSize(width: 1, height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(width: 256, height: 1,
                                                    depth: 1))
+            }
+            for (groupIndex, range) in rigidMotionRanges.enumerated() {
+                var group = UInt32(groupIndex + 1), span = range
+                enc.setComputePipelineState(ps("rigid_motion_solve"))
+                for (index, buffer) in [posLin, posAng, initLin, initAng,
+                    inertLin, inertAng, props, joints, springs, manifolds,
+                    adjStart, degrees, adjList, shape, softContacts].enumerated() {
+                    enc.setBuffer(buffer, offset: 0, index: index)
+                }
+                enc.setBuffer(rigidMotionMembers, offset: 0, index: 15)
+                enc.setBuffer(rigidMotionOwners, offset: 0, index: 16)
+                enc.setBytes(&span, length: 8, index: 17)
+                enc.setBytes(&group, length: 4, index: 18)
+                enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 19)
+                enc.setBuffer(boundsBuf, offset: 0, index: 20)
+                enc.setBuffer(ogcPrevBuf, offset: 0, index: 21)
+                enc.setBuffer(counters, offset: 0, index: 22)
+                noteDispatch("rigid_motion_solve")
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
             }
             if profiling { try stage("solve-dual") }
             let dualName = hasTorsionalFriction
