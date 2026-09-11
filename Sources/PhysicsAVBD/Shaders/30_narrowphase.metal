@@ -473,6 +473,72 @@ inline void npcSwap(thread NPCVertex& a, thread NPCVertex& b) {
     b = t;
 }
 
+// First failed pair, captured before failed-frame pose restoration. The
+// poison allocation has 32 words; word 0 retains its original safety ABI.
+inline void npcCaptureFailure(device atomic_uint* poison,
+    thread const NPCShape& a, thread const NPCShape& b)
+{
+    uint expected = 0u;
+    while (!atomic_compare_exchange_weak_explicit(&poison[1], &expected, 1u,
+        memory_order_relaxed, memory_order_relaxed)) {
+        if (expected != 0u) return;
+    }
+    device uint* words = reinterpret_cast<device uint*>(poison);
+    words[2] = a.collider; words[3] = b.collider;
+    device float4* data = reinterpret_cast<device float4*>(words + 4);
+    data[0] = float4(a.center, float(a.kind)); data[1] = a.rotation;
+    data[2] = a.dimensions;
+    data[3] = float4(b.center, float(b.kind)); data[4] = b.rotation;
+    data[5] = b.dimensions;
+}
+
+// A support point whose perpendicular projection lies strictly inside a
+// box face supplies an exact separated closest-point pair: the face normal
+// is a separating axis and the witness reaches that lower distance bound.
+// This bounded feature query also works inside the speculative contact band.
+inline NPCResult npcBoxFaceWitness(
+    thread const NPCShape& shape, thread const NPCShape& box,
+    device const uint2* colliderHullRange,
+    device const float4* convexHullVertices)
+{
+    NPCResult out; out.valid = false; out.overlap = false;
+    if (box.kind != 0u) return out;
+    NPCShape localBox, localShape;
+    float3 origin; float4 rotation;
+    npcMakeAFrame(box, shape, localBox, localShape, origin, rotation);
+    float3 halfExtent = localBox.dimensions.xyz * 0.5f;
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        for (uint side = 0u; side < 2u; ++side) {
+            float3 normal = float3(0);
+            normal[axis] = side == 0u ? -1.0f : 1.0f;
+            NPCShapePoint point = npcShapeSupport(localShape, -normal,
+                colliderHullRange, convexHullVertices);
+            float gap = dot(point.point, normal) - halfExtent[axis];
+            float error = 1.0e-5f + 32.0f * FLT_EPSILON
+                * (length(point.point) + length(localShape.center)
+                   + length(shape.dimensions.xyz) + length(box.dimensions.xyz));
+            if (!finite3(point.point) || !finite_bits(gap)
+                || !finite_bits(error) || gap <= error) continue;
+            float3 projected = point.point - normal * gap;
+            uint u = (axis + 1u) % 3u, v = (axis + 2u) % 3u;
+            if (fabs(projected[u]) >= halfExtent[u] - error
+                || fabs(projected[v]) >= halfExtent[v] - error) continue;
+            out.valid = true;
+            out.pointA = point.point; out.pointB = projected;
+            out.normalAB = -normal; out.signedDistance = gap;
+            out.featureA = point.feature;
+            // Box-face feature namespace used by the manifold helpers below.
+            out.featureB = 0x20000000u | (2u * axis + side);
+            NPCResult world = npcResultFromAFrame(out, origin, rotation);
+            world.valid = finite3(world.pointA) && finite3(world.pointB)
+                && finite3(world.normalAB)
+                && fabs(dot(world.normalAB, world.normalAB) - 1.0f) <= 5.0e-5f;
+            return world;
+        }
+    }
+    return out;
+}
+
 // Port of Newton/Jitter's XenoCollide portal refinement. It supplies stable
 // penetration witnesses directly, avoiding EPA's unbounded face expansion.
 inline NPCResult npcMPRWithEnlargeLocal(
@@ -1807,6 +1873,131 @@ struct TorusHit {
 // not retain MPR/GJK, clipping workspaces, or convex-only buffer accesses in
 // its generated code. Both passes still consume the same deterministic pair
 // stream and address the same manifold slot by `gid`.
+// Complete polyhedral SAT for the rare polytope query that MPR/GJK cannot
+// certify. Unlike a box-face-only guess this includes hull faces and every
+// edge/edge cross axis, so floor-edge contacts are classified too.
+inline bool npcSATAxis(
+    thread const NPCShape& a, thread const NPCShape& b, float3 axis,
+    device const uint2* ranges, device const float4* vertices,
+    thread float& bestGap, thread float3& bestNormal)
+{
+    float lengthSquared = dot(axis, axis);
+    if (!finite_bits(lengthSquared)) return false;
+    if (lengthSquared == 0.0f) return true; // exactly parallel edges
+    float3 n = axis * rsqrt(lengthSquared);
+    if (!finite3(n)) return false;
+    float aMax = dot(npcShapeSupport(a, n, ranges, vertices).point, n);
+    float aMin = dot(npcShapeSupport(a, -n, ranges, vertices).point, n);
+    float bMax = dot(npcShapeSupport(b, n, ranges, vertices).point, n);
+    float bMin = dot(npcShapeSupport(b, -n, ranges, vertices).point, n);
+    float forward = bMin - aMax, reverse = aMin - bMax;
+    if (!finite_bits(forward) || !finite_bits(reverse)) return false;
+    if (forward > bestGap) { bestGap = forward; bestNormal = n; }
+    if (reverse > bestGap) { bestGap = reverse; bestNormal = -n; }
+    return true;
+}
+
+inline NPCResult npcPolySATWitness(
+    thread const NPCShape& a, thread const NPCShape& b, float maxDistance,
+    device const uint2* ranges, device const float4* vertices,
+    device const uint* assetIDs, device const ConvexHullGPU* hulls,
+    device const ConvexFaceGPU* faces, device const uint* loops,
+    device const ConvexEdgeGPU* edges)
+{
+    NPCResult out; out.valid = false; out.overlap = false;
+    if (!((a.kind == 0u || a.kind == 4u)
+        && (b.kind == 0u || b.kind == 4u))) return out;
+    NPCShape localA, localB;
+    float3 origin; float4 rotation;
+    npcMakeAFrame(a, b, localA, localB, origin, rotation);
+    uint facesA = npcPolyFaceCount(localA, assetIDs, hulls);
+    uint facesB = npcPolyFaceCount(localB, assetIDs, hulls);
+    uint edgesA = npcPolyEdgeCount(localA, assetIDs, hulls);
+    uint edgesB = npcPolyEdgeCount(localB, assetIDs, hulls);
+    // Fail closed outside the complete-query budget; never truncate axes.
+    // Detailed rounded floors against small hardware exceed 16K edge axes.
+    // 64K covers that captured case while keeping rare recovery bounded.
+    if (facesA == 0u || facesB == 0u || edgesA == 0u || edgesB == 0u
+        || facesA > 2048u || facesB > 2048u
+        || edgesA > 2048u || edgesB > 2048u
+        || edgesA * edgesB > 65536u) return out;
+    float bestGap = -FLT_MAX; float3 bestNormal = float3(1,0,0);
+    for (uint side = 0u; side < 2u; ++side) {
+        NPCShape shape = side == 0u ? localA : localB;
+        uint count = side == 0u ? facesA : facesB;
+        for (uint f = 0u; f < count; ++f) {
+            NPCPolyFace face = npcPolyFace(shape, f, assetIDs, hulls, faces);
+            if (!face.valid || !npcSATAxis(localA, localB, face.normal,
+                ranges, vertices, bestGap, bestNormal)) return out;
+        }
+    }
+    for (uint i = 0u; i < edgesA; ++i) {
+        NPCPolyEdge ea = npcPolyEdge(localA, i, assetIDs, hulls, edges, vertices);
+        if (!ea.valid) return out;
+        for (uint j = 0u; j < edgesB; ++j) {
+            NPCPolyEdge eb = npcPolyEdge(localB, j, assetIDs, hulls, edges, vertices);
+            if (!eb.valid || !npcSATAxis(localA, localB,
+                cross(ea.b - ea.a, eb.b - eb.a),
+                ranges, vertices, bestGap, bestNormal)) return out;
+        }
+    }
+    if (bestGap > 0.0f) {
+        // Edge-edge separation at a box rim: enumerate candidates rather than
+        // accepting the heuristic edge score used for manifold enrichment.
+        // Any pair of surface points attaining the SAT lower bound certifies
+        // the closest distance (within the existing local witness tolerance).
+        uint countA = npcPolyEdgeCount(localA, assetIDs, hulls);
+        uint countB = npcPolyEdgeCount(localB, assetIDs, hulls);
+        float supportA = dot(npcShapeSupport(localA, bestNormal, ranges, vertices).point, bestNormal);
+        float supportB = dot(npcShapeSupport(localB, -bestNormal, ranges, vertices).point, bestNormal);
+        for (uint i = 0u; i < countA; ++i) {
+            NPCPolyEdge ea = npcPolyEdge(localA, i, assetIDs, hulls, edges, vertices);
+            if (!ea.valid) return out;
+            if (min(fabs(dot(ea.a, bestNormal)-supportA),
+                    fabs(dot(ea.b, bestNormal)-supportA)) > 5.0e-5f) continue;
+            for (uint j = 0u; j < countB; ++j) {
+                NPCPolyEdge eb = npcPolyEdge(localB, j, assetIDs, hulls, edges, vertices);
+                if (!eb.valid) return out;
+                if (min(fabs(dot(eb.a, bestNormal)-supportB),
+                        fabs(dot(eb.b, bestNormal)-supportB)) > 5.0e-5f) continue;
+                float3 pa, pb;
+                npClosestSegSeg(ea.a, ea.b, eb.a, eb.b, pa, pb);
+                float distance = length(pb-pa);
+                if (!finite3(pa) || !finite3(pb) || !finite_bits(distance)
+                    || distance <= 0.0f || fabs(distance-bestGap) > 5.0e-5f) continue;
+                out.pointA=pa; out.pointB=pb; out.signedDistance=distance;
+                out.normalAB=(pb-pa)/distance;
+                out.featureA=(localA.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE) | i;
+                out.featureB=(localB.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE) | j;
+                out.valid=true; out.overlap=false;
+                return npcResultFromAFrame(out, origin, rotation);
+            }
+        }
+    }
+    NPCManifoldContact contacts[MAX_CONTACTS]; uint attempts = 0u;
+    int count = npcBuildPolyhedralManifold(localA, localB, bestNormal, maxDistance,
+        ranges, vertices, assetIDs, hulls, faces, loops, edges, contacts, attempts);
+    // Reconstruct actual surface witnesses, not unrelated support vertices.
+    for (int i = 0; i < count; ++i) {
+        out.pointA = contacts[i].pointA; out.pointB = contacts[i].pointB;
+        out.normalAB = bestNormal;
+        out.signedDistance = dot(out.pointB - out.pointA, bestNormal);
+        out.featureA = contacts[i].features.x; out.featureB = contacts[i].features.y;
+        // For separation, SAT is only a lower bound. A surface witness must
+        // attain that bound before it can serve as a closest-point result.
+        out.overlap = true;
+        out.valid = bestGap <= 0.0f ? out.signedDistance <= 0.0f
+            : out.signedDistance > 0.0f
+                && fabs(out.signedDistance - bestGap) <= 5.0e-5f;
+        if (npcCorrectedMPRInAFrameIsConsistent(out)) {
+            out.overlap = bestGap <= 0.0f;
+            return npcResultFromAFrame(out, origin, rotation);
+        }
+    }
+    out.valid = false;
+    return out;
+}
+
 template <bool CONVEX_PASS, bool ENHANCED_ANALYTIC_ONLY>
 inline void npCollidePass(
     device const float4* posLin,
@@ -1980,6 +2171,29 @@ inline void npCollidePass(
                     }
                 }
                 if (!recovered) {
+                    NPCResult face = npcBoxFaceWitness(convexA, convexB,
+                        colliderHullRange, convexHullVertices);
+                    if (!face.valid) {
+                        face = npcBoxFaceWitness(convexB, convexA,
+                            colliderHullRange, convexHullVertices);
+                        if (face.valid) {
+                            NPCResult mapped = face;
+                            mapped.pointA = face.pointB; mapped.pointB = face.pointA;
+                            mapped.normalAB = -face.normalAB;
+                            mapped.featureA = face.featureB; mapped.featureB = face.featureA;
+                            face = mapped;
+                        }
+                    }
+                    if (face.valid) { result = face; recovered = true; }
+                }
+                if (!recovered) {
+                    NPCResult sat = npcPolySATWitness(convexA, convexB, maxDetect,
+                        colliderHullRange, convexHullVertices, colliderConvexAssetID,
+                        convexHulls, convexFaces, convexFaceVertexIndices, convexEdges);
+                    if (sat.valid) { result = sat; recovered = true; }
+                }
+                if (!recovered) {
+                    npcCaptureFailure(convexQueryPoison, convexA, convexB);
                     latchConvexQueryFailure(counters, convexQueryPoison);
                     outM.header = uint4(ba, bb, 0, 0);
                     return;
@@ -3080,6 +3294,7 @@ kernel void convex_query_fail_for_testing(
         NPCResult exhausted = npcGJKWithIterationLimit(
             a, b, 0.1f, colliderHullRange, convexHullVertices, 0);
         if (!exhausted.valid) {
+            npcCaptureFailure(convexQueryPoison, a, b);
             latchConvexQueryFailure(counters, convexQueryPoison);
         }
     }

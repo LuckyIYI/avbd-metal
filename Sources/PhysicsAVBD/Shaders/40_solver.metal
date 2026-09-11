@@ -747,6 +747,15 @@ kernel void warmstart_joints(
     float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
     float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
     float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+    if (j.response.x > 0.0f) {
+        if (j.prismaticAxis.w != 0) {
+            j.response.w=dot(q_rotate(qA,j.prismaticAxis.xyz),pB-pA);
+        } else {
+            float4 r=q_mul(q_inv(q_mul(qA,j.restRel)),posAng[b]);
+            if (r.w<0) r=-r;
+            j.response.w=2.0f*atan2(dot(r.xyz,j.hingeAxis.xyz),r.w);
+        }
+    }
     float torqueArm = j.C0Lin.w;
 
     j.C0Lin = float4(j.prismaticAxis.w != 0
@@ -898,6 +907,25 @@ inline M3 geomStiffBallSocket(int k, float3 v) {
     return m;
 }
 
+// Passive piecewise-linear effort. Positive residual curvature is retained;
+// negative curvature at a detent barrier is projected to zero, not inverted.
+inline float2 responseForce(device const JointGPU& j,float q,float dt,bool hinge) {
+    uint count=uint(j.response.x);
+    float force=j.responseKnots[0].y,slope=0;
+    if (q>=j.responseKnots[count-1].x) force=j.responseKnots[count-1].y;
+    else if (q>j.responseKnots[0].x) {
+        for (uint i=1;i<count;++i) if (q<=j.responseKnots[i].x) {
+            float2 a=j.responseKnots[i-1].xy,b=j.responseKnots[i].xy;
+            slope=(b.y-a.y)/(b.x-a.x);force=a.y+slope*(q-a.x);break;
+        }
+    }
+    float dq=q-j.response.w;
+    if (hinge) dq-=6.2831853f*floor((dq+3.14159265f)/6.2831853f);
+    float c=j.response.y/max(dt,1e-6f),raw=force-c*dq;
+    return float2(clamp(raw,-j.response.z,j.response.z),
+        fabs(raw)<j.response.z ? max(0.0f,-slope+c) : 0.0f);
+}
+
 inline void stampJoint(device const JointGPU& j, uint self,
                        device const float4* posLin, device const float4* posAng,
                        device const float4* initAng, float alpha, float dt,
@@ -906,6 +934,32 @@ inline void stampJoint(device const JointGPU& j, uint self,
     uint a = j.header.x, b = j.header.y;
     bool isA = self == a;
     float torqueArm = j.C0Lin.w;
+
+    if (j.response.x > 0.0f) {
+        float4 qA=a==WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+        if (j.prismaticAxis.w != 0) {
+            float3 xA=a==WORLD_BODY ? float3(0) : posLin[a].xyz;
+            float3 pA=a==WORLD_BODY ? j.rA.xyz : xform(xA,qA,j.rA.xyz);
+            float3 rB=q_rotate(posAng[b],j.rB.xyz),pB=posLin[b].xyz+rB;
+            float3 axis=q_rotate(qA,j.prismaticAxis.xyz);
+            float q=dot(axis,pB-pA);
+            float2 law=responseForce(j,q,dt,false);
+            float3 lin=axis*(isA ? -1.0f : 1.0f);
+            float3 ang=isA ? cross(axis,pB-xA) : cross(rB,axis);
+            acc.rhsLin-=lin*law.x;acc.rhsAng-=ang*law.x;
+            acc.lhsLin=m3_add(acc.lhsLin,m3_scale(m3_outer(lin,lin),law.y));
+            acc.lhsAng=m3_add(acc.lhsAng,m3_scale(m3_outer(ang,ang),law.y));
+            acc.lhsCross=m3_add(acc.lhsCross,m3_scale(m3_outer(ang,lin),law.y));
+        } else {
+            float4 r=q_mul(q_inv(q_mul(qA,j.restRel)),posAng[b]);
+            if (r.w<0) r=-r;
+            float q=2.0f*atan2(dot(r.xyz,j.hingeAxis.xyz),r.w);
+            float2 law=responseForce(j,q,dt,true);
+            float3 axis=q_rotate(posAng[b],j.hingeAxis.xyz)*(isA ? -1.0f : 1.0f);
+            acc.rhsAng-=axis*law.x;
+            acc.lhsAng=m3_add(acc.lhsAng,m3_scale(m3_outer(axis,axis),law.y));
+        }
+    }
 
     // Linear
     float3 penLin = j.penaltyLin.xyz;
@@ -1028,7 +1082,7 @@ inline void stampJoint(device const JointGPU& j, uint self,
                     float over = max(twist - j.limits.y, 0.0f)
                                + min(twist - j.limits.x, 0.0f);
                     if (over != 0.0f) {
-                        float kL = 4.0e4f;
+                        float kL = j.limits.w;
                         float FL = clamp(kL * over, -3000.0f, 3000.0f);
                         float sm = (self == a) ? -1.0f : 1.0f;
                         acc.lhsAng = m3_add(acc.lhsAng,
@@ -2781,7 +2835,32 @@ static inline void dual_joint_one(
     float fracture = j.C0Ang.w;
     float3 la = j.lambdaAng.xyz;
     float lin2 = (j.header.w & 8) ? length_squared(j.lambdaLin.xyz) : 0.0f;
-    if ((j.header.w & 4) && dot(la, la) + lin2 > fracture * fracture) {
+    bool failed=false;
+    if (j.header.w & 64) {
+        float4 qA=a==WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+        float3 reactionLin=j.lambdaLin.xyz;
+        if (!(j.header.w & 1)) {
+            float3 pA=a==WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz,qA,j.rA.xyz);
+            float3 pB=xform(posLin[b].xyz,posAng[b],j.rB.xyz);
+            reactionLin=penLin*(j.prismaticAxis.w != 0 ? prismaticError(j,pA-pB,qA) : pA-pB);
+        }
+        float3 reactionAng=la;
+        if (!(j.header.w & 2)) {
+            float3 C=j.hingeAxis.w != 0
+                ? cross(q_rotate(q_mul(qA,j.restRel),j.hingeAxis.xyz),q_rotate(posAng[b],j.hingeAxis.xyz))*torqueArm
+                : q_sub(q_mul(qA,j.restRel),posAng[b])*torqueArm;
+            reactionAng=penAng*C;
+        }
+        float3 torque=reactionAng*torqueArm;
+        if (j.hingeAxis.w != 0) {
+            float3 aA=q_rotate(q_mul(qA,j.restRel),j.hingeAxis.xyz),aB=q_rotate(posAng[b],j.hingeAxis.xyz);
+            torque=torqueArm*(dot(aA,aB)*reactionAng-aA*dot(aB,reactionAng));
+        }
+        uint channels=uint(j.breakLoad.z);
+        failed=((channels&1) && length(reactionLin)>j.breakLoad.x)
+            || ((channels&2) && length(torque)>j.breakLoad.y);
+    } else if (j.header.w & 4) failed=dot(la,la)+lin2>fracture*fracture;
+    if (failed) {
         j.penaltyLin = float4(0);
         j.penaltyAng = float4(0);
         j.lambdaLin = float4(0);
@@ -3525,4 +3604,63 @@ kernel void diag_error(
         return;
     }
     atomic_fetch_max_explicit(&diag[0], as_type<uint>(err), memory_order_relaxed);
+}
+
+// Sparse rigid contact scheduling. The atomic order is irrelevant: each
+// lane updates a distinct original manifold. The primal adjacency stream
+// and persistent contact identities are deliberately left unchanged.
+kernel void active_rigid_clear(device atomic_uint* list [[buffer(0)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid == 0) atomic_store_explicit(list, 0u, memory_order_relaxed);
+}
+kernel void active_rigid_gather(
+    device const ManifoldGPU* manifolds [[buffer(0)]],
+    device const atomic_uint* counters [[buffer(1)]],
+    device atomic_uint* list [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint n = atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed);
+    if (gid >= n || manifolds[gid].header.z == 0) return;
+    uint slot = atomic_fetch_add_explicit(list, 1u, memory_order_relaxed);
+    atomic_store_explicit(&list[slot + 1], gid, memory_order_relaxed);
+}
+kernel void active_rigid_args(device const uint* list [[buffer(0)]],
+    device uint* args [[buffer(1)]], constant SimParams& P [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid != 0) return;
+    args[6] = (P.numJoints + list[0] + 63u) / 64u;
+    args[7] = 1u; args[8] = 1u;
+}
+kernel void dual_rigid_active(
+    device const float4* posLin [[buffer(0)]],
+    device const float4* posAng [[buffer(1)]],
+    device const float4* initLin [[buffer(2)]],
+    device const float4* initAng [[buffer(3)]],
+    device JointGPU* joints [[buffer(4)]],
+    device ManifoldGPU* manifolds [[buffer(5)]],
+    device const atomic_uint* counters [[buffer(6)]],
+    constant SimParams& P [[buffer(7)]],
+    device SpringGPU* springs [[buffer(8)]],
+    device SoftContactGPU* soft [[buffer(9)]],
+    device const SolverManifoldGPU* solveManifolds [[buffer(10)]],
+    device SolverContactGPU* solveContacts [[buffer(11)]],
+    constant uint& compact [[buffer(12)]],
+    constant uint& writeBack [[buffer(13)]],
+    device const uint* list [[buffer(14)]],
+    device float4* torsionState [[buffer(15)]],
+    constant uint& torsion [[buffer(16)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid < P.numJoints) {
+        dual_joint_one(posLin, posAng, joints, P, gid); return;
+    }
+    uint slot = gid - P.numJoints;
+    if (slot >= list[0]) return;
+    uint mi = list[slot + 1];
+    if (compact != 0u) {
+        dual_solver_manifold_one(posLin, posAng, initLin, initAng,
+            solveManifolds, solveContacts, manifolds, writeBack != 0u, P, mi);
+    } else {
+        dual_manifold_one(posLin, posAng, initLin, initAng, manifolds, P, mi);
+    }
+    if (torsion != 0u) dual_torsion_one(posLin, posAng, initLin, initAng,
+                                     manifolds, torsionState, P, mi);
 }

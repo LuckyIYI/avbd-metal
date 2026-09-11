@@ -347,9 +347,12 @@ struct JointGPU {
     float4 translationLimits; // x/y: metres, z: enabled, w: warm-start stop (-1/0/+1)
     float4 motor;       // x = angle/velocity target, y = effort limit,
                         // z = pad, w = position-PD kp (zero for velocity)
-    float4 limits;      // x/y = twist range, z = kd, w = pad
+    float4 limits;      // x/y = twist range, z = kd, w = stop stiffness
     float4 dynamics;    // x = armature, y = inertial-predicted twist,
                         // z = start-of-step explicit effort
+    float4 response; // count, damping, effort cap, initial coordinate
+    float4 breakLoad; // force, torque, enabled force/torque bits, pad
+    float4 responseKnots[16];
 };
 
 inline float3 prismaticError(device const JointGPU& j, float3 delta, float4 qA) {
