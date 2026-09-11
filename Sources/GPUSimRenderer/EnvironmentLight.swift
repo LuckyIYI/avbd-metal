@@ -21,6 +21,7 @@ public final class GPUSimEnvironmentLight {
   ) throws {
     guard texture.device.registryID == device.registryID, texture.textureType == .type2D,
       texture.sampleCount == 1, texture.storageMode != .memoryless,
+      Self.supportsColorSampling(texture.pixelFormat),
       texture.usage == .unknown || texture.usage.contains(.shaderRead)
     else { throw Failure.invalidTexture }
     guard (64...65536).contains(diffuseSamples)
@@ -49,6 +50,45 @@ public final class GPUSimEnvironmentLight {
     command.waitUntilCompleted()
     guard command.status == .completed else {
       throw Failure.preparation(String(describing: command.error))
+    }
+  }
+
+  // Only formats that the floating-point color sampler can consume. Keep this
+  // explicit so new integer/depth formats cannot silently reach a GPU encoder.
+  private static func supportsColorSampling(_ format: MTLPixelFormat) -> Bool {
+    switch format {
+    case .a8Unorm, .r8Unorm, .r8Unorm_srgb, .r8Snorm,
+      .r16Unorm, .r16Snorm, .r16Float, .r32Float,
+      .rg8Unorm, .rg8Unorm_srgb, .rg8Snorm,
+      .rg16Unorm, .rg16Snorm, .rg16Float, .rg32Float,
+      .rgba8Unorm, .rgba8Unorm_srgb, .rgba8Snorm, .bgra8Unorm, .bgra8Unorm_srgb,
+      .rgba16Unorm, .rgba16Snorm, .rgba16Float, .rgba32Float,
+      .b5g6r5Unorm, .a1bgr5Unorm, .abgr4Unorm, .bgr5A1Unorm,
+      .rgb10a2Unorm, .bgr10a2Unorm, .rg11b10Float, .rgb9e5Float,
+      .bgr10_xr, .bgr10_xr_srgb, .bgra10_xr, .bgra10_xr_srgb,
+      .bc1_rgba, .bc1_rgba_srgb, .bc2_rgba, .bc2_rgba_srgb,
+      .bc3_rgba, .bc3_rgba_srgb, .bc4_rUnorm, .bc4_rSnorm,
+      .bc5_rgUnorm, .bc5_rgSnorm, .bc6H_rgbFloat, .bc6H_rgbuFloat,
+      .bc7_rgbaUnorm, .bc7_rgbaUnorm_srgb,
+      .eac_r11Unorm, .eac_r11Snorm, .eac_rg11Unorm, .eac_rg11Snorm,
+      .eac_rgba8, .eac_rgba8_srgb, .etc2_rgb8, .etc2_rgb8_srgb,
+      .etc2_rgb8a1, .etc2_rgb8a1_srgb:
+      return true
+    case .astc_4x4_srgb, .astc_5x4_srgb, .astc_5x5_srgb, .astc_6x5_srgb,
+      .astc_6x6_srgb, .astc_8x5_srgb, .astc_8x6_srgb, .astc_8x8_srgb,
+      .astc_10x5_srgb, .astc_10x6_srgb, .astc_10x8_srgb, .astc_10x10_srgb,
+      .astc_12x10_srgb, .astc_12x12_srgb,
+      .astc_4x4_ldr, .astc_5x4_ldr, .astc_5x5_ldr, .astc_6x5_ldr,
+      .astc_6x6_ldr, .astc_8x5_ldr, .astc_8x6_ldr, .astc_8x8_ldr,
+      .astc_10x5_ldr, .astc_10x6_ldr, .astc_10x8_ldr, .astc_10x10_ldr,
+      .astc_12x10_ldr, .astc_12x12_ldr,
+      .astc_4x4_hdr, .astc_5x4_hdr, .astc_5x5_hdr, .astc_6x5_hdr,
+      .astc_6x6_hdr, .astc_8x5_hdr, .astc_8x6_hdr, .astc_8x8_hdr,
+      .astc_10x5_hdr, .astc_10x6_hdr, .astc_10x8_hdr, .astc_10x10_hdr,
+      .astc_12x10_hdr, .astc_12x12_hdr:
+      return true
+    default:
+      return false
     }
   }
 

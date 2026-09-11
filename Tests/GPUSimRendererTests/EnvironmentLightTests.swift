@@ -67,6 +67,46 @@ final class EnvironmentLightTests: XCTestCase {
     XCTAssertEqual(resources.textureBytes, tex.allocatedSize)
   }
 
+  func testRejectsIntegerDepthAndStencilEnvironmentTextures() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let formats: [MTLPixelFormat] = [.r32Uint, .rgba8Sint, .rgba16Uint,
+      .depth16Unorm, .depth32Float, .depth32Float_stencil8, .stencil8]
+    for format in formats {
+      let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: format, width: 16, height: 8, mipmapped: false)
+      descriptor.storageMode = .private
+      descriptor.usage = .shaderRead
+      let texture = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+      XCTAssertThrowsError(try GPUSimEnvironmentLight(device: device, texture: texture)) { error in
+        guard case GPUSimEnvironmentLight.Failure.invalidTexture = error else {
+          return XCTFail("Expected CPU validation for \(format), got \(error)")
+        }
+      }
+    }
+  }
+
+  func testAcceptsNormalizedSRGBAndFloatingPointEnvironmentTextures() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let formats: [MTLPixelFormat] = [.rgba8Unorm, .rgba8Unorm_srgb, .bgra8Unorm_srgb,
+      .rgba8Snorm, .rgba16Float, .rgba32Float]
+    for format in formats {
+      let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: format, width: 16, height: 8, mipmapped: false)
+      descriptor.storageMode = .shared
+      descriptor.usage = .shaderRead
+      let texture = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+      let bytesPerPixel = format == .rgba32Float ? 16 : (format == .rgba16Float ? 8 : 4)
+      let bytes = [UInt8](repeating: 0, count: 16 * 8 * bytesPerPixel)
+      bytes.withUnsafeBytes {
+        texture.replace(region: MTLRegionMake2D(0, 0, 16, 8), mipmapLevel: 0,
+          withBytes: $0.baseAddress!, bytesPerRow: 16 * bytesPerPixel)
+      }
+      let environment = try GPUSimEnvironmentLight(device: device, texture: texture, diffuseSamples: 64)
+      let coefficients = environment.irradiance.contents().assumingMemoryBound(to: SIMD4<Float>.self)
+      for i in 0..<9 { XCTAssertEqual(coefficients[i], .zero, "\(format)") }
+    }
+  }
+
   func testEnvironmentValidationAndSharedTextureBudget() throws {
     let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
     let tex = try texture(device, color: SIMD4(repeating: 1))
