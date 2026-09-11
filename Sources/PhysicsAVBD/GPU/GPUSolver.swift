@@ -2478,6 +2478,7 @@ public final class GPUSolver {
                     g.translationLimits = SIMD4(limits.lowerBound, limits.upperBound, 1, 0)
                 }
             }
+            precondition(j.limitStiffness.isFinite && j.limitStiffness > 0, "hinge stop stiffness must be finite and positive")
             if let axis = j.hingeAxis {
                 g.hingeAxis = SIMD4(axis, 1)
                 g.dynamics.x = j.armature
@@ -2485,7 +2486,7 @@ public final class GPUSolver {
                     g.motor = SIMD4(j.motorTarget, j.motorTorque, 0,
                                     j.motorStiffness)
                     g.limits = SIMD4(j.limitLo, j.limitHi,
-                                    j.motorDamping, 0)
+                                    j.motorDamping, j.limitStiffness)
                     switch j.motorMode {
                     case .implicitPositionPD:
                         g.header.w |= Self.jointMotorModeImplicitPositionPD
@@ -2501,7 +2502,7 @@ public final class GPUSolver {
                     }
                 }
                 if j.limitLo < j.limitHi && j.motorTorque == 0 {
-                    g.limits = SIMD4(j.limitLo, j.limitHi, 0, 0)
+                    g.limits = SIMD4(j.limitLo, j.limitHi, 0, j.limitStiffness)
                 }
             }
             // A hard articulation constraint must be load-bearing on its

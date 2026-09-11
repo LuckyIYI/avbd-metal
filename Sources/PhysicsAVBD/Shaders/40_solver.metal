@@ -1028,7 +1028,7 @@ inline void stampJoint(device const JointGPU& j, uint self,
                     float over = max(twist - j.limits.y, 0.0f)
                                + min(twist - j.limits.x, 0.0f);
                     if (over != 0.0f) {
-                        float kL = 4.0e4f;
+                        float kL = j.limits.w;
                         float FL = clamp(kL * over, -3000.0f, 3000.0f);
                         float sm = (self == a) ? -1.0f : 1.0f;
                         acc.lhsAng = m3_add(acc.lhsAng,
