@@ -127,20 +127,23 @@ private func closestPointsOnSegments(_ p0: F3, _ p1: F3, _ q0: F3, _ q1: F3) -> 
     var s: Float = 0
     var t: Float = 0
 
-    if a <= SAT_AXIS_EPSILON && e <= SAT_AXIS_EPSILON {
+    if a <= 1e-20 && e <= 1e-20 {
         return (p0, q0)
     }
-    if a <= SAT_AXIS_EPSILON {
+    if a <= 1e-20 {
         t = simd_clamp(f / e, 0, 1)
     } else {
         let c = dot(d1, r)
-        if e <= SAT_AXIS_EPSILON {
+        if e <= 1e-20 {
             s = simd_clamp(-c / a, 0, 1)
         } else {
             let b = dot(d1, d2)
-            let denom = a * e - b * b
-            if abs(denom) > SAT_AXIS_EPSILON {
-                s = simd_clamp((b * f - c * e) / denom, 0, 1)
+            // This determinant has units length^4. An absolute SAT epsilon
+            // classified short, crossing cable segments as parallel.
+            let normal = cross(d1, d2)
+            let denom = dot(normal, normal)
+            if denom > 1e-12 * a * e {
+                s = simd_clamp(dot(cross(d2, r), normal) / denom, 0, 1)
             }
             t = (b * s + f) / e
             if t < 0 {

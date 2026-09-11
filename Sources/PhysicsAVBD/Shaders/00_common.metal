@@ -355,6 +355,8 @@ struct JointGPU {
     // JOINT_CABLE tagged layout: motor.xyz = linear stiffness,
     // limits.xyz = angular stiffness, motor.w = damping time.
     // C0Lin/Ang.xyz = initial strain; other motor/constraint state is inactive.
+    // limits.w = bend yield angle (0 disables); lambdaAng.xyz = committed
+    // plastic bending coordinates. These are material state, not AL duals.
 };
 
 struct CableRotationLog { float3 value; M3 derivative; };
@@ -376,6 +378,24 @@ inline CableRotationLog cableRotationLog(float4 q) {
     M3 skew = m3_skew(result.value);
     result.derivative = m3_add(m3_add(m3_identity(), m3_scale(skew, -0.5f)),
                               m3_scale(m3_mulm(skew, skew), coefficient));
+    return result;
+}
+
+struct CableBendResponse { float3 elastic; M3 tangent; };
+inline CableBendResponse cableBendResponse(float3 strain, float3 plastic,
+                                          float yieldAngle) {
+    float3 trial = strain - plastic;
+    CableBendResponse result = { trial, m3_identity() };
+    if (yieldAngle <= 0.0f) return result;
+    float3 bend = float3(trial.xy, 0);
+    float magnitude = length(bend);
+    if (magnitude > yieldAngle) {
+        float3 direction = bend / magnitude;
+        float scale = yieldAngle / magnitude;
+        result.elastic = float3(bend.xy * scale, trial.z);
+        result.tangent = m3_add(m3_diag(float3(scale, scale, 1)),
+            m3_scale(m3_outer(direction, direction), -scale));
+    }
     return result;
 }
 
@@ -549,12 +569,17 @@ struct NPCResult {
 #define NPC_MAX_FACE_VERTICES 32
 
 struct ManifoldGPU {
-    uint4 header;       // bodyA, bodyB, numContacts, active
+    uint4 header;       // bodyA, bodyB, numContacts, active/anchor flags
     uint4 colliderPair; // colliderA, colliderB (warm-start identity), pad
     float4 basisN;      // w = friction
     float4 basisT1;     // t2 = cross(n, t1)
     ContactGPU contacts[MAX_CONTACTS];
 };
+
+// Material capsule contacts must use the reference lever arms in the Taylor
+// value AND Jacobian. Current-frame arms spuriously turn axial material spin
+// into normal separation under repeated iterations.
+#define MANIFOLD_FIXED_CONTACT_FRAME 8u
 
 // Iterative-solver view of a rigid contact manifold. Persistence and
 // narrowphase need the fixed 8-contact, 704-byte record above; the solver

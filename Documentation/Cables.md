@@ -1,4 +1,4 @@
-# Elastic cables
+# Elastic and plastic cables
 
 `PhysicsScene.addCable` creates a native elastic rod from a polyline. Each
 segment has six degrees of freedom, cylinder mass/inertia, a capsule collider,
@@ -76,8 +76,10 @@ Nonadjacent segments and other bodies use the existing capsule narrow phase,
 friction, collision groups and exclusion APIs. Cable friction anchors rotate
 with the segment material. Contact is discrete: choose a timestep and segment
 length appropriate to the radius, speed and curvature. There is no new CCD
-guarantee. Very short, thick segments may need additional nearby-pair
-exclusions because their capsule caps overlap beyond immediate neighbors.
+guarantee. Authoring also excludes local pairs whose intervening rest arclength
+is shorter than the diameter. This prevents overlapping capsule caps from
+fighting the material at high resolution; distant folds and separate cables
+retain contact.
 
 ## Energy and solver integration
 
@@ -95,8 +97,9 @@ exact linear torque versus angle for pure bend or twist. This is a discrete
 Cosserat-style material, distinct from Newton's curvature-binormal/Bishop
 bend-twist split. At large simultaneous bend and twist the models differ.
 Neighboring rest-relative rotations must stay below pi; refine the cable for
-tight bends or concentrated twist. Plasticity, hysteresis, fracture, dedicated
-cable friction, and a continuous surface mesh are not implemented.
+tight bends or concentrated twist. Optional bending plasticity is described
+below. Fracture, a dedicated cable friction law, and a continuous surface mesh
+are not implemented.
 
 The damping potential is `½ (dampingTime/dt) Δcᵀ K Δc` plus the analogous
 angular term. Initial strains are cached before prediction, and analytic
@@ -112,8 +115,112 @@ or multiplier clamping. The cable flag selects a dedicated stamp within the
 existing joint dispatch, including scalar, SIMD and fused solver paths. It
 uses the inactive motor fields as explicitly tagged material storage and
 preserves the 256-byte joint ABI. No cable-only buffers or dispatches are
-added. Undamped joints skip history evaluation; zero angular rigidity skips
+added. Elastic undamped joints skip history evaluation; zero angular rigidity skips
 the angular logarithm. Reset preserves the material coefficients.
+
+## Interactive Cable Lab
+
+```sh
+swift run -c release cable-playground cablegrippers
+```
+
+The standalone macOS viewer has a scene picker, pause/reset, material damping
+and environmental drag sliders, and these four demos. The Development app
+also lists them.
+
+| Scene ID | Interaction |
+|---|---|
+| `cablethreading` | Feed the gold tip through three rigid torus guides. |
+| `cabletwisting` | Two clamped, striped strands wind into a braid. |
+| `cablegrippers` | Pull a routed cable out of four white C clips on a grooved L frame. |
+| `cableplastic` | Bend the blue elastic and copper plastic cantilevers; release to compare spring-back. |
+
+![Cable braid after 20 seconds](Images/Cables/braid.png)
+
+![Routed cable in four deformable snap clips](Images/Cables/snap-clips.png)
+
+Left-drag a cable to grab it. Option-drag or drag empty space to orbit,
+right-drag to pan, and scroll to zoom. Space pauses; R resets. The gold ends
+are pickable. Clips are conforming tetrahedral soft bodies with pinned rear
+surfaces and freely deforming lips. Retention and release come from contact,
+without cable-to-clip joints. The clip scene enables contact-aware coloring.
+
+For a reproducible render:
+
+```sh
+swift run -c release cable-playground cabletwisting --snapshot /tmp/braid.png --steps 2400
+```
+
+The twisting drive keeps adding turns; turn it down or pause to inspect the
+braid. The regression covers 30 simulated seconds at the default drive rate,
+not unlimited winding or arbitrary speed.
+
+## Damping and permanent bending
+
+Internal damping acts on changes in material strain, so it does not damp a
+uniform translation. A slow mode can remain underdamped despite strong
+high-frequency damping. The interactive presets use `dampingTime = 0.12 s`
+and the existing scene-level rigid viscous drag at `0.8 /s`. Both controls
+can be set to zero. Drag applies to all dynamic rigid bodies in the scene,
+using `v *= exp(-drag * dt)` (and the corresponding angular velocity rule).
+It is an environmental dissipation approximation, not a fitted air model:
+there is no wind field, directional drag coefficient, or Reynolds-number law.
+The values are illustrative presets, not measurements of a particular cable.
+
+For a cable that keeps a permanent bend, pass `yieldCurvature` in radians per
+metre to `CableMaterial` or `.circular`. Nil preserves the elastic behavior.
+For example, `bendRigidity: 0.8` and `yieldCurvature: 1.5` give a 1.2 N m
+bending yield moment regardless of segment resolution. Stretch and twist
+remain elastic; length does not plastically grow.
+
+The plastic law is isotropic, rate-independent, ideal plastic bending in the
+two rest-frame bending coordinates. With total angular strain `e`, committed
+plastic bend `p`, and `y = yieldCurvature * L`, form the trial `b = (e-p).xy`.
+Project `b` onto the disk of radius `y` to obtain elastic bending strain.
+This is the gradient of a quadratic/linear incremental bending energy;
+the radial-return tangent is positive semidefinite. Unloading is elastic,
+and loading beyond the threshold changes the stress-free bend. No hardening,
+Dahl friction model, viscoplastic creep, or plastic twist is implied.
+
+The preceding accepted pose commits plastic state once at the next step's
+warmstart. Every current primal iterate uses a return-mapped trial against
+that fixed history; solver iterations never accumulate plastic deformation.
+Damping uses the change in **total** strain, avoiding a spurious damping
+impulse when the plastic rest state changes. Plastic state reuses the cable
+joint's inactive `lambdaAng` storage, and the yield angle uses `limits.w`.
+No buffer, dispatch, or CPU readback is added. `setDrivenBodyStates` preserves
+material history; episode resets through `setBodyStates` clear plastic state
+on incident cable joints. Recreating the solver also restores authored rest.
+
+Newton offers a [Dahl cable hysteresis example](https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_bundle_hysteresis.py).
+This implementation uses the simpler return-map law above and does not claim
+to reproduce that model or measured cable hysteresis.
+
+## Collision corrections and coverage
+
+The twisting regression originally measured 53.8 mm overlap between 54 mm
+diameter strands. The contact Taylor value used reference-frame pose deltas
+with current-frame lever arms, allowing axial spin to invent normal separation.
+Material capsule contacts now use reference lever arms consistently in primal
+and dual updates, including packed and fallback Metal paths and the CPU
+reference. This applies to cable/cable and cable/rigid analytic or convex
+contacts. Legacy world-offset round anchors retain their convention.
+
+The shared segment-distance query also uses scale-relative parallel tests
+and a cross-product denominator, so short or near-parallel crossing segments
+keep their interior witnesses.
+
+| Interaction | Scope |
+|---|---|
+| Cable / cable, including distant self-contact | Corrected segment query, consistent contact frame, local rest-arclength exclusions. |
+| Cable / box, sphere, torus, convex hull | Consistent contact frame; existing shape-specific collision geometry remains. |
+| Cable / soft body | Existing rigid-to-triangle path. Capsules use three sphere samples on the centreline; coverage is approximate, particularly with long segments. |
+
+The soft-body path is not upgraded to exact swept-capsule/triangle collision
+by this change. Clip retention, lip deformation, and mouse release are tested
+for the supplied mesh and cable resolution. This is not a general no-crossing
+guarantee for thin or rapidly moving soft surfaces. Discrete rigid contact
+also permits solver slop and can tunnel under sufficiently large motion.
 
 ## Validation and performance
 
@@ -122,6 +229,13 @@ Run the standalone CPU/Metal validation without XCTest or external packages:
 ```sh
 swift run -c release cable-validation
 swift run -c release cable-validation --benchmark
+swift run -c release cable-validation --materials
+swift run -c release cable-validation --rigid-contact
+swift run -c release cable-validation --collision-stress
+swift run -c release cable-validation --collision-stress --segments 80
+swift run -c release cable-validation --collision-stress --mixed
+swift run -c release cable-validation --demos
+swift run -c release cable-validation --compatibility
 ```
 
 `--cpu-only` runs without a Metal device. The cable GitHub Actions workflow
@@ -159,9 +273,12 @@ Measured on 2026-09-11: Apple M5, macOS 26.5.2, Swift 6.3.3, release build:
 
 | Segments | No contact, ms/frame | Floor contact, ms/frame | Floor pairs |
 |---:|---:|---:|---:|
-| 16 | 0.2871 | 0.4967 | 16 |
-| 256 | 0.2921 | 0.5657 | 256 |
-| 1,024 | 0.3086 | 0.8464 | 1,024 |
+| 16 | 0.2114 | 0.3844 | 16 |
+| 256 | 0.2156 | 0.4376 | 256 |
+| 1,024 | 0.2494 | 0.6700 | 1,024 |
+
+These are current implementation timings, not a controlled speedup comparison
+against the earlier commit. The GPU was not rendering Cable Lab during this run.
 
 All benchmark states remained finite. Maximum connector gaps at 1,024
 segments were 0.005835 m suspended and 0.000044 m on the floor, for 0.1 m
@@ -184,3 +301,36 @@ benchmark was run on this Mac.
 Reference: [Newton's rod kernels at 811b7b1](https://github.com/newton-physics/newton/blob/811b7b1ac803e193f063819d6e5d085cebdcddf6/newton/_src/solvers/vbd/rigid_vbd_kernels.py)
 and [rod authoring API](https://github.com/newton-physics/newton/blob/811b7b1ac803e193f063819d6e5d085cebdcddf6/newton/_src/sim/builder.py).
 The Swift/Metal constitutive implementation here is independently derived.
+
+The isolated 15-second torsional ring-down checks monotonically decreasing
+mechanical energy and agreement with the analytic Kelvin–Voigt oscillator.
+CPU/Metal retain about 42% of initial energy at 25 ms damping versus 2.4% at
+120 ms. Internal damping preserves bulk translation; environmental drag at
+0.8 /s leaves the expected 0.4493 m/s from an initial 1 m/s after one second.
+The plastic release check retains 0.400 rad from a 0.500 rad imposed bend
+with a 0.100 rad yield threshold; its elastic control returns to straight.
+Loading/reversal dissipation, the two-axis force tangent, and episode reset
+are checked separately. These controlled tests diagnose material behavior;
+they do not rule out all contact or finite-iteration artifacts in every scene.
+
+The final 30-second twisting test uses an independent double-precision
+segment-distance oracle every step and rejects non-finite/escaped poses or
+connector gaps above 25 mm. At 40 segments per strand it measured a maximum
+3.52 mm overlap and 1.57 mm connector gap; the mixed convex/analytic pipeline
+matched. At 80 segments it measured 2.58 mm overlap and 1.93 mm connector gap.
+These overlaps include the 1.5 mm configured contact slop. A capsule spinning
+at 80 rad/s on a box measured the same support height as the nonspinning
+control (CPU overlap 2.65 mm, Metal 1.49 mm). The existing gear-clock
+compatibility regression also passes.
+
+For the permanent-bend screenshot below, use:
+
+```sh
+swift run -c release cable-playground cableplastic --snapshot /tmp/bend.png --bend-release --steps 2400
+```
+
+That script grabs each gold tip with the ordinary 50 N/m mouse spring,
+releases it, and waits before rendering. It does not rewrite body poses or
+material rest state to create the picture.
+
+![Elastic cable springs back while the plastic cable keeps a bend](Images/Cables/bend-and-keep.png)

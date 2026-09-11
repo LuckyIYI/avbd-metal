@@ -305,6 +305,30 @@ func benchmark() throws {
 @main struct CableValidation {
     static func main() throws {
         setbuf(stdout, nil)
+        if CommandLine.arguments.contains("--compatibility") {
+            try validateGearClockCompatibility()
+            return
+        }
+        if CommandLine.arguments.contains("--collision-stress") {
+            try validateTwistingContact()
+            return
+        }
+        if CommandLine.arguments.contains("--demos") {
+            try validateCableDemos()
+            return
+        }
+        if CommandLine.arguments.contains("--materials") {
+            for gpu in CommandLine.arguments.contains("--cpu-only") ? [false] : [false, true] {
+                try validateCableMaterials(gpu: gpu)
+            }
+            return
+        }
+        if CommandLine.arguments.contains("--rigid-contact") {
+            for gpu in CommandLine.arguments.contains("--cpu-only") ? [false] : [false, true] {
+                try validateSpinningRigidContact(gpu: gpu)
+            }
+            return
+        }
         try validateAuthoring()
         try validateRotationDerivative()
         try validateLinearDerivatives()

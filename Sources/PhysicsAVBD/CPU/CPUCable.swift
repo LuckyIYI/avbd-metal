@@ -36,14 +36,31 @@ package func cableRotationLog(_ rotation: Quat) -> (value: F3, derivative: Mat3R
     return (value, derivative)
 }
 
-/// Finite elastic material energy in the same AVBD body blocks as contacts
-/// and hard joints. Physical coefficients are never penalty-ramped or capped.
+/// Radial return in the two bending coordinates. The yielded moment is the
+/// gradient of the incremental Huber energy; its tangent has zero stiffness
+/// along continued plastic loading and positive transverse stiffness.
+package func cableBendResponse(_ strain: F3, plastic: F3, yieldAngle: Float)
+    -> (elastic: F3, tangent: Mat3Rows) {
+    let trial = strain - plastic
+    let bend = F3(trial.x, trial.y, 0), magnitude = length(bend)
+    guard yieldAngle > 0 && magnitude > yieldAngle else {
+        return (trial, .identity)
+    }
+    let direction = bend / magnitude, scale = yieldAngle / magnitude
+    var tangent = Mat3Rows.diagonal(F3(scale, scale, 1))
+    tangent += Mat3Rows(rowMajor: outer(direction, direction)) * -scale
+    return (F3(bend.x * scale, bend.y * scale, trial.z), tangent)
+}
+
+/// Finite material energy in the AVBD body blocks shared with contacts and
+/// hard joints. Physical coefficients are never penalty-ramped or capped.
 final class CPUCable: CPUForce {
     let rA: F3, rB: F3
     let material: CableJointMaterial
     let restRel: Quat
     var initialLinear: F3 = .zero
     var initialAngular: F3 = .zero
+    var plasticAngular: F3 = .zero
 
     init(solver: CPUSolver, bodyA: CPURigid?, bodyB: CPURigid,
          rA: F3, rB: F3, material: CableJointMaterial) {
@@ -55,13 +72,19 @@ final class CPUCable: CPUForce {
 
     override func initialize() -> Result<Bool, CPUSolver.RuntimeFailure> {
         guard let bodyB else { return .success(false) }
-        guard material.dampingTime > 0 else { return .success(true) }
+        guard material.dampingTime > 0 || material.yieldAngle > 0 else { return .success(true) }
         let qA = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
         let xA = bodyA?.positionLin ?? .zero
         let pB = transform(bodyB.positionLin, bodyB.positionAng, rB)
         initialLinear = qA.inverse.act(pB - xA) - rA
         if material.angularStiffness.max() > 0 {
             initialAngular = cableRotationLog((qA * restRel).inverse * bodyB.positionAng).value
+            if material.yieldAngle > 0 {
+                // Commit only the preceding accepted pose, never an iterate.
+                let response = cableBendResponse(initialAngular, plastic: plasticAngular,
+                                                 yieldAngle: material.yieldAngle)
+                plasticAngular = initialAngular - response.elastic
+            }
         }
         return .success(true)
     }
@@ -95,8 +118,12 @@ final class CPUCable: CPUForce {
             let j = strain.derivative.mul(
                 Mat3Rows(rowMajor: simd_float3x3(frame).transpose)) * (isA ? -1 : 1)
             let kAng = material.angularStiffness
-            let f = kAng * (strain.value + damping * (strain.value - initialAngular))
-            lhsAng += j.transposed.mul(Mat3Rows.diagonal(kAng * (1 + damping))).mul(j)
+            let response = cableBendResponse(strain.value, plastic: plasticAngular,
+                                             yieldAngle: material.yieldAngle)
+            let f = kAng * (response.elastic + damping * (strain.value - initialAngular))
+            var tangent = Mat3Rows.diagonal(kAng).mul(response.tangent)
+            tangent += Mat3Rows.diagonal(kAng * damping)
+            lhsAng += j.transposed.mul(tangent).mul(j)
             rhsAng += j.transposed.mul(f)
         }
     }

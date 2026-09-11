@@ -744,7 +744,7 @@ kernel void warmstart_joints(
     if (j.header.z != 0) return;    // broken
 
     if (j.header.w & JOINT_CABLE) {
-        if (j.motor.w == 0.0f) return; // no damping history needed
+        if (j.motor.w == 0.0f && j.limits.w == 0.0f) return;
         uint a = j.header.x, b = j.header.y;
         float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
         float3 xA = a == WORLD_BODY ? float3(0) : posLin[a].xyz;
@@ -753,6 +753,13 @@ kernel void warmstart_joints(
         if (any(j.limits.xyz > 0.0f)) {
             j.C0Ang.xyz = cableRotationLog(
                 q_mul(q_inv(q_mul(qA, j.restRel)), posAng[b])).value;
+            if (j.limits.w > 0.0f) {
+                // Commit the previous accepted pose once per step. Primal
+                // iterates use a return-mapped trial without mutating history.
+                CableBendResponse response = cableBendResponse(
+                    j.C0Ang.xyz, j.lambdaAng.xyz, j.limits.w);
+                j.lambdaAng.xyz = j.C0Ang.xyz - response.elastic;
+            }
         }
         return;
     }
@@ -946,9 +953,12 @@ inline void stampCable(device const JointGPU& j, uint self,
                         isA ? -1.0f : 1.0f);
         M3 JT = m3_transpose(J);
         float3 ka = j.limits.xyz;
-        float3 Fa = ka * (strain.value + damping * (strain.value - j.C0Ang.xyz));
+        CableBendResponse response = cableBendResponse(
+            strain.value, j.lambdaAng.xyz, j.limits.w);
+        float3 Fa = ka * (response.elastic + damping * (strain.value - j.C0Ang.xyz));
+        M3 tangent = m3_add(m3_mulm(m3_diag(ka), response.tangent), m3_diag(ka * damping));
         acc.lhsAng = m3_add(acc.lhsAng,
-            m3_mulm(m3_mulm(JT, m3_diag(ka * (1.0f + damping))), J));
+            m3_mulm(m3_mulm(JT, tangent), J));
         acc.rhsAng += m3_mul(JT, Fa);
     }
 }
@@ -1590,9 +1600,9 @@ inline void stampSolverManifold(
         device const SolverContactGPU& c =
             solveContacts[i * maxManifolds + manifoldIndex];
         float3 rAW = sphA ? c.rAStick.xyz
-                          : q_rotate(posAng[a], c.rAStick.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], c.rAStick.xyz);
         float3 rBW = sphB ? c.rB_C0x.xyz
-                          : q_rotate(posAng[b], c.rB_C0x.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], c.rB_C0x.xyz);
 
         float3 C; float fs, bnd;
         float3 F = solverContactForceC(
@@ -1663,8 +1673,8 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
     float3 t2 = cross(nrm, t1);
 
     for (uint i = 0; i < n; i++) {
-        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate(posAng[a], m.contacts[i].rA.xyz);
-        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
 
         float3 C; float fs, bnd;
         float3 F = contactForceC(m, i, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW, alpha, C, fs, bnd);
@@ -2879,8 +2889,8 @@ static inline void dual_manifold_one(
     float lamCap = min(P.lambdaMax, max(10.0f, 1.0e5f * minMass));
 
     for (uint i = 0; i < n; i++) {
-        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate(posAng[a], m.contacts[i].rA.xyz);
-        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
 
         float3 C; float fs, bnd;
         float3 F = contactForceC(m, i, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW, P.alpha, C, fs, bnd);
@@ -2988,9 +2998,9 @@ static inline void dual_solver_manifold_one(
         device SolverContactGPU& c =
             solveContacts[i * P.maxManifolds + gid];
         float3 rAW = sphA ? c.rAStick.xyz
-                          : q_rotate(posAng[a], c.rAStick.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], c.rAStick.xyz);
         float3 rBW = sphB ? c.rB_C0x.xyz
-                          : q_rotate(posAng[b], c.rB_C0x.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], c.rB_C0x.xyz);
 
         float3 C; float fs, bnd;
         float3 F = solverContactForceC(

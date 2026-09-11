@@ -95,6 +95,8 @@ public struct JointGPU {
     // fields. This preserves the 256-byte joint ABI for all existing scenes.
     // motor.xyz = linear stiffness; limits.xyz = angular stiffness;
     // motor.w = material damping time. C0Lin/Ang hold initial material strain.
+    // limits.w = bending yield angle (0 disables), lambdaAng.xyz = plastic
+    // angular strain. No extra storage or dispatch for cable plasticity.
     public var header: SIMD4<UInt32> = .zero  // bodyA, bodyB, broken, flags
     public var rA: SIMD4<Float> = .zero       // w = stiffnessLin
     public var rB: SIMD4<Float> = .zero       // w = stiffnessAng

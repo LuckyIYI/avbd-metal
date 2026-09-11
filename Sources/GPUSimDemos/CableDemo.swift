@@ -10,6 +10,8 @@ public extension Demos {
         scene.settings.dt = 1 / 120
         scene.settings.iterations = 24
         scene.settings.collisionMargin = 0.002
+        scene.settings.rigidLinearDamping = 0.8
+        scene.settings.rigidAngularDamping = 0.8
         _ = scene.addBody(size: F3(6, Float(count) * 0.5 + 2, 0.2),
                           density: 0, friction: 0.6, position: F3(0, 0, -0.1))
         for row in 0..<count {
@@ -20,7 +22,7 @@ public extension Demos {
             }
             let material = CableMaterial(stretchRigidity: 4000, shearRigidity: 2000,
                 bendRigidity: 0.01 * pow(4, Float(row % 3)), twistRigidity: 0.02,
-                dampingTime: 0.015)
+                dampingTime: 0.12)
             // All values above are finite, statically authored demo geometry.
             let cable = try! scene.addCable(points: points, radius: 0.025,
                 density: 1000, material: material, friction: 0.6,

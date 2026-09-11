@@ -32,7 +32,10 @@ crossing protection with boundary release, runtime shader concatenation
 Native [elastic cables](Documentation/Cables.md) provide independent stretch,
 shear, bend and twist materials, damping, curved rest shapes, capsule contact,
 and rigid attachments on both CPU and Metal. `PhysicsScene.addCable` authors
-the topology; `Demos.make("cables")` demonstrates it. Run the headless physical
+the topology, with optional permanent bending above a yield curvature. Run
+`swift run -c release cable-playground` for threading, twisting, soft snap clips,
+and an elastic/plastic bend-and-release comparison with damping/drag controls.
+Run the headless physical
 checks and scaling benchmark with `swift run -c release cable-validation --benchmark`.
 
 Rigid contact materials keep geometry and constitutive response separate.

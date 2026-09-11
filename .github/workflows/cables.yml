@@ -7,6 +7,8 @@ on:
       - "Sources/**"
       - "Tests/**"
       - "Examples/Cables/**"
+      - "Examples/CablePlayground/**"
+      - "Development/Sources/AVBDApp/**"
       - "Tools/verify_architecture.py"
       - "Tools/tests/test_verify_architecture.py"
       - ".github/workflows/cables.yml"
@@ -29,11 +31,18 @@ jobs:
       - name: Cable authoring, force derivatives, contact normals and ABI
         run: >-
           swift test -c release --filter
-          'CableAuthoringTests|testFullForceGradientMatchesEnergyOnBothBodies|testCapsuleBoxContactNormalInBothOrders|testDemoMetadataAndJointABI'
+          'CableAuthoringTests|CableDemoTests|CableContactTests|testFullForceGradientMatchesEnergyOnBothBodies|testCapsuleBoxContactNormalInBothOrders|testDemoMetadataAndJointABI'
+      - name: Standalone interactive demos
+        run: swift build -c release --product cable-playground
       # Hosted runners need not expose a Metal device. Metal physics and
       # performance checks also run locally via cable-validation --benchmark.
       - name: CPU physical validation
         run: swift run -c release cable-validation --cpu-only
+      - name: Damping, plasticity and contact regressions
+        run: |
+          swift run -c release cable-validation --cpu-only --materials
+          swift run -c release cable-validation --cpu-only --rigid-contact
+          swift run -c release cable-validation --cpu-only --collision-stress
       - name: Package boundaries
         run: |
           python3 -S Tools/verify_architecture.py

@@ -82,7 +82,11 @@ SIMULATOR_EXAMPLES = {
     ),
     "CableValidation": (
         "cable-validation", "Examples/Cables",
-        frozenset({_target("PhysicsAVBD"), _target("SimCore")}), frozenset(),
+        frozenset({_target("PhysicsAVBD"), _target("SimCore"), _target("GPUSimDemos")}), frozenset(),
+    ),
+    "CablePlayground": (
+        "cable-playground", "Examples/CablePlayground",
+        frozenset({_target("GPUSimRenderer"), _target("GPUSimDemos"), _target("PhysicsAVBD"), _target("SimCore")}), frozenset(),
     ),
 }
 

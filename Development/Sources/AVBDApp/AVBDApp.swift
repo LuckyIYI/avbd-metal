@@ -65,11 +65,14 @@ struct ContentView: View {
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
                         ForEach(Demos.all, id: \.self) {
-                            Text($0 == "gaudifunicular" ? "Gaudí Funicular"
+                            Text(Demos.cableDemoTitle($0) ?? ($0 == "gaudifunicular" ? "Gaudí Funicular"
                                 : $0 == "classicrigids" ? "Classic Rigid Bodies"
                                 : $0 == "boxofboxes" ? "Box of Boxes"
-                                : $0)
+                                : $0))
                         }
+                    }
+                    if let instructions = Demos.cableDemoInstructions(model.demoName) {
+                        Text(instructions).font(.callout).foregroundStyle(.secondary)
                     }
                     if Demos.supportsScale(model.demoName) {
                         Picker("Size", selection: $model.scale) {

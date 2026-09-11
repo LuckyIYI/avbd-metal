@@ -2526,7 +2526,7 @@ public final class GPUSolver {
                     "cable materials cannot be combined with other joint laws")
                 g.header.w = JointGPU.cableFlag
                 g.motor = SIMD4(material.linearStiffness, material.dampingTime)
-                g.limits = SIMD4(material.angularStiffness, 0)
+                g.limits = SIMD4(material.angularStiffness, material.yieldAngle)
             }
             jp[i] = g
         }

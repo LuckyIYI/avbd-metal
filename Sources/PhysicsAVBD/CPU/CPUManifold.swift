@@ -32,6 +32,7 @@ public final class CPUManifold: CPUForce {
     let colliderAIndex: Int?
     let colliderBIndex: Int?
     let colliderPairKey: UInt64?
+    private var usesFixedContactFrame = false
     /// Compatibility alias for the original single Coulomb coefficient.
     /// Reads the static coefficient; writes update both coefficients so
     /// legacy callers retain their original single-material semantics.
@@ -81,7 +82,8 @@ public final class CPUManifold: CPUForce {
 
     func anchorOffsetWorld(_ body: CPURigid, _ r: F3, isA: Bool) -> F3 {
         if let collider = collider(isA: isA) {
-            return collider.usesWorldSpaceRoundAnchor ? r : rotate(body.positionAng, r)
+            return collider.usesWorldSpaceRoundAnchor ? r
+                : rotate(usesFixedContactFrame ? body.initialAng : body.positionAng, r)
         }
         return body.shape != .box ? r : rotate(body.positionAng, r)
     }
@@ -97,6 +99,13 @@ public final class CPUManifold: CPUForce {
         guard let bodyA, let bodyB else { return .success(false) }
         let colliderA = collider(isA: true)
         let colliderB = collider(isA: false)
+        // A Taylor contact must use the reference lever arm in both its
+        // value and Jacobian. Updating it while a material capsule spins
+        // invents normal separation and lets twisted cables pass through.
+        usesFixedContactFrame = (colliderA?.shape == .capsule
+            && colliderA?.usesWorldSpaceRoundAnchor == false)
+            || (colliderB?.shape == .capsule
+            && colliderB?.usesWorldSpaceRoundAnchor == false)
         let previousContacts = contacts
         let previousBasis = basis
         let previousTorsionLambda = previousContacts.first?.torsionLambda ?? 0

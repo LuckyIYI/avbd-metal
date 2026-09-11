@@ -3,6 +3,7 @@ import QuartzCore
 import SimCore
 import PhysicsAVBD
 import GPUSimDemos
+import GPUSimRenderer
 import Robotics
 import RL
 import MLXRL
@@ -52,6 +53,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
     @Published var statsText = ""
 
     private(set) var solver: GPUSolver?
+    private(set) var rendererBodyAppearances: [Int: GPUSimRenderAppearance] = [:]
     private(set) var dragJoint: Int = -1
     private var dragBody: Int? = nil
     private var dragLocal = F3.zero
@@ -101,6 +103,13 @@ final class SimulationModel: ObservableObject, RenderableModel {
                 scene.settings.gravity = Float(current.gravity)
             }
             let adoptedSettings = scene.settings
+            var appearances: [Int: GPUSimRenderAppearance] = [:]
+            for collider in scene.colliders {
+                if scene.bodies[collider.body].isParticle, let color = collider.renderColor {
+                    appearances[collider.body] = GPUSimRenderAppearance(color: color)
+                }
+            }
+            let authoredAppearances = appearances
             let result: Result<GPUSolver, Error> = Result {
                 try GPUSolver(scene: scene)
             }
@@ -118,6 +127,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
                         self.adopting = false
                     }
                     self.solver = newSolver
+                    self.rendererBodyAppearances = authoredAppearances
                     self.dragJoint = dragSlot
                     self.dragBody = nil
                     self.stepAccumulator = 0

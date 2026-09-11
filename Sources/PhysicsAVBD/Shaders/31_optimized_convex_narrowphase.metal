@@ -174,17 +174,21 @@ inline void npClosestSegSeg(float3 p0, float3 p1, float3 q0, float3 q1,
     float f = dot(d2, r);
     float s = 0.0f, t = 0.0f;
 
-    if (a <= SAT_EPS && e <= SAT_EPS) { c0 = p0; c1 = q0; return; }
-    if (a <= SAT_EPS) {
+    if (a <= 1e-20f && e <= 1e-20f) { c0 = p0; c1 = q0; return; }
+    if (a <= 1e-20f) {
         t = clamp(f / e, 0.0f, 1.0f);
     } else {
         float c = dot(d1, r);
-        if (e <= SAT_EPS) {
+        if (e <= 1e-20f) {
             s = clamp(-c / a, 0.0f, 1.0f);
         } else {
             float b = dot(d1, d2);
-            float denom = a * e - b * b;
-            if (fabs(denom) > SAT_EPS) s = clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+            // Scale-free parallel test: the determinant has units length^4.
+            // Cross products also avoid cancellation for nearly parallel rods.
+            float3 normal = cross(d1, d2);
+            float denom = dot(normal, normal);
+            if (denom > 1e-12f * a * e)
+                s = clamp(dot(cross(d2, r), normal) / denom, 0.0f, 1.0f);
             t = (b * s + f) / e;
             if (t < 0.0f) { t = 0.0f; s = clamp(-c / a, 0.0f, 1.0f); }
             else if (t > 1.0f) { t = 1.0f; s = clamp((b - c) / a, 0.0f, 1.0f); }
@@ -2108,7 +2112,8 @@ inline void npCollidePass(
                                   P.mapCapacity, ia, ib);
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
-        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
+            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(contactCount), flags);
         outM.basisN = float4(normal, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -2345,7 +2350,10 @@ inline void npCollidePass(
         int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
-        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        // Material capsules use the same reference frame for the Taylor
+        // contact value and its Jacobian throughout this step.
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
+            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(nh), flags);
         outM.basisN = float4(nrmC, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -2587,7 +2595,8 @@ inline void npCollidePass(
 
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
-        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
+            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(nHits), flags);
         outM.basisN = float4(nrmT, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -2736,7 +2745,8 @@ inline void npCollidePass(
 
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
-        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
+            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(count), flags);
         outM.basisN = float4(nrm, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);

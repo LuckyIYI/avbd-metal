@@ -42,7 +42,7 @@ public enum Demos {
     }
 
     public static var all: [String] {
-        ["cables", "gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+        ["cablethreading", "cabletwisting", "cablegrippers", "cableplastic", "cables", "gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
          "convexdecomp", "classicrigids",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
@@ -56,7 +56,7 @@ public enum Demos {
     /// Whether the global stress-test size selector changes this demo.
     /// Fixed showcases keep one copy of each expensive detailed visual mesh.
     public static func supportsScale(_ name: String) -> Bool {
-        name != "classicrigids"
+        !["classicrigids", "cablethreading", "cabletwisting", "cablegrippers", "cableplastic"].contains(name)
     }
 
     /// Tunable parameters per demo (empty = none). Keys are looked up in
@@ -67,7 +67,18 @@ public enum Demos {
         // bending stiffness (the actual element parameters)
         let membrane = DemoParam("membrane", "Membrane µ", 30...1500, 300)
         let bending = DemoParam("bending", "Bending ×1e-4", 0...40, 5)
+        let cableDamping = [DemoParam("damping", "Damping time (s)", 0...0.25, 0.12),
+                            DemoParam("drag", "Drag /s", 0...2, 0.8)]
         switch name {
+        case "cablethreading": return cableDamping + [DemoParam("clearance", "Hole radius", 0.08...0.20, 0.13)]
+        case "cabletwisting": return cableDamping + [DemoParam("turnRate", "Turns / s", 0...0.25, 0.10)]
+        case "cablegrippers": return cableDamping + [
+            DemoParam("gripMu", "Clip stiffness", 10000...60000, 30000),
+            DemoParam("friction", "Grip friction", 0.3...1.2, 0.8)
+        ]
+        case "cableplastic": return cableDamping + [
+            DemoParam("yield", "Yield curvature /m", 0.3...4, 1.5)
+        ]
         case "gaudifunicular": return [
             DemoParam("loadScale", "Stone load", 0.25...2, 1),
             DemoParam("slack", "Cord slack", 1.02...1.30, 1.12),
@@ -127,6 +138,10 @@ public enum Demos {
             }
         }
         switch name {
+        case "cablethreading": return cableThreading(segments: res ?? 40, holeRadius: p("clearance", 0.13), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
+        case "cabletwisting": return cableTwisting(segments: res ?? 40, turnRate: p("turnRate", 0.10), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
+        case "cablegrippers": return cableGrippers(segments: res ?? 64, padStiffness: p("gripMu", 30000), friction: p("friction", 0.8), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
+        case "cableplastic": return cablePlastic(segments: res ?? 24, yieldCurvature: p("yield", 1.5), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
         case "cables": return cables(count: 3 * s, segments: res ?? 24)
         case "gaudifunicular": return gaudiFunicular(
             segmentsPerCable: min(9, 5 + s / 4),

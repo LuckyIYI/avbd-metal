@@ -9,10 +9,14 @@ public struct CableMaterial: Sendable, Equatable {
     public let twistRigidity: Float   // GJ, N m²
     /// Kelvin–Voigt relaxation time (seconds): damping = stiffness * time.
     public let dampingTime: Float
+    /// Optional ideal plastic bending yield curvature (rad/m). Beyond this
+    /// curvature the cable acquires permanent bend; stretch and twist remain
+    /// elastic. Nil disables plasticity. Independent of segment resolution.
+    public let yieldCurvature: Float?
 
     public init(stretchRigidity: Float, shearRigidity: Float,
                 bendRigidity: Float, twistRigidity: Float,
-                dampingTime: Float = 0) {
+                dampingTime: Float = 0, yieldCurvature: Float? = nil) {
         precondition(stretchRigidity > 0 && stretchRigidity.isFinite
             && shearRigidity > 0 && shearRigidity.isFinite)
         precondition(bendRigidity >= 0 && bendRigidity.isFinite
@@ -23,12 +27,18 @@ public struct CableMaterial: Sendable, Equatable {
         self.bendRigidity = bendRigidity
         self.twistRigidity = twistRigidity
         self.dampingTime = dampingTime
+        if let yieldCurvature {
+            precondition(yieldCurvature > 0 && yieldCurvature.isFinite
+                         && bendRigidity > 0)
+        }
+        self.yieldCurvature = yieldCurvature
     }
 
     /// Homogeneous circular cross section (unit shear correction factor).
     public static func circular(radius: Float, youngModulus: Float,
                                 poissonRatio: Float = 0.3,
-                                dampingTime: Float = 0) -> Self {
+                                dampingTime: Float = 0,
+                                yieldCurvature: Float? = nil) -> Self {
         precondition(radius > 0 && radius.isFinite
             && youngModulus > 0 && youngModulus.isFinite
             && poissonRatio > -1 && poissonRatio < 0.5)
@@ -39,7 +49,7 @@ public struct CableMaterial: Sendable, Equatable {
                     shearRigidity: shearModulus * area,
                     bendRigidity: youngModulus * secondMoment,
                     twistRigidity: shearModulus * 2 * secondMoment,
-                    dampingTime: dampingTime)
+                    dampingTime: dampingTime, yieldCurvature: yieldCurvature)
     }
 }
 
@@ -50,6 +60,8 @@ public struct CableJointMaterial: Sendable, Equatable {
     public let linearStiffness: F3
     public let angularStiffness: F3
     public let dampingTime: Float
+    /// Zero disables plasticity; otherwise yieldCurvature * dual rest length.
+    public let yieldAngle: Float
 
     public init(material: CableMaterial, restLength: Float) {
         precondition(restLength > 0 && restLength.isFinite)
@@ -60,6 +72,8 @@ public struct CableJointMaterial: Sendable, Equatable {
         precondition(linearStiffness.max().isFinite
             && angularStiffness.max().isFinite)
         dampingTime = material.dampingTime
+        yieldAngle = (material.yieldCurvature ?? 0) * restLength
+        precondition(yieldAngle.isFinite)
     }
 }
 
@@ -148,6 +162,7 @@ public extension PhysicsScene {
             let dualLength = (lengths[i - 1] + lengths[i]) * 0.5
             guard (max(material.stretchRigidity, material.shearRigidity) / dualLength).isFinite
                 && (max(material.bendRigidity, material.twistRigidity) / dualLength).isFinite
+                && ((material.yieldCurvature ?? 0) * dualLength).isFinite
             else { throw CableAuthoringError.invalidGeometry }
             jointMaterials.append(CableJointMaterial(material: material, restLength: dualLength))
         }
@@ -178,6 +193,21 @@ public extension PhysicsScene {
                 joint.cable = jointMaterials[i - 1]
                 joints.append(self.joints.count)
                 addJoint(joint)
+            }
+        }
+        // Capsule end caps overlap nearby material when segments are shorter
+        // than the cable diameter. Excluding only directly jointed bodies
+        // then makes a straight, stress-free cable collide with itself.
+        // Use rest arclength (not spatial proximity) so distant folded spans
+        // still self-collide. The scan is bounded by the local tube diameter.
+        if collisionEnabled && count > 2 {
+            for i in 0..<(count - 2) {
+                var gap: Float = 0
+                for j in (i + 2)..<count {
+                    gap += lengths[j - 1]
+                    if gap >= 2 * radius { break }
+                    addCollisionExclusion(bodyA: ids[i], bodyB: ids[j])
+                }
             }
         }
         let cable = SceneCable(bodyIDs: ids, jointIDs: joints,

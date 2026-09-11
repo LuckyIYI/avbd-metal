@@ -3,7 +3,30 @@ import simd
 @testable import SimCore
 
 final class CableAuthoringTests: XCTestCase {
+    func testYieldMomentDoesNotDependOnResolution() {
+        let material = CableMaterial(stretchRigidity: 2000, shearRigidity: 1000,
+            bendRigidity: 0.8, twistRigidity: 0.1, dampingTime: 0.12, yieldCurvature: 1.5)
+        for length: Float in [0.2, 0.1, 0.025] {
+            let joint = CableJointMaterial(material: material, restLength: length)
+            XCTAssertEqual(joint.angularStiffness.x * joint.yieldAngle, 1.2, accuracy: 1e-6)
+        }
+    }
+
     private let material = CableMaterial.circular(radius: 0.02, youngModulus: 1e6)
+
+    func testRefinementExcludesOnlyLocalOverlappingMaterial() throws {
+        var scene = PhysicsScene(name: "refined cable")
+        let cable = try scene.addCable(points: (0...10).map { F3(Float($0) * 0.01, 0, 0) },
+            radius: 0.02, density: 1000, material: material)
+        XCTAssertFalse(scene.canPotentiallyCollide(colliderA: 0, colliderB: 2))
+        XCTAssertFalse(scene.canPotentiallyCollide(colliderA: 0, colliderB: 4))
+        XCTAssertTrue(scene.canPotentiallyCollide(colliderA: 0, colliderB: 6))
+        let other = try scene.addCable(points: [F3(0,-0.05,0), F3(0,0.05,0)],
+            radius: 0.02, density: 1000, material: material)
+        XCTAssertTrue(scene.canPotentiallyCollide(colliderA: cable.bodyIDs[0], colliderB: other.bodyIDs[0]))
+        let copy = scene.replicated(count: 2, spacing: F3(2,2,0)).scene
+        XCTAssertEqual(copy.collisionExclusions.count, 2 * scene.collisionExclusions.count)
+    }
 
     func testNonuniformLengthsMassFramesAndReplication() throws {
         var scene = PhysicsScene(name: "cable authoring")
