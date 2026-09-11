@@ -298,6 +298,10 @@ public struct SceneJoint {
     /// without limits a decelerating arm can tumble over the top and wedge.
     public var limitLo: Float
     public var limitHi: Float
+    /// GPU hinge stop stiffness (N m / rad); preserve the historical default.
+    public var limitStiffness: Float = 4.0e4
+    public var response: JointResponse? = nil
+    public var breakLoad: JointBreakLoad? = nil
 
     @_disfavoredOverload
     public init(bodyA: Int, bodyB: Int, rA: F3, rB: F3,
