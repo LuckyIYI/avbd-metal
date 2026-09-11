@@ -510,11 +510,11 @@ v 0 0 1
         with self.assertRaises(cooker.CookError):
             cooker.CookParameters(max_hulls=257).validate()
         with self.assertRaises(cooker.CookError):
-            cooker.CookParameters(max_vertices_per_hull=65).validate()
+            cooker.CookParameters(max_vertices_per_hull=cooker.MAX_VERTICES_PER_HULL + 1).validate()
 
         asset = cooker.cook_asset(TETRA_OBJ, "tetra.obj", method="hull")
         asset["parts"][0]["triangles"] = (
-            asset["parts"][0]["triangles"] * 32
+            asset["parts"][0]["triangles"] * (cooker.MAX_TRIANGLES_PER_HULL // 4 + 1)
         )[: cooker.MAX_TRIANGLES_PER_HULL + 1]
         with self.assertRaisesRegex(cooker.CookError, "triangle count"):
             cooker.validate_asset(asset)
@@ -538,22 +538,22 @@ v 0 0 1
         self.assertEqual(part["centroid"], [1000000.25, 1000000.25, 1000000.25])
 
     def test_merged_coplanar_face_loop_must_fit_gpu_workspace(self) -> None:
-        prism_vertices, prism_triangles = regular_polygon_prism(17)
-        with self.assertRaisesRegex(cooker.CookError, "17 vertices"):
+        sides = cooker.MAX_FACE_VERTICES + 1
+        prism_vertices, prism_triangles = regular_polygon_prism(sides)
+        with self.assertRaisesRegex(cooker.CookError, f"{sides} vertices"):
             cooker.validate_merged_face_loops(prism_vertices, prism_triangles)
 
-        # A 17-gon pyramid stays inside the whole-hull 64-vertex limit, proving
-        # the independent face-loop limit is enforced by canonical cooking.
-        base = prism_vertices[:17]
+        # The pyramid fits the independent whole-hull limit, but not face storage.
+        base = prism_vertices[:sides]
         pyramid_vertices = base + [(0.0, 0.0, 1.0)]
         pyramid_triangles = [
-            (0, index + 1, index) for index in range(1, 16)
+            (0, index + 1, index) for index in range(1, sides-1)
         ] + [
-            (index, (index + 1) % 17, 17) for index in range(17)
+            (index, (index + 1) % sides, sides) for index in range(sides)
         ]
-        with self.assertRaisesRegex(cooker.CookError, "17 vertices"):
+        with self.assertRaisesRegex(cooker.CookError, f"{sides} vertices"):
             cooker.canonicalize_hull(
-                pyramid_vertices, pyramid_triangles, max_vertices=64
+                pyramid_vertices, pyramid_triangles, max_vertices=cooker.MAX_VERTICES_PER_HULL
             )
 
     def test_asset_size_and_source_uri_are_bounded_before_validation(self) -> None:

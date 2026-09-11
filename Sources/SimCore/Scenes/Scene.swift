@@ -928,8 +928,8 @@ public struct PhysicsScene {
         isRendered: Bool = false
     ) -> Int {
         precondition(bodies.indices.contains(body), "collider owner out of range")
-        precondition(vertices.count >= 4 && vertices.count <= 64,
-                     "convex collider requires 4...64 cooked hull vertices")
+        precondition(vertices.count >= 4 && vertices.count <= ConvexAssetLimits.maximumVerticesPerHull,
+                     "convex collider requires 4...\(ConvexAssetLimits.maximumVerticesPerHull) cooked hull vertices")
         var lo = F3(repeating: .greatestFiniteMagnitude)
         var hi = F3(repeating: -.greatestFiniteMagnitude)
         for vertex in vertices {

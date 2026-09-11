@@ -766,8 +766,8 @@ public final class GPUSolver {
     }
 
     private struct ConvexPlaneGroup {
-        var normal: F3
-        var distance: Float
+        var normal: SIMD3<Double>
+        var distance: Double
         var triangles: [SIMD3<UInt32>]
     }
 
@@ -789,7 +789,7 @@ public final class GPUSolver {
     /// Grouping and loop tracing are deterministic because the source arrays,
     /// edge keys, and adjacency choices are all canonically ordered.
     private static func makeConvexPolygonTopology(
-        vertices: [F3], triangles: [SIMD3<UInt32>], stableID: String
+        vertices: [F3], triangles: [SIMD3<UInt32>], stableID: String, origin: F3 = .zero
     ) throws -> (faces: [ConvexPolygonFace], edges: [ConvexPolygonEdge]) {
         guard !triangles.isEmpty else { return ([], []) }
 
@@ -797,7 +797,7 @@ public final class GPUSolver {
         let hi = vertices.reduce(F3(repeating: -.infinity), simd.max)
         let scale = max(simd_length(hi - lo), 1e-4)
         let planeTolerance = max(scale * 2e-6, 1e-7)
-        let normalTolerance: Float = 5e-5
+        let normalTolerance: Double = 5e-5
         var groups: [ConvexPlaneGroup] = []
         groups.reserveCapacity(triangles.count)
 
@@ -808,9 +808,9 @@ public final class GPUSolver {
                     asset: stableID,
                     reason: "triangle \(triangleIndex) references a missing vertex")
             }
-            let a = vertices[Int(triangle.x)]
-            let b = vertices[Int(triangle.y)]
-            let c = vertices[Int(triangle.z)]
+            let a = SIMD3<Double>(vertices[Int(triangle.x)])
+            let b = SIMD3<Double>(vertices[Int(triangle.y)])
+            let c = SIMD3<Double>(vertices[Int(triangle.z)])
             let crossValue = simd_cross(b - a, c - a)
             let crossLength = simd_length(crossValue)
             guard crossLength.isFinite && crossLength > 1e-12 else {
@@ -824,7 +824,7 @@ public final class GPUSolver {
                 simd_dot($0.normal, normal) > 0
                     && simd_length(simd_cross($0.normal, normal))
                         <= normalTolerance
-                    && abs($0.distance - distance) <= planeTolerance
+                    && abs($0.distance - distance) <= Double(planeTolerance)
             }) {
                 groups[groupIndex].triangles.append(triangle)
             } else {
@@ -895,11 +895,12 @@ public final class GPUSolver {
                     reason: "coplanar face \(groupIndex) boundary is disconnected")
             }
 
-            var areaNormal = F3.zero
+            let reference = SIMD3<Double>(vertices[Int(loop[0])])
+            var areaNormal = SIMD3<Double>.zero
             for index in loop.indices {
                 let next = loop[(index + 1) % loop.count]
-                areaNormal += simd_cross(vertices[Int(loop[index])],
-                                         vertices[Int(next)])
+                areaNormal += simd_cross(SIMD3<Double>(vertices[Int(loop[index])]) - reference,
+                                         SIMD3<Double>(vertices[Int(next)]) - reference)
             }
             if simd_dot(areaNormal, group.normal) < 0 {
                 loop = [loop[0]] + loop.dropFirst().reversed()
@@ -910,7 +911,7 @@ public final class GPUSolver {
                     reason: "coplanar face \(groupIndex) has \(loop.count) vertices; runtime assets support at most \(ConvexHullGPU.maximumSourceFaceVertices)")
             }
             faces.append(ConvexPolygonFace(
-                normal: group.normal, distance: group.distance,
+                normal: F3(group.normal), distance: Float(group.distance - simd_dot(group.normal, SIMD3<Double>(origin))),
                 vertices: loop))
         }
 
@@ -1033,7 +1034,9 @@ public final class GPUSolver {
             let loopStart = UInt32(upload.faceVertexIndices.count)
             let edgeStart = UInt32(upload.edges.count)
             let topology = try makeConvexPolygonTopology(
-                vertices: centered, triangles: triangles, stableID: stableID)
+                // Derive connectivity from the validated source vertices.
+                // A second Float recenter must not regroup coplanar faces.
+                vertices: vertices, triangles: triangles, stableID: stableID, origin: center)
 
             for (faceIndex, polygon) in topology.faces.enumerated() {
                 var face = ConvexFaceGPU()
@@ -1249,6 +1252,8 @@ public final class GPUSolver {
         self.queue = q
 
         let convexUpload = try Self.makeConvexGPUUpload(scene: scene)
+        convexClipWorkspaceVertices = ConvexHullGPU.clipWorkspaceVertices(
+            largestSourceFace: convexUpload.faces.map { Int($0.loop.y) }.max() ?? 0)
         let rigidHierarchy = Self.makeRigidBroadphaseHierarchy(
             scene: scene, convexUpload: convexUpload)
         self.usesRigidColliderHierarchy = rigidHierarchy != nil
@@ -1933,6 +1938,8 @@ public final class GPUSolver {
 
     // MARK: - Shader compilation
 
+    public private(set) var convexClipWorkspaceVertices = 32
+
     private func buildPipelines() throws {
         let lib: MTLLibrary
         let hierarchyLib: MTLLibrary?
@@ -1953,7 +1960,8 @@ public final class GPUSolver {
             }
         }
         if hasPotentialRigidConvexPair {
-            let optimized = try Self.makeOptimizedConvexLibrary(device: device)
+            let optimized = try Self.makeOptimizedConvexLibrary(
+                device: device, clipWorkspaceVertices: convexClipWorkspaceVertices)
             for name in ["np_collide", "np_collide_convex"] {
                 guard let fn = optimized.makeFunction(name: name) else {
                     throw AVBDError.kernelMissing(name)
@@ -2082,7 +2090,7 @@ public final class GPUSolver {
     /// as a fallback, while this scene-local library replaces just those two
     /// PSOs without changing analytic compatibility code generation.
     private static func makeOptimizedConvexLibrary(
-        device: MTLDevice
+        device: MTLDevice, clipWorkspaceVertices: Int
     ) throws -> MTLLibrary {
         let urls = try shaderResourceURLs().filter {
             $0.lastPathComponent != hierarchyShaderName
@@ -2090,7 +2098,9 @@ public final class GPUSolver {
         }
         return try compileLibrary(
             device: device, urls: urls,
-            preamble: "#define AVBD_OPTIMIZED_CONVEX 1\n")
+            preamble: "#define AVBD_OPTIMIZED_CONVEX 1\n"
+                + (clipWorkspaceVertices == 32 ? ""
+                    : "#define NPC_MAX_FACE_VERTICES \(clipWorkspaceVertices)\n"))
     }
 
     /// Boundary faces of the tet meshes (faces used by exactly one tet),
@@ -7013,6 +7023,11 @@ public final class GPUSolver {
                                                              capacity: numColliders)
         let lq = colliderLocalRotation.contents().bindMemory(to: SIMD4<Float>.self,
                                                              capacity: numColliders)
+        let hullIDs = colliderConvexAssetID.contents().bindMemory(to: UInt32.self, capacity: numColliders)
+        let hulls = convexHullHeaders.contents().bindMemory(to: ConvexHullGPU.self,
+            capacity: convexHullHeaders.length / MemoryLayout<ConvexHullGPU>.stride)
+        let faces = convexFaces.contents().bindMemory(to: ConvexFaceGPU.self,
+            capacity: convexFaces.length / MemoryLayout<ConvexFaceGPU>.stride)
         var bestT = Float.infinity
         var best: (Int, F3)? = nil
         for i in 0..<numColliders {
@@ -7028,7 +7043,31 @@ public final class GPUSolver {
             let o = inv.act(origin - center)
             let d = inv.act(dir)
             var hitT: Float?
-            if (st[i] & 0xF) != 0 {
+            if (st[i] & 0xF) == 4 {
+                // Convex cells are not spheres. Bounding-sphere picks can hit
+                // empty drawer cavities or hide nearby handles behind a panel.
+                let hull = hulls[Int(hullIDs[i])]
+                var enter = -Float.infinity, leave = Float.infinity
+                var hit = true
+                for f in Int(hull.verticesFaces.z)..<Int(hull.verticesFaces.z+hull.verticesFaces.w) {
+                    let plane = faces[f].plane
+                    let normal = F3(plane.x,plane.y,plane.z)
+                    let denominator = dot(normal,d)
+                    // Account for Float transform roundoff at shared cell seams.
+                    // This tolerance applies to mouse rays only, not contacts.
+                    let rayTolerance = 8 * Float.ulpOfOne * max(1, length(o))
+                    let remaining = plane.w-dot(normal,o)+rayTolerance
+                    if abs(denominator) < 1e-8 {
+                        if remaining < 0 { hit=false;break }
+                    } else {
+                        let t = remaining/denominator
+                        if denominator < 0 { enter=max(enter,t) } else { leave=min(leave,t) }
+                        if enter > leave { hit=false;break }
+                    }
+                }
+                let t = enter >= 0 ? enter : leave
+                if hit && t.isFinite && t >= 0 { hitT=t }
+            } else if (st[i] & 0xF) != 0 {
                 // sphere/torus: pick against bounding sphere (good enough for grab)
                 let r = abs(sh[i].w)
                 let b = dot(o, d)
