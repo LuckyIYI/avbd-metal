@@ -256,6 +256,9 @@ public enum JointMotorMode: Sendable, Equatable {
 }
 
 public struct SceneJoint {
+    /// Elastic rod constitutive law. Mutually exclusive with hinge/motor,
+    /// prismatic, fracture, and adaptive joint stiffness parameters.
+    public var cable: CableJointMaterial? = nil
     public var bodyA: Int           // -1 = world
     public var bodyB: Int
     public var rA: F3
@@ -651,6 +654,7 @@ public struct PhysicsScene {
     /// digest-preimage equality still closes the collision boundary.
     private var convexAssetIndexByDigest: [String: Int] = [:]
     public var joints: [SceneJoint] = []
+    public internal(set) var cables: [SceneCable] = []
     public var springs: [SceneSpring] = []
     public var tets: [SceneTet] = []
     public var tris: [SceneTri] = []

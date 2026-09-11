@@ -331,6 +331,8 @@ inline bool motor_uses_explicit_effort(uint flags) {
         || motor_uses_velocity_feedback(flags);
 }
 
+constant uint JOINT_CABLE = 1u << 6;
+
 struct JointGPU {
     uint4 header;       // bodyA (WORLD_BODY=world), bodyB, broken flag, flags
     float4 rA;          // w = stiffnessLin
@@ -350,7 +352,32 @@ struct JointGPU {
     float4 limits;      // x/y = twist range, z = kd, w = pad
     float4 dynamics;    // x = armature, y = inertial-predicted twist,
                         // z = start-of-step explicit effort
+    // JOINT_CABLE tagged layout: motor.xyz = linear stiffness,
+    // limits.xyz = angular stiffness, motor.w = damping time.
+    // C0Lin/Ang.xyz = initial strain; other motor/constraint state is inactive.
 };
+
+struct CableRotationLog { float3 value; M3 derivative; };
+
+inline CableRotationLog cableRotationLog(float4 q) {
+    if (q.w < 0.0f) q = -q;
+    float s2 = dot(q.xyz, q.xyz);
+    CableRotationLog result;
+    float coefficient;
+    if (s2 < 1e-8f) {
+        result.value = q.xyz * (2.0f + s2 / 3.0f);
+        coefficient = 1.0f / 12.0f + s2 / 180.0f;
+    } else {
+        float s = sqrt(s2);
+        float angle = 2.0f * atan2(s, q.w);
+        result.value = q.xyz * (angle / s);
+        coefficient = (1.0f - 0.5f * angle * q.w / s) / (angle * angle);
+    }
+    M3 skew = m3_skew(result.value);
+    result.derivative = m3_add(m3_add(m3_identity(), m3_scale(skew, -0.5f)),
+                              m3_scale(m3_mulm(skew, skew), coefficient));
+    return result;
+}
 
 inline float3 prismaticError(device const JointGPU& j, float3 delta, float4 qA) {
     float3 d = q_rotate(q_inv(qA), delta);

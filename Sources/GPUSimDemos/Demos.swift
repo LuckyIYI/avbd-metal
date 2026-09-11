@@ -42,7 +42,7 @@ public enum Demos {
     }
 
     public static var all: [String] {
-        ["gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
+        ["cables", "gaudifunicular", "boxofboxes", "stack", "ratiostack", "wall", "pyramid", "pendulum", "boxpile",
          "convexdecomp", "classicrigids",
          "cardhouse", "fracture", "bridge", "tensegrity", "chainmail",
          "treadmill", "jenga", "dominoes", "car", "marblerun",
@@ -127,6 +127,7 @@ public enum Demos {
             }
         }
         switch name {
+        case "cables": return cables(count: 3 * s, segments: res ?? 24)
         case "gaudifunicular": return gaudiFunicular(
             segmentsPerCable: min(9, 5 + s / 4),
             loadScale: p("loadScale", 1),

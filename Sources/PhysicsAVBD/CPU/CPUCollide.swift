@@ -901,7 +901,9 @@ extension CPUManifold {
         }
         if found.isEmpty { return 0 }
         let nAvg = normalize(found.reduce(F3.zero) { $0 + $1.n })
-        let n = capsuleIsA ? -nAvg : nAvg
+        // Each sample points from the box toward the capsule. The manifold
+        // convention is B -> A, matching the signed surface witnesses below.
+        let n = capsuleIsA ? nAvg : -nAvg
         basisOut = orthonormalBasis(n)
         for (i, f) in found.enumerated() {
             var c = ContactPoint()

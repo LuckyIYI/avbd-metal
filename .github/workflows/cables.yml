@@ -1,0 +1,40 @@
+name: Cable validation
+
+on:
+  pull_request:
+    paths:
+      - "Package.swift"
+      - "Sources/**"
+      - "Tests/**"
+      - "Examples/Cables/**"
+      - "Tools/verify_architecture.py"
+      - "Tools/tests/test_verify_architecture.py"
+      - ".github/workflows/cables.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-cables:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Cable authoring, force derivatives, contact normals and ABI
+        run: >-
+          swift test -c release --filter
+          'CableAuthoringTests|testFullForceGradientMatchesEnergyOnBothBodies|testCapsuleBoxContactNormalInBothOrders|testDemoMetadataAndJointABI'
+      # Hosted runners need not expose a Metal device. Metal physics and
+      # performance checks also run locally via cable-validation --benchmark.
+      - name: CPU physical validation
+        run: swift run -c release cable-validation --cpu-only
+      - name: Package boundaries
+        run: |
+          python3 -S Tools/verify_architecture.py
+          python3 -m unittest discover -s Tools/tests -p test_verify_architecture.py

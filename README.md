@@ -4,7 +4,7 @@ GPU-oriented, multi-backend simulation for Swift. The current production
 backend is a Swift + Metal implementation of **Augmented Vertex Block Descent**
 ([Giles, Diaz, Yuksel — SIGGRAPH 2025](https://graphics.cs.utah.edu/research/projects/avbd/))
 with a CPU reference backend alongside it. **Rigid bodies, volumetric soft
-bodies, and cloth are first-class citizens** in one solve loop. A
+bodies, cloth, and elastic cables are first-class citizens** in one solve loop. A
 robotics/world-model research playground is built on top of the simulator.
 
 ## Papers & techniques
@@ -28,6 +28,12 @@ primal (8 threads/body, `simd_shuffle_xor` reduction — rigids included),
 counting-sort spatial hash, CAS open-addressing persistence maps, sign-memory
 crossing protection with boundary release, runtime shader concatenation
 (`00_common` … `60_robotics`).
+
+Native [elastic cables](Documentation/Cables.md) provide independent stretch,
+shear, bend and twist materials, damping, curved rest shapes, capsule contact,
+and rigid attachments on both CPU and Metal. `PhysicsScene.addCable` authors
+the topology; `Demos.make("cables")` demonstrates it. Run the headless physical
+checks and scaling benchmark with `swift run -c release cable-validation --benchmark`.
 
 Rigid contact materials keep geometry and constitutive response separate.
 `friction` / `dynamicFriction` bound tangential force; the optional

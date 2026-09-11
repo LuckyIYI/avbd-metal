@@ -5,6 +5,7 @@ let package = Package(
     name: "gpu-sim",
     platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
+        .executable(name: "cable-validation", targets: ["CableValidation"]),
         .executable(name: "material-preview", targets: ["MaterialPreview"]),
         .library(name: "GPUSim", targets: ["GPUSim"]),
         .library(name: "GPUSimDemos", targets: ["GPUSimDemos"]),
@@ -13,6 +14,7 @@ let package = Package(
         .library(name: "PhysicsAVBD", targets: ["PhysicsAVBD"]),
     ],
     targets: [
+        .executableTarget(name: "CableValidation", dependencies: ["PhysicsAVBD", "SimCore"], path: "Examples/Cables"),
         .executableTarget(name: "MaterialPreview", dependencies: ["GPUSimRenderer", "PhysicsAVBD", "SimCore"], path: "Examples/Materials", exclude: ["README.md", "fetch-example.py"]),
         .target(name: "SimCore"),
         .target(

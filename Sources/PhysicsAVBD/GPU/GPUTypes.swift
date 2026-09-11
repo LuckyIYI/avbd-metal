@@ -90,7 +90,12 @@ public struct SimParamsGPU {
 extension SimParamsGPU: Equatable {}
 
 public struct JointGPU {
-    public var header: SIMD4<UInt32> = .zero  // bodyA, bodyB, broken, pad
+    public static let cableFlag: UInt32 = 1 << 6
+    // Tagged storage: cable joints reuse the otherwise inactive motor/limit
+    // fields. This preserves the 256-byte joint ABI for all existing scenes.
+    // motor.xyz = linear stiffness; limits.xyz = angular stiffness;
+    // motor.w = material damping time. C0Lin/Ang hold initial material strain.
+    public var header: SIMD4<UInt32> = .zero  // bodyA, bodyB, broken, flags
     public var rA: SIMD4<Float> = .zero       // w = stiffnessLin
     public var rB: SIMD4<Float> = .zero       // w = stiffnessAng
     public var C0Lin: SIMD4<Float> = .zero    // w = torqueArm

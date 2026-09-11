@@ -72,6 +72,20 @@ SIMULATOR_PRODUCTS = {
     name: ("library", (name,)) for name in SIMULATOR_TARGETS
 }
 
+# Explicit leaf examples may consume simulator products without becoming
+# dependencies of those products. Keep their paths and dependencies checked.
+SIMULATOR_EXAMPLES = {
+    "MaterialPreview": (
+        "material-preview", "Examples/Materials",
+        frozenset({_target("GPUSimRenderer"), _target("PhysicsAVBD"), _target("SimCore")}),
+        frozenset({"README.md", "fetch-example.py"}),
+    ),
+    "CableValidation": (
+        "cable-validation", "Examples/Cables",
+        frozenset({_target("PhysicsAVBD"), _target("SimCore")}), frozenset(),
+    ),
+}
+
 _SIM_CORE = _product("SimCore", "gpu-sim")
 _PHYSICS = _product("PhysicsAVBD", "gpu-sim")
 _DEMOS = _product("GPUSimDemos", "gpu-sim")
@@ -286,6 +300,23 @@ def verify_manifest(
     }
     if len(targets) != len(raw_targets) or len(products) != len(raw_products):
         raise VerificationError("SwiftPM package dump has duplicate or malformed names")
+
+    if contract is SIMULATOR_CONTRACT:
+        for name, (product_name, path, dependencies, excludes) in SIMULATOR_EXAMPLES.items():
+            if name not in targets:
+                continue
+            example = targets.pop(name)
+            if (example.get("type") != "executable"
+                    or example.get("path") != path
+                    or _normalize_dependencies(example) != dependencies
+                    or _normalize_resources(example)
+                    or frozenset(example.get("exclude", [])) != excludes
+                    or example.get("sources") not in (None, [])):
+                raise VerificationError(f"example {name} differs from its leaf target contract")
+            example_product = products.pop(product_name, {})
+            if (example_product.get("targets") != [name]
+                    or _product_kind(example_product.get("type"), product_name) != "executable"):
+                raise VerificationError(f"example {name} requires its executable product")
 
     superseded = SUPERSEDED_TARGETS.intersection((*targets, *products))
     if superseded:

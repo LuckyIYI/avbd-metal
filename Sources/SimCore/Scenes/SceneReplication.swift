@@ -99,6 +99,9 @@ public extension PhysicsScene {
                 }
                 output.springs.append(spring)
             }
+            for cable in source.cables {
+                output.cables.append(cable.remapped(body: mapping.body, joint: mapping.joint))
+            }
             for tet in source.tets {
                 output.tets.append(SceneTet(
                     ids: (

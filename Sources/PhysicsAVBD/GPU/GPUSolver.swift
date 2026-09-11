@@ -2519,6 +2519,15 @@ public final class GPUSolver {
             if j.stiffnessAng > 0 && j.stiffnessAng.isFinite {
                 g.penaltyAng = SIMD4(repeating: min(j.stiffnessAng, 1e9))
             }
+            if let material = j.cable {
+                precondition(j.hingeAxis == nil && j.prismaticAxis == nil
+                    && j.motorTorque == 0 && j.stiffnessLin == 0
+                    && j.stiffnessAng == 0 && j.fracture.isInfinite,
+                    "cable materials cannot be combined with other joint laws")
+                g.header.w = JointGPU.cableFlag
+                g.motor = SIMD4(material.linearStiffness, material.dampingTime)
+                g.limits = SIMD4(material.angularStiffness, 0)
+            }
             jp[i] = g
         }
         initialJointPenaltyLin = (0..<numJoints).map { jp[$0].penaltyLin }
@@ -4010,7 +4019,9 @@ public final class GPUSolver {
                     || (a != UInt32.max && resetBodies.contains(a)) {
                     jp[i].lambdaLin = .zero
                     jp[i].lambdaAng = .zero
-                    jp[i].motor.z = 0
+                    if jp[i].header.w & JointGPU.cableFlag == 0 {
+                        jp[i].motor.z = 0
+                    }
                     jp[i].dynamics.y = 0
                     jp[i].dynamics.z = 0
                     jp[i].penaltyLin = initialJointPenaltyLin[i]

@@ -123,6 +123,17 @@ public extension PhysicsScene {
             CPUSolver.bodyPairKey($0.bodyA, $0.bodyB)
         })
         for joint in joints {
+            if let material = joint.cable {
+                precondition(joint.hingeAxis == nil && joint.prismaticAxis == nil
+                    && joint.motorTorque == 0 && joint.stiffnessLin == 0
+                    && joint.stiffnessAng == 0 && joint.fracture.isInfinite,
+                    "cable materials cannot be combined with other joint laws")
+                _ = CPUCable(solver: solver,
+                    bodyA: joint.bodyA >= 0 ? solver.bodies[joint.bodyA] : nil,
+                    bodyB: solver.bodies[joint.bodyB], rA: joint.rA, rB: joint.rB,
+                    material: material)
+                continue
+            }
             let cpuJoint = solver.addJoint(
                 joint.bodyA >= 0 ? solver.bodies[joint.bodyA] : nil,
                 solver.bodies[joint.bodyB],
