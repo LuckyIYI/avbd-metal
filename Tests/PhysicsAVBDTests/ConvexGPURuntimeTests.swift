@@ -11,10 +11,12 @@ final class ConvexGPURuntimeTests: XCTestCase {
     func testCapturedSmallHullInsideFloor() throws { try checkCapturedPair(2) }
     func testCapturedSmallHullAgainstFurnitureHull() throws { try checkCapturedPair(3) }
 
+    func testCapturedDetailedFloorAgainstMouseDetail() throws { try checkCapturedPair(4) }
+
     private func checkCapturedPair(_ requestedIndex: Int) throws {
         try requireMetal()
         let fixtures = try JSONSerialization.jsonObject(with: Data(capturedFloorPairsJSON.utf8)) as! [[[String: Any]]]
-        XCTAssertEqual(fixtures.count, 4, "Keep every captured failure")
+        XCTAssertEqual(fixtures.count, 5, "Keep every captured failure")
         for (index, pair) in fixtures.enumerated() where index == requestedIndex {
             let vertexCounts = pair.map { ($0["vertices"] as! [[NSNumber]]).count }
             if vertexCounts.contains(where: { $0 > ConvexAssetLimits.maximumVerticesPerHull }) {
@@ -1367,6 +1369,68 @@ final class ConvexGPURuntimeTests: XCTestCase {
         XCTAssertTrue(manifoldSnapshots(solver).allSatisfy(\.finite))
     }
 
+    func testHierarchyKeepsFastLinearAndAngularSpeculativePairs() throws {
+        try requireMetal()
+        for angular in [false,true] {
+            var scene=PhysicsScene(name:"velocity-bounded-hierarchy")
+            scene.settings.gravity=0;scene.settings.iterations=0
+            scene.settings.collisionMargin=0.01
+            let fixed=scene.addBody(size:F3(repeating:1),density:0,friction:0.5,
+                position:F3(0,0,0),collisionEnabled:false)
+            let moving=scene.addBody(size:F3(repeating:1),density:1,friction:0.5,
+                position:F3(1.1,0,0),collisionEnabled:false)
+            let asset=try cubeAsset()
+            let a=scene.addConvexCollider(body:fixed,asset:asset)
+            let b=scene.addConvexCollider(body:moving,asset:asset)
+            scene.addCollider(body:fixed,size:F3(repeating:0.05),localPosition:F3(-3,0,0))
+            let solver=try GPUSolver(scene:scene)
+            try solver.submitStep();try solver.synchronize()
+            func emitted()->Set<SIMD2<UInt32>> {
+                Set(UnsafeBufferPointer(start:solver.pairs.contents().assumingMemoryBound(to:SIMD2<UInt32>.self),count:solver.lastNumPairs))
+            }
+            XCTAssertFalse(emitted().contains(SIMD2(UInt32(a),UInt32(b))),"stationary gap exceeds ordinary margin")
+            solver.setBodyStates([.init(body:moving,position:F3(1.1,0,0),
+                rotation:Quat(real:1,imag:.zero),
+                linearVelocity:angular ? .zero : F3(-10,0,0),
+                angularVelocity:angular ? F3(0,0,20) : .zero)])
+            try solver.submitStep();try solver.synchronize()
+            XCTAssertTrue(emitted().contains(SIMD2(UInt32(a),UInt32(b))),
+                "linear/angular sweep must retain potentially approaching surfaces")
+        }
+    }
+
+    func testHierarchyKeepsFastPrimitivePairsWithoutHulls() throws {
+        try requireMetal()
+        // Same compound configuration as the hull sweep above, plus a box on
+        // each body. The box gate must keep the approaching box/box pair even
+        // though neither side is a hull.
+        var scene=PhysicsScene(name:"primitive-speculative-hierarchy")
+        scene.settings.gravity=0;scene.settings.iterations=0
+        scene.settings.collisionMargin=0.01
+        let fixed=scene.addBody(size:F3(repeating:1),density:0,friction:0.5,
+            position:F3(0,0,0),collisionEnabled:false)
+        let moving=scene.addBody(size:F3(repeating:1),density:1,friction:0.5,
+            position:F3(1.1,0,0),collisionEnabled:false)
+        let asset=try cubeAsset()
+        _=scene.addConvexCollider(body:fixed,asset:asset)
+        _=scene.addConvexCollider(body:moving,asset:asset)
+        scene.addCollider(body:fixed,size:F3(repeating:0.05),localPosition:F3(-3,0,0))
+        let boxA=scene.addCollider(body:fixed,size:F3(repeating:1),localPosition:F3(0,0,2))
+        let boxB=scene.addCollider(body:moving,size:F3(repeating:1),localPosition:F3(0,0,2))
+        let solver=try GPUSolver(scene:scene)
+        try solver.submitStep();try solver.synchronize()
+        func emitted()->Set<SIMD2<UInt32>> {
+            Set(UnsafeBufferPointer(start:solver.pairs.contents().assumingMemoryBound(to:SIMD2<UInt32>.self),count:solver.lastNumPairs))
+        }
+        let pair=SIMD2(UInt32(boxA),UInt32(boxB))
+        XCTAssertFalse(emitted().contains(pair),"stationary gap exceeds ordinary margin")
+        solver.setBodyStates([.init(body:moving,position:F3(1.1,0,0),
+            rotation:Quat(real:1,imag:.zero),linearVelocity:F3(-10,0,0),angularVelocity:.zero)])
+        try solver.submitStep();try solver.synchronize()
+        XCTAssertTrue(emitted().contains(pair),
+            "a fast face-on primitive pair must keep its speculative contact on the hierarchy path")
+    }
+
     func testHierarchyFinalizationHasExactlyOneWriter() throws {
         try requireMetal()
         var scene = PhysicsScene(name: "hierarchy-finalizer-writer")
@@ -1459,7 +1523,7 @@ final class ConvexGPURuntimeTests: XCTestCase {
         }
     }
 
-    func testHierarchySubtreesPreserveAllEligibleSpherePairs() throws {
+    func testHierarchySubtreesPreserveAllEligibleGeometryBounds() throws {
         try requireMetal()
         var scene = PhysicsScene(name: "compound-subtree-pair-oracle")
         scene.settings.gravity = 0
@@ -1526,6 +1590,25 @@ final class ConvexGPURuntimeTests: XCTestCase {
             let p = local[index]
             return body.position + body.rotation.act(F3(p.x, p.y, p.z))
         }
+        // Independent oracle: transform source vertices directly to world
+        // space, rather than using the hierarchy's uploaded local bounds.
+        func worldBounds(_ index: Int) -> (F3,F3) {
+            let c=scene.colliders[index], body=scene.bodies[c.body]
+            let points:[F3]
+            if let id=c.convexAssetID {points=scene.convexAssets[id].vertices}
+            else {
+                var corners:[F3]=[]
+                for x:Float in [-0.5,0.5] {for y:Float in [-0.5,0.5] {for z:Float in [-0.5,0.5] {
+                    corners.append(c.size * F3(x,y,z))
+                }}}
+                points=corners
+            }
+            let world=points.map{body.position+body.rotation.act(c.localPosition+c.localRotation.act($0))}
+            return (world.reduce(F3(repeating:.infinity),simd_min),
+                    world.reduce(F3(repeating:-.infinity),simd_max))
+        }
+        let bounds=scene.colliders.indices.map(worldBounds)
+        var required = Set<SIMD2<UInt32>>()
         var expected = Set<SIMD2<UInt32>>()
         for a in scene.colliders.indices {
             for b in scene.colliders.indices where b > a {
@@ -1537,7 +1620,14 @@ final class ConvexGPURuntimeTests: XCTestCase {
                         max(4 * scene.settings.collisionMargin, 3 * min(ra, rb)))
                 }
                 if simd_length_squared(center(a) - center(b)) <= radius * radius {
-                    expected.insert(SIMD2(UInt32(a), UInt32(b)))
+                    let pair=SIMD2(UInt32(a),UInt32(b))
+                    expected.insert(pair)
+                    // This fixture has zero linear/angular velocity: only
+                    // the ordinary hull margin can enter narrowphase.
+                    let hullPair=shapeType[a] & 15 == 4 || shapeType[b] & 15 == 4
+                    let padding=F3(repeating:hullPair ? scene.settings.collisionMargin : 0)
+                    if all(bounds[a].0 .<= bounds[b].1+padding)
+                        && all(bounds[b].0 .<= bounds[a].1+padding) {required.insert(pair)}
                 }
             }
         }
@@ -1553,8 +1643,12 @@ final class ConvexGPURuntimeTests: XCTestCase {
                 start: solver.pairs.contents().assumingMemoryBound(to: SIMD2<UInt32>.self),
                 count: solver.lastNumPairs))
             XCTAssertEqual(emitted.count, Set(emitted).count, "no duplicate collider pairs")
-            XCTAssertTrue(Set(emitted) == expected,
-                "subtrees must preserve all \(expected.count) pairs, got \(emitted.count)")
+            XCTAssertFalse(required.isEmpty)
+            XCTAssertTrue(required.isSubset(of:Set(emitted)),
+                "must retain every source-geometry AABB pair inside the original query band")
+            XCTAssertTrue(Set(emitted).isSubset(of:expected),
+                "tightening must not add pairs outside the original sphere/domain oracle")
+            XCTAssertLessThan(emitted.count,expected.count,"thin shapes should prune sphere false positives")
             if let first { XCTAssertTrue(emitted == first, "stable emission order") }
             else { first = emitted }
         }

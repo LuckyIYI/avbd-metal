@@ -13,6 +13,7 @@ using namespace metal;
 
 struct ColliderBVHNodeGPU {
     float4 centerRadius;
+    float4 halfExtent;
     uint4 links;               // left, right, leaf collider, flags
 };
 
@@ -23,16 +24,20 @@ inline float3 bpBVHWorldCenter(
     return posLin[body].xyz + q_rotate(posAng[body], node.centerRadius.xyz);
 }
 
+// Mirrors npSpeculativeCap in 30_narrowphase.metal (separate library).
+inline float bpSpeculativeCap(float radiusA, float radiusB, constant SimParams& P)
+{
+    return min(0.25f, max(4.0f * P.collisionMargin, 3.0f * min(radiusA, radiusB)));
+}
+
 inline float bpBVHPairRadius(
     float radiusA, float radiusB, uint flagsA, uint flagsB,
-    constant SimParams& P)
+    float speedBound, constant SimParams& P)
 {
     float result = radiusA + radiusB;
     if (((flagsA | flagsB) & 2u) != 0u) {
-        float cap = min(0.25f,
-            max(4.0f * P.collisionMargin,
-                3.0f * min(radiusA, radiusB)));
-        result += P.collisionMargin + cap;
+        float cap = bpSpeculativeCap(radiusA, radiusB, P);
+        result += P.collisionMargin + min(cap, speedBound * P.dt);
     }
     return result;
 }
@@ -44,6 +49,7 @@ inline uint bpExpandHierarchyPair(
     device const ColliderBVHNodeGPU* nodes,
     device const float4* posLin,
     device const float4* posAng,
+    device const float4* velLin, device const float4* velAng,
     constant SimParams& P,
     device uchar* leafPairs)
 {
@@ -59,10 +65,38 @@ inline uint bpExpandHierarchyPair(
         ColliderBVHNodeGPU nodeB = nodes[nodePair.y];
         float3 centerA = bpBVHWorldCenter(nodeA, bodyA, posLin, posAng);
         float3 centerB = bpBVHWorldCenter(nodeB, bodyB, posLin, posAng);
+        // Bound relative velocity at every descendant collider center.
+        // Angular inflation covers the subtree radius; the same velocity
+        // buffers feed narrowphase's directional speculative contact gate.
+        float3 wa=velAng[bodyA].xyz, wb=velAng[bodyB].xyz;
+        float3 va=velLin[bodyA].xyz+cross(wa,centerA-posLin[bodyA].xyz);
+        float3 vb=velLin[bodyB].xyz+cross(wb,centerB-posLin[bodyB].xyz);
+        float speedBound=length(vb-va)+length(wa)*nodeA.centerRadius.w
+            + length(wb)*nodeB.centerRadius.w;
         float radius = bpBVHPairRadius(
             nodeA.centerRadius.w, nodeB.centerRadius.w,
-            nodeA.links.w, nodeB.links.w, P);
-        if (distance_squared(centerA, centerB) > radius * radius) continue;
+            nodeA.links.w, nodeB.links.w, speedBound, P);
+        // Preserve the original sphere envelope. Velocity refines the
+        // independent box bound below, not this established traversal gate.
+        float sphereRadius=bpBVHPairRadius(nodeA.centerRadius.w,
+            nodeB.centerRadius.w,nodeA.links.w,nodeB.links.w,FLT_MAX,P);
+        if (distance_squared(centerA, centerB) > sphereRadius * sphereRadius) continue;
+        // Tight compound bounds reject distant shelves/walls that overlap a
+        // large enclosing sphere. Every pair keeps the narrowphase's speculative
+        // reach (approach*dt, capped like npSpeculativeCap) along the box axes,
+        // not only hull pairs, so a fast face-on primitive is not culled until
+        // it already overlaps; hull pairs keep their larger sphere padding.
+        float3 ha=nodeA.halfExtent.xyz, hb=nodeB.halfExtent.xyz;
+        float3 ea=abs(q_rotate(posAng[bodyA],float3(ha.x,0,0)))
+            + abs(q_rotate(posAng[bodyA],float3(0,ha.y,0)))
+            + abs(q_rotate(posAng[bodyA],float3(0,0,ha.z)));
+        float3 eb=abs(q_rotate(posAng[bodyB],float3(hb.x,0,0)))
+            + abs(q_rotate(posAng[bodyB],float3(0,hb.y,0)))
+            + abs(q_rotate(posAng[bodyB],float3(0,0,hb.z)));
+        float speculative=min(speedBound*P.dt,
+            bpSpeculativeCap(nodeA.centerRadius.w,nodeB.centerRadius.w,P));
+        float padding=max(radius-nodeA.centerRadius.w-nodeB.centerRadius.w,speculative);
+        if (any(abs(centerA-centerB)>ea+eb+padding)) continue;
 
         bool leafA = (nodeA.links.w & 1u) != 0u;
         bool leafB = (nodeB.links.w & 1u) != 0u;
@@ -104,13 +138,15 @@ kernel void bp_count_hierarchy_pairs(
     device uchar* leafPairs [[buffer(8)]],
     constant SimParams& P [[buffer(9)]],
     constant uint& pairCapacity [[buffer(10)]],
+    device const float4* velLin [[buffer(11)]],
+    device const float4* velAng [[buffer(12)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= pairCapacity) return;
     uint proxyCount = atomic_load_explicit(
         &counters[CTR_PAIRS], memory_order_relaxed);
     pairCounts[gid] = gid < proxyCount ? bpExpandHierarchyPair(
-        proxyPairs[gid], proxyOwner, proxyRoot, nodes, posLin, posAng,
+        proxyPairs[gid], proxyOwner, proxyRoot, nodes, posLin, posAng, velLin, velAng,
         P, leafPairs + size_t(gid) * 256u) : 0u;
 }
 
