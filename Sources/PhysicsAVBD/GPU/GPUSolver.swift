@@ -1716,7 +1716,7 @@ public final class GPUSolver {
         changedFlag = try makeBuf(24 * 4, "changedFlag")  // per-pass slots
 
         counters = try makeBuf(GPUCounters.total * 4, "counters")
-        convexQueryPoison = try makeBuf(4, "convexQueryPoison")
+        convexQueryPoison = try makeBuf(128, "convexQueryPoison")
         counterReadbacks = try (0..<2).map {
             try makeBuf(GPUCounters.total * 4, "counterReadback[\($0)]")
         }
@@ -7367,6 +7367,37 @@ public final class GPUSolver {
             buffers.triangles, convexDebugTriangleVertexCount,
             buffers.edges, convexDebugEdgeVertexCount,
             posLin, posAng)
+    }
+
+    /// Read only after a typed convex-query failure has retired. Captures the
+    /// actual narrowphase poses, before the failed-frame rollback. No sync()
+    /// here: that legacy accessor traps on a latched failure.
+    public func convexFailureEvidence() -> [String: Any]? {
+        guard case .commandExecution(_, _, _, let domain, _, _) = runtimeFailure,
+              domain == RuntimeFailure.convexQueryFailureDomain else { return nil }
+        let words = convexQueryPoison.contents().bindMemory(to: UInt32.self, capacity: 32)
+        guard words[1] == 1 else { return nil }
+        let data = convexQueryPoison.contents().advanced(by: 16)
+            .bindMemory(to: SIMD4<Float>.self, capacity: 6)
+        func array(_ v: SIMD4<Float>) -> [Float] { [v.x, v.y, v.z, v.w] }
+        let ranges = colliderHullRange.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: numColliders)
+        let vertices = convexHullVertices.contents().bindMemory(to: SIMD4<Float>.self,
+            capacity: convexHullVertices.length / 16)
+        var shapes: [[String: Any]] = []
+        for side in 0..<2 {
+            let collider = Int(words[2 + side])
+            guard collider < numColliders else { return nil }
+            let range = ranges[collider]
+            let start = Int(range.x), count = Int(range.y)
+            guard start <= convexHullVertices.length / 16,
+                  count <= convexHullVertices.length / 16 - start else { return nil }
+            let hull = data[side * 3].w == 4
+                ? (start..<(start + count)).map { array(vertices[$0]) } : []
+            shapes.append(["collider": collider, "center_kind": array(data[side * 3]),
+                "rotation": array(data[side * 3 + 1]), "dimensions": array(data[side * 3 + 2]),
+                "vertices": hull])
+        }
+        return ["schema": 1, "shapes": shapes]
     }
 
     public var bodyCount: Int { numBodies }
