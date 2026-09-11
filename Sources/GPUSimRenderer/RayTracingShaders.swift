@@ -157,8 +157,9 @@ inline float3 rtLit(float3 P, float3 N, float3 V, float3 albedo, float rough, fl
 inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant Uniforms& U,
     device const RTVertex* vertices, device const RTObject* objects, device const RTInstance* instances,
     device const RenderInstance* rigid, device const RenderInstance* auxiliary,
-    device const RenderAppearance* appearances, uint hasAppearance, constant MaterialResources& materials, bool diffuseOnly = false, bool includeEmitters = true) {
+    device const RenderAppearance* appearances, uint hasAppearance, constant MaterialResources& materials, bool diffuseOnly = false, bool includeEmitters = true, thread float* firstHitDistance = nullptr) {
     float4 emitter=areaIntersection(r.origin,r.direction,U);
+    if (firstHitDistance) *firstHitDistance=r.max_distance;
     bool lightHit=emitter.w<r.max_distance;
     if (lightHit) r.max_distance=emitter.w;
     float groundDistance = rtGroundDistance(r,U);
@@ -167,6 +168,11 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
     query.assume_geometry_type(geometry_type::triangle);
     query.force_opacity(forced_opacity::opaque);
     auto hit = query.intersect(r,scene,2);
+    if (firstHitDistance) {
+        if (hit.type != intersection_type::none) *firstHitDistance=hit.distance;
+        else if (groundDistance>=0) *firstHitDistance=groundDistance;
+        else if (lightHit) *firstHitDistance=emitter.w;
+    }
     if (hit.type == intersection_type::none) {
         // Direct emitter lighting is sampled separately at opaque receivers.
         // Do not count a second BSDF-hit estimator without MIS weighting.
@@ -241,7 +247,7 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
 inline float4 rtTransmission(ray r, instance_acceleration_structure scene, constant Uniforms& U,
     device const RTVertex* vertices, device const RTObject* objects, device const RTInstance* instances,
     device const RenderInstance* rigid, device const RenderInstance* auxiliary,
-    device const RenderAppearance* appearances, uint hasAppearance, constant MaterialResources& materials) {
+    device const RenderAppearance* appearances, uint hasAppearance, constant MaterialResources& materials, thread float* firstHitDistance = nullptr) {
     intersector<triangle_data,instancing> query;
     query.assume_geometry_type(geometry_type::triangle);
     query.force_opacity(forced_opacity::opaque);
@@ -251,6 +257,12 @@ inline float4 rtTransmission(ray r, instance_acceleration_structure scene, const
     for (uint boundary=0; boundary<interfaces; ++boundary) {
         auto hit = query.intersect(r,scene,2);
         float ground = rtGroundDistance(r,U);
+        if (boundary==1 && firstHitDistance) {
+            *firstHitDistance = hit.type==intersection_type::none ? r.max_distance : hit.distance;
+            if (ground>=0) *firstHitDistance=min(*firstHitDistance,ground);
+            float4 emitter=areaIntersection(r.origin,r.direction,U);
+            *firstHitDistance=min(*firstHitDistance,emitter.w);
+        }
         if (hit.type == intersection_type::none || (ground>=0 && ground<hit.distance)) {
             if (boundary==0) return float4(0);
             float4 background = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials);
@@ -318,8 +330,12 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     constant uint& hasAppearance [[buffer(8)]], constant MaterialResources& materials [[buffer(10)]], depth2d<float,access::read> depth [[texture(0)]],
     texture2d<float,access::read> normal [[texture(1)]], texture2d<float,access::write> output [[texture(2)]],
     texture2d<float,access::read> material [[texture(3)]], texture2d<float,access::read> visibility [[texture(4)]],
+    texture2d<float,access::write> hitDistance [[texture(5)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= uint2(output.get_width(),output.get_height()))) return;
+    // Zero marks pixels without an evaluated specular lobe. Misses use the
+    // finite tracing horizon (100 world units), not camera depth or infinity.
+    if (U.diffuse.y>0) hitDistance.write(float4(0),pixel);
     float d = depth.read(pixel); float4 nr = normal.read(pixel);
     if (d >= 1) { output.write(float4(0),pixel); return; }
     float2 uv = (float2(pixel)+0.5)/float2(output.get_width(),output.get_height());
@@ -327,8 +343,10 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     ray cameraRay; cameraRay.origin=U.eye.xyz; cameraRay.direction=-V;
     float2 cameraClip=cameraRayInterval(cameraRay.direction,U);
     cameraRay.min_distance=cameraClip.x; cameraRay.max_distance=cameraClip.y;
-    float4 transmitted=U.rayBudget.w>0 ? rtTransmission(cameraRay,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials) : float4(0);
+    float transmissionDistance=0;
+    float4 transmitted=U.rayBudget.w>0 ? rtTransmission(cameraRay,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,&transmissionDistance) : float4(0);
     if (transmitted.a>0) {
+        if (U.diffuse.y>0) hitDistance.write(float4(transmissionDistance),pixel);
         float fog=horizonFog(length(P-U.eye.xyz));
         output.write(float4(mix(transmitted.rgb,HORIZON_LIN,fog)*transmitted.a,1),pixel);
         return;
@@ -341,6 +359,7 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     float4 receiver = material.read(pixel);
     float3 F0 = mix(float3(0.04),receiver.rgb,receiver.a);
     float3 correctionSum = float3(0); float coverage = 0;
+    float distanceSum=0; uint distanceCount=0;
     // One ray preserves the real-time default; callers can spend more within a frame.
     uint reflectionSamples=uint(max(U.rayBudget.y,1.0));
     for(uint sample=0;sample<reflectionSamples;++sample) {
@@ -354,7 +373,9 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     if (NdR > 0) {
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
         ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
-        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,false,false);
+        float sampleDistance=100;
+        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,false,false,&sampleDistance);
+        distanceSum+=sampleDistance; distanceCount+=1;
         float3 incoming = hit.w > 0 ? hit.rgb : materialEnvironment(R,U,materials);
         float viewLambda = rtSmithLambda(localV.z,alpha);
         float masking = (1+viewLambda)/(1+viewLambda+rtSmithLambda(NdR,alpha));
@@ -365,6 +386,7 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
         coverage += 1;
     }
     }
+    if (U.diffuse.y>0 && distanceCount>0) hitDistance.write(float4(distanceSum/float(distanceCount)),pixel);
     correctionSum /= float(reflectionSamples); coverage /= float(reflectionSamples);
     // A below-surface sample has zero incoming radiance, but still replaces
     // the analytic raster environment, exactly like every other HQ sample.

@@ -115,6 +115,15 @@ HQ guide infrastructure and device requirements; it is not a separate portable
 path tracer. Compare it against denoised output with identical ray counts,
 resolution and scene state. The default remains denoising enabled.
 
+The denoiser receives signed world-space normals, view-dependent Schlick specular
+albedo, and specular hit distances from the existing reflection rays; no extra
+rays are traced for guides. Distances use world units and average evaluated
+specular samples. Misses use the finite tracing horizon; pixels without an
+evaluated specular lobe use zero. Transmission previews use the first refracted
+segment. These are approximate guides for the combined lighting signal,
+particularly where reflection and transmission overlap. Fast mode allocates no
+specular-distance texture.
+
 `verticalFieldOfView` defaults to 50 degrees. `nearClipDistance` and
 `farClipDistance` default to 0.1 and 1000 world units. A narrow lens aimed at a
 distant subject benefits from moving the near clip plane forward. All camera

@@ -676,7 +676,7 @@ struct Uniforms {
     float4 rayTracing; // x: world visibility, y: screen reflection shortcut enabled
     float4 rayScene; // x: analytic built-in ground enabled
     float4 rayBudget; // shadow, reflection, diffuse (0 adaptive), transmission interfaces (0 absent)
-    float4 diffuse; // x: world diffuse lighting enabled
+    float4 diffuse; // x: world diffuse lighting enabled; y: ray pass writes specular distance
     float4 reconstruction; // x: MetalFX, yz: normalized projection jitter, w: sample index
     float4 areaSettings; // count, samples per emitter, reserved
     float4 environmentSettings; // intensity minus one, rotation, hide background, reserved
@@ -2311,7 +2311,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             if activeOptions.reconstruction == .metalFX {
                 let denoising = activeOptions.usesRayTracing && activeOptions.rayTracingDenoising
                 if metalFX?.size != targetSize || metalFX?.outputSize != SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)) || metalFX?.denoising != denoising {
-                    metalFX = try MetalFXReconstruction(device: device, size: targetSize, denoising: denoising, outputSize: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)), sharedDepth: screenSpace.depth, sharedNormal: screenSpace.normal, sharedMaterial: screenSpace.material)
+                    metalFX = try MetalFXReconstruction(device: device, size: targetSize, denoising: denoising, outputSize: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)), sharedDepth: screenSpace.depth, sharedNormal: screenSpace.normal, sharedMaterial: screenSpace.material, enableSpecularHitDistance: denoising)
                 }
             } else { metalFX = nil }
         } catch {
@@ -2909,7 +2909,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             }
             if Uh.rayTracing.w > 0, let rayWorld {
                 try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
-                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
+                    instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true, specularHitDistance: metalFX?.specularHitDistance)
             }
         } catch {
             reportFailure("screen-space lighting failed: \(error)")
@@ -3038,7 +3038,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 }
                 if U.rayTracing.w == 0, let rayWorld {
                     try rayWorld.encodeLighting(command: cmd, uniforms: Uh, screen: screenSpace,
-                        instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true)
+                        instances: instances, auxiliary: auxiliaryBatch?.buffer, appearances: appearanceOverrides, reflections: true, specularHitDistance: metalFX?.specularHitDistance)
                     try screenSpace.encodeReflectionFilter(command: cmd, uniforms: Uh)
                 }
                 if let metalFX { try metalFX.finishFrame(command: cmd, color: screenSpace.sceneColor!, reconstruct: activeOptions.rayTracingDenoising) }

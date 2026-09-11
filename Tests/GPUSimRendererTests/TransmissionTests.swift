@@ -66,7 +66,9 @@ final class TransmissionTests: XCTestCase {
               device const RTInstance* instances [[buffer(4)]],device const RenderInstance* rigid [[buffer(5)]],
               device const RenderAppearance* overrides [[buffer(6)]],device float4* result [[buffer(9)]],constant MaterialResources& materials [[buffer(10)]]) {
               ray r; r.origin=float3(-1.15,0,1); r.direction=normalize(float3(0.6,0,-1)); r.min_distance=0.001; r.max_distance=10;
-              result[0]=rtTransmission(r,scene,U,vertices,objects,instances,rigid,rigid,overrides,0,materials);
+              float distance=0;
+              result[0]=rtTransmission(r,scene,U,vertices,objects,instances,rigid,rigid,overrides,0,materials,&distance);
+              result[1]=float4(distance);
           }
           """
       let lib = try device.makeLibrary(source: source, options: nil)
@@ -86,7 +88,7 @@ final class TransmissionTests: XCTestCase {
       memset(u.contents(), 0, u.length)
       u.contents().assumingMemoryBound(to: Uniforms.self).pointee.screen.z = 1000
       u.contents().assumingMemoryBound(to: Uniforms.self).pointee.lightDir = SIMD4(0, 0, -1, 0)
-      let output = try XCTUnwrap(device.makeBuffer(length: 16, options: .storageModeShared))
+      let output = try XCTUnwrap(device.makeBuffer(length: 32, options: .storageModeShared))
       let e = try XCTUnwrap(command.makeComputeCommandEncoder())
       e.setComputePipelineState(pipeline)
       e.setAccelerationStructure(world.structure, bufferIndex: 0)
@@ -106,6 +108,11 @@ final class TransmissionTests: XCTestCase {
       command.commit()
       command.waitUntilCompleted()
       XCTAssertEqual(command.status, .completed, "\(String(describing: command.error))")
+      let distance = output.contents().assumingMemoryBound(to: SIMD4<Float>.self)[1].x
+      let ior: Float = mode == 2 ? 1.5 : 1
+      let cosine = sqrt(1 - (0.36 / 1.36) / (ior * ior))
+      XCTAssertEqual(distance, mode == 0 ? 0 : 0.5 / cosine, accuracy: 0.001,
+                     "Guide measures the first refracted segment, not camera depth or total path length")
       results.append(output.contents().assumingMemoryBound(to: SIMD4<Float>.self).pointee)
     }
     XCTAssertEqual(results[0], .zero, "Opaque receivers must retain the original shading path")

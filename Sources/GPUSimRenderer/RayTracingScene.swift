@@ -327,11 +327,11 @@ final class RayTracingScene {
     }
 
     func encodeLighting(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
-                        instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?, reflections: Bool) throws {
+                        instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?, reflections: Bool, specularHitDistance: MTLTexture? = nil) throws {
         try encodeRays(command: command, uniforms: uniforms, screen: screen, instances: instances,
             auxiliary: auxiliary, appearances: appearances, pipeline: reflections ? reflectionPipeline : shadowPipeline,
             output: (reflections ? screen.reflectionRaw : screen.directVisibilityRaw)!,
-            label: reflections ? "Selective world reflections" : "World directional visibility")
+            label: reflections ? "Selective world reflections" : "World directional visibility", specularHitDistance: specularHitDistance)
     }
 
     func encodeAreaLighting(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
@@ -352,7 +352,7 @@ final class RayTracingScene {
 
     private func encodeRays(command: MTLCommandBuffer, uniforms: Uniforms, screen: ScreenSpacePipeline,
                             instances: MTLBuffer, auxiliary: MTLBuffer?, appearances: MTLBuffer?,
-                            pipeline: MTLComputePipelineState, output: MTLTexture, label: String) throws {
+                            pipeline: MTLComputePipelineState, output: MTLTexture, label: String, specularHitDistance: MTLTexture? = nil) throws {
         guard let e = command.makeComputeCommandEncoder() else { throw Failure.allocation("ray lighting encoder") }
         e.label = label
         e.setComputePipelineState(pipeline)
@@ -362,6 +362,7 @@ final class RayTracingScene {
         for asset in assets { e.useResource(asset.structure, usage: .read) }
         var u = uniforms
         u.rayScene.x = hasGround ? 1 : 0
+        u.diffuse.y = specularHitDistance == nil ? 0 : 1
         e.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
         e.setBuffer(vertices, offset: 0, index: 2)
         e.setBuffer(objects, offset: 0, index: 3)
@@ -376,6 +377,7 @@ final class RayTracingScene {
         e.setTexture(output, index: 2)
         e.setTexture(screen.material, index: 3)
         e.setTexture(screen.visibility, index: 4)
+        e.setTexture(specularHitDistance ?? screen.directVisibilityRaw, index: 5)
         e.dispatchThreads(MTLSize(width: output.width, height: output.height, depth: 1),
                           threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         e.endEncoding()

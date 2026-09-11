@@ -5,6 +5,49 @@ import XCTest
 
 @MainActor
 final class MetalFXReconstructionTests: XCTestCase {
+    func testSpecularDistanceAllocationIsOptional() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: true)
+        else { throw XCTSkip("MetalFX denoising unavailable") }
+        let disabled = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: true)
+        XCTAssertNil(disabled.specularHitDistance)
+        let enabled = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: true, enableSpecularHitDistance: true)
+        let distance = try XCTUnwrap(enabled.specularHitDistance)
+        XCTAssertEqual(distance.pixelFormat, .r16Float)
+        XCTAssertEqual(distance.width, 64)
+        XCTAssertTrue(distance.usage.contains(.shaderWrite))
+    }
+
+    func testSpecularGuideIncludesViewDependentFresnel() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let source = makeRenderShaderSource(motionGuides: true) + """
+        kernel void probe(constant ReconstructionUniforms& R [[buffer(0)]], device float4* result [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+            float3 view = i%2==0 ? float3(0,0,1) : float3(sqrt(0.99),0,0.1);
+            auto guide=reconstructionGuides(float3(0),float3(0),float3(0,0,1),float3(0.2,0.4,0.6),0.3,i>=2 ? 1.0 : 0.0,view,R);
+            result[i]=guide.specular;
+        }
+        """
+        let library = try device.makeLibrary(source: source, options: nil)
+        let pipeline = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "probe")))
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        let output = try XCTUnwrap(device.makeBuffer(length: 64, options: .storageModeShared))
+        let uniforms = try XCTUnwrap(device.makeBuffer(length: 144, options: .storageModeShared))
+        memset(uniforms.contents(), 0, uniforms.length)
+        let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(uniforms, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        encoder.dispatchThreads(MTLSize(width: 4,height: 1,depth: 1), threadsPerThreadgroup: MTLSize(width: 4,height: 1,depth: 1))
+        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+        XCTAssertEqual(command.status, .completed, "\(String(describing: command.error))")
+        let values = output.contents().assumingMemoryBound(to: SIMD4<Float>.self)
+        for i in 0..<4 { for channel in 0..<3 {
+            let f0: Float = i<2 ? 0.04 : [0.2,0.4,0.6][channel]
+            let expected = i%2==0 ? f0 : f0+(1-f0)*pow(Float(0.9),5)
+            XCTAssertEqual(values[i][channel], expected, accuracy: 0.0001)
+        } }
+    }
+
     func testDisplayExposurePreservesLinearHistory() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
         else { throw XCTSkip("MetalFX unavailable") }

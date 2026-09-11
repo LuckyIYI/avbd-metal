@@ -10,6 +10,7 @@ final class MetalFXReconstruction {
     let size: SIMD2<Int>
     let outputSize: SIMD2<Int>
     let denoising: Bool
+    let specularHitDistance: MTLTexture?
     let material: MTLTexture
     let depth, motion, normal, diffuseAlbedo, specularAlbedo, roughness, output: MTLTexture
     private let device: MTLDevice
@@ -40,7 +41,7 @@ final class MetalFXReconstruction {
         return MTLFXTemporalScalerDescriptor.supportsDevice(device)
     }
 
-    init(device: MTLDevice, size: SIMD2<Int>, denoising: Bool, outputSize: SIMD2<Int>? = nil, sharedDepth: MTLTexture? = nil, sharedNormal: MTLTexture? = nil, sharedMaterial: MTLTexture? = nil) throws {
+    init(device: MTLDevice, size: SIMD2<Int>, denoising: Bool, outputSize: SIMD2<Int>? = nil, sharedDepth: MTLTexture? = nil, sharedNormal: MTLTexture? = nil, sharedMaterial: MTLTexture? = nil, enableSpecularHitDistance: Bool = false) throws {
         self.device = device; self.size = size; self.denoising = denoising
         let outputSize = outputSize ?? size
         self.outputSize = outputSize
@@ -60,6 +61,8 @@ final class MetalFXReconstruction {
             d.depthTextureFormat = .depth32Float; d.motionTextureFormat = .rg16Float
             d.normalTextureFormat = .rgba16Float; d.diffuseAlbedoTextureFormat = .rgba16Float
             d.specularAlbedoTextureFormat = .rgba16Float; d.roughnessTextureFormat = .r16Float
+            d.isSpecularHitDistanceTextureEnabled = enableSpecularHitDistance
+            d.specularHitDistanceTextureFormat = .r16Float
             d.isAutoExposureEnabled = false
             guard let scaler = d.makeTemporalDenoisedScaler(device: device) else { throw Failure.unsupported }
             depth = try sharedDepth ?? texture(.depth32Float, scaler.depthTextureUsage, "MetalFX depth")
@@ -71,6 +74,9 @@ final class MetalFXReconstruction {
             output = try texture(.rgba16Float, scaler.outputTextureUsage, "MetalFX reconstructed HDR", output: true)
             scaler.depthTexture = depth; scaler.motionTexture = motion; scaler.normalTexture = normal
             scaler.diffuseAlbedoTexture = diffuseAlbedo; scaler.specularAlbedoTexture = specularAlbedo
+            specularHitDistance = enableSpecularHitDistance
+                ? try texture(.r16Float, scaler.specularHitDistanceTextureUsage.union(.shaderWrite), "MetalFX specular hit distance") : nil
+            scaler.specularHitDistanceTexture = specularHitDistance
             scaler.roughnessTexture = roughness; scaler.outputTexture = output
             scaler.motionVectorScaleX = 1; scaler.motionVectorScaleY = 1
             scaler.preExposure = 1
@@ -80,6 +86,7 @@ final class MetalFXReconstruction {
                 scaler.encode(commandBuffer: command)
             }
         } else {
+            specularHitDistance = nil
             let d = MTLFXTemporalScalerDescriptor()
             d.inputWidth = size.x; d.inputHeight = size.y; d.outputWidth = outputSize.x; d.outputHeight = outputSize.y
             d.colorTextureFormat = .rgba16Float; d.outputTextureFormat = .rgba16Float
@@ -183,7 +190,7 @@ struct ReconstructionOut {
     float4 material [[color(5)]];
 };
 inline ReconstructionOut reconstructionGuides(float3 world, float3 previous, float3 n, float3 albedo,
-                                              float roughness, float metal, constant ReconstructionUniforms& R) {
+                                              float roughness, float metal, float3 view, constant ReconstructionUniforms& R) {
     float4 c = R.current * float4(world, 1);
     float4 p = R.previous * float4(previous, 1);
     ReconstructionOut o;
@@ -191,7 +198,10 @@ inline ReconstructionOut reconstructionGuides(float3 world, float3 previous, flo
     o.normal = float4(normalize(n), roughness);
     o.material = float4(albedo, metal);
     o.diffuse = float4(albedo * (1.0-metal), 1);
-    o.specular = float4(mix(float3(0.04), albedo, metal), 1);
+    // Noise-free view-dependent Fresnel, matching the renderer's Schlick lobe.
+    float3 f0 = mix(float3(0.04), albedo, metal);
+    float nv = saturate(dot(normalize(n),normalize(view)));
+    o.specular = float4(f0+(1-f0)*pow(1-nv,5.0), 1);
     o.roughness = roughness;
     return o;
 }
@@ -201,18 +211,18 @@ fragment ReconstructionOut reconstruction_fragment(VOut in [[stage_in]], constan
     float3 n = normalize(in.normal);
     if (in.flatShade > 0.5) n = normalize(cross(dfdx(in.world), dfdy(in.world)));
     if (dot(n, U.eye.xyz-in.world)<0) n = -n;
-    return reconstructionGuides(in.world, in.previousWorld, n, in.albedo, clamp(in.pbr.x,0.02,1.0), saturate(in.pbr.y), R);
+    return reconstructionGuides(in.world, in.previousWorld, n, in.albedo, clamp(in.pbr.x,0.02,1.0), saturate(in.pbr.y), U.eye.xyz-in.world, R);
 }
 fragment ReconstructionOut soft_reconstruction_fragment(VOut in [[stage_in]], constant Uniforms& U [[buffer(1)]], constant ReconstructionUniforms& R [[buffer(2)]]) {
     float3 n = normalize(in.normal);
     if (in.flatShade > 0.5) n = normalize(cross(dfdx(in.world),dfdy(in.world)));
     if (dot(n,U.eye.xyz-in.world)<0) n = -n;
-    return reconstructionGuides(in.world,in.previousWorld,n,in.albedo,0.72,0,R);
+    return reconstructionGuides(in.world,in.previousWorld,n,in.albedo,0.72,0,U.eye.xyz-in.world,R);
 }
 fragment ReconstructionOut floor_reconstruction_fragment(FloorOut in [[stage_in]], constant Uniforms& U [[buffer(1)]], constant ReconstructionUniforms& R [[buffer(2)]]) {
     float3 albedo = floorAlbedo(in.world,U);
     // The checker floor is diffuse-only; its guide must not advertise a specular lobe.
-    ReconstructionOut result = reconstructionGuides(in.world, in.world, float3(0,0,1), albedo, 1, 0, R);
+    ReconstructionOut result = reconstructionGuides(in.world, in.world, float3(0,0,1), albedo, 1, 0, U.eye.xyz-in.world, R);
     result.specular = float4(0);
     return result;
 }
