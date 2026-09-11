@@ -1916,11 +1916,12 @@ inline NPCResult npcPolySATWitness(
     uint edgesB = npcPolyEdgeCount(localB, assetIDs, hulls);
     // Fail closed outside the complete-query budget; never truncate axes.
     // Detailed rounded floors against small hardware exceed 16K edge axes.
-    // 64K covers that captured case while keeping rare recovery bounded.
+    // Two supported 120-vertex rounded hulls can each have 300 edges.
+    // 128K covers their complete 90K-axis query without truncation.
     if (facesA == 0u || facesB == 0u || edgesA == 0u || edgesB == 0u
         || facesA > 2048u || facesB > 2048u
         || edgesA > 2048u || edgesB > 2048u
-        || edgesA * edgesB > 65536u) return out;
+        || edgesA * edgesB > 131072u) return out;
     float bestGap = -FLT_MAX; float3 bestNormal = float3(1,0,0);
     for (uint side = 0u; side < 2u; ++side) {
         NPCShape shape = side == 0u ? localA : localB;
