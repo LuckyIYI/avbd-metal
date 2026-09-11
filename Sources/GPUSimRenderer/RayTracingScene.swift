@@ -75,6 +75,9 @@ final class RayTracingScene {
         var instanceRefits = 0
     }
     private(set) var lastUpdate = UpdateStatistics()
+    /// True when any built rigid-mesh vertex references a transmissive material,
+    /// so opaque scenes never pay for dielectric camera transport.
+    private(set) var usesTransmission = false
     private let dummy: MTLBuffer
 
     private init(scene: any GPUSimRenderableScene, materials: GPUSimMaterialLibrary) throws {
@@ -167,6 +170,7 @@ final class RayTracingScene {
             let v = meshVertices.contents().assumingMemoryBound(to: GPUSimRigidMeshRenderVertex.self)
             let indices = meshIndices.contents().assumingMemoryBound(to: UInt32.self)
             var groups: [UInt32: [Vertex]] = [:]
+            var transmissive = false
             for triangle in stride(from: 0, to: mesh.indexCount, by: 3) {
                 guard triangle + 2 < mesh.indexCount else { throw Failure.invalidGeometry }
                 let ids = (0..<3).map { Int(indices[triangle + $0]) }
@@ -176,6 +180,8 @@ final class RayTracingScene {
                 guard ids.allSatisfy({ v[$0].positionBody.w.bitPattern == body }) else { throw Failure.invalidGeometry }
                 for id in ids {
                     let input = v[id]
+                    let material = Int((max(input.uvMaterial.z, 0) + 0.5).rounded(.down))
+                    if material > 0, material <= materials.transmissiveMaterials.count, materials.transmissiveMaterials[material - 1] { transmissive = true }
                     let c = SIMD3(input.color.x, input.color.y, input.color.z)
                     let rough = input.normal.w > 0 ? max(0.02, min(input.normal.w, 1)) : 0.45
                     let metal = input.normal.w > 0 ? max(0, min(input.color.w, 1)) : 0
@@ -184,6 +190,7 @@ final class RayTracingScene {
                         albedo: SIMD4(c*c*(SIMD3(repeating: 0.7)+c*0.3), metal), uvMaterial: input.uvMaterial))
                 }
             }
+            usesTransmission = transmissive
             for body in groups.keys.sorted() {
                 let asset = addAsset(groups[body]!)
                 allObjects.append(Object(vertexStart: UInt32(ranges[asset].start), source: 2, index: body, asset: UInt32(asset)))

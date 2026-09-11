@@ -24,15 +24,19 @@ inline float3 bpBVHWorldCenter(
     return posLin[body].xyz + q_rotate(posAng[body], node.centerRadius.xyz);
 }
 
+// Mirrors npSpeculativeCap in 30_narrowphase.metal (separate library).
+inline float bpSpeculativeCap(float radiusA, float radiusB, constant SimParams& P)
+{
+    return min(0.25f, max(4.0f * P.collisionMargin, 3.0f * min(radiusA, radiusB)));
+}
+
 inline float bpBVHPairRadius(
     float radiusA, float radiusB, uint flagsA, uint flagsB,
     float speedBound, constant SimParams& P)
 {
     float result = radiusA + radiusB;
     if (((flagsA | flagsB) & 2u) != 0u) {
-        float cap = min(0.25f,
-            max(4.0f * P.collisionMargin,
-                3.0f * min(radiusA, radiusB)));
+        float cap = bpSpeculativeCap(radiusA, radiusB, P);
         result += P.collisionMargin + min(cap, speedBound * P.dt);
     }
     return result;
@@ -78,8 +82,10 @@ inline uint bpExpandHierarchyPair(
             nodeB.centerRadius.w,nodeA.links.w,nodeB.links.w,FLT_MAX,P);
         if (distance_squared(centerA, centerB) > sphereRadius * sphereRadius) continue;
         // Tight compound bounds reject distant shelves/walls that overlap a
-        // large enclosing sphere. Keep the same speculative hull padding as
-        // the sphere test, so no accepted near-contact distance is reduced.
+        // large enclosing sphere. Every pair keeps the narrowphase's speculative
+        // reach (approach*dt, capped like npSpeculativeCap) along the box axes,
+        // not only hull pairs, so a fast face-on primitive is not culled until
+        // it already overlaps; hull pairs keep their larger sphere padding.
         float3 ha=nodeA.halfExtent.xyz, hb=nodeB.halfExtent.xyz;
         float3 ea=abs(q_rotate(posAng[bodyA],float3(ha.x,0,0)))
             + abs(q_rotate(posAng[bodyA],float3(0,ha.y,0)))
@@ -87,8 +93,10 @@ inline uint bpExpandHierarchyPair(
         float3 eb=abs(q_rotate(posAng[bodyB],float3(hb.x,0,0)))
             + abs(q_rotate(posAng[bodyB],float3(0,hb.y,0)))
             + abs(q_rotate(posAng[bodyB],float3(0,0,hb.z)));
-        float padding=radius-nodeA.centerRadius.w-nodeB.centerRadius.w;
-        if (any(abs(centerA-centerB)>ea+eb+max(padding,0.0f))) continue;
+        float speculative=min(speedBound*P.dt,
+            bpSpeculativeCap(nodeA.centerRadius.w,nodeB.centerRadius.w,P));
+        float padding=max(radius-nodeA.centerRadius.w-nodeB.centerRadius.w,speculative);
+        if (any(abs(centerA-centerB)>ea+eb+padding)) continue;
 
         bool leafA = (nodeA.links.w & 1u) != 0u;
         bool leafB = (nodeB.links.w & 1u) != 0u;

@@ -125,7 +125,8 @@ final class MetalFXReconstruction {
         reset = invalidate || previousCamera == nil || previousOptions?.linearHistoryOptions != options.linearHistoryOptions
         if reset { frame = 0 }
         sources.removeAll(keepingCapacity: true)
-        jitter = Self.sampleJitter(frame)
+        // Raw diagnostic color is displayed directly, without temporal unjittering.
+        jitter = options.rayTracingDenoising ? Self.sampleJitter(frame) : .zero
         guideUniforms = GuideUniforms(current: camera, previous: reset ? camera : previousCamera!,
                                      size: SIMD4(Float(size.x), Float(size.y), 0, 0))
         // Shift homogeneous clip coordinates by the requested pixel jitter.

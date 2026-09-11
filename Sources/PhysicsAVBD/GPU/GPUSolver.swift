@@ -2490,11 +2490,12 @@ public final class GPUSolver {
             var g = JointGPU()
             let aIdx: UInt32 = j.bodyA >= 0 ? UInt32(j.bodyA) : 0xFFFFFFFF
             // Flag bits avoid inf comparisons under fast math:
-            // 1 = hard linear, 2 = hard angular, 4 = breakable
+            // 1 = hard linear, 2 = hard angular, 4 = breakable, 8 = fracture counts
+            // linear reaction, 64 = physical break loads, 128 = finite scalar fracture
             var flags: UInt32 = 0
             if j.stiffnessLin.isInfinite { flags |= 1 }
             if j.stiffnessAng.isInfinite { flags |= 2 }
-            if j.fracture.isFinite { flags |= 4 }
+            if j.fracture.isFinite { flags |= 4 | 128 }
             if j.breakLoad != nil { flags |= 4 | 64 }
             if j.fractureLinear { flags |= 8 }
             g.header = SIMD4(aIdx, UInt32(j.bodyB), 0, flags)

@@ -1401,6 +1401,38 @@ final class ConvexGPURuntimeTests: XCTestCase {
         }
     }
 
+    func testHierarchyKeepsFastPrimitivePairsWithoutHulls() throws {
+        try requireMetal()
+        // Same compound configuration as the hull sweep above, plus a box on
+        // each body. The box gate must keep the approaching box/box pair even
+        // though neither side is a hull.
+        var scene=PhysicsScene(name:"primitive-speculative-hierarchy")
+        scene.settings.gravity=0;scene.settings.iterations=0
+        scene.settings.collisionMargin=0.01
+        let fixed=scene.addBody(size:F3(repeating:1),density:0,friction:0.5,
+            position:F3(0,0,0),collisionEnabled:false)
+        let moving=scene.addBody(size:F3(repeating:1),density:1,friction:0.5,
+            position:F3(1.1,0,0),collisionEnabled:false)
+        let asset=try cubeAsset()
+        _=scene.addConvexCollider(body:fixed,asset:asset)
+        _=scene.addConvexCollider(body:moving,asset:asset)
+        scene.addCollider(body:fixed,size:F3(repeating:0.05),localPosition:F3(-3,0,0))
+        let boxA=scene.addCollider(body:fixed,size:F3(repeating:1),localPosition:F3(0,0,2))
+        let boxB=scene.addCollider(body:moving,size:F3(repeating:1),localPosition:F3(0,0,2))
+        let solver=try GPUSolver(scene:scene)
+        try solver.submitStep();try solver.synchronize()
+        func emitted()->Set<SIMD2<UInt32>> {
+            Set(UnsafeBufferPointer(start:solver.pairs.contents().assumingMemoryBound(to:SIMD2<UInt32>.self),count:solver.lastNumPairs))
+        }
+        let pair=SIMD2(UInt32(boxA),UInt32(boxB))
+        XCTAssertFalse(emitted().contains(pair),"stationary gap exceeds ordinary margin")
+        solver.setBodyStates([.init(body:moving,position:F3(1.1,0,0),
+            rotation:Quat(real:1,imag:.zero),linearVelocity:F3(-10,0,0),angularVelocity:.zero)])
+        try solver.submitStep();try solver.synchronize()
+        XCTAssertTrue(emitted().contains(pair),
+            "a fast face-on primitive pair must keep its speculative contact on the hierarchy path")
+    }
+
     func testHierarchyFinalizationHasExactlyOneWriter() throws {
         try requireMetal()
         var scene = PhysicsScene(name: "hierarchy-finalizer-writer")

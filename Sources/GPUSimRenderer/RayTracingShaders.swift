@@ -93,6 +93,16 @@ inline float rtVisibility(float3 P, float3 N, float3 L, float bias,
 }
 inline float rtTransparentVisibility(ray r, instance_acceleration_structure scene,
     device const RTVertex* vertices, device const RTObject* objects, constant MaterialResources& materials) {
+    // One any-hit query answers the common cases at the old cost: a miss is
+    // fully lit and an opaque occluder anywhere along the ray gives the same
+    // 0.16 floor the loop would. Only a transmissive first hit needs ordering.
+    intersector<triangle_data,instancing> anyHit;
+    anyHit.assume_geometry_type(geometry_type::triangle);
+    anyHit.force_opacity(forced_opacity::opaque);
+    anyHit.accept_any_intersection(true);
+    auto first=anyHit.intersect(r,scene,1);
+    if (first.type==intersection_type::none) return 1;
+    if (materialOptics(materialIndex(vertices[objects[first.instance_id].vertexStart+first.primitive_id*3].uvMaterial.z),materials).x<=0) return 0.16;
     intersector<triangle_data,instancing> query;
     query.assume_geometry_type(geometry_type::triangle);
     query.force_opacity(forced_opacity::opaque);
@@ -148,8 +158,8 @@ kernel void rt_shadows(instance_acceleration_structure scene [[buffer(0)]], cons
 inline float3 rtLit(float3 P, float3 N, float3 V, float3 albedo, float rough, float metal,
                     float3 emissive, uint source, constant Uniforms& U, instance_acceleration_structure scene, constant MaterialResources& materials) {
     float3 L = -U.lightDir.xyz;
-    float visibility = U.rayScene.z > -1 && dot(N,L) > 0 ? rtVisibility(P,N,L,0.0002,U,scene) : 1;
-    float3 area=rtAreaLighting(P,N,V,albedo,rough,metal,scene,U,uint2(abs(P.xy)*4096),false,true);
+    float visibility = U.rayScene.z > 0 && dot(N,L) > 0 ? rtVisibility(P,N,L,0.0002,U,scene) : 1;
+    float3 area=rtAreaLighting(P,N,V,albedo,rough,metal,scene,U,uint2(abs(P.xy)*4096),1,true);
     if (source == 3) return area+clothRadiance(albedo,emissive,N,V,1,visibility,U,materials);
     if (source == 4) return area+albedo*(materialDiffuseAmbient(N,U,materials)*1.1+SUN_COL/M_PI_F*max(L.z,0.0)*0.85*visibility);
     return area+pbrRadiance(albedo,rough,metal,emissive,N,V,1,visibility,U,materials);
@@ -174,8 +184,9 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
         else if (lightHit) *firstHitDistance=emitter.w;
     }
     if (hit.type == intersection_type::none) {
-        // Direct emitter lighting is sampled separately at opaque receivers.
-        // Do not count a second BSDF-hit estimator without MIS weighting.
+        // Diffuse bounce rays exclude emitters: their direct light is light-sampled
+        // at the receiver. Specular rays include them; the area pass drops its
+        // specular term wherever reflection rays are traced, so nothing is counted twice.
         if (groundDistance<0) return lightHit ? float4(includeEmitters && !diffuseOnly ? emitter.rgb : float3(0),1) : float4(0);
         float3 P = r.origin+r.direction*groundDistance, N = float3(0,0,r.direction.z<0 ? 1 : -1);
         float checker = float((int(floor(P.x))+int(floor(P.y))) & 1);
@@ -228,14 +239,14 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
         if (mat.a == 1.0 && object.source != 3) return float4(emission,1);
         float3 L = -U.lightDir.xyz, halfVector = L-R;
         float3 H = halfVector*rsqrt(max(dot(halfVector,halfVector),1e-8));
-        float visibility = U.rayScene.z > -1 && dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
+        float visibility = U.rayScene.z > 0 && dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
         float3 F0 = mix(float3(0.04),mat.rgb,mat.a);
         float3 F = F0+(1-F0)*pow(1-saturate(dot(L,H)),5.0);
         float3 bounce = mat.rgb*(1-mat.a)*(materialDiffuseAmbient(hitN,U,materials)
             +SUN_COL/M_PI_F*saturate(dot(hitN,L))*visibility*(1-F));
         if (object.source==3) bounce = mat.rgb*(materialDiffuseAmbient(hitN,U,materials)*1.15
             +SUN_COL/M_PI_F*max((dot(hitN,L)+0.35)/1.35,0.0)*visibility);
-        bounce += rtAreaLighting(hitP+geomN*0.0001,hitN,-R,mat.rgb,nm.w,mat.a,scene,U,uint2(abs(hitP.xy)*4096),true,true);
+        bounce += rtAreaLighting(hitP+geomN*0.0001,hitN,-R,mat.rgb,nm.w,mat.a,scene,U,uint2(abs(hitP.xy)*4096),0,true);
         return float4(bounce+emission,1);
     }
     return float4(rtLit(hitP+geomN*0.0001,hitN,-R,mat.rgb,clamp(nm.w,0.02,1.0),mat.a,emission,object.source,U,scene,materials),1);
@@ -348,7 +359,11 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
     if (transmitted.a>0) {
         if (U.diffuse.y>0) hitDistance.write(float4(transmissionDistance),pixel);
         float fog=horizonFog(length(P-U.eye.xyz));
-        output.write(float4(mix(transmitted.rgb,HORIZON_LIN,fog)*transmitted.a,1),pixel);
+        // Stored in the same Fresnel-scaled units as opaque corrections so the
+        // screen-space gather can mix glass and opaque texels; the receiver
+        // divides its own factor back out (surfaceReflection, transmission=true).
+        float4 rc=material.read(pixel);
+        output.write(float4(mix(transmitted.rgb,materialHorizon(-V,U,materials),fog)*transmitted.a*reflectionFactor(P,N,nr.w,rc.rgb,rc.a,U),1),pixel);
         return;
     }
     if (nr.w >= U.effects.w || dot(N,V) <= 0) { output.write(float4(0),pixel); return; }
@@ -374,7 +389,7 @@ kernel void rt_reflections(instance_acceleration_structure scene [[buffer(0)]], 
         float bias = max(0.0001,screenDepth(d,U)/U.screen.z*0.02);
         ray r; r.origin = P+N*bias; r.direction = R; r.min_distance = bias; r.max_distance = 100;
         float sampleDistance=100;
-        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,false,false,&sampleDistance);
+        float4 hit = rtIncoming(r,scene,U,vertices,objects,instances,rigid,auxiliary,appearances,hasAppearance,materials,false,true,&sampleDistance);
         distanceSum+=sampleDistance; distanceCount+=1;
         float3 incoming = hit.w > 0 ? hit.rgb : materialEnvironment(R,U,materials);
         float viewLambda = rtSmithLambda(localV.z,alpha);

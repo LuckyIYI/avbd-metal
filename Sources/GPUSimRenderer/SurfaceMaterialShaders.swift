@@ -35,6 +35,7 @@ func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram], argument
       inline float3 materialEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources,float rough=0) { return screenEnvironment(R,U); }
       inline float3 materialDiffuseAmbient(float3 N,constant Uniforms& U,constant MaterialResources& resources) { return diffuseAmbient(N,U); }
       inline float3 materialDiffuseEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources) { return diffuseEnvironment(R,U); }
+      inline float3 materialHorizon(float3 direction,constant Uniforms& U,constant MaterialResources& resources) { return HORIZON_LIN; }
       inline MaterialSample evaluateMaterial(uint id, MaterialContext context, MaterialSample surface, constant MaterialResources& resources) { return surface; }
       inline float3 materialNormal(float3 n, float3 t, float3 b, float3 map) { return n; }
       inline VOut texturedSurface(VOut input, constant MaterialResources& resources) { return input; }
@@ -64,17 +65,26 @@ func makeSurfaceMaterialShaderSource(programs: [GPUSimMaterialProgram], argument
         constexpr sampler s(coord::normalized,s_address::repeat,t_address::clamp_to_edge,filter::linear,mip_filter::linear);
         float lod=rough*rough*float(resources.environmentMap.get_num_mip_levels()-1);
         float3 color=resources.environmentMap.sample(s,uv,level(lod)).rgb;
-        return max(select(float3(0),color,isfinite(color)),float3(0))*(1+U.environmentSettings.x);
+        return max(select(float3(0),color,isfinite(color)),float3(0))*U.environmentSettings.x;
     }
     inline float3 materialDiffuseAmbient(float3 N,constant Uniforms& U,constant MaterialResources& resources) {
         if (!hasEnvironment(resources)) return diffuseAmbient(N,U);
         N=environmentDirection(normalize(N),U);
         float3 color=float3(0);
         for(uint i=0;i<9;++i) color+=resources.environmentSH[i].rgb*environmentBasis(i,N);
-        return max(color,float3(0))*(1+U.environmentSettings.x);
+        return max(color,float3(0))*U.environmentSettings.x;
     }
     inline float3 materialDiffuseEnvironment(float3 R,constant Uniforms& U,constant MaterialResources& resources) {
         return hasEnvironment(resources) ? materialEnvironment(R,U,resources) : diffuseEnvironment(R,U);
+    }
+    // Distance fog target: the drawn sky at the horizon in this direction. With
+    // an environment background that is a coarse environment sample, so fogged
+    // geometry meets the sky without a band; otherwise the analytic horizon.
+    inline float3 materialHorizon(float3 direction,constant Uniforms& U,constant MaterialResources& resources) {
+        if (!environmentBackground(U,resources)) return HORIZON_LIN;
+        float2 flat=direction.xy;
+        if (dot(flat,flat)<1e-8) flat=float2(1,0);
+        return materialEnvironment(float3(normalize(flat),0),U,resources,0.8);
     }
     \(functions)
     inline float2 materialOptics(uint id, constant MaterialResources& resources) {

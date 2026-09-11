@@ -48,6 +48,34 @@ final class MetalFXReconstructionTests: XCTestCase {
         } }
     }
 
+    func testRawLightingKeepsCameraStableAndRestartsReconstruction() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
+        else { throw XCTSkip("MetalFX unavailable") }
+        let fx = try MetalFXReconstruction(device: device, size: SIMD2(64,64), denoising: false)
+        var options = GPUSimRenderOptions.qualityBeta
+        var camera = matrix_identity_float4x4
+        camera.columns.0.x = 1.7
+        camera.columns.3 = SIMD4(0.25, -0.5, 0.75, 1)
+        let first = fx.beginFrame(camera: camera, options: options, invalidate: false)
+        XCTAssertNotEqual(first, camera)
+        options.rayTracingDenoising = false
+        for frame in 0..<40 {
+            let raw = fx.beginFrame(camera: camera, options: options, invalidate: false)
+            XCTAssertEqual(raw, camera, "Raw lighting must stay on the unjittered pixel grid")
+            XCTAssertEqual(fx.jitter, .zero)
+            XCTAssertEqual(fx.guideUniforms.current, camera)
+            XCTAssertEqual(fx.guideUniforms.previous, camera)
+            XCTAssertEqual(fx.reset, frame == 0)
+        }
+        options.rayTracingDenoising = true
+        XCTAssertEqual(fx.beginFrame(camera: camera, options: options, invalidate: false), first)
+        XCTAssertTrue(fx.reset, "Re-enabling reconstruction must discard stale history")
+        XCTAssertEqual(fx.jitter, MetalFXReconstruction.sampleJitter(0))
+        let next = fx.beginFrame(camera: camera, options: options, invalidate: false)
+        XCTAssertNotEqual(next, first)
+        XCTAssertFalse(fx.reset)
+    }
+
     func testDisplayExposurePreservesLinearHistory() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: false)
         else { throw XCTSkip("MetalFX unavailable") }

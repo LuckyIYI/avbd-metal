@@ -8,6 +8,9 @@ import simd
 /// independent GPU poses. Screen-space effects still execute once per view.
 ///
 /// This is a fixed-topology, Fast-only adapter. Recreate it after topology edits.
+/// Repeated references to one solver share a capture only while no body
+/// appearance overrides are active; with overrides each reference is captured
+/// and synchronized separately, so cost grows with the reference count.
 /// Offsets affect presentation only, not physics. Use one batch per renderer;
 /// serialize calls and keep custom backend buffers valid until frame retirement.
 public final class GPUSimEnvironmentBatch: GPUSimRenderableScene, RenderSubmissionProvider {
@@ -86,7 +89,6 @@ public final class GPUSimEnvironmentBatch: GPUSimRenderableScene, RenderSubmissi
   public var sharedGeometryBytes: Int { (vertices?.length ?? 0) + (indices?.length ?? 0) }
   private let bodies, primitives, indexCount: Int
   private let vertices, indices: MTLBuffer?
-  private let revisions: [UInt64]
   private let sourceVertices, sourceIndices: [MTLBuffer?]
   private let posePipeline, primitivePipeline: MTLComputePipelineState
   private let canonical: [Int]
@@ -101,6 +103,12 @@ public final class GPUSimEnvironmentBatch: GPUSimRenderableScene, RenderSubmissi
 
   private final class Slot {
     let available = DispatchSemaphore(value: 1)
+    /// The consumer command buffer that owns this slot until it completes. A
+    /// committed buffer is retained by Metal; one dropped without a commit is
+    /// released, which lets the next encode reclaim the slot instead of hanging.
+    weak var pending: MTLCommandBuffer?
+    var inUse = false
+    let lock = NSLock()
     let positions, rotations: MTLBuffer
     var primitives: [Int: MTLBuffer] = [:]
     var snapshots: [Int: RenderSnapshot] = [:]
@@ -216,7 +224,6 @@ public final class GPUSimEnvironmentBatch: GPUSimRenderableScene, RenderSubmissi
         }
       }
     }
-    revisions = environments.map { $0.scene.renderGeometryRevision }
     sourceVertices = environments.map { $0.scene.rigidMeshRenderSurface?.vertices }
     sourceIndices = environments.map { $0.scene.rigidMeshRenderSurface?.indices }
     let library = try renderDevice.makeLibrary(source: environmentBatchShaderSource, options: nil)
@@ -238,7 +245,10 @@ public final class GPUSimEnvironmentBatch: GPUSimRenderableScene, RenderSubmissi
   }
   private func validate(_ scene: any GPUSimRenderableScene, index: Int) throws {
     let mesh = scene.rigidMeshRenderSurface
-    guard scene.renderGeometryRevision == revisions[index], scene.renderBodyCount == bodies,
+    // Buffer identity, counts and index count pin the shared topology. The
+    // geometry revision is not consulted: backends bump it for in-place
+    // primitive-dimension edits, which this Fast-only adapter re-packs every frame.
+    guard scene.renderBodyCount == bodies,
       scene.renderRigidInstanceCount == primitives,
       mesh?.vertices === sourceVertices[index], mesh?.indices === sourceIndices[index],
       (mesh?.indexCount ?? 0) == indexCount,
@@ -260,6 +270,13 @@ public final class GPUSimEnvironmentBatch: GPUSimRenderableScene, RenderSubmissi
             * MemoryLayout<GPUSimRenderAppearance>.stride)
     else { throw Failure.incompatibleEnvironment(0) }
     let slot = slots[nextSlot]
+    slot.lock.lock()
+    let abandoned = slot.inUse && slot.pending == nil
+    if abandoned { slot.inUse = false }
+    slot.lock.unlock()
+    // The previous consumer never committed its command buffer, so its
+    // completion handler will never run. The GPU never read this slot.
+    if abandoned { slot.available.signal() }
     slot.available.wait()
     var submitted = false
     defer { if !submitted { slot.available.signal() } }
@@ -355,12 +372,20 @@ public final class GPUSimEnvironmentBatch: GPUSimRenderableScene, RenderSubmissi
     updateSurface(slot)
     let producers = captured.values.compactMap { ($0 as? RenderSnapshot)?.submission }
     renderSubmissions = producers
+    slot.lock.lock()
+    slot.pending = commandBuffer
+    slot.inUse = true
+    slot.lock.unlock()
     commandBuffer.addCompletedHandler { [self] _ in
       if producers.contains(where: { $0.status == .error }) {
         failureLock.lock()
         producerFailed = true
         failureLock.unlock()
       }
+      slot.lock.lock()
+      slot.inUse = false
+      slot.pending = nil
+      slot.lock.unlock()
       slot.available.signal()
     }
     submitted = true

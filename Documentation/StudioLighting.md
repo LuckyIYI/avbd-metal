@@ -81,6 +81,9 @@ invalid configuration reports a renderer failure rather than silently dropping l
 HQ evaluates finite distance, emitter orientation, GGX response, and bounded
 shadow rays toward samples on each emitter. Emitters are visible in the sky
 background and to reflection rays, but contribute no collision geometry or mass.
+Smooth receivers get the emitter's specular image from those reflection rays;
+the direct area-light pass supplies specular only where reflection rays are not
+traced (roughness at or above the reflection cutoff), so no emitter is counted twice.
 Camera-visible emitters use the background pass: opaque raster geometry covers
 them even when it lies behind the light. Direct-emitter
 radiance is excluded from the separate opaque bounce estimators to avoid counting
@@ -168,6 +171,9 @@ renderer.options.rayTracingQuality = quality
 ```
 
 Zero (the default) inherits the primary budget; positive budgets clamp to 1...64.
+Note that any body appearance override makes `GPUSimEnvironmentBatch` capture each
+reference to a shared solver separately (one synchronized snapshot per reference per
+frame); highlight bodies sparingly in large repeated-environment views.
 This changes variance, not the lighting model. More noise at secondary hits is
 possible. It does not lower primary direct-light sampling or turn off shadows.
 

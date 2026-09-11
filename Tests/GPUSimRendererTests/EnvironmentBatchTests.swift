@@ -423,12 +423,41 @@ final class EnvironmentBatchTests: XCTestCase {
       view.draw()
       XCTAssertTrue(renderer.runtimeFailure?.contains("Fast") == true)
     }
-    a.renderGeometryRevision += 1
-    let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+    let queue = try XCTUnwrap(device.makeCommandQueue())
     let output = try XCTUnwrap(device.makeBuffer(length: 112, options: .storageModeShared))
+    // A revision bump alone signals an in-place dimension edit, which the batch re-packs.
+    a.renderGeometryRevision += 1
+    let accepted = try XCTUnwrap(queue.makeCommandBuffer())
+    try batch.encodeRenderInstances(
+      accepted, instances: output, colorMode: .bodyIndex, appearanceOverrides: nil)
+    accepted.commit()
+    accepted.waitUntilCompleted()
+    // Replacing the mesh buffers is a topology edit.
+    let mesh = try XCTUnwrap(a.rigidMeshRenderSurface)
+    a.rigidMeshRenderSurface = .init(
+      vertices: try XCTUnwrap(device.makeBuffer(length: mesh.vertices.length, options: .storageModeShared)),
+      indices: mesh.indices, indexCount: mesh.indexCount, positions: mesh.positions, rotations: mesh.rotations)
+    let command = try XCTUnwrap(queue.makeCommandBuffer())
     XCTAssertThrowsError(
       try batch.encodeRenderInstances(
         command, instances: output, colorMode: .bodyIndex, appearanceOverrides: nil))
     XCTAssertFalse(batch.renderSupportsRayTracing)
+  }
+
+  func testDroppedUncommittedFrameDoesNotExhaustSlots() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let batch = try GPUSimEnvironmentBatch(environments: [.init(scene: try Scene(device: device, offsets: [.zero]))])
+    let queue = try XCTUnwrap(device.makeCommandQueue())
+    let output = try XCTUnwrap(device.makeBuffer(length: 112, options: .storageModeShared))
+    // A consumer that encodes and then abandons its command buffer must not
+    // keep a slot forever; more frames than slots must still encode.
+    for frame in 0..<8 {
+      try autoreleasepool {
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        try batch.encodeRenderInstances(
+          command, instances: output, colorMode: .bodyIndex, appearanceOverrides: nil)
+        if frame % 2 == 1 { command.commit(); command.waitUntilCompleted() }
+      }
+    }
   }
 }
