@@ -31,3 +31,15 @@ Use `--environment-srgb` for an encoded SDR environment image. The default expec
 linear HDR input. `--no-denoise` displays native-resolution HDR lighting before
 MetalFX; ray budgets remain controlled by `--quality`. See
 [StudioLighting.md](../../Documentation/StudioLighting.md) for limits and costs.
+
+
+To exercise shared-topology instancing in one Fast view:
+
+```sh
+swift run -c release material-preview --environments 128 --spacing 3 --frames 120 --output /tmp/environments.png
+```
+
+This demo repeats one solver's state. Applications can pass independently evolving
+solvers with identical topology to `GPUSimEnvironmentBatch.Environment`; each gets
+its own presentation offset. `--environments` selects Fast, accepts 1–4096 copies,
+and shares one AO/contact-shadow pass. Adjust `--spacing` for imported asset scale.

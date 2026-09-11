@@ -231,3 +231,48 @@ See [configurable environment and finite-area lighting](StudioLighting.md) for
 HDR environment maps, finite disk/rectangle emitters, per-frame ray budgets,
 dielectric preview materials, clipping controls and a MetalFX bypass comparison.
 These features are opt-in; the default light setup and real-time budgets remain.
+
+
+## Repeated environments in one view
+
+`GPUSimEnvironmentBatch` adapts repeated rigid scenes to a single Fast renderer:
+
+```swift
+let batch = try GPUSimEnvironmentBatch(environments: solvers.enumerated().map { i, solver in
+    .init(scene: solver, offset: SIMD3(Float(i % 16) * 3, Float(i / 16) * 3, 0))
+})
+let renderer = try GPUSimRenderer(device: device, scene: batch, materials: materials)
+renderer.options = .lightweight
+```
+
+Entries share identical local indexed mesh topology, material IDs and body
+numbering. Poses and primitive dimensions can differ between entries. Construction
+validates geometry once and owns one immutable copy; frames snapshot and pack
+poses/primitive instances on the GPU, with three owned slots. Repeated references
+to one solver reuse its capture when there are no per-body overrides. Separate
+solvers evolve independently. Placement offsets affect rendering only. Global
+appearance indices are `environmentIndex * bodiesPerEnvironment + localBodyIndex`.
+
+The mesh is instanced in shadow, front/back depth and color passes. Large Fast
+primitive sets use GPU classification and indirect draws, avoiding unrelated
+shape vertex work. AO, contact shadows and optional SSR operate once on the
+combined depth/normal image at the original resolution. Environments share one
+camera and lighting setup; objects close together can occlude or shadow each
+other. This is an overview, not independent camera images packed into tiles.
+
+The initial adapter supports fixed rigid topology and translation offsets.
+Deformable/skinned scenes, nested batches and mismatched topology are rejected;
+recreate the batch after a topology edit. HQ is explicitly rejected for this
+representation. Custom backends retain the existing buffer ownership/retirement
+contract. Use one batch per renderer and serialize calls.
+
+Backends that already own packed batched poses can supply a
+`GPUSimRigidMeshRenderSurface` directly with `instanceCount` and
+`bodiesPerInstance`, avoiding the adapter's gathering step. Vertex body IDs stay
+local; positions/rotations and appearance overrides address the packed global
+body range. Such surfaces currently require Fast rendering.
+
+Run the opt-in release scaling benchmark with
+`AVBD_ENV_BENCHMARK=1 swift test -c release --filter EnvironmentBatchTests/testEnvironmentThroughputBenchmark`.
+It compares identical geometry in one 1024×768 view at 1/16/64/128 environments;
+measurements are printed, not stored as production artifacts.

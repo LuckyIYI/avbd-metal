@@ -408,19 +408,27 @@ public struct GPUSimRigidMeshRenderSurface {
     public let indexCount: Int
     public let positions: MTLBuffer
     public let rotations: MTLBuffer
+    /// Shared topology is drawn once per environment. Pose arrays are packed
+    /// with this body stride; vertex body IDs remain local to the topology.
+    public let instanceCount: Int
+    public let bodiesPerInstance: Int
 
     public init(
         vertices: MTLBuffer,
         indices: MTLBuffer,
         indexCount: Int,
         positions: MTLBuffer,
-        rotations: MTLBuffer
+        rotations: MTLBuffer,
+        instanceCount: Int = 1,
+        bodiesPerInstance: Int = 0
     ) {
         self.vertices = vertices
         self.indices = indices
         self.indexCount = indexCount
         self.positions = positions
         self.rotations = rotations
+        self.instanceCount = instanceCount
+        self.bodiesPerInstance = bodiesPerInstance
     }
 }
 
@@ -468,6 +476,8 @@ public protocol GPUSimRenderableScene: AnyObject {
     /// to reuse a scene's acceleration-structure update. Nil updates every draw.
     var renderStateRevision: UInt64? { get }
     var rendererStateIsValid: Bool { get }
+    /// False for raster-only scene representations. HQ must not silently omit geometry.
+    var renderSupportsRayTracing: Bool { get }
     var renderCameraHint: GPUSimRenderCameraHint { get }
     var softRenderSurface: GPUSimSoftRenderSurface? { get }
     var skinnedRenderSurface: GPUSimSkinnedRenderSurface? { get }
@@ -491,6 +501,10 @@ public protocol GPUSimRenderableScene: AnyObject {
         colorMode: GPUSimRenderColorMode,
         appearanceOverrides: MTLBuffer?
     ) throws
+}
+
+extension GPUSimRenderableScene {
+    public var renderSupportsRayTracing: Bool { true }
 }
 
 extension GPUSolver: GPUSimRenderableScene {
@@ -679,6 +693,7 @@ struct Uniforms {
     float4 diffuse; // x: world diffuse lighting enabled; y: ray pass writes specular distance
     float4 reconstruction; // x: MetalFX, yz: normalized projection jitter, w: sample index
     float4 areaSettings; // count, samples per emitter, reserved
+    uint4 instancing; // x: rigid mesh body stride between environment instances
     float4 environmentSettings; // intensity minus one, rotation, hide background, reserved
     float4 displaySettings; // exposure, custom display transform enabled, reserved
     AreaLight areaLights[8];
@@ -887,11 +902,11 @@ inline VOut emit(float3 p, float3 n, RenderInstance inst, constant Uniforms& U) 
     return o;
 }
 
-vertex VOut box_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                       device const RenderInstance* instances [[buffer(0)]],
-                       constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut box_geometry(uint vid, uint iid,
+                       device const RenderInstance* instances,
+                       constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 0.0) return collapse();
@@ -899,14 +914,24 @@ vertex VOut box_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     o.previousWorld = writesMotion ? (previousPrimary[iid].model * float4(cubeVerts[vid], 1)).xyz : o.world;
     return o;
 }
+vertex VOut box_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                       device const RenderInstance* instances [[buffer(0)]],
+                       constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return box_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut box_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                       device const RenderInstance* instances [[buffer(0)]],
+                       constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return box_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 #define SPH_STACKS 12
 #define SPH_SLICES 18
-vertex VOut sphere_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                          device const RenderInstance* instances [[buffer(0)]],
-                          constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut sphere_geometry(uint vid, uint iid,
+                          device const RenderInstance* instances,
+                          constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 1.0) return collapse();
@@ -921,14 +946,24 @@ vertex VOut sphere_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     o.previousWorld = writesMotion ? (previousPrimary[iid].model * float4(n * 0.5, 1)).xyz : o.world;
     return o;
 }
+vertex VOut sphere_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                          device const RenderInstance* instances [[buffer(0)]],
+                          constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return sphere_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut sphere_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                          device const RenderInstance* instances [[buffer(0)]],
+                          constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return sphere_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 #define TOR_RINGS 24
 #define TOR_SIDES 12
-vertex VOut torus_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                         device const RenderInstance* instances [[buffer(0)]],
-                         constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut torus_geometry(uint vid, uint iid,
+                         device const RenderInstance* instances,
+                         constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 2.0) return collapse();
@@ -949,14 +984,24 @@ vertex VOut torus_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     }
     return o;
 }
+vertex VOut torus_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                         device const RenderInstance* instances [[buffer(0)]],
+                         constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return torus_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut torus_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                         device const RenderInstance* instances [[buffer(0)]],
+                         constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return torus_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 #define CAP_SLICES 16
 #define CAP_STACKS 6
-vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                           device const RenderInstance* instances [[buffer(0)]],
-                           constant Uniforms& U [[buffer(1)]],
-    device const RenderInstance* previousPrimary [[buffer(6)]],
-    device const float4* previousSecondary [[buffer(7)]])
+inline VOut capsule_geometry(uint vid, uint iid,
+                           device const RenderInstance* instances,
+                           constant Uniforms& U,
+    device const RenderInstance* previousPrimary,
+    device const float4* previousSecondary)
 {
     RenderInstance inst = instances[iid];
     if (inst.color.w != 3.0) return collapse();
@@ -985,6 +1030,16 @@ vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     }
     return o;
 }
+vertex VOut capsule_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                           device const RenderInstance* instances [[buffer(0)]],
+                           constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]]) { return capsule_geometry(vid, iid, instances, U, previousPrimary, previousSecondary); }
+vertex VOut capsule_compact_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
+                           device const RenderInstance* instances [[buffer(0)]],
+                           constant Uniforms& U [[buffer(1)]],
+    device const RenderInstance* previousPrimary [[buffer(6)]],
+    device const float4* previousSecondary [[buffer(7)]], device const uint* visible [[buffer(8)]]) { return capsule_geometry(vid, visible[iid], instances, U, previousPrimary, previousSecondary); }
 
 // ---------------------------------------------------------------------------
 // Soft surface meshes (cloth sheets, tet-body boundaries): vertices live in
@@ -1073,7 +1128,7 @@ inline float3 rigidMeshRotate(float4 q, float3 v) {
 }
 
 vertex VOut rigid_mesh_vertex(
-    uint vid [[vertex_id]],
+    uint vid [[vertex_id]], uint iid [[instance_id]],
     device const RigidMeshVertex* vertices [[buffer(0)]],
     constant Uniforms& U [[buffer(1)]],
     device const float4* posLin [[buffer(2)]],
@@ -1084,7 +1139,7 @@ vertex VOut rigid_mesh_vertex(
     device const float4* previousSecondary [[buffer(7)]])
 {
     RigidMeshVertex v = vertices[vid];
-    uint body = as_type<uint>(v.positionBody.w);
+    uint body = as_type<uint>(v.positionBody.w) + iid*U.instancing.x;
     float4 q = posAng[body];
     float3 world = posLin[body].xyz + rigidMeshRotate(q, v.positionBody.xyz);
     VOut o;
@@ -1423,6 +1478,7 @@ struct Uniforms {
     var diffuse = SIMD4<Float>.zero
     var reconstruction = SIMD4<Float>.zero
     var areaSettings = SIMD4<Float>.zero
+    var instancing = SIMD4<UInt32>.zero
     var environmentSettings = SIMD4<Float>.zero
     var displaySettings = SIMD4<Float>.zero
     var areaLights = (AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord(),AreaLightRecord())
@@ -1492,6 +1548,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     /// export to `sRGB`, to preserve the displayed brightness.
     public var frameCompletionHandler: (@MainActor (MTLTexture, Int) -> Void)?
 
+    private var compactPipelines: [ObjectIdentifier: MTLRenderPipelineState] = [:]
+    private var primitiveBatch: PrimitiveBatch?
+    // Internal switch used by the matched rendering regression/benchmark.
+    var enablesPrimitiveBatching = true
     var boxP, sphereP, torusP, capsuleP, softP, skinP, rigidMeshP: MTLRenderPipelineState!
     var boxAuxP, sphereAuxP, torusAuxP, capsuleAuxP: MTLRenderPipelineState!
     var boxPre, spherePre, torusPre, capsulePre, floorPreP, softPre, skinPre,
@@ -1542,7 +1602,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     private let frameReadback = FrameReadback()
     @MainActor private struct CompletedFrameResources {
         let texture: MTLTexture?
-        let snapshot: MTLCommandBuffer?
+        let snapshots: [MTLCommandBuffer]
         let lighting: GPUSimLightingBindings
     }
 
@@ -1759,6 +1819,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         skinPre = try pipe("skin_vertex", "soft_prepass_fragment", samples: 1, colorFormats: preFmt)
         rigidMeshPre = try pipe("rigid_mesh_vertex", "prepass_fragment",
                                 samples: 1, colorFormats: preFmt)
+        for (name, main, pre, shadow) in [("box",boxP!,boxPre!,boxShadow!),
+                ("sphere",sphereP!,spherePre!,sphereShadow!), ("torus",torusP!,torusPre!,torusShadow!),
+                ("capsule",capsuleP!,capsulePre!,capsuleShadow!)] {
+            compactPipelines[ObjectIdentifier(main)] = try pipe(name+"_compact_vertex", "pbr_fragment")
+            compactPipelines[ObjectIdentifier(pre)] = try pipe(name+"_compact_vertex", "prepass_fragment", samples: 1, colorFormats: preFmt)
+            compactPipelines[ObjectIdentifier(shadow)] = try depthPipe(name+"_compact_vertex")
+        }
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
@@ -2235,6 +2302,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         do { try activeOptions.validateLighting() }
         catch { reportFailure("Scene exceeds the supported limit of \(GPUSimAreaLight.maximumCount) area lights"); return }
         activeOptions = activeOptions.resolved(supportsHQ: Self.supportsHQ(device: device))
+        guard !activeOptions.usesRayTracing || (renderScene.renderSupportsRayTracing && (renderScene.rigidMeshRenderSurface?.instanceCount ?? 1) == 1) else {
+            reportFailure("This scene representation supports Fast rendering only")
+            return
+        }
         activeLightingMode = activeOptions.lightingMode
         guard renderScene.rendererStateIsValid else { return }
         let activeBodyAppearances = source?.rendererBodyAppearances
@@ -2390,7 +2461,6 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 return
             }
         }
-        let snapshotSubmission = (renderScene as? RenderSnapshot)?.submission
 
         do {
             try renderScene.encodeRenderInstances(
@@ -2404,6 +2474,27 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             guard renderScene.rendererStateIsValid else { return }
             reportFailure("instance-build encoder failed: \(error.localizedDescription)")
             return
+        }
+
+        let compactPrimitives = enablesPrimitiveBatching && !activeOptions.usesRayTracing && activeOptions.reconstruction != .metalFX && rigidCount >= 64
+        do {
+            if compactPrimitives {
+                if primitiveBatch == nil { primitiveBatch = try PrimitiveBatch(device: device) }
+                try primitiveBatch!.encode(command: cmd, instances: instances, count: rigidCount)
+            }
+        } catch { reportFailure("primitive batching failed: \(error)"); return }
+
+        func primitivePipeline(_ pipeline: MTLRenderPipelineState) -> MTLRenderPipelineState {
+            compactPrimitives ? compactPipelines[ObjectIdentifier(pipeline)]! : pipeline
+        }
+        func drawRigid(_ encoder: MTLRenderCommandEncoder, vertices: Int) {
+            if compactPrimitives, let batch = primitiveBatch {
+                encoder.setVertexBuffer(batch.indices, offset: 0, index: 8)
+                let shape = [36, SPHV, TORV, CAPV].firstIndex(of: vertices)!
+                encoder.drawPrimitives(type: .triangle, indirectBuffer: batch.arguments, indirectBufferOffset: shape*16)
+            } else {
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices, instanceCount: rigidCount)
+            }
         }
 
         // Topology edits invalidate vertex correspondence even when buffer
@@ -2523,6 +2614,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         U.rayBudget = SIMD4(Float(quality.shadowSamples),Float(quality.reflectionSamples),
                            Float(quality.diffuseSamples),materialLibrary.hasTransmission ? Float(quality.transmissionInterfaces) : 0)
         U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),0,0)
+        U.instancing.x = UInt32(renderScene.rigidMeshRenderSurface?.bodiesPerInstance ?? 0)
         U.environmentSettings = SIMD4(activeOptions.environmentIntensity-1,activeOptions.environmentRotation,activeOptions.showsEnvironmentBackground ? 0 : 1,0)
         U.displaySettings.x = activeOptions.displayExposure
         U.displaySettings.y = displayTransform == nil ? 0 : 1
@@ -2586,11 +2678,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 if rigidCount > 0 {
                     for (p, verts) in [(boxShadow!, 36), (sphereShadow!, SPHV),
                                        (torusShadow!, TORV), (capsuleShadow!, CAPV)] {
-                        enc.setRenderPipelineState(p)
+                        enc.setRenderPipelineState(primitivePipeline(p))
                         enc.setVertexBuffer(instances, offset: 0, index: 0)
                         enc.setVertexBytes(&shadowU, length: MemoryLayout<Uniforms>.stride, index: 1)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                           vertexCount: verts, instanceCount: rigidCount)
+                        drawRigid(enc, vertices: verts)
                     }
                 }
                 if let auxiliaryBatch, auxiliaryBatch.casterCount > 0 {
@@ -2634,7 +2725,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.drawIndexedPrimitives(
                         type: .triangle, indexCount: mesh.indexCount,
                         indexType: .uint32, indexBuffer: mesh.indices,
-                        indexBufferOffset: 0)
+                        indexBufferOffset: 0, instanceCount: mesh.instanceCount)
                 }
                 enc.endEncoding()
             }
@@ -2678,8 +2769,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                         enc.setVertexBuffer(instances, offset: 0, index: 0)
                         enc.setVertexBuffer(previous["instances"], offset: 0, index: 6)
                         enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                           vertexCount: verts, instanceCount: rigidCount)
+                        drawRigid(enc, vertices: verts)
                     }
                 }
                 if let surf = renderScene.softRenderSurface {
@@ -2716,7 +2806,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.drawIndexedPrimitives(
                         type: .triangle, indexCount: mesh.indexCount,
                         indexType: .uint32, indexBuffer: mesh.indices,
-                        indexBufferOffset: 0)
+                        indexBufferOffset: 0, instanceCount: mesh.instanceCount)
                 }
                 if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
                     setOpaqueAuxiliaryDepth(on: enc)
@@ -2774,11 +2864,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 if rigidCount > 0 {
                     for (p, verts) in [(boxPre!, 36), (spherePre!, SPHV),
                                        (torusPre!, TORV), (capsulePre!, CAPV)] {
-                        enc.setRenderPipelineState(surfacePipeline(p))
+                        enc.setRenderPipelineState(surfacePipeline(primitivePipeline(p)))
                         enc.setVertexBuffer(instances, offset: 0, index: 0)
                         enc.setVertexBytes(&Uh, length: MemoryLayout<Uniforms>.stride, index: 1)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                           vertexCount: verts, instanceCount: rigidCount)
+                        drawRigid(enc, vertices: verts)
                     }
                 }
                 if let surf = renderScene.softRenderSurface {
@@ -2809,7 +2898,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                     enc.drawIndexedPrimitives(
                         type: .triangle, indexCount: mesh.indexCount,
                         indexType: .uint32, indexBuffer: mesh.indices,
-                        indexBufferOffset: 0)
+                        indexBufferOffset: 0, instanceCount: mesh.instanceCount)
                 }
                 if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
                     for (p, vertices) in [(boxPre!, 36), (spherePre!, SPHV), (torusPre!, TORV), (capsulePre!, CAPV)] {
@@ -2852,10 +2941,9 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             ]
             if rigidCount > 0 {
                 for (pipeline, vertices) in primitiveDepthPipelines {
-                    back.setRenderPipelineState(backPipeline(pipeline))
+                    back.setRenderPipelineState(backPipeline(primitivePipeline(pipeline)))
                     back.setVertexBuffer(instances, offset: 0, index: 0)
-                    back.drawPrimitives(type: .triangle, vertexStart: 0,
-                        vertexCount: vertices, instanceCount: rigidCount)
+                    drawRigid(back, vertices: vertices)
                 }
             }
             if let auxiliaryBatch, auxiliaryBatch.opaqueCount > 0 {
@@ -2890,7 +2978,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 back.setVertexBuffer(mesh.rotations, offset: 0, index: 3)
                 bindAppearance(back)
                 back.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
-                    indexType: .uint32, indexBuffer: mesh.indices, indexBufferOffset: 0)
+                    indexType: .uint32, indexBuffer: mesh.indices, indexBufferOffset: 0, instanceCount: mesh.instanceCount)
             }
             // The built-in floor is a single plane and has no finite exit.
             back.endEncoding()
@@ -2949,14 +3037,13 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         enc.setDepthStencilState(depthState)
         if rigidCount > 0 {
             for (p, verts) in [(boxP!, 36), (sphereP!, SPHV), (torusP!, TORV), (capsuleP!, CAPV)] {
-                enc.setRenderPipelineState(scenePipeline(p))
+                enc.setRenderPipelineState(scenePipeline(primitivePipeline(p)))
                 enc.setVertexBuffer(instances, offset: 0, index: 0)
                 enc.setVertexBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentBytes(&U, length: MemoryLayout<Uniforms>.stride, index: 1)
                 enc.setFragmentTexture(visibilityTex, index: 0)
                 enc.setFragmentTexture(shadowTex, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: verts, instanceCount: rigidCount)
+                drawRigid(enc, vertices: verts)
             }
         }
         if let surf = renderScene.softRenderSurface {
@@ -2996,7 +3083,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             enc.drawIndexedPrimitives(
                 type: .triangle, indexCount: mesh.indexCount,
                 indexType: .uint32, indexBuffer: mesh.indices,
-                indexBufferOffset: 0)
+                indexBufferOffset: 0, instanceCount: mesh.instanceCount)
         }
         if let auxiliaryBatch {
             // Opaque auxiliary geometry participates in depth just like the
@@ -3157,7 +3244,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let retire = renderScene.renderSceneRequiresFrameRetirement
         framesDrawn += 1
         let frameNumber = framesDrawn
-        let completed = CompletedFrameResources(texture: completedTexture, snapshot: snapshotSubmission, lighting: lightingBindings)
+        let completed = CompletedFrameResources(texture: completedTexture, snapshots: (renderScene as? RenderSubmissionProvider)?.renderSubmissions ?? [], lighting: lightingBindings)
         let inFlight = inFlightFrames
         cmd.addCompletedHandler { [weak self] finished in
             inFlight.signal()
@@ -3173,8 +3260,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 guard let self else { return }
                 defer { if let texture = completed.texture { self.frameReadback.recycle(texture) } }
                 self.lastFrameGPUMilliseconds = ms
-                if completed.snapshot?.status == .error {
-                    self.reportFailure("render snapshot command failed: \(String(describing: completed.snapshot?.error))")
+                if let failed = completed.snapshots.first(where: { $0.status == .error }) {
+                    self.reportFailure("render snapshot command failed: \(String(describing: failed.error))")
                     return
                 }
                 if status != .completed || error != nil {
@@ -3201,6 +3288,10 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             // callback runs with finished pixels, before this call returns
             lastFrameGPUMilliseconds =
                 (cmd.gpuEndTime - cmd.gpuStartTime) * 1000
+            if let failed = completed.snapshots.first(where: { $0.status == .error }) {
+                reportFailure("render snapshot command failed: \(String(describing: failed.error))")
+                return
+            }
             if let failure = commandFailureDescription(cmd) {
                 reportFailure(failure)
                 return
