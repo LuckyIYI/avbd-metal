@@ -2113,7 +2113,8 @@ inline void npCollidePass(
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
-            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
+            | (((shapeType[ia] | shapeType[ib]) & COLLIDER_CABLE_CONTACT_FRAME)
+                ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(contactCount), flags);
         outM.basisN = float4(normal, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -2353,7 +2354,8 @@ inline void npCollidePass(
         // Material capsules use the same reference frame for the Taylor
         // contact value and its Jacobian throughout this step.
         uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
-            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
+            | (((shapeType[ia] | shapeType[ib]) & COLLIDER_CABLE_CONTACT_FRAME)
+                ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(nh), flags);
         outM.basisN = float4(nrmC, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -2596,7 +2598,8 @@ inline void npCollidePass(
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
-            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
+            | (((shapeType[ia] | shapeType[ib]) & COLLIDER_CABLE_CONTACT_FRAME)
+                ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(nHits), flags);
         outM.basisN = float4(nrmT, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -2746,7 +2749,8 @@ inline void npCollidePass(
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
-            | ((capA && !roundA) || (capB && !roundB) ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
+            | (((shapeType[ia] | shapeType[ib]) & COLLIDER_CABLE_CONTACT_FRAME)
+                ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(count), flags);
         outM.basisN = float4(nrm, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);

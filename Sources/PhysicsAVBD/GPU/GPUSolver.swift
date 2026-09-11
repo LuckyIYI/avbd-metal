@@ -2282,6 +2282,7 @@ public final class GPUSolver {
         }
         var radii: [Float] = []
         radii.reserveCapacity(numColliders)
+        let cableContactBodies = scene.cableContactBodies
         for (i, c) in scene.colliders.enumerated() {
             precondition(scene.bodies.indices.contains(c.body),
                          "collider owner out of range")
@@ -2310,6 +2311,10 @@ public final class GPUSolver {
             }
             if particle { flags |= 0x10 }
             if c.usesWorldSpaceRoundAnchor { flags |= 0x20 }
+            if (flags & 0xF) == 3 && !particle
+                && !c.usesWorldSpaceRoundAnchor && cableContactBodies.contains(c.body) {
+                flags |= ColliderGPUFlags.cableContactFrame
+            }
             ct[i] = flags
             if rigidHierarchy == nil, c.collisionEnabled,
                scene.bodies[c.body].isDynamic {

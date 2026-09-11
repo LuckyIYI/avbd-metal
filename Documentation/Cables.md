@@ -114,8 +114,11 @@ contacts, like existing elastic elements; they do not use adaptive penalties
 or multiplier clamping. The cable flag selects a dedicated stamp within the
 existing joint dispatch, including scalar, SIMD and fused solver paths. It
 uses the inactive motor fields as explicitly tagged material storage and
-preserves the 256-byte joint ABI. No cable-only buffers or dispatches are
-added. Elastic undamped joints skip history evaluation; zero angular rigidity skips
+adds no fields to the existing joint layout. On this branch the record is
+256 bytes; PR #36 independently appends joint-response storage, so that
+absolute size is not a promise about a future merged layout. The cable tag
+is bit 7 (128), separate from bit 6 (64) used by break-load joints. No
+cable-only buffers or dispatches are added. Elastic undamped joints skip history evaluation; zero angular rigidity skips
 the angular logarithm. Reset preserves the material coefficients.
 
 ## Interactive Cable Lab
@@ -201,10 +204,15 @@ to reproduce that model or measured cable hysteresis.
 The twisting regression originally measured 53.8 mm overlap between 54 mm
 diameter strands. The contact Taylor value used reference-frame pose deltas
 with current-frame lever arms, allowing axial spin to invent normal separation.
-Material capsule contacts now use reference lever arms consistently in primal
-and dual updates, including packed and fallback Metal paths and the CPU
-reference. This applies to cable/cable and cable/rigid analytic or convex
-contacts. Legacy world-offset round anchors retain their convention.
+Cable capsule contacts use reference lever arms consistently in primal and
+dual updates, including torsional-friction load bounds, packed and fallback
+Metal paths, and the CPU reference. Only analytic material capsules owned
+by `scene.cables` or by joints with `SceneJoint.cable` opt into this policy.
+One-segment cables are included; ordinary attachments do not opt in their
+other body. Contacts without cable participants, including authored humanoid
+and arm capsules, retain their prior policy. This applies to cable/cable and
+cable/rigid analytic or convex contacts. Legacy world-offset round anchors
+retain their convention.
 
 The shared segment-distance query also uses scale-relative parallel tests
 and a cross-product denominator, so short or near-parallel crossing segments
@@ -231,6 +239,7 @@ swift run -c release cable-validation
 swift run -c release cable-validation --benchmark
 swift run -c release cable-validation --materials
 swift run -c release cable-validation --rigid-contact
+swift run -c release cable-validation --shader-regressions
 swift run -c release cable-validation --collision-stress
 swift run -c release cable-validation --collision-stress --segments 80
 swift run -c release cable-validation --collision-stress --mixed
@@ -334,3 +343,13 @@ releases it, and waits before rendering. It does not rewrite body poses or
 material rest state to create the picture.
 
 ![Elastic cable springs back while the plastic cable keeps a bend](Images/Cables/bend-and-keep.png)
+
+The shader regression appends a probe to the checkout's production Metal
+source. It checks both torsional-friction routines against a known 1 N
+normal load while a capsule spins, verifies that an unflagged contact keeps
+its prior behavior, and checks explicit cable adjacency with zero shear
+storage, separation from break-load flags, and Swift/Metal joint stride.
+It does not add test kernels to the shipped solver library. CPU ownership
+regressions also cover single segments, custom cable joints, replication,
+and ordinary authored capsules. The focused CI workflow follows cable files
+and their shared solver dependencies on both PRs and pushes to main.

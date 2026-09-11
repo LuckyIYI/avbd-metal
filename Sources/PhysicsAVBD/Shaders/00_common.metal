@@ -23,6 +23,8 @@ using namespace metal;
 // contact anchor as a world-space offset to roll freely. Offset compound
 // colliders must use body-local anchors so they rotate with their owner.
 #define COLLIDER_WORLD_ROUND_ANCHOR 0x20u
+// Only analytic material capsules owned by an authored cable opt in.
+#define COLLIDER_CABLE_CONTACT_FRAME 0x40u
 #define MAX_CONTACTS 8
 
 // Force kinds packed into adjacency entries (top 4 bits)
@@ -331,7 +333,8 @@ inline bool motor_uses_explicit_effort(uint flags) {
         || motor_uses_velocity_feedback(flags);
 }
 
-constant uint JOINT_CABLE = 1u << 6;
+// Bit 6 is reserved for break-load joints (PR #36).
+constant uint JOINT_CABLE = 1u << 7;
 
 struct JointGPU {
     uint4 header;       // bodyA (WORLD_BODY=world), bodyB, broken flag, flags

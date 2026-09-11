@@ -224,6 +224,7 @@ public final class CPUSolver {
     private(set) var colliders: [CPUCollider] = []
     var convexAssets: [ConvexHullAsset] = []
     var collisionExclusions: Set<UInt64> = []
+    var cableContactBodies: Set<Int> = []
     private var colliderManifolds: [UInt64: CPUManifold] = [:]
 
     public init() {}

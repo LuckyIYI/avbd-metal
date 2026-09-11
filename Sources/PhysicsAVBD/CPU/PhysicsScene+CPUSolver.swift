@@ -85,6 +85,7 @@ public extension PhysicsScene {
         solver.rigidLinearDamping = settings.rigidLinearDamping
         solver.rigidAngularDamping = settings.rigidAngularDamping
         solver.convexAssets = convexAssets
+        solver.cableContactBodies = cableContactBodies
 
         for body in bodies {
             let rigidBody = solver.addSceneBody(

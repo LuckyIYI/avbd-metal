@@ -17,6 +17,11 @@ inline bool bodyDynamic(device const float4* posLin, uint b) {
     return b != WORLD_BODY && posLin[b].w > 0.0f;
 }
 
+inline bool jointHasSolveTerms(device const JointGPU& j) {
+    return (j.header.w & JOINT_CABLE) != 0u
+        || j.rA.w != 0.0f || j.rB.w != 0.0f || j.motor.y != 0.0f;
+}
+
 kernel void adj_clear_degrees(
     device atomic_uint* degrees     [[buffer(0)]],
     constant uint& numBodies        [[buffer(1)]],
@@ -69,8 +74,7 @@ kernel void adj_count(
     if (gid < P.numJoints) {
         if (joints[gid].header.z != 0) return;  // broken
         // inert (exclusion-only / inactive drag slots): nothing to stamp
-        if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
-            && joints[gid].motor.y == 0.0f) return;
+        if (!jointHasSolveTerms(joints[gid])) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
     } else if (gid < P.numJoints + P.numSprings) {
@@ -171,8 +175,7 @@ kernel void adj_scatter(
     uint entry = 0;
     if (gid < P.numJoints) {
         if (joints[gid].header.z != 0) return;
-        if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
-            && joints[gid].motor.y == 0.0f) return;
+        if (!jointHasSolveTerms(joints[gid])) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
         entry = (FK_JOINT << ADJ_KIND_SHIFT) | gid;
@@ -1721,9 +1724,9 @@ inline void stampTorsionalManifold(
     float normalLoad = 0.0f;
     for (uint i = 0u; i < n; ++i) {
         float3 rAW = sphA ? m.contacts[i].rA.xyz
-            : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
         float3 rBW = sphB ? m.contacts[i].rB.xyz
-            : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
         float3 C;
         float frictionScale, bounds;
         float3 F = contactForceC(
@@ -2943,9 +2946,9 @@ static inline void dual_torsion_one(
     float normalLoad = 0.0f;
     for (uint i = 0u; i < n; ++i) {
         float3 rAW = sphA ? m.contacts[i].rA.xyz
-            : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
         float3 rBW = sphB ? m.contacts[i].rB.xyz
-            : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
         float3 C;
         float frictionScale, bounds;
         float3 F = contactForceC(

@@ -1,9 +1,55 @@
 import XCTest
+import Metal
 import simd
 import SimCore
 @testable import PhysicsAVBD
 
 final class CableContactTests: XCTestCase {
+    func testOrdinaryAuthoredCapsulesKeepTheirContactPolicy() throws {
+        var scene = PhysicsScene(name: "ordinary authored capsules")
+        scene.settings.gravity = 0
+        for z: Float in [0, 0.059] {
+            let body = scene.addBody(size: F3(0.2,0.03,0), density: 1000,
+                friction: 0, position: F3(0,0,z),
+                rotation: Quat(from: F3(0,0,1), to: F3(1,0,0)),
+                shape: .capsule, collisionEnabled: false)
+            scene.addCollider(body: body, size: F3(0.2,0.03,0), shape: .capsule)
+        }
+        XCTAssertTrue(scene.cableContactBodies.isEmpty)
+        let cpu = try scene.makeCPUSolverChecked()
+        try cpu.stepChecked()
+        let manifold = try XCTUnwrap(cpu.forces.compactMap { $0 as? CPUManifold }.first)
+        XCTAssertFalse(manifold.usesFixedContactFrame)
+    }
+
+    func testCableOwnershipIncludesSingleSegmentsAndCustomJointsOnly() throws {
+        var scene = PhysicsScene(name: "cable contact ownership")
+        let material = CableMaterial(stretchRigidity: 1000, shearRigidity: 500,
+                                     bendRigidity: 0.1, twistRigidity: 0.1)
+        try scene.addCable(points: [.zero, F3(0,0,0.2)], radius: 0.03,
+                           density: 1000, material: material)
+        for x: Float in [1,2,3] {
+            let body = scene.addBody(size: F3(0.2,0.03,0), density: 1000,
+                friction: 0, position: F3(x,0,0), shape: .capsule, collisionEnabled: false)
+            scene.addCollider(body: body, size: F3(0.2,0.03,0), shape: .capsule)
+        }
+        var joint = SceneJoint(bodyA: 1, bodyB: 2, stiffnessLin: 0, stiffnessAng: 0)
+        joint.cable = CableJointMaterial(material: material, restLength: 0.2)
+        scene.addJoint(joint)
+        scene.addJoint(SceneJoint(bodyA: 2, bodyB: 3)) // ordinary attachment
+        XCTAssertEqual(scene.cableContactBodies, [0,1,2])
+        XCTAssertEqual(try scene.makeCPUSolverChecked().cableContactBodies, [0,1,2])
+        XCTAssertEqual(scene.replicated(count: 2, spacing: F3(8,0,0)).scene.cableContactBodies,
+                       [0,1,2,4,5,6])
+        if MTLCreateSystemDefaultDevice() != nil {
+            let gpu = try GPUSolver(scene: scene)
+            let flags = gpu.colliderShapeType.contents().bindMemory(to: UInt32.self, capacity: 4)
+            for i in 0..<4 {
+                XCTAssertEqual(flags[i] & ColliderGPUFlags.cableContactFrame != 0, i < 3)
+            }
+        }
+    }
+
     func testMaterialSpinCannotEraseNormalContactForce() throws {
         for shape in [BodyShape.capsule, .box, .sphere, .torus] {
             for cableFirst in [false, true] {
@@ -34,6 +80,7 @@ final class CableContactTests: XCTestCase {
                 try solver.stepChecked()
                 let contact = try XCTUnwrap(solver.forces.compactMap { $0 as? CPUManifold }.first,
                                             "shape=\(shape), cableFirst=\(cableFirst)")
+                XCTAssertTrue(contact.usesFixedContactFrame)
                 for body in solver.bodies {
                     body.initialLin = body.positionLin; body.initialAng = body.positionAng
                 }

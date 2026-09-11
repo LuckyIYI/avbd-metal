@@ -101,6 +101,13 @@ final class CableTests: XCTestCase {
         let scene = Demos.cables(count: 3, segments: 12)
         XCTAssertEqual(scene.cables.count, 3)
         XCTAssertEqual(scene.cables[0].jointIDs.count, 11)
-        XCTAssertEqual(MemoryLayout<JointGPU>.stride, 256)
+        XCTAssertEqual(JointGPU.cableFlag, 128)
+        XCTAssertEqual(JointGPU.cableFlag & (4 | 64), 0, "break-load flags must not select cables")
+        // Cable storage remains in the existing prefix; other joint features
+        // (e.g. PR #36's responses) may append fields to the overall record.
+        XCTAssertEqual(MemoryLayout<JointGPU>.offset(of: \.motor), 208)
+        XCTAssertEqual(MemoryLayout<JointGPU>.offset(of: \.limits), 224)
+        XCTAssertGreaterThanOrEqual(MemoryLayout<JointGPU>.stride, 256)
+        XCTAssertEqual(MemoryLayout<JointGPU>.stride % 16, 0)
     }
 }

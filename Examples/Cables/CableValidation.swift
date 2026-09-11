@@ -305,6 +305,10 @@ func benchmark() throws {
 @main struct CableValidation {
     static func main() throws {
         setbuf(stdout, nil)
+        if CommandLine.arguments.contains("--shader-regressions") {
+            try validateCableShaders()
+            return
+        }
         if CommandLine.arguments.contains("--compatibility") {
             try validateGearClockCompatibility()
             return

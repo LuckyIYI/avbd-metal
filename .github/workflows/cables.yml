@@ -2,18 +2,34 @@ name: Cable validation
 
 on:
   pull_request:
-    paths:
+    # Follow cable code and its shared solver dependencies, not every scene
+    # or unrelated renderer/robotics change. Apply the same filter on main.
+    paths: &cable_paths
       - "Package.swift"
-      - "Sources/**"
-      - "Tests/**"
+      - "Sources/SimCore/Scenes/Cable.swift"
+      - "Sources/SimCore/Scenes/Scene.swift"
+      - "Sources/SimCore/Scenes/SceneReplication.swift"
+      - "Sources/SimCore/Math/**"
+      - "Sources/PhysicsAVBD/CableContactPolicy.swift"
+      - "Sources/PhysicsAVBD/CPU/**"
+      - "Sources/PhysicsAVBD/GPU/**"
+      - "Sources/PhysicsAVBD/Shaders/00_common.metal"
+      - "Sources/PhysicsAVBD/Shaders/30_narrowphase.metal"
+      - "Sources/PhysicsAVBD/Shaders/31_optimized_convex_narrowphase.metal"
+      - "Sources/PhysicsAVBD/Shaders/35_analytic_compat.metal"
+      - "Sources/PhysicsAVBD/Shaders/40_solver.metal"
+      - "Sources/GPUSimDemos/Cable*.swift"
+      - "Sources/GPUSimDemos/Demos.swift"
+      - "Tests/SimCoreTests/Cable*.swift"
+      - "Tests/PhysicsAVBDTests/Cable*.swift"
       - "Examples/Cables/**"
       - "Examples/CablePlayground/**"
-      - "Development/Sources/AVBDApp/**"
       - "Tools/verify_architecture.py"
       - "Tools/tests/test_verify_architecture.py"
       - ".github/workflows/cables.yml"
   push:
     branches: [main]
+    paths: *cable_paths
 
 permissions:
   contents: read

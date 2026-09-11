@@ -32,7 +32,7 @@ public final class CPUManifold: CPUForce {
     let colliderAIndex: Int?
     let colliderBIndex: Int?
     let colliderPairKey: UInt64?
-    private var usesFixedContactFrame = false
+    private(set) var usesFixedContactFrame = false
     /// Compatibility alias for the original single Coulomb coefficient.
     /// Reads the static coefficient; writes update both coefficients so
     /// legacy callers retain their original single-material semantics.
@@ -103,9 +103,13 @@ public final class CPUManifold: CPUForce {
         // value and Jacobian. Updating it while a material capsule spins
         // invents normal separation and lets twisted cables pass through.
         usesFixedContactFrame = (colliderA?.shape == .capsule
-            && colliderA?.usesWorldSpaceRoundAnchor == false)
+            && colliderA?.usesWorldSpaceRoundAnchor == false
+            && colliderA?.hasConvexHull == false && !bodyA.isParticle
+            && solver.cableContactBodies.contains(bodyA.index))
             || (colliderB?.shape == .capsule
-            && colliderB?.usesWorldSpaceRoundAnchor == false)
+            && colliderB?.usesWorldSpaceRoundAnchor == false
+            && colliderB?.hasConvexHull == false && !bodyB.isParticle
+            && solver.cableContactBodies.contains(bodyB.index))
         let previousContacts = contacts
         let previousBasis = basis
         let previousTorsionLambda = previousContacts.first?.torsionLambda ?? 0
