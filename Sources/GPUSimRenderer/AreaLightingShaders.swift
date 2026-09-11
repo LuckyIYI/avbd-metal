@@ -7,6 +7,41 @@ let areaLightingShaderSource = """
       if (light.position.w>0) p=sqrt(xi.x)*float2(cos(2*M_PI_F*xi.y),sin(2*M_PI_F*xi.y));
       return light.position.xyz+light.right.xyz*(p.x*light.right.w)+light.up.xyz*(p.y*light.up.w);
   }
+  // Exact conservative rejection: every point of a convex emitter is below
+  // the receiver's tangent plane, or the receiver is behind a one-sided emitter.
+  inline bool areaMayContribute(AreaLight light,float3 P,float3 N) {
+      if (max(max(light.radiance.x,light.radiance.y),light.radiance.z)<=0) return false;
+      float3 delta=light.position.xyz-P;
+      if (light.radiance.w==0 && dot(areaNormal(light),-delta)<=0) return false;
+      float2 extent=float2(dot(N,light.right.xyz)*light.right.w,dot(N,light.up.xyz)*light.up.w);
+      float support=light.position.w>0 ? length(extent) : abs(extent.x)+abs(extent.y);
+      return dot(N,delta)+support>0;
+  }
+  // Scale before multiplying area and radiance to avoid overflow for HDR emitters.
+  inline float areaSelectionWeights(constant Uniforms& U,thread float* weights) {
+      uint n=uint(U.areaSettings.x);float maxRadiance=0,maxArea=0;
+      for(uint i=0;i<n;++i) {
+          float3 c=U.areaLights[i].radiance.rgb;
+          maxRadiance=max(maxRadiance,max(c.x,max(c.y,c.z)));
+          maxArea=max(maxArea,areaSize(U.areaLights[i]));
+      }
+      float sum=0;
+      for(uint i=0;i<n;++i) {
+          float w=0;
+          if(maxRadiance>0 && maxArea>0) w=dot(U.areaLights[i].radiance.rgb/maxRadiance,float3(0.2126,0.7152,0.0722))*(areaSize(U.areaLights[i])/maxArea);
+          // A small uniform mixture keeps support even for extreme power ratios.
+          weights[i]=max(w,1e-4);sum+=weights[i];
+      }
+      return sum;
+  }
+  inline uint areaSelectLight(float u,uint n,thread const float* weights,float sum,thread float& probability) {
+      float target=u*sum,cdf=0;
+      for(uint i=0;i<n;++i) {
+          cdf+=weights[i];
+          if(target<cdf || i+1==n) { probability=weights[i]/sum;return i; }
+      }
+      probability=1;return 0;
+  }
   // RGB radiance and nearest distance. Analytic emitters never enter collision
   // geometry, and a back-facing one-sided emitter cannot illuminate a ray.
   inline float4 areaIntersection(float3 origin,float3 direction,constant Uniforms& U) {
@@ -55,16 +90,56 @@ let areaLightingShaderSource = """
   """
 
 let areaRayShaderSource = """
-  inline float3 rtAreaLighting(float3 P,float3 N,float3 V,float3 albedo,float rough,float metal,
-      instance_acceleration_structure scene,constant Uniforms& U,uint2 pixel,bool diffuseOnly=false) {
+  __attribute__((noinline)) float3 rtSelectedAreaLighting(float3 P,float3 N,float3 V,float3 albedo,float rough,float metal,
+      instance_acceleration_structure scene,constant Uniforms& U,uint2 pixel,bool diffuseOnly=false,bool secondary=false) {
       float3 total=float3(0);
-      uint count=uint(max(U.areaSettings.y,1.0));
+      uint lights=uint(U.areaSettings.x);
+      if(lights==0) return total;
+      uint count=uint(max(secondary && U.areaSettings.z>0 ? U.areaSettings.z : U.areaSettings.y,1.0));
+      uint frame=uint(U.reconstruction.w);
+      bool selected=true;
+      float weights[8],weightSum=0;
+      if(selected) weightSum=areaSelectionWeights(U,weights);
+      intersector<triangle_data,instancing> query;
+      query.assume_geometry_type(geometry_type::triangle);query.force_opacity(forced_opacity::opaque);
+      query.accept_any_intersection(true);
+      uint groups=selected ? 1u : lights;
+      float selectionShift=screenNoise(pixel+uint2(frame*149u+3989u,frame*199u+6971u));
+      for(uint group=0;group<groups;++group) {
+          if(!selected && !areaMayContribute(U.areaLights[group],P,N)) continue;
+          float2 shift=float2(screenNoise(pixel+uint2(group*733u+frame*103u,frame*71u)),screenNoise(pixel+uint2(frame*53u,group*977u+frame*97u)));
+          for(uint j=0;j<count;++j) {
+              float probability=1;
+              uint i=selected ? areaSelectLight(fract((float(j)+selectionShift)/float(count)),lights,weights,weightSum,probability) : group;
+              AreaLight light=U.areaLights[i];
+              if(selected && !areaMayContribute(light,P,N)) continue;
+              // Independent dimensions for light selection and emitter position.
+              float2 xi=fract(float2(float(j)/float(count),float(reverse_bits(j))*2.3283064365386963e-10)+shift);
+              float3 delta=areaPoint(light,xi)-P;float d2=dot(delta,delta);
+              if (d2<1e-8) continue;
+              float distance=sqrt(d2);float3 L=delta/distance;
+              float cosine=dot(areaNormal(light),-L);
+              cosine=light.radiance.w>0 ? abs(cosine) : max(cosine,0.0);
+              if (cosine<=0 || dot(N,L)<=0) continue;
+              ray r;r.origin=P+N*0.0001;r.direction=L;r.min_distance=0.00002;r.max_distance=max(0.00003,distance-0.0002);
+              if (rtGroundDistance(r,U)>=0 || query.intersect(r,scene,1).type!=intersection_type::none) continue;
+              total+=areaBRDF(albedo,rough,metal,N,V,L,diffuseOnly)*light.radiance.rgb*(cosine*areaSize(light)/(d2*float(count)*probability));
+          }
+      }
+      return total;
+  }
+  inline float3 rtAreaLighting(float3 P,float3 N,float3 V,float3 albedo,float rough,float metal,
+      instance_acceleration_structure scene,constant Uniforms& U,uint2 pixel,bool diffuseOnly=false,bool secondary=false) {
+      if(U.areaSettings.w>0) return rtSelectedAreaLighting(P,N,V,albedo,rough,metal,scene,U,pixel,diffuseOnly,secondary);
+      float3 total=float3(0);
+      uint count=uint(max(secondary && U.areaSettings.z>0 ? U.areaSettings.z : U.areaSettings.y,1.0));
       uint frame=uint(U.reconstruction.w);
       intersector<triangle_data,instancing> query;
       query.assume_geometry_type(geometry_type::triangle);query.force_opacity(forced_opacity::opaque);
       query.accept_any_intersection(true);
       for(uint i=0;i<uint(U.areaSettings.x);++i) {
           AreaLight light=U.areaLights[i];
+          if(!areaMayContribute(light,P,N)) continue;
           float2 shift=float2(screenNoise(pixel+uint2(i*733u+frame*103u,frame*71u)),screenNoise(pixel+uint2(frame*53u,i*977u+frame*97u)));
           for(uint j=0;j<count;++j) {
               float2 xi=fract(float2(float(j)/float(count),float(reverse_bits(j))*2.3283064365386963e-10)+shift);

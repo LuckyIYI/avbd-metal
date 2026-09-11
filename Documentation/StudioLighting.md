@@ -152,3 +152,64 @@ prefilter, and uniform finite-emitter sampling can be noisy for sharp highlights
 More rays and denoising trade throughput for quality; they do not add missing
 light paths. The default ACES-style display curve remains available; a caller's
 display program can match Blender's AgX independently of those transport limits.
+
+
+## Bounded finite-emitter sampling
+
+The default remains stratified sampling of every light. `areaLightSamples` is a
+**per-light** budget in this mode. Secondary diffuse/reflection hits previously
+inherited this budget, multiplying visibility work by both bounce samples and
+light count. Callers can now choose an independent budget:
+
+```swift
+var quality = GPUSimRayTracingQuality.balanced
+quality.secondaryAreaLightSamples = 1
+renderer.options.rayTracingQuality = quality
+```
+
+Zero (the default) inherits the primary budget; positive budgets clamp to 1...64.
+This changes variance, not the lighting model. More noise at secondary hits is
+possible. It does not lower primary direct-light sampling or turn off shadows.
+
+For larger light sets, callers can opt into `quality.areaLightSampling =
+.powerWeighted`. Both primary and secondary counts then specify **total** light
+samples, independent of emitter count. Each sample selects an emitter with a
+probability proportional to emitted luminance times area, with a small uniform
+floor to preserve support. Its contribution is divided by that probability.
+Emitter position sampling uses separate random dimensions. This is ordinary
+importance sampling, not reservoir sampling or ReSTIR; there is no persistent
+history, neighbor lookup, reservoir allocation or spatial reuse pass.
+
+Power weighting ignores receiver orientation, distance and occlusion. A dominant
+but hidden emitter can increase variance; per-light stratification can be better
+for a few studio lights. The mode is opt-in and should be evaluated at equal time
+and acceptable image quality, not just equal numerical sample counts.
+
+Both modes conservatively reject emitters wholly below the receiver hemisphere,
+black emitters, and one-sided emitters facing away. Secondary directional shadow
+queries are omitted when the directional light has zero intensity. These skips
+remove zero-contribution work; they do not relax visibility or geometric bias.
+
+
+### Exploratory measurements
+
+See `LightingEfficiencyMeasurements.json` for all runs, including unfavorable
+ones. On a local Apple M5 cabinet fixture at native 1600×1200, high quality,
+one frame and 64 primary area samples per light, changing the inherited secondary
+budget from 64 to 1 reduced median GPU time from 1446.6 to 289.5 ms. The single
+saved-frame mean absolute display-JPEG difference was 0.197/255; that is not an
+unbiased or converged ground-truth quality metric. The same-budget median was
+approximately unchanged (1470.2 vs 1489.4 ms in the paired repeat).
+
+At 800×600 internal resolution with MetalFX output at 1600×1200, a two-frame
+balanced preset with 8 primary and 1 secondary samples per light measured 62.9 ms
+median / 78.0 ms maximum per saved image after initialization over 14 views.
+The first render took 151.3 ms, excluding application startup. Grain remains.
+A higher-budget two-frame trial exceeded 100 ms. The optional power selector's
+low-budget gain did not repeat; it is an experimental alternative for evaluating
+larger light sets, not a recommended default for a three-light studio.
+
+These are application-level observations using external procedural fixtures.
+They do not establish portable performance or a universal quality improvement.
+The 19 related GPU correctness tests cover area-light energy and occlusion,
+material transport, environment lighting and MetalFX reconstruction.

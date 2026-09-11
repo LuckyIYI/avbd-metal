@@ -9,6 +9,10 @@ import simd
 @MainActor
 final class AreaLightTests: XCTestCase {
   func testValidationBudgetsAndUniformABI() throws {
+    XCTAssertEqual(GPUSimRayTracingQuality().secondaryAreaLightSamples, 0)
+    XCTAssertEqual(GPUSimRayTracingQuality().areaLightSampling, .allLights)
+    XCTAssertEqual(GPUSimRayTracingQuality(secondaryAreaLightSamples: -2).resolved.secondaryAreaLightSamples, 0)
+    XCTAssertEqual(GPUSimRayTracingQuality(secondaryAreaLightSamples: 100).resolved.secondaryAreaLightSamples, 64)
     XCTAssertEqual(MemoryLayout<AreaLightRecord>.stride, 64)
     XCTAssertEqual(
       MemoryLayout.offset(of: \Uniforms.aoProjection)! - MemoryLayout.offset(
@@ -92,6 +96,47 @@ final class AreaLightTests: XCTestCase {
     XCTAssertEqual(result[4].y, 10, accuracy: 0.0001)
     XCTAssertEqual(result[4].z, 2 * sqrt(2), accuracy: 0.0001)
     XCTAssertEqual(result[4].w, 10 * sqrt(2), accuracy: 0.0001)
+  }
+
+  func testPowerSelectionPreservesRGBEnergyAndEmitterSupport() throws {
+    let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+    let library = try device.makeLibrary(source: renderShaderSource + """
+      kernel void selection_probe(device float4* out [[buffer(0)]],constant Uniforms& U [[buffer(1)]]) {
+          float weights[8];float sum=areaSelectionWeights(U,weights);float3 estimate=0,exact=0;
+          for(uint i=0;i<3;++i) exact+=U.areaLights[i].radiance.rgb;
+          for(uint j=0;j<65536;++j) {
+              float p;uint i=areaSelectLight((float(j)+0.5)/65536,3,weights,sum,p);
+              estimate+=U.areaLights[i].radiance.rgb/p/65536;
+          }
+          out[0]=float4(estimate,1);out[1]=float4(exact,1);
+          // Light at z=3 faces downward. Receiver faces away, toward, and lies behind it.
+          out[2]=float4(areaMayContribute(U.areaLights[0],float3(0),float3(0,0,-1)),
+                        areaMayContribute(U.areaLights[0],float3(0),float3(0,0,1)),
+                        areaMayContribute(U.areaLights[0],float3(0,0,4),float3(0,0,-1)),weights[2]/sum);
+      }
+      """, options: nil)
+    let pipeline = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "selection_probe")))
+    let u = try XCTUnwrap(device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared))
+    memset(u.contents(), 0, u.length)
+    let v = u.contents().assumingMemoryBound(to: Uniforms.self)
+    v.pointee.areaSettings = SIMD4(3,1,1,1)
+    func light(_ c: SIMD3<Float>, _ size: Float) throws -> AreaLightRecord {
+      try GPUSimAreaLight(position: SIMD3(0,0,3), normal: SIMD3(0,0,-1), up: SIMD3(0,1,0), size: SIMD2(repeating:size), radiance:c).record
+    }
+    v.pointee.areaLights.0 = try light(SIMD3(10,1,0),1)
+    v.pointee.areaLights.1 = try light(SIMD3(0,2,5),2)
+    v.pointee.areaLights.2 = try light(.zero,1)
+    let out = try XCTUnwrap(device.makeBuffer(length:48,options:.storageModeShared))
+    let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
+    let e = try XCTUnwrap(command.makeComputeCommandEncoder())
+    e.setComputePipelineState(pipeline);e.setBuffer(out,offset:0,index:0);e.setBuffer(u,offset:0,index:1)
+    e.dispatchThreads(.init(width:1,height:1,depth:1),threadsPerThreadgroup:.init(width:1,height:1,depth:1))
+    e.endEncoding();command.commit();command.waitUntilCompleted()
+    XCTAssertEqual(command.status,.completed,"\(String(describing:command.error))")
+    let values = out.contents().assumingMemoryBound(to:SIMD4<Float>.self)
+    for c in 0..<3 { XCTAssertEqual(values[0][c],values[1][c],accuracy:0.015) }
+    XCTAssertEqual(values[2].x,0);XCTAssertEqual(values[2].y,1);XCTAssertEqual(values[2].z,0)
+    XCTAssertGreaterThan(values[2].w,0)
   }
 
   func testWorldGeometryOccludesFiniteEmitter() throws {

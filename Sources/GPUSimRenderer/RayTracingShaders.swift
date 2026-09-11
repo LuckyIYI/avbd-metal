@@ -148,8 +148,8 @@ kernel void rt_shadows(instance_acceleration_structure scene [[buffer(0)]], cons
 inline float3 rtLit(float3 P, float3 N, float3 V, float3 albedo, float rough, float metal,
                     float3 emissive, uint source, constant Uniforms& U, instance_acceleration_structure scene, constant MaterialResources& materials) {
     float3 L = -U.lightDir.xyz;
-    float visibility = dot(N,L) > 0 ? rtVisibility(P,N,L,0.0002,U,scene) : 1;
-    float3 area=rtAreaLighting(P,N,V,albedo,rough,metal,scene,U,uint2(abs(P.xy)*4096));
+    float visibility = U.rayScene.z > -1 && dot(N,L) > 0 ? rtVisibility(P,N,L,0.0002,U,scene) : 1;
+    float3 area=rtAreaLighting(P,N,V,albedo,rough,metal,scene,U,uint2(abs(P.xy)*4096),false,true);
     if (source == 3) return area+clothRadiance(albedo,emissive,N,V,1,visibility,U,materials);
     if (source == 4) return area+albedo*(materialDiffuseAmbient(N,U,materials)*1.1+SUN_COL/M_PI_F*max(L.z,0.0)*0.85*visibility);
     return area+pbrRadiance(albedo,rough,metal,emissive,N,V,1,visibility,U,materials);
@@ -228,14 +228,14 @@ inline float4 rtIncoming(ray r, instance_acceleration_structure scene, constant 
         if (mat.a == 1.0 && object.source != 3) return float4(emission,1);
         float3 L = -U.lightDir.xyz, halfVector = L-R;
         float3 H = halfVector*rsqrt(max(dot(halfVector,halfVector),1e-8));
-        float visibility = dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
+        float visibility = U.rayScene.z > -1 && dot(hitN,L)>0 ? rtVisibility(hitP+geomN*0.0001,hitN,L,0.0002,U,scene) : 1;
         float3 F0 = mix(float3(0.04),mat.rgb,mat.a);
         float3 F = F0+(1-F0)*pow(1-saturate(dot(L,H)),5.0);
         float3 bounce = mat.rgb*(1-mat.a)*(materialDiffuseAmbient(hitN,U,materials)
             +SUN_COL/M_PI_F*saturate(dot(hitN,L))*visibility*(1-F));
         if (object.source==3) bounce = mat.rgb*(materialDiffuseAmbient(hitN,U,materials)*1.15
             +SUN_COL/M_PI_F*max((dot(hitN,L)+0.35)/1.35,0.0)*visibility);
-        bounce += rtAreaLighting(hitP+geomN*0.0001,hitN,-R,mat.rgb,nm.w,mat.a,scene,U,uint2(abs(hitP.xy)*4096),true);
+        bounce += rtAreaLighting(hitP+geomN*0.0001,hitN,-R,mat.rgb,nm.w,mat.a,scene,U,uint2(abs(hitP.xy)*4096),true,true);
         return float4(bounce+emission,1);
     }
     return float4(rtLit(hitP+geomN*0.0001,hitN,-R,mat.rgb,clamp(nm.w,0.02,1.0),mat.a,emission,object.source,U,scene,materials),1);

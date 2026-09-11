@@ -2613,7 +2613,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let quality = activeOptions.rayTracingQuality
         U.rayBudget = SIMD4(Float(quality.shadowSamples),Float(quality.reflectionSamples),
                            Float(quality.diffuseSamples),materialLibrary.hasTransmission ? Float(quality.transmissionInterfaces) : 0)
-        U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),0,0)
+        U.areaSettings = SIMD4(Float(activeOptions.areaLights.count),Float(quality.areaLightSamples),
+            Float(quality.secondaryAreaLightSamples),quality.areaLightSampling == .powerWeighted ? 1 : 0)
         U.instancing.x = UInt32(renderScene.rigidMeshRenderSurface?.bodiesPerInstance ?? 0)
         U.environmentSettings = SIMD4(activeOptions.environmentIntensity-1,activeOptions.environmentRotation,activeOptions.showsEnvironmentBackground ? 0 : 1,0)
         U.displaySettings.x = activeOptions.displayExposure
