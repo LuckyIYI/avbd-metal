@@ -265,7 +265,7 @@ final class ConvexAssetTests: XCTestCase {
             maxVerticesPerHull: 3
         ))
         XCTAssertThrowsError(try ConvexAssetCookerParameters(
-            maxVerticesPerHull: 65
+            maxVerticesPerHull: ConvexAssetLimits.maximumVerticesPerHull + 1
         ))
         XCTAssertThrowsError(try ConvexAssetCookerParameters(maxHulls: 257))
         XCTAssertThrowsError(try ConvexAssetCookerParameters(seed: UInt32(Int32.max) + 1))
@@ -399,7 +399,7 @@ final class ConvexAssetTests: XCTestCase {
     }
 
     func testSeventeenGonPrismFaceLoopExceedsPerInputClipCap() {
-        let sides = 17
+        let sides = ConvexAssetLimits.maximumFaceVertices + 1
         var vertices: [F3] = []
         for z: Float in [-0.5, 0.5] {
             for index in 0..<sides {
@@ -427,7 +427,7 @@ final class ConvexAssetTests: XCTestCase {
         XCTAssertThrowsError(try ConvexHullAsset.validateMergedFaceLoops(
             vertices: vertices, triangles: triangles
         )) { error in
-            XCTAssertTrue(String(describing: error).contains("17 vertices"))
+            XCTAssertTrue(String(describing: error).contains("\(sides) vertices"))
         }
     }
 

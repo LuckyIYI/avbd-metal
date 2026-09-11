@@ -6,6 +6,64 @@ import simd
 @testable import GPUSimDemos
 
 final class ConvexGPURuntimeTests: XCTestCase {
+    func testCapturedRoundedHullInsideFloor() throws { try checkCapturedPair(0) }
+    func testCapturedRoundedHullAtFloorEdge() throws { try checkCapturedPair(1) }
+    func testCapturedSmallHullInsideFloor() throws { try checkCapturedPair(2) }
+    func testCapturedSmallHullAgainstFurnitureHull() throws { try checkCapturedPair(3) }
+
+    private func checkCapturedPair(_ requestedIndex: Int) throws {
+        try requireMetal()
+        let fixtures = try JSONSerialization.jsonObject(with: Data(capturedFloorPairsJSON.utf8)) as! [[[String: Any]]]
+        XCTAssertEqual(fixtures.count, 4, "Keep every captured failure")
+        for (index, pair) in fixtures.enumerated() where index == requestedIndex {
+            let vertexCounts = pair.map { ($0["vertices"] as! [[NSNumber]]).count }
+            if vertexCounts.contains(where: { $0 > ConvexAssetLimits.maximumVerticesPerHull }) {
+                throw XCTSkip("Captured pair \(index) has \(vertexCounts) vertices; this base supports \(ConvexAssetLimits.maximumVerticesPerHull). Full-size regression runs on the detailed-convex integration.")
+            }
+            func f(_ s: [String: Any], _ key: String) -> [Float] {
+                (s[key] as! [NSNumber]).map { $0.floatValue }
+            }
+            func xyz(_ a: [Float]) -> F3 { F3(a[0], a[1], a[2]) }
+            let a = pair[0], b = pair[1]
+            let q = f(a, "rotation")
+            let vertices = (a["vertices"] as! [[NSNumber]]).map { xyz($0.map { $0.floatValue }) }
+            for shifted in [false, true] { for reversed in [false, true] {
+                let offset: F3 = shifted ? -xyz(f(b, "center_kind")) : .zero
+                var scene = PhysicsScene(name: "captured-floor-\(index)")
+                scene.settings.gravity = 0
+                scene.settings.iterations = 0
+                func addBox() {
+                    let qb = f(b, "rotation")
+                    let isHull = f(b, "center_kind")[3] == 4
+                    let body = scene.addBody(size: xyz(f(b, "dimensions")), density: 0, friction: 0.5,
+                        position: xyz(f(b, "center_kind")) + offset,
+                        rotation: Quat(vector: SIMD4(qb[0], qb[1], qb[2], qb[3])),
+                        collisionEnabled: !isHull)
+                    if isHull {
+                        let points = (b["vertices"] as! [[NSNumber]]).map { xyz($0.map { $0.floatValue }) }
+                        _ = scene.addConvexCollider(body: body, vertices: points)
+                    }
+                }
+                if reversed { addBox() }
+                let owner = scene.addBody(size: F3(repeating: 1), density: 1, friction: 0.5,
+                    position: xyz(f(a, "center_kind")) + offset,
+                    rotation: Quat(vector: SIMD4(q[0], q[1], q[2], q[3])), collisionEnabled: false)
+                _ = scene.addConvexCollider(body: owner, vertices: vertices)
+                if !reversed { addBox() }
+                let solver = try GPUSolver(scene: scene)
+                try solver.submitStep()
+                do { try solver.synchronize() }
+                catch { XCTFail("Captured pair \(index), shifted \(shifted), reversed \(reversed): \(error)"); continue }
+                XCTAssertNil(solver.runtimeFailure)
+                XCTAssertFalse(solver.activeRigidContactPairs().isEmpty, "Pair \(index) lost its contact")
+                let m = solver.prevManifolds.contents().assumingMemoryBound(to: ManifoldGPU.self)[0]
+                let n = F3(m.basisN.x, m.basisN.y, m.basisN.z) * (reversed ? -1 : 1)
+                if index < 3 { XCTAssertGreaterThan(n.z, 0.6, "Floor must push the hull upward") }
+                XCTAssertEqual(length(n), 1, accuracy: 1e-4)
+            }}
+        }
+    }
+
     func testNearTouchingHullBoxUsesStableMPRGJKSwitchover() throws {
         try requireMetal()
         let source = Demos.convexDecomposition(scale: 1)
@@ -957,6 +1015,18 @@ final class ConvexGPURuntimeTests: XCTestCase {
         XCTAssertEqual(solver.convexDebugEdgeVertexCount, 24)
         XCTAssertEqual(solver.materializedConvexDebugByteCount, 0,
                        "headless replicas must not expand debug geometry")
+        let selectedDebug = try XCTUnwrap(solver.renderConvexCollisionSurface(forBodies: bodyB..<(bodyB+1)))
+        XCTAssertEqual(selectedDebug.triangleVertexCount, 12)
+        XCTAssertEqual(selectedDebug.edgeVertexCount, 12)
+        XCTAssertEqual(solver.materializedConvexDebugByteCount, 0,
+                       "a selected view must not populate the full-world debug cache")
+        let selectedVertices = selectedDebug.triangleVertices.contents().bindMemory(
+            to: RigidMeshVertexGPU.self, capacity: selectedDebug.triangleVertexCount)
+        for i in 0..<selectedDebug.triangleVertexCount {
+            XCTAssertEqual(selectedVertices[i].positionBody.w.bitPattern, UInt32(bodyB))
+        }
+        XCTAssertNil(solver.renderConvexCollisionSurface(forBodies: 0..<0))
+        XCTAssertNil(solver.renderConvexCollisionSurface(forBodies: 0..<3))
         let debugSurface = try XCTUnwrap(solver.renderConvexCollisionSurface)
         XCTAssertEqual(debugSurface.triangleVertexCount, 24)
         XCTAssertEqual(debugSurface.edgeVertexCount, 24)

@@ -519,7 +519,9 @@ struct NPCResult {
 #define NPC_FEATURE_SMOOTH 0xF0000000u
 #define NPC_MPR_ITERATIONS 30
 #define NPC_GJK_ITERATIONS 30
+#ifndef NPC_MAX_FACE_VERTICES
 #define NPC_MAX_FACE_VERTICES 32
+#endif
 
 struct ManifoldGPU {
     uint4 header;       // bodyA, bodyB, numContacts, active
