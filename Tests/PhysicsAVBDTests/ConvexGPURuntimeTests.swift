@@ -64,7 +64,6 @@ final class ConvexGPURuntimeTests: XCTestCase {
         }
     }
 
-
     func testNearTouchingHullBoxUsesStableMPRGJKSwitchover() throws {
         try requireMetal()
         let source = Demos.convexDecomposition(scale: 1)
@@ -1016,6 +1015,18 @@ final class ConvexGPURuntimeTests: XCTestCase {
         XCTAssertEqual(solver.convexDebugEdgeVertexCount, 24)
         XCTAssertEqual(solver.materializedConvexDebugByteCount, 0,
                        "headless replicas must not expand debug geometry")
+        let selectedDebug = try XCTUnwrap(solver.renderConvexCollisionSurface(forBodies: bodyB..<(bodyB+1)))
+        XCTAssertEqual(selectedDebug.triangleVertexCount, 12)
+        XCTAssertEqual(selectedDebug.edgeVertexCount, 12)
+        XCTAssertEqual(solver.materializedConvexDebugByteCount, 0,
+                       "a selected view must not populate the full-world debug cache")
+        let selectedVertices = selectedDebug.triangleVertices.contents().bindMemory(
+            to: RigidMeshVertexGPU.self, capacity: selectedDebug.triangleVertexCount)
+        for i in 0..<selectedDebug.triangleVertexCount {
+            XCTAssertEqual(selectedVertices[i].positionBody.w.bitPattern, UInt32(bodyB))
+        }
+        XCTAssertNil(solver.renderConvexCollisionSurface(forBodies: 0..<0))
+        XCTAssertNil(solver.renderConvexCollisionSurface(forBodies: 0..<3))
         let debugSurface = try XCTUnwrap(solver.renderConvexCollisionSurface)
         XCTAssertEqual(debugSurface.triangleVertexCount, 24)
         XCTAssertEqual(debugSurface.edgeVertexCount, 24)

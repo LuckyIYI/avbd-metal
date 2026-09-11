@@ -47,8 +47,11 @@ public final class GPUSolver {
     public let device: MTLDevice
     let queue: MTLCommandQueue
 
+    private var rigidSleepState: RigidSleepState?
+
     public var settings = SimSettings() {
         didSet {
+            wakeRigidBodies()
             if settings.clothRenderScale != oldValue.clothRenderScale {
                 invalidateGeometryState()
             }
@@ -3987,6 +3990,7 @@ public final class GPUSolver {
     /// warm starts incident to those bodies are cleared exactly as for pose
     /// resets, so a relaunched projectile cannot inherit stale impulses.
     public func setBodyStates(_ updates: [BodyStateUpdate]) {
+        wakeRigidBodies()
         guard !updates.isEmpty else { return }
         sync()
         invalidateGeometryState()
@@ -4077,6 +4081,7 @@ public final class GPUSolver {
     /// resets and discontinuous teleports must continue to use
     /// ``setBodyStates(_:)`` so stale impulses are cleared.
     public func setDrivenBodyStates(_ updates: [BodyStateUpdate]) {
+        wakeRigidBodies()
         guard !updates.isEmpty else { return }
         sync()
         invalidateGeometryState()
@@ -4106,6 +4111,7 @@ public final class GPUSolver {
         _ impulses: [BodyLinearVelocityImpulse]
     ) {
         guard !impulses.isEmpty else { return }
+        wakeRigidBodies(impulses.map{$0.body})
         sync()
         let velocities = velLin.contents().bindMemory(
             to: SIMD4<Float>.self, capacity: numBodies)
@@ -4139,6 +4145,7 @@ public final class GPUSolver {
     /// Robotics: move a world-anchored joint's target point (Cartesian
     /// position actuator — the joint's bounded force does the rest).
     public func setJointWorldAnchors(_ updates: [JointAnchorUpdate]) {
+        wakeRigidBodies()
         setJointParentAnchors(updates)
     }
 
@@ -4147,6 +4154,7 @@ public final class GPUSolver {
     /// body-to-body actuator it remains attached to that moving body and
     /// applies equal and opposite constraint forces to both bodies.
     public func setJointParentAnchors(_ updates: [JointAnchorUpdate]) {
+        wakeRigidBodies()
         guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
@@ -4162,6 +4170,7 @@ public final class GPUSolver {
 
     /// Robotics: set a motor joint's target angle at runtime.
     public func setMotorTargets(_ updates: [MotorTargetUpdate]) {
+        wakeRigidBodies()
         guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
@@ -4200,6 +4209,7 @@ public final class GPUSolver {
 
     /// Set commands for physically defined velocity motors.
     public func setMotorVelocities(_ updates: [MotorVelocityUpdate]) {
+        wakeRigidBodies()
         guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(
@@ -4235,6 +4245,7 @@ public final class GPUSolver {
 
     /// Robotics: set several motor effort limits behind one GPU fence.
     public func setMotorTorques(_ updates: [MotorTorqueUpdate]) {
+        wakeRigidBodies()
         guard !updates.isEmpty else { return }
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: max(1, numJoints))
@@ -4905,6 +4916,7 @@ public final class GPUSolver {
     }
 
     public func captureRigidSpeculationSnapshot() -> RigidSpeculationSnapshot {
+        wakeRigidBodies()
         precondition(numTris == 0 && numTets == 0,
             "rigid speculation snapshots do not include soft-body state")
         return captureRigidSpeculationState()
@@ -4913,6 +4925,7 @@ public final class GPUSolver {
     private func restoreRigidSpeculationState(
         _ snapshot: RigidSpeculationSnapshot
     ) {
+        wakeRigidBodies()
         precondition(snapshot.ownerID == snapshotOwnerID,
             "speculation snapshot belongs to a different solver")
         sync()
@@ -4964,6 +4977,7 @@ public final class GPUSolver {
     public func restoreRigidSpeculationSnapshot(
         _ snapshot: RigidSpeculationSnapshot
     ) {
+        wakeRigidBodies()
         precondition(numTris == 0 && numTets == 0,
             "rigid speculation snapshots do not include soft-body state")
         restoreRigidSpeculationState(snapshot)
@@ -5001,6 +5015,7 @@ public final class GPUSolver {
     /// caller must have a healthy solver; terminal failures remain terminal
     /// and are never erased by restoring an older checkpoint.
     public func captureSimulationSnapshot() -> SimulationSnapshot {
+        wakeRigidBodies()
         precondition(runtimeFailure == nil,
             "cannot checkpoint a solver after a terminal runtime failure")
         let rigid = captureRigidSpeculationState()
@@ -5025,6 +5040,7 @@ public final class GPUSolver {
     /// history are restored together; this is not the cold restart performed
     /// by `setBodyStates`.
     public func restoreSimulationSnapshot(_ snapshot: SimulationSnapshot) {
+        wakeRigidBodies()
         precondition(runtimeFailure == nil,
             "a terminal solver cannot resume from a checkpoint")
         restoreRigidSpeculationState(snapshot.rigid)
@@ -5106,6 +5122,7 @@ public final class GPUSolver {
     public func submitStep() throws {
         try requireHealthy()
         try throttleChecked()
+        guard try prepareRigidSleeping() else { return }
         if profiling || !spinners.isEmpty || !rateMotors.isEmpty {
             // Profiling retires its own submission synchronously. Drain any
             // older asynchronous owner before selecting a parity readback
@@ -6986,6 +7003,7 @@ public final class GPUSolver {
     public func setDrag(jointIndex: Int, body: Int?, worldTarget: F3, localAnchor: F3,
 
                         stiffness: Float = 5000) {
+        if let body { wakeRigidBodies([body]) }
         sync()
         guard jointIndex < numJoints else { return }
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: numJoints)
@@ -7010,6 +7028,7 @@ public final class GPUSolver {
     /// Ray-cast against collision primitives (CPU, shared buffers). Returns
     /// the owning body and a body-local anchor suitable for dragging.
     public func pick(origin: F3, dir: F3) -> (body: Int, local: F3)? {
+        wakeRigidBodies()
         sync()
         let pl = posLin.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
         let pa = posAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
@@ -7311,21 +7330,24 @@ public final class GPUSolver {
         return rigidMeshExpandedVertexBuf?.length ?? 0
     }
 
-    private func materializeConvexDebugGeometry()
+    private func materializeConvexDebugGeometry(bodies: Range<Int>? = nil)
         -> (triangles: MTLBuffer, edges: MTLBuffer)? {
         convexDebugBufferLock.lock()
         defer { convexDebugBufferLock.unlock() }
-        if let triangles = convexDebugTriangleVertexBuffer,
+        if bodies == nil, let triangles = convexDebugTriangleVertexBuffer,
            let edges = convexDebugEdgeVertexBuffer {
             return (triangles, edges)
         }
 
         var triangleVertices: [RigidMeshVertexGPU] = []
         var edgeVertices: [RigidMeshVertexGPU] = []
-        triangleVertices.reserveCapacity(convexDebugTriangleVertexCount)
-        edgeVertices.reserveCapacity(convexDebugEdgeVertexCount)
+        if bodies == nil {
+            triangleVertices.reserveCapacity(convexDebugTriangleVertexCount)
+            edgeVertices.reserveCapacity(convexDebugEdgeVertexCount)
+        }
 
         for instance in convexDebugInstances {
+            if let bodies, !bodies.contains(Int(instance.body)) { continue }
             guard convexDebugGeometries.indices.contains(
                     Int(instance.geometry)) else { return nil }
             let geometry = convexDebugGeometries[Int(instance.geometry)]
@@ -7351,8 +7373,8 @@ public final class GPUSolver {
                     geometry.vertices[Int(edge.y)], normal: F3(0, 0, 1)))
             }
         }
-        guard triangleVertices.count == convexDebugTriangleVertexCount,
-              edgeVertices.count == convexDebugEdgeVertexCount else {
+        guard bodies != nil || (triangleVertices.count == convexDebugTriangleVertexCount &&
+              edgeVertices.count == convexDebugEdgeVertexCount) else {
             return nil
         }
 
@@ -7375,8 +7397,10 @@ public final class GPUSolver {
                 memcpy(edgeBuffer.contents(), bytes.baseAddress!, bytes.count)
             }
         }
-        convexDebugTriangleVertexBuffer = triangleBuffer
-        convexDebugEdgeVertexBuffer = edgeBuffer
+        if bodies == nil {
+            convexDebugTriangleVertexBuffer = triangleBuffer
+            convexDebugEdgeVertexBuffer = edgeBuffer
+        }
         return (triangleBuffer, edgeBuffer)
     }
 
@@ -7406,6 +7430,21 @@ public final class GPUSolver {
             buffers.triangles, convexDebugTriangleVertexCount,
             buffers.edges, convexDebugEdgeVertexCount,
             posLin, posAng)
+    }
+
+    /// Builds collision diagnostics only for the requested global body range.
+    /// The returned buffers are caller-owned; the full-world cache stays lazy.
+    public func renderConvexCollisionSurface(forBodies bodies: Range<Int>) -> (
+        triangleVertices: MTLBuffer, triangleVertexCount: Int,
+        edgeVertices: MTLBuffer, edgeVertexCount: Int,
+        positions: MTLBuffer, rotations: MTLBuffer
+    )? {
+        guard bodies.lowerBound >= 0, bodies.upperBound <= numBodies,
+              !bodies.isEmpty,
+              let buffers = materializeConvexDebugGeometry(bodies: bodies) else { return nil }
+        let stride = MemoryLayout<RigidMeshVertexGPU>.stride
+        return (buffers.triangles, buffers.triangles.length / stride,
+                buffers.edges, buffers.edges.length / stride, posLin, posAng)
     }
 
     /// Read only after a typed convex-query failure has retired. Captures the
@@ -7601,5 +7640,158 @@ public final class GPUSolver {
             cmd, operation: "constraint diagnostics", frame: frameIndex)
         let bits = diag.contents().load(as: UInt32.self)
         return Float(bitPattern: bits)
+    }
+}
+
+// MARK: - Opt-in rigid sleeping at a synchronized control boundary
+
+public struct RigidSleepSettings {
+    public var linearThreshold: Float = 0.012
+    public var angularThreshold: Float = 0.025
+    public var quietTime: Float = 0.8
+    public var wakeMargin: Float = 0.02
+    public init() {}
+}
+
+public enum RigidSleepError: Error {
+    case invalidSettings, invalidGroup, unsupportedDeformables
+}
+
+private final class RigidSleepState {
+    let settings: RigidSleepSettings
+    let mass: [Float]
+    let radius: [Float]
+    let groups: [[Int]]
+    var asleep: [Bool]
+    var quiet: [Float]
+    var island: [Int]
+    var lastPosition: [F3]
+    var lastRotation: [SIMD4<Float>]
+    var skippedFrames = 0
+    var observedStep = false
+    init(settings: RigidSleepSettings, mass: [Float], radius: [Float], groups: [[Int]], positions: [F3], rotations: [SIMD4<Float>]) {
+        self.settings=settings; self.mass=mass; self.radius=radius; self.groups=groups
+        asleep=Array(repeating:false,count:mass.count)
+        quiet=Array(repeating:0,count:mass.count)
+        island=Array(mass.indices); lastPosition=positions; lastRotation=rotations
+    }
+}
+
+extension GPUSolver {
+    /// Opt-in host-managed rigid islands. Requires a retirement boundary each
+    /// step; intended for mostly settled interactive scenes, not pipelined
+    /// training. Geometry stays in collision/picking structures while asleep.
+    /// Groups optionally bind several bodies into one sleep/wake unit.
+    public func configureRigidSleeping(_ configuration: RigidSleepSettings?, groups: [[Int]] = []) throws {
+        try synchronize()
+        wakeRigidBodies()
+        rigidSleepState=nil
+        guard let configuration else { return }
+        guard numParticles == 0 && numTets == 0 && numTris == 0 && numSprings == 0 else { throw RigidSleepError.unsupportedDeformables }
+        guard configuration.linearThreshold.isFinite, configuration.linearThreshold > 0,
+              configuration.angularThreshold.isFinite, configuration.angularThreshold > 0,
+              configuration.quietTime.isFinite, configuration.quietTime >= settings.dt,
+              configuration.wakeMargin.isFinite, configuration.wakeMargin >= 0 else { throw RigidSleepError.invalidSettings }
+        guard groups.allSatisfy({ !$0.isEmpty && Set($0).count == $0.count && $0.allSatisfy({ $0 >= 0 && $0 < numBodies }) }) else { throw RigidSleepError.invalidGroup }
+        let p=posLin.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        let q=posAng.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        let owners=colliderOwner.contents().bindMemory(to:UInt32.self,capacity:numColliders)
+        let local=colliderLocalPosition.contents().bindMemory(to:SIMD4<Float>.self,capacity:numColliders)
+        let sizes=colliderShape.contents().bindMemory(to:SIMD4<Float>.self,capacity:numColliders)
+        var radii=Array(repeating:Float(0),count:numBodies)
+        for i in 0..<numColliders {
+            let o=Int(owners[i]); radii[o]=max(radii[o],length(F3(local[i].x,local[i].y,local[i].z))+abs(sizes[i].w))
+        }
+        rigidSleepState=RigidSleepState(settings:configuration,mass:(0..<numBodies).map{p[$0].w},radius:radii,groups:groups,positions:(0..<numBodies).map{F3(p[$0].x,p[$0].y,p[$0].z)},rotations:(0..<numBodies).map{q[$0]})
+    }
+
+    public var sleepingRigidBodyCount: Int { rigidSleepState?.asleep.filter{$0}.count ?? 0 }
+    public var sleepingSkippedFrameCount: Int { rigidSleepState?.skippedFrames ?? 0 }
+
+    /// Wake complete retained contact/joint islands. Nil wakes all bodies.
+    public func wakeRigidBodies(_ bodies: [Int]? = nil) {
+        guard let state=rigidSleepState else { return }
+        sync()
+        state.observedStep=false
+        let roots=bodies.map{Set($0.filter{$0>=0 && $0<numBodies}.map{state.island[$0]})}
+        let p=posLin.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        for i in 0..<numBodies where roots == nil || roots!.contains(state.island[i]) {
+            p[i].w=state.mass[i]; state.asleep[i]=false; state.quiet[i]=0
+        }
+    }
+
+    private func prepareRigidSleeping() throws -> Bool {
+        guard let s=rigidSleepState else { return true }
+        try synchronize()
+        // Always observe an integrated step before classifying a new scene.
+        if !s.observedStep { s.observedStep=true; return true }
+        // Authored perpetual drives never become quiescent merely because
+        // contact currently blocks their motion.
+        if !spinners.isEmpty || !rateMotors.isEmpty { wakeRigidBodies(); return true }
+        let p=posLin.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        let q=posAng.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        let v=velLin.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        let w=velAng.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        let pv=prevVelLin.contents().bindMemory(to:SIMD4<Float>.self,capacity:numBodies)
+        let dynamic=(0..<numBodies).filter{s.mass[$0]>0}
+        var parent=Array(0..<numBodies)
+        func root(_ a:Int)->Int { var i=a;while parent[i] != i { i=parent[i] };return i }
+        func join(_ a:Int,_ b:Int) {
+            guard a>=0,b>=0,a<numBodies,b<numBodies,s.mass[a]>0,s.mass[b]>0 else{return}
+            let ra=root(a),rb=root(b);if ra != rb {parent[max(ra,rb)]=min(ra,rb)}
+        }
+        for group in s.groups {
+            let d=group.filter{s.mass[$0]>0}; if let first=d.first {for i in d.dropFirst(){join(first,i)}}
+        }
+        // Sleep-sleep contact pairs may no longer be emitted; retain those
+        // islands until woken instead of silently splitting a resting stack.
+        var retained:[Int:Int]=[:]
+        for i in dynamic where s.asleep[i] { if let first=retained[s.island[i]]{join(first,i)}else{retained[s.island[i]]=i} }
+        for pair in activeRigidContactPairs(){join(pair.0,pair.1)}
+        let jp=joints.contents().bindMemory(to:JointGPU.self,capacity:numJoints)
+        var driven=Set<Int>()
+        for j in 0..<numJoints where jp[j].header.z == 0 {
+            let a=Int(jp[j].header.x),b=Int(jp[j].header.y)
+            join(a,b)
+            // World constraints/drag targets and motors can store pending
+            // work even while velocities are momentarily small.
+            if a == Int(UInt32.max) || b == Int(UInt32.max) || jp[j].header.w & Self.jointMotorModeMask != 0 {
+                if a<numBodies {driven.insert(a)};if b<numBodies{driven.insert(b)}
+            }
+        }
+        let positions=(0..<numBodies).map{F3(p[$0].x,p[$0].y,p[$0].z)}
+        // Conservative swept body spheres wake sleepers BEFORE contact solve.
+        // Broad bounds intentionally over-wake; they never suppress contacts.
+        var wake=Set<Int>()
+        for a in dynamic where !s.asleep[a] {
+            let speed=length(F3(v[a].x,v[a].y,v[a].z))
+            for b in dynamic where s.asleep[b] {
+                let reach=s.radius[a]+s.radius[b]+s.settings.wakeMargin+speed*settings.dt
+                if length_squared(positions[a]-positions[b])<=reach*reach {wake.insert(root(b));wake.insert(root(a))}
+            }
+        }
+        for i in driven {wake.insert(root(i))}
+        var islands:[Int:[Int]]=[:]
+        for i in dynamic {let r=root(i);s.island[i]=r;islands[r,default:[]].append(i)}
+        for (r,members) in islands {
+            let moving=members.contains { i in
+                !s.asleep[i] && (length(F3(v[i].x,v[i].y,v[i].z))>s.settings.linearThreshold
+                    || length(F3(w[i].x,w[i].y,w[i].z))>s.settings.angularThreshold
+                    || length(positions[i]-s.lastPosition[i])>s.settings.linearThreshold*settings.dt
+                    || 1-abs(dot(q[i],s.lastRotation[i]))>0.000001)
+            }
+            let keepAwake=wake.contains(r) || moving || members.contains{driven.contains($0)}
+            for i in members {
+                s.quiet[i]=keepAwake ? 0 : s.quiet[i]+settings.dt
+                if keepAwake {p[i].w=s.mass[i];s.asleep[i]=false}
+            }
+            if !keepAwake && members.allSatisfy({s.quiet[$0]>=s.settings.quietTime}) {
+                for i in members {s.asleep[i]=true;p[i].w=0;v[i] = .zero;w[i] = .zero;pv[i] = .zero}
+            }
+        }
+        s.lastPosition=positions;s.lastRotation=(0..<numBodies).map{q[$0]}
+        let active=dynamic.contains{!s.asleep[$0]}
+        if !active {s.skippedFrames += 1}
+        return active
     }
 }
