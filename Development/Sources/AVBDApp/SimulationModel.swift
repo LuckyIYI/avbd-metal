@@ -3,6 +3,7 @@ import QuartzCore
 import SimCore
 import PhysicsAVBD
 import GPUSimDemos
+import GPUSimRenderer
 import Robotics
 import RL
 import MLXRL
@@ -21,6 +22,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
     /// Bumped only when the demo changes; the renderer reframes the camera
     /// on epoch change (reset/size/param rebuilds keep the user's view).
     private(set) var cameraEpoch = 0
+    private var ethernetRun: EthernetInsertionRun?
     @Published var scale = Int(ProcessInfo.processInfo.environment["AVBD_SIZE"] ?? "") ?? 1 {
         didSet { reset() }
     }
@@ -52,6 +54,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
     @Published var statsText = ""
 
     private(set) var solver: GPUSolver?
+    private(set) var rendererBodyAppearances: [Int: GPUSimRenderAppearance] = [:]
     private(set) var dragJoint: Int = -1
     private var dragBody: Int? = nil
     private var dragLocal = F3.zero
@@ -84,7 +87,11 @@ final class SimulationModel: ObservableObject, RenderableModel {
         lastStepTime = CACurrentMediaTime()
 
         DispatchQueue.global(qos: .userInitiated).async {
-            guard var scene = Demos.make(name, scale: sceneScale, params: params) else {
+            let task = name == "cableethernet" ? Demos.ethernetInsertionTask(
+                youngModulus: (params["youngMPa"] ?? 2400) * 1e6,
+                lateralError: (params["offsetMM"] ?? 0) * 0.001,
+                yawError: (params["yawDeg"] ?? 0) * Float.pi / 180) : nil
+            guard var scene = task?.scene ?? Demos.make(name, scale: sceneScale, params: params) else {
                 DispatchQueue.main.async {
                     guard generation == self.resetGeneration else { return }
                     self.statsText = "unknown demo: \(name)"
@@ -101,6 +108,13 @@ final class SimulationModel: ObservableObject, RenderableModel {
                 scene.settings.gravity = Float(current.gravity)
             }
             let adoptedSettings = scene.settings
+            var appearances: [Int: GPUSimRenderAppearance] = [:]
+            for collider in scene.colliders {
+                if scene.bodies[collider.body].isParticle, let color = collider.renderColor {
+                    appearances[collider.body] = GPUSimRenderAppearance(color: color)
+                }
+            }
+            let authoredAppearances = appearances
             let result: Result<GPUSolver, Error> = Result {
                 try GPUSolver(scene: scene)
             }
@@ -118,6 +132,8 @@ final class SimulationModel: ObservableObject, RenderableModel {
                         self.adopting = false
                     }
                     self.solver = newSolver
+                    self.ethernetRun = task.map { EthernetInsertionRun(task: $0) }
+                    self.rendererBodyAppearances = authoredAppearances
                     self.dragJoint = dragSlot
                     self.dragBody = nil
                     self.stepAccumulator = 0
@@ -152,12 +168,17 @@ final class SimulationModel: ObservableObject, RenderableModel {
 
         let dt = Double(solver.settings.dt)
         var steps = 0
+        let maxSteps = ethernetRun != nil ? max(4, Int(ceil(1 / (60 * dt)))) : 4
         do {
             let batchStart = CACurrentMediaTime()
-            while stepAccumulator >= dt && steps < 4 {
-                try solver.submitStep()
+            while stepAccumulator >= dt && steps < maxSteps {
+                try advancePhysics(solver)
                 stepAccumulator -= dt
                 steps += 1
+                if ethernetRun != nil && CACurrentMediaTime() - batchStart >= 0.012 {
+                    stepAccumulator = min(stepAccumulator, dt)
+                    break
+                }
             }
             // Retire physics for CPU observations and the next presentation
             // snapshot. The previous render uses immutable buffers and can
@@ -173,7 +194,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
             statsText = "solver stopped: \(error.localizedDescription)"
             return
         }
-        if steps == 4 { stepAccumulator = 0 }  // avoid spiral of death
+        if steps == maxSteps { stepAccumulator = 0 }  // avoid spiral of death
 
         frameCounter += 1
         if frameCounter % 15 == 0 {
@@ -181,6 +202,10 @@ final class SimulationModel: ObservableObject, RenderableModel {
             statsText = String(
                 format: "%d bodies   %.2f ms/step   %d pairs   %d colors",
                 solver.bodyCount, msEMA, solver.lastNumPairs, colors)
+            if let run = ethernetRun {
+                statsText += String(format: "   %@   %.2f mm   %.2f N / 20 N",
+                    run.phase, run.noseCenter.x * 1000, length(run.force))
+            }
             if solver.uniqueConvexAssetCount > 0 {
                 statsText += "   \(solver.uniqueConvexAssetCount) shared hulls"
             }
@@ -192,11 +217,24 @@ final class SimulationModel: ObservableObject, RenderableModel {
         running = false
         guard let solver else { return }
         do {
-            try solver.submitStep()
+            try advancePhysics(solver)
             try solver.synchronize()
         } catch {
             statsText = "solver stopped: \(error.localizedDescription)"
         }
+    }
+
+    private func advancePhysics(_ solver: GPUSolver) throws {
+        guard var run = ethernetRun else { try solver.submitStep(); return }
+        let task = run.task, command = run.command
+        solver.setDrivenBodyStates([.init(body: task.wristBody, position: command.position,
+            rotation: command.rotation, linearVelocity: command.linearVelocity,
+            angularVelocity: command.angularVelocity)])
+        try solver.submitStep()
+        let nose = task.noseNodes.reduce(F3.zero) { $0 + solver.bodyPosition($1) } / Float(task.noseNodes.count)
+        run.observe(toolPosition: solver.bodyPosition(task.toolBody),
+                    toolRotation: solver.bodyRotation(task.toolBody), noseCenter: nose)
+        ethernetRun = run
     }
 
     // MARK: - Mouse dragging

@@ -1,13 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ============================================================================
-// AVBD Metal — common types, math, and constants.
+// =====================================================================// AVBD Metal — common types, math, and constants.
 // Shader files are concatenated in filename order and compiled at runtime.
 // All struct layouts are float4/uint4-granular and mirrored in Swift
 // (GPUTypes.swift); any change here must be reflected there.
-// ============================================================================
-
+// =====================================================================
 #define PENALTY_MIN 1.0f
 #define PENALTY_MAX 1.0e10f
 // Tangential (friction) penalty cap: friction force is cone-bounded, so
@@ -23,6 +21,8 @@ using namespace metal;
 // contact anchor as a world-space offset to roll freely. Offset compound
 // colliders must use body-local anchors so they rotate with their owner.
 #define COLLIDER_WORLD_ROUND_ANCHOR 0x20u
+// Only analytic material capsules owned by an authored cable opt in.
+#define COLLIDER_CABLE_CONTACT_FRAME 0x40u
 #define MAX_CONTACTS 8
 
 // Force kinds packed into adjacency entries (top 4 bits)
@@ -331,6 +331,11 @@ inline bool motor_uses_explicit_effort(uint flags) {
         || motor_uses_velocity_feedback(flags);
 }
 
+// Bit 6 is reserved for break-load joints (PR #36).
+// Standard joints use bits 0...7, including physical break loads (6) and
+// finite scalar fracture (7). Cables must not alias either fracture mode.
+constant uint JOINT_CABLE = 1u << 8;
+
 struct JointGPU {
     uint4 header;       // bodyA (WORLD_BODY=world), bodyB, broken flag, flags
     float4 rA;          // w = stiffnessLin
@@ -350,10 +355,55 @@ struct JointGPU {
     float4 limits;      // x/y = twist range, z = kd, w = stop stiffness
     float4 dynamics;    // x = armature, y = inertial-predicted twist,
                         // z = start-of-step explicit effort
+    // JOINT_CABLE tagged layout: motor.xyz = linear stiffness,
+    // limits.xyz = angular stiffness, motor.w = damping time.
+    // C0Lin/Ang.xyz = initial strain; other motor/constraint state is inactive.
+    // limits.w = bend yield angle (0 disables); lambdaAng.xyz = committed
+    // plastic bending coordinates. These are material state, not AL duals.
     float4 response; // count, damping, effort cap, initial coordinate
     float4 breakLoad; // force, torque, enabled force/torque bits, pad
     float4 responseKnots[16];
 };
+
+struct CableRotationLog { float3 value; M3 derivative; };
+
+inline CableRotationLog cableRotationLog(float4 q) {
+    if (q.w < 0.0f) q = -q;
+    float s2 = dot(q.xyz, q.xyz);
+    CableRotationLog result;
+    float coefficient;
+    if (s2 < 1e-8f) {
+        result.value = q.xyz * (2.0f + s2 / 3.0f);
+        coefficient = 1.0f / 12.0f + s2 / 180.0f;
+    } else {
+        float s = sqrt(s2);
+        float angle = 2.0f * atan2(s, q.w);
+        result.value = q.xyz * (angle / s);
+        coefficient = (1.0f - 0.5f * angle * q.w / s) / (angle * angle);
+    }
+    M3 skew = m3_skew(result.value);
+    result.derivative = m3_add(m3_add(m3_identity(), m3_scale(skew, -0.5f)),
+                              m3_scale(m3_mulm(skew, skew), coefficient));
+    return result;
+}
+
+struct CableBendResponse { float3 elastic; M3 tangent; };
+inline CableBendResponse cableBendResponse(float3 strain, float3 plastic,
+                                          float yieldAngle) {
+    float3 trial = strain - plastic;
+    CableBendResponse result = { trial, m3_identity() };
+    if (yieldAngle <= 0.0f) return result;
+    float3 bend = float3(trial.xy, 0);
+    float magnitude = length(bend);
+    if (magnitude > yieldAngle) {
+        float3 direction = bend / magnitude;
+        float scale = yieldAngle / magnitude;
+        result.elastic = float3(bend.xy * scale, trial.z);
+        result.tangent = m3_add(m3_diag(float3(scale, scale, 1)),
+            m3_scale(m3_outer(direction, direction), -scale));
+    }
+    return result;
+}
 
 inline float3 prismaticError(device const JointGPU& j, float3 delta, float4 qA) {
     float3 d = q_rotate(q_inv(qA), delta);
@@ -527,12 +577,17 @@ struct NPCResult {
 #endif
 
 struct ManifoldGPU {
-    uint4 header;       // bodyA, bodyB, numContacts, active
+    uint4 header;       // bodyA, bodyB, numContacts, active/anchor flags
     uint4 colliderPair; // colliderA, colliderB (warm-start identity), pad
     float4 basisN;      // w = friction
     float4 basisT1;     // t2 = cross(n, t1)
     ContactGPU contacts[MAX_CONTACTS];
 };
+
+// Material capsule contacts must use the reference lever arms in the Taylor
+// value AND Jacobian. Current-frame arms spuriously turn axial material spin
+// into normal separation under repeated iterations.
+#define MANIFOLD_FIXED_CONTACT_FRAME 8u
 
 // Iterative-solver view of a rigid contact manifold. Persistence and
 // narrowphase need the fixed 8-contact, 704-byte record above; the solver

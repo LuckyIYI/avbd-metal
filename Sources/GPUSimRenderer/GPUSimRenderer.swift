@@ -678,7 +678,7 @@ struct Uniforms {
     float4x4 viewProj;
     float4 lightDir;    // xyz
     float4 eye;         // xyz
-    float4 screen;      // x,y = drawable size; z = px per world unit at d=1
+    float4 screen;      // xy: drawable size; z: px/world unit at d=1; w: presentation length scale
     float4 camRight;    // xyz: world dir of screen +x
     float4 camUp;       // xyz: world dir of UV +y (down on screen)
     float4x4 prevViewProj;
@@ -1118,7 +1118,10 @@ vertex VOut skin_vertex(uint vid [[vertex_id]],
     o.previousWorld = writesMotion ? previousPrimary[v].position.xyz : o.world;
     o.normal = normalize(sv.normal.xyz);
     o.flatShade = 0.0;
-    o.albedo = srgbToLin(mix(float3(0.90), softPalette(comp * 5u + 11u), 0.76));
+    uint skinColor = as_type<uint>(sv.normal.w);
+    o.albedo = srgbToLin(skinColor != 0u
+        ? float3((skinColor >> 16u) & 255u, (skinColor >> 8u) & 255u, skinColor & 255u) / 255.0f
+        : mix(float3(0.90), softPalette(comp * 5u + 11u), 0.76));
     o.emissive = float3(0);
     o.opacity = 1;
     return o;
@@ -1531,6 +1534,14 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public weak var source: (any GPUSimRendererSource)?
     public private(set) var scene: (any GPUSimRenderableScene)?
     public var options = GPUSimRenderOptions()
+    /// Presentation length reference for small SI-unit scenes. Scales camera
+    /// clipping, lighting distances and tolerances, never simulation coordinates.
+    public var sceneLengthScale: Float = 1 {
+        didSet {
+            precondition(sceneLengthScale.isFinite && sceneLengthScale > 0)
+            if sceneLengthScale != oldValue { resetTemporalHistory() }
+        }
+    }
     /// Presentation-only overrides keyed by simulation body index. A live
     /// source's `rendererBodyAppearances` takes precedence when present.
     public var bodyAppearances: [Int: GPUSimRenderAppearance] = [:]
@@ -2243,7 +2254,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let angle = verticalFieldOfView.isFinite ? min(120,max(1,verticalFieldOfView)) : 50
         let near = nearClipDistance.isFinite ? max(0.0001,min(1e6,nearClipDistance)) : 0.1
         let far = farClipDistance.isFinite ? max(near*1.001,min(1e8,farClipDistance)) : max(1000,near*1.001)
-        return perspective(fovY: angle * .pi / 180, aspect: aspect, near: near, far: far)
+        return perspective(fovY: angle * .pi / 180, aspect: aspect, near: near * sceneLengthScale, far: far * sceneLengthScale)
     }
 
     /// Builds a world ray from a pixel point whose origin is the view's
@@ -2559,8 +2570,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let shadowFocus = shadowFollowsContent
             ? contentBounds!.center : activeFocus
         let shadowExtent = shadowFollowsContent
-            ? max(1.0, contentBounds!.radius * 1.15)
-            : max(1.5, min(length(activeFocus - activeEye) * 0.9, 40.0))
+            ? max(sceneLengthScale, contentBounds!.radius * 1.15)
+            : max(1.5 * sceneLengthScale, min(length(activeFocus - activeEye) * 0.9, 40.0 * sceneLengthScale))
         let lightUp = abs(lightDirection.y) > 0.95 ? F3(0, 0, 1) : F3(0, 1, 0)
         let lightRight = normalize(cross(lightDirection, lightUp))
         let lightMapUp = cross(lightRight, lightDirection)
@@ -2574,7 +2585,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         let shadowVP = metalOrthographicProjection(
             left: -shadowExtent, right: shadowExtent,
             bottom: -shadowExtent, top: shadowExtent,
-            near: 0.1, far: shadowExtent * 5.0)
+            near: 0.1 * sceneLengthScale, far: shadowExtent * 5.0)
             * lookAt(eye: lightEye, center: shadowCenter, up: lightUp)
         let screenViewport = MTLViewport(originX: 0, originY: 0,
                                          width: Double(targetSize.x),
@@ -2592,7 +2603,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(lightDirection, 0),
                          eye: SIMD4(activeEye, 0),
-                         screen: SIMD4(renderSize.x, renderSize.y, pxPerUnit, 0),
+                         screen: SIMD4(renderSize.x, renderSize.y, pxPerUnit, sceneLengthScale),
                          camRight: SIMD4(camR, 0),
                          camUp: SIMD4(-camU, 0),
                          prevViewProj: prevVP ?? vp,
@@ -2604,8 +2615,8 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                          invViewProj: vp.inverse,
                          prevInvViewProj: (prevVP ?? vp).inverse,
                          effects: SIMD4(activeOptions.usesHDR ? 1 : 0,
-                                        activeOptions.contactShadows || activeOptions.usesRayTracing ? 0.2 : 0,
-                                        activeOptions.screenSpaceReflections ? 4 : 0, 0.65),
+                                        activeOptions.contactShadows || activeOptions.usesRayTracing ? 0.2 * sceneLengthScale : 0,
+                                        activeOptions.screenSpaceReflections ? 4 * sceneLengthScale : 0, 0.65),
                          rayTracing: SIMD4(activeOptions.usesRayTracing ? 1 : 0,
                                            activeOptions.screenSpaceReflections ? 1 : 0, 0,
                                            activeOptions.usesRayTracing && !activeOptions.screenSpaceReflections ? 1 : 0),
@@ -3144,7 +3155,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 if metalFX != nil {
                     U.viewProj = unjitteredVP; U.invViewProj = unjitteredVP.inverse
-                    U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, 0)
+                    U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, sceneLengthScale)
                     U.reconstruction.y = 0; U.reconstruction.z = 0
                 }
                 bindSurfaceLighting(enc)

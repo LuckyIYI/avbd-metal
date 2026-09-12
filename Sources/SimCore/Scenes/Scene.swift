@@ -256,6 +256,9 @@ public enum JointMotorMode: Sendable, Equatable {
 }
 
 public struct SceneJoint {
+    /// Elastic rod constitutive law. Mutually exclusive with hinge/motor,
+    /// prismatic, fracture, and adaptive joint stiffness parameters.
+    public var cable: CableJointMaterial? = nil
     public var bodyA: Int           // -1 = world
     public var bodyB: Int
     public var rA: F3
@@ -384,13 +387,17 @@ public struct SceneTri {
     public var mu: Float        // membrane shear/stretch stiffness (0 = contact only)
     public var lambda: Float    // membrane area-preservation stiffness
     public var bend: Float      // bending stiffness across shared edges
+    /// Enables self-contact for this connected soft surface. Inter-component
+    /// contact remains enabled. Thin shells default to self-contact.
+    public var selfCollisionEnabled: Bool
 
     public init(ids: (Int, Int, Int), mu: Float = 0, lambda: Float = 0,
-                bend: Float = 0) {
+                bend: Float = 0, selfCollisionEnabled: Bool = true) {
         self.ids = ids
         self.mu = mu
         self.lambda = lambda
         self.bend = bend
+        self.selfCollisionEnabled = selfCollisionEnabled
     }
 }
 
@@ -426,6 +433,7 @@ public struct SceneTet {
 /// tet deformation every frame, while collision remains owned by the tet
 /// boundary triangles.
 public struct SceneSkinnedVertex {
+    public var color: F3?
     public var ids: (Int, Int, Int, Int)
     public var weights: SIMD4<Float>
     public var restNormal: F3
@@ -437,7 +445,8 @@ public struct SceneSkinnedVertex {
                 restNormal: F3,
                 restInv0: F3 = .zero,
                 restInv1: F3 = .zero,
-                restInv2: F3 = .zero) {
+                restInv2: F3 = .zero, color: F3? = nil) {
+        self.color = color
         self.ids = ids
         self.weights = weights
         self.restNormal = restNormal
@@ -655,6 +664,13 @@ public struct PhysicsScene {
     /// digest-preimage equality still closes the collision boundary.
     private var convexAssetIndexByDigest: [String: Int] = [:]
     public var joints: [SceneJoint] = []
+    public internal(set) var cables: [SceneCable] = []
+    /// Optional coarse SE(3) solver blocks for stiff deformable assemblies.
+    /// This accelerates their shared motion; every vertex retains its ordinary
+    /// deformation DOFs. Groups must be disjoint and contain complete elastic
+    /// elements. Metal supports solids with shell features and ball-joint
+    /// handles; Planar-DAT, volume self-contact and torsional contact are rejected.
+    public var rigidMotionGroups: [[Int]] = []
     public var springs: [SceneSpring] = []
     public var tets: [SceneTet] = []
     public var tris: [SceneTri] = []

@@ -69,7 +69,10 @@ kernel void rt_deform(device RTVertex* output [[buffer(0)]], device const uint* 
         uint index = (packed & 0x00FFFFFFu)*2u;
         v.position = positions[index];
         v.normal = float4(normalize(positions[index+1].xyz),0.72);
-        v.albedo = float4(srgbToLin(mix(float3(0.90),softPalette(comp*5u+11u),0.76)),0);
+        uint color = as_type<uint>(positions[index+1].w);
+        v.albedo = float4(srgbToLin(color != 0u
+            ? float3((color >> 16u)&255u,(color >> 8u)&255u,color&255u)/255.0f
+            : mix(float3(0.90),softPalette(comp*5u+11u),0.76)),0);
     }
     output[i] = v;
 }

@@ -65,11 +65,14 @@ struct ContentView: View {
                 GroupBox("Demo") {
                     Picker("Scene", selection: $model.demoName) {
                         ForEach(Demos.all, id: \.self) {
-                            Text($0 == "gaudifunicular" ? "Gaudí Funicular"
+                            Text(Demos.cableDemoTitle($0) ?? ($0 == "gaudifunicular" ? "Gaudí Funicular"
                                 : $0 == "classicrigids" ? "Classic Rigid Bodies"
                                 : $0 == "boxofboxes" ? "Box of Boxes"
-                                : $0)
+                                : $0))
                         }
+                    }
+                    if let instructions = Demos.cableDemoInstructions(model.demoName) {
+                        Text(instructions).font(.callout).foregroundStyle(.secondary)
                     }
                     if Demos.supportsScale(model.demoName) {
                         Picker("Size", selection: $model.scale) {
@@ -240,6 +243,7 @@ struct MetalView: NSViewRepresentable {
         }
         do {
             let renderer = try GPUSimRenderer(device: device, source: model)
+            renderer.sceneLengthScale = model.demoName == "cableethernet" ? 0.01 : 1
             configureAppCapture(renderer: renderer, model: model)
             renderer.configure(view, preferredFramesPerSecond: 60)
             context.coordinator.renderer = renderer
@@ -251,7 +255,9 @@ struct MetalView: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ view: InteractiveMTKView, context: Context) {}
+    func updateNSView(_ view: InteractiveMTKView, context: Context) {
+        context.coordinator.renderer?.sceneLengthScale = model.demoName == "cableethernet" ? 0.01 : 1
+    }
 
     final class Coordinator {
         let model: SimulationModel
@@ -325,6 +331,11 @@ final class InteractiveMTKView: MTKView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let r = coordinator?.renderer else { return }
-        r.distance = min(max(r.distance * (1 - Float(event.scrollingDeltaY) * 0.02), 2), 400)
+        r.distance = min(max(r.distance * exp(-Float(event.scrollingDeltaY) * 0.02), 2 * r.sceneLengthScale), 400 * r.sceneLengthScale)
+    }
+
+    override func magnify(with event: NSEvent) {
+        guard let r = coordinator?.renderer else { return }
+        r.distance = min(max(r.distance * exp(-Float(event.magnification)), 2 * r.sceneLengthScale), 400 * r.sceneLengthScale)
     }
 }

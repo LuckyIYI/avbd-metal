@@ -4,6 +4,7 @@
 let ambientOcclusionShaderSource = gtaoSamplingShaderSource + """
 inline float3 gtaoGeometricNormal(uint2 pixel, float centerDepth, float3 P, float3 N,
     constant Uniforms& U, depth2d<float> depthTex) {
+    float worldScale = U.screen.w > 0 ? U.screen.w : 1.0;
     float centerZ = P.z;
     float2 pixelToView = 2.0 * U.aoProjection.zw / U.screen.xy;
     // A closer depth can belong to the other face of a concave crease.
@@ -45,7 +46,7 @@ inline float3 gtaoGeometricNormal(uint2 pixel, float centerDepth, float3 P, floa
     float3 geometricN = cross(dx, dy);
     float geometricLength = length(geometricN);
     bool hasPlane = isfinite(min(distances[0], distances[1]))
-                 && isfinite(min(distances[2], distances[3])) && geometricLength > 1e-10;
+                 && isfinite(min(distances[2], distances[3])) && geometricLength > 1e-10 * worldScale * worldScale;
     geometricN = hasPlane ? geometricN/geometricLength : N;
     return geometricN * (dot(geometricN, -P) < 0.0 ? -1.0 : 1.0);
 }
@@ -89,9 +90,10 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     float centerZ = U.aoProjection.y / (dC - U.aoProjection.x);
     float3 P = float3((in.position.xy - U.reconstruction.yz * U.screen.xy) * pixelToView - U.aoProjection.zw, 1.0) * centerZ;
     float3 V = normalize(-P);
-    float viewDepth = max(centerZ, 0.25);
+    float worldScale = U.screen.w > 0 ? U.screen.w : 1.0;
+    float viewDepth = max(centerZ, 0.25 * worldScale);
 
-    const float R = 0.9;                                  // world AO radius
+    const float R = 0.9 * worldScale;                                  // world AO radius
     float pxRadius = U.screen.z * R / viewDepth;
     // far away the radius collapses below sampling density — fade AO out
     // instead of letting a few-pixel march invent large-scale occlusion
@@ -102,7 +104,7 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
     // the falloff must use the radius we ACTUALLY march (post-clamp), or
     // near-camera AO reaches past its sampled range and over-darkens
     float Reff = pxRadius * viewDepth / U.screen.z;
-    float falloffRange = max(Reff * 0.65, 1e-4);
+    float falloffRange = max(Reff * 0.65, 1e-4 * worldScale);
 
     float2 px = floor(in.position.xy);
     float2 noise = gtaoSampleNoise(uint2(px));
@@ -171,18 +173,18 @@ fragment float4 gtao_fragment(FSOut in [[stage_in]],
                 float3 w = float3((sampleCenter - U.reconstruction.yz) * 2.0 * U.aoProjection.zw
                                  - U.aoProjection.zw, 1.0) * sampleZ - P;
                 float l = length(w);
-                if (l < 1e-4) continue;
+                if (l < 1e-4 * worldScale) continue;
                 // Rounding moves samples off the ideal slice. Coplanar or
                 // below-tangent points cannot occlude the normal hemisphere.
                 // Cover half-float normal error plus sub-mm depth roundoff;
                 // this is a tangent-plane tolerance, not an AO radius bias.
-                if (dot(N, w) <= 0.001 * l + 0.0001 || dot(geometricN, w) <= 0.001 * l + 0.0001) continue;
+                if (dot(N, w) <= 0.001 * l + 0.0001 * worldScale || dot(geometricN, w) <= 0.001 * l + 0.0001 * worldScale) continue;
                 float weight = saturate((Reff - l) / falloffRange);
                 if (weight <= 0.0) continue;
                 float exitZ = sampleDepth.y < 1e9 ? sampleDepth.y : sampleZ + Reff;
                 // An open/double-sided sheet has no paired back face. Keep
                 // a finite footprint instead of extruding a wire to infinity.
-                if (exitZ <= sampleZ + 1e-5) exitZ = sampleZ + max(0.001, sampleZ / U.screen.z);
+                if (exitZ <= sampleZ + 1e-5 * worldScale) exitZ = sampleZ + max(0.001 * worldScale, sampleZ / U.screen.z);
                 float3 wBack = (w + P) * (exitZ / sampleZ) - P;
                 float frontAngle = atan2(dot(w, omega), dot(w, V));
                 float backAngle = atan2(dot(wBack, omega), dot(wBack, V));

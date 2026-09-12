@@ -4,10 +4,12 @@ using namespace metal;
 
 #define ORDERED_COLORING_BODY_LIMIT 1024u
 
-// ============================================================================
+// =====================================================================}
+
 // AVBD solver kernels: adjacency (CSR), coloring, warm start, primal update
 // (per color, 6x6 LDL in registers), dual update, velocity finalize.
-// ============================================================================
+// =====================================================================}
+
 
 // ----------------------------------------------------------------------------
 // CSR adjacency build
@@ -15,6 +17,11 @@ using namespace metal;
 
 inline bool bodyDynamic(device const float4* posLin, uint b) {
     return b != WORLD_BODY && posLin[b].w > 0.0f;
+}
+
+inline bool jointHasSolveTerms(device const JointGPU& j) {
+    return (j.header.w & JOINT_CABLE) != 0u
+        || j.rA.w != 0.0f || j.rB.w != 0.0f || j.motor.y != 0.0f;
 }
 
 kernel void adj_clear_degrees(
@@ -69,8 +76,7 @@ kernel void adj_count(
     if (gid < P.numJoints) {
         if (joints[gid].header.z != 0) return;  // broken
         // inert (exclusion-only / inactive drag slots): nothing to stamp
-        if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
-            && joints[gid].motor.y == 0.0f) return;
+        if (!jointHasSolveTerms(joints[gid])) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
     } else if (gid < P.numJoints + P.numSprings) {
@@ -171,8 +177,7 @@ kernel void adj_scatter(
     uint entry = 0;
     if (gid < P.numJoints) {
         if (joints[gid].header.z != 0) return;
-        if (joints[gid].rA.w == 0.0f && joints[gid].rB.w == 0.0f
-            && joints[gid].motor.y == 0.0f) return;
+        if (!jointHasSolveTerms(joints[gid])) return;
         a = joints[gid].header.x;
         b = joints[gid].header.y;
         entry = (FK_JOINT << ADJ_KIND_SHIFT) | gid;
@@ -743,6 +748,27 @@ kernel void warmstart_joints(
     device JointGPU& j = joints[gid];
     if (j.header.z != 0) return;    // broken
 
+    if (j.header.w & JOINT_CABLE) {
+        if (j.motor.w == 0.0f && j.limits.w == 0.0f) return;
+        uint a = j.header.x, b = j.header.y;
+        float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+        float3 xA = a == WORLD_BODY ? float3(0) : posLin[a].xyz;
+        float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
+        j.C0Lin.xyz = q_rotate(q_inv(qA), pB - xA) - j.rA.xyz;
+        if (any(j.limits.xyz > 0.0f)) {
+            j.C0Ang.xyz = cableRotationLog(
+                q_mul(q_inv(q_mul(qA, j.restRel)), posAng[b])).value;
+            if (j.limits.w > 0.0f) {
+                // Commit the previous accepted pose once per step. Primal
+                // iterates use a return-mapped trial without mutating history.
+                CableBendResponse response = cableBendResponse(
+                    j.C0Ang.xyz, j.lambdaAng.xyz, j.limits.w);
+                j.lambdaAng.xyz = j.C0Ang.xyz - response.elastic;
+            }
+        }
+        return;
+    }
+
     uint a = j.header.x, b = j.header.y;
     float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
     float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
@@ -907,6 +933,50 @@ inline M3 geomStiffBallSocket(int k, float3 v) {
     return m;
 }
 
+inline void stampCable(device const JointGPU& j, uint self,
+                       device const float4* posLin, device const float4* posAng,
+                       float dt, thread PrimalAccum& acc)
+{
+    uint a = j.header.x, b = j.header.y;
+    bool isA = self == a;
+    float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+    float3 xA = a == WORLD_BODY ? float3(0) : posLin[a].xyz;
+    float3 rBW = q_rotate(posAng[b], j.rB.xyz);
+    float3 pB = posLin[b].xyz + rBW;
+    M3 basis = inverseRotation(qA);
+    float3 C = m3_mul(basis, pB - xA) - j.rA.xyz;
+    M3 jLin = m3_scale(basis, isA ? -1.0f : 1.0f);
+    // Includes the derivative of the parent material frame.
+    M3 jAng = m3_mulm(basis, m3_skew(isA ? pB - xA : -rBW));
+    float damping = j.motor.w / dt;
+    float3 k = j.motor.xyz;
+    float3 F = k * (C + damping * (C - j.C0Lin.xyz));
+    M3 K = m3_diag(k * (1.0f + damping));
+    M3 jLinT = m3_transpose(jLin), jAngT = m3_transpose(jAng);
+    M3 jLinTK = m3_mulm(jLinT, K), jAngTK = m3_mulm(jAngT, K);
+    acc.lhsLin = m3_add(acc.lhsLin, m3_mulm(jLinTK, jLin));
+    acc.lhsAng = m3_add(acc.lhsAng, m3_mulm(jAngTK, jAng));
+    acc.lhsCross = m3_add(acc.lhsCross, m3_mulm(jAngTK, jLin));
+    acc.rhsLin += m3_mul(jLinT, F);
+    acc.rhsAng += m3_mul(jAngT, F);
+
+    if (any(j.limits.xyz > 0.0f)) {
+        float4 frame = q_mul(qA, j.restRel);
+        CableRotationLog strain = cableRotationLog(q_mul(q_inv(frame), posAng[b]));
+        M3 J = m3_scale(m3_mulm(strain.derivative, inverseRotation(frame)),
+                        isA ? -1.0f : 1.0f);
+        M3 JT = m3_transpose(J);
+        float3 ka = j.limits.xyz;
+        CableBendResponse response = cableBendResponse(
+            strain.value, j.lambdaAng.xyz, j.limits.w);
+        float3 Fa = ka * (response.elastic + damping * (strain.value - j.C0Ang.xyz));
+        M3 tangent = m3_add(m3_mulm(m3_diag(ka), response.tangent), m3_diag(ka * damping));
+        acc.lhsAng = m3_add(acc.lhsAng,
+            m3_mulm(m3_mulm(JT, tangent), J));
+        acc.rhsAng += m3_mul(JT, Fa);
+    }
+}
+
 // Passive piecewise-linear effort. Positive residual curvature is retained;
 // negative curvature at a detent barrier is projected to zero, not inverted.
 inline float2 responseForce(device const JointGPU& j,float q,float dt,bool hinge) {
@@ -931,6 +1001,10 @@ inline void stampJoint(device const JointGPU& j, uint self,
                        device const float4* initAng, float alpha, float dt,
                        thread PrimalAccum& acc)
 {
+    if (j.header.w & JOINT_CABLE) {
+        stampCable(j, self, posLin, posAng, dt, acc);
+        return;
+    }
     uint a = j.header.x, b = j.header.y;
     bool isA = self == a;
     float torqueArm = j.C0Lin.w;
@@ -1587,9 +1661,9 @@ inline void stampSolverManifold(
         device const SolverContactGPU& c =
             solveContacts[i * maxManifolds + manifoldIndex];
         float3 rAW = sphA ? c.rAStick.xyz
-                          : q_rotate(posAng[a], c.rAStick.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], c.rAStick.xyz);
         float3 rBW = sphB ? c.rB_C0x.xyz
-                          : q_rotate(posAng[b], c.rB_C0x.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], c.rB_C0x.xyz);
 
         float3 C; float fs, bnd;
         float3 F = solverContactForceC(
@@ -1660,8 +1734,8 @@ inline void stampManifold(device const ManifoldGPU& m, uint self,
     float3 t2 = cross(nrm, t1);
 
     for (uint i = 0; i < n; i++) {
-        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate(posAng[a], m.contacts[i].rA.xyz);
-        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
 
         float3 C; float fs, bnd;
         float3 F = contactForceC(m, i, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW, alpha, C, fs, bnd);
@@ -1708,9 +1782,9 @@ inline void stampTorsionalManifold(
     float normalLoad = 0.0f;
     for (uint i = 0u; i < n; ++i) {
         float3 rAW = sphA ? m.contacts[i].rA.xyz
-            : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
         float3 rBW = sphB ? m.contacts[i].rB.xyz
-            : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
         float3 C;
         float frictionScale, bounds;
         float3 F = contactForceC(
@@ -2783,6 +2857,7 @@ static inline void dual_joint_one(
 {
     device JointGPU& j = joints[gid];
     if (j.header.z != 0) return;
+    if (j.header.w & JOINT_CABLE) return; // finite constitutive energy, no AL dual
 
     uint a = j.header.x, b = j.header.y;
     float torqueArm = j.C0Lin.w;
@@ -2903,8 +2978,8 @@ static inline void dual_manifold_one(
     float lamCap = min(P.lambdaMax, max(10.0f, 1.0e5f * minMass));
 
     for (uint i = 0; i < n; i++) {
-        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate(posAng[a], m.contacts[i].rA.xyz);
-        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+        float3 rAW = sphA ? m.contacts[i].rA.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
+        float3 rBW = sphB ? m.contacts[i].rB.xyz : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
 
         float3 C; float fs, bnd;
         float3 F = contactForceC(m, i, dqALin, dqAAng, dqBLin, dqBAng, rAW, rBW, P.alpha, C, fs, bnd);
@@ -2957,9 +3032,9 @@ static inline void dual_torsion_one(
     float normalLoad = 0.0f;
     for (uint i = 0u; i < n; ++i) {
         float3 rAW = sphA ? m.contacts[i].rA.xyz
-            : q_rotate(posAng[a], m.contacts[i].rA.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], m.contacts[i].rA.xyz);
         float3 rBW = sphB ? m.contacts[i].rB.xyz
-            : q_rotate(posAng[b], m.contacts[i].rB.xyz);
+            : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], m.contacts[i].rB.xyz);
         float3 C;
         float frictionScale, bounds;
         float3 F = contactForceC(
@@ -3012,9 +3087,9 @@ static inline void dual_solver_manifold_one(
         device SolverContactGPU& c =
             solveContacts[i * P.maxManifolds + gid];
         float3 rAW = sphA ? c.rAStick.xyz
-                          : q_rotate(posAng[a], c.rAStick.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[a] : posAng[a], c.rAStick.xyz);
         float3 rBW = sphB ? c.rB_C0x.xyz
-                          : q_rotate(posAng[b], c.rB_C0x.xyz);
+                          : q_rotate((m.header.w & MANIFOLD_FIXED_CONTACT_FRAME) ? initAng[b] : posAng[b], c.rB_C0x.xyz);
 
         float3 C; float fs, bnd;
         float3 F = solverContactForceC(

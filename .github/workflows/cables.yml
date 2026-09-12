@@ -1,0 +1,72 @@
+name: Cable validation
+
+on:
+  pull_request:
+    # Follow cable code and its shared solver dependencies, not every scene
+    # or unrelated renderer/robotics change. Apply the same filter on main.
+    paths: &cable_paths
+      - "Package.swift"
+      - "Makefile"
+      - "Sources/SimCore/Scenes/Cable.swift"
+      - "Sources/SimCore/Scenes/Scene.swift"
+      - "Sources/SimCore/Scenes/SceneReplication.swift"
+      - "Sources/SimCore/Math/**"
+      - "Sources/PhysicsAVBD/CableContactPolicy.swift"
+      - "Sources/PhysicsAVBD/CPU/**"
+      - "Sources/PhysicsAVBD/GPU/**"
+      - "Sources/PhysicsAVBD/Shaders/00_common.metal"
+      - "Sources/PhysicsAVBD/Shaders/25_cloth.metal"
+      - "Sources/PhysicsAVBD/Shaders/30_narrowphase.metal"
+      - "Sources/PhysicsAVBD/Shaders/31_optimized_convex_narrowphase.metal"
+      - "Sources/PhysicsAVBD/Shaders/35_analytic_compat.metal"
+      - "Sources/PhysicsAVBD/Shaders/40_solver.metal"
+      - "Sources/PhysicsAVBD/Shaders/45_rigid_motion.metal"
+      - "Sources/PhysicsAVBD/Shaders/50_render.metal"
+      - "Sources/GPUSimDemos/Cable*.swift"
+      - "Sources/GPUSimDemos/Ethernet*.swift"
+      - "Sources/GPUSimDemos/Demos.swift"
+      - "Sources/GPUSimRenderer/**"
+      - "Tests/SimCoreTests/Cable*.swift"
+      - "Tests/PhysicsAVBDTests/Cable*.swift"
+      - "Examples/Cables/**"
+      - "Examples/CablePlayground/**"
+      - "Tools/verify_architecture.py"
+      - "Tools/tests/test_verify_architecture.py"
+      - ".github/workflows/cables.yml"
+  push:
+    branches: [main]
+    paths: *cable_paths
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-cables:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Cable authoring, force derivatives, contact normals and ABI
+        run: >-
+          swift test -c release --filter
+          'CableAuthoringTests|CableDemoTests|CableContactTests|testFullForceGradientMatchesEnergyOnBothBodies|testCapsuleBoxContactNormalInBothOrders|testDemoMetadataAndJointABI'
+      - name: Standalone interactive demos
+        run: make cable-app
+      # Hosted runners need not expose a Metal device. Metal physics and
+      # performance checks also run locally via cable-validation --benchmark.
+      - name: CPU physical validation
+        run: swift run -c release cable-validation --cpu-only
+      - name: Damping, plasticity and contact regressions
+        run: |
+          swift run -c release cable-validation --ethernet-authoring
+          swift run -c release cable-validation --cpu-only --materials
+          swift run -c release cable-validation --cpu-only --rigid-contact
+          swift run -c release cable-validation --cpu-only --collision-stress
+      - name: Package boundaries
+        run: |
+          python3 -S Tools/verify_architecture.py
+          python3 -m unittest discover -s Tools/tests -p test_verify_architecture.py

@@ -179,6 +179,22 @@ class ManifestVerificationTests(unittest.TestCase):
     def test_standalone_simulator_manifest_passes(self) -> None:
         architecture.verify_manifest(valid_simulator_manifest())
 
+    def test_leaf_example_contracts(self) -> None:
+        manifest = valid_simulator_manifest()
+        for name, (product_name, path, dependencies, excludes) in architecture.SIMULATOR_EXAMPLES.items():
+            example = target(name, [target_dependency(d.removeprefix("target:"))
+                                   for d in dependencies], target_type="executable")
+            example["path"] = path
+            example["exclude"] = sorted(excludes)
+            manifest["targets"].append(example)
+            item = product(name, "executable")
+            item["name"] = product_name
+            manifest["products"].append(item)
+        architecture.verify_manifest(manifest)
+        find_target(manifest, "CableValidation")["dependencies"].append(target_dependency("MLXRL"))
+        with self.assertRaises(architecture.VerificationError):
+            architecture.verify_manifest(manifest)
+
     def test_development_manifest_passes(self) -> None:
         architecture.verify_manifest(
             valid_development_manifest(), architecture.DEVELOPMENT_CONTRACT

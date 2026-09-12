@@ -499,7 +499,7 @@ kernel void vt_emit(
     device const uint* nbr2Count    [[buffer(23)]],
     device const uint* nbr2List     [[buffer(24)]],
     device const uint* clothGroup   [[buffer(25)]],
-    device const uint* clothVert    [[buffer(26)]],
+    device const uint* selfCollision    [[buffer(26)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numParticles) return;
@@ -510,7 +510,7 @@ kernel void vt_emit(
     float3 velV = velLin[v].xyz;
     uint ns = nbrStart[v], ne = ns + nbrCount[v];
     uint gv = clothGroup[v];
-    bool solidV = gv != 0 && clothVert[v] == 0;
+    bool solidV = gv != 0 && selfCollision[v] == 0;
 
     Best4 best;
     best4Init(best);
@@ -537,8 +537,8 @@ kernel void vt_emit(
             if (tid_.x != v && tid_.y != v && tid_.z != v) {                   \
                 bool sameSolid_ = solidV && clothGroup[tid_.x] == gv            \
                     && clothGroup[tid_.y] == gv && clothGroup[tid_.z] == gv     \
-                    && clothVert[tid_.x] == 0 && clothVert[tid_.y] == 0         \
-                    && clothVert[tid_.z] == 0;                                  \
+                    && selfCollision[tid_.x] == 0 && selfCollision[tid_.y] == 0         \
+                    && selfCollision[tid_.z] == 0;                                  \
                 if (sameSolid_) {                                               \
                 } else {                                                        \
                 float3 ba_;                                                    \
@@ -773,7 +773,7 @@ kernel void ee_emit(
     device const uint* nbr2Count    [[buffer(24)]],
     device const uint* nbr2List     [[buffer(25)]],
     device const uint* clothGroup   [[buffer(26)]],
-    device const uint* clothVert    [[buffer(27)]],
+    device const uint* selfCollision    [[buffer(27)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numEdges) return;
@@ -785,7 +785,7 @@ kernel void ee_emit(
     uint nsy = nbrStart[eA.y], ney = nsy + nbrCount[eA.y];
     uint gA = clothGroup[eA.x];
     bool solidA = gA != 0 && clothGroup[eA.y] == gA
-        && clothVert[eA.x] == 0 && clothVert[eA.y] == 0;
+        && selfCollision[eA.x] == 0 && selfCollision[eA.y] == 0;
 
     Best4 best;
     best4Init(best);
@@ -804,7 +804,7 @@ kernel void ee_emit(
                 && eB_.y != eA.x && eB_.y != eA.y) {                           \
                 bool sameSolid_ = solidA && clothGroup[eB_.x] == gA             \
                     && clothGroup[eB_.y] == gA                                  \
-                    && clothVert[eB_.x] == 0 && clothVert[eB_.y] == 0;          \
+                    && selfCollision[eB_.x] == 0 && selfCollision[eB_.y] == 0;          \
                 if (sameSolid_) {                                               \
                 } else {                                                        \
                 float s_, t_;                                                  \
@@ -1081,6 +1081,46 @@ inline float4 rtColliderRotation(
 {
     return q_mul(posAng[colliderOwner[collider]],
                  colliderLocalRotation[collider]);
+}
+
+// Complete capsule-axis / triangle closest pair. Unlike three sphere
+// samples, this detects a thin cable crossing a face between sample sites.
+// Degeneracy tests are relative, so millimetre wires retain their edge DOFs.
+inline float3 cableTriangleAxisWitness(float3 p0, float3 p1,
+                                       float3 a, float3 b, float3 c) {
+    float3 d=p1-p0, n=cross(b-a,c-a), bary;
+    float dd=dot(d,d), nn=dot(n,n), nd=dot(n,d);
+    if(nd*nd>1e-12f*nn*dd && dd>1e-24f) {
+        float u=dot(n,a-p0)/nd;
+        if(u>=0 && u<=1) {
+            float3 p=p0+u*d, q=closestPtTriangle(p,a,b,c,bary);
+            float scale2=max(dd,max(dot(b-a,b-a),dot(c-a,c-a)));
+            if(distance_squared(p,q)<=1e-12f*scale2) return p;
+        }
+    }
+    float3 best=p0, q=closestPtTriangle(p0,a,b,c,bary);
+    float bestD=distance_squared(p0,q);
+    q=closestPtTriangle(p1,a,b,c,bary);
+    float endD=distance_squared(p1,q);
+    if(endD<bestD) {best=p1;bestD=endD;}
+    float3 verts[3]={a,b,c};
+    for(uint i=0;i<3;++i) {
+        float3 e=verts[(i+1)%3]-verts[i], r=p0-verts[i];
+        float ee=dot(e,e), ed=dot(e,d), dr=dot(d,r), er=dot(e,r);
+        float u=0, v=0;
+        if(dd>1e-24f && ee>1e-24f) {
+            float den=dd*ee-ed*ed;
+            if(den>1e-7f*dd*ee) u=clamp((ed*er-dr*ee)/den,0.0f,1.0f);
+            v=(ed*u+er)/ee;
+            if(v<0) {v=0;u=clamp(-dr/dd,0.0f,1.0f);}
+            else if(v>1) {v=1;u=clamp((ed-dr)/dd,0.0f,1.0f);}
+        } else if(dd>1e-24f) u=clamp(-dr/dd,0.0f,1.0f);
+        else if(ee>1e-24f) v=clamp(er/ee,0.0f,1.0f);
+        float3 p=p0+u*d; q=verts[i]+v*e;
+        float d2=distance_squared(p,q);
+        if(d2<bestD) {best=p;bestD=d2;}
+    }
+    return best;
 }
 
 // Collect the established analytic feature set of collider `collider` that
@@ -1461,7 +1501,20 @@ kernel void rt_emit(
                     }                                                          \
                 } else {                                                       \
                 RTFeature feats[8];                                            \
-                int nf = rtFeatures(                                           \
+                bool continuousCable_ = colliderKind_ == 3u                   \
+                    && (colliderShapeType[collider_]                           \
+                        & COLLIDER_CABLE_CONTACT_FRAME) != 0u;                \
+                int nf;                                                       \
+                if (continuousCable_) {                                       \
+                    float4 cq_ = rtColliderRotation(posAng, colliderOwner,     \
+                        colliderLocalRotation, collider_);                    \
+                    float3 halfAxis_ = q_rotate(cq_, float3(0,0,              \
+                        colliderShape[collider_].x * 0.5f));                   \
+                    feats[0].world = cableTriangleAxisWitness(                \
+                        center_-halfAxis_, center_+halfAxis_, a,b,c);         \
+                    feats[0].radius = colliderShape[collider_].y;             \
+                    feats[0].id = 12u; nf = 1;                                \
+                } else nf = rtFeatures(                                       \
                     posLin, posAng, colliderShape, colliderShapeType,          \
                     colliderOwner, colliderLocalPosition,                     \
                     colliderLocalRotation, collider_, m, rT,                  \
@@ -1481,10 +1534,10 @@ kernel void rt_emit(
                                    ? 1.0f : -1.0f;                             \
                     bool interior = bary.x > 0.02f && bary.y > 0.02f           \
                                  && bary.z > 0.02f;                            \
-                    float sMem = interior                                      \
-                        ? softPrevSide(prevSoft, mapKeyA, mapKeyB,             \
-                                       mapVal, P, keyA, keyB, proposed)        \
-                        : proposed;                                            \
+                    float sMem = continuousCable_                             \
+                        ? (tid.w != 0u ? 1.0f : side)                        \
+                        : (interior ? softPrevSide(prevSoft, mapKeyA, mapKeyB, \
+                            mapVal, P, keyA, keyB, proposed) : proposed);      \
                     float3 n; float g;                                         \
                     if (dist > 1e-7f && side == sMem) { n = d / dist; g = dist; } \
                     else { n = sMem * triN; g = -dist; }                       \

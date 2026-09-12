@@ -77,6 +77,9 @@ public extension PhysicsScene {
                 }
                 output.colliders.append(collider)
             }
+            output.rigidMotionGroups += source.rigidMotionGroups.map {
+                $0.map { mapping.body($0) }
+            }
             for var joint in source.joints {
                 if joint.bodyA >= 0 {
                     joint.bodyA = mapping.body(joint.bodyA)
@@ -99,6 +102,9 @@ public extension PhysicsScene {
                 }
                 output.springs.append(spring)
             }
+            for cable in source.cables {
+                output.cables.append(cable.remapped(body: mapping.body, joint: mapping.joint))
+            }
             for tet in source.tets {
                 output.tets.append(SceneTet(
                     ids: (
@@ -114,7 +120,7 @@ public extension PhysicsScene {
                         mapping.body(triangle.ids.1),
                         mapping.body(triangle.ids.2)),
                     mu: triangle.mu, lambda: triangle.lambda,
-                    bend: triangle.bend))
+                    bend: triangle.bend, selfCollisionEnabled: triangle.selfCollisionEnabled))
             }
             for spinner in source.spinners {
                 output.spinners.append(SceneSpinner(
@@ -151,7 +157,7 @@ public extension PhysicsScene {
                         restNormal: vertex.restNormal,
                         restInv0: vertex.restInv0,
                         restInv1: vertex.restInv1,
-                        restInv2: vertex.restInv2)
+                        restInv2: vertex.restInv2, color: vertex.color)
                 }
                 output.skinnedMeshes.append(SceneSkinnedMesh(
                     vertices: vertices, triangles: mesh.triangles,

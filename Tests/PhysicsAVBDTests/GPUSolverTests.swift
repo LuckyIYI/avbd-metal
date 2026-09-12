@@ -1114,25 +1114,26 @@ final class GPUSolverTests: XCTestCase {
     /// contact (the kernels drop every same-solid candidate), so skipping the
     /// element grid and both emitters must leave the trajectory untouched.
     func testSurfaceEmissionSkipIsExactForSingleSolid() throws {
-        var scene = Demos.softbody()
-        scene.settings.deterministic = true
-        let bodies = Array(0..<scene.bodies.count)
-        let skipping = try makeGPU(scene)
-        let emitting = try makeGPU(scene)
-        emitting.forceSurfaceEmissionForTesting = true
-        for s in [skipping, emitting] { s.surfaceTruncationMode = .isotropicDAT }
-        XCTAssertGreaterThan(skipping.numTris, 0, "fixture needs boundary faces")
-        for _ in 0..<120 {
-            skipping.step()
-            emitting.step()
+        for (label, authored) in [("solid",Demos.softbody()),
+                                  ("solid with shell latch",Demos.ethernetInsertionTask().scene)] {
+            var scene = authored
+            scene.settings.deterministic = true
+            let bodies = Array(0..<scene.bodies.count)
+            let skipping = try makeGPU(scene)
+            let emitting = try makeGPU(scene)
+            emitting.forceSurfaceEmissionForTesting = true
+            for s in [skipping, emitting] { s.surfaceTruncationMode = .isotropicDAT }
+            XCTAssertGreaterThan(skipping.numTris, 0)
+            for _ in 0..<120 {
+                skipping.step()
+                emitting.step()
+            }
+            skipping.sync()
+            emitting.sync()
+            XCTAssertNil(skipping.runtimeFailure, label)
+            XCTAssertLessThan(skipping.dispatchesLastFrame,emitting.dispatchesLastFrame,label)
+            assertBitwiseEqualStates(skipping,emitting,bodies:bodies,label)
         }
-        skipping.sync()
-        emitting.sync()
-        XCTAssertNil(skipping.runtimeFailure)
-        XCTAssertLessThan(skipping.dispatchesLastFrame,
-                          emitting.dispatchesLastFrame,
-                          "the skip must remove dispatches")
-        assertBitwiseEqualStates(skipping, emitting, bodies: bodies, "softbody")
     }
 
     func testDynamicColorTailIsBitwiseExact() throws {

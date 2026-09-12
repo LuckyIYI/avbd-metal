@@ -404,7 +404,10 @@ kernel void np_collide_analytic_compat(
         int prevIdx = pairMapFind(mapKeyA, mapKeyB, mapVal, P.mapCapacity, ia, ib);
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
-        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        // Use a consistent reference frame for material capsule contacts.
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
+            | (((shapeType[ia] | shapeType[ib]) & COLLIDER_CABLE_CONTACT_FRAME)
+                ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(nh), flags);
         outM.basisN = float4(nrmC, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -646,7 +649,9 @@ kernel void np_collide_analytic_compat(
 
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
-        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
+            | (((shapeType[ia] | shapeType[ib]) & COLLIDER_CABLE_CONTACT_FRAME)
+                ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(nHits), flags);
         outM.basisN = float4(nrmT, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
@@ -795,7 +800,9 @@ kernel void np_collide_analytic_compat(
 
         bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
         bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
-        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u);
+        uint flags = 1u | (roundA ? 2u : 0u) | (roundB ? 4u : 0u)
+            | (((shapeType[ia] | shapeType[ib]) & COLLIDER_CABLE_CONTACT_FRAME)
+                ? MANIFOLD_FIXED_CONTACT_FRAME : 0u);
         outM.header = uint4(ba, bb, uint(count), flags);
         outM.basisN = float4(nrm, dynamicFriction);
         outM.basisT1 = float4(t1, staticFriction);
