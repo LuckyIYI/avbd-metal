@@ -197,8 +197,9 @@ private func addCableClip(_ s: inout PhysicsScene, center: F3, axis: F3,
             for a in 0..<angular {
                 let angle = Float.pi / 4 + Float(a) * (1.5 * .pi) / Float(angular - 1)
                 let radius: Float = 0.04 + 0.0175 * Float(r)
-                let position = center + axis * (Float(u) - 1) * 0.06
-                    + radius * (front * cos(angle) + across * sin(angle))
+                let axialOffset = axis * (Float(u) - 1) * 0.06
+                let ringOffset = radius * (front * cos(angle) + across * sin(angle))
+                let position = center + axialOffset + ringOffset
                 let node = s.addParticle(radius: 0.005, mass: 0.0008,
                                         friction: friction, position: position)
                 if r == radial - 1 && cos(angle) < -0.45 { s.bodies[node].density = 0 }
