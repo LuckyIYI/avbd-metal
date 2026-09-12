@@ -68,14 +68,15 @@ public extension Demos {
         return s
     }
 
-    static func cableGrippers(segments: Int = 64, padStiffness: Float = 30000,
-                              friction: Float = 0.8, dampingTime: Float = 0.12,
-                              drag: Float = 0.8) -> PhysicsScene {
+    static func cableGrippers(segments: Int = 64, padStiffness: Float = 60000,
+                              friction: Float = 1, dampingTime: Float = 0.1,
+                              drag: Float = 0.1) -> PhysicsScene {
         precondition(segments >= 24 && padStiffness > 0 && padStiffness.isFinite
             && friction >= 0 && friction.isFinite)
         var s = cableBench("Snap-fit Cable Routing", length: 4.4, drag: drag)
         s.settings.dt = 1 / 240
         s.settings.iterations = 24
+        s.settings.alpha = 1
         s.settings.deterministic = true
         s.settings.particleDamping = 0.8
         s.settings.deformableCollisionMargin = 0.001

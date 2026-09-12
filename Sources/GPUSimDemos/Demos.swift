@@ -72,9 +72,11 @@ public enum Demos {
         switch name {
         case "cableethernet": return [DemoParam("youngMPa", "Housing E (MPa)", 1800...2800, 2400), DemoParam("offsetMM", "Lateral error (mm)", 0...1.2, 0), DemoParam("yawDeg", "Yaw error (°)", 0...5, 0)]
         case "cabletwisting": return cableDamping + [DemoParam("turnRate", "Turns / s", 0...0.25, 0.10)]
-        case "cablegrippers": return cableDamping + [
-            DemoParam("gripMu", "Clip stiffness", 10000...60000, 30000),
-            DemoParam("friction", "Grip friction", 0.3...1.2, 0.8)
+        case "cablegrippers": return [
+            DemoParam("damping", "Damping time (s)", 0...0.25, 0.1),
+            DemoParam("drag", "Drag /s", 0...2, 0.1),
+            DemoParam("gripMu", "Clip stiffness", 10000...60000, 60000),
+            DemoParam("friction", "Grip friction", 0.3...1.2, 1)
         ]
         case "cableplastic": return cableDamping + [
             DemoParam("yield", "Yield curvature /m", 0.3...4, 1.5)
@@ -140,7 +142,7 @@ public enum Demos {
         switch name {
         case "cableethernet": return cableEthernet(segments: res ?? 32, youngModulus: p("youngMPa", 2400)*1e6, lateralError: p("offsetMM", 0)*0.001, yawError: p("yawDeg", 0)*Float.pi/180)
         case "cabletwisting": return cableTwisting(segments: res ?? 40, turnRate: p("turnRate", 0.10), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
-        case "cablegrippers": return cableGrippers(segments: res ?? 64, padStiffness: p("gripMu", 30000), friction: p("friction", 0.8), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
+        case "cablegrippers": return cableGrippers(segments: res ?? 64, padStiffness: p("gripMu", 60000), friction: p("friction", 1), dampingTime: p("damping", 0.1), drag: p("drag", 0.1))
         case "cableplastic": return cablePlastic(segments: res ?? 24, yieldCurvature: p("yield", 1.5), dampingTime: p("damping", 0.12), drag: p("drag", 0.8))
         case "cables": return cables(count: 3 * s, segments: res ?? 24)
         case "gaudifunicular": return gaudiFunicular(
