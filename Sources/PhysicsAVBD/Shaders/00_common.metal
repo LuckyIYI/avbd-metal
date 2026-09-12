@@ -332,7 +332,9 @@ inline bool motor_uses_explicit_effort(uint flags) {
 }
 
 // Bit 6 is reserved for break-load joints (PR #36).
-constant uint JOINT_CABLE = 1u << 7;
+// Standard joints use bits 0...7, including physical break loads (6) and
+// finite scalar fracture (7). Cables must not alias either fracture mode.
+constant uint JOINT_CABLE = 1u << 8;
 
 struct JointGPU {
     uint4 header;       // bodyA (WORLD_BODY=world), bodyB, broken flag, flags

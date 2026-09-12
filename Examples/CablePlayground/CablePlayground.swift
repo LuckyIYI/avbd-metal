@@ -15,6 +15,8 @@ private let demoNames = ["cableethernet", "cabletwisting", "cablegrippers", "cab
 final class Playground: ObservableObject, GPUSimRendererSource {
     @Published var name: String
     @Published var running = true
+    @Published var overview = true
+    @Published var cameraRevision = 0
     @Published var failure: String?
     @Published var parameters: [String: Float] = [:]
     var solver: GPUSolver!
@@ -76,9 +78,16 @@ final class Playground: ObservableObject, GPUSimRendererSource {
         guard running, failure == nil, lastTime > 0 else { return }
         accumulator += min(now - lastTime, 0.05)
         do {
+            // Bound UI latency when physics cannot keep up. Discard only
+            // wall-clock backlog; every physical step retains its fixed dt.
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.012
             while accumulator >= timestep {
                 try advancePhysics()
                 accumulator -= timestep
+                if ProcessInfo.processInfo.systemUptime >= deadline {
+                    accumulator = min(accumulator, timestep)
+                    break
+                }
             }
         } catch { rendererDidFail(error.localizedDescription) }
     }
@@ -131,17 +140,31 @@ final class CableView: MTKView {
     var model: Playground!
     var renderer: GPUSimRenderer!
     var framedName = ""
+    var framedOverview = false
+    var framedRevision = -1
+    var framingDistance: Float = 4.2
     override var acceptsFirstResponder: Bool { true }
 
     func frameScene() {
-        guard renderer != nil, framedName != model.name else { return }
+        guard renderer != nil, framedName != model.name || framedOverview != model.overview
+            || framedRevision != model.cameraRevision else { return }
         framedName = model.name
+        framedOverview = model.overview
+        framedRevision = model.cameraRevision
         renderer.automaticallyFramesScene = false
         renderer.sceneLengthScale = model.name == "cableethernet" ? 0.01 : 1
         renderer.azimuth = model.name == "cableethernet" ? -2.35 : model.name == "cablegrippers" ? -2.25 : -1.85
         renderer.elevation = model.name == "cableethernet" ? 0.38 : model.name == "cablegrippers" ? 0.24 : 0.5
         renderer.distance = model.name == "cableethernet" ? 0.13 : 4.2
         renderer.target = model.name == "cableethernet" ? F3(-0.013,0,0.034) : F3(-0.2, 0, (model.name == "cablegrippers" || model.name == "cableplastic") ? 1.5 : 0.8)
+        if model.name == "cableethernet" && model.overview {
+            let hint = model.solver.renderCameraHint
+            renderer.distance = hint.distance
+            renderer.target = hint.target
+            renderer.azimuth = hint.azimuth
+            renderer.elevation = hint.elevation
+        }
+        framingDistance = renderer.distance
     }
 
     func ray(_ event: NSEvent) -> (F3, F3) {
@@ -171,11 +194,18 @@ final class CableView: MTKView {
         renderer.target.z += Float(event.deltaY) * scale
     }
     override func scrollWheel(with event: NSEvent) {
-        renderer.distance = min(max(renderer.distance * (1 - Float(event.scrollingDeltaY) * 0.02), model.name == "cableethernet" ? 0.025 : 0.6), 30)
+        zoom(by: exp(-Float(event.scrollingDeltaY) * 0.02))
+    }
+    override func magnify(with event: NSEvent) {
+        zoom(by: exp(-Float(event.magnification)))
+    }
+    private func zoom(by factor: Float) {
+        renderer.distance = min(max(renderer.distance * factor, framingDistance / 20), framingDistance * 8)
     }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 49 { model.running.toggle() }
         else if event.charactersIgnoringModifiers == "r" { model.reset() }
+        else if event.charactersIgnoringModifiers == "f" { model.cameraRevision += 1; frameScene() }
         else { super.keyDown(with: event) }
     }
 }
@@ -209,6 +239,10 @@ struct PlaygroundContent: View {
                         model.reset()
                     }
                     Spacer()
+                    if model.name == "cableethernet" {
+                        Button(model.overview ? "Connector close-up" : "Whole cable") { model.overview.toggle() }
+                    }
+                    Button("Reset view") { model.cameraRevision += 1 }
                     Button(model.running ? "Pause" : "Play") { model.running.toggle() }
                     Button(model.name == "cableethernet" ? "Replay" : "Reset") { model.reset(); model.running = true }
                 }
@@ -218,6 +252,8 @@ struct PlaygroundContent: View {
                         Text(model.taskPhase).font(.headline).foregroundStyle(model.ethernetRun?.stopped == true ? .red : .primary)
                         Text(String(format:"Depth  %.2f mm", model.insertionDepth*1000))
                         Text(String(format:"Tool load  %.2f N / 20 N", model.toolForce))
+                        Spacer()
+                        Text("Plug 22.48 mm · Cable Ø 5.46 mm").foregroundStyle(.secondary)
                     }.font(.callout.monospacedDigit())
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 320))], alignment: .leading, spacing: 8) {
@@ -236,7 +272,7 @@ struct PlaygroundContent: View {
                     }
                     Spacer()
                 }
-                Text("Drag to grab · Option-drag to orbit · Right-drag to pan · Scroll to zoom · Space to pause · R to reset")
+                Text("Drag to grab · Option-drag to orbit · Right-drag to pan · Scroll/pinch to zoom · F to reset view · Space to pause · R to reset")
                     .font(.caption).foregroundStyle(.secondary)
                 if let failure = model.failure { Text(failure).foregroundStyle(.red) }
             }.padding(16)
@@ -297,7 +333,15 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
         renderer.setCamera(position: F3(-1.5, -4.0, 2.4), target: F3(-0.1, 0, 1.5), up: F3(0, 0, 1))
     } else if model.name == "cableethernet" {
         renderer.sceneLengthScale = 0.01
-        renderer.setCamera(position: F3(-0.082,-0.10,0.080), target: F3(-0.013,0,0.034), up: F3(0,0,1))
+        if model.overview {
+            let hint = model.solver.renderCameraHint
+            renderer.azimuth = hint.azimuth
+            renderer.elevation = hint.elevation
+            renderer.distance = hint.distance
+            renderer.target = hint.target
+        } else {
+            renderer.setCamera(position: F3(-0.082,-0.10,0.080), target: F3(-0.013,0,0.034), up: F3(0,0,1))
+        }
     } else {
         renderer.setCamera(position: F3(-2.3, -3.8, 3.0), target: F3(-0.25, 0, 0.8), up: F3(0, 0, 1))
     }
@@ -340,11 +384,12 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
     @MainActor static func main() async throws {
         let args = CommandLine.arguments
         if args.contains("--help") {
-            print("cable-playground [cableethernet|cabletwisting|cablegrippers|cableplastic] [--snapshot /path/image.png --steps 120] [--bend-release] [--insert]")
+            print("cable-playground [cableethernet|cabletwisting|cablegrippers|cableplastic] [--snapshot /path/image.png --steps 120] [--bend-release] [--insert] [--close-up]")
             return
         }
         let name = args.dropFirst().first(where: { demoNames.contains($0) }) ?? "cablegrippers"
         let model = try Playground(name: name)
+        model.overview = !args.contains("--close-up")
         if let index = args.firstIndex(of: "--snapshot"), index + 1 < args.count {
             let steps = args.firstIndex(of: "--steps").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 120
             try await snapshot(model, path: args[index + 1], steps: max(0, steps),

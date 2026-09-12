@@ -5,7 +5,13 @@ and hold. Replay resets the complete physical state. The plug housing is a
 deformable tetrahedral solid with a thin shell latch; the jack casing is rigid. The moving tool
 holds the rear boot and is coupled to a commanded wrist by three finite springs.
 Only the wrist pose is prescribed. Neither the plug nor its contact deformation
-is animated.
+is animated. The other cable end is attached to an already-mated connector on
+the bench. An approximately 30 cm service loop supplies slack through the full
+43 mm wrist stroke. The viewer starts with the complete apparatus in frame;
+**Connector close-up** and **Whole cable** switch inspection views. **Reset view**
+(or F) restores the current view; scroll and trackpad pinch zoom smoothly. Zoom limits
+and rendering tolerances follow the scene's presentation scale; physical units
+remain metres.
 
 ## Geometry and units
 
@@ -27,7 +33,7 @@ numerically ill-conditioned coating elements.
 | Part | Model | Reference or assumption |
 | --- | --- | --- |
 | Plug housing | Stable Neo-Hookean FEM, E = 2.4 GPa, ν = 0.37, density = 1200 kg/m³ | E and density use [Covestro Makrolon 2405](https://solutions.covestro.com/en/products/makrolon/makrolon-2405_000000000000945088) as a generic polycarbonate reference; the connector's resin grade and Poisson ratio are unmeasured. |
-| Latch | 0.47 mm plane-stress membrane and plate bending, same PC material, two shared root rows | Thickness and free angle are authored assumptions. The shell avoids the bending stiffness error of a single layer of linear tetrahedra. Its rounded contact boundary is included in the 3.15 mm envelope. |
+| Latch | 0.47 mm plane-stress membrane and plate bending, same PC material, two shared root rows | Thickness and free angle are authored assumptions. The shell avoids the bending stiffness error of a single layer of linear tetrahedra. Its rounded contact boundary is included in the 3.15 mm envelope. Internal velocity smoothing damps unresolved shell vibration (0.3 per 480 Hz step); this is a numerical viscosity approximation, not measured PC loss data. |
 | Socket contacts | Eight 8 mm × 0.30 mm spring wires; one rod and finite root spring each, tip stiffness 3EI/L³ | E = 110 GPa, density approximately 8800 kg/m³ from [Copper Development Association C52100](https://alloys.copper.org/alloy/C52100). Wire dimensions, preload and one-mode approximation are authored assumptions. |
 | Cable | Native shearable, extensible rod; EA = 3000 N, GA = 1200 N, EI = 0.002 N·m², GJ = 0.001 N·m² | Effective properties of the entire jacketed cable; require measurement. Individual copper strands are not resolved. |
 | Wrist/tool compliance | Three 8000 N/m springs at noncollinear anchors, plus a 15 N·m/rad orientation spring | Represents a compliant tool mount, not a calibrated robot servo. |
@@ -55,7 +61,16 @@ Every vertex also receives its ordinary VBD update. Material moduli and nodal
 masses are unchanged. The coarse pass combines complete contact stencils,
 including barycentric cross terms, and uses a shared displacement fraction so
 its update cannot invert an internal tet. Default scenes allocate no group
-buffers and dispatch no coarse passes.
+buffers and dispatch no coarse passes. Small assemblies use one persistent
+workgroup for the complete colored solve, reusing the existing eight-lane vertex
+kernel and a 64-lane coarse reduction. There are no cross-workgroup spin waits.
+`AVBD_MOTION_DISPATCHED=1` selects the original dispatch schedule for comparison.
+
+V-T/E-E surface queries now honor each connected component's authored
+self-contact flag. A single mixed solid/shell component with self-contact off
+skips queries that cannot produce contacts. Rigid/cable-to-surface queries and
+contact between separate soft components remain active. This also removes
+unintended latch-to-housing contacts from the insertion task.
 
 Current scope is disjoint assemblies containing complete elastic elements,
 with ball attachments and rigid handles. Shell features are supported in mixed
@@ -72,32 +87,40 @@ over time. Ordinary, unflagged rigid capsules retain their compatibility path.
 ## Reproduction
 
 The task contains 236 dynamic particles: 684 housing tetrahedra and 20 latch
-triangles, with volume/area-lumped mass of 1.159 g. On Apple M5, the qualified
-480 Hz / 48-iteration run seats at 14.782 mm, with 2.708 N peak tool load,
-0.470 mm latch deformation and approximately 0.813 mm deflection of all eight
-contact wires. The sampled contact-skin overlap is 26.2 µm (the rigid contact
-margin is 25 µm), and the minimum sampled tet volume ratio is 0.99874. Sampled
-contact-wire axes remain outside the housing at seating. A fresh process
-produces a byte-identical force/depth trace.
+triangles, with volume/area-lumped mass of 1.159 g. The qualified default uses
+480 Hz and 16 iterations. On Apple M5 it seats at 14.780 mm with a 2.303 N peak
+mount load. All eight contact wires deflect approximately 0.811 mm and the latch
+bends 0.444 mm during insertion. Sampled contact-skin overlap stays below 29 µm
+(the rigid contact margin is 25 µm), and minimum sampled tet volume ratio is
+0.99973. Sampled contact-wire axes remain outside the housing at seating.
 
-At 96 iterations, seated depth is 14.804 mm, contact deflection differs by
-less than 0.001 mm, and peak tool load is 3.321 N. These are solver sensitivity
-checks, not a calibrated hardware force curve. The 24-iteration and 240 Hz
-alternatives fail the task; 32 iterations seats but has larger attachment error.
-The stiff FEM task currently runs slower than real time (about 32 s wall time
-for the 8 s headless cycle at the default settings on this M5). The optional
-coarse pass is not dispatched by ordinary cable scenes.
+The pre-contact latch-tip excursion is below 53 µm, versus millimetres without
+internal damping; the final half-second's tip variation is about 1.1 µm. The
+remote cable anchor remains within 0.6 µm. These are checked over the trajectory,
+not inferred from a final screenshot. A 1.2 mm lateral error stops the nose
+approximately 0.40 mm before the socket mouth at the 20 N force budget.
+
+The 24-iteration comparison seats at 14.762 mm with a 2.072 N peak load, and the
+48-iteration reference seats at 14.762 mm with a 2.007 N peak load. This is a solver sensitivity check,
+not a calibrated hardware force curve. The 240 Hz alternatives produced
+inconsistent force spikes under iteration refinement and are not the default.
+The headless 8-second cycle has measured roughly 7–13 seconds on this M5
+(9.45 seconds in the final regression run). Background GPU load affects these
+timings. The viewer limits physics work per draw to 12 ms to keep camera and
+controls responsive, preserving the fixed physical timestep when it falls
+behind wall time. This is not a guarantee of real-time performance.
 
 ```sh
 swift build -c release --product cable-validation
 .build/release/cable-validation --ethernet-authoring
 .build/release/cable-validation --motion-groups
+.build/release/cable-validation --surface-policy
 .build/release/cable-validation --shader-regressions
 .build/release/cable-validation --ethernet
 ETHERNET_OFFSET_MM=1.2 .build/release/cable-validation --ethernet
 ```
 
-`ETHERNET_ITERS` and `ETHERNET_DT` override the headless task's solver schedule
+`ETHERNET_ITERS`, `ETHERNET_DT`, and `ETHERNET_VISCOSITY` override the headless task's solver schedule
 for convergence checks. Runs write SI-unit force/depth traces under `/tmp`.
 
 ## Sim-to-real status

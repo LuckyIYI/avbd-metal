@@ -92,3 +92,38 @@ func validateCableSurfaceContact() throws {
     }
     print("PASS native cable catches a face between sphere samples; ordinary capsule compatibility preserved")
 }
+
+/// Legacy V-T/E-E must use the physical self-contact policy, independent of
+/// whether a vertex is rendered as a sheet or as a tet boundary.
+func validateSurfaceContactPolicy() throws {
+    func folded(selfContact: Bool, separate: Bool) -> PhysicsScene {
+        var scene = PhysicsScene(name: "folded surface policy")
+        scene.settings.gravity = 0
+        scene.settings.dt = 1/240
+        scene.settings.iterations = 1
+        scene.settings.deterministic = true
+        scene.settings.deformableCollisionMargin = 0.00001
+        for row in 0..<7 {
+            let x = Float(row <= 3 ? row : 6-row)*0.01
+            let z: Float = row <= 2 ? 0 : row == 3 ? 0.00025 : 0.0005
+            for y: Float in [-0.005,0.005] {
+                _ = scene.addParticle(radius:0.0004,mass:0.001,position:F3(x,y,z))
+            }
+        }
+        for row in 0..<6 where !separate || (row != 2 && row != 3) {
+            let a = 2*row, b = a+2
+            scene.addTri(SceneTri(ids:(a,b,b+1),selfCollisionEnabled:selfContact))
+            scene.addTri(SceneTri(ids:(a,b+1,a+1),selfCollisionEnabled:selfContact))
+        }
+        return scene
+    }
+    for (selfContact,separate) in [(false,false),(true,false),(false,true)] {
+        let solver = try GPUSolver(scene: folded(selfContact:selfContact,separate:separate))
+        try solver.submitStep()
+        try solver.synchronize()
+        let expectContact = selfContact || separate
+        try require(expectContact ? solver.lastNumSoft > 0 : solver.lastNumSoft == 0,
+            "surface policy self=\(selfContact) separate=\(separate) emitted \(solver.lastNumSoft)")
+    }
+    print("PASS surface self-contact off/on and separate-body contact with self-contact off")
+}

@@ -117,7 +117,7 @@ uses the inactive motor fields as explicitly tagged material storage and
 adds no fields to the existing joint layout. On this branch the record is
 256 bytes; PR #36 independently appends joint-response storage, so that
 absolute size is not a promise about a future merged layout. The cable tag
-is bit 7 (128), separate from bit 6 (64) used by break-load joints. No
+is bit 8 (256), separate from physical break loads (64) and finite scalar fracture (128). No
 cable-only buffers or dispatches are added. Elastic undamped joints skip history evaluation; zero angular rigidity skips
 the angular logarithm. Reset preserves the material coefficients.
 
@@ -133,12 +133,12 @@ also lists them.
 
 | Scene ID | Interaction |
 |---|---|
-| `cableethernet` | Watch a compliant tool physically insert a deformable Ethernet plug; vary alignment or replay the task. |
+| `cableethernet` | Watch a compliant tool insert a deformable Ethernet plug; the cable connects to a second fixture through a service loop. |
 | `cabletwisting` | Two clamped, striped strands wind into a braid. |
 | `cablegrippers` | Pull a routed cable out of four white C clips on a grooved L frame. |
 | `cableplastic` | Bend the blue elastic and copper plastic cantilevers; release to compare spring-back. |
 
-![Deformable Ethernet plug and rigid socket](Images/Cables/ethernet.png)
+![Connected Ethernet insertion apparatus](Images/Cables/ethernet.png)
 
 The Ethernet task uses a 22.48 × 11.68 × 6.60 mm plug, a polycarbonate FEM
 housing, a bending latch, eight spring contacts, and a rigid shielded socket

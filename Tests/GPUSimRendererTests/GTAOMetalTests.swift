@@ -87,9 +87,10 @@ final class GTAOMetalTests: XCTestCase {
         var milliseconds: Double
     }
 
-    private func uniforms(width: Int, height: Int, eye: SIMD3<Float> = .zero) -> Uniforms {
+    private func uniforms(width: Int, height: Int, eye: SIMD3<Float> = .zero,
+                          sceneScale: Float = 1) -> Uniforms {
         let y: Float = 1 / tan(25 * .pi / 180)
-        let near: Float = 0.1, far: Float = 1000
+        let near: Float = 0.1 * sceneScale, far: Float = 1000 * sceneScale
         let projection = simd_float4x4(columns: (
             SIMD4(y * Float(height) / Float(width), 0, 0, 0),
             SIMD4(0, y, 0, 0),
@@ -99,7 +100,7 @@ final class GTAOMetalTests: XCTestCase {
         view.columns.3 = SIMD4(-eye, 1)
         let vp = projection * view
         return Uniforms(viewProj: vp, lightDir: .zero, eye: SIMD4(eye, 0),
-            screen: SIMD4(Float(width), Float(height), Float(height) * y * 0.5, 0),
+            screen: SIMD4(Float(width), Float(height), Float(height) * y * 0.5, sceneScale),
             camRight: SIMD4(1, 0, 0, 0), camUp: SIMD4(0, -1, 0, 0),
             prevViewProj: vp, temporal: SIMD4(0, 1, 0, 0),
             shadowViewProj: matrix_identity_float4x4, shadowParams: .zero,
@@ -112,7 +113,7 @@ final class GTAOMetalTests: XCTestCase {
                         frames: Int = 1, eye: SIMD3<Float> = .zero, finalFixture: Fixture? = nil,
                         captureFrames: Set<Int> = [],
                         camera: ((Int) -> SIMD3<Float>)? = nil,
-                        capturePreciseResolve: Bool = false) throws -> Result {
+                        capturePreciseResolve: Bool = false, sceneScale: Float = 1) throws -> Result {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal is unavailable") }
         // Exercise the shader library and pass chain used by the renderer.
         let library = try device.makeLibrary(source: renderShaderSource + fixtureShader, options: nil)
@@ -150,7 +151,7 @@ final class GTAOMetalTests: XCTestCase {
         depthDesc.isDepthWriteEnabled = true
         depthDesc.depthCompareFunction = .always
         let depthState = try XCTUnwrap(device.makeDepthStencilState(descriptor: depthDesc))
-        var U = uniforms(width: width, height: height, eye: eye)
+        var U = uniforms(width: width, height: height, eye: eye, sceneScale: sceneScale)
         var F = fixture
         var gpuTime: Double = 0
         var previousEye = camera?(0) ?? eye
@@ -159,7 +160,7 @@ final class GTAOMetalTests: XCTestCase {
             let currentEye = camera?(frame) ?? eye
             let movedCamera = currentEye != previousEye
             let previousVP = U.viewProj
-            U = uniforms(width: width, height: height, eye: currentEye)
+            U = uniforms(width: width, height: height, eye: currentEye, sceneScale: sceneScale)
             U.prevViewProj = frame == 0 ? U.viewProj : previousVP
             U.prevInvViewProj = U.prevViewProj.inverse
             U.temporal = SIMD4((Float(frame % 64) * 0.6180339887).truncatingRemainder(dividingBy: 1),
@@ -238,6 +239,29 @@ final class GTAOMetalTests: XCTestCase {
                           preciseResolved: preciseVisibility.map { try read($0) },
                           snapshots: snapshots, rawSnapshots: rawSnapshots,
                           milliseconds: gpuTime * 1000 / Double(max(frames - 8, 1)))
+    }
+
+    func testSmallSceneKeepsEquivalentContactShading() throws {
+        // Equivalent camera and geometry in metres and centimetres must have
+        // the same screen-space contact shadow, including the raw estimator.
+        let fixture = Fixture(plane: SIMD4(0, 0, 1, -3),
+                              boxMin: SIMD4(-0.2, -0.35, -3, 1),
+                              boxMax: SIMD4(0.2, 0.35, -2.8, 1))
+        let eye = SIMD3<Float>(1.2, 0, 0)
+        let reference = try render(fixture, eye: eye)
+        let scale: Float = 0.01
+        var small = fixture
+        small.plane.w *= scale
+        small.boxMin *= SIMD4(scale, scale, scale, 1)
+        small.boxMax *= SIMD4(scale, scale, scale, 1)
+        let result = try render(small, eye: eye * scale, sceneScale: scale)
+        XCTAssertLessThan(try XCTUnwrap(reference.raw.min()), 0.9,
+                          "the fixture must exercise real contact occlusion")
+        for (a, b) in [(reference.raw, result.raw), (reference.resolved, result.resolved)] {
+            let errors = zip(a, b).map { abs($0 - $1) }.sorted()
+            XCTAssertLessThan(errors.reduce(0, +) / Float(errors.count), 0.006)
+            XCTAssertLessThan(errors[errors.count * 99 / 100], 0.025)
+        }
     }
 
     func testUnoccludedTiltedPlanesStayUnoccluded() throws {

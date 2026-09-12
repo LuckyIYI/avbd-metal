@@ -161,14 +161,25 @@ func validateEthernetDemo() throws {
     let offset = env["ETHERNET_OFFSET_MM"].flatMap(Float.init) ?? 0
     var task = Demos.ethernetInsertionTask(lateralError: offset * 0.001)
     if let v = env["ETHERNET_ITERS"].flatMap(Int.init) { task.scene.settings.iterations = v }
-    if let v = env["ETHERNET_DT"].flatMap(Float.init) { task.scene.settings.dt = v }
+    if let v = env["ETHERNET_DT"].flatMap(Float.init) {
+        task.scene.settings.clothViscosity = 1-pow(1-task.scene.settings.clothViscosity,v/task.scene.settings.dt)
+        task.scene.settings.dt = v
+    }
+    if let v = env["ETHERNET_VISCOSITY"].flatMap(Float.init) { task.scene.settings.clothViscosity = v }
     let scene = task.scene
     let solver = try GPUSolver(scene: scene)
+    solver.profiling = env["ETHERNET_PROFILE"] != nil
     var run = EthernetInsertionRun(task: task)
     let begin = ProcessInfo.processInfo.systemUptime
     var minJ: Float = 1, peakPenetration: Float = 0, peakGap: Float = 0
+    let tip = task.latchNodes.min { scene.bodies[$0].position.x < scene.bodies[$1].position.x }!
+    let tipRest = scene.bodies[task.toolBody].rotation.inverse.act(
+        scene.bodies[tip].position-scene.bodies[task.toolBody].position)
+    var freeTipExcursion: Float = 0, remoteGap: Float = 0
+    var holdMin = F3(repeating: Float.infinity), holdMax = F3(repeating: -Float.infinity)
+    let remoteBond = scene.joints.first { $0.bodyA == task.remoteConnectorBody && $0.bodyB == task.cable.bodyIDs[0] }!
     let bonds = scene.joints.filter { Set(task.plugNodes).contains($0.bodyB) }
-    var trace = ["time_s,command_x_m,nose_x_m,nose_y_m,nose_z_m,fx_N,fy_N,fz_N,stopped"]
+    var trace = ["time_s,command_x_m,nose_x_m,nose_y_m,nose_z_m,fx_N,fy_N,fz_N,stopped,latch_tip_x_m,latch_tip_y_m,latch_tip_z_m"]
     var stoppedFrames = 0
     for step in 0..<Int(ceil(EthernetInsertionTask.duration / scene.settings.dt)) {
         let c = run.command
@@ -178,7 +189,14 @@ func validateEthernetDemo() throws {
         let nose = task.noseNodes.reduce(F3.zero) { $0 + solver.bodyPosition($1) } / Float(task.noseNodes.count)
         run.observe(toolPosition: solver.bodyPosition(task.toolBody),
                     toolRotation: solver.bodyRotation(task.toolBody), noseCenter: nose)
-        trace.append("\(Float(step)*scene.settings.dt),\(c.position.x),\(nose.x),\(nose.y),\(nose.z),\(run.force.x),\(run.force.y),\(run.force.z),\(run.stopped)")
+        let toolP = solver.bodyPosition(task.toolBody), toolQ = solver.bodyRotation(task.toolBody)
+        let tipLocal = toolQ.inverse.act(solver.bodyPosition(tip)-toolP)
+        let physicalTime = Float(step)*scene.settings.dt
+        if physicalTime < 3.5 { freeTipExcursion = max(freeTipExcursion,length(tipLocal-tipRest)) }
+        if physicalTime > 7.5 { holdMin = min(holdMin,tipLocal); holdMax = max(holdMax,tipLocal) }
+        remoteGap = max(remoteGap,distance(endpoint(solver,task.cable,start:true),
+            scene.bodies[task.remoteConnectorBody].position+remoteBond.rA))
+        trace.append("\(Float(step)*scene.settings.dt),\(c.position.x),\(nose.x),\(nose.y),\(nose.z),\(run.force.x),\(run.force.y),\(run.force.z),\(run.stopped),\(tipLocal.x),\(tipLocal.y),\(tipLocal.z)")
         if step % 120 == 119 || run.stopped {
             let positions = scene.bodies.indices.map { solver.bodyPosition($0) }
             for tet in scene.tets {
@@ -223,7 +241,12 @@ func validateEthernetDemo() throws {
     let tracePath = "/tmp/ethernet-trace-\(offset)-\(scene.settings.iterations)-\(scene.settings.dt).csv"
     try trace.joined(separator: "\n").write(toFile: tracePath, atomically: true, encoding: .utf8)
     print("ETHERNET result phase=\(run.phase) nose=\(run.noseCenter) peak_N=\(run.peakForce) minJ=\(minJ) penetration_um=\(peakPenetration*1e6) wall_s=\(ProcessInfo.processInfo.systemUptime-begin) trace=\(tracePath)")
+    let holdRange = holdMin.x.isFinite ? (holdMax-holdMin)*1e6 : .zero
+    print("LATCH precontact_excursion_um=\(freeTipExcursion*1e6) hold_range_um=\(holdRange) remote_anchor_gap_um=\(remoteGap*1e6)")
+    try require(remoteGap < 0.000025,"remote cable termination detached")
+    try require(freeTipExcursion < 0.00015,"latch flutter before contact exceeds 0.15 mm")
     if offset == 0 {
+        try require((holdMax-holdMin).max() < 0.00005,"seated latch vibration exceeds 50 micrometers")
         try require(run.seated, "nominal insertion must seat without exceeding the force limit")
         try require(peakPenetration < 0.00005, "socket penetration including contact skins: \(peakPenetration)m")
         let deflections = task.contactWires.map { wire -> Float in
@@ -263,6 +286,7 @@ func validateEthernetDemo() throws {
         try require(run.stopped && !run.seated && run.noseCenter.x < 0.010,
                     "misalignment must stop before seating")
     }
+    if solver.profiling { print("PROFILE \(solver.profileFrames) \(solver.profileNS.sorted { $0.value > $1.value })") }
     print("PASS Ethernet offset=\(offset)mm iterations=\(scene.settings.iterations)")
 }
 
@@ -292,5 +316,11 @@ func validateEthernetTopology() throws {
         return sum + length(cross(p[1]-p[0],p[2]-p[0]))/2 * 0.00047
     }
     try require(abs(mass-(volume+latchVolume)*1200)<1e-7,"SI nodal mass mismatch")
+    let rootBond = scene.joints.first { $0.bodyA == task.remoteConnectorBody && $0.bodyB == task.cable.bodyIDs[0] }
+    try require(rootBond != nil && !scene.bodies[task.remoteConnectorBody].isDynamic,"remote connector must anchor the cable")
+    let root = scene.bodies[task.remoteConnectorBody].position+rootBond!.rA
+    let endCommand = task.command(at:EthernetInsertionTask.duration)
+    let end = endCommand.position+endCommand.rotation.act(F3(-0.004,0,0))
+    try require(task.cable.restLengths.reduce(0,+)-distance(root,end)>0.04,"insufficient service-loop slack")
     print("PASS SI plug nodes=\(task.plugNodes.count) tets=\(scene.tets.count) latch_triangles=\(scene.tris.count) mass_g=\(mass*1000)")
 }

@@ -168,12 +168,17 @@ final class SimulationModel: ObservableObject, RenderableModel {
 
         let dt = Double(solver.settings.dt)
         var steps = 0
+        let maxSteps = ethernetRun != nil ? max(4, Int(ceil(1 / (60 * dt)))) : 4
         do {
             let batchStart = CACurrentMediaTime()
-            while stepAccumulator >= dt && steps < 4 {
+            while stepAccumulator >= dt && steps < maxSteps {
                 try advancePhysics(solver)
                 stepAccumulator -= dt
                 steps += 1
+                if ethernetRun != nil && CACurrentMediaTime() - batchStart >= 0.012 {
+                    stepAccumulator = min(stepAccumulator, dt)
+                    break
+                }
             }
             // Retire physics for CPU observations and the next presentation
             // snapshot. The previous render uses immutable buffers and can
@@ -189,7 +194,7 @@ final class SimulationModel: ObservableObject, RenderableModel {
             statsText = "solver stopped: \(error.localizedDescription)"
             return
         }
-        if steps == 4 { stepAccumulator = 0 }  // avoid spiral of death
+        if steps == maxSteps { stepAccumulator = 0 }  // avoid spiral of death
 
         frameCounter += 1
         if frameCounter % 15 == 0 {

@@ -305,6 +305,10 @@ func benchmark() throws {
 @main struct CableValidation {
     static func main() throws {
         setbuf(stdout, nil)
+        if CommandLine.arguments.contains("--surface-policy") {
+            try validateSurfaceContactPolicy()
+            return
+        }
         if CommandLine.arguments.contains("--motion-groups") {
             try validateRigidMotionGroups()
             return

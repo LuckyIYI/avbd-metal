@@ -61,6 +61,8 @@ public final class GPUSolver {
     private var rigidMotionMembers: MTLBuffer?
     private var rigidMotionOwners: MTLBuffer?
     private var rigidMotionMass: MTLBuffer?
+    private let rigidMotionThreadWidth = max(64, min(256,
+        (ProcessInfo.processInfo.environment["AVBD_MOTION_THREADS"].flatMap(Int.init) ?? 256) / 64 * 64))
     private var rigidMotionRanges: [SIMD2<UInt32>] = []
 
     // Capacities
@@ -1879,7 +1881,7 @@ public final class GPUSolver {
                 && $0.lastPathComponent != Self.optimizedConvexShaderName
         }
         let lib = try Self.compileLibrary(device: device, urls: urls)
-        for name in ["rigid_motion_solve", "rigid_motion_contact_penalties"] {
+        for name in ["rigid_motion_solve", "rigid_motion_contact_penalties", "rigid_motion_persistent"] {
             guard let fn = lib.makeFunction(name: name) else { throw AVBDError.kernelMissing(name) }
             pso[name] = try device.makeComputePipelineState(function: fn)
         }
@@ -2171,6 +2173,7 @@ public final class GPUSolver {
         // away; an incompatible bundle fails at load time, before simulation.
         source += """
         \nstatic_assert(sizeof(JointGPU) == \(MemoryLayout<JointGPU>.stride), "Swift/Metal joint stride mismatch; rebuild the app with its shader bundle");
+        static_assert((JOINT_CABLE & 255u) == 0u, "Cable tag aliases ordinary joint flags");
         static_assert(JOINT_CABLE == \(JointGPU.cableFlag)u, "Swift/Metal cable flag mismatch; rebuild the app with its shader bundle");
         """
         let options = MTLCompileOptions()
@@ -3765,16 +3768,15 @@ public final class GPUSolver {
     /// launch-bound, so this is the number to watch when a frame's GPU time
     /// does not track its arithmetic.
     public private(set) var dispatchesLastFrame = 0
-    /// V-T and E-E emission drop every candidate inside one solid (the
-    /// `sameSolid_` gate in the kernels), so a scene whose surface elements
-    /// all belong to a single solid without cloth vertices never emits a
-    /// surface contact. Skipping the element grid and both emitters there is
-    /// exact. Rigid-vs-triangle emission is independent and still runs.
+    /// V-T/E-E reject every candidate within a connected surface with
+    /// self-contact disabled, including mixed solid/shell assemblies. Skip
+    /// their grid and emission only when all query/target vertices belong to
+    /// that one component. Rigid/cable-to-triangle queries still run.
     private lazy var surfaceEmissionNeeded: Bool = {
         guard numTris > 0 else { return false }
         let groups = clothGroupBuf.contents()
             .bindMemory(to: UInt32.self, capacity: numBodies)
-        let cloth = clothVertFlag.contents()
+        let selfContact = softSelfCollisionFlag.contents()
             .bindMemory(to: UInt32.self, capacity: numBodies)
         let tris = trisBuf.contents()
             .bindMemory(to: SIMD4<UInt32>.self, capacity: numTris)
@@ -3782,7 +3784,7 @@ public final class GPUSolver {
             .bindMemory(to: UInt32.self, capacity: max(1, numParticles))
         var solidGroups = Set<UInt32>()
         func touches(_ v: Int) -> Bool {
-            if groups[v] == 0 || cloth[v] != 0 { return true }
+            if groups[v] == 0 || selfContact[v] != 0 { return true }
             solidGroups.insert(groups[v])
             return false
         }
@@ -6159,7 +6161,7 @@ public final class GPUSolver {
         if numTris > 0 {
             if !isPlanarDAT, !surfaceEmissionNeeded,
                !forceSurfaceEmissionForTesting {
-                // Single solid, no cloth: the emitters would drop every
+                // One component with self-contact off: emitters drop every
                 // candidate (see surfaceEmissionNeeded). Exact skip.
             } else if !isPlanarDAT {
             try stage("el-bin")
@@ -6194,7 +6196,7 @@ public final class GPUSolver {
                 e.setBuffer(self.nbr2Count, offset: 0, index: 23)
                 e.setBuffer(self.nbr2List, offset: 0, index: 24)
                 e.setBuffer(self.clothGroupBuf, offset: 0, index: 25)
-                e.setBuffer(self.clothVertFlag, offset: 0, index: 26)
+                e.setBuffer(self.softSelfCollisionFlag, offset: 0, index: 26)
             }
             }
             try stage("ee-emit")
@@ -6227,7 +6229,7 @@ public final class GPUSolver {
                 e.setBuffer(self.nbr2Count, offset: 0, index: 24)
                 e.setBuffer(self.nbr2List, offset: 0, index: 25)
                 e.setBuffer(self.clothGroupBuf, offset: 0, index: 26)
-                e.setBuffer(self.clothVertFlag, offset: 0, index: 27)
+                e.setBuffer(self.softSelfCollisionFlag, offset: 0, index: 27)
             }
             }
             }
@@ -6642,7 +6644,7 @@ public final class GPUSolver {
         // Metal guarantees no forward progress between threadgroups, and the
         // arrive-and-spin barrier wedged the queue. Kept for further study.
         let multiOK = ProcessInfo.processInfo.environment["AVBD_MULTI"] != nil
-        // The dispatched solver is the canonical path at every scene size.
+        // Ordinary scenes keep the dispatched solver at every scene size.
         // Switching to a different numerical kernel at the threadgroup-size
         // boundary made otherwise identical vectorized RL replicas diverge.
         // Keep the scalar persistent kernel as an explicit benchmark/debug
@@ -6651,7 +6653,50 @@ public final class GPUSolver {
             || (ProcessInfo.processInfo.environment["AVBD_PERSIST"] != nil
                 && ProcessInfo.processInfo.environment[
                     "AVBD_NO_PERSIST"] == nil)
-        if multiOK && rigidMotionRanges.isEmpty && !isPlanarDAT && !hasTorsionalFriction
+        // Closed stiff assemblies explicitly opt into a common-motion solve.
+        // Keep that solve on one workgroup at interactive scene sizes. The
+        // reference dispatch path remains available for numerical comparisons.
+        if !rigidMotionRanges.isEmpty && rigidMotionRanges.count <= 128
+            && numBodies <= 1024 && !isPlanarDAT && !hasTorsionalFriction && !noRSplit
+            && ProcessInfo.processInfo.environment["AVBD_MOTION_DISPATCHED"] == nil {
+            enc.setComputePipelineState(ps("rigid_motion_persistent"))
+            enc.setBuffer(posLin, offset: 0, index: 0)
+            enc.setBuffer(posAng, offset: 0, index: 1)
+            enc.setBuffer(initLin, offset: 0, index: 2)
+            enc.setBuffer(initAng, offset: 0, index: 3)
+            enc.setBuffer(inertLin, offset: 0, index: 4)
+            enc.setBuffer(inertAng, offset: 0, index: 5)
+            enc.setBuffer(props, offset: 0, index: 6)
+            enc.setBuffer(joints, offset: 0, index: 7)
+            enc.setBuffer(springs, offset: 0, index: 8)
+            enc.setBuffer(manifolds, offset: 0, index: 9)
+            enc.setBuffer(adjStart, offset: 0, index: 10)
+            enc.setBuffer(degrees, offset: 0, index: 11)
+            enc.setBuffer(adjList, offset: 0, index: 12)
+            enc.setBuffer(activeColorList, offset: 0, index: 13)
+            enc.setBuffer(activeColorStart, offset: 0, index: 14)
+            enc.setBuffer(counters, offset: 0, index: 15)
+            enc.setBytes(&P, length: MemoryLayout<SimParamsGPU>.stride, index: 16)
+            enc.setBuffer(shape, offset: 0, index: 17)
+            enc.setBuffer(tets, offset: 0, index: 18)
+            enc.setBuffer(softContacts, offset: 0, index: 19)
+            enc.setBuffer(membranes, offset: 0, index: 20)
+            enc.setBuffer(bends, offset: 0, index: 21)
+            enc.setBuffer(rigidMotionMembers, offset: 0, index: 22)
+            enc.setBuffer(rigidMotionOwners, offset: 0, index: 23)
+            rigidMotionRanges.withUnsafeBytes { spans in
+                enc.setBytes(spans.baseAddress!, length: spans.count, index: 24)
+            }
+            var groupCount = UInt32(rigidMotionRanges.count)
+            enc.setBytes(&groupCount, length: 4, index: 25)
+            enc.setBuffer(boundsBuf, offset: 0, index: 26)
+            enc.setBuffer(ogcPrevBuf, offset: 0, index: 27)
+            enc.setBuffer(counters, offset: 0, index: 28)
+            noteDispatch("rigid_motion_persistent")
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: min(rigidMotionThreadWidth,
+                                        ps("rigid_motion_persistent").maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        } else if multiOK && rigidMotionRanges.isEmpty && !isPlanarDAT && !hasTorsionalFriction
             && numBodies <= 4096 {
             let tgW = min(256, multiPSO.maxTotalThreadsPerThreadgroup)
             var ntg = UInt32(min(8, max(1, (numBodies + tgW - 1) / tgW + 1)))

@@ -678,7 +678,7 @@ struct Uniforms {
     float4x4 viewProj;
     float4 lightDir;    // xyz
     float4 eye;         // xyz
-    float4 screen;      // x,y = drawable size; z = px per world unit at d=1
+    float4 screen;      // xy: drawable size; z: px/world unit at d=1; w: presentation length scale
     float4 camRight;    // xyz: world dir of screen +x
     float4 camUp;       // xyz: world dir of UV +y (down on screen)
     float4x4 prevViewProj;
@@ -1535,9 +1535,12 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
     public private(set) var scene: (any GPUSimRenderableScene)?
     public var options = GPUSimRenderOptions()
     /// Presentation length reference for small SI-unit scenes. Scales camera
-    /// clipping and light-map minimum extent, never simulation coordinates.
+    /// clipping, lighting distances and tolerances, never simulation coordinates.
     public var sceneLengthScale: Float = 1 {
-        didSet { precondition(sceneLengthScale.isFinite && sceneLengthScale > 0) }
+        didSet {
+            precondition(sceneLengthScale.isFinite && sceneLengthScale > 0)
+            if sceneLengthScale != oldValue { resetTemporalHistory() }
+        }
     }
     /// Presentation-only overrides keyed by simulation body index. A live
     /// source's `rendererBodyAppearances` takes precedence when present.
@@ -2600,7 +2603,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
         var U = Uniforms(viewProj: vp,
                          lightDir: SIMD4(lightDirection, 0),
                          eye: SIMD4(activeEye, 0),
-                         screen: SIMD4(renderSize.x, renderSize.y, pxPerUnit, 0),
+                         screen: SIMD4(renderSize.x, renderSize.y, pxPerUnit, sceneLengthScale),
                          camRight: SIMD4(camR, 0),
                          camUp: SIMD4(-camU, 0),
                          prevViewProj: prevVP ?? vp,
@@ -3152,7 +3155,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
                 enc.setFragmentTexture(displayTransform?.texture, index: 8)
                 if metalFX != nil {
                     U.viewProj = unjitteredVP; U.invViewProj = unjitteredVP.inverse
-                    U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, 0)
+                    U.screen = SIMD4(viewportSize.x, viewportSize.y, pxPerUnit * viewportSize.y / renderSize.y, sceneLengthScale)
                     U.reconstruction.y = 0; U.reconstruction.z = 0
                 }
                 bindSurfaceLighting(enc)

@@ -331,6 +331,11 @@ final class InteractiveMTKView: MTKView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let r = coordinator?.renderer else { return }
-        r.distance = min(max(r.distance * (1 - Float(event.scrollingDeltaY) * 0.02), 2 * r.sceneLengthScale), 400 * r.sceneLengthScale)
+        r.distance = min(max(r.distance * exp(-Float(event.scrollingDeltaY) * 0.02), 2 * r.sceneLengthScale), 400 * r.sceneLengthScale)
+    }
+
+    override func magnify(with event: NSEvent) {
+        guard let r = coordinator?.renderer else { return }
+        r.distance = min(max(r.distance * exp(-Float(event.magnification)), 2 * r.sceneLengthScale), 400 * r.sceneLengthScale)
     }
 }

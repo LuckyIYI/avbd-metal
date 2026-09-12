@@ -1,6 +1,6 @@
 // Optional coarse motion correction for stiff, closed tetrahedral assemblies.
 // Compiled separately: it does not alter the established solver's codegen.
-// One 64-lane workgroup performs a six-DOF subspace Newton step. Local VBD
+// A 64-lane reduction performs a six-DOF subspace Newton step. Local VBD
 // still solves all vertex deformation DOFs. Internal elastic energies are
 // invariant under this common SE(3) transform and contribute no stiffness.
 inline PrimalAccum motionZero() {
@@ -20,27 +20,25 @@ inline PrimalAccum motionProject(PrimalAccum a, float3 r) {
 inline bool motionMember(uint b, uint group, device const uint* owners) {
     return b!=WORLD_BODY && owners[b]==group;
 }
-kernel void rigid_motion_solve(
-    device float4* posLin [[buffer(0)]], device float4* posAng [[buffer(1)]],
-    device const float4* initLin [[buffer(2)]], device const float4* initAng [[buffer(3)]],
-    device const float4* inertLin [[buffer(4)]], device const float4* inertAng [[buffer(5)]],
-    device const float4* props [[buffer(6)]], device const JointGPU* joints [[buffer(7)]],
-    device const SpringGPU* springs [[buffer(8)]], device const ManifoldGPU* manifolds [[buffer(9)]],
-    device const uint* adjStart [[buffer(10)]], device const uint* adjCount [[buffer(11)]],
-    device const uint* adjList [[buffer(12)]], device const float4* shape [[buffer(13)]],
-    device const SoftContactGPU* soft [[buffer(14)]], device const uint* members [[buffer(15)]],
-    device const uint* owners [[buffer(16)]], constant uint2& span [[buffer(17)]],
-    constant uint& group [[buffer(18)]], constant SimParams& P [[buffer(19)]],
-    device const uint* bounds [[buffer(20)]], device const float4* ogcPrev [[buffer(21)]],
-    device atomic_uint* counters [[buffer(22)]], uint lane [[thread_index_in_threadgroup]])
+inline void rigidMotionStep(
+    device float4* posLin, device float4* posAng,
+    device const float4* initLin, device const float4* initAng,
+    device const float4* inertLin, device const float4* inertAng,
+    device const float4* props, device const JointGPU* joints,
+    device const SpringGPU* springs, device const ManifoldGPU* manifolds,
+    device const uint* adjStart, device const uint* adjCount,
+    device const uint* adjList, device const float4* shape,
+    device const SoftContactGPU* soft, device const uint* members,
+    device const uint* owners, uint2 span,
+    uint group, constant SimParams& P,
+    device const uint* bounds, device const float4* ogcPrev,
+    device atomic_uint* counters, uint lane, threadgroup PrimalAccum* partial, threadgroup float* fractions,
+    threadgroup float3& translation, threadgroup float3& angular, threadgroup float3& origin)
 {
-    threadgroup PrimalAccum partial[64];
-    threadgroup float fractions[64];
-    threadgroup float3 translation, angular, origin;
     if(lane==0) origin=posLin[members[span.x]].xyz;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     PrimalAccum total=motionZero();
-    for(uint i=lane;i<span.y;i+=64) {
+    if(lane<64) for(uint i=lane;i<span.y;i+=64) {
         uint body=members[span.x+i];
         float4 pl=posLin[body];
         float m=pl.w/(P.dt*P.dt);
@@ -100,7 +98,7 @@ kernel void rigid_motion_solve(
         }
         total=motionAdd(total,motionProject(a,pl.xyz-origin));
     }
-    partial[lane]=total;
+    if(lane<64) partial[lane]=total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for(uint stride=32;stride>0;stride>>=1) {
         if(lane<stride) partial[lane]=motionAdd(partial[lane],partial[lane+stride]);
@@ -118,7 +116,7 @@ kernel void rigid_motion_solve(
     // Backtrack against the same particle trust regions and absolute OGC
     // balls as local VBD. No vertex is individually warped by this pass.
     float fraction=1;
-    for(uint i=lane;i<span.y;i+=64) {
+    if(lane<64) for(uint i=lane;i<span.y;i+=64) {
         uint body=members[span.x+i]; float3 p=posLin[body].xyz;
         float d2=as_type<float>(bounds[body]);
         float bound=max(0.45f*sqrt(max(d2,0.0f)),-0.2f*shape[body].w);
@@ -133,7 +131,7 @@ kernel void rigid_motion_solve(
             fraction*=0.5f;
         }
     }
-    fractions[lane]=fraction;
+    if(lane<64) fractions[lane]=fraction;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for(uint stride=32;stride>0;stride>>=1) {
         if(lane<stride) fractions[lane]=min(fractions[lane],fractions[lane+stride]);
@@ -142,11 +140,33 @@ kernel void rigid_motion_solve(
     fraction=fractions[0];
     if(fraction<1 && lane==0) atomic_fetch_add_explicit(&counters[CTR_OGC],span.y,memory_order_relaxed);
     float4 dq=normalize(float4(0.5f*angular*fraction,1));
-    for(uint i=lane;i<span.y;i+=64) {
+    if(lane<64) for(uint i=lane;i<span.y;i+=64) {
         uint b=members[span.x+i]; float4 pl=posLin[b];
         posLin[b]=float4(origin+translation*fraction+q_rotate(dq,pl.xyz-origin),pl.w);
         if(shape[b].w>=0) posAng[b]=normalize(q_mul(dq,posAng[b]));
     }
+}
+
+kernel void rigid_motion_solve(
+    device float4* posLin [[buffer(0)]], device float4* posAng [[buffer(1)]],
+    device const float4* initLin [[buffer(2)]], device const float4* initAng [[buffer(3)]],
+    device const float4* inertLin [[buffer(4)]], device const float4* inertAng [[buffer(5)]],
+    device const float4* props [[buffer(6)]], device const JointGPU* joints [[buffer(7)]],
+    device const SpringGPU* springs [[buffer(8)]], device const ManifoldGPU* manifolds [[buffer(9)]],
+    device const uint* adjStart [[buffer(10)]], device const uint* adjCount [[buffer(11)]],
+    device const uint* adjList [[buffer(12)]], device const float4* shape [[buffer(13)]],
+    device const SoftContactGPU* soft [[buffer(14)]], device const uint* members [[buffer(15)]],
+    device const uint* owners [[buffer(16)]], constant uint2& span [[buffer(17)]],
+    constant uint& group [[buffer(18)]], constant SimParams& P [[buffer(19)]],
+    device const uint* bounds [[buffer(20)]], device const float4* ogcPrev [[buffer(21)]],
+    device atomic_uint* counters [[buffer(22)]], uint lane [[thread_index_in_threadgroup]])
+{
+    threadgroup PrimalAccum partial[64];
+    threadgroup float fractions[64];
+    threadgroup float3 translation, angular, origin;
+    rigidMotionStep(posLin,posAng,initLin,initAng,inertLin,inertAng,props,joints,springs,manifolds,
+        adjStart,adjCount,adjList,shape,soft,members,owners,span,group,P,bounds,ogcPrev,counters,lane,
+        partial,fractions,translation,angular,origin);
 }
 
 // A stiff assembly's contact rows must be conditioned against its coarse
@@ -173,5 +193,108 @@ kernel void rigid_motion_contact_penalties(
         float mass=0;
         for(uint i=0;i<4;++i) if(c.ids[i]!=WORLD_BODY) mass=max(mass,groupMass[owners[c.ids[i]]]);
         if(mass>0) c.penalty.xyz=max(c.penalty.xyz,float3(min(PENALTY_MAX_T,mass/(P.dt*P.dt))));
+    }
+}
+
+
+// One workgroup owns the complete ordered solve. No inter-workgroup spin
+// barriers or per-iteration CPU launches. Every lane participates in every
+// color, coarse-motion and dual barrier; body work is distributed over
+// cooperative groups of eight SIMD lanes.
+constant uint MOTION_NO_COMPACT = 0;
+kernel void rigid_motion_persistent(
+    device float4* posLin           [[buffer(0)]],
+    device float4* posAng           [[buffer(1)]],
+    device const float4* initLin    [[buffer(2)]],
+    device const float4* initAng    [[buffer(3)]],
+    device const float4* inertLin   [[buffer(4)]],
+    device const float4* inertAng   [[buffer(5)]],
+    device const float4* props      [[buffer(6)]],
+    device JointGPU* joints         [[buffer(7)]],
+    device SpringGPU* springs       [[buffer(8)]],
+    device ManifoldGPU* manifolds   [[buffer(9)]],
+    device const uint* adjStart     [[buffer(10)]],
+    device const uint* adjCount     [[buffer(11)]],
+    device const uint* adjList      [[buffer(12)]],
+    device const uint* colorList    [[buffer(13)]],
+    device const uint* colorStart   [[buffer(14)]],
+    device const atomic_uint* counters [[buffer(15)]],
+    constant SimParams& P           [[buffer(16)]],
+    device const float4* shape      [[buffer(17)]],
+    device const TetGPU* tets       [[buffer(18)]],
+    device SoftContactGPU* soft     [[buffer(19)]],
+    device const MembraneGPU* membranes [[buffer(20)]],
+    device const BendGPU* bends     [[buffer(21)]],
+    device const uint* members [[buffer(22)]],
+    device const uint* owners [[buffer(23)]],
+    constant uint2* spans [[buffer(24)]],
+    constant uint& groupCount [[buffer(25)]],
+    device const uint* boundsBits   [[buffer(26)]],
+    device const float4* ogcPrev    [[buffer(27)]],
+    device atomic_uint* ogcCounters [[buffer(28)]],
+    uint tid                        [[thread_position_in_threadgroup]],
+    uint tgSize                     [[threads_per_threadgroup]])
+{
+    threadgroup PrimalAccum partial[64];
+    threadgroup float fractions[64];
+    threadgroup float3 translation, angular, origin;
+    uint numPairs = min(P.maxPairs, atomic_load_explicit(&counters[CTR_PAIRS], memory_order_relaxed));
+    uint numSoft = min(atomic_load_explicit(&counters[CTR_SOFT], memory_order_relaxed),
+                       P.maxSoft);
+    uint dualTotal = P.numJoints + P.numSprings + numPairs + numSoft;
+    // empty palette tail costs a threadgroup barrier per color per
+    // iteration (64x20 = 1280 barriers dominated small-scene solves)
+    uint usedColors = colorStart[MAX_COLORS + 1];
+    for (uint iter = 0; iter < P.iterations; iter++) {
+        for (uint c = 0; c < usedColors; c++) {
+            uint s0 = colorStart[c];
+            uint e0 = colorStart[c + 1];
+            if (s0 == e0) continue;
+            for (uint i = s0 + (tid >> 3); i < e0; i += tgSize >> 3) {
+                primal_split_body_impl<8>(posLin,posAng,initLin,initAng,inertLin,inertAng,
+                    props,joints,springs,manifolds,adjStart,adjCount,adjList,P,shape,tets,soft,
+                    membranes,bends,boundsBits,ogcPrev,ogcCounters,nullptr,nullptr,MOTION_NO_COMPACT,
+                    colorList[i],tid & 7);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        for(uint groupIndex=0;groupIndex<groupCount;++groupIndex) {
+            rigidMotionStep(posLin,posAng,initLin,initAng,inertLin,inertAng,props,joints,springs,manifolds,
+                adjStart,adjCount,adjList,shape,soft,members,owners,spans[groupIndex],groupIndex+1,P,
+                boundsBits,ogcPrev,ogcCounters,tid,partial,fractions,translation,angular,origin);
+            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        }
+        for (uint g = tid; g < dualTotal; g += tgSize) {
+            if (g < P.numJoints) {
+                if (joints[g].header.z == 0)
+                    dual_joint_one(posLin, posAng, joints, P, g);
+            } else if (g < P.numJoints + P.numSprings) {
+                device SpringGPU& sp = springs[g - P.numJoints];
+                if (sp.header.z != 0) {
+                    uint a = sp.header.x, b = sp.header.y;
+                    float3 pA = xform(posLin[a].xyz, posAng[a], sp.rA.xyz);
+                    float3 pB = xform(posLin[b].xyz, posAng[b], sp.rB.xyz);
+                    float C = length(pA - pB) - sp.rB.w - sp.dual.z * P.alpha;
+                    float mA = posLin[a].w, mB = posLin[b].w;
+                    float mMin = min(mA > 0.0f ? mA : FLT_MAX,
+                                     mB > 0.0f ? mB : FLT_MAX);
+                    float cap = min(P.lambdaMax, max(2.0f, 5.0e3f * mMin));
+                    sp.dual.x = clamp(0.98f * sp.dual.x + sp.dual.y * C, 0.0f, cap);
+                    if (C > 0.0f) {
+                        sp.dual.y = min(sp.dual.y + C * P.betaLin,
+                                        min(sp.rA.w, PENALTY_MAX));
+                    }
+                }
+            } else if (g < P.numJoints + P.numSprings + numPairs) {
+                uint mi = g - P.numJoints - P.numSprings;
+                if (manifolds[mi].header.z != 0)
+                    dual_manifold_one(posLin, posAng, initLin, initAng,
+                                      manifolds, P, mi);
+            } else {
+                uint sci = g - P.numJoints - P.numSprings - numPairs;
+                dual_soft_one(posLin, posAng, initLin, initAng, soft, P, sci);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }

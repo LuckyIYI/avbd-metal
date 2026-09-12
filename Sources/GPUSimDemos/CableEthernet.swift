@@ -18,6 +18,8 @@ public struct EthernetInsertionTask {
     public static let forceLimit: Float = 20
     public var scene: PhysicsScene
     public var socketBody: Int
+    public var remoteConnectorBody: Int
+    public var cable: SceneCable
     public var contactWires: [SceneCable]
     public var wristBody: Int
     public var toolBody: Int
@@ -112,12 +114,16 @@ extension Demos {
         let z = EthernetInsertionTask.axisHeight
         var s = PhysicsScene(name: "Ethernet — Robotic Insertion")
         s.settings.dt = 1 / 480
-        s.settings.iterations = 48
+        s.settings.iterations = 16
         s.settings.gravity = -9.81
         s.settings.collisionMargin = 0.000025
         s.settings.deformableCollisionMargin = 0.000015
         s.settings.deterministic = true
         s.settings.particleDamping = 20
+        // Internal velocity smoothing suppresses under-resolved thin-shell
+        // vibration. This numerical viscosity is an authored, uncalibrated
+        // material damping approximation; the latch keeps every elastic DOF.
+        s.settings.clothViscosity = 0.3
         s.settings.clothRenderScale = 1
         s.settings.alpha = 0.9
         // Keep finite tool, boot and contact-root springs at their authored
@@ -126,12 +132,12 @@ extension Demos {
         s.settings.betaLin = 100000
         s.settings.rigidLinearDamping = drag
         s.settings.rigidAngularDamping = drag
-        s.settings.cameraDistance = 0.13
-        s.settings.cameraTargetZ = 0.034
-        s.settings.cameraTargetX = -0.013
+        s.settings.cameraDistance = 0.40
+        s.settings.cameraTargetZ = 0.020
+        s.settings.cameraTargetX = -0.075
         s.settings.cameraTargetY = 0
-        s.settings.cameraAzimuth = -2.35
-        s.settings.cameraElevation = 0.38
+        s.settings.cameraAzimuth = -2.15
+        s.settings.cameraElevation = 0.65
         func box(_ size: F3, _ p: F3, _ color: F3, density: Float = 0) -> Int {
             let b = s.addBody(size: size, density: density, friction: 0.25, position: p)
             paintBody(&s, b, color)
@@ -257,19 +263,33 @@ extension Demos {
             )
         }
         let cableEnd = initial + rotation.act(F3(-0.004, 0, 0))
-        let points = (0...segments).map { i -> F3 in
-            let t = Float(i) / Float(segments)
-            return F3(
-                -0.235 + (cableEnd.x + 0.235) * t,
-                cableEnd.y * t - 0.025 * pow(sin(.pi * t), 2),
-                0.003 + pow(t, 4) * (cableEnd.z - 0.003))
+        // A second, already-mated endpoint on the bench. The service loop
+        // has surplus arc length for the full 43 mm wrist stroke; attaching
+        // the old almost-straight lead would put the insertion under tension.
+        let remote = box(F3(0.035, 0.038, 0.026), F3(-0.195, 0.045, 0.013), dark)
+        part(remote, F3(0.001, 0.017, 0.014), F3(0.018, 0, 0.005), steel)
+        part(remote, F3(0.007, 0.01168, 0.0066), F3(0.021, 0, 0.005), pc)
+        part(remote, F3(0.011, 0.0119, 0.0088), F3(0.0265, 0, 0.005), blue)
+        for y: Float in [-0.006, 0.006] {
+            part(remote, F3(0.001, 0.002, 0.001), F3(0.0181, y, 0.014),
+                 F3(0.15, 0.85, 0.25), collision: false)
         }
+        let route = [F3(-0.163,0.045,0.018), F3(-0.140,0.045,0.018),
+                     F3(-0.125,0.025,0.003), F3(-0.155,-0.045,0.003),
+                     F3(-0.125,-0.068,0.003), F3(-0.091,-0.057,0.003),
+                     F3(-0.095,-0.015,0.009), cableEnd]
+        let points = ethernetServiceLoop(route, segments: segments)
         let cable = try! s.addCable(
             points: points, radius: 0.00273, density: 1450,
             material: CableMaterial(
                 stretchRigidity: 3000, shearRigidity: 1200,
                 bendRigidity: 0.002, twistRigidity: 0.001, dampingTime: dampingTime), friction: 0.35)
         stripedCable(&s, cable, color: blue)
+        let first = cable.bodyIDs[0]
+        let rootArm2 = length_squared(s.bodies[remote].size + s.bodies[first].size)
+        s.addJoint(SceneJoint(bodyA: remote, bodyB: first,
+            rA: points[0] - s.bodies[remote].position, rB: cable.startAnchor,
+            stiffnessLin: 1e6, stiffnessAng: 0.1 / (rootArm2 * rootArm2)))
         let end = cable.bodyIDs.last!
         let bootArm2 = length_squared(s.bodies[tool].size + s.bodies[end].size)
         s.addJoint(
@@ -387,13 +407,14 @@ extension Demos {
         // tetrahedra. It follows deformation without sliver volume elements.
         var platedVertices: [SceneSkinnedVertex] = []
         var platedTris: [(Int, Int, Int)] = []
+        let contactXs: [Float] = [-0.005,-0.002,-0.00035,0]
         for i in 0..<8 {
             let c = Float(i) * 0.00102 - 0.00357
-            for x in 4..<nx - 1 {
+            for x in 0..<contactXs.count - 1 {
                 let base = platedVertices.count
                 for (px, py) in [
-                    (xs[x], c - 0.00023), (xs[x + 1], c - 0.00023),
-                    (xs[x + 1], c + 0.00023), (xs[x], c + 0.00023),
+                    (contactXs[x], c - 0.00023), (contactXs[x + 1], c - 0.00023),
+                    (contactXs[x + 1], c + 0.00023), (contactXs[x], c + 0.00023),
                 ] {
                     let top: Float = px == 0 ? 0.003164 : 0.0033
                     let target = mesh.origin + rotation.act(F3(px, py, top + 0.000060))
@@ -424,11 +445,11 @@ extension Demos {
             }
         }
         mesh.scene.addSkinnedMesh(SceneSkinnedMesh(vertices: platedVertices, triangles: platedTris))
-        EthernetVisuals.finish(&mesh.scene, bodies: [table, board, wrist, tool], table: table)
+        EthernetVisuals.finish(&mesh.scene, bodies: [table, board, wrist, tool, remote], table: table)
         mesh.scene.rigidMotionGroups = [[tool] + mesh.nodes]
         let nose = nodes.filter { $0.key / (ny * nz) == nx - 1 }.map(\.value).sorted()
         return EthernetInsertionTask(
-            scene: mesh.scene, socketBody: socket, contactWires: Array(mesh.scene.cables.dropFirst()),
+            scene: mesh.scene, socketBody: socket, remoteConnectorBody: remote, cable: cable, contactWires: Array(mesh.scene.cables.dropFirst()),
             wristBody: wrist, toolBody: tool, noseNodes: nose,
             plugNodes: mesh.nodes, latchNodes: latchIDs, couplingAnchors: anchors, lateralError: lateralError,
             yawError: yawError)
@@ -477,5 +498,35 @@ private struct EthernetSolid {
             }
             scene.addTet(SceneTet(ids: (ids[0], ids[1], ids[2], ids[3]), mu: mu, lambda: lambda))
         }
+    }
+}
+
+/// Smooth the authored loop, then sample by arc length so short bends do not
+/// create tiny segments with a disproportionate stiffness/iteration cost.
+private func ethernetServiceLoop(_ points: [F3], segments: Int) -> [F3] {
+    var dense: [F3] = [points[0]]
+    for i in 0..<points.count-1 {
+        let p0 = i > 0 ? points[i-1] : 2*points[i]-points[i+1]
+        let p1 = points[i], p2 = points[i+1]
+        let p3 = i+2 < points.count ? points[i+2] : 2*p2-p1
+        for j in 1...32 {
+            let t = Float(j)/32
+            let a: F3 = p1 * 2
+            let b: F3 = p2 - p0
+            let c: F3 = p0 * 2 - p1 * 5 + p2 * 4 - p3
+            let d: F3 = -p0 + p1 * 3 - p2 * 3 + p3
+            var p = (a + b * t + c * (t*t) + d * (t*t*t)) * 0.5
+            p.z = max(0.003, p.z)
+            dense.append(p)
+        }
+    }
+    var lengths: [Float] = [0]
+    for i in 1..<dense.count { lengths.append(lengths.last! + distance(dense[i],dense[i-1])) }
+    var cursor = 1
+    return (0...segments).map { i in
+        let target = lengths.last!*Float(i)/Float(segments)
+        while cursor < lengths.count-1 && lengths[cursor] < target { cursor += 1 }
+        let t = (target-lengths[cursor-1])/(lengths[cursor]-lengths[cursor-1])
+        return mix(dense[cursor-1],dense[cursor],t:F3(repeating:t))
     }
 }

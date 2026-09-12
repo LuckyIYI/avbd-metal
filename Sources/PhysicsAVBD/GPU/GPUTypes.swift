@@ -91,7 +91,7 @@ extension SimParamsGPU: Equatable {}
 
 public struct JointGPU {
     // Bit 6 is reserved for break-load joints (PR #36).
-    public static let cableFlag: UInt32 = 1 << 7
+    public static let cableFlag: UInt32 = 1 << 8
     // Tagged storage: cable joints reuse the otherwise inactive motor/limit
     // fields. Cables add no fields to the existing joint layout.
     // motor.xyz = linear stiffness; limits.xyz = angular stiffness;

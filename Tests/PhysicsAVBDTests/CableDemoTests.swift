@@ -101,6 +101,14 @@ final class CableDemoTests: XCTestCase {
         XCTAssertEqual(mass, (volume+latchVolume) * 1200, accuracy: 1e-7)
         XCTAssertGreaterThan(mass, 0.0008)
         XCTAssertLessThan(mass, 0.002)
+        XCTAssertFalse(scene.bodies[task.remoteConnectorBody].isDynamic)
+        let remote = try XCTUnwrap(scene.joints.first {
+            $0.bodyA == task.remoteConnectorBody && $0.bodyB == task.cable.bodyIDs[0]
+        })
+        let root = scene.bodies[remote.bodyA].position+remote.rA
+        let command = task.command(at:EthernetInsertionTask.duration)
+        let end = command.position+command.rotation.act(F3(-0.004,0,0))
+        XCTAssertGreaterThan(task.cable.restLengths.reduce(0,+)-distance(root,end),0.04)
         XCTAssertFalse(scene.bodies[task.socketBody].isDynamic)
         for x: Float in [0.002, 0.0075, 0.014] {
             for c in scene.colliders where c.body == task.socketBody && c.collisionEnabled {

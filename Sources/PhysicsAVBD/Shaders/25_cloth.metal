@@ -499,7 +499,7 @@ kernel void vt_emit(
     device const uint* nbr2Count    [[buffer(23)]],
     device const uint* nbr2List     [[buffer(24)]],
     device const uint* clothGroup   [[buffer(25)]],
-    device const uint* clothVert    [[buffer(26)]],
+    device const uint* selfCollision    [[buffer(26)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numParticles) return;
@@ -510,7 +510,7 @@ kernel void vt_emit(
     float3 velV = velLin[v].xyz;
     uint ns = nbrStart[v], ne = ns + nbrCount[v];
     uint gv = clothGroup[v];
-    bool solidV = gv != 0 && clothVert[v] == 0;
+    bool solidV = gv != 0 && selfCollision[v] == 0;
 
     Best4 best;
     best4Init(best);
@@ -537,8 +537,8 @@ kernel void vt_emit(
             if (tid_.x != v && tid_.y != v && tid_.z != v) {                   \
                 bool sameSolid_ = solidV && clothGroup[tid_.x] == gv            \
                     && clothGroup[tid_.y] == gv && clothGroup[tid_.z] == gv     \
-                    && clothVert[tid_.x] == 0 && clothVert[tid_.y] == 0         \
-                    && clothVert[tid_.z] == 0;                                  \
+                    && selfCollision[tid_.x] == 0 && selfCollision[tid_.y] == 0         \
+                    && selfCollision[tid_.z] == 0;                                  \
                 if (sameSolid_) {                                               \
                 } else {                                                        \
                 float3 ba_;                                                    \
@@ -773,7 +773,7 @@ kernel void ee_emit(
     device const uint* nbr2Count    [[buffer(24)]],
     device const uint* nbr2List     [[buffer(25)]],
     device const uint* clothGroup   [[buffer(26)]],
-    device const uint* clothVert    [[buffer(27)]],
+    device const uint* selfCollision    [[buffer(27)]],
     uint gid                        [[thread_position_in_grid]])
 {
     if (gid >= P.numEdges) return;
@@ -785,7 +785,7 @@ kernel void ee_emit(
     uint nsy = nbrStart[eA.y], ney = nsy + nbrCount[eA.y];
     uint gA = clothGroup[eA.x];
     bool solidA = gA != 0 && clothGroup[eA.y] == gA
-        && clothVert[eA.x] == 0 && clothVert[eA.y] == 0;
+        && selfCollision[eA.x] == 0 && selfCollision[eA.y] == 0;
 
     Best4 best;
     best4Init(best);
@@ -804,7 +804,7 @@ kernel void ee_emit(
                 && eB_.y != eA.x && eB_.y != eA.y) {                           \
                 bool sameSolid_ = solidA && clothGroup[eB_.x] == gA             \
                     && clothGroup[eB_.y] == gA                                  \
-                    && clothVert[eB_.x] == 0 && clothVert[eB_.y] == 0;          \
+                    && selfCollision[eB_.x] == 0 && selfCollision[eB_.y] == 0;          \
                 if (sameSolid_) {                                               \
                 } else {                                                        \
                 float s_, t_;                                                  \
