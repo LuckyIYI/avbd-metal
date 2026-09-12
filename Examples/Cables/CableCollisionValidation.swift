@@ -60,9 +60,17 @@ func validateTwistingContact() throws {
     }
     var s = Demos.cableTwisting(segments: value("--segments", default: 40))
     if args.contains("--mixed") {
-        let vertices = [-1,1].flatMap { x in [-1,1].flatMap { y in [-1,1].map { z in
-            F3(Float(x),Float(y),Float(z)) * 0.1
-        } } }
+        let signs = [-1, 1]
+        var vertices: [F3] = []
+        vertices.reserveCapacity(8)
+        for x in signs {
+            for y in signs {
+                for z in signs {
+                    let point = F3(Float(x), Float(y), Float(z))
+                    vertices.append(point * 0.1)
+                }
+            }
+        }
         let hull = s.addBody(size: F3(repeating: 0.2), density: 0, friction: 0.5,
                              position: F3(10,10,0), collisionEnabled: false)
         _ = s.addCollider(body: hull, size: F3(repeating: 0.2), convexHullVertices: vertices)

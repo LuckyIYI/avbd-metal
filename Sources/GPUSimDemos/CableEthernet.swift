@@ -515,7 +515,10 @@ private func ethernetServiceLoop(_ points: [F3], segments: Int) -> [F3] {
             let b: F3 = p2 - p0
             let c: F3 = p0 * 2 - p1 * 5 + p2 * 4 - p3
             let d: F3 = -p0 + p1 * 3 - p2 * 3 + p3
-            var p = (a + b * t + c * (t*t) + d * (t*t*t)) * 0.5
+            let t2 = t * t
+            let t3 = t2 * t
+            let curve = a + b * t + c * t2 + d * t3
+            var p = curve * 0.5
             p.z = max(0.003, p.z)
             dense.append(p)
         }
