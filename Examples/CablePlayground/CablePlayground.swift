@@ -15,7 +15,7 @@ private let demoNames = ["cableethernet", "cabletwisting", "cablegrippers", "cab
 final class Playground: ObservableObject, GPUSimRendererSource {
     @Published var name: String
     @Published var running = true
-    @Published var overview = true
+    @Published var overview = false
     @Published var cameraRevision = 0
     @Published var failure: String?
     @Published var parameters: [String: Float] = [:]
@@ -65,6 +65,7 @@ final class Playground: ObservableObject, GPUSimRendererSource {
         lastTime = 0
         accumulator = 0
         rendererSceneRevision += 1
+        cameraRevision += 1
         failure = nil
     }
 
@@ -211,7 +212,9 @@ final class CableView: MTKView {
 }
 
 struct MetalCanvas: NSViewRepresentable {
-    let model: Playground
+    // The NSView persists across scene selection. Observe model changes so
+    // its camera does not retain the previous demo's metre-scale framing.
+    @ObservedObject var model: Playground
     func makeNSView(context: Context) -> CableView {
         let view = CableView(frame: .zero, device: model.solver.device)
         view.model = model
@@ -383,13 +386,17 @@ private func snapshot(_ model: Playground, path: String, steps: Int,
 @main struct CablePlayground {
     @MainActor static func main() async throws {
         let args = CommandLine.arguments
-        if args.contains("--help") {
-            print("cable-playground [cableethernet|cabletwisting|cablegrippers|cableplastic] [--snapshot /path/image.png --steps 120] [--bend-release] [--insert] [--close-up]")
+        if args.contains("--camera-regression") {
+            try validateCameraUpdates()
             return
         }
-        let name = args.dropFirst().first(where: { demoNames.contains($0) }) ?? "cablegrippers"
+        if args.contains("--help") {
+            print("cable-playground [cableethernet|cabletwisting|cablegrippers|cableplastic] [--snapshot /path/image.png --steps 120] [--bend-release] [--insert] [--overview|--close-up]")
+            return
+        }
+        let name = args.dropFirst().first(where: { demoNames.contains($0) }) ?? "cableethernet"
         let model = try Playground(name: name)
-        model.overview = !args.contains("--close-up")
+        model.overview = args.contains("--overview") && !args.contains("--close-up")
         if let index = args.firstIndex(of: "--snapshot"), index + 1 < args.count {
             let steps = args.firstIndex(of: "--steps").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 120
             try await snapshot(model, path: args[index + 1], steps: max(0, steps),

@@ -7,8 +7,8 @@ holds the rear boot and is coupled to a commanded wrist by three finite springs.
 Only the wrist pose is prescribed. Neither the plug nor its contact deformation
 is animated. The other cable end is attached to an already-mated connector on
 the bench. An approximately 30 cm service loop supplies slack through the full
-43 mm wrist stroke. The viewer starts with the complete apparatus in frame;
-**Connector close-up** and **Whole cable** switch inspection views. **Reset view**
+43 mm wrist stroke. The viewer starts close to the connector so the insertion fills the viewport;
+**Whole cable** shows the complete connected apparatus and **Connector close-up** returns to the task. **Reset view**
 (or F) restores the current view; scroll and trackpad pinch zoom smoothly. Zoom limits
 and rendering tolerances follow the scene's presentation scale; physical units
 remain metres.
