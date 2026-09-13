@@ -13,10 +13,12 @@ final class ConvexGPURuntimeTests: XCTestCase {
 
     func testCapturedDetailedFloorAgainstMouseDetail() throws { try checkCapturedPair(4) }
 
+    func testCapturedRoomFloorAgainstEightMillimeterDetail() throws { try checkCapturedPair(5) }
+
     private func checkCapturedPair(_ requestedIndex: Int) throws {
         try requireMetal()
         let fixtures = try JSONSerialization.jsonObject(with: Data(capturedFloorPairsJSON.utf8)) as! [[[String: Any]]]
-        XCTAssertEqual(fixtures.count, 5, "Keep every captured failure")
+        XCTAssertEqual(fixtures.count, 6, "Keep every captured failure")
         for (index, pair) in fixtures.enumerated() where index == requestedIndex {
             let vertexCounts = pair.map { ($0["vertices"] as! [[NSNumber]]).count }
             if vertexCounts.contains(where: { $0 > ConvexAssetLimits.maximumVerticesPerHull }) {
