@@ -86,7 +86,12 @@ inline float3 surfaceReflection(float2 uv, float3 P, float3 N, float rough, floa
         int2 q = base+int2(x,y);
         if (any(q<0) || any(q>=int2(size))) continue;
         float d = depth.read(uint2(q)); float4 nr = normal.read(uint2(q));
-        if (d>=1 || (!transmission && abs(nr.w-rough)>0.08)) continue;
+        // Filtered roughness includes screen-footprint normal variance. The
+        // half-resolution G-buffer and full-resolution receiver can disagree
+        // on a continuous curved surface; rejecting that difference removes
+        // valid specular radiance (especially screw threads). Depth and normal
+        // agreement below still reject cross-surface samples.
+        if (d>=1) continue;
         float3 Q = worldFromDepth((float2(q)+0.5)/size,d,U.invViewProj);
         float plane = max(abs(dot(Q-P,N)),abs(dot(Q-P,nr.xyz)));
         float w = (x ? f.x : 1-f.x)*(y ? f.y : 1-f.y);
