@@ -845,8 +845,14 @@ kernel void warmstart_joints(
     }
     j.lambdaLin.xyz *= warm;
     j.lambdaAng.xyz *= warm;
-    j.penaltyLin.xyz = min(clamp(j.penaltyLin.xyz * P.gamma, PENALTY_MIN, PENALTY_MAX), stiffLin);
-    j.penaltyAng.xyz = min(clamp(j.penaltyAng.xyz * P.gamma, PENALTY_MIN, PENALTY_MAX), stiffAng);
+    // Finite joints are constitutive springs, not adaptive hard penalties.
+    // Decaying them changes the authored spring constant over time.
+    j.penaltyLin.xyz = (j.header.w & 1)
+        ? min(clamp(j.penaltyLin.xyz * P.gamma, PENALTY_MIN, PENALTY_MAX), stiffLin)
+        : float3(min(stiffLin, PENALTY_MAX));
+    j.penaltyAng.xyz = (j.header.w & 2)
+        ? min(clamp(j.penaltyAng.xyz * P.gamma, PENALTY_MIN, PENALTY_MAX), stiffAng)
+        : float3(min(stiffAng, PENALTY_MAX));
 }
 
 kernel void warmstart_bodies(
