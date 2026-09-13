@@ -206,9 +206,10 @@ final class ScreenSpaceLightingTests: XCTestCase {
     }
 
     func testReflectionGatherKeepsCurvedSurfaceRoughnessVariationButRejectsOtherSurfaces() throws {
+        for sourceRoughness: Float in [0.12, 0.82] {
         let h = try Harness(source: fixtureSource, width: 64, height: 64)
         var fixture = Fixture(); fixture.boxMin.w = 0
-        fixture.plane = SIMD4(0,0,1,-2); fixture.parameters.x = 0.12
+        fixture.plane = SIMD4(0,0,1,-2); fixture.parameters.x = sourceRoughness
         _ = try render(fixture, harness: h)
         let e=h.effects, device=e.device
         let source = renderShaderSource + """
@@ -221,7 +222,8 @@ final class ScreenSpaceLightingTests: XCTestCase {
             uint scenario=uint(in.position.x);
             if(scenario==1) N=-N;
             if(scenario==2) P+=N*0.1;
-            float3 result=surfaceReflection(uv,P,N,0.32,float3(0.6),1,U,reflection,normal,depth,material);
+            float rough=scenario==3 ? 0.65 : 0.32;
+            float3 result=surfaceReflection(uv,P,N,rough,float3(0.6),1,U,reflection,normal,depth,material);
             return float4(result,1);
         }
         """
@@ -232,7 +234,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
         descriptor.colorAttachments[0].pixelFormat = .rgba16Float
         let pipeline=try device.makeRenderPipelineState(descriptor:descriptor)
         let reflected=try e.texture(.rgba16Float,width:e.halfSize.x,height:e.halfSize.y,label:"Known radiance")
-        let output=try e.texture(.rgba16Float,width:3,height:1,label:"Gather scenarios")
+        let output=try e.texture(.rgba16Float,width:4,height:1,label:"Gather scenarios")
         let command=try XCTUnwrap(h.queue.makeCommandBuffer())
         let clear=MTLRenderPassDescriptor();clear.colorAttachments[0].texture=reflected
         clear.colorAttachments[0].loadAction = .clear;clear.colorAttachments[0].storeAction = .store
@@ -243,6 +245,7 @@ final class ScreenSpaceLightingTests: XCTestCase {
         let encoder=try XCTUnwrap(command.makeRenderCommandEncoder(descriptor:pass))
         encoder.setRenderPipelineState(pipeline)
         var U=uniforms(width:e.halfSize.x,height:e.halfSize.y)
+        U.effects.w = 0.8
         encoder.setFragmentBytes(&U,length:MemoryLayout<Uniforms>.stride,index:1)
         encoder.setFragmentTexture(reflected,index:0);encoder.setFragmentTexture(e.normal,index:1)
         encoder.setFragmentTexture(e.depth,index:2);encoder.setFragmentTexture(e.material,index:3)
@@ -251,9 +254,15 @@ final class ScreenSpaceLightingTests: XCTestCase {
         XCTAssertEqual(command.status,.completed,"\(String(describing:command.error))")
         let bytes=try read(output,queue:h.queue,bytesPerPixel:8)
         let values=bytes.withUnsafeBytes { raw in raw.bindMemory(to:UInt16.self).map { Float(Float16(bitPattern:$0)) } }
-        XCTAssertGreaterThan(values[0],0.05,"Footprint roughness must not erase a valid same-surface reflection")
+        if sourceRoughness < 0.8 {
+            XCTAssertGreaterThan(values[0],0.05,"Footprint roughness must not erase a valid same-surface reflection")
+        } else {
+            XCTAssertEqual(values[0],0,accuracy:0.001,"Skipped rough texels must not enter the gather")
+        }
         XCTAssertEqual(values[4],0,accuracy:0.001,"Opposite-facing surface must be rejected")
         XCTAssertEqual(values[8],0,accuracy:0.001,"Separated surface must be rejected")
+        XCTAssertEqual(values[12],0,accuracy:0.001,"Coplanar roughness boundary must be rejected")
+        }
     }
 
     func testOpenPlanesHaveNeitherContactShadowsNorSelfReflections() throws {
