@@ -5,6 +5,17 @@ import XCTest
 
 @MainActor
 final class MetalFXReconstructionTests: XCTestCase {
+    func testRepeatedFieldOfViewPreservesHistoryAndChangesInvalidateIt() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let renderer = try GPUSimRenderer(device: device)
+        renderer.prevVP = matrix_identity_float4x4
+        let fieldOfView = renderer.verticalFieldOfView
+        renderer.verticalFieldOfView = fieldOfView
+        XCTAssertNotNil(renderer.prevVP, "Per-frame assignment must preserve temporal history")
+        renderer.verticalFieldOfView = fieldOfView + 1
+        XCTAssertNil(renderer.prevVP, "An actual projection change must invalidate history")
+    }
+
     func testSpecularDistanceAllocationIsOptional() throws {
         guard let device = MTLCreateSystemDefaultDevice(), MetalFXReconstruction.supports(device: device, denoising: true)
         else { throw XCTSkip("MetalFX denoising unavailable") }
