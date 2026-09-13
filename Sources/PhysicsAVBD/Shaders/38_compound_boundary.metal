@@ -43,10 +43,14 @@ kernel void filter_compound_internal_contacts(
     float3 outwardB=q_rotate(q_conj(rotations[m.header.y]), m.basisN.xyz)*probe;
     for (uint j=0;j<m.header.z;++j) {
         ContactGPU c=m.contacts[j];
+        float3 pointA=(m.header.w & 2u) != 0u
+            ? q_rotate(q_conj(rotations[m.header.x]),c.rA.xyz) : c.rA.xyz;
+        float3 pointB=(m.header.w & 4u) != 0u
+            ? q_rotate(q_conj(rotations[m.header.y]),c.rB.xyz) : c.rB.xyz;
         // Filter only hull compounds enabled by the host's neighbour table.
-        bool hiddenA=compoundBuried(m.colliderPair.x,c.rA.xyz+outwardA,
+        bool hiddenA=compoundBuried(m.colliderPair.x,pointA+outwardA,
             neighbours,localPosition,localRotation,assetIDs,hulls,faces);
-        bool hiddenB=compoundBuried(m.colliderPair.y,c.rB.xyz+outwardB,
+        bool hiddenB=compoundBuried(m.colliderPair.y,pointB+outwardB,
             neighbours,localPosition,localRotation,assetIDs,hulls,faces);
         if (hiddenA || hiddenB) continue;
         m.contacts[count]=c;
