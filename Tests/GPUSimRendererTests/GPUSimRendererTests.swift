@@ -12,6 +12,22 @@ private final class MinimalRenderSource: GPUSimRendererSource {
 
 @MainActor
 final class GPUSimRendererTests: XCTestCase {
+    func testNormalDiagnosticBypassesEveryHDRRoute() {
+        for options in [GPUSimRenderOptions.lightweight, .qualityBeta,
+                        GPUSimRenderOptions(screenSpaceReflections: true)] {
+            var exposed = options
+            exposed.displayExposure = 4
+            let diagnostic = exposed.diagnosticOptions(enabled: true)
+            XCTAssertFalse(diagnostic.usesHDR)
+            XCTAssertFalse(diagnostic.usesRayTracing)
+            XCTAssertEqual(diagnostic.reconstruction, .legacy)
+            XCTAssertFalse(diagnostic.ambientOcclusion)
+            XCTAssertFalse(diagnostic.contactShadows)
+            XCTAssertFalse(diagnostic.edgeAntialiasing)
+            XCTAssertEqual(exposed.diagnosticOptions(enabled: false), exposed)
+        }
+    }
+
     func testDefaultOptionsAreMinimal() {
         XCTAssertEqual(GPUSimRenderOptions(), GPUSimRenderOptions(
             colorMode: .bodyIndex,
