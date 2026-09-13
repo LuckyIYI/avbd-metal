@@ -1200,6 +1200,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenMaterial [[texture(5)]],
                              texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
+    \(ProcessInfo.processInfo.environment["AVBD_NORMAL_PASS"] == "1" ? "return float4(normalize(in.normal)*0.5+0.5,1);" : "")
     in = texturedSurface(in, materials);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
