@@ -40,4 +40,20 @@ final class FiniteGraspSpringTests: XCTestCase {
         XCTAssertLessThan(gpu.bodyPosition(payload).z,0.3)
     }
 
+    func testHelicalJointBackdrivesUnderAxialForceAcrossMultipleTurns() throws {
+        var scene=PhysicsScene(name:"backdrivable screw")
+        scene.settings.gravity=0;scene.settings.dt=1/480;scene.settings.iterations=32
+        let base=scene.addBody(size:F3(repeating:0.04),density:0,friction:0.5,position:.zero,collisionEnabled:false)
+        let nut=scene.addBody(size:F3(repeating:0.02),density:1000,friction:0.5,position:F3(0,0,0.1),collisionEnabled:false)
+        let screw=scene.addDragSlot(),pull=scene.addDragSlot();let gpu=try GPUSolver(scene:scene)
+        gpu.setHelicalJoint(jointIndex:screw,parent:base,body:nut,parentAnchor:F3(0,0,0.1),pitch:0.02)
+        gpu.setDrag(jointIndex:pull,body:nut,worldTarget:F3(0,0,0.14),localAnchor:.zero,stiffness:1000)
+        for _ in 0..<2400 {try gpu.submitStep()}
+        try gpu.synchronize()
+        let travel=gpu.bodyPosition(nut).z-0.1,angle=gpu.helicalAngle(screw)
+        XCTAssertGreaterThan(angle,3 * .pi)
+        XCTAssertEqual(travel,0.04,accuracy:0.001)
+        XCTAssertEqual(travel,angle * 0.02/(2 * .pi),accuracy:0.0003)
+    }
+
 }

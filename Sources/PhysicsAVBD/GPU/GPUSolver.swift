@@ -7347,6 +7347,31 @@ public final class GPUSolver {
         jp[jointIndex] = j
     }
 
+    /// Ideal finite-stiffness screw coupling. Axial displacement and twist
+    /// share one energy term, so axial load generates reciprocal torque.
+    public func setHelicalJoint(jointIndex: Int, parent: Int, body: Int,
+                                parentAnchor: F3, pitch: Float,
+                                axialStiffness: Float = 100000) {
+        precondition(jointIndex >= 0 && jointIndex < numJoints && pitch > 0 && pitch.isFinite)
+        precondition(parent >= 0 && parent < numBodies && body >= 0 && body < numBodies)
+        sync()
+        let jp=joints.contents().bindMemory(to:JointGPU.self,capacity:numJoints)
+        var j=JointGPU()
+        j.header=SIMD4(UInt32(parent),UInt32(body),0,3)
+        j.rA=SIMD4(parentAnchor,1e9);j.rB=SIMD4(0,0,0,1e9)
+        j.prismaticAxis=SIMD4(0,0,1,1);j.hingeAxis=SIMD4(0,0,1,1)
+        j.restRel=(bodyRotation(parent).inverse*bodyRotation(body)).vector
+        j.C0Lin=SIMD4(0,0,0,0.03);j.C0Ang=SIMD4(0,0,0,3e18)
+        j.penaltyLin=SIMD4(repeating:100000);j.penaltyAng=SIMD4(repeating:100000)
+        j.dynamics.w=pitch/(2 * .pi)
+        j.responseKnot0.y=axialStiffness
+        jp[jointIndex]=j
+    }
+    public func helicalAngle(_ jointIndex:Int) -> Float {
+        sync()
+        return joints.contents().bindMemory(to:JointGPU.self,capacity:numJoints)[jointIndex].response.w
+    }
+
     /// Ray-cast against collision primitives (CPU, shared buffers). Returns
     /// the owning body and a body-local anchor suitable for dragging.
     public func pick(origin: F3, dir: F3) -> (body: Int, local: F3)? {

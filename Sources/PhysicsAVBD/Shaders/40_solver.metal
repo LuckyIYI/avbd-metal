@@ -773,6 +773,15 @@ kernel void warmstart_joints(
     float3 pA = a == WORLD_BODY ? j.rA.xyz : xform(posLin[a].xyz, posAng[a], j.rA.xyz);
     float3 pB = xform(posLin[b].xyz, posAng[b], j.rB.xyz);
     float4 qA = a == WORLD_BODY ? float4(0,0,0,1) : posAng[a];
+    if (j.dynamics.w > 0.0f) {
+        float4 rel=q_mul(q_inv(q_mul(qA,j.restRel)),posAng[b]);
+        if (rel.w<0) rel=-rel;
+        float wrapped=2.0f*atan2(dot(rel.xyz,j.hingeAxis.xyz),rel.w);
+        float change=wrapped-j.responseKnots[0].x;
+        change=atan2(sin(change),cos(change));
+        j.response.w+=change;
+        j.responseKnots[0].x=wrapped;
+    }
     if (j.response.x > 0.0f) {
         if (j.prismaticAxis.w != 0) {
             j.response.w=dot(q_rotate(qA,j.prismaticAxis.xyz),pB-pA);
@@ -1095,6 +1104,27 @@ inline void stampJoint(device const JointGPU& j, uint self,
 
         acc.rhsLin += jsign * F;
         acc.rhsAng += m3_mul(jAngT, F);
+    }
+
+    if (j.dynamics.w > 0.0f) {
+        float4 qA=a==WORLD_BODY ? float4(0,0,0,1):posAng[a];
+        float3 xA=a==WORLD_BODY ? float3(0):posLin[a].xyz;
+        float3 axis=q_rotate(qA,j.prismaticAxis.xyz);
+        float3 pA=a==WORLD_BODY ? j.rA.xyz:xform(xA,qA,j.rA.xyz);
+        float3 rB=q_rotate(posAng[b],j.rB.xyz),pB=posLin[b].xyz+rB;
+        float4 rel=q_mul(q_inv(q_mul(qA,j.restRel)),posAng[b]);
+        if (rel.w<0) rel=-rel;
+        float wrapped=2.0f*atan2(dot(rel.xyz,j.hingeAxis.xyz),rel.w);
+        float d=wrapped-j.responseKnots[0].x;
+        float angle=j.response.w+atan2(sin(d),cos(d));
+        float lead=j.dynamics.w,k=j.responseKnots[0].y;
+        float C=dot(axis,pB-pA)-lead*angle;
+        float3 jl=(isA ? -1.0f:1.0f)*axis;
+        float3 ja=isA ? cross(axis,pB-xA)+lead*axis : cross(rB,axis)-lead*axis;
+        acc.rhsLin+=jl*(k*C);acc.rhsAng+=ja*(k*C);
+        acc.lhsLin=m3_add(acc.lhsLin,m3_scale(m3_outer(jl,jl),k));
+        acc.lhsAng=m3_add(acc.lhsAng,m3_scale(m3_outer(ja,ja),k));
+        acc.lhsCross=m3_add(acc.lhsCross,m3_scale(m3_outer(ja,jl),k));
     }
 
     // Angular
