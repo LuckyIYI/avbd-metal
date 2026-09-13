@@ -7331,10 +7331,16 @@ public final class GPUSolver {
         precondition(jointIndex >= 0 && jointIndex < numJoints)
         sync()
         let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: numJoints)
-        guard let body else { jp[jointIndex].header.z = 1; return }
+        guard let body else {
+            if jp[jointIndex].header.z == 0 {
+                wakeRigidBodies([Int(jp[jointIndex].header.x), Int(jp[jointIndex].header.y)])
+            }
+            jp[jointIndex].header.z = 1
+            return
+        }
         precondition(parent >= 0 && parent < numBodies && body >= 0 && body < numBodies)
         precondition(linearStiffness > 0 && angularStiffness > 0 && linearStiffness.isFinite && angularStiffness.isFinite)
-        wakeRigidBodies([body])
+        wakeRigidBodies([parent, body])
         var j = JointGPU()
         j.header = SIMD4(UInt32(parent), UInt32(body), 0, 0)
         j.rA = SIMD4(parentAnchor, linearStiffness)
@@ -7354,7 +7360,9 @@ public final class GPUSolver {
                                 axialStiffness: Float = 100000) {
         precondition(jointIndex >= 0 && jointIndex < numJoints && pitch > 0 && pitch.isFinite)
         precondition(parent >= 0 && parent < numBodies && body >= 0 && body < numBodies)
+        precondition(axialStiffness.isFinite && axialStiffness > 0)
         sync()
+        wakeRigidBodies([parent, body])
         let jp=joints.contents().bindMemory(to:JointGPU.self,capacity:numJoints)
         var j=JointGPU()
         j.header=SIMD4(UInt32(parent),UInt32(body),0,3)
@@ -7372,6 +7380,7 @@ public final class GPUSolver {
         jp[jointIndex]=j
     }
     public func helicalAngle(_ jointIndex:Int) -> Float {
+        precondition(jointIndex >= 0 && jointIndex < numJoints)
         sync()
         return joints.contents().bindMemory(to:JointGPU.self,capacity:numJoints)[jointIndex].response.w
     }
