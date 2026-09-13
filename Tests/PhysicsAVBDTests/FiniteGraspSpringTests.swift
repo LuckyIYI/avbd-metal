@@ -56,4 +56,22 @@ final class FiniteGraspSpringTests: XCTestCase {
         XCTAssertEqual(travel,angle * 0.02/(2 * .pi),accuracy:0.0003)
     }
 
+    func testGraspTransmitsPureMultiTurnSpin() throws {
+        var scene=PhysicsScene(name:"multi turn rigid grasp")
+        scene.settings.gravity=0;scene.settings.dt=1/480;scene.settings.iterations=32
+        let hand=scene.addBody(size:F3(repeating:0.04),density:0,friction:0.5,position:.zero,collisionEnabled:false)
+        let load=scene.addBody(size:F3(repeating:0.1),density:0,friction:0.5,position:F3(0,0,-0.05),mass:0.64,diagonalInertia:F3(0.0025,0.0025,0.0023),collisionEnabled:false)
+        let slot=scene.addDragSlot();let gpu=try GPUSolver(scene:scene)
+        gpu.setGrasp(jointIndex:slot,parent:hand,body:load,parentAnchor:F3(0,0,-0.05),linearStiffness:100000,angularStiffness:500000)
+        var previous:Float=0,total:Float=0
+        for i in 0..<960 {
+            let angle=Float(i)/960 * 4 * Float.pi
+            gpu.setDrivenBodyStates([.init(body:hand,position:.zero,rotation:Quat(angle:angle,axis:F3(0,0,1)))])
+            try gpu.submitStep();try gpu.synchronize()
+            let q=gpu.bodyRotation(load);let a=2*atan2(q.imag.z,q.real)
+            total+=atan2(sin(a-previous),cos(a-previous));previous=a
+        }
+        XCTAssertEqual(total,4 * .pi,accuracy:0.04)
+    }
+
 }
