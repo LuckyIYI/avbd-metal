@@ -149,6 +149,8 @@ public final class GPUSolver {
     var colliderSharedCollision: MTLBuffer
     var colliderLocalPosition, colliderLocalRotation: MTLBuffer
     var colliderRenderColor: MTLBuffer
+    var compoundBoundaryNeighbours: MTLBuffer? = nil
+    var compoundBoundaryProbe: Float = 1e-6
     var colliderFriction: MTLBuffer
     var colliderTorsionalFriction: MTLBuffer
     var torsionState, prevTorsionState: MTLBuffer
@@ -402,6 +404,7 @@ public final class GPUSolver {
         "np_collide",
         "np_collide_analytic_compat",
         "np_collide_convex",
+        "filter_compound_internal_contacts",
         "np_collide_enhanced_analytic",
         "prepare_torsional_friction",
         "primal_particles_split_torsion",
@@ -4324,6 +4327,62 @@ public final class GPUSolver {
         }
     }
 
+    /// Experimental opt-in: reject buried partition contacts in an authored
+    /// all-convex rigid compound. Probe size is an explicit geometric budget.
+    /// Rebuild after any changes to collider-local geometry or transforms.
+    public func enableCompoundBoundaryFiltering(probeDistance: Float = 1e-6) throws {
+        guard probeDistance > 0, probeDistance.isFinite else {
+            throw ConvexCollisionError.invalidAssetGeometry(asset:"compound",reason:"invalid boundary-filter probe")
+        }
+        sync()
+        let owners=colliderOwner.contents().bindMemory(to:UInt32.self,capacity:numColliders)
+        let positions=colliderLocalPosition.contents().bindMemory(to:SIMD4<Float>.self,capacity:numColliders)
+        let rotations=colliderLocalRotation.contents().bindMemory(to:SIMD4<Float>.self,capacity:numColliders)
+        let sizes=colliderShape.contents().bindMemory(to:SIMD4<Float>.self,capacity:numColliders)
+        let assets=colliderConvexAssetID.contents().bindMemory(to:UInt32.self,capacity:numColliders)
+        let groups=Dictionary(grouping:0..<numColliders,by:{owners[$0]})
+        var bounds:[(F3,F3)]=[]
+        for i in 0..<numColliders {
+            guard assets[i] != UInt32.max else {throw ConvexCollisionError.invalidAssetGeometry(asset:"compound",reason:"boundary filter requires cooked convex topology")}
+            let p=F3(positions[i].x,positions[i].y,positions[i].z),q=Quat(vector:rotations[i])
+            let h=F3(sizes[i].x,sizes[i].y,sizes[i].z)*0.5
+            var lo=F3(repeating:Float.infinity),hi=F3(repeating:-Float.infinity)
+            for x:Float in [-1,1] {for y:Float in [-1,1] {for z:Float in [-1,1] {
+                let v=p+q.act(h*F3(x,y,z));lo=simd_min(lo,v);hi=simd_max(hi,v)
+            }}}
+            bounds.append((lo,hi))
+        }
+        var lists=[[UInt32]](repeating:[],count:numColliders)
+        for group in groups.values {
+            guard group.count<=4096 else {throw ConvexCollisionError.invalidAssetGeometry(asset:"compound",reason:"boundary adjacency budget exceeded")}
+            for i in group {for j in group where i != j {
+                let a=bounds[i],b=bounds[j]
+                if all(a.0 .<= b.1+F3(repeating:probeDistance*2)) && all(b.0 .<= a.1+F3(repeating:probeDistance*2)) {lists[i].append(UInt32(j))}
+            }}
+        }
+        var packed=[UInt32](repeating:0,count:numColliders+1)
+        for i in 0..<numColliders {packed[i]=UInt32(packed.count);packed.append(contentsOf:lists[i])}
+        packed[numColliders]=UInt32(packed.count)
+        sync()
+        guard let buffer=device.makeBuffer(bytes:packed,length:packed.count*4,options:.storageModeShared) else {throw ConvexCollisionError.invalidAssetGeometry(asset:"compound",reason:"adjacency allocation failed")}
+        compoundBoundaryNeighbours=buffer;compoundBoundaryProbe=probeDistance
+    }
+
+    /// Apply world-space angular velocity increments without resetting poses
+    /// or contact history. Callers convert angular impulses using the current
+    /// world inverse inertia; this API does not interpret increments as torque.
+    public func applyAngularVelocityImpulses(_ impulses: [(body: Int, deltaVelocity: F3)]) {
+        guard !impulses.isEmpty else { return }
+        wakeRigidBodies(impulses.map { $0.body })
+        sync()
+        let values = velAng.contents().bindMemory(to: SIMD4<Float>.self, capacity: numBodies)
+        for impulse in impulses {
+            precondition(impulse.body >= 0 && impulse.body < numBodies)
+            precondition(impulse.deltaVelocity.x.isFinite && impulse.deltaVelocity.y.isFinite && impulse.deltaVelocity.z.isFinite)
+            values[impulse.body] += SIMD4(impulse.deltaVelocity, 0)
+        }
+    }
+
     /// Robotics: teleport a body (resets its velocity).
     public func setBodyPose(_ i: Int, position: F3, rotation: Quat) {
         setBodyPoses([BodyPoseUpdate(body: i, position: position, rotation: rotation)])
@@ -6115,6 +6174,22 @@ public final class GPUSolver {
             }
         }
 
+        if let neighbours=compoundBoundaryNeighbours {
+            dispatchIndirect(enc,"filter_compound_internal_contacts",argsOffset:0) { e in
+                e.setBuffer(self.manifolds,offset:0,index:0)
+                e.setBuffer(self.contactFeatures,offset:0,index:1)
+                e.setBuffer(self.posLin,offset:0,index:2)
+                e.setBuffer(self.posAng,offset:0,index:3)
+                e.setBuffer(neighbours,offset:0,index:4)
+                e.setBuffer(self.colliderLocalPosition,offset:0,index:5)
+                e.setBuffer(self.colliderLocalRotation,offset:0,index:6)
+                e.setBuffer(self.colliderConvexAssetID,offset:0,index:7)
+                e.setBuffer(self.convexHullHeaders,offset:0,index:8)
+                e.setBuffer(self.convexFaces,offset:0,index:9)
+                e.setBuffer(self.counters,offset:0,index:10)
+                var probe=self.compoundBoundaryProbe;e.setBytes(&probe,length:4,index:11)
+            }
+        }
         if hasTorsionalFriction {
             try stage("torsional-friction")
             dispatchIndirect(
@@ -7875,6 +7950,32 @@ public final class GPUSolver {
 
     /// Deepest active rigid-contact violation from the last completed step.
     /// Intended for convergence diagnostics in dense cable/contact rigs.
+    /// Read-only world-space witnesses for independent contact-geometry audits.
+    /// Normal points from body B toward body A. Includes speculative contacts;
+    /// a returned witness is not itself proof of penetration or load.
+    public func debugRigidContactWitnesses() -> [(colliderA: Int, colliderB: Int, pointA: F3, pointB: F3, normal: F3, normalMultiplier: Float)] {
+        sync()
+        let data = prevManifolds.contents().bindMemory(to: ManifoldGPU.self, capacity: maxPairs)
+        var result: [(Int, Int, F3, F3, F3, Float)] = []
+        for index in 0..<lastNumPairs where data[index].header.z > 0 {
+            let m = data[index]
+            let a=Int(m.header.x), b=Int(m.header.y)
+            let pa=bodyPosition(a), pb=bodyPosition(b)
+            let qa=bodyRotation(a), qb=bodyRotation(b)
+            var contacts=m.contacts
+            withUnsafeBytes(of: &contacts) { bytes in
+                for c in bytes.bindMemory(to: ContactGPU.self).prefix(min(Int(m.header.z), AVBD_MAX_CONTACTS)) {
+                    let ra=F3(c.rA.x,c.rA.y,c.rA.z), rb=F3(c.rB.x,c.rB.y,c.rB.z)
+                    result.append((Int(m.colliderPair.x), Int(m.colliderPair.y),
+                        pa + ((m.header.w & 2) != 0 ? ra : qa.act(ra)),
+                        pb + ((m.header.w & 4) != 0 ? rb : qb.act(rb)),
+                        F3(m.basisN.x,m.basisN.y,m.basisN.z), c.lambda.x))
+                }
+            }
+        }
+        return result
+    }
+
     public func debugWorstRigidContactPenetration()
         -> (bodyA: Int, bodyB: Int, depth: Float)? {
         sync()

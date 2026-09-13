@@ -687,8 +687,12 @@ inline NPCResult npcMPRWithEnlargeLocal(
             temp = cross(e13, v1.w);
             float beta = dot(temp, unitNormal) * invNormal;
             float alpha = 1.0f - gamma - beta;
+            // A portal-plane projection outside the triangle extrapolates
+            // witnesses beyond both convex hulls. It can look algebraically
+            // consistent while inventing penetration across a real gap.
             if (!finite_bits(alpha) || !finite_bits(beta)
-                || !finite_bits(gamma)) return out;
+                || !finite_bits(gamma) || min(alpha, min(beta, gamma)) < 0.0f)
+                return out;
 
             out.overlap = true;
             out.valid = true;
@@ -810,6 +814,8 @@ inline void npcClosestSegment(
 {
     float3 a = simplex.vertices[i0].w;
     float3 b = simplex.vertices[i1].w;
+    float simplexScale = max(1.0e-20f, max(length(a), length(b)));
+    a /= simplexScale; b /= simplexScale;
     float3 edge = b - a;
     float denom = dot(edge, edge);
     bool degenerate = denom < 1.0e-8f;
@@ -829,7 +835,7 @@ inline void npcClosestSegment(
     barycentric = float4(0);
     barycentric[i0] = lambda0;
     barycentric[i1] = lambda1;
-    closest = a * barycentric[i0] + b * barycentric[i1];
+    closest = (a * barycentric[i0] + b * barycentric[i1]) * simplexScale;
 }
 
 inline void npcClosestTriangle(
@@ -839,6 +845,8 @@ inline void npcClosestTriangle(
     float3 a = simplex.vertices[i0].w;
     float3 b = simplex.vertices[i1].w;
     float3 c = simplex.vertices[i2].w;
+    float simplexScale = max(1.0e-20f, max(length(a), max(length(b), length(c))));
+    a /= simplexScale; b /= simplexScale; c /= simplexScale;
     float3 u = a - b;
     float3 w = a - c;
     float3 normal = cross(u, w);
@@ -882,7 +890,7 @@ inline void npcClosestTriangle(
     barycentric[i1] = lambda1;
     barycentric[i2] = lambda2;
     mask = (1u << uint(i0)) | (1u << uint(i1)) | (1u << uint(i2));
-    closest = lambda0 * a + lambda1 * b + lambda2 * c;
+    closest = (lambda0 * a + lambda1 * b + lambda2 * c) * simplexScale;
 }
 
 inline void npcClosestTetrahedron(
@@ -893,6 +901,8 @@ inline void npcClosestTetrahedron(
     float3 v1 = simplex.vertices[1].w;
     float3 v2 = simplex.vertices[2].w;
     float3 v3 = simplex.vertices[3].w;
+    float simplexScale = max(1.0e-20f, max(max(length(v0), length(v1)), max(length(v2), length(v3))));
+    v0 /= simplexScale; v1 /= simplexScale; v2 /= simplexScale; v3 /= simplexScale;
     float det = npcDeterminant(v0, v1, v2, v3);
     bool degenerate = fabs(det) < 1.0e-8f;
     float inv = degenerate ? 0.0f : 1.0f / det;
@@ -989,7 +999,7 @@ inline NPCResult npcGJKWithIterationLimitLocal(
     // previous 1e-5 relative threshold was ten times stricter around
     // unit-scale geometry and could cycle between nearly degenerate simplices
     // until the bounded iteration budget expired.
-    float epsilon = 1.0e-4f;
+    float epsilon = max(1.0e-8f, 1.0e-4f * min(1.0f, min(length(a.dimensions.xyz), length(b.dimensions.xyz))));
     float distSq = dot(v, v);
     float3 lastDirection = out.normalAB;
     bool converged = false;
