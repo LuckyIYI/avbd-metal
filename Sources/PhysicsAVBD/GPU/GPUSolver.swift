@@ -7350,7 +7350,7 @@ public final class GPUSolver {
     /// Ideal finite-stiffness screw coupling. Axial displacement and twist
     /// share one energy term, so axial load generates reciprocal torque.
     public func setHelicalJoint(jointIndex: Int, parent: Int, body: Int,
-                                parentAnchor: F3, pitch: Float,
+                                parentAnchor: F3, pitch: Float, minimumTravel: Float? = nil,
                                 axialStiffness: Float = 100000) {
         precondition(jointIndex >= 0 && jointIndex < numJoints && pitch > 0 && pitch.isFinite)
         precondition(parent >= 0 && parent < numBodies && body >= 0 && body < numBodies)
@@ -7365,6 +7365,10 @@ public final class GPUSolver {
         j.penaltyLin=SIMD4(repeating:100000);j.penaltyAng=SIMD4(repeating:100000)
         j.dynamics.w=pitch/(2 * .pi)
         j.responseKnot0.y=axialStiffness
+        if let minimumTravel {
+            precondition(minimumTravel.isFinite)
+            j.translationLimits=SIMD4(minimumTravel,Float.greatestFiniteMagnitude,1,0)
+        }
         jp[jointIndex]=j
     }
     public func helicalAngle(_ jointIndex:Int) -> Float {

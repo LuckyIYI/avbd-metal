@@ -74,4 +74,22 @@ final class FiniteGraspSpringTests: XCTestCase {
         XCTAssertEqual(total,4 * .pi,accuracy:0.04)
     }
 
+    func testSeatedScrewCannotBackdriveBelowItsClosedPosition() throws {
+        var scene=PhysicsScene(name:"seated screw under gravity")
+        scene.settings.dt=1/480;scene.settings.iterations=24
+        let jar=scene.addBody(size:F3(repeating:0.1),density:0,friction:0.3,position:.zero,collisionEnabled:false)
+        let lid=scene.addBody(size:F3(repeating:0.1),density:0,friction:0.3,position:F3(0,0,0.2),mass:0.035,diagonalInertia:F3(0.00003,0.00003,0.00005),collisionEnabled:false)
+        let screw=scene.addDragSlot(),pull=scene.addDragSlot();let gpu=try GPUSolver(scene:scene)
+        gpu.setHelicalJoint(jointIndex:screw,parent:jar,body:lid,parentAnchor:F3(0,0,0.2),pitch:0.006,minimumTravel:0)
+        for _ in 0..<1440 {try gpu.submitStep()}
+        try gpu.synchronize()
+        XCTAssertEqual(gpu.bodyPosition(lid).z,0.2,accuracy:0.0001)
+        XCTAssertEqual(gpu.helicalAngle(screw),0,accuracy:0.03)
+        gpu.setDrag(jointIndex:pull,body:lid,worldTarget:F3(0,0,0.212),localAnchor:.zero,stiffness:1000)
+        for _ in 0..<2400 {try gpu.submitStep()}
+        try gpu.synchronize()
+        XCTAssertGreaterThan(gpu.bodyPosition(lid).z,0.21)
+        XCTAssertGreaterThan(gpu.helicalAngle(screw),3 * .pi)
+    }
+
 }
