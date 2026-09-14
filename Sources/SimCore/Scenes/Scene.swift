@@ -123,6 +123,7 @@ public struct SceneBody {
 public struct SceneCollider {
     /// Optional metric implicit surface. GPU contacts currently support sphere pairs.
     public var implicitField: ImplicitField? = nil
+    public var implicitContactSurface: ImplicitContactSurface? = nil
 
     public var body: Int
     public var size: F3

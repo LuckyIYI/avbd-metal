@@ -1,4 +1,5 @@
 import Foundation
+import simd
 
 public extension ImplicitField {
     /// Compiled straight-line arithmetic. No dynamic dispatch inside evaluation.
@@ -49,7 +50,10 @@ public enum ImplicitCollisionError: Error { case unsupportedPair(Int,Int), inval
 public extension PhysicsScene {
     func implicitCollisionPreamble() throws -> String {
         let ids = colliders.indices.filter { colliders[$0].implicitField != nil }
-        if ids.isEmpty { return "" }
+        if ids.isEmpty {
+            if colliders.contains(where: {$0.implicitContactSurface != nil}) {throw ImplicitCollisionError.invalidCollider(0)}
+            return ""
+        }
         var source = "#define AVBD_IMPLICIT 1\n"
         var shared = [Data:Int](), names = [Int:Int]()
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
@@ -64,8 +68,7 @@ public extension PhysicsScene {
             else { throw ImplicitCollisionError.invalidCollider(i) }
             for j in colliders.indices where canPotentiallyCollide(colliderA:i,colliderB:j) {
                 let other = colliders[j]
-                guard other.implicitField == nil, other.shape == .sphere,
-                      other.convexAssetID == nil, other.convexHullVertices.isEmpty
+                guard other.implicitField == nil, (other.shape == .sphere || other.shape == .box || other.convexAssetID != nil || other.implicitContactSurface != nil)
                 else { throw ImplicitCollisionError.unsupportedPair(i,j) }
             }
             let key = try encoder.encode(f)
@@ -74,6 +77,6 @@ public extension PhysicsScene {
         }
         source += "inline float4 implicit_query(uint id,float3 p) { switch(id) {\n"
         for i in ids { source += "case \(i): return implicit_\(names[i]!)(p);\n" }
-        return source + "default: return float4(NAN); }}\n"
+        return source + "default: return float4(NAN); }}\n" + (try implicitSurfaceSource())
     }
 }

@@ -1291,6 +1291,9 @@ public final class GPUSolver {
         self.queue = q
 
         self.implicitPreamble = try scene.implicitCollisionPreamble()
+        self.implicitGlobalPairCount = scene.implicitPlanePairs().count
+        var scene = scene
+        for i in scene.colliders.indices where scene.colliders[i].implicitContactSurface?.isInfinitePlane == true {scene.colliders[i].collisionEnabled=false}
         let convexUpload = try Self.makeConvexGPUUpload(scene: scene)
         convexClipWorkspaceVertices = ConvexHullGPU.clipWorkspaceVertices(
             largestSourceFace: convexUpload.faces.map { Int($0.loop.y) }.max() ?? 0)
@@ -2061,6 +2064,7 @@ public final class GPUSolver {
     // MARK: - Shader compilation
 
     private var implicitPreamble = ""
+    private var implicitGlobalPairCount = 0
     public private(set) var convexClipWorkspaceVertices = 32
 
     private func buildPipelines() throws {
@@ -2453,6 +2457,7 @@ public final class GPUSolver {
                 }
             }
             if c.implicitField != nil { flags = 5 }
+            if c.implicitContactSurface != nil { flags = 6 }
             if particle { flags |= 0x10 }
             if c.usesWorldSpaceRoundAnchor { flags |= 0x20 }
             if (flags & 0xF) == 3 && !particle
@@ -6028,6 +6033,17 @@ public final class GPUSolver {
             }
         }
 
+        if implicitGlobalPairCount > 0 {
+            dispatch1D(enc,"implicit_append_planes",1) {e in
+                e.setBuffer(self.pairs,offset:0,index:0);e.setBuffer(self.counters,offset:0,index:1)
+                e.setBytes(&P,length:MemoryLayout<SimParamsGPU>.stride,index:2)
+                e.setBuffer(self.convexQueryPoison,offset:0,index:3)
+            }
+            dispatch1D(enc,"bp_finalize_pairs",1) {e in
+                e.setBuffer(self.counters,offset:0,index:0);e.setBuffer(self.dispatchArgs,offset:0,index:1)
+                e.setBytes(&P,length:MemoryLayout<SimParamsGPU>.stride,index:2)
+            }
+        }
         try stage("narrowphase")
         // Hull-free scenes retain the exact established 22-buffer analytic
         // kernel: wrapping its body in the expanded generic template changes
@@ -7774,6 +7790,12 @@ public final class GPUSolver {
     /// Read only after a typed convex-query failure has retired. Captures the
     /// actual narrowphase poses, before the failed-frame rollback. No sync()
     /// here: that legacy accessor traps on a latched failure.
+    public func implicitFailureEvidence() -> [String:Any]? {
+        guard runtimeFailure != nil else {return nil}
+        let w=convexQueryPoison.contents().bindMemory(to:UInt32.self,capacity:32)
+        guard w[1]==2 else {return nil}
+        return ["reason_code":w[2],"field_collider":w[3],"surface_collider":w[4]]
+    }
     public func convexFailureEvidence() -> [String: Any]? {
         guard case .commandExecution(_, _, _, let domain, _, _) = runtimeFailure,
               domain == RuntimeFailure.convexQueryFailureDomain else { return nil }

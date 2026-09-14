@@ -41,7 +41,7 @@ public extension PhysicsScene {
     /// map. Potentially colliding torus/hull pairs therefore fail before any
     /// solver state is allocated or mutated.
     func makeCPUSolverChecked() throws -> CPUSolver {
-        if colliders.contains(where: { $0.implicitField != nil }) { throw CPUConvexCollisionError.unsupportedImplicitField }
+        if colliders.contains(where: { $0.implicitField != nil || $0.implicitContactSurface != nil }) { throw CPUConvexCollisionError.unsupportedImplicitField }
         for (index, collider) in colliders.enumerated() {
             if let asset = collider.convexAssetID {
                 guard collider.convexHullVertices.isEmpty else {
