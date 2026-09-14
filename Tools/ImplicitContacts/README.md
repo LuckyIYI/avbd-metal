@@ -34,10 +34,24 @@ generic 214, native 32-box approximation 1438. Includes submission, synchronizat
 and per-step body reads; excludes shader initialization. These are historical local
 checkout numbers; rerun on the PR checkout/hardware before relying on them.
 
-**Known accuracy failure:** a ring dropped 80 mm reaches 4.48 mm transient floor
-penetration; final flat-path penetration is 0.50 mm. The regular strict checker
-fails this impact test. Do not interpret final-position acceptance as impact
-accuracy. This PR improves query support/performance, not contact stiffness or CCD.
+**Impact regression fixed:** SDF queries now use bounded speculative detection
+for approaching pairs, while retaining the same solver collision margin. The
+formerly failing ring-drop check passes at 0.0796 mm maximum penetration (previously
+4.48 mm), with dt 1/240 and four iterations unchanged. This is not general CCD.
+
+Convex hull triangles are grouped into unique outward face planes. A support face
+can reuse the flat-patch path only when all other hull halfspaces establish that
+no edge or other face intersects the field bounds. A cached previous face is tried
+first and revalidated; generic search remains the fallback. No concavity is removed
+from the field. `surface-hull-octagon` and `surface-hull-octagon-ramp` exercise a
+non-box hull and inclined support. Append `-generic` for matched comparisons.
+
+`validation-convex.json` retains all trials and the original ramp check that used
+world Z incorrectly. The corrected check measures support distance along the ramp
+normal, with the same 1 mm limit; maximum penetration is 0.0843 mm. Native box,
+cooked hull, plane, triangle and tilted-ring impacts pass. Full containment still
+rejects. Historical benchmark data above predates this impact fix. Current octagon
+trial timings vary substantially under shared-machine load; inspect all samples.
 
 Other limits: exact metric field/bounds are an author contract; CPU field contacts
 and SDF/SDF reject; triangle surfaces are limited to 508 triangles/collider and

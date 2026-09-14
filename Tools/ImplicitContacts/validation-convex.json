@@ -1,0 +1,464 @@
+{
+  "scope": "Speculative SDF impact detection and unique convex hull face specialization; multi-normal patch handling remains unsupported",
+  "settings": {
+    "dt": 0.004166666666666667,
+    "iterations": 4,
+    "steps": 240,
+    "strict_penetration_limit_m": 0.001
+  },
+  "checks": {
+    "convex-specialized-v1/surface-contain.json": {
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 1, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "evidence": {
+        "surface_collider": 1,
+        "reason_code": 5,
+        "field_collider": 0
+      },
+      "passed": false
+    },
+    "convex-specialized-v1/surface-convex.json": {
+      "strict_impact_pass": true,
+      "final_z": [
+        0.019920388236641884
+      ],
+      "step_seconds": 0.45657598972320557,
+      "minimum_center_z": 0.019920388236641884,
+      "mode": "surface-convex",
+      "maximum_plane_penetration_m": 7.961131632328033e-05,
+      "replicas": 1,
+      "initialization_seconds": 2.858924984931946,
+      "passed": true,
+      "steps_per_second": 525.6518200738009
+    },
+    "convex-specialized-v1/surface-edge-miss.json": {
+      "maximum_plane_penetration_m": 0,
+      "replicas": 1,
+      "passed": true,
+      "mode": "surface-edge-miss",
+      "final_z": [
+        -4.825181007385254
+      ],
+      "initialization_seconds": 0.04914700984954834,
+      "minimum_center_z": -4.825181007385254,
+      "steps_per_second": 881.7143202499481,
+      "step_seconds": 0.27219700813293457,
+      "strict_impact_pass": true
+    },
+    "convex-specialized-v1/surface-hole.json": {
+      "strict_impact_pass": true,
+      "maximum_plane_penetration_m": 0,
+      "minimum_center_z": -4.825181007385254,
+      "passed": true,
+      "mode": "surface-hole",
+      "final_z": [
+        -4.825181007385254
+      ],
+      "step_seconds": 0.2685530185699463,
+      "steps_per_second": 893.6782810262492,
+      "replicas": 1,
+      "initialization_seconds": 2.7384870052337646
+    },
+    "convex-specialized-v1/surface-hull-octagon-generic.json": {
+      "maximum_plane_penetration_m": 7.848069071769714e-05,
+      "steps_per_second": 129.59894264320917,
+      "initialization_seconds": 2.4307539463043213,
+      "passed": true,
+      "mode": "surface-hull-octagon-generic",
+      "strict_impact_pass": true,
+      "replicas": 1,
+      "final_z": [
+        0.019921815022826195
+      ],
+      "step_seconds": 1.8518669605255127,
+      "minimum_center_z": 0.019921815022826195
+    },
+    "convex-specialized-v1/surface-hull-octagon.json": {
+      "minimum_center_z": 0.019920386373996735,
+      "step_seconds": 0.4425950050354004,
+      "steps_per_second": 542.2564585445422,
+      "maximum_plane_penetration_m": 7.961317896842957e-05,
+      "final_z": [
+        0.019920386373996735
+      ],
+      "replicas": 1,
+      "initialization_seconds": 2.8016200065612793,
+      "mode": "surface-hull-octagon",
+      "strict_impact_pass": true,
+      "passed": true
+    },
+    "convex-specialized-v1/surface-hull.json": {
+      "replicas": 1,
+      "final_z": [
+        0.019920388236641884
+      ],
+      "mode": "surface-hull",
+      "steps_per_second": 482.62941473870137,
+      "step_seconds": 0.4972759485244751,
+      "strict_impact_pass": true,
+      "maximum_plane_penetration_m": 7.961131632328033e-05,
+      "minimum_center_z": 0.019920388236641884,
+      "passed": true,
+      "initialization_seconds": 2.9277950525283813
+    },
+    "convex-specialized-v1/surface-infinite.json": {
+      "step_seconds": 0.7289279699325562,
+      "steps_per_second": 329.2506391573998,
+      "final_z": [
+        0.01992405578494072
+      ],
+      "initialization_seconds": 2.6609280109405518,
+      "strict_impact_pass": true,
+      "maximum_plane_penetration_m": 7.594376802444458e-05,
+      "minimum_center_z": 0.01992405578494072,
+      "passed": true,
+      "replicas": 1,
+      "mode": "surface-infinite"
+    },
+    "convex-specialized-v1/surface-plane.json": {
+      "maximum_plane_penetration_m": 7.961131632328033e-05,
+      "passed": true,
+      "step_seconds": 0.439067006111145,
+      "minimum_center_z": 0.019920388236641884,
+      "final_z": [
+        0.019920388236641884
+      ],
+      "initialization_seconds": 2.705374002456665,
+      "strict_impact_pass": true,
+      "steps_per_second": 546.6136071705798,
+      "mode": "surface-plane",
+      "replicas": 1
+    },
+    "convex-specialized-v1/surface-tilted.json": {
+      "minimum_center_z": 0.019927673041820526,
+      "steps_per_second": 189.93366784791124,
+      "strict_impact_pass": true,
+      "passed": true,
+      "maximum_plane_penetration_m": 7.29970633983612e-05,
+      "mode": "surface-tilted",
+      "step_seconds": 1.2635990381240845,
+      "initialization_seconds": 0.05517005920410156,
+      "final_z": [
+        0.019927673041820526
+      ],
+      "replicas": 1
+    },
+    "convex-specialized-v1/surface-triangle.json": {
+      "final_z": [
+        0.019921202212572098
+      ],
+      "passed": true,
+      "mode": "surface-triangle",
+      "replicas": 1,
+      "steps_per_second": 124.36109172022043,
+      "strict_impact_pass": true,
+      "maximum_plane_penetration_m": 7.89891928434372e-05,
+      "minimum_center_z": 0.019921202212572098,
+      "step_seconds": 1.9298640489578247,
+      "initialization_seconds": 2.188815951347351
+    },
+    "convex-specialized-v2/implicit.json": {
+      "colliders": 16,
+      "dt": 0.004166666666666667,
+      "dynamic": false,
+      "final_z": [
+        -4.865182876586914,
+        0.025909774005413055,
+        0.025909774005413055,
+        0.025909774005413055,
+        -4.865182876586914,
+        0.025909774005413055,
+        0.025909774005413055,
+        0.025909774005413055
+      ],
+      "initialization_seconds": 2.590939998626709,
+      "iterations": 4,
+      "mode": "implicit",
+      "momentum_error": [
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573
+      ],
+      "passed": true,
+      "replicas": 8,
+      "ring_velocity_x": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "step_wall_seconds": 0.45041799545288086,
+      "steps": 240,
+      "steps_per_second": 532.8383910564845
+    },
+    "convex-specialized-v2/ramp-normal-check.json": {
+      "minimum_center_z": 0.017890697345137596,
+      "initialization_seconds": 0.08648109436035156,
+      "maximum_plane_penetration_m": 8.427537977695465e-05,
+      "replicas": 1,
+      "steps_per_second": 175.68183954120374,
+      "mode": "surface-hull-octagon-ramp",
+      "step_seconds": 1.3661059141159058,
+      "final_plane_gaps": [
+        -8.427537977695465e-05
+      ],
+      "strict_impact_pass": true,
+      "final_z": [
+        0.017890697345137596
+      ],
+      "passed": true
+    },
+    "convex-specialized-v2/regular-checker.json": {
+      "articulated_joints": 0,
+      "schema": "assetgen-native-avbd-result-1",
+      "maximum_fixed_body_displacement_m": 0,
+      "initialization_seconds": 4.236863970756531,
+      "passed": true,
+      "final_max_linear_velocity_m_s": 5.0067898e-05,
+      "steps": 240,
+      "audit_samples": 241,
+      "scope": "AVBD headless rigid-body run; floor and joint-anchor audits sampled every 1 step; no interobject penetration claim",
+      "bodies": [
+        {
+          "displacement": 0.080079615,
+          "name": "rubber",
+          "initial": {
+            "y": 0,
+            "x": -6.423931e-18,
+            "z": 0.1
+          },
+          "final": {
+            "y": -2.818374e-33,
+            "x": 8.4132874e-13,
+            "z": 0.019920388
+          },
+          "finite": true
+        }
+      ],
+      "maximum_collider_floor_penetration_m": 7.961504e-05,
+      "finite_state": true,
+      "name": "ring_surface_integration",
+      "audit_stride": 1,
+      "stepping_seconds": 0.5644659996032715,
+      "final_max_angular_velocity_rad_s": 1.8117007e-09,
+      "broken_joints": [],
+      "max_rotation_from_initial_rad": 0,
+      "dt": 0.004166667,
+      "maximum_joint_limit_violation_m": 0,
+      "maximum_joint_anchor_gap_m": 0,
+      "independent_free_bodies": 1,
+      "workload": "AVBD GPU",
+      "iterations": 4,
+      "maximum_joint_limit_violation_rad": 0,
+      "audit_seconds": 0.0009109973907470703,
+      "max_horizontal_displacement_m": 1.6982664e-12,
+      "max_displacement_m": 0.080079615
+    },
+    "convex-specialized-v2/surface-contain.json": {
+      "evidence": {
+        "field_collider": 0,
+        "reason_code": 5,
+        "surface_collider": 1
+      },
+      "passed": false,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 1, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")"
+    },
+    "convex-specialized-v2/surface-hull-octagon-0.json": {
+      "maximum_plane_penetration_m": 7.961317896842957e-05,
+      "mode": "surface-hull-octagon",
+      "passed": true,
+      "steps_per_second": 174.78507617686748,
+      "minimum_center_z": 0.019920386373996735,
+      "strict_impact_pass": true,
+      "replicas": 8,
+      "final_z": [
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735
+      ],
+      "step_seconds": 1.3731149435043335,
+      "initialization_seconds": 4.22616708278656
+    },
+    "convex-specialized-v2/surface-hull-octagon-1.json": {
+      "maximum_plane_penetration_m": 7.961317896842957e-05,
+      "passed": true,
+      "minimum_center_z": 0.019920386373996735,
+      "replicas": 8,
+      "strict_impact_pass": true,
+      "final_z": [
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735
+      ],
+      "step_seconds": 0.22619402408599854,
+      "steps_per_second": 1061.0359887702093,
+      "initialization_seconds": 1.9989659786224365,
+      "mode": "surface-hull-octagon"
+    },
+    "convex-specialized-v2/surface-hull-octagon-2.json": {
+      "steps_per_second": 877.5168811424606,
+      "step_seconds": 0.2734990119934082,
+      "final_z": [
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735,
+        0.019920386373996735
+      ],
+      "replicas": 8,
+      "initialization_seconds": 0.0650249719619751,
+      "mode": "surface-hull-octagon",
+      "strict_impact_pass": true,
+      "passed": true,
+      "minimum_center_z": 0.019920386373996735,
+      "maximum_plane_penetration_m": 7.961317896842957e-05
+    },
+    "convex-specialized-v2/surface-hull-octagon-generic-0.json": {
+      "strict_impact_pass": true,
+      "initialization_seconds": 3.2517930269241333,
+      "passed": true,
+      "step_seconds": 4.578992962837219,
+      "replicas": 8,
+      "steps_per_second": 52.41327120347703,
+      "mode": "surface-hull-octagon-generic",
+      "maximum_plane_penetration_m": 8.000433444976807e-05,
+      "minimum_center_z": 0.01992143504321575,
+      "final_z": [
+        0.019921815022826195,
+        0.019922271370887756,
+        0.019922703504562378,
+        0.019921835511922836,
+        0.019921908155083656,
+        0.01992143504321575,
+        0.01992143504321575,
+        0.01992143504321575
+      ]
+    },
+    "convex-specialized-v2/surface-hull-octagon-generic-1.json": {
+      "step_seconds": 2.639569044113159,
+      "strict_impact_pass": true,
+      "final_z": [
+        0.019921815022826195,
+        0.019922271370887756,
+        0.019922703504562378,
+        0.019921835511922836,
+        0.019921908155083656,
+        0.01992143504321575,
+        0.01992143504321575,
+        0.01992143504321575
+      ],
+      "replicas": 8,
+      "maximum_plane_penetration_m": 8.000433444976807e-05,
+      "mode": "surface-hull-octagon-generic",
+      "initialization_seconds": 0.045626044273376465,
+      "minimum_center_z": 0.01992143504321575,
+      "passed": true,
+      "steps_per_second": 90.9239334107417
+    },
+    "convex-specialized-v2/surface-hull-octagon-generic-2.json": {
+      "final_z": [
+        0.019921815022826195,
+        0.019922271370887756,
+        0.019922703504562378,
+        0.019921835511922836,
+        0.019921908155083656,
+        0.01992143504321575,
+        0.01992143504321575,
+        0.01992143504321575
+      ],
+      "step_seconds": 2.2179949283599854,
+      "replicas": 8,
+      "initialization_seconds": 1.5168280601501465,
+      "minimum_center_z": 0.01992143504321575,
+      "maximum_plane_penetration_m": 8.000433444976807e-05,
+      "mode": "surface-hull-octagon-generic",
+      "passed": true,
+      "steps_per_second": 108.20583804375926,
+      "strict_impact_pass": true
+    },
+    "convex-specialized-v2/surface-hull-octagon-ramp.json": {
+      "replicas": 1,
+      "maximum_plane_penetration_m": 8.427537977695465e-05,
+      "strict_impact_pass": true,
+      "minimum_center_z": 0.017890697345137596,
+      "mode": "surface-hull-octagon-ramp",
+      "step_seconds": 1.9478049278259277,
+      "initialization_seconds": 3.1366679668426514,
+      "final_z": [
+        0.017890697345137596
+      ],
+      "passed": false,
+      "steps_per_second": 123.21562419902062
+    },
+    "convex-specialized-v2/surface-hull-octagon.json": {
+      "maximum_plane_penetration_m": 7.961317896842957e-05,
+      "strict_impact_pass": true,
+      "minimum_center_z": 0.019920386373996735,
+      "mode": "surface-hull-octagon",
+      "initialization_seconds": 0.06380808353424072,
+      "final_z": [
+        0.019920386373996735
+      ],
+      "step_seconds": 0.5430459976196289,
+      "passed": true,
+      "replicas": 1,
+      "steps_per_second": 441.95151249067044
+    },
+    "convex-specialized-v2/surface-tilted.json": {
+      "minimum_center_z": 0.019927673041820526,
+      "replicas": 1,
+      "passed": true,
+      "step_seconds": 1.5605980157852173,
+      "mode": "surface-tilted",
+      "strict_impact_pass": true,
+      "final_z": [
+        0.019927673041820526
+      ],
+      "maximum_plane_penetration_m": 7.29970633983612e-05,
+      "initialization_seconds": 4.020283937454224,
+      "steps_per_second": 153.78720052981973
+    }
+  },
+  "benchmark": {
+    "surface-hull-octagon": {
+      "replicas": 8,
+      "median_steps_per_second": 877.5168811424606,
+      "trials_steps_per_second": [
+        174.78507617686748,
+        1061.0359887702093,
+        877.5168811424606
+      ]
+    },
+    "surface-hull-octagon-generic": {
+      "replicas": 8,
+      "median_steps_per_second": 90.9239334107417,
+      "trials_steps_per_second": [
+        52.41327120347703,
+        90.9239334107417,
+        108.20583804375926
+      ]
+    },
+    "caveat": "Shared-machine load caused substantial timing variation; all alternating trials retained. No universal speedup claim."
+  }
+}
