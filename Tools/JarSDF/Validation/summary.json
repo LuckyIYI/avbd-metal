@@ -1,0 +1,54 @@
+{
+  "passed": true,
+  "trials": 6,
+  "settings": {
+    "physics_hz": 480,
+    "iterations": 4,
+    "seconds": 6,
+    "fasteners": 12,
+    "maximum_penetration_limit_m": 0.001
+  },
+  "backends": {
+    "sdf": {
+      "passes": 3,
+      "jar_colliders": 1,
+      "total_colliders": 86,
+      "median_physics_steps_per_second": 353.8669770371457,
+      "steps_per_second_range": [
+        313.714064934701,
+        470.6581667683051
+      ],
+      "worst_sampled_jar_penetration_m": 0.0008720606565475464,
+      "worst_final_table_penetration_m": 0.0006329668685793877,
+      "discharged_each": [
+        12,
+        12,
+        12
+      ]
+    },
+    "convex": {
+      "passes": 3,
+      "jar_colliders": 512,
+      "total_colliders": 597,
+      "median_physics_steps_per_second": 236.2556004280203,
+      "steps_per_second_range": [
+        89.44143537815394,
+        265.098758080461
+      ],
+      "worst_sampled_jar_penetration_m": 0.0006028655916452408,
+      "worst_final_table_penetration_m": 0.00010724319145083427,
+      "discharged_each": [
+        12,
+        12,
+        12
+      ]
+    }
+  },
+  "median_throughput_ratio": 1.4978141317964564,
+  "regression_verification": {
+    "python_tests_passed": 31,
+    "supported_native_cases_passed": 8,
+    "unsupported_containment_correctly_rejected": true,
+    "captured_convex_witness_passed": true
+  }
+}
