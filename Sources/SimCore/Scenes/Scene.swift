@@ -683,6 +683,8 @@ public struct PhysicsScene {
     public var spinners: [SceneSpinner] = []
     public var collisionExclusions: [SceneCollisionExclusion] = []
     public var settings = SimSettings()
+    /// Disable only for matched contact-search benchmarks.
+    public var implicitPlaneAcceleration = true
 
     public init(name: String) {
         self.name = name

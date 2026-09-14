@@ -13,10 +13,82 @@ inline float3 impClosestTriangle(float3 p,float3 a,float3 b,float3 c) {
     float va=d3*d6-d5*d4;if(va<=0&&(d4-d3)>=0&&(d5-d6)>=0)return b+(c-b)*((d4-d3)/((d4-d3)+(d5-d6)));
     float inv=1/(va+vb+vc);return a+ab*(vb*inv)+ac*(vc*inv);
 }
+// Returns -1 when a finite edge, tilted support or missing witness needs the
+// general search. Bounding support certifies separation/contact depth; witnesses
+// are evaluated on the actual field surface when the shader is compiled.
+inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,float4 oq,
+ float margin,thread ImplicitHit* hits) {
+    if(!implicit_plane_acceleration())return -1;
+    float3 lo=implicit_bounds_min(fi),hi=implicit_bounds_max(fi),h=(hi-lo)*0.5f;
+    float3 center=q_rotate(q_conj(oq),fp+q_rotate(fq,(lo+hi)*0.5f)-op);
+    float3 ax=q_rotate(q_conj(oq),q_rotate(fq,float3(1,0,0)));
+    float3 ay=q_rotate(q_conj(oq),q_rotate(fq,float3(0,1,0)));
+    float3 az=q_rotate(q_conj(oq),q_rotate(fq,float3(0,0,1)));
+    float3 extent=abs(ax)*h.x+abs(ay)*h.y+abs(az)*h.z;
+    float3 bh=implicit_native_box_half(oi),normal=float3(0);float plane=0;
+    if(bh.x>0) {
+        int face=-1;
+        for(int a=0;a<3;a++) {
+            int u=(a+1)%3,v=(a+2)%3;
+            if(abs(center[a])>=bh[a] && abs(center[u])+extent[u]<bh[u]-margin && abs(center[v])+extent[v]<bh[v]-margin && abs(center[a])-extent[a]>-bh[a]+margin) {face=a;break;}
+        }
+        if(face<0)return -1;
+        normal[face]=center[face]>=0 ? 1.0f : -1.0f;plane=bh[face];
+    } else {
+        float2 rect=implicit_rectangle_half(oi);
+        if(!implicit_infinite_plane(oi) && (rect.x<=0 || any(abs(center.xy)+extent.xy>rect-margin)))return -1;
+        if(abs(center.z)<1e-7f)return -1;
+        normal.z=center.z>0 ? 1.0f : -1.0f;
+    }
+    float3 worldN=q_rotate(oq,normal),localN=q_rotate(q_conj(fq),worldN);
+    float bound=dot(normal,center)-dot(abs(normal),extent)-plane;
+    if(bound>margin)return 0;
+    // Flat support patches only. Near-tilted point/edge manifolds must retain
+    // the general search rather than switch between incompatible supports.
+    float3 alignment=abs(localN);float dominant=max(alignment.x,max(alignment.y,alignment.z));
+    if(alignment.x+alignment.y+alignment.z-dominant>1e-7f)return -1;
+    uint count=implicit_support_count(fi);if(count==0)return -1;
+    float best=INFINITY;int deepest=-1;
+    for(uint k=0;k<count;k++) {
+        float3 p=implicit_support_vertex(fi,k);
+        float d=dot(worldN,fp-op)+dot(localN,p)-plane;
+        if(d<best){best=d;deepest=int(k);}
+    }
+    const float certificateTolerance=2e-6f;
+    if(best-bound>certificateTolerance)return -1;
+    if(best>margin)return -1;
+    // Choose a small, spatially spread support manifold, keeping actual points.
+    int selected[4];int nout=0;
+    for(int slot=0;slot<4;slot++) {
+        int chosen=-1;float farthest=-1;
+        for(uint k=0;k<count;k++) {
+            bool used=false;for(int j=0;j<nout;j++)if(selected[j]==int(k))used=true;
+            if(used)continue;
+            float3 p=implicit_support_vertex(fi,k);
+            float d=dot(worldN,fp-op)+dot(localN,p)-plane;
+            if(d>margin || d>best+certificateTolerance)continue;
+            float score=slot==0 ? (int(k)==deepest ? 1.0f : 0.0f) : INFINITY;
+            for(int j=0;j<nout;j++)score=min(score,distance(p,implicit_support_vertex(fi,uint(selected[j]))));
+            if(score>farthest){farthest=score;chosen=int(k);}
+        }
+        if(chosen<0)break;
+        selected[nout]=chosen;
+        float3 p=fp+q_rotate(fq,implicit_support_vertex(fi,uint(chosen)));
+        float d=dot(worldN,p-op)-plane;
+        hits[nout++]={p,p-worldN*d,-worldN,d};
+    }
+    if(nout<3)return -1;
+    float area=0;
+    for(int j=1;j<nout;j++)for(int k=j+1;k<nout;k++)area=max(area,length(cross(hits[j].fieldPoint-hits[0].fieldPoint,hits[k].fieldPoint-hits[0].fieldPoint)));
+    if(area<0.01f*length_squared(h))return -1;
+    return nout;
+}
 // Adaptive triangle coverage uses the 1-Lipschitz bound of a metric SDF.
 // Exhaustion is reported, never interpreted as separation.
 inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,float4 oq,
  float3 halfBounds,float margin,thread ImplicitHit* hits,thread uint& failed) {
+    int planeHits=implicitPlaneContacts(fi,oi,fp,fq,op,oq,margin,hits);
+    if(planeHits>=0)return planeHits;
     float3 boundMin=implicit_bounds_min(fi),boundMax=implicit_bounds_max(fi);
     halfBounds=(boundMax-boundMin)*0.5f;
     ImplicitHit candidates[32];int count=0;uint work=0;

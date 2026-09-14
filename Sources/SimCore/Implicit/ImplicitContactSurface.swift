@@ -93,6 +93,55 @@ extension PhysicsScene {
         text += "inline uint implicit_global_pair_count(){return \(pairs.count)u;}\ninline uint2 implicit_global_pair(uint i){"
         if pairs.isEmpty {text += "return uint2(0);}"}
         else {text += "const uint2 p[]={"+pairs.map {"uint2(\($0.x),\($0.y))"}.joined(separator:",")+"};return p[i];}"}
+        text += "\ninline bool implicit_plane_acceleration(){return \(implicitPlaneAcceleration ? "true" : "false");}\n"
+        text += "inline float3 implicit_native_box_half(uint id){switch(id){\n"
+        for i in surfaces.keys.sorted() where colliders[i].implicitContactSurface == nil && colliders[i].convexAssetID == nil {
+            text += "case \(i):return \(literal(colliders[i].size*0.5));\n"
+        }
+        text += "default:return float3(0);}}\ninline float2 implicit_rectangle_half(uint id){switch(id){\n"
+        for i in surfaces.keys.sorted() {
+            if let surface=colliders[i].implicitContactSurface, !surface.isInfinitePlane {
+                let h=SIMD2(colliders[i].size.x,colliders[i].size.y)*0.5
+                if surface.triangles == ImplicitContactSurface.plane(halfExtents:h).triangles {
+                    text += "case \(i):return float2(\(h.x)f,\(h.y)f);\n"
+                }
+            }
+        }
+        text += "default:return float2(0);}}\n"
+        // Surface witnesses on bounding faces certify the support bound. No
+        // sampled convex hull is substituted for the implicit collision shape.
+        var witnessCache=[Data:[SIMD3<Float>]](), witnessByID=[Int:[SIMD3<Float>]]()
+        for i in fields {
+            let f=colliders[i].implicitField!,key=try seedEncoder.encode(f)
+            if let found=witnessCache[key] {witnessByID[i]=found;continue}
+            let lo=SIMD3(f.bounds[0][0],f.bounds[0][1],f.bounds[0][2]),hi=SIMD3(f.bounds[1][0],f.bounds[1][1],f.bounds[1][2])
+            var witnesses=[SIMD3<Float>]()
+            for axis in 0..<3 {for side in 0..<2 {
+                let u=(axis+1)%3,v=(axis+2)%3
+                var candidates=[SIMD3<Float>]()
+                for a in 0...8 {for b in 0...8 {
+                    var p=lo;p[axis]=side==0 ? lo[axis] : hi[axis]
+                    p[u]=lo[u]+(hi[u]-lo[u])*Float(a)/8;p[v]=lo[v]+(hi[v]-lo[v])*Float(b)/8
+                    if abs(try f.evaluate(p).distance)<=1e-7 {candidates.append(p)}
+                }}
+                var selected=[SIMD3<Float>]()
+                while !candidates.isEmpty && selected.count<8 {
+                    let index=candidates.indices.max {a,b in
+                        let da=selected.map {simd_length_squared($0-candidates[a])}.min() ?? simd_length_squared(candidates[a]-(lo+hi)*0.5)
+                        let db=selected.map {simd_length_squared($0-candidates[b])}.min() ?? simd_length_squared(candidates[b]-(lo+hi)*0.5)
+                        return da<db
+                    }!
+                    selected.append(candidates.remove(at:index))
+                }
+                witnesses += selected
+            }}
+            witnessCache[key]=witnesses;witnessByID[i]=witnesses
+        }
+        text += "inline uint implicit_support_count(uint id){switch(id){\n"
+        for i in fields {text += "case \(i):return \(witnessByID[i]!.count)u;\n"}
+        text += "default:return 0u;}}\ninline float3 implicit_support_vertex(uint id,uint v){switch(id){\n"
+        for i in fields where !witnessByID[i]!.isEmpty {text += "case \(i):{const float3 p[]={"+witnessByID[i]!.map(literal).joined(separator:",")+"};return p[v];}\n"}
+        text += "default:return float3(NAN);}}\n"
         return text+"\n"
     }
 }
