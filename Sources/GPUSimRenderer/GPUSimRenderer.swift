@@ -2259,7 +2259,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
 
     /// Vertical camera field of view in degrees; 50 preserves the default view.
     public var verticalFieldOfView: Float = 50 {
-        didSet { resetTemporalHistory() }
+        didSet { if verticalFieldOfView != oldValue { resetTemporalHistory() } }
     }
     /// Camera clipping distances in world units. Bringing the near plane toward
     /// distant subjects improves depth precision without changing the lens.
