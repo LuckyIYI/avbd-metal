@@ -1945,6 +1945,54 @@ inline NPCResult npcPolySATWitness(
                 ranges, vertices, bestGap, bestNormal)) return out;
         }
     }
+    if (bestGap <= 0.0f) {
+        // SAT gives the minimum translation, but clipping to a nearby face
+        // may produce witnesses with a different normal. Reconstruct the
+        // actual touching features after translating B by that exact MTV.
+        const float witnessTolerance = 5.0e-5f;
+        for (uint side=0u; side<2u; ++side) {
+            NPCShape source=side==0u ? localA : localB;
+            NPCShape target=side==0u ? localB : localA;
+            uint ne=side==0u ? edgesA : edgesB;
+            uint nf=side==0u ? facesB : facesA;
+            for(uint e=0u;e<ne;e++) {
+                NPCPolyEdge edge=npcPolyEdge(source,e,assetIDs,hulls,edges,vertices);
+                for(uint end=0u;end<2u;end++) {
+                    float3 p=end==0u ? edge.a : edge.b;
+                    float3 mapped=p+(side==0u ? bestNormal*bestGap : -bestNormal*bestGap);
+                    bool inside=true;float boundary=-FLT_MAX;
+                    for(uint f=0u;f<nf;f++) {
+                        NPCPolyFace face=npcPolyFace(target,f,assetIDs,hulls,faces);
+                        float d=dot(face.normal,mapped)-face.distance;
+                        boundary=max(boundary,d);
+                        if(!face.valid || d>witnessTolerance){inside=false;break;}
+                    }
+                    if(!inside || fabs(boundary)>witnessTolerance)continue;
+                    out.pointA=side==0u ? p : mapped;
+                    out.pointB=side==0u ? mapped : p;
+                    out.normalAB=bestNormal;out.signedDistance=bestGap;
+                    out.featureA=NPC_FEATURE_SMOOTH;out.featureB=NPC_FEATURE_SMOOTH;
+                    out.valid=true;out.overlap=true;
+                    if(npcCorrectedMPRInAFrameIsConsistent(out))
+                        return npcResultFromAFrame(out,origin,rotation);
+                }
+            }
+        }
+        for(uint i=0u;i<edgesA;i++) {
+            NPCPolyEdge ea=npcPolyEdge(localA,i,assetIDs,hulls,edges,vertices);
+            for(uint j=0u;j<edgesB;j++) {
+                NPCPolyEdge eb=npcPolyEdge(localB,j,assetIDs,hulls,edges,vertices);
+                float3 shift=-bestNormal*bestGap,pa,pb;
+                npClosestSegSeg(ea.a,ea.b,eb.a+shift,eb.b+shift,pa,pb);
+                if(distance(pa,pb)>witnessTolerance)continue;
+                out.pointA=pa;out.pointB=pb-shift;out.normalAB=bestNormal;
+                out.signedDistance=bestGap;out.featureA=(localA.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)|i;
+                out.featureB=(localB.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)|j;out.valid=true;out.overlap=true;
+                if(npcCorrectedMPRInAFrameIsConsistent(out))
+                    return npcResultFromAFrame(out,origin,rotation);
+            }
+        }
+    }
     if (bestGap > 0.0f) {
         // Edge-edge separation at a box rim: enumerate candidates rather than
         // accepting the heuristic edge score used for manifold enrichment.
@@ -2105,7 +2153,7 @@ inline void npCollidePass(
             uint faceHint=previous>=0 ? prevManifolds[previous].colliderPair.z : 0;
             // Match native speculative detection: build constraints before a
             // closing pair crosses the surface, without enlarging solver margin.
-            float detectionMargin=P.collisionMargin+min(length(relVel)*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+            float detectionMargin=P.collisionMargin+min((length(relVel)+length(velAng[ba].xyz)*abs(shape[ia].w)+length(velAng[bb].xyz)*abs(shape[ib].w))*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
             int nh=implicitSurfaceContacts(fi,si,fp,fq,sp,oq,shape[fi].xyz*0.5f,detectionMargin,faceHint,hits,failed);
             outM.header=uint4(ba,bb,0,0);
             if(failed){atomic_store_explicit(&convexQueryPoison[2],failed,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[3],fi,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[4],si,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[1],2u,memory_order_relaxed);latchConvexQueryFailure(counters,convexQueryPoison);return;}
@@ -2125,12 +2173,21 @@ inline void npCollidePass(
                 if(previous>=0){
                     device const ManifoldGPU& old=prevManifolds[previous];
                     if(dot(old.basisN.xyz,n)>0.98f){
-                        float closest=max(0.001f,length(shape[fi].xyz)*0.05f);int match=-1;
+                        float closest=max(0.001f,min(length(shape[fi].xyz),length(shape[si].xyz))*0.05f);int match=-1;
                         for(uint j=0;j<old.header.z;j++)if(!(used&(1u<<j))){float d=max(distance(ra,old.contacts[j].rA.xyz),distance(rb,old.contacts[j].rB.xyz));if(d<closest){closest=d;match=int(j);}}
                         if(match>=0){used|=1u<<uint(match);lambda=old.contacts[match].lambda.xyz;penalty=old.contacts[match].penalty.xyz;
                             float3 tangent=old.basisT1.xyz*lambda.y+cross(old.basisN.xyz,old.basisT1.xyz)*lambda.z;lambda.y=dot(t1,tangent);lambda.z=dot(t2,tangent);
                             stick=old.contacts[match].rB.w;
-                            if(stick!=0){ra=old.contacts[match].rA.xyz;rb=old.contacts[match].rB.xyz;}
+                            if(stick!=0){
+                                float3 cachedA=xform(bodyPA4.xyz,qBodyA,old.contacts[match].rA.xyz);
+                                float3 cachedB=xform(bodyPB4.xyz,qBodyB,old.contacts[match].rB.xyz);
+                                // Tangential warm starts must not change the
+                                // certified normal gap on a curved field.
+                                float normalDrift=abs(dot(n,(cachedA-cachedB)-(aw-bw)));
+                                if(normalDrift<=min(2e-5f,P.collisionMargin*0.25f)) {
+                                    ra=old.contacts[match].rA.xyz;rb=old.contacts[match].rB.xyz;
+                                } else {stick=0;lambda.yz=float2(0);}
+                            }
                         }
                     }
                 }
@@ -2147,7 +2204,7 @@ inline void npCollidePass(
         outM.header = uint4(ba,bb,0,0);
         if (!all(isfinite(sample))) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
         float radius = shape[si].x*0.5f;
-        float sphereDetectMargin=P.collisionMargin+min(length(relVel)*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+        float sphereDetectMargin=P.collisionMargin+min((length(relVel)+length(velAng[ba].xyz)*abs(shape[ia].w)+length(velAng[bb].xyz)*abs(shape[ib].w))*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
         if (sample.w-radius > sphereDetectMargin) return;
         if (gl < 1e-6f) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
         float3 normal = q_rotate(fq,sample.xyz/gl);

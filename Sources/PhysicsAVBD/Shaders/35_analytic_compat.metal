@@ -153,7 +153,7 @@ kernel void np_collide_analytic_compat(
             uint faceHint=previous>=0 ? prevManifolds[previous].colliderPair.z : 0;
             // Match native speculative detection: build constraints before a
             // closing pair crosses the surface, without enlarging solver margin.
-            float detectionMargin=P.collisionMargin+min(length(relVel)*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+            float detectionMargin=P.collisionMargin+min((length(relVel)+length(velAng[ba].xyz)*abs(shape[ia].w)+length(velAng[bb].xyz)*abs(shape[ib].w))*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
             int nh=implicitSurfaceContacts(fi,si,fp,fq,sp,oq,shape[fi].xyz*0.5f,detectionMargin,faceHint,hits,failed);
             outM.header=uint4(ba,bb,0,0);
             if(failed){atomic_store_explicit(&convexQueryPoison[2],failed,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[3],fi,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[4],si,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[1],2u,memory_order_relaxed);latchConvexQueryFailure(const_cast<device atomic_uint*>(counters),convexQueryPoison);return;}
@@ -195,7 +195,7 @@ kernel void np_collide_analytic_compat(
         outM.header = uint4(ba,bb,0,0);
         if (!all(isfinite(sample))) { latchConvexQueryFailure(const_cast<device atomic_uint*>(counters),convexQueryPoison); return; }
         float radius = shape[si].x*0.5f;
-        float sphereDetectMargin=P.collisionMargin+min(length(relVel)*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+        float sphereDetectMargin=P.collisionMargin+min((length(relVel)+length(velAng[ba].xyz)*abs(shape[ia].w)+length(velAng[bb].xyz)*abs(shape[ib].w))*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
         if (sample.w-radius > sphereDetectMargin) return;
         if (gl < 1e-6f) { latchConvexQueryFailure(const_cast<device atomic_uint*>(counters),convexQueryPoison); return; }
         float3 normal = q_rotate(fq,sample.xyz/gl);

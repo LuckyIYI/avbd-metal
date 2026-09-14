@@ -138,17 +138,28 @@ inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op
             if(++work>8192u){failed=1;return 0;}
             ImplicitPatch t=stack[--pending];
             if(any(min(t.a,min(t.b,t.c))>boundMax+margin)||any(max(t.a,max(t.b,t.c)) < boundMin-margin))continue;
+            if(implicit_void_triangle_clear(fi,t.a,t.b,t.c,margin))continue;
+            if(implicit_region_triangle_min(fi,t.a,t.b,t.c)>margin)continue;
             float3 p=(t.a+t.b+t.c)/3;
             float radius=max(length(p-t.a),max(length(p-t.b),length(p-t.c)));
             float4 q=implicit_query(fi,p);
             if(!all(isfinite(q))){failed=2;return 0;}
             if(q.w-radius>margin)continue;
             if(radius<=coverage) {
+                // A shallowly inclined face has a tiny tangential gradient:
+                // centroid descent can miss its deepest vertex by millimetres.
+                // Retain the best actual triangle vertex as a start as well.
+                float3 seeds[3]={t.a,t.b,t.c};
+                for(int vi=0;vi<3;vi++) {
+                    float4 sample=implicit_query(fi,seeds[vi]);
+                    if(!all(isfinite(sample))){failed=2;return 0;}
+                    if(sample.w<q.w){p=seeds[vi];q=sample;}
+                }
                 // Refine a minimum on this patch, including edges/interior.
                 for(int it=0;it<24;it++) {
                     float step=radius;bool improved=false;
                     for(int bt=0;bt<10;bt++) {
-                        float3 trial=impClosestTriangle(p-q.xyz*step,a,b,c);
+                        float3 trial=impClosestTriangle(p-q.xyz*step,t.a,t.b,t.c);
                         float4 next=implicit_query(fi,trial);
                         if(!all(isfinite(next))){failed=2;return 0;}
                         if(next.w<q.w-1e-9f){p=trial;q=next;improved=true;break;}
@@ -159,22 +170,13 @@ inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op
                 if(q.w<=margin+tolerance) {
                     float gl=length(q.xyz);if(gl<1e-6f){failed=3;return 0;}
                     ImplicitHit h;h.feature=0;h.otherPoint=p;
-                    float3 planeN=normalize(cross(b-a,c-a));
-                    if(dot(planeN,p-implicit_interior_seed(fi))<0)planeN=-planeN;
-                    h.normal=planeN;h.separation=q.w;h.fieldPoint=p-planeN*q.w;
-                    if(q.w<0) {
-                        // A triangle supplies its face normal. Find an actual
-                        // SDF boundary witness along it, rather than mixing
-                        // unrelated nearest-exit normals around the rim.
-                        float travel=0;float residual=q.w;
-                        for(int it=0;it<64 && abs(residual)>tolerance;it++) {
-                            travel+=abs(residual);
-                            residual=implicit_query(fi,p+planeN*travel).w;
-                            if(!isfinite(residual)){failed=2;return 0;}
-                        }
-                        if(abs(residual)>tolerance){failed=7;return 0;}
-                        h.fieldPoint=p+planeN*travel;h.separation=-travel;
-                    } else if(abs(implicit_query(fi,h.fieldPoint).w)>tolerance) {continue;}
+                    // Metric SDF gradient points out of the field solid. A
+                    // contacted hull triangle's own normal is not generally
+                    // that direction (especially at hull edges or in a cavity).
+                    float3 planeN=q.xyz/gl;
+                    h.normal=planeN;h.separation=q.w;
+                    h.fieldPoint=p-planeN*q.w;
+                    if(abs(implicit_query(fi,h.fieldPoint).w)>tolerance){failed=7;return 0;}
 
                     // Bound candidate storage while preserving spatial extent.
                     int near=-1;float closest=coverage*0.18f;

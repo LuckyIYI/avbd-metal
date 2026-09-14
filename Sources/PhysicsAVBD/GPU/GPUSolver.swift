@@ -2465,6 +2465,7 @@ public final class GPUSolver {
                 flags |= ColliderGPUFlags.cableContactFrame
             }
             ct[i] = flags
+
             if rigidHierarchy == nil, c.collisionEnabled,
                scene.bodies[c.body].isDynamic {
                 radii.append(broadphaseCellRadius(r, collider: i))
@@ -7817,7 +7818,7 @@ public final class GPUSolver {
                   count <= convexHullVertices.length / 16 - start else { return nil }
             let hull = data[side * 3].w == 4
                 ? (start..<(start + count)).map { array(vertices[$0]) } : []
-            shapes.append(["collider": collider, "center_kind": array(data[side * 3]),
+            shapes.append(["collider": collider, "uploaded_kind": colliderShapeType.contents().assumingMemoryBound(to:UInt32.self)[collider], "center_kind": array(data[side * 3]),
                 "rotation": array(data[side * 3 + 1]), "dimensions": array(data[side * 3 + 2]),
                 "vertices": hull])
         }

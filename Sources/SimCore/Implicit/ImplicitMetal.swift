@@ -22,6 +22,7 @@ public extension ImplicitField {
             case "mul": v = "\(a)*\(b)"; g = "\(da)*\(b)+\(db)*\(a)"
             case "div": v = "\(a)/\(b)"; g = "(\(da)*\(b)-\(db)*\(a))/(\(b)*\(b))"
             case "sqrt": v = "sqrt(\(a))"; g = "v\(i)>0 ? \(da)/(2*v\(i)) : float3(0)"
+            case "sign": v = "sign(\(a))"; g = "float3(0)"
             case "abs": v = "abs(\(a))"; g = "\(da)*sign(\(a))"
             case "sin": v = "sin(\(a))"; g = "\(da)*cos(\(a))"
             case "cos": v = "cos(\(a))"; g = "-\(da)*sin(\(a))"
@@ -34,13 +35,15 @@ public extension ImplicitField {
         }
         let grad = gradient.map { "float3(" + $0.map {"v\($0)"}.joined(separator:",") + ")" } ?? "g\(output)"
         lines += ["return float4(\(grad),v\(output));", "}", "inline float4 \(name)(float3 p) {", "float4 q = \(name)_analytic(p);"]
-        if gradient == nil && !autodiff {
+        if gradient == nil {
+            if autodiff {lines.append("if(abs(q.w)<=\(epsilon)f && dot(q.xyz,q.xyz)<1e-12f){")}
             lines.append("const float h = \(epsilon)f;")
             for i in 0..<3 {
                 var xyz = ["0","0","0"]; xyz[i] = "h"
                 let step = "float3(" + xyz.joined(separator:",") + ")"
                 lines.append("q[\(i)] = (\(name)_analytic(p+\(step)).w-\(name)_analytic(p-\(step)).w)/(2*h);")
             }
+            if autodiff {lines.append("}")}
         }
         return (lines + ["return q;", "}"]).joined(separator:"\n")
     }
@@ -76,7 +79,14 @@ public extension PhysicsScene {
             else { shared[key] = i; names[i] = i; source += try f.metalSource(name:"implicit_\(i)") + "\n" }
         }
         source += "inline float4 implicit_query(uint id,float3 p) { switch(id) {\n"
-        for i in ids { source += "case \(i): return implicit_\(names[i]!)(p);\n" }
+        for i in ids {
+            source += "case \(i): {\n"
+            for r in colliders[i].implicitField!.planarRegions ?? [] {
+                func lit(_ v:[Float])->String { "float3("+v.map{"\($0)f"}.joined(separator:",")+")" }
+                source += "if(all(p>=\(lit(r.bounds[0])))&&all(p<=\(lit(r.bounds[1]))))return float4(\(lit(r.normal)),dot(\(lit(r.normal)),p)-\(r.offset)f);\n"
+            }
+            source += "return implicit_\(names[i]!)(p); }\n"
+        }
         return source + "default: return float4(NAN); }}\n" + (try implicitSurfaceSource())
     }
 }

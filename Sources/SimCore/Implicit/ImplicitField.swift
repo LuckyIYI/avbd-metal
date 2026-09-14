@@ -22,12 +22,20 @@ public struct ImplicitField: Codable {
     public var exactDistance: Bool
     public var epsilon: Float
     public var native: Native?
+    public struct PlanarRegion: Codable {
+        public var normal: [Float]
+        public var offset: Float
+        public var bounds: [[Float]]
+    }
+    public var planarRegions: [PlanarRegion]? = nil
+    public struct RadialVoid: Codable { public var planes: [[Float]] }
+    public var radialVoids: [RadialVoid]? = nil
 
     public enum Failure: Error { case invalidProgram, nonFinite, undefinedNormal }
 
     public func validate() throws {
         let arities = ["constant":0,"x":0,"y":0,"z":0,"add":2,"mul":2,
-                       "div":2,"sqrt":1,"abs":1,"sin":1,"cos":1,"min":2,"max":2]
+                       "div":2,"sqrt":1,"sign":1,"abs":1,"sin":1,"cos":1,"min":2,"max":2]
         guard !nodes.isEmpty, nodes.count <= 512, nodes.indices.contains(output),
               bounds.count == 2, bounds.allSatisfy({$0.count == 3 && $0.allSatisfy(\.isFinite)}),
               (0..<3).allSatisfy({bounds[0][$0] < bounds[1][$0]}),
@@ -39,6 +47,19 @@ public struct ImplicitField: Codable {
         for (i,n) in nodes.enumerated() {
             guard let arity = arities[n.op], n.args.count == arity, n.value.isFinite,
                   n.args.allSatisfy({$0 >= 0 && $0 < i}) else { throw Failure.invalidProgram }
+        }
+        for r in planarRegions ?? [] {
+            guard r.normal.count == 3, r.normal.allSatisfy(\.isFinite), r.offset.isFinite,
+                r.bounds.count == 2, r.bounds.allSatisfy({$0.count == 3 && $0.allSatisfy(\.isFinite)}),
+                (0..<3).allSatisfy({r.bounds[0][$0] < r.bounds[1][$0]}),
+                abs(simd_length(SIMD3(r.normal[0],r.normal[1],r.normal[2]))-1)<1e-5
+            else { throw Failure.invalidProgram }
+        }
+        for region in radialVoids ?? [] {
+            guard !region.planes.isEmpty, region.planes.count <= 64,
+                region.planes.allSatisfy({p in p.count == 3 && p.allSatisfy(\.isFinite)
+                    && p[0]>=0 && abs(p[0]*p[0]+p[1]*p[1]-1)<1e-5})
+            else {throw Failure.invalidProgram}
         }
         // Native is only an authoring hint. Importers must verify the formula
         // before selecting a native collider; never trust arbitrary JSON tags.
@@ -62,6 +83,7 @@ public struct ImplicitField: Codable {
             case "mul": x = a*b; dx = da*b+db*a
             case "div": x = a/b; dx = (da*b-db*a)/(b*b)
             case "sqrt": x = sqrt(a); dx = x > 0 ? da/(2*x) : .zero
+            case "sign": x = a == 0 ? 0 : (a > 0 ? 1 : -1); dx = .zero
             case "abs": x = abs(a); dx = a == 0 ? .zero : (a > 0 ? da : -da)
             case "sin": x = sin(a); dx = da*cos(a)
             case "cos": x = cos(a); dx = -da*sin(a)
@@ -84,7 +106,7 @@ public struct ImplicitField: Codable {
         var derivative = g[output]
         if let gradient {
             derivative = SIMD3(v[gradient[0]],v[gradient[1]],v[gradient[2]])
-        } else if !autodiff {
+        } else if !autodiff || (abs(v[output])<=epsilon && simd_length_squared(derivative)<1e-12) {
             for i in 0..<3 {
                 var step = SIMD3<Float>.zero; step[i] = epsilon
                 let plus = try run(p+step).0[output]

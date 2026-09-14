@@ -2009,6 +2009,54 @@ inline NPCResult npcPolySATWitness(
                 ranges, vertices, bestGap, bestNormal)) return out;
         }
     }
+    if (bestGap <= 0.0f) {
+        // SAT gives the minimum translation, but clipping to a nearby face
+        // may produce witnesses with a different normal. Reconstruct the
+        // actual touching features after translating B by that exact MTV.
+        const float witnessTolerance = 5.0e-5f;
+        for (uint side=0u; side<2u; ++side) {
+            NPCShape source=side==0u ? localA : localB;
+            NPCShape target=side==0u ? localB : localA;
+            uint ne=side==0u ? edgesA : edgesB;
+            uint nf=side==0u ? facesB : facesA;
+            for(uint e=0u;e<ne;e++) {
+                NPCPolyEdge edge=npcPolyEdge(source,e,assetIDs,hulls,edges,vertices);
+                for(uint end=0u;end<2u;end++) {
+                    float3 p=end==0u ? edge.a : edge.b;
+                    float3 mapped=p+(side==0u ? bestNormal*bestGap : -bestNormal*bestGap);
+                    bool inside=true;float boundary=-FLT_MAX;
+                    for(uint f=0u;f<nf;f++) {
+                        NPCPolyFace face=npcPolyFace(target,f,assetIDs,hulls,faces);
+                        float d=dot(face.normal,mapped)-face.distance;
+                        boundary=max(boundary,d);
+                        if(!face.valid || d>witnessTolerance){inside=false;break;}
+                    }
+                    if(!inside || fabs(boundary)>witnessTolerance)continue;
+                    out.pointA=side==0u ? p : mapped;
+                    out.pointB=side==0u ? mapped : p;
+                    out.normalAB=bestNormal;out.signedDistance=bestGap;
+                    out.featureA=NPC_FEATURE_SMOOTH;out.featureB=NPC_FEATURE_SMOOTH;
+                    out.valid=true;out.overlap=true;
+                    if(npcCorrectedMPRInAFrameIsConsistent(out))
+                        return npcResultFromAFrame(out,origin,rotation);
+                }
+            }
+        }
+        for(uint i=0u;i<edgesA;i++) {
+            NPCPolyEdge ea=npcPolyEdge(localA,i,assetIDs,hulls,edges,vertices);
+            for(uint j=0u;j<edgesB;j++) {
+                NPCPolyEdge eb=npcPolyEdge(localB,j,assetIDs,hulls,edges,vertices);
+                float3 shift=-bestNormal*bestGap,pa,pb;
+                npClosestSegSeg(ea.a,ea.b,eb.a+shift,eb.b+shift,pa,pb);
+                if(distance(pa,pb)>witnessTolerance)continue;
+                out.pointA=pa;out.pointB=pb-shift;out.normalAB=bestNormal;
+                out.signedDistance=bestGap;out.featureA=(localA.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)|i;
+                out.featureB=(localB.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)|j;out.valid=true;out.overlap=true;
+                if(npcCorrectedMPRInAFrameIsConsistent(out))
+                    return npcResultFromAFrame(out,origin,rotation);
+            }
+        }
+    }
     if (bestGap > 0.0f) {
         // Edge-edge separation at a box rim: enumerate candidates rather than
         // accepting the heuristic edge score used for manifold enrichment.

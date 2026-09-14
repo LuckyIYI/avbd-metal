@@ -56,11 +56,14 @@ extension PhysicsScene {
             surfaces[i]=vertices
         }
         func literal(_ p:SIMD3<Float>)->String {"float3(\(p.x)f,\(p.y)f,\(p.z)f)"}
+        // Immutable geometry belongs in Metal constant memory, not per-thread arrays.
+        var tables=""
         var text="inline uint implicit_triangle_count(uint id) {switch(id) {\n"
         for i in surfaces.keys.sorted() {text+="case \(i): return \(surfaces[i]!.count/3)u;\n"}
         text+="default:return 0u;}}\ninline float3 implicit_triangle_vertex(uint id,uint v) {switch(id) {\n"
         for i in surfaces.keys.sorted() {
-            text+="case \(i): {const float3 p[]={"+surfaces[i]!.map(literal).joined(separator:",")+"};return p[v];}\n"
+            tables += "constant float3 implicit_tri_\(i)[]={"+surfaces[i]!.map(literal).joined(separator:",")+"};\n"
+            text += "case \(i):return implicit_tri_\(i)[v];\n"
         }
         text+="default:return float3(NAN);}}\ninline bool implicit_closed_surface(uint id) {switch(id) {\n"
         for i in closed.sorted() {text+="case \(i):return true;\n"}
@@ -126,7 +129,8 @@ extension PhysicsScene {
         text += "default:return 0u;}}\ninline float4 implicit_hull_face(uint id,uint f){switch(id){\n"
         for i in facePlanes.keys.sorted() {
             let data=facePlanes[i]!.map {"float4(\($0.x)f,\($0.y)f,\($0.z)f,\($0.w)f)"}.joined(separator:",")
-            text += "case \(i):{const float4 p[]={\(data)};return p[f];}\n"
+            tables += "constant float4 implicit_faces_\(i)[]={\(data)};\n"
+            text += "case \(i):return implicit_faces_\(i)[f];\n"
         }
         text += "default:return float4(NAN);}}\n"
         // Surface witnesses on bounding faces certify the support bound. No
@@ -161,9 +165,41 @@ extension PhysicsScene {
         text += "inline uint implicit_support_count(uint id){switch(id){\n"
         for i in fields {text += "case \(i):return \(witnessByID[i]!.count)u;\n"}
         text += "default:return 0u;}}\ninline float3 implicit_support_vertex(uint id,uint v){switch(id){\n"
-        for i in fields where !witnessByID[i]!.isEmpty {text += "case \(i):{const float3 p[]={"+witnessByID[i]!.map(literal).joined(separator:",")+"};return p[v];}\n"}
+        for i in fields where !witnessByID[i]!.isEmpty {
+            tables += "constant float3 implicit_witness_\(i)[]={"+witnessByID[i]!.map(literal).joined(separator:",")+"};\n"
+            text += "case \(i):return implicit_witness_\(i)[v];\n"
+        }
         text += "default:return float3(NAN);}}\n"
-        return text+"\n"
+        // Author-certified regions where the distance field is exactly planar.
+        text += "inline float implicit_region_triangle_min(uint id,float3 a,float3 b,float3 c){switch(id){\n"
+        for i in fields {
+            text += "case \(i):{\n"
+            for r in colliders[i].implicitField!.planarRegions ?? [] {
+                guard r.normal.count==3,r.bounds.count==2,r.bounds.allSatisfy({$0.count==3}),r.offset.isFinite else {throw ImplicitCollisionError.invalidCollider(i)}
+                let n=SIMD3(r.normal[0],r.normal[1],r.normal[2]),lo=SIMD3(r.bounds[0][0],r.bounds[0][1],r.bounds[0][2]),hi=SIMD3(r.bounds[1][0],r.bounds[1][1],r.bounds[1][2])
+                guard abs(simd_length(n)-1)<1e-5,(0..<3).allSatisfy({lo[$0].isFinite && hi[$0].isFinite && lo[$0]<hi[$0]}) else {throw ImplicitCollisionError.invalidCollider(i)}
+                text += "if(all(min(a,min(b,c))>=\(literal(lo)))&&all(max(a,max(b,c))<=\(literal(hi))))return min(dot(\(literal(n)),a),min(dot(\(literal(n)),b),dot(\(literal(n)),c)))-\(r.offset)f;\n"
+            }
+            text += "return -INFINITY;}\n"
+        }
+        text += "default:return -INFINITY;}}\n"
+        // A convex empty region is a separation certificate for an entire
+        // triangle when every vertex lies inside its margin erosion. Each
+        // radial halfspace is convex and 1-Lipschitz (nonnegative radius term).
+        text += "inline bool implicit_void_triangle_clear(uint id,float3 a,float3 b,float3 c,float margin){switch(id){\n"
+        for i in fields {
+            text += "case \(i):{\n"
+            for r in colliders[i].implicitField!.radialVoids ?? [] {
+                text += "{bool clear=true;\n"
+                for p in r.planes {
+                    text += "clear=clear && max(\(p[0])f*length(a.xy)+\(p[1])f*a.z,max(\(p[0])f*length(b.xy)+\(p[1])f*b.z,\(p[0])f*length(c.xy)+\(p[1])f*c.z))<\(p[2])f-margin;\n"
+                }
+                text += "if(clear)return true;}\n"
+            }
+            text += "return false;}\n"
+        }
+        text += "default:return false;}}\n"
+        return tables+text+"\n"
     }
 }
 
