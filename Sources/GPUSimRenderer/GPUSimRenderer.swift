@@ -4,6 +4,8 @@ import SimCore
 import PhysicsAVBD
 import simd
 
+let nativeNormalDiagnosticEnabled = ProcessInfo.processInfo.environment["AVBD_NORMAL_PASS"] == "1"
+
 /// Runtime presentation choices. They affect only rendering and never mutate
 /// the simulation or its collision geometry.
 public enum GPUSimRenderColorMode: UInt32, Sendable, Equatable {
@@ -105,6 +107,19 @@ public struct GPUSimRenderOptions: Sendable, Equatable {
         result.minimumFrameDuration = nil
         result.showConvexCollisionGeometry = false
         result.convexCollisionWireframe = false
+        return result
+    }
+
+    // Diagnostics must reach the display without lighting, HDR composition,
+    // exposure or temporal reconstruction modifying the encoded normal.
+    func diagnosticOptions(enabled: Bool) -> Self {
+        guard enabled else { return self }
+        var result = self
+        result.lightingMode = .lightweight
+        result.screenSpaceReflections = false
+        result.ambientOcclusion = false
+        result.contactShadows = false
+        result.edgeAntialiasing = false
         return result
     }
 
@@ -1200,6 +1215,7 @@ fragment float4 pbr_fragment(VOut in [[stage_in]],
                              texture2d<float> screenMaterial [[texture(5)]],
                              texture2d<float> diffuse [[texture(6)]], texture2d<float> areaDirect [[texture(7)]], constant MaterialResources& materials [[buffer(10)]], texture3d<float> displayLUT [[texture(8)]])
 {
+    \(nativeNormalDiagnosticEnabled ? "return float4(normalize(in.normal)*0.5+0.5,1);" : "")
     in = texturedSurface(in, materials);
     float3 n = normalize(in.normal), V = normalize(U.eye.xyz - in.world);
     float2 visibility = U.rayTracing.z > 0 ? float2(1) : surfaceVisibility(in.position.xy/U.screen.xy,in.world,n,U,aoTex,screenDepthTexture,screenNormal);
@@ -2314,7 +2330,7 @@ public final class GPUSimRenderer: NSObject, MTKViewDelegate {
             return
         }
 
-        var activeOptions = source?.rendererOptions ?? options
+        var activeOptions = (source?.rendererOptions ?? options).diagnosticOptions(enabled: nativeNormalDiagnosticEnabled)
         do { try activeOptions.validateLighting() }
         catch { reportFailure("Scene exceeds the supported limit of \(GPUSimAreaLight.maximumCount) area lights"); return }
         activeOptions = activeOptions.resolved(supportsHQ: Self.supportsHQ(device: device))
