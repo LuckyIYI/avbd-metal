@@ -4,12 +4,14 @@ import SimCore
 public enum CPUConvexCollisionError: Error, Equatable, Sendable,
     CustomStringConvertible
 {
+    case unsupportedImplicitField
     case invalidAssetReference(collider: Int, asset: Int)
     case conflictingAssetSources(collider: Int)
     case unsupportedTorusHull(colliderA: Int, colliderB: Int)
 
     public var description: String {
         switch self {
+        case .unsupportedImplicitField: return "Implicit contact fields currently require the GPU backend"
         case .invalidAssetReference(let collider, let asset):
             return "CPU convex collider \(collider) references missing asset \(asset)"
         case .conflictingAssetSources(let collider):
@@ -39,6 +41,7 @@ public extension PhysicsScene {
     /// map. Potentially colliding torus/hull pairs therefore fail before any
     /// solver state is allocated or mutated.
     func makeCPUSolverChecked() throws -> CPUSolver {
+        if colliders.contains(where: { $0.implicitField != nil }) { throw CPUConvexCollisionError.unsupportedImplicitField }
         for (index, collider) in colliders.enumerated() {
             if let asset = collider.convexAssetID {
                 guard collider.convexHullVertices.isEmpty else {

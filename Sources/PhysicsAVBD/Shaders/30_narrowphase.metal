@@ -2091,6 +2091,55 @@ inline void npCollidePass(
     bool capB = stB == 3;
     bool hullA = stA == 4;
     bool hullB = stB == 4;
+#ifdef AVBD_IMPLICIT
+    if (stA == 5u || stB == 5u) {
+        if (CONVEX_PASS) return;
+        bool fieldA = stA == 5u;
+        uint fi = fieldA ? ia : ib, si = fieldA ? ib : ia;
+        float3 fp = fieldA ? centerA : centerB, sp = fieldA ? centerB : centerA;
+        float4 fq = fieldA ? qA : qB;
+        float4 sample = implicit_query(fi,q_rotate(q_conj(fq),sp-fp));
+        float gl = length(sample.xyz);
+        outM.header = uint4(ba,bb,0,0);
+        if (!all(isfinite(sample))) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
+        float radius = shape[si].x*0.5f;
+        if (sample.w-radius > P.collisionMargin) return;
+        if (gl < 1e-6f) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
+        float3 normal = q_rotate(fq,sample.xyz/gl);
+        float3 fieldPoint = sp-normal*sample.w;
+        float3 spherePoint = sp-normal*radius;
+        float3 xAw = fieldA ? fieldPoint : spherePoint;
+        float3 xBw = fieldA ? spherePoint : fieldPoint;
+        float3 n = fieldA ? -normal : normal;
+        float3 t1,t2; orthonormal(n,t1,t2);
+        bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        float3 ra = roundA ? xAw-bodyPA4.xyz : q_rotate(q_conj(qBodyA),xAw-bodyPA4.xyz);
+        float3 rb = roundB ? xBw-bodyPB4.xyz : q_rotate(q_conj(qBodyB),xBw-bodyPB4.xyz);
+        float3 lambda = float3(0), penalty = float3(0);
+        int prev = pairMapFind(mapKeyA,mapKeyB,mapVal,P.mapCapacity,ia,ib);
+        if (prev >= 0) {
+            device const ManifoldGPU& old = prevManifolds[prev];
+            if (old.header.z == 1u && dot(old.basisN.xyz,n) > .95f
+                && distance(old.contacts[0].rA.xyz,ra) < radius*.5f
+                && distance(old.contacts[0].rB.xyz,rb) < radius*.5f) {
+                lambda = old.contacts[0].lambda.xyz; penalty = old.contacts[0].penalty.xyz;
+                float3 tangent = old.basisT1.xyz*lambda.y + cross(old.basisN.xyz,old.basisT1.xyz)*lambda.z;
+                lambda.y = dot(tangent,t1); lambda.z = dot(tangent,t2);
+            }
+        }
+        outM.header = uint4(ba,bb,1,1u|(roundA?2u:0u)|(roundB?4u:0u));
+        outM.basisN = float4(n,combine_friction(colliderFriction[ia].y,colliderFriction[ib].y,P.frictionCombineMode));
+        outM.basisT1 = float4(t1,combine_friction(colliderFriction[ia].x,colliderFriction[ib].x,P.frictionCombineMode));
+        float3 d = xAw-xBw;
+        outM.contacts[0].rA = float4(ra,0); outM.contacts[0].rB = float4(rb,0);
+        outM.contacts[0].C0 = float4(dot(n,d)+P.collisionMargin,dot(t1,d),dot(t2,d),0);
+        outM.contacts[0].lambda = float4(lambda*P.alpha*P.gamma,0);
+        outM.contacts[0].penalty = float4(clamp(penalty*P.gamma,npPenaltyFloor(posLin,ba,bb,P),npPenaltyCeil()),0);
+        return;
+    }
+#endif
+
 
     if (hullA || hullB) {
         if (!CONVEX_PASS) return;

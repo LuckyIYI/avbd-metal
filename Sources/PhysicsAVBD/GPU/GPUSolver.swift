@@ -598,7 +598,8 @@ public final class GPUSolver {
     private static func makeRigidBroadphaseHierarchy(
         scene: PhysicsScene, convexUpload: ConvexGPUUpload
     ) -> RigidBroadphaseHierarchyUpload? {
-        guard scene.tris.isEmpty, scene.tets.isEmpty else { return nil }
+        guard scene.tris.isEmpty, scene.tets.isEmpty,
+              !scene.colliders.contains(where: { $0.implicitField != nil }) else { return nil }
 
         func radius(collider index: Int) -> Float {
             let collider = scene.colliders[index]
@@ -1289,6 +1290,7 @@ public final class GPUSolver {
         guard let q = dev.makeCommandQueue() else { throw AVBDError.noDevice }
         self.queue = q
 
+        self.implicitPreamble = try scene.implicitCollisionPreamble()
         let convexUpload = try Self.makeConvexGPUUpload(scene: scene)
         convexClipWorkspaceVertices = ConvexHullGPU.clipWorkspaceVertices(
             largestSourceFace: convexUpload.faces.map { Int($0.loop.y) }.max() ?? 0)
@@ -2058,13 +2060,14 @@ public final class GPUSolver {
 
     // MARK: - Shader compilation
 
+    private var implicitPreamble = ""
     public private(set) var convexClipWorkspaceVertices = 32
 
     private func buildPipelines() throws {
         let lib: MTLLibrary
         let hierarchyLib: MTLLibrary?
         do {
-            lib = try Self.makeLibrary(device: device)
+            lib = try Self.makeLibrary(device: device, preamble: implicitPreamble)
             hierarchyLib = usesRigidColliderHierarchy
                 ? try Self.makeHierarchyLibrary(device: device) : nil
         } catch let error as AVBDError {
@@ -2079,7 +2082,7 @@ public final class GPUSolver {
                 pso[name] = try device.makeComputePipelineState(function: fn)
             }
         }
-        if hasPotentialRigidConvexPair {
+        if hasPotentialRigidConvexPair && implicitPreamble.isEmpty {
             let optimized = try Self.makeOptimizedConvexLibrary(
                 device: device, clipWorkspaceVertices: convexClipWorkspaceVertices)
             for name in ["np_collide", "np_collide_convex"] {
@@ -2190,13 +2193,13 @@ public final class GPUSolver {
     /// optional compound hierarchy is deliberately excluded: adding kernels
     /// to this Metal translation unit measurably perturbs fast-math codegen
     /// for long-horizon analytic scenes even when they are never dispatched.
-    static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
+    static func makeLibrary(device: MTLDevice, preamble: String = "") throws -> MTLLibrary {
         let urls = try shaderResourceURLs().filter {
             $0.lastPathComponent != hierarchyShaderName
                 && $0.lastPathComponent != optimizedConvexShaderName
                 && $0.lastPathComponent != "45_rigid_motion.metal"
         }
-        return try compileLibrary(device: device, urls: urls)
+        return try compileLibrary(device: device, urls: urls, preamble: preamble)
     }
 
     /// Compile the compound hierarchy with common ABI declarations in its
@@ -2449,6 +2452,7 @@ public final class GPUSolver {
                 case .capsule: flags = 3
                 }
             }
+            if c.implicitField != nil { flags = 5 }
             if particle { flags |= 0x10 }
             if c.usesWorldSpaceRoundAnchor { flags |= 0x20 }
             if (flags & 0xF) == 3 && !particle
@@ -6090,6 +6094,7 @@ public final class GPUSolver {
                 e.setBuffer(self.colliderHullRange, offset: 0, index: 19)
                 e.setBuffer(self.convexHullVertices, offset: 0, index: 20)
                 e.setBuffer(self.colliderFriction, offset: 0, index: 21)
+                if !self.implicitPreamble.isEmpty { e.setBuffer(self.convexQueryPoison, offset: 0, index: 29) }
             }
             if usesEnhancedAnalyticNarrowPhaseForTesting {
                 dispatchIndirect(
