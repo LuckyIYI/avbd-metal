@@ -154,14 +154,16 @@ kernel void np_collide_analytic_compat(
             // Match native speculative detection: build constraints before a
             // closing pair crosses the surface, without enlarging solver margin.
             float detectionMargin=P.collisionMargin+min((length(relVel)+length(velAng[ba].xyz)*abs(shape[ia].w)+length(velAng[bb].xyz)*abs(shape[ib].w))*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
-            int nh=implicitSurfaceContacts(fi,si,fp,fq,sp,oq,shape[fi].xyz*0.5f,detectionMargin,faceHint,hits,failed);
+            int nh=implicitSurfaceContacts(fi,si,fp,fq,sp,oq,shape[si].xyz*0.5f,detectionMargin,faceHint,hits,failed);
             outM.header=uint4(ba,bb,0,0);
             if(failed){atomic_store_explicit(&convexQueryPoison[2],failed,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[3],fi,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[4],si,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[1],2u,memory_order_relaxed);latchConvexQueryFailure(const_cast<device atomic_uint*>(counters),convexQueryPoison);return;}
             if(nh==0)return;
             outM.colliderPair.z=hits[0].feature;
             float3 n=fieldA ? -hits[0].normal : hits[0].normal;
             float3 t1,t2;orthonormal(n,t1,t2);
-            outM.header=uint4(ba,bb,uint(nh),1u);
+            // This is a Taylor contact model about the step's reference pose:
+            // use the same reference lever arms in its value and Jacobian.
+            outM.header=uint4(ba,bb,uint(nh),1u|MANIFOLD_FIXED_CONTACT_FRAME);
             outM.basisN=float4(n,combine_friction(colliderFriction[ia].y,colliderFriction[ib].y,P.frictionCombineMode));
             outM.basisT1=float4(t1,combine_friction(colliderFriction[ia].x,colliderFriction[ib].x,P.frictionCombineMode));
             uint used=0;

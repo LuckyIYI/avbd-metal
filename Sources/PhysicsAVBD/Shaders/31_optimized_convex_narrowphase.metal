@@ -2164,6 +2164,8 @@ inline void npCollidePass(
     uint stB = shapeType[ib] & SHAPE_KIND_MASK;
     bool hullA = stA == 4;
     bool hullB = stB == 4;
+    // Implicit/raw-surface pairs belong to the field-aware base pass.
+    if (stA >= 5u || stB >= 5u) return;
     bool hullPair = hullA || hullB;
     if (CONVEX_PASS != hullPair) return;
 #endif

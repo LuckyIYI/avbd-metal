@@ -2086,10 +2086,10 @@ public final class GPUSolver {
                 pso[name] = try device.makeComputePipelineState(function: fn)
             }
         }
-        if hasPotentialRigidConvexPair && implicitPreamble.isEmpty {
+        if hasPotentialRigidConvexPair {
             let optimized = try Self.makeOptimizedConvexLibrary(
                 device: device, clipWorkspaceVertices: convexClipWorkspaceVertices)
-            for name in ["np_collide", "np_collide_convex"] {
+            for name in (implicitPreamble.isEmpty ? ["np_collide", "np_collide_convex"] : ["np_collide_convex"]) {
                 guard let fn = optimized.makeFunction(name: name) else {
                     throw AVBDError.kernelMissing(name)
                 }

@@ -28,8 +28,8 @@ Requires macOS 14+, Swift and native Metal access. No asset generator checkout i
 ```sh
 cd Tools/JarSDF
 swift build -c release
-JAR_HZ=480 JAR_ITERATIONS=4 .build/release/jar-sdf-pilot Fixtures/jar.json sdf /tmp/jar-sdf.json 0 2880
-JAR_HZ=480 JAR_ITERATIONS=4 .build/release/jar-sdf-pilot Fixtures/jar.json convex /tmp/jar-convex.json 0 2880
+JAR_HZ=240 JAR_ITERATIONS=4 .build/release/jar-sdf-pilot Fixtures/jar.json sdf /tmp/jar-sdf.json 0 1440
+JAR_HZ=240 JAR_ITERATIONS=4 .build/release/jar-sdf-pilot Fixtures/jar.json convex /tmp/jar-convex.json 0 1440
 .build/release/jar-sdf-pilot Fixtures/bolt-nut-overlap.json witness /tmp/jar-witness.json
 ```
 
@@ -44,12 +44,12 @@ The six-second sequence settles, lifts, tips and discharges using three physical
 world-anchor constraints, without per-step pose resets. Lift height is derived
 from the rotated jar envelope, largest fastener diagonal and 20 mm exit clearance.
 The original 180 mm lift wedged 50 mm bolts under a lip only 17 mm above the table;
-the corrected lift is 236.6 mm. 240 Hz was insufficient for these impacts; the
-qualified comparison uses 480 Hz and four iterations for both representations.
+the corrected lift is 236.6 mm. The original implementation at 240 Hz was insufficient for these impacts; the repaired
+qualified comparison uses 240 Hz and four iterations for both representations.
 
 Gates: no pre-pour escapes, less than 1 mm sampled jar penetration, all twelve
 pieces discharged, less than 1 mm final table penetration, and final actuator
-tracking within 5 mm / 0.05 rad. Samples use actual simulated poses. Vertex sampling
+tracking within 5 mm / 0.05 rad. Samples use actual simulated poses and an independent polygon oracle at every step by default. Vertex sampling
 is not continuous collision certification and does not measure every hardware pair.
 
 `Validation/attempts.json` preserves every final-cohort trial and its trace;
@@ -59,11 +59,7 @@ were collected in the integration checkout before this standalone packaging.
 The manifest's generator paths and base commit describe that original run.
 Earlier failed experiments remain in the source workspace, not mislabeled as passes.
 
-Results: 6/6 trials pass; median SDF 353.9 vs convex 236.3 physics steps/s (1.50×).
-At 480 steps per simulated second, SDF is still 0.74× realtime. Shared-machine load
-and trajectories affect timing. Timing includes submissions and fences but excludes
-setup and validation reads. One jar field replaces 512 convex cells; serialized
-collision data is 15,410 vs 856,469 bytes, not a measured GPU allocation reduction.
+Current qualification is in **Validation/low-budget/README.md**: SDF passes 3/3 at 240 Hz / four iterations, with 0.960 mm worst every-step penetration and median 2.64 s including checks for six simulated seconds. Convex controls pass 0/3 at 240 Hz and 1/3 at 480 Hz. Original Validation results remain historical, using sparser checks.
 
 ## Engine repairs
 

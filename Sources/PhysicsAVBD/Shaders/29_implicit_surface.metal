@@ -109,13 +109,14 @@ inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,f
 // Adaptive triangle coverage uses the 1-Lipschitz bound of a metric SDF.
 // Exhaustion is reported, never interpreted as separation.
 inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,float4 oq,
- float3 halfBounds,float margin,uint faceHint,thread ImplicitHit* hits,thread uint& failed) {
+ float3 otherHalfBounds,float margin,uint faceHint,thread ImplicitHit* hits,thread uint& failed) {
     int planeHits=implicitPlaneContacts(fi,oi,fp,fq,op,oq,margin,faceHint,hits);
     if(planeHits>=0)return planeHits;
     float3 boundMin=implicit_bounds_min(fi),boundMax=implicit_bounds_max(fi);
-    halfBounds=(boundMax-boundMin)*0.5f;
+    float3 halfBounds=(boundMax-boundMin)*0.5f;
     ImplicitHit candidates[32];int count=0;uint work=0;
     float coverage=max(0.001f,length(halfBounds)*0.22f);
+    float contactSpacing=max(2e-5f,min(length(halfBounds),length(otherHalfBounds))*0.04f);
     float tolerance=max(1e-6f,min(2e-5f,margin*0.25f));
     float4 inverse=q_conj(fq);
     uint nt=implicit_triangle_count(oi);
@@ -160,6 +161,7 @@ inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op
                     float step=radius;bool improved=false;
                     for(int bt=0;bt<10;bt++) {
                         float3 trial=impClosestTriangle(p-q.xyz*step,t.a,t.b,t.c);
+                        if(length_squared(trial-p)<1e-16f)break;
                         float4 next=implicit_query(fi,trial);
                         if(!all(isfinite(next))){failed=2;return 0;}
                         if(next.w<q.w-1e-9f){p=trial;q=next;improved=true;break;}
@@ -179,7 +181,7 @@ inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op
                     if(abs(implicit_query(fi,h.fieldPoint).w)>tolerance){failed=7;return 0;}
 
                     // Bound candidate storage while preserving spatial extent.
-                    int near=-1;float closest=coverage*0.18f;
+                    int near=-1;float closest=contactSpacing;
                     for(int k=0;k<count;k++){float d=distance(candidates[k].otherPoint,p);if(d<closest){closest=d;near=k;}}
                     if(near>=0){if(q.w<candidates[near].separation)candidates[near]=h;}
                     else if(count<32)candidates[count++]=h;

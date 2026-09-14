@@ -4,7 +4,20 @@ import GPUSim
 import simd
 struct Collider: Decodable {let asset:ConvexHullAsset;let center:[Float]}
 struct Hardware: Decodable {let name:String;let colliders:[Collider];let hulls:[[[Float]]];let mass:Float;let inertia:[Float]}
-struct Fixture: Decodable {let field:ImplicitField;let convex_hulls:[[[Float]]];let cooked_jar:[ConvexHullAsset];let hardware:[Hardware];let parameters:[String:Double]}
+struct Fixture: Decodable {let field:ImplicitField;let profile:[[Float]];let convex_hulls:[[[Float]]];let cooked_jar:[ConvexHullAsset];let hardware:[Hardware];let parameters:[String:Double]}
+// Independent radial polygon oracle: no expression DAG or acceleration metadata.
+func profileDistance(_ p:F3,_ profile:[[Float]]) -> Float {
+ let q=SIMD2<Float>(hypot(p.x,p.y),p.z);var inside=false;var best=Float.infinity
+ for i in profile.indices {
+  let aa=profile[i],bb=profile[(i+1)%profile.count]
+  let a=SIMD2<Float>(aa[0],aa[1]),b=SIMD2<Float>(bb[0],bb[1]),e=b-a
+  if (a.y>q.y) != (b.y>q.y), q.x < a.x+(q.y-a.y)*(b.x-a.x)/(b.y-a.y) {inside.toggle()}
+  if a.x==0 && b.x==0 {continue} // Rotation axis is not a physical surface.
+  let t=max(0,min(1,dot(q-a,e)/dot(e,e)))
+  best=min(best,length(q-(a+t*e)))
+ }
+ return inside ? -best : best
+}
 func v(_ a:[Float])->F3 {F3(a[0],a[1],a[2])}
 @main struct Main {
  static func main() {
@@ -22,6 +35,12 @@ func v(_ a:[Float])->F3 {F3(a[0],a[1],a[2])}
  static func run(_ args:[String],_ report:inout [String:Any]) throws {
   if args[2]=="witness" {try runCapturedWitness(args,&report);return}
   let f=try JSONDecoder().decode(Fixture.self,from:Data(contentsOf:URL(fileURLWithPath:args[1])))
+  // Cross-check the independent oracle against the imported field on a grid.
+  for x in 0...8 {for y in 0...8 {for z in 0...16 {
+   let p=F3(Float(x)*0.027-0.108,Float(y)*0.027-0.108,Float(z)*0.012-0.016)
+   let expected=try f.field.evaluate(p).distance
+   precondition(abs(profileDistance(p,f.profile)-expected)<2e-6)
+  }}}
   let sdf=args[2]=="sdf", seed=args.count>4 ? Int(args[4])! : 0, steps=args.count>5 ? Int(args[5])! : 1440
   let count=args.count>6 ? Int(args[6])! : 12
   let spheres=args.count>7 && args[7]=="spheres"
@@ -60,6 +79,7 @@ func v(_ a:[Float])->F3 {F3(a[0],a[1],a[2])}
   precondition(fieldCount == (sdf ? 1 : 0), "SDF import lost; clean rebuild required")
   report["authored_field_count"]=fieldCount;
   let initStart=Date();let solver=try GPUSolver(scene:scene,maxPairsPerBody:128);report["initialization_seconds"]=Date().timeIntervalSince(initStart)
+  solver.profiling=ProcessInfo.processInfo.environment["JAR_PROFILE"]=="1"
   var times=[Double](),trace=[[[Float]]]();var penetration:Float=0;var maxLocation:[String:Any]=[:];var escaped=Set<Int>();var maxContacts=0;var lastPos=F3.zero;var lastAngle:Float=0
   let clock=Date()
   do { for i in 0..<steps {
@@ -68,15 +88,15 @@ func v(_ a:[Float])->F3 {F3(a[0],a[1],a[2])}
    let pos=F3(0,0,liftHeight*smooth((t-1.5)/1.0));let angle:Float=2.2*smooth((t-3)/1.3);let rot=Quat(angle:angle,axis:F3(0,1,0))
    solver.setJointWorldAnchors(drivePoints.enumerated().map{.init(joint:$0.offset,point:pos+rot.act($0.element))});lastPos=pos;lastAngle=angle
    try solver.submitStep();try solver.synchronize();times.append(Date().timeIntervalSince(start))
-   if i%12==0 {
+   if i%max(1,Int(ProcessInfo.processInfo.environment["JAR_SAMPLE_EVERY"] ?? "1")!)==0 {
     if i%120==0 && ProcessInfo.processInfo.environment["JAR_PROGRESS"]=="1" {FileHandle.standardError.write(Data("step \(i)/\(steps)\n".utf8))}
     let jarState=solver.bodyStates([jar])[0];let actualRot=jarState.rotation;let actualPos=jarState.position;
-    let states=solver.bodyStates(ids);trace.append(states.map{[$0.position.x,$0.position.y,$0.position.z]})
+    let states=solver.bodyStates(ids);if i%12==0 {trace.append(states.map{[$0.position.x,$0.position.y,$0.position.z]})}
     maxContacts=max(maxContacts,solver.activeRigidContactCounts().reduce(0){$0+$1.contacts})
     for (j,b) in states.enumerated() {
      let local=actualRot.inverse.act(b.position-actualPos)
      if t<3 && (local.z < 0 || hypot(local.x,local.y)>radius+0.008) {escaped.insert(j)}
-     for vertex in witnesses[j] {let q=actualRot.inverse.act(b.position+b.rotation.act(vertex)-actualPos);let d=try f.field.evaluate(q).distance;if -d>penetration {penetration = -d;maxLocation=["step":i,"body":j,"jar_deviation_m":length(actualPos-pos),"local_point":[q.x,q.y,q.z]]}}
+     for vertex in witnesses[j] {let q=actualRot.inverse.act(b.position+b.rotation.act(vertex)-actualPos);let d=profileDistance(q,f.profile);if -d>penetration {penetration = -d;maxLocation=["step":i,"body":j,"jar_deviation_m":length(actualPos-pos),"local_point":[q.x,q.y,q.z]]}}
     }
    }
   }} catch {report["maximum_penetration_location"]=maxLocation;report["maximum_sampled_vertex_penetration_m"]=penetration;report["containment_escapes"]=escaped.sorted();report["failure_evidence"]=solver.implicitFailureEvidence() ?? solver.convexFailureEvidence() ?? [:];report["completed_steps"]=times.count;report["trace"]=trace;throw error}
@@ -91,6 +111,8 @@ func v(_ a:[Float])->F3 {F3(a[0],a[1],a[2])}
   let trackingOK=length(finalJar.position-lastPos)<0.005 && abs(dot(finalJar.rotation.vector,Quat(angle:lastAngle,axis:F3(0,1,0)).vector))>cos(0.025)
   report["discharged_count"]=discharged;report["pour_attempted"]=Float(steps)*dt>4.3
   report["passed"]=escaped.isEmpty && penetration<0.001 && tablePenetration<0.001 && trackingOK && (Float(steps)*dt<=4.3 || discharged==count);report["containment_escapes"]=escaped.sorted();report["maximum_sampled_vertex_penetration_m"]=penetration;report["maximum_penetration_location"]=maxLocation
+  report["penetration_sampling_interval_steps"]=max(1,Int(ProcessInfo.processInfo.environment["JAR_SAMPLE_EVERY"] ?? "1")!);report["penetration_oracle"]="independent radial polygon signed distance"
+  report["gpu_profile_ns"]=solver.profileNS;report["gpu_profile_frames"]=solver.profileFrames
   report["physics_steps_per_second"]=Double(steps)/times.reduce(0,+);report["wall_seconds_including_checks"]=elapsed;report["p95_step_ms"]=sorted[Int(Double(sorted.count-1)*0.95)]*1000;report["worst_step_ms"]=sorted.last!*1000;report["max_sampled_contacts"]=maxContacts;report["trace"]=trace
   report["scope"]="Saved demo fasteners or explicit sphere control; constraint-actuated dynamic jar; sampled vertex penetration is not a continuous collision certificate; contact memory and isolated narrowphase timing not measured"
  }
