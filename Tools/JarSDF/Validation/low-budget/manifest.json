@@ -1,0 +1,24 @@
+{
+  "fixture_sha256": "a537fd49dd46a4c4ebf81cef3694237edd0fda08b21bbdaef789610577fee653",
+  "executable_sha256": "2ca7a8ac5b072afcfbdfb085871f1087a9dcdb0389f55a4306fe483bec45b66c",
+  "base_commit": "0ad64c41c8aef337a331908ba02bb9f9c9134ef0",
+  "every_step_penetration_checks": true,
+  "sources": {
+    "Sources/PhysicsAVBD/Shaders/00_common.metal": "ad4db143ba3621e182e6412bbbe7be876b6ed3d581e519c5f4bca566b99edda6",
+    "Sources/PhysicsAVBD/Shaders/27_planar_dat.metal": "6e7e93b258d7eb4f91bc1e73ce81d2584af5acdbe444925af3f4a0b8310aefb4",
+    "Sources/PhysicsAVBD/Shaders/21_hierarchy_broadphase.metal": "58572c842469669cb7d3c2afcb54c2b4406b99af4638d679721c38ff47b401f3",
+    "Sources/PhysicsAVBD/Shaders/40_solver.metal": "31a06f845e4adff2cd0210c26e9a90d8e92603e51e686a1fa0a2a624a661fa62",
+    "Sources/PhysicsAVBD/Shaders/45_rigid_motion.metal": "715a6f8cc0ab22549cbbe925b00c30b65065a63abcca2e456bda8fc8ac788ed6",
+    "Sources/PhysicsAVBD/Shaders/20_broadphase.metal": "da495c3e946f508b06ea0133e1f2c88d2aa9096d67e6c9e36e5140742aaf0c21",
+    "Sources/PhysicsAVBD/Shaders/31_optimized_convex_narrowphase.metal": "fa9b7c65e98a03bc94caba25aa1ca937d4cb82aeca3224cba24645df96f47fa7",
+    "Sources/PhysicsAVBD/Shaders/25_cloth.metal": "601d80b74b05a879d0faf430112c741a288e5cdd66eda2cc1815157acdcf29b2",
+    "Sources/PhysicsAVBD/Shaders/50_render.metal": "56305dc3c7bcfe15df94ca54054757bad904c859e7de5fdd0d79296e683e4e8f",
+    "Sources/PhysicsAVBD/Shaders/35_analytic_compat.metal": "91994099119bc805267d257ec3c29784a65eb8fae8d9a07304da8237dc024a60",
+    "Sources/PhysicsAVBD/Shaders/10_scan.metal": "6e7078941de041e856aa691954a8ce64d16a0a750c1c867db9563aa2dac8b2ce",
+    "Sources/PhysicsAVBD/Shaders/60_robotics.metal": "340aaa2eacbe58009ed95cee2fa1b507ec65b1608ddc49acb90ff73b6bd4d7cf",
+    "Sources/PhysicsAVBD/Shaders/29_implicit_surface.metal": "ff153fc9c2ef9f9a9b382d98c667585c11014e31e3618577936132d261389548",
+    "Sources/PhysicsAVBD/Shaders/30_narrowphase.metal": "a67f5ad624aa291f15c1c6f5423eefe429bcd4cf44c3d97553213b523026a46a",
+    "Sources/PhysicsAVBD/GPU/GPUSolver.swift": "35fa4fc2f87e7f2fbf2b0aae845e56d9f3fe1241b8c160a4eaf8e37e39272c90",
+    "Tools/JarSDF/Sources/Main.swift": "8422ca316b0f105c0c0d83352b3f1f96465f3b4a087cfe1eb4197cf8b43bc1f4"
+  }
+}

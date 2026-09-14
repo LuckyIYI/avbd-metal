@@ -1946,6 +1946,54 @@ inline NPCResult npcPolySATWitness(
                 ranges, vertices, bestGap, bestNormal)) return out;
         }
     }
+    if (bestGap <= 0.0f) {
+        // SAT gives the minimum translation, but clipping to a nearby face
+        // may produce witnesses with a different normal. Reconstruct the
+        // actual touching features after translating B by that exact MTV.
+        const float witnessTolerance = 5.0e-5f;
+        for (uint side=0u; side<2u; ++side) {
+            NPCShape source=side==0u ? localA : localB;
+            NPCShape target=side==0u ? localB : localA;
+            uint ne=side==0u ? edgesA : edgesB;
+            uint nf=side==0u ? facesB : facesA;
+            for(uint e=0u;e<ne;e++) {
+                NPCPolyEdge edge=npcPolyEdge(source,e,assetIDs,hulls,edges,vertices);
+                for(uint end=0u;end<2u;end++) {
+                    float3 p=end==0u ? edge.a : edge.b;
+                    float3 mapped=p+(side==0u ? bestNormal*bestGap : -bestNormal*bestGap);
+                    bool inside=true;float boundary=-FLT_MAX;
+                    for(uint f=0u;f<nf;f++) {
+                        NPCPolyFace face=npcPolyFace(target,f,assetIDs,hulls,faces);
+                        float d=dot(face.normal,mapped)-face.distance;
+                        boundary=max(boundary,d);
+                        if(!face.valid || d>witnessTolerance){inside=false;break;}
+                    }
+                    if(!inside || fabs(boundary)>witnessTolerance)continue;
+                    out.pointA=side==0u ? p : mapped;
+                    out.pointB=side==0u ? mapped : p;
+                    out.normalAB=bestNormal;out.signedDistance=bestGap;
+                    out.featureA=NPC_FEATURE_SMOOTH;out.featureB=NPC_FEATURE_SMOOTH;
+                    out.valid=true;out.overlap=true;
+                    if(npcCorrectedMPRInAFrameIsConsistent(out))
+                        return npcResultFromAFrame(out,origin,rotation);
+                }
+            }
+        }
+        for(uint i=0u;i<edgesA;i++) {
+            NPCPolyEdge ea=npcPolyEdge(localA,i,assetIDs,hulls,edges,vertices);
+            for(uint j=0u;j<edgesB;j++) {
+                NPCPolyEdge eb=npcPolyEdge(localB,j,assetIDs,hulls,edges,vertices);
+                float3 shift=-bestNormal*bestGap,pa,pb;
+                npClosestSegSeg(ea.a,ea.b,eb.a+shift,eb.b+shift,pa,pb);
+                if(distance(pa,pb)>witnessTolerance)continue;
+                out.pointA=pa;out.pointB=pb-shift;out.normalAB=bestNormal;
+                out.signedDistance=bestGap;out.featureA=(localA.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)|i;
+                out.featureB=(localB.kind==4u ? NPC_FEATURE_HULL_EDGE : NPC_FEATURE_BOX_EDGE)|j;out.valid=true;out.overlap=true;
+                if(npcCorrectedMPRInAFrameIsConsistent(out))
+                    return npcResultFromAFrame(out,origin,rotation);
+            }
+        }
+    }
     if (bestGap > 0.0f) {
         // Edge-edge separation at a box rim: enumerate candidates rather than
         // accepting the heuristic edge score used for manifold enrichment.
@@ -2092,6 +2140,111 @@ inline void npCollidePass(
     bool capB = stB == 3;
     bool hullA = stA == 4;
     bool hullB = stB == 4;
+#ifdef AVBD_IMPLICIT
+    if (stA == 5u || stB == 5u) {
+        if (CONVEX_PASS) return;
+        bool fieldA = stA == 5u;
+        uint fi = fieldA ? ia : ib, si = fieldA ? ib : ia;
+        float3 fp = fieldA ? centerA : centerB, sp = fieldA ? centerB : centerA;
+        float4 fq = fieldA ? qA : qB;
+        if ((fieldA ? stB : stA) != 1u) {
+            float4 oq=fieldA ? qB : qA;
+            ImplicitHit hits[8];uint failed=0;
+            int previous=pairMapFind(mapKeyA,mapKeyB,mapVal,P.mapCapacity,ia,ib);
+            uint faceHint=previous>=0 ? prevManifolds[previous].colliderPair.z : 0;
+            // Match native speculative detection: build constraints before a
+            // closing pair crosses the surface, without enlarging solver margin.
+            float detectionMargin=P.collisionMargin+min((length(relVel)+length(velAng[ba].xyz)*abs(shape[ia].w)+length(velAng[bb].xyz)*abs(shape[ib].w))*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+            int nh=implicitSurfaceContacts(fi,si,fp,fq,sp,oq,shape[si].xyz*0.5f,detectionMargin,faceHint,hits,failed);
+            outM.header=uint4(ba,bb,0,0);
+            if(failed){atomic_store_explicit(&convexQueryPoison[2],failed,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[3],fi,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[4],si,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[1],2u,memory_order_relaxed);latchConvexQueryFailure(counters,convexQueryPoison);return;}
+            if(nh==0)return;
+            outM.colliderPair.z=hits[0].feature;
+            float3 n=fieldA ? -hits[0].normal : hits[0].normal;
+            float3 t1,t2;orthonormal(n,t1,t2);
+            // This is a Taylor contact model about the step's reference pose:
+            // use the same reference lever arms in its value and Jacobian.
+            outM.header=uint4(ba,bb,uint(nh),1u|MANIFOLD_FIXED_CONTACT_FRAME);
+            outM.basisN=float4(n,combine_friction(colliderFriction[ia].y,colliderFriction[ib].y,P.frictionCombineMode));
+            outM.basisT1=float4(t1,combine_friction(colliderFriction[ia].x,colliderFriction[ib].x,P.frictionCombineMode));
+            uint used=0;
+            for(int k=0;k<nh;k++){
+                float3 aw=fieldA ? hits[k].fieldPoint : hits[k].otherPoint;
+                float3 bw=fieldA ? hits[k].otherPoint : hits[k].fieldPoint;
+                float3 ra=q_rotate(q_conj(qBodyA),aw-bodyPA4.xyz),rb=q_rotate(q_conj(qBodyB),bw-bodyPB4.xyz);
+                float3 lambda=float3(0),penalty=float3(0);float stick=0;
+                if(previous>=0){
+                    device const ManifoldGPU& old=prevManifolds[previous];
+                    if(dot(old.basisN.xyz,n)>0.98f){
+                        float closest=max(0.001f,min(length(shape[fi].xyz),length(shape[si].xyz))*0.05f);int match=-1;
+                        for(uint j=0;j<old.header.z;j++)if(!(used&(1u<<j))){float d=max(distance(ra,old.contacts[j].rA.xyz),distance(rb,old.contacts[j].rB.xyz));if(d<closest){closest=d;match=int(j);}}
+                        if(match>=0){used|=1u<<uint(match);lambda=old.contacts[match].lambda.xyz;penalty=old.contacts[match].penalty.xyz;
+                            float3 tangent=old.basisT1.xyz*lambda.y+cross(old.basisN.xyz,old.basisT1.xyz)*lambda.z;lambda.y=dot(t1,tangent);lambda.z=dot(t2,tangent);
+                            stick=old.contacts[match].rB.w;
+                            if(stick!=0){
+                                float3 cachedA=xform(bodyPA4.xyz,qBodyA,old.contacts[match].rA.xyz);
+                                float3 cachedB=xform(bodyPB4.xyz,qBodyB,old.contacts[match].rB.xyz);
+                                // Tangential warm starts must not change the
+                                // certified normal gap on a curved field.
+                                float normalDrift=abs(dot(n,(cachedA-cachedB)-(aw-bw)));
+                                if(normalDrift<=min(2e-5f,P.collisionMargin*0.25f)) {
+                                    ra=old.contacts[match].rA.xyz;rb=old.contacts[match].rB.xyz;
+                                } else {stick=0;lambda.yz=float2(0);}
+                            }
+                        }
+                    }
+                }
+                aw=xform(bodyPA4.xyz,qBodyA,ra);bw=xform(bodyPB4.xyz,qBodyB,rb);float3 d=aw-bw;
+                outM.contacts[k].rA=float4(ra,float(k));outM.contacts[k].rB=float4(rb,stick);
+                outM.contacts[k].C0=float4(dot(n,d)+P.collisionMargin,dot(t1,d),dot(t2,d),0);
+                outM.contacts[k].lambda=float4(lambda*P.alpha*P.gamma,0);
+                outM.contacts[k].penalty=float4(clamp(penalty*P.gamma,npPenaltyFloor(posLin,ba,bb,P),npPenaltyCeil()),0);
+            }
+            return;
+        }
+        float4 sample = implicit_query(fi,q_rotate(q_conj(fq),sp-fp));
+        float gl = length(sample.xyz);
+        outM.header = uint4(ba,bb,0,0);
+        if (!all(isfinite(sample))) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
+        float radius = shape[si].x*0.5f;
+        float sphereDetectMargin=P.collisionMargin+min((length(relVel)+length(velAng[ba].xyz)*abs(shape[ia].w)+length(velAng[bb].xyz)*abs(shape[ib].w))*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+        if (sample.w-radius > sphereDetectMargin) return;
+        if (gl < 1e-6f) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
+        float3 normal = q_rotate(fq,sample.xyz/gl);
+        float3 fieldPoint = sp-normal*sample.w;
+        float3 spherePoint = sp-normal*radius;
+        float3 xAw = fieldA ? fieldPoint : spherePoint;
+        float3 xBw = fieldA ? spherePoint : fieldPoint;
+        float3 n = fieldA ? -normal : normal;
+        float3 t1,t2; orthonormal(n,t1,t2);
+        bool roundA = (shapeType[ia] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        bool roundB = (shapeType[ib] & COLLIDER_WORLD_ROUND_ANCHOR) != 0;
+        float3 ra = roundA ? xAw-bodyPA4.xyz : q_rotate(q_conj(qBodyA),xAw-bodyPA4.xyz);
+        float3 rb = roundB ? xBw-bodyPB4.xyz : q_rotate(q_conj(qBodyB),xBw-bodyPB4.xyz);
+        float3 lambda = float3(0), penalty = float3(0);
+        int prev = pairMapFind(mapKeyA,mapKeyB,mapVal,P.mapCapacity,ia,ib);
+        if (prev >= 0) {
+            device const ManifoldGPU& old = prevManifolds[prev];
+            if (old.header.z == 1u && dot(old.basisN.xyz,n) > .95f
+                && distance(old.contacts[0].rA.xyz,ra) < radius*.5f
+                && distance(old.contacts[0].rB.xyz,rb) < radius*.5f) {
+                lambda = old.contacts[0].lambda.xyz; penalty = old.contacts[0].penalty.xyz;
+                float3 tangent = old.basisT1.xyz*lambda.y + cross(old.basisN.xyz,old.basisT1.xyz)*lambda.z;
+                lambda.y = dot(tangent,t1); lambda.z = dot(tangent,t2);
+            }
+        }
+        outM.header = uint4(ba,bb,1,1u|(roundA?2u:0u)|(roundB?4u:0u));
+        outM.basisN = float4(n,combine_friction(colliderFriction[ia].y,colliderFriction[ib].y,P.frictionCombineMode));
+        outM.basisT1 = float4(t1,combine_friction(colliderFriction[ia].x,colliderFriction[ib].x,P.frictionCombineMode));
+        float3 d = xAw-xBw;
+        outM.contacts[0].rA = float4(ra,0); outM.contacts[0].rB = float4(rb,0);
+        outM.contacts[0].C0 = float4(dot(n,d)+P.collisionMargin,dot(t1,d),dot(t2,d),0);
+        outM.contacts[0].lambda = float4(lambda*P.alpha*P.gamma,0);
+        outM.contacts[0].penalty = float4(clamp(penalty*P.gamma,npPenaltyFloor(posLin,ba,bb,P),npPenaltyCeil()),0);
+        return;
+    }
+#endif
+
 
     if (hullA || hullB) {
         if (!CONVEX_PASS) return;

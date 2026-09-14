@@ -1,0 +1,824 @@
+{
+  "note": "Unfiltered exploratory outcomes. These include reverted solver experiments, mixed sampling intervals, and partial diagnostic runs; they are not the final qualified cohort. Full raw traces remain in fast-gen/out/jar-sdf-low-budget/experiments.",
+  "attempt_count": 73,
+  "attempts": [
+    {
+      "file": "spacing-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0010276809334754944,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "convex-240.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.002440171781927347,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "spacing-240-0.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0007484714733436704,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "spacing-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004418997094035149,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 5
+      }
+    },
+    {
+      "file": "sdf-120.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0038707442581653595,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 20, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 6
+      }
+    },
+    {
+      "file": "dispatch-240-1.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0008786654216237366,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dispatch-240-0.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0008771131397224963,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "convex-120.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.00322518777102232,
+      "discharged": 5,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dispatch-240-2.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0006279479712247849,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "sdf-240.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0010409975657239556,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "profile-240.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0010409975657239556,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "spacing-240-2.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0006279489025473595,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "impact-debug.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0015806523151695728,
+      "discharged": 0,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "bounded-active/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0012791170738637447,
+      "discharged": 0,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "bounded-active/sdf-240-0.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0019446932710707188,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 1391, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 7
+      }
+    },
+    {
+      "file": "bounded-active/sdf-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.002860698848962784,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 1432, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 47
+      }
+    },
+    {
+      "file": "bounded-active/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0020744367502629757,
+      "discharged": 0,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "bounded-active/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004492280539125204,
+      "discharged": 0,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "bounded-active/sdf-240-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0012368258321657777,
+      "discharged": 4,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "reference-frame/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0036287845578044653,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 4
+      }
+    },
+    {
+      "file": "reference-frame/sdf-240-0.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.000960339792072773,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "reference-frame/sdf-240-1.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0009516645222902298,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "reference-frame/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.003656388958916068,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 4
+      }
+    },
+    {
+      "file": "reference-frame/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.003506320295855403,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 4
+      }
+    },
+    {
+      "file": "reference-frame/sdf-240-2.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0009506009519100189,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "precondition/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0029301829636096954,
+      "discharged": 0,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "precondition/sdf-240-0.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0009842319414019585,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "precondition/sdf-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0012905891053378582,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "precondition/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.003171485848724842,
+      "discharged": 0,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "precondition/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.002058254089206457,
+      "discharged": 0,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "precondition/sdf-240-2.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0009161141933873296,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "conditioned/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004194527864456177,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 5
+      }
+    },
+    {
+      "file": "conditioned/sdf-240-0.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.000385318067856133,
+      "discharged": 2,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "conditioned/sdf-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0026456336490809917,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 1428, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 71
+      }
+    },
+    {
+      "file": "conditioned/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004331172443926334,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 18, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 2
+      }
+    },
+    {
+      "file": "conditioned/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004498057998716831,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 4
+      }
+    },
+    {
+      "file": "conditioned/sdf-240-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0026912526227533817,
+      "discharged": 9,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dense/convex-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.002851372119039297,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dense/convex-0.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0037091546691954136,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dense/sdf-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0010450603440403938,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dense/sdf-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0013430430553853512,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dense/sdf-0.json",
+      "passed": true,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0009858841076493263,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "dense/convex-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0037756776437163353,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "gap/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0036267079412937164,
+      "discharged": 7,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "gap/sdf-240-0.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.004115237854421139,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "gap/sdf-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.004111096262931824,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "gap/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0036187274381518364,
+      "discharged": 4,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "gap/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0036138708237558603,
+      "discharged": 8,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "gap/sdf-240-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.004108232446014881,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "support/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0044196853414177895,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 5
+      }
+    },
+    {
+      "file": "support/sdf-240-0.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0010624529095366597,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "support/sdf-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0013430430553853512,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "support/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.002419025870040059,
+      "discharged": 4,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "support/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.00448023434728384,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 5
+      }
+    },
+    {
+      "file": "support/sdf-240-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0010450603440403938,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "incident/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.0026911944150924683,
+      "discharged": 5,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "incident/sdf-240-0.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0010399994207546115,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "incident/sdf-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0015806523151695728,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "incident/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004480442963540554,
+      "discharged": 1,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "incident/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.00447542080655694,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 15, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 6
+      }
+    },
+    {
+      "file": "incident/sdf-240-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0015602181665599346,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "active/sdf-120-0.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004454829730093479,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 18, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"2 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 7
+      }
+    },
+    {
+      "file": "active/sdf-240-0.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.004038788378238678,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 18, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 2
+      }
+    },
+    {
+      "file": "active/sdf-240-1.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.0035440288484096527,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 96, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 0
+      }
+    },
+    {
+      "file": "active/sdf-120-1.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.004460060503333807,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 17, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"2 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 0
+      }
+    },
+    {
+      "file": "active/sdf-120-2.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 4,
+      "penetration_m": 0.00029416754841804504,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 13, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 0
+      }
+    },
+    {
+      "file": "active/sdf-240-2.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 4,
+      "penetration_m": 0.004479086957871914,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 37, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 3
+      }
+    },
+    {
+      "file": "allocation/sdf-240-6.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 6,
+      "penetration_m": 0.0016707952599972486,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "allocation/convex-240-6.json",
+      "passed": false,
+      "dt": 0.004166666883975267,
+      "iterations": 6,
+      "penetration_m": 0.004497068002820015,
+      "discharged": 12,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "allocation/sdf-60-16.json",
+      "passed": false,
+      "dt": 0.01666666753590107,
+      "iterations": 16,
+      "penetration_m": 0.0042718555778265,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 7, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"2 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 3
+      }
+    },
+    {
+      "file": "allocation/convex-60-16.json",
+      "passed": false,
+      "dt": 0.01666666753590107,
+      "iterations": 16,
+      "penetration_m": 0.0044996715150773525,
+      "discharged": 4,
+      "error": null,
+      "failure_evidence": null
+    },
+    {
+      "file": "allocation/sdf-120-8.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 8,
+      "penetration_m": 0.004434382542967796,
+      "discharged": null,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 16, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "failure_evidence": {
+        "field_collider": 1,
+        "reason_code": 6,
+        "surface_collider": 7
+      }
+    },
+    {
+      "file": "allocation/convex-120-8.json",
+      "passed": false,
+      "dt": 0.008333333767950535,
+      "iterations": 8,
+      "penetration_m": 0.0036705504171550274,
+      "discharged": 1,
+      "error": null,
+      "failure_evidence": null
+    }
+  ]
+}

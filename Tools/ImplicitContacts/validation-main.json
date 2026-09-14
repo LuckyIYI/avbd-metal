@@ -1,0 +1,173 @@
+{
+  "scope": "Correctness smoke checks with Infinite app running concurrently; timings are not isolated benchmarks",
+  "results": [
+    {
+      "colliders": 16,
+      "dt": 0.004166666666666667,
+      "dynamic": false,
+      "final_z": [
+        -4.865182876586914,
+        0.025714974850416183,
+        0.025714974850416183,
+        0.025714974850416183,
+        -4.865182876586914,
+        0.025714974850416183,
+        0.025714974850416183,
+        0.025714974850416183
+      ],
+      "initialization_seconds": 7.858821988105774,
+      "iterations": 4,
+      "mode": "implicit",
+      "momentum_error": [
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573,
+        0.00027143361512571573
+      ],
+      "passed": true,
+      "replicas": 8,
+      "ring_velocity_x": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "step_wall_seconds": 2.284964919090271,
+      "steps": 240,
+      "steps_per_second": 105.03443531883758,
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "minimum_center_z": 0.015524841845035553,
+      "replicas": 1,
+      "steps_per_second": 103.00902261340356,
+      "passed": true,
+      "final_z": [
+        0.019499396905303
+      ],
+      "initialization_seconds": 3.1667699813842773,
+      "step_seconds": 2.3298929929733276,
+      "mode": "surface-convex",
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "step_seconds": 2.3312699794769287,
+      "replicas": 1,
+      "steps_per_second": 102.94817936695999,
+      "initialization_seconds": 3.26445996761322,
+      "passed": true,
+      "minimum_center_z": 0.015524841845035553,
+      "mode": "surface-plane",
+      "final_z": [
+        0.019499396905303
+      ],
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "replicas": 1,
+      "minimum_center_z": 0.015524841845035553,
+      "steps_per_second": 68.76704137647626,
+      "mode": "surface-infinite-far",
+      "passed": true,
+      "final_z": [
+        0.01936635747551918
+      ],
+      "step_seconds": 3.4900439977645874,
+      "initialization_seconds": 3.0397329330444336,
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "passed": true,
+      "mode": "surface-hull",
+      "replicas": 1,
+      "step_seconds": 3.8988800048828125,
+      "initialization_seconds": 2.157850980758667,
+      "final_z": [
+        0.019411170855164528
+      ],
+      "minimum_center_z": 0.015524841845035553,
+      "steps_per_second": 61.55613912185882,
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "step_seconds": 4.906835913658142,
+      "steps_per_second": 48.91135636550669,
+      "replicas": 1,
+      "initialization_seconds": 2.160112977027893,
+      "passed": true,
+      "minimum_center_z": 0.015524841845035553,
+      "final_z": [
+        0.019389785826206207
+      ],
+      "mode": "surface-triangle",
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "minimum_center_z": -4.825181007385254,
+      "passed": true,
+      "step_seconds": 1.9829379320144653,
+      "initialization_seconds": 2.8245320320129395,
+      "steps_per_second": 121.03253265027018,
+      "mode": "surface-hole",
+      "final_z": [
+        -4.825181007385254
+      ],
+      "replicas": 1,
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "passed": true,
+      "step_seconds": 1.7536039352416992,
+      "minimum_center_z": -4.825181007385254,
+      "mode": "surface-edge-miss",
+      "replicas": 1,
+      "final_z": [
+        -4.825181007385254
+      ],
+      "steps_per_second": 136.8610067397692,
+      "initialization_seconds": 0.058451056480407715,
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "initialization_seconds": 0.044325947761535645,
+      "steps_per_second": 61.39776467853946,
+      "minimum_center_z": 0.019854478538036346,
+      "replicas": 1,
+      "final_z": [
+        0.019893789663910866
+      ],
+      "step_seconds": 3.908937096595764,
+      "passed": true,
+      "mode": "surface-tilted",
+      "exit_code": 0,
+      "expected_rejection": false
+    },
+    {
+      "passed": false,
+      "error": "commandExecution(operation: \"convex narrowphase safety validation\", frame: 1, status: 0, domain: \"PhysicsAVBD.ConvexQuery\", code: 1, message: \"1 support-mapped convex queries failed to produce a trustworthy collision witness\")",
+      "evidence": {
+        "reason_code": 5,
+        "surface_collider": 1,
+        "field_collider": 0
+      },
+      "exit_code": 1,
+      "expected_rejection": true
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "purpose": "Post-packaging full seed-0 SDF trial and captured witness regression on the PR branch; not part of original six-trial timing cohort",
+  "sdf": {
+    "actuator": "three world-anchor constraints; no per-step pose resets",
+    "authored_field_count": 1,
+    "containment_escapes": [],
+    "contents_count": 12,
+    "discharged_count": 12,
+    "dt": 0.0020833334419876337,
+    "final_jar_position": [
+      3.8934220469855063e-07,
+      1.3750504024301335e-07,
+      0.23657561838626862
+    ],
+    "final_table_penetration_m": 0.00015067285858094692,
+    "final_tracking_position_error_m": 6.888207622068876e-07,
+    "final_tracking_rotation_error_rad": 0,
+    "initialization_seconds": 2.307002902030945,
+    "iterations": 4,
+    "jar_colliders": 1,
+    "largest_fastener_span_m": 0.05369269847869873,
+    "lift_height_m": 0.23657506704330444,
+    "max_sampled_contacts": 200,
+    "maximum_penetration_location": {
+      "body": 2,
+      "jar_deviation_m": 0.002233058912679553,
+      "local_point": [
+        0.012060243636369705,
+        -0.005994210951030254,
+        0.008702895604074001
+      ],
+      "step": 1812
+    },
+    "maximum_sampled_vertex_penetration_m": 0.00029710400849580765,
+    "mode": "sdf",
+    "p95_step_ms": 2.3349523544311523,
+    "passed": true,
+    "physics_steps_per_second": 597.250923130911,
+    "pour_attempted": true,
+    "probe_kind": "saved demo hardware",
+    "scope": "Saved demo fasteners or explicit sphere control; constraint-actuated dynamic jar; sampled vertex penetration is not a continuous collision certificate; contact memory and isolated narrowphase timing not measured",
+    "seed": 0,
+    "total_colliders": 86,
+    "wall_seconds_including_checks": 7.402835965156555,
+    "worst_step_ms": 8.890032768249512
+  },
+  "witness": {
+    "max_contacts": 4,
+    "mode": "witness",
+    "passed": true,
+    "steps": 16
+  }
+}

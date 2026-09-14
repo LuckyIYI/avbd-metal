@@ -598,7 +598,8 @@ public final class GPUSolver {
     private static func makeRigidBroadphaseHierarchy(
         scene: PhysicsScene, convexUpload: ConvexGPUUpload
     ) -> RigidBroadphaseHierarchyUpload? {
-        guard scene.tris.isEmpty, scene.tets.isEmpty else { return nil }
+        guard scene.tris.isEmpty, scene.tets.isEmpty,
+              !scene.colliders.contains(where: { $0.implicitField != nil }) else { return nil }
 
         func radius(collider index: Int) -> Float {
             let collider = scene.colliders[index]
@@ -1289,6 +1290,10 @@ public final class GPUSolver {
         guard let q = dev.makeCommandQueue() else { throw AVBDError.noDevice }
         self.queue = q
 
+        self.implicitPreamble = try scene.implicitCollisionPreamble()
+        self.implicitGlobalPairCount = scene.implicitPlanePairs().count
+        var scene = scene
+        for i in scene.colliders.indices where scene.colliders[i].implicitContactSurface?.isInfinitePlane == true {scene.colliders[i].collisionEnabled=false}
         let convexUpload = try Self.makeConvexGPUUpload(scene: scene)
         convexClipWorkspaceVertices = ConvexHullGPU.clipWorkspaceVertices(
             largestSourceFace: convexUpload.faces.map { Int($0.loop.y) }.max() ?? 0)
@@ -2058,13 +2063,15 @@ public final class GPUSolver {
 
     // MARK: - Shader compilation
 
+    private var implicitPreamble = ""
+    private var implicitGlobalPairCount = 0
     public private(set) var convexClipWorkspaceVertices = 32
 
     private func buildPipelines() throws {
         let lib: MTLLibrary
         let hierarchyLib: MTLLibrary?
         do {
-            lib = try Self.makeLibrary(device: device)
+            lib = try Self.makeLibrary(device: device, preamble: implicitPreamble)
             hierarchyLib = usesRigidColliderHierarchy
                 ? try Self.makeHierarchyLibrary(device: device) : nil
         } catch let error as AVBDError {
@@ -2082,7 +2089,7 @@ public final class GPUSolver {
         if hasPotentialRigidConvexPair {
             let optimized = try Self.makeOptimizedConvexLibrary(
                 device: device, clipWorkspaceVertices: convexClipWorkspaceVertices)
-            for name in ["np_collide", "np_collide_convex"] {
+            for name in (implicitPreamble.isEmpty ? ["np_collide", "np_collide_convex"] : ["np_collide_convex"]) {
                 guard let fn = optimized.makeFunction(name: name) else {
                     throw AVBDError.kernelMissing(name)
                 }
@@ -2190,13 +2197,13 @@ public final class GPUSolver {
     /// optional compound hierarchy is deliberately excluded: adding kernels
     /// to this Metal translation unit measurably perturbs fast-math codegen
     /// for long-horizon analytic scenes even when they are never dispatched.
-    static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
+    static func makeLibrary(device: MTLDevice, preamble: String = "") throws -> MTLLibrary {
         let urls = try shaderResourceURLs().filter {
             $0.lastPathComponent != hierarchyShaderName
                 && $0.lastPathComponent != optimizedConvexShaderName
                 && $0.lastPathComponent != "45_rigid_motion.metal"
         }
-        return try compileLibrary(device: device, urls: urls)
+        return try compileLibrary(device: device, urls: urls, preamble: preamble)
     }
 
     /// Compile the compound hierarchy with common ABI declarations in its
@@ -2449,6 +2456,8 @@ public final class GPUSolver {
                 case .capsule: flags = 3
                 }
             }
+            if c.implicitField != nil { flags = 5 }
+            if c.implicitContactSurface != nil { flags = 6 }
             if particle { flags |= 0x10 }
             if c.usesWorldSpaceRoundAnchor { flags |= 0x20 }
             if (flags & 0xF) == 3 && !particle
@@ -2456,6 +2465,7 @@ public final class GPUSolver {
                 flags |= ColliderGPUFlags.cableContactFrame
             }
             ct[i] = flags
+
             if rigidHierarchy == nil, c.collisionEnabled,
                scene.bodies[c.body].isDynamic {
                 radii.append(broadphaseCellRadius(r, collider: i))
@@ -6024,6 +6034,17 @@ public final class GPUSolver {
             }
         }
 
+        if implicitGlobalPairCount > 0 {
+            dispatch1D(enc,"implicit_append_planes",1) {e in
+                e.setBuffer(self.pairs,offset:0,index:0);e.setBuffer(self.counters,offset:0,index:1)
+                e.setBytes(&P,length:MemoryLayout<SimParamsGPU>.stride,index:2)
+                e.setBuffer(self.convexQueryPoison,offset:0,index:3)
+            }
+            dispatch1D(enc,"bp_finalize_pairs",1) {e in
+                e.setBuffer(self.counters,offset:0,index:0);e.setBuffer(self.dispatchArgs,offset:0,index:1)
+                e.setBytes(&P,length:MemoryLayout<SimParamsGPU>.stride,index:2)
+            }
+        }
         try stage("narrowphase")
         // Hull-free scenes retain the exact established 22-buffer analytic
         // kernel: wrapping its body in the expanded generic template changes
@@ -6090,6 +6111,7 @@ public final class GPUSolver {
                 e.setBuffer(self.colliderHullRange, offset: 0, index: 19)
                 e.setBuffer(self.convexHullVertices, offset: 0, index: 20)
                 e.setBuffer(self.colliderFriction, offset: 0, index: 21)
+                if !self.implicitPreamble.isEmpty { e.setBuffer(self.convexQueryPoison, offset: 0, index: 29) }
             }
             if usesEnhancedAnalyticNarrowPhaseForTesting {
                 dispatchIndirect(
@@ -7769,6 +7791,12 @@ public final class GPUSolver {
     /// Read only after a typed convex-query failure has retired. Captures the
     /// actual narrowphase poses, before the failed-frame rollback. No sync()
     /// here: that legacy accessor traps on a latched failure.
+    public func implicitFailureEvidence() -> [String:Any]? {
+        guard runtimeFailure != nil else {return nil}
+        let w=convexQueryPoison.contents().bindMemory(to:UInt32.self,capacity:32)
+        guard w[1]==2 else {return nil}
+        return ["reason_code":w[2],"field_collider":w[3],"surface_collider":w[4]]
+    }
     public func convexFailureEvidence() -> [String: Any]? {
         guard case .commandExecution(_, _, _, let domain, _, _) = runtimeFailure,
               domain == RuntimeFailure.convexQueryFailureDomain else { return nil }
@@ -7790,7 +7818,7 @@ public final class GPUSolver {
                   count <= convexHullVertices.length / 16 - start else { return nil }
             let hull = data[side * 3].w == 4
                 ? (start..<(start + count)).map { array(vertices[$0]) } : []
-            shapes.append(["collider": collider, "center_kind": array(data[side * 3]),
+            shapes.append(["collider": collider, "uploaded_kind": colliderShapeType.contents().assumingMemoryBound(to:UInt32.self)[collider], "center_kind": array(data[side * 3]),
                 "rotation": array(data[side * 3 + 1]), "dimensions": array(data[side * 3 + 2]),
                 "vertices": hull])
         }

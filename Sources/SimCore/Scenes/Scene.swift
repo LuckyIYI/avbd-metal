@@ -121,6 +121,10 @@ public struct SceneBody {
 /// MJCF/URDF instead of those shapes. `localPosition` and `localRotation` are
 /// expressed in the owning body's frame.
 public struct SceneCollider {
+    /// Optional metric implicit surface. GPU contacts currently support sphere pairs.
+    public var implicitField: ImplicitField? = nil
+    public var implicitContactSurface: ImplicitContactSurface? = nil
+
     public var body: Int
     public var size: F3
     public var friction: Float
@@ -679,6 +683,8 @@ public struct PhysicsScene {
     public var spinners: [SceneSpinner] = []
     public var collisionExclusions: [SceneCollisionExclusion] = []
     public var settings = SimSettings()
+    /// Disable only for matched contact-search benchmarks.
+    public var implicitPlaneAcceleration = true
 
     public init(name: String) {
         self.name = name

@@ -1,0 +1,38 @@
+{
+  "convex-240": {
+    "passes": 0,
+    "trials": 3,
+    "worst_penetration_m": 0.0037756776437163353,
+    "median_steps_per_second": 724.4146974031082,
+    "median_wall_seconds_including_checks": 2.10137403011322,
+    "discharged": [
+      12,
+      12,
+      12
+    ]
+  },
+  "sdf-240": {
+    "passes": 3,
+    "trials": 3,
+    "worst_penetration_m": 0.000960339792072773,
+    "median_steps_per_second": 568.3101048402589,
+    "median_wall_seconds_including_checks": 2.643772006034851,
+    "discharged": [
+      12,
+      12,
+      12
+    ]
+  },
+  "convex-480": {
+    "passes": 1,
+    "trials": 3,
+    "worst_penetration_m": 0.0010163234546780586,
+    "median_steps_per_second": 742.7067593773634,
+    "median_wall_seconds_including_checks": 4.089058995246887,
+    "discharged": [
+      11,
+      12,
+      12
+    ]
+  }
+}

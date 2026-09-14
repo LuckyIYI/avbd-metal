@@ -1,0 +1,23 @@
+{
+  "hz": 480,
+  "iterations": 4,
+  "seeds": 3,
+  "duration_seconds": 6,
+  "executable_sha256": "b9e541f4c2958cd254a69a41d4ae73a1d0d5766798bbe307170aaa641f262949",
+  "fixture_sha256": "a537fd49dd46a4c4ebf81cef3694237edd0fda08b21bbdaef789610577fee653",
+  "engine_base_commit": "bf11156babc42c35439acf3b911ed0f447eefb31",
+  "source_sha256": {
+    ".integrations/avbd-metal/Sources/PhysicsAVBD/GPU/GPUSolver.swift": "1c592d4d284a9f1c30ed89bfa7e4455e0332abba2e2232985d4f3239b7d77367",
+    ".integrations/avbd-metal/Sources/PhysicsAVBD/Shaders/29_implicit_surface.metal": "be1e1a8ac37bf8c6625d569f42e314c0d0b07c3b2b65773319b3900185006de6",
+    ".integrations/avbd-metal/Sources/PhysicsAVBD/Shaders/30_narrowphase.metal": "6a894def0d59fe223e707e465ee53523b25289c9b2d23e5b60e35ee3dc693738",
+    ".integrations/avbd-metal/Sources/PhysicsAVBD/Shaders/31_optimized_convex_narrowphase.metal": "1becaad13cbb27527f558a1e51eb8517af14c04d81f11b0b2395bec9ffaf1e19",
+    ".integrations/avbd-metal/Sources/PhysicsAVBD/Shaders/35_analytic_compat.metal": "cde554dc1f81d8d0fe89ab8b82653be0cb285834fb7aaa703d8e73ce2fcdea98",
+    ".integrations/avbd-metal/Sources/SimCore/Implicit/ImplicitContactSurface.swift": "579a84d36946e108724021d6d7f8c3ace946c7c3812a75f94e5b82aa5b0dfe1e",
+    ".integrations/avbd-metal/Sources/SimCore/Implicit/ImplicitField.swift": "a1600067e161265a7d75888076e98afb82b0bddc161e80b0bf0af2de4a0956f1",
+    ".integrations/avbd-metal/Sources/SimCore/Implicit/ImplicitMetal.swift": "813b64b0406b581924d08744467197fc53a6074fecd7389bb7131d9c56c67ee9",
+    "src/assetgen/design/implicit/__init__.py": "f1a5cb800db3cf3244c05c68335760b81a71439565a5a52e93fbc4542092ff7c",
+    "src/assetgen/design/implicit/jar.py": "e87dd81e3222e866bab11ff529fb7e05d5297131ee4da304cefe372f3fd25fec",
+    "tools/jar-sdf-pilot/Sources/Main.swift": "12d0b950c4ceccaef72dc745de8b319bcc702973528310433e9108a6255c173b",
+    "scripts/jar_sdf_pilot.py": "ce85b63a75e00faeab01d0e61270f8c2c98b237d27a4c803084113eb5e26895d"
+  }
+}
