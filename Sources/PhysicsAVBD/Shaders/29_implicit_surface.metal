@@ -1,6 +1,6 @@
 #ifdef AVBD_IMPLICIT
 struct ImplicitPatch {float3 a,b,c; uint depth;};
-struct ImplicitHit {float3 fieldPoint, otherPoint, normal;float separation;};
+struct ImplicitHit {float3 fieldPoint, otherPoint, normal;float separation;uint feature;};
 inline float3 impClosestTriangle(float3 p,float3 a,float3 b,float3 c) {
     float3 ab=b-a,ac=c-a,ap=p-a;float d1=dot(ab,ap),d2=dot(ac,ap);
     if(d1<=0&&d2<=0)return a;
@@ -17,7 +17,7 @@ inline float3 impClosestTriangle(float3 p,float3 a,float3 b,float3 c) {
 // general search. Bounding support certifies separation/contact depth; witnesses
 // are evaluated on the actual field surface when the shader is compiled.
 inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,float4 oq,
- float margin,thread ImplicitHit* hits) {
+ float margin,uint faceHint,thread ImplicitHit* hits) {
     if(!implicit_plane_acceleration())return -1;
     float3 lo=implicit_bounds_min(fi),hi=implicit_bounds_max(fi),h=(hi-lo)*0.5f;
     float3 center=q_rotate(q_conj(oq),fp+q_rotate(fq,(lo+hi)*0.5f)-op);
@@ -25,7 +25,7 @@ inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,f
     float3 ay=q_rotate(q_conj(oq),q_rotate(fq,float3(0,1,0)));
     float3 az=q_rotate(q_conj(oq),q_rotate(fq,float3(0,0,1)));
     float3 extent=abs(ax)*h.x+abs(ay)*h.y+abs(az)*h.z;
-    float3 bh=implicit_native_box_half(oi),normal=float3(0);float plane=0;
+    float3 bh=implicit_native_box_half(oi),normal=float3(0);float plane=0;uint feature=0;
     if(bh.x>0) {
         int face=-1;
         for(int a=0;a<3;a++) {
@@ -34,6 +34,29 @@ inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,f
         }
         if(face<0)return -1;
         normal[face]=center[face]>=0 ? 1.0f : -1.0f;plane=bh[face];
+    } else if(implicit_hull_face_count(oi)>0) {
+        // Every other halfspace bounds this polygon's edges. Only use the
+        // face shortcut when no other hull face can intersect the field bounds.
+        uint nf=implicit_hull_face_count(oi);int chosen=-1;
+        uint first=faceHint>0 && faceHint<=nf ? faceHint-1 : 0;
+        for(uint slot=0;slot<nf;slot++) {
+            uint f=(first+slot)%nf;
+            float4 face=implicit_hull_face(oi,f);
+            float3 ln=q_rotate(q_conj(fq),q_rotate(oq,face.xyz));
+            float mid=dot(face.xyz,center)-face.w,rad=dot(abs(ln),h);
+            if(mid-rad>margin)return 0; // Separating hull plane.
+            if(mid>=0) {
+                bool covered=true;
+                for(uint j=0;j<nf;j++)if(j!=f) {
+                    float4 edge=implicit_hull_face(oi,j);
+                    float3 en=q_rotate(q_conj(fq),q_rotate(oq,edge.xyz));
+                    if(dot(edge.xyz,center)+dot(abs(en),h)>=edge.w-margin){covered=false;break;}
+                }
+                if(covered){chosen=int(f);break;}
+            }
+        }
+        if(chosen<0)return -1;
+        float4 face=implicit_hull_face(oi,uint(chosen));normal=face.xyz;plane=face.w;feature=uint(chosen)+1;
     } else {
         float2 rect=implicit_rectangle_half(oi);
         if(!implicit_infinite_plane(oi) && (rect.x<=0 || any(abs(center.xy)+extent.xy>rect-margin)))return -1;
@@ -41,7 +64,7 @@ inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,f
         normal.z=center.z>0 ? 1.0f : -1.0f;
     }
     float3 worldN=q_rotate(oq,normal),localN=q_rotate(q_conj(fq),worldN);
-    float bound=dot(normal,center)-dot(abs(normal),extent)-plane;
+    float bound=dot(normal,center)-dot(abs(localN),h)-plane;
     if(bound>margin)return 0;
     // Flat support patches only. Near-tilted point/edge manifolds must retain
     // the general search rather than switch between incompatible supports.
@@ -75,7 +98,7 @@ inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,f
         selected[nout]=chosen;
         float3 p=fp+q_rotate(fq,implicit_support_vertex(fi,uint(chosen)));
         float d=dot(worldN,p-op)-plane;
-        hits[nout++]={p,p-worldN*d,-worldN,d};
+        hits[nout++]={p,p-worldN*d,-worldN,d,feature};
     }
     if(nout<3)return -1;
     float area=0;
@@ -86,8 +109,8 @@ inline int implicitPlaneContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,f
 // Adaptive triangle coverage uses the 1-Lipschitz bound of a metric SDF.
 // Exhaustion is reported, never interpreted as separation.
 inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op,float4 oq,
- float3 halfBounds,float margin,thread ImplicitHit* hits,thread uint& failed) {
-    int planeHits=implicitPlaneContacts(fi,oi,fp,fq,op,oq,margin,hits);
+ float3 halfBounds,float margin,uint faceHint,thread ImplicitHit* hits,thread uint& failed) {
+    int planeHits=implicitPlaneContacts(fi,oi,fp,fq,op,oq,margin,faceHint,hits);
     if(planeHits>=0)return planeHits;
     float3 boundMin=implicit_bounds_min(fi),boundMax=implicit_bounds_max(fi);
     halfBounds=(boundMax-boundMin)*0.5f;
@@ -135,7 +158,7 @@ inline int implicitSurfaceContacts(uint fi,uint oi,float3 fp,float4 fq,float3 op
                 }
                 if(q.w<=margin+tolerance) {
                     float gl=length(q.xyz);if(gl<1e-6f){failed=3;return 0;}
-                    ImplicitHit h;h.otherPoint=p;
+                    ImplicitHit h;h.feature=0;h.otherPoint=p;
                     float3 planeN=normalize(cross(b-a,c-a));
                     if(dot(planeN,p-implicit_interior_seed(fi))<0)planeN=-planeN;
                     h.normal=planeN;h.separation=q.w;h.fieldPoint=p-planeN*q.w;

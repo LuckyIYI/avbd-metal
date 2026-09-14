@@ -2101,16 +2101,22 @@ inline void npCollidePass(
         if ((fieldA ? stB : stA) != 1u) {
             float4 oq=fieldA ? qB : qA;
             ImplicitHit hits[8];uint failed=0;
-            int nh=implicitSurfaceContacts(fi,si,fp,fq,sp,oq,shape[fi].xyz*0.5f,P.collisionMargin,hits,failed);
+            int previous=pairMapFind(mapKeyA,mapKeyB,mapVal,P.mapCapacity,ia,ib);
+            uint faceHint=previous>=0 ? prevManifolds[previous].colliderPair.z : 0;
+            // Match native speculative detection: build constraints before a
+            // closing pair crosses the surface, without enlarging solver margin.
+            float detectionMargin=P.collisionMargin+min(length(relVel)*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+            int nh=implicitSurfaceContacts(fi,si,fp,fq,sp,oq,shape[fi].xyz*0.5f,detectionMargin,faceHint,hits,failed);
             outM.header=uint4(ba,bb,0,0);
             if(failed){atomic_store_explicit(&convexQueryPoison[2],failed,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[3],fi,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[4],si,memory_order_relaxed);atomic_store_explicit(&convexQueryPoison[1],2u,memory_order_relaxed);latchConvexQueryFailure(counters,convexQueryPoison);return;}
             if(nh==0)return;
+            outM.colliderPair.z=hits[0].feature;
             float3 n=fieldA ? -hits[0].normal : hits[0].normal;
             float3 t1,t2;orthonormal(n,t1,t2);
             outM.header=uint4(ba,bb,uint(nh),1u);
             outM.basisN=float4(n,combine_friction(colliderFriction[ia].y,colliderFriction[ib].y,P.frictionCombineMode));
             outM.basisT1=float4(t1,combine_friction(colliderFriction[ia].x,colliderFriction[ib].x,P.frictionCombineMode));
-            int previous=pairMapFind(mapKeyA,mapKeyB,mapVal,P.mapCapacity,ia,ib);uint used=0;
+            uint used=0;
             for(int k=0;k<nh;k++){
                 float3 aw=fieldA ? hits[k].fieldPoint : hits[k].otherPoint;
                 float3 bw=fieldA ? hits[k].otherPoint : hits[k].fieldPoint;
@@ -2141,7 +2147,8 @@ inline void npCollidePass(
         outM.header = uint4(ba,bb,0,0);
         if (!all(isfinite(sample))) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
         float radius = shape[si].x*0.5f;
-        if (sample.w-radius > P.collisionMargin) return;
+        float sphereDetectMargin=P.collisionMargin+min(length(relVel)*P.dt,npSpeculativeCap(shape[ia].w,shape[ib].w,P.collisionMargin));
+        if (sample.w-radius > sphereDetectMargin) return;
         if (gl < 1e-6f) { latchConvexQueryFailure(counters,convexQueryPoison); return; }
         float3 normal = q_rotate(fq,sample.xyz/gl);
         float3 fieldPoint = sp-normal*sample.w;

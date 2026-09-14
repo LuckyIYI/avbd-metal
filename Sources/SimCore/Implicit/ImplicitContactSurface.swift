@@ -108,6 +108,27 @@ extension PhysicsScene {
             }
         }
         text += "default:return float2(0);}}\n"
+        // A convex hull is the intersection of its unique outward face
+        // halfspaces. Merge coplanar triangulation without approximating edges.
+        var facePlanes=[Int:[SIMD4<Float>]]()
+        for i in closed.sorted() where colliders[i].convexAssetID != nil {
+            let vertices=surfaces[i]!
+            var planes=[SIMD4<Float>]()
+            for j in stride(from:0,to:vertices.count,by:3) {
+                let a=vertices[j],n=simd_normalize(simd_cross(vertices[j+1]-a,vertices[j+2]-a)),d=simd_dot(n,a)
+                guard vertices.allSatisfy({simd_dot(n,$0)<=d+1e-6}) else {throw ImplicitCollisionError.invalidCollider(i)}
+                if !planes.contains(where:{simd_length(SIMD3($0.x,$0.y,$0.z)-n)<1e-6 && abs($0.w-d)<1e-7}) {planes.append(SIMD4(n,d))}
+            }
+            facePlanes[i]=planes
+        }
+        text += "inline uint implicit_hull_face_count(uint id){switch(id){\n"
+        for i in facePlanes.keys.sorted() {text += "case \(i):return \(facePlanes[i]!.count)u;\n"}
+        text += "default:return 0u;}}\ninline float4 implicit_hull_face(uint id,uint f){switch(id){\n"
+        for i in facePlanes.keys.sorted() {
+            let data=facePlanes[i]!.map {"float4(\($0.x)f,\($0.y)f,\($0.z)f,\($0.w)f)"}.joined(separator:",")
+            text += "case \(i):{const float4 p[]={\(data)};return p[f];}\n"
+        }
+        text += "default:return float4(NAN);}}\n"
         // Surface witnesses on bounding faces certify the support bound. No
         // sampled convex hull is substituted for the implicit collision shape.
         var witnessCache=[Data:[SIMD3<Float>]](), witnessByID=[Int:[SIMD3<Float>]]()
