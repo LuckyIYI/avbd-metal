@@ -643,8 +643,7 @@ struct SolverContactGPU {
 #define CTR_CONVEX_SAT_QUERIES (26 + 2 * MAX_COLORS)
 #define CTR_CONVEX_SAT_EDGE_AXES (27 + 2 * MAX_COLORS)   // edge/edge axes tested
 #define CTR_CONVEX_SAT_EDGE_PRUNED (28 + 2 * MAX_COLORS) // edge pairs skipped by the Gauss map
-#define CTR_CONVEX_CACHED_AXIS_SEPARATED (29 + 2 * MAX_COLORS)
-#define CTR_TOTAL (30 + 2 * MAX_COLORS)
+#define CTR_TOTAL (29 + 2 * MAX_COLORS)
 
 inline void latchConvexQueryFailure(
     device atomic_uint* counters,

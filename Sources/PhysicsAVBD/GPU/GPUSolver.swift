@@ -4908,7 +4908,6 @@ public final class GPUSolver {
         convexQuery.satQueries = Int(ctr[GPUCounters.convexSATQueries])
         convexQuery.satEdgeAxesTested = Int(ctr[GPUCounters.convexSATEdgeAxesTested])
         convexQuery.satEdgePairsPruned = Int(ctr[GPUCounters.convexSATEdgePairsPruned])
-        convexQuery.cachedAxisSeparated = Int(ctr[GPUCounters.convexCachedAxisSeparated])
         convexQuery.failures = convexQueryFailures
 
         statsLock.lock()

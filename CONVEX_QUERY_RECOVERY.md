@@ -33,8 +33,8 @@ by MPR, separated by GJK, recovered by the swapped-operand retry, the enlarged
 retry, the box-face witness, or the complete separating-axis search, or failed
 closed. `GPUSolver.lastConvexQueryStatistics` (and the `convex_*` keys of
 `rigidContactStatistics()`) report those counts per step together with the
-number of complete searches, the edge/edge axes they tested, the edge pairs
-the Gauss-map test pruned, and the searches ended by a cached axis. A frame
+number of complete searches, the edge/edge axes they tested and the edge
+pairs the Gauss-map test pruned. A frame
 whose contact counts stay flat while `satQueries` or `satEdgeAxesTested`
 rises is spending its time in the fallback; that signature was previously
 inferable only from timing.
@@ -51,12 +51,8 @@ captured regression pairs the search now tests 115 of 5,484, 18 of 144 and
 275 of 90,000 edge axes and certifies the same contacts. The 131,072 edge-pair
 work budget is unchanged and still counts the complete, unpruned pair set.
 
-When a pair reaches the complete search and has a manifold from the previous
-step, that manifold normal is tested first. Its gap is a lower bound on the
-true distance, so a gap beyond the detection band proves the pair needs no
-contact this step without walking the axis set. Overlapping or near pairs fall
-through to the full search unchanged; the fail-closed contract, poison
-capture and failed-frame restoration are untouched.
+The fail-closed contract, poison capture and failed-frame restoration are
+untouched.
 
 ## Two complete-search defects that latched failures
 

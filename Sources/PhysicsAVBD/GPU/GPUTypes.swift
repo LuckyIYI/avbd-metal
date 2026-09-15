@@ -319,14 +319,12 @@ public enum GPUCounters {
     public static let convexRecoveredEnlarged = 23 + 2 * AVBD_MAX_COLORS
     public static let convexRecoveredFace = 24 + 2 * AVBD_MAX_COLORS
     public static let convexRecoveredSAT = 25 + 2 * AVBD_MAX_COLORS
-    /// Complete separating-axis searches entered, edge/edge axes they tested,
-    /// edge pairs the Gauss-map test pruned, and searches that ended early
-    /// because the pair's previous manifold normal already separated it.
+    /// Complete separating-axis searches entered, edge/edge axes they tested
+    /// and edge pairs the Gauss-map test pruned.
     public static let convexSATQueries = 26 + 2 * AVBD_MAX_COLORS
     public static let convexSATEdgeAxesTested = 27 + 2 * AVBD_MAX_COLORS
     public static let convexSATEdgePairsPruned = 28 + 2 * AVBD_MAX_COLORS
-    public static let convexCachedAxisSeparated = 29 + 2 * AVBD_MAX_COLORS
-    public static let total = 30 + 2 * AVBD_MAX_COLORS
+    public static let total = 29 + 2 * AVBD_MAX_COLORS
 }
 
 /// Per-step convex query recovery statistics, read back with the other
@@ -344,7 +342,6 @@ public struct ConvexQueryStatistics: Equatable, Sendable {
     public var satQueries = 0
     public var satEdgeAxesTested = 0
     public var satEdgePairsPruned = 0
-    public var cachedAxisSeparated = 0
     public var failures = 0
 
     public init() {}
@@ -363,7 +360,6 @@ public struct ConvexQueryStatistics: Equatable, Sendable {
          "convex_sat_queries": satQueries,
          "convex_sat_edge_axes_tested": satEdgeAxesTested,
          "convex_sat_edge_pairs_pruned": satEdgePairsPruned,
-         "convex_cached_axis_separated": cachedAxisSeparated,
          "convex_query_failures": failures]
     }
 }
