@@ -843,21 +843,10 @@ public final class GPUSolver {
         var groups: [ConvexPlaneGroup] = []
         groups.reserveCapacity(triangles.count)
 
-        // Faces are assembled largest-triangle-first, so every face's plane
-        // is defined by its best-conditioned member. Seeding from the first
-        // triangle in authored order let a sliver define the plane; every
-        // well-conditioned triangle of the same face then failed the angular
-        // test against its noisy normal and split into a second group, each
-        // half carrying internal diagonals on its boundary. A triangle joins a
-        // face only if all three vertices lie on the face plane, its normal is
-        // within the (unchanged) angular tolerance, and it shares an edge with
-        // a current member - adjacency is what stops two non-adjacent
-        // near-coplanar faces of a gently curved surface being fused. A final
-        // pass unions same-plane groups that share an edge, which a small
-        // triangle processed before its larger neighbours can leave apart.
-        // The seeding key is quantised to Float so this orders identically to
-        // the offline cooker; ties break by triangle index. Mirrors
-        // Tools/cook_convex_asset.py validate_merged_face_loops exactly.
+        // Group triangles into coplanar faces. Faces are seeded from the
+        // largest triangle so a sliver never defines a plane; a triangle joins
+        // a face only if its vertices lie on the plane, its normal agrees, and
+        // it shares an edge. Must match the cooker and ConvexAssets.swift.
         struct Prepared {
             var key: Float
             var index: Int

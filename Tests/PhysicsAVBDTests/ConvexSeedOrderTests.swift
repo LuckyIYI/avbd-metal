@@ -4,18 +4,9 @@ import simd
 @testable import PhysicsAVBD
 import SimCore
 
-/// Faces are assembled largest-triangle-first. Before that, whichever triangle
-/// the hull builder emitted first defined a face's plane; when it was a
-/// sliver, every well-conditioned triangle of the same face failed the angular
-/// test against its noisy normal and split off, and the cell was refused as
-/// "not one convex loop" or "boundary is disconnected". 408 authored cells of
-/// one generated arena were lost that way, silently.
-///
-/// This is the runtime half of the parity guarantee: the offline cooker
-/// (Tools/cook_convex_asset.py) and this uploader must group identically, or a
-/// hull the cooker accepts throws at scene build. Every captured cell goes
-/// through `addConvexCollider` and `GPUSolver(scene:)` exactly as an asset
-/// does.
+/// Captured cells that the coplanar-face check refused when faces were seeded
+/// from the first triangle. They must upload now; the degenerate ones must
+/// still be refused.
 final class ConvexSeedOrderTests: XCTestCase {
     private struct Cell: Decodable {
         let owner: String

@@ -1,12 +1,5 @@
-"""Offline half of the coplanar-face seeding fix.
-
-Faces are assembled largest-triangle-first. Before that, the first triangle
-in authored order defined a face's plane; a sliver there split its face in two
-and the cell was refused as "not one convex loop" or "boundary is
-disconnected". The runtime uploader is pinned by ConvexSeedOrderTests; this
-pins the cooker on the same captured geometry so the two cannot drift apart
-unnoticed.
-"""
+"""Cooker half of the coplanar-face seeding fix, on the same captured
+geometry the runtime tests use."""
 
 from __future__ import annotations
 

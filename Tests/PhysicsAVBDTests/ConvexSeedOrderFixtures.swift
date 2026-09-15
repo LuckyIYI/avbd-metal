@@ -1,10 +1,5 @@
-// Authored convex cells refused by the coplanar-face validator before faces
-// were seeded largest-triangle-first, captured 2026-09-15 from a generated
-// kitchen arena. Each entry is one cell as handed to the cooker: Float32
-// vertices about their centroid, the owning body, and the refusal it drew.
-// Numeric regression data; 405 of the 408 must canonicalise and upload, and
-// the remaining 3 (a 2 um step, sub-Float32 partition output) must still be
-// refused as degenerate rather than silently accepted.
+// Convex cells refused by the coplanar-face check before largest-triangle
+// seeding: Float32 vertices about the centroid, owner, and the refusal.
 import Foundation
 
 let convexSeedOrderCellsJSON = #"""

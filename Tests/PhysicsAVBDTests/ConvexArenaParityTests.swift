@@ -5,16 +5,9 @@ import simd
 @testable import PhysicsAVBD
 import SimCore
 
-/// Population-level parity: every hull asset of a cooked arena document must
-/// decode (SimCore's ConvexHullAsset validator) AND upload (the GPU
-/// uploader's face grouping) - the two runtime copies of the cooker's
-/// coplanar-face check. A cell the offline cooker wrote and either runtime
-/// copy refuses is exactly the failure this pins; it was found in the wild
-/// as `DecodingError.dataCorrupted hullAssets.h02423: coplanar face 36
-/// boundary is disconnected` after only the uploader had been fixed.
-///
-/// Skips unless CLATTER_ARENA_JSON names a document; runs on every hull it
-/// contains and names each refusal.
+/// Every hull asset of a cooked document must decode and upload; the two
+/// runtime copies of the coplanar-face check must agree with the cooker.
+/// Runs when CLATTER_ARENA_JSON names a document.
 final class ConvexArenaParityTests: XCTestCase {
     private struct Document: Decodable { let hullAssets: [String: JSONValue] }
     private struct JSONValue: Decodable {
@@ -59,11 +52,7 @@ final class ConvexArenaParityTests: XCTestCase {
             let body = scene.addBody(size: F3(repeating: 1), density: 1, friction: 0.5,
                                      position: .zero, rotation: Quat(real: 1, imag: .zero),
                                      collisionEnabled: false)
-            // The stored asset, triangulation and all - the path a cooked
-            // document actually takes. The vertices-only overload rebuilds a
-            // hull with the package's own builder and tests that builder, not
-            // the uploader; it refused 15 of these 3,033 point sets while the
-            // game loaded every one of them.
+            // Upload the stored asset, triangulation included, as a document does.
             _ = scene.addConvexCollider(body: body, asset: asset,
                                         localPosition: .zero,
                                         localRotation: Quat(real: 1, imag: .zero))

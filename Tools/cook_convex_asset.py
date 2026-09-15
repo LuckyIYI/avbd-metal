@@ -671,19 +671,10 @@ def validate_merged_face_loops(
     scale = max(mesh_diagonal(vertices), 1.0e-4)
     plane_tolerance = max(scale * 2.0e-6, 1.0e-7)
     normal_tolerance = 5.0e-5
-    # Faces are assembled largest-triangle-first, so every face's plane is
-    # defined by its best-conditioned member. Previously the first triangle
-    # in authored order seeded the plane; when that was a sliver its normal
-    # was noisy, every well-conditioned triangle of the same face then failed
-    # the angular test against it and split into a second group, and each half
-    # carried internal diagonals on its boundary. A triangle joins a face only
-    # if all three of its vertices lie on the face plane, its normal is within
-    # the (unchanged) angular tolerance, and it shares an edge with a current
-    # member - adjacency is what stops two non-adjacent, near-coplanar faces
-    # of a gently curved surface being fused into one. A final pass unions
-    # same-plane groups that share an edge, which a small triangle processed
-    # before its larger neighbours can otherwise leave separate. Deterministic:
-    # ties break by triangle index. The runtime uploader groups identically.
+    # Group triangles into coplanar faces, seeded from the largest triangle so
+    # a sliver never defines a plane. A triangle joins a face only if its
+    # vertices lie on the plane, its normal agrees, and it shares an edge.
+    # Must match the runtime copies in ConvexAssets.swift and GPUSolver.swift.
     prepared: list[tuple[float, int, Point, float]] = []
     for triangle_index, triangle in enumerate(triangles):
         normal = triangle_normal(vertices, triangle)
@@ -691,10 +682,7 @@ def validate_merged_face_loops(
         if not math.isfinite(normal_length) or normal_length <= 1.0e-12:
             raise CookError(f"generated hull triangle {triangle_index} is degenerate")
         normal = multiply(normal, 1.0 / normal_length)
-        # The seeding key is quantised to Float32 so that the cooker and the
-        # runtime uploader - which orders the same triangles in Swift - agree
-        # on which of two near-equal-area triangles seeds a face. Ties then
-        # break by triangle index on both sides.
+        # Float32 key so the Swift copies order near-equal triangles identically.
         prepared.append((-f32(normal_length), triangle_index, normal, dot(normal, vertices[triangle[0]])))
     prepared.sort(key=lambda item: (item[0], item[1]))
 

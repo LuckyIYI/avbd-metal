@@ -574,16 +574,10 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
         var groups: [PlaneGroup] = []
         groups.reserveCapacity(triangles.count)
 
-        // Faces are assembled largest-triangle-first, so every face's plane
-        // is defined by its best-conditioned member; a triangle joins a face
-        // only if all three vertices lie on its plane, its normal is within
-        // the unchanged angular tolerance, and it shares an edge with a
-        // current member, and a final pass unions same-plane groups that
-        // share an edge. The seeding key is quantised to Float so this orders
-        // identically to the offline cooker and the GPU uploader. Mirrors
-        // Tools/cook_convex_asset.py validate_merged_face_loops and
-        // GPUSolver.makeConvexPolygonTopology exactly - all three must agree,
-        // or an asset the cooker wrote is refused at decode.
+        // Group triangles into coplanar faces. Faces are seeded from the
+        // largest triangle so a sliver never defines a plane; a triangle joins
+        // a face only if its vertices lie on the plane, its normal agrees, and
+        // it shares an edge. Must match the cooker and GPUSolver.swift.
         struct Prepared {
             var key: Float
             var index: Int
