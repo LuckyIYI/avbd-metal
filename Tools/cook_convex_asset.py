@@ -545,28 +545,40 @@ def incremental_convex_hull(points: Sequence[Point]) -> Mesh:
         if point_index in seed:
             continue
         point = vertices[point_index]
-        visible: list[int] = []
-        for face_index, face in enumerate(faces):
+        heights: list[float] = []
+        for face in faces:
             face_normal = triangle_normal(vertices, face)
             normal_length = math.sqrt(length_squared(face_normal))
-            distance = dot(face_normal, subtract(point, vertices[face[0]]))
-            if distance > tolerance * normal_length:
-                visible.append(face_index)
-        if not visible:
+            heights.append(dot(face_normal, subtract(point, vertices[face[0]])) / normal_length)
+        # Visibility is decided by exact sign. A tolerance here let neighbouring
+        # faces disagree about a coplanar point, which opened holes in the
+        # visible region; the horizon check below refuses anything that slips.
+        visible_set = {index for index, height in enumerate(heights) if height > 0.0}
+        if not visible_set:
             continue
 
-        boundary: dict[tuple[int, int], tuple[int, int]] = {}
-        counts: dict[tuple[int, int], int] = {}
-        for face_index in visible:
-            face = faces[face_index]
-            for edge in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-                key = tuple(sorted(edge))
-                counts[key] = counts.get(key, 0) + 1
-                boundary[key] = edge
-        horizon = [boundary[key] for key, count in counts.items() if count == 1]
+        def horizon_of(region: set[int]) -> tuple[list[tuple[int, int]], dict[int, int]]:
+            boundary: dict[tuple[int, int], tuple[int, int]] = {}
+            counts: dict[tuple[int, int], int] = {}
+            for face_index in region:
+                face = faces[face_index]
+                for edge in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+                    key = tuple(sorted(edge))
+                    counts[key] = counts.get(key, 0) + 1
+                    boundary[key] = edge
+            loop = [boundary[key] for key, count in counts.items() if count == 1]
+            degree: dict[int, int] = {}
+            for u, v in loop:
+                degree[u] = degree.get(u, 0) + 1
+                degree[v] = degree.get(v, 0) + 1
+            return loop, degree
+
+        horizon, degree = horizon_of(visible_set)
         if len(horizon) < 3:
             raise CookError("convex hull horizon was not a closed loop")
-        visible_set = set(visible)
+        if any(count != 2 for count in degree.values()) or len(degree) != len(horizon):
+            raise CookError("convex hull horizon was not one closed loop")
+        visible = sorted(visible_set)
         faces = [face for index, face in enumerate(faces) if index not in visible_set]
         for u, v in sorted(horizon):
             faces.append(oriented_face(v, u, point_index, vertices, interior))
