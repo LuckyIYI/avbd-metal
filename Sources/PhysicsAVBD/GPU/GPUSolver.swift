@@ -7326,9 +7326,10 @@ public final class GPUSolver {
             j.rA = SIMD4(worldTarget, stiffness)
             j.rB = SIMD4(localAnchor, 0)
             j.C0Ang = SIMD4(0, 0, 0, Float.greatestFiniteMagnitude)
-            // soft (finite) constraint: no flags, penalty ramps to stiffness
-            j.penaltyLin = SIMD4(repeating: 0)
-            j.penaltyLin = SIMD4(1, 1, 1, 0)
+            // Finite joints use their physical stiffness immediately, matching
+            // scene initialization. They do not use the hard-joint ramp.
+            let k = min(max(stiffness, 0), 1e9)
+            j.penaltyLin = SIMD4(k, k, k, 0)
             j.lambdaLin = .zero
         } else {
             j.header.z = 1   // broken = disabled
@@ -7336,6 +7337,69 @@ public final class GPUSolver {
             j.lambdaLin = .zero
         }
         jp[jointIndex] = j
+    }
+
+    /// A compliant grasp joining a dynamic payload to an articulated hand.
+    /// This changes a constraint, never a payload pose or velocity.
+    public func setGrasp(jointIndex: Int, parent: Int, body: Int?,
+                         parentAnchor: F3 = .zero, childAnchor: F3 = .zero,
+                         restRotation: Quat = Quat(real: 1, imag: .zero),
+                         linearStiffness: Float = 20000, angularStiffness: Float = 20000) {
+        precondition(jointIndex >= 0 && jointIndex < numJoints)
+        sync()
+        let jp = joints.contents().bindMemory(to: JointGPU.self, capacity: numJoints)
+        guard let body else {
+            if jp[jointIndex].header.z == 0 {
+                wakeRigidBodies([Int(jp[jointIndex].header.x), Int(jp[jointIndex].header.y)])
+            }
+            jp[jointIndex].header.z = 1
+            return
+        }
+        precondition(parent >= 0 && parent < numBodies && body >= 0 && body < numBodies)
+        precondition(linearStiffness > 0 && angularStiffness > 0 && linearStiffness.isFinite && angularStiffness.isFinite)
+        wakeRigidBodies([parent, body])
+        var j = JointGPU()
+        j.header = SIMD4(UInt32(parent), UInt32(body), 0, 0)
+        j.rA = SIMD4(parentAnchor, linearStiffness)
+        j.rB = SIMD4(childAnchor, angularStiffness)
+        j.restRel = restRotation.normalized.vector
+        j.C0Lin = SIMD4(0,0,0,0.03)
+        j.C0Ang = SIMD4(0,0,0,3e18)
+        j.penaltyLin = SIMD4(repeating:linearStiffness)
+        j.penaltyAng = SIMD4(repeating:angularStiffness)
+        jp[jointIndex] = j
+    }
+
+    /// Ideal finite-stiffness screw coupling. Axial displacement and twist
+    /// share one energy term, so axial load generates reciprocal torque.
+    public func setHelicalJoint(jointIndex: Int, parent: Int, body: Int,
+                                parentAnchor: F3, pitch: Float, minimumTravel: Float? = nil,
+                                axialStiffness: Float = 100000) {
+        precondition(jointIndex >= 0 && jointIndex < numJoints && pitch > 0 && pitch.isFinite)
+        precondition(parent >= 0 && parent < numBodies && body >= 0 && body < numBodies)
+        precondition(axialStiffness.isFinite && axialStiffness > 0)
+        sync()
+        wakeRigidBodies([parent, body])
+        let jp=joints.contents().bindMemory(to:JointGPU.self,capacity:numJoints)
+        var j=JointGPU()
+        j.header=SIMD4(UInt32(parent),UInt32(body),0,3)
+        j.rA=SIMD4(parentAnchor,1e9);j.rB=SIMD4(0,0,0,1e9)
+        j.prismaticAxis=SIMD4(0,0,1,1);j.hingeAxis=SIMD4(0,0,1,1)
+        j.restRel=(bodyRotation(parent).inverse*bodyRotation(body)).vector
+        j.C0Lin=SIMD4(0,0,0,0.03);j.C0Ang=SIMD4(0,0,0,3e18)
+        j.penaltyLin=SIMD4(repeating:100000);j.penaltyAng=SIMD4(repeating:100000)
+        j.dynamics.w=pitch/(2 * .pi)
+        j.responseKnot0.y=axialStiffness
+        if let minimumTravel {
+            precondition(minimumTravel.isFinite)
+            j.translationLimits=SIMD4(minimumTravel,Float.greatestFiniteMagnitude,1,0)
+        }
+        jp[jointIndex]=j
+    }
+    public func helicalAngle(_ jointIndex:Int) -> Float {
+        precondition(jointIndex >= 0 && jointIndex < numJoints)
+        sync()
+        return joints.contents().bindMemory(to:JointGPU.self,capacity:numJoints)[jointIndex].response.w
     }
 
     /// Ray-cast against collision primitives (CPU, shared buffers). Returns

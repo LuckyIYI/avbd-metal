@@ -113,7 +113,7 @@ public struct JointGPU {
     public var translationLimits: SIMD4<Float> = .zero // lo, hi, enabled, warm-start stop (-1/0/+1)
     public var motor: SIMD4<Float> = .zero       // target, effort cap, pad, gain
     public var limits: SIMD4<Float> = .zero      // lo, hi, position-PD kd, stop stiffness
-    public var dynamics: SIMD4<Float> = .zero    // armature, predicted twist, explicit effort, pad
+    public var dynamics: SIMD4<Float> = .zero    // armature, predicted twist, explicit effort, helical lead (metres/radian; zero disables)
     public var response: SIMD4<Float> = .zero // count, damping, effort cap, initial coordinate
     public var breakLoad: SIMD4<Float> = .zero // force, torque, enabled force/torque bits, pad
     public var responseKnot0: SIMD4<Float> = .zero
