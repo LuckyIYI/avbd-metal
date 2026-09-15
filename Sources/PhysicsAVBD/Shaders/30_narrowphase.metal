@@ -1211,6 +1211,7 @@ struct NPCPolyFace {
 
 struct NPCPolyEdge {
     bool valid;
+    bool degenerate;                // finite endpoints that coincide (a cooking artefact)
     uint localIndex;
     float3 a;
     float3 b;
@@ -1556,6 +1557,7 @@ inline NPCPolyEdge npcPolyEdge(
 {
     NPCPolyEdge result;
     result.valid = false;
+    result.degenerate = false;
     result.localIndex = localEdge;
     result.a = shape.center;
     result.b = shape.center;
@@ -1583,8 +1585,14 @@ inline NPCPolyEdge npcPolyEdge(
         convexHullVertices[vertexStart + vertices.x].xyz);
     result.b = shape.center + q_rotate(shape.rotation,
         convexHullVertices[vertexStart + vertices.y].xyz);
-    result.valid = finite3(result.a) && finite3(result.b)
-        && distance_squared(result.a, result.b) > 1.0e-16f;
+    // Half-space cooking can round two routes to the same vertex 1-5 ULPs
+    // apart. Such an edge is below the engine's supported geometric
+    // resolution (every consumer already refuses it); the complete search
+    // skips it rather than aborting, unlike an out-of-range index or a
+    // missing asset, which stay invalid.
+    bool finite = finite3(result.a) && finite3(result.b);
+    result.degenerate = finite && distance_squared(result.a, result.b) <= 1.0e-16f;
+    result.valid = finite && !result.degenerate;
     return result;
 }
 
@@ -2034,7 +2042,7 @@ inline NPCResult npcPolySATWitness(
     }
     for (uint i = 0u; i < edgesA; ++i) {
         NPCPolyEdge ea = npcPolyEdge(localA, i, assetIDs, hulls, edges, vertices);
-        if (!ea.valid) return out;
+        if (!ea.valid) { if (ea.degenerate) continue; return out; }
         float3 na0 = float3(0), na1 = float3(0);
         bool arcsA = npcPolyEdgeFaceNormals(localA, i, assetIDs, hulls, faces, edges, na0, na1);
         for (uint j = 0u; j < edgesB; ++j) {
@@ -2045,12 +2053,30 @@ inline NPCResult npcPolySATWitness(
                 ++edgePairsPruned;
                 continue;
             }
-            ++edgeAxesTested;
             NPCPolyEdge eb = npcPolyEdge(localB, j, assetIDs, hulls, edges, vertices);
-            if (!eb.valid || !npcSATAxis(localA, localB,
+            if (!eb.valid) { if (eb.degenerate) continue; return out; }
+            ++edgeAxesTested;
+            if (!npcSATAxis(localA, localB,
                 cross(ea.b - ea.a, eb.b - eb.a),
                 ranges, vertices, bestGap, bestNormal)) return out;
         }
+    }
+    // A separation certified beyond the detection band is an answer, not a
+    // failure: the caller discards any pair whose distance exceeds its band,
+    // and maxDistance bounds that band. The slack scales with the projected
+    // magnitudes so a room-sized slab and a small prop share one rule.
+    float bandSlack = 8.0f * FLT_EPSILON * (fabs(maxDistance)
+        + fabs(dot(npcShapeSupport(localA, bestNormal, ranges, vertices).point, bestNormal))
+        + fabs(dot(npcShapeSupport(localB, -bestNormal, ranges, vertices).point, bestNormal)));
+    if (bestGap > maxDistance + bandSlack) {
+        // Support points along the certified axis, not a closest-point pair:
+        // the caller discards a pair beyond its band before reading them.
+        out.pointA = npcShapeSupport(localA, bestNormal, ranges, vertices).point;
+        out.pointB = npcShapeSupport(localB, -bestNormal, ranges, vertices).point;
+        out.normalAB = bestNormal; out.signedDistance = bestGap;
+        out.featureA = NPC_FEATURE_SMOOTH; out.featureB = NPC_FEATURE_SMOOTH;
+        out.valid = true; out.overlap = false;
+        return npcResultFromAFrame(out, origin, rotation);
     }
     if (bestGap > 0.0f) {
         // Edge-edge separation at a box rim: enumerate candidates rather than
@@ -2063,12 +2089,12 @@ inline NPCResult npcPolySATWitness(
         float supportB = dot(npcShapeSupport(localB, -bestNormal, ranges, vertices).point, bestNormal);
         for (uint i = 0u; i < countA; ++i) {
             NPCPolyEdge ea = npcPolyEdge(localA, i, assetIDs, hulls, edges, vertices);
-            if (!ea.valid) return out;
+            if (!ea.valid) { if (ea.degenerate) continue; return out; }
             if (min(fabs(dot(ea.a, bestNormal)-supportA),
                     fabs(dot(ea.b, bestNormal)-supportA)) > 5.0e-5f) continue;
             for (uint j = 0u; j < countB; ++j) {
                 NPCPolyEdge eb = npcPolyEdge(localB, j, assetIDs, hulls, edges, vertices);
-                if (!eb.valid) return out;
+                if (!eb.valid) { if (eb.degenerate) continue; return out; }
                 if (min(fabs(dot(eb.a, bestNormal)-supportB),
                         fabs(dot(eb.b, bestNormal)-supportB)) > 5.0e-5f) continue;
                 float3 pa, pb;
@@ -2088,6 +2114,17 @@ inline NPCResult npcPolySATWitness(
     NPCManifoldContact contacts[MAX_CONTACTS]; uint attempts = 0u;
     int count = npcBuildPolyhedralManifold(localA, localB, bestNormal, maxDistance,
         ranges, vertices, assetIDs, hulls, faces, loops, edges, contacts, attempts);
+    if (count == 0 && bestGap > maxDistance - bandSlack) {
+        // Within slack of the band edge the clipper may keep no contact; the
+        // certified gap is still the pair's answer. Support points again, not
+        // closest points; the caller discards the pair before reading them.
+        out.pointA = npcShapeSupport(localA, bestNormal, ranges, vertices).point;
+        out.pointB = npcShapeSupport(localB, -bestNormal, ranges, vertices).point;
+        out.normalAB = bestNormal; out.signedDistance = bestGap;
+        out.featureA = NPC_FEATURE_SMOOTH; out.featureB = NPC_FEATURE_SMOOTH;
+        out.valid = true; out.overlap = false;
+        return npcResultFromAFrame(out, origin, rotation);
+    }
     // Reconstruct actual surface witnesses, not unrelated support vertices.
     for (int i = 0; i < count; ++i) {
         out.pointA = contacts[i].pointA; out.pointB = contacts[i].pointB;

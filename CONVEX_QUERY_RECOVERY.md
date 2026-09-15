@@ -57,3 +57,38 @@ true distance, so a gap beyond the detection band proves the pair needs no
 contact this step without walking the axis set. Overlapping or near pairs fall
 through to the full search unchanged; the fail-closed contract, poison
 capture and failed-frame restoration are untouched.
+
+## Two complete-search defects that latched failures
+
+Captured on-GPU by the arena workload of a second integration (poison site
+tagged, winning axis and gap recorded under the same CAS winner):
+
+- A hull edge whose endpoints coincide within one to five Float32 ULPs made
+  `npcPolyEdge` invalid, and the complete search treated any invalid edge as
+  fatal, abandoning the query and latching a failure. Half-space cooking
+  produces such edges routinely (381 of 120,858 edges across 1,422 cooked
+  hulls in that integration). `NPCPolyEdge` now separates `degenerate`
+  (finite endpoints within the 1e-16 squared-length floor) from `valid`; the
+  complete search skips such edges and still fails closed on an out-of-range
+  index, a missing asset or non-finite data. This is a resolution decision,
+  not an exact equivalence: exactly coincident endpoints contribute no axis,
+  but endpoints a few nanometres apart still define one mathematically. The
+  engine already refuses to use edges below that floor everywhere else, so the
+  search now agrees with that supported resolution instead of aborting.
+- A pair certified separated along a face normal with a gap just outside the
+  detection band produced no manifold contact, and the search reported that as
+  a failed query. A certified gap beyond `maxDistance` is an answer: the caller
+  discards every pair beyond its band, and `maxDistance` bounds that band. The
+  search now returns a separated result for a gap beyond the band, with a slack
+  of eight Float32 epsilons of the projected magnitudes so room-sized slabs and
+  small props share one rule, and treats an empty manifold within that slack
+  the same way.
+
+A third finding is left open: for some separated pairs inside the band the
+manifold builder returns points that are not the closest features (residuals
+of 74 micrometres and 2.1 millimetres against certified gaps of 3.4 and 1.0
+millimetres; an exact float64 distance confirms the SAT gap is the true
+distance to within float32 noise), and one pair inside the band produced no
+manifold contact at all. The 50 micrometre witness check is therefore doing
+its job; loosening it would admit wrong contact points. The open item is the
+separated-case manifold witness, not the tolerance.
