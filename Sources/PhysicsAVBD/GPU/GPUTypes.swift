@@ -311,5 +311,59 @@ public enum GPUCounters {
     public static let rigidTriangleCandidates = 18 + 2 * AVBD_MAX_COLORS
     /// Supporting edge pairs considered by generic convex manifold builds.
     public static let convexEdgePairTests = 19 + 2 * AVBD_MAX_COLORS
-    public static let total = 20 + 2 * AVBD_MAX_COLORS
+    /// How support-mapped convex pairs resolved this step: accepted by MPR,
+    /// separated by GJK, or recovered at one of the bounded fallback stages.
+    public static let convexMPRAccepted = 20 + 2 * AVBD_MAX_COLORS
+    public static let convexGJKSeparated = 21 + 2 * AVBD_MAX_COLORS
+    public static let convexRecoveredSwapped = 22 + 2 * AVBD_MAX_COLORS
+    public static let convexRecoveredEnlarged = 23 + 2 * AVBD_MAX_COLORS
+    public static let convexRecoveredFace = 24 + 2 * AVBD_MAX_COLORS
+    public static let convexRecoveredSAT = 25 + 2 * AVBD_MAX_COLORS
+    /// Complete separating-axis searches entered, edge/edge axes they tested,
+    /// edge pairs the Gauss-map test pruned, and searches that ended early
+    /// because the pair's previous manifold normal already separated it.
+    public static let convexSATQueries = 26 + 2 * AVBD_MAX_COLORS
+    public static let convexSATEdgeAxesTested = 27 + 2 * AVBD_MAX_COLORS
+    public static let convexSATEdgePairsPruned = 28 + 2 * AVBD_MAX_COLORS
+    public static let convexCachedAxisSeparated = 29 + 2 * AVBD_MAX_COLORS
+    public static let total = 30 + 2 * AVBD_MAX_COLORS
+}
+
+/// Per-step convex query recovery statistics, read back with the other
+/// narrow-phase counters. Every support-mapped pair increments exactly one of
+/// the resolution counters or `failures`, so a flat contact count with a
+/// rising `satQueries` or `satEdgeAxesTested` identifies the complete
+/// separating-axis fallback as the frame's cost.
+public struct ConvexQueryStatistics: Equatable, Sendable {
+    public var mprAccepted = 0
+    public var gjkSeparated = 0
+    public var recoveredSwapped = 0
+    public var recoveredEnlarged = 0
+    public var recoveredFace = 0
+    public var recoveredSAT = 0
+    public var satQueries = 0
+    public var satEdgeAxesTested = 0
+    public var satEdgePairsPruned = 0
+    public var cachedAxisSeparated = 0
+    public var failures = 0
+
+    public init() {}
+
+    public var recovered: Int {
+        recoveredSwapped + recoveredEnlarged + recoveredFace + recoveredSAT
+    }
+
+    public var dictionary: [String: Int] {
+        ["convex_mpr_accepted": mprAccepted,
+         "convex_gjk_separated": gjkSeparated,
+         "convex_recovered_swapped": recoveredSwapped,
+         "convex_recovered_enlarged": recoveredEnlarged,
+         "convex_recovered_face": recoveredFace,
+         "convex_recovered_sat": recoveredSAT,
+         "convex_sat_queries": satQueries,
+         "convex_sat_edge_axes_tested": satEdgeAxesTested,
+         "convex_sat_edge_pairs_pruned": satEdgePairsPruned,
+         "convex_cached_axis_separated": cachedAxisSeparated,
+         "convex_query_failures": failures]
+    }
 }

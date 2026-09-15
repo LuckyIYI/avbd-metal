@@ -1877,7 +1877,80 @@ struct TorusHit {
 // not retain MPR/GJK, clipping workspaces, or convex-only buffer accesses in
 // its generated code. Both passes still consume the same deterministic pair
 // stream and address the same manifold slot by `gid`.
+// Adjacent outward face normals of a polyhedron edge in the query frame.
+inline bool npcPolyEdgeFaceNormals(
+    thread const NPCShape& shape, uint localEdge,
+    device const uint* assetIDs, device const ConvexHullGPU* hulls,
+    device const ConvexFaceGPU* faces, device const ConvexEdgeGPU* edges,
+    thread float3& n0, thread float3& n1)
+{
+    if (shape.kind == 0u) {
+        if (localEdge >= 12u) return false;
+        uint2 v = npcBoxEdgeVertices(localEdge);
+        uint along = v.x ^ v.y;   // the single differing vertex bit is the edge axis
+        uint count = 0u;
+        for (uint axis = 0u; axis < 3u; ++axis) {
+            if ((along & (1u << axis)) != 0u) continue;
+            uint face = 2u * axis + (((v.x >> axis) & 1u) != 0u ? 1u : 0u);
+            float3 n = q_rotate(shape.rotation, npcBoxFaceLocalNormal(face));
+            if (count == 0u) n0 = n; else n1 = n;
+            ++count;
+        }
+        return count == 2u;
+    }
+    if (shape.kind != 4u) return false;
+    uint asset = assetIDs[shape.collider];
+    if (asset == 0xFFFFFFFFu) return false;
+    ConvexHullGPU hull = hulls[asset];
+    if (localEdge >= hull.edgesLoops.y) return false;
+    ConvexEdgeGPU edge = edges[hull.edgesLoops.x + localEdge];
+    NPCPolyFace f0 = npcPolyFace(shape, edge.endpointsFaces.z, assetIDs, hulls, faces);
+    NPCPolyFace f1 = npcPolyFace(shape, edge.endpointsFaces.w, assetIDs, hulls, faces);
+    if (!f0.valid || !f1.valid) return false;
+    n0 = f0.normal;
+    n1 = f1.normal;
+    return true;
+}
+
+// Gauss-map arc test (Gregorius, GDC 2015). An edge pair realises a face of
+// the Minkowski difference, and so can be a separating axis or the minimum
+// translation, only when the arc between A's adjacent normals crosses the arc
+// between B's negated adjacent normals. Pairs that clearly cannot are pruned;
+// near-boundary and degenerate pairs are kept, so pruning never drops an axis
+// the complete search would have needed.
+inline bool npcEdgePairCannotBeMinkowskiFace(
+    float3 a, float3 b, float3 nb0, float3 nb1)
+{
+    float3 c = -nb0, d = -nb1;
+    float3 bxa = cross(b, a);
+    float3 dxc = cross(d, c);
+    float cba = dot(c, bxa), dba = dot(d, bxa);
+    float adc = dot(a, dxc), bdc = dot(b, dxc);
+    if (!finite_bits(cba) || !finite_bits(dba)
+        || !finite_bits(adc) || !finite_bits(bdc)) return false;
+    const float eps = 1.0e-8f;
+    return (cba * dba > eps) || (adc * bdc > eps) || (cba * bdc < -eps);
+}
+
+inline void npcFlushConvexQueryStats(
+    device atomic_uint* counters,
+    uint mpr, uint gjk, uint swapped, uint enlarged, uint face, uint sat,
+    uint satQueries, uint satEdgeAxes, uint satEdgePruned, uint cachedSeparated)
+{
+    if (mpr) atomic_fetch_add_explicit(&counters[CTR_CONVEX_MPR_ACCEPTED], mpr, memory_order_relaxed);
+    if (gjk) atomic_fetch_add_explicit(&counters[CTR_CONVEX_GJK_SEPARATED], gjk, memory_order_relaxed);
+    if (swapped) atomic_fetch_add_explicit(&counters[CTR_CONVEX_RECOVERED_SWAPPED], swapped, memory_order_relaxed);
+    if (enlarged) atomic_fetch_add_explicit(&counters[CTR_CONVEX_RECOVERED_ENLARGED], enlarged, memory_order_relaxed);
+    if (face) atomic_fetch_add_explicit(&counters[CTR_CONVEX_RECOVERED_FACE], face, memory_order_relaxed);
+    if (sat) atomic_fetch_add_explicit(&counters[CTR_CONVEX_RECOVERED_SAT], sat, memory_order_relaxed);
+    if (satQueries) atomic_fetch_add_explicit(&counters[CTR_CONVEX_SAT_QUERIES], satQueries, memory_order_relaxed);
+    if (satEdgeAxes) atomic_fetch_add_explicit(&counters[CTR_CONVEX_SAT_EDGE_AXES], satEdgeAxes, memory_order_relaxed);
+    if (satEdgePruned) atomic_fetch_add_explicit(&counters[CTR_CONVEX_SAT_EDGE_PRUNED], satEdgePruned, memory_order_relaxed);
+    if (cachedSeparated) atomic_fetch_add_explicit(&counters[CTR_CONVEX_CACHED_AXIS_SEPARATED], cachedSeparated, memory_order_relaxed);
+}
+
 // Complete polyhedral SAT for the rare polytope query that MPR/GJK cannot
+
 // certify. Unlike a box-face-only guess this includes hull faces and every
 // edge/edge cross axis, so floor-edge contacts are classified too.
 inline bool npcSATAxis(
@@ -1906,9 +1979,13 @@ inline NPCResult npcPolySATWitness(
     device const uint2* ranges, device const float4* vertices,
     device const uint* assetIDs, device const ConvexHullGPU* hulls,
     device const ConvexFaceGPU* faces, device const uint* loops,
-    device const ConvexEdgeGPU* edges)
+    device const ConvexEdgeGPU* edges,
+    thread uint& edgeAxesTested, thread uint& edgePairsPruned,
+    bool hasCachedAxis, float3 cachedAxisWorld,
+    thread bool& cachedAxisSeparated)
 {
     NPCResult out; out.valid = false; out.overlap = false;
+    cachedAxisSeparated = false;
     if (!((a.kind == 0u || a.kind == 4u)
         && (b.kind == 0u || b.kind == 4u))) return out;
     NPCShape localA, localB;
@@ -1926,6 +2003,25 @@ inline NPCResult npcPolySATWitness(
         || facesA > 2048u || facesB > 2048u
         || edgesA > 2048u || edgesB > 2048u
         || edgesA * edgesB > 131072u) return out;
+    if (hasCachedAxis) {
+        // Temporal coherence: the previous manifold normal of this pair is a
+        // separating-axis candidate. Its gap is a lower bound on the true
+        // distance, so a gap beyond the detection band proves the pair needs
+        // no contact this step without walking the complete axis set.
+        float3 cached = q_rotate(q_conj(rotation), cachedAxisWorld);
+        float gap = -FLT_MAX; float3 n = float3(1, 0, 0);
+        if (dot(cached, cached) > 1.0e-12f
+            && npcSATAxis(localA, localB, cached, ranges, vertices, gap, n)
+            && gap > maxDistance) {
+            out.pointA = npcShapeSupport(localA, n, ranges, vertices).point;
+            out.pointB = npcShapeSupport(localB, -n, ranges, vertices).point;
+            out.normalAB = n; out.signedDistance = gap;
+            out.featureA = NPC_FEATURE_SMOOTH; out.featureB = NPC_FEATURE_SMOOTH;
+            out.valid = true; out.overlap = false;
+            cachedAxisSeparated = true;
+            return npcResultFromAFrame(out, origin, rotation);
+        }
+    }
     float bestGap = -FLT_MAX; float3 bestNormal = float3(1,0,0);
     for (uint side = 0u; side < 2u; ++side) {
         NPCShape shape = side == 0u ? localA : localB;
@@ -1939,7 +2035,17 @@ inline NPCResult npcPolySATWitness(
     for (uint i = 0u; i < edgesA; ++i) {
         NPCPolyEdge ea = npcPolyEdge(localA, i, assetIDs, hulls, edges, vertices);
         if (!ea.valid) return out;
+        float3 na0 = float3(0), na1 = float3(0);
+        bool arcsA = npcPolyEdgeFaceNormals(localA, i, assetIDs, hulls, faces, edges, na0, na1);
         for (uint j = 0u; j < edgesB; ++j) {
+            float3 nb0 = float3(0), nb1 = float3(0);
+            if (arcsA
+                && npcPolyEdgeFaceNormals(localB, j, assetIDs, hulls, faces, edges, nb0, nb1)
+                && npcEdgePairCannotBeMinkowskiFace(na0, na1, nb0, nb1)) {
+                ++edgePairsPruned;
+                continue;
+            }
+            ++edgeAxesTested;
             NPCPolyEdge eb = npcPolyEdge(localB, j, assetIDs, hulls, edges, vertices);
             if (!eb.valid || !npcSATAxis(localA, localB,
                 cross(ea.b - ea.a, eb.b - eb.a),
@@ -2118,12 +2224,17 @@ inline void npCollidePass(
             // otherwise continue through the certified GJK/retry boundary.
             result.valid = false;
         }
+        // Recovery statistics for this pair, flushed once below.
+        uint cqMPR = (result.valid && result.overlap) ? 1u : 0u;
+        uint cqGJK = 0u, cqSwapped = 0u, cqEnlarged = 0u, cqFace = 0u, cqSAT = 0u;
+        uint cqSATQueries = 0u, cqSATEdgeAxes = 0u, cqSATEdgePruned = 0u, cqCached = 0u;
         if (!result.valid || !result.overlap) {
             float maxDetect = P.collisionMargin
                 + npSpeculativeCap(shape[ia].w, shape[ib].w,
                                    P.collisionMargin);
             result = npcGJK(convexA, convexB, maxDetect,
                             colliderHullRange, convexHullVertices);
+            cqGJK = (result.valid && !result.overlap) ? 1u : 0u;
             // GJK is only the separated-distance fallback. It deliberately
             // does not manufacture a penetration witness; if it discovers an
             // overlap after MPR was inconclusive, dropping the pair would let
@@ -2149,6 +2260,7 @@ inline void npCollidePass(
                     if (npcCorrectedMPRIsConsistent(mapped)) {
                         result = mapped;
                         recovered = true;
+                        cqSwapped = 1u;
                     }
                 }
                 if (!recovered) {
@@ -2173,6 +2285,7 @@ inline void npCollidePass(
                         && npcCorrectedMPRIsConsistent(retry)) {
                         result = retry;
                         recovered = true;
+                        cqEnlarged = 1u;
                     }
                 }
                 if (!recovered) {
@@ -2189,15 +2302,31 @@ inline void npCollidePass(
                             face = mapped;
                         }
                     }
-                    if (face.valid) { result = face; recovered = true; }
+                    if (face.valid) { result = face; recovered = true; cqFace = 1u; }
                 }
                 if (!recovered) {
+                    // Seed the complete search with this pair's previous
+                    // manifold normal, when one exists.
+                    int cachedIdx = pairMapFind(mapKeyA, mapKeyB, mapVal,
+                                                P.mapCapacity, ia, ib);
+                    bool hasCachedAxis = cachedIdx >= 0
+                        && prevManifolds[cachedIdx].header.z > 0u;
+                    float3 cachedAxis = hasCachedAxis
+                        ? prevManifolds[cachedIdx].basisN.xyz : float3(0);
+                    bool cachedSeparated = false;
+                    cqSATQueries = 1u;
                     NPCResult sat = npcPolySATWitness(convexA, convexB, maxDetect,
                         colliderHullRange, convexHullVertices, colliderConvexAssetID,
-                        convexHulls, convexFaces, convexFaceVertexIndices, convexEdges);
-                    if (sat.valid) { result = sat; recovered = true; }
+                        convexHulls, convexFaces, convexFaceVertexIndices, convexEdges,
+                        cqSATEdgeAxes, cqSATEdgePruned, hasCachedAxis, cachedAxis,
+                        cachedSeparated);
+                    cqCached = cachedSeparated ? 1u : 0u;
+                    if (sat.valid) { result = sat; recovered = true; cqSAT = 1u; }
                 }
                 if (!recovered) {
+                    npcFlushConvexQueryStats(counters, cqMPR, cqGJK, cqSwapped,
+                        cqEnlarged, cqFace, cqSAT, cqSATQueries, cqSATEdgeAxes,
+                        cqSATEdgePruned, cqCached);
                     npcCaptureFailure(convexQueryPoison, convexA, convexB);
                     latchConvexQueryFailure(counters, convexQueryPoison);
                     outM.header = uint4(ba, bb, 0, 0);
@@ -2205,6 +2334,9 @@ inline void npCollidePass(
                 }
             }
         }
+
+        npcFlushConvexQueryStats(counters, cqMPR, cqGJK, cqSwapped, cqEnlarged,
+            cqFace, cqSAT, cqSATQueries, cqSATEdgeAxes, cqSATEdgePruned, cqCached);
 
         float3 normalAtoB = npcSafeNormalize(result.normalAB,
             npcSafeNormalize(centerB - centerA, float3(0, 0, 1)));

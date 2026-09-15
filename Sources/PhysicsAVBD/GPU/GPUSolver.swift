@@ -453,6 +453,8 @@ public final class GPUSolver {
     public private(set) var lastSoftCandidates: Int = 0
     public private(set) var lastRigidTriangleCandidates: Int = 0
     public private(set) var lastConvexEdgePairTests: Int = 0
+    /// Convex query resolution counts from the most recent step.
+    public private(set) var lastConvexQueryStatistics = ConvexQueryStatistics()
     public private(set) var lastPlanarDATPairs: Int = 0
     public private(set) var lastPlanarDATVertexTrianglePairs: Int = 0
     public private(set) var lastPlanarDATEdgeEdgePairs: Int = 0
@@ -4896,6 +4898,18 @@ public final class GPUSolver {
             ctr[GPUCounters.rigidTriangleCandidates])
         let convexEdgePairTests = Int(
             ctr[GPUCounters.convexEdgePairTests])
+        var convexQuery = ConvexQueryStatistics()
+        convexQuery.mprAccepted = Int(ctr[GPUCounters.convexMPRAccepted])
+        convexQuery.gjkSeparated = Int(ctr[GPUCounters.convexGJKSeparated])
+        convexQuery.recoveredSwapped = Int(ctr[GPUCounters.convexRecoveredSwapped])
+        convexQuery.recoveredEnlarged = Int(ctr[GPUCounters.convexRecoveredEnlarged])
+        convexQuery.recoveredFace = Int(ctr[GPUCounters.convexRecoveredFace])
+        convexQuery.recoveredSAT = Int(ctr[GPUCounters.convexRecoveredSAT])
+        convexQuery.satQueries = Int(ctr[GPUCounters.convexSATQueries])
+        convexQuery.satEdgeAxesTested = Int(ctr[GPUCounters.convexSATEdgeAxesTested])
+        convexQuery.satEdgePairsPruned = Int(ctr[GPUCounters.convexSATEdgePairsPruned])
+        convexQuery.cachedAxisSeparated = Int(ctr[GPUCounters.convexCachedAxisSeparated])
+        convexQuery.failures = convexQueryFailures
 
         statsLock.lock()
         lastPairCandidates = pairCandidates
@@ -4904,6 +4918,7 @@ public final class GPUSolver {
         lastNumSoft = soft
         lastRigidTriangleCandidates = rigidTriangleCandidates
         lastConvexEdgePairTests = convexEdgePairTests
+        lastConvexQueryStatistics = convexQuery
         lastPlanarDATPairs = planarDATPairs
         lastPlanarDATVertexTrianglePairs = planarDATVT
         lastPlanarDATEdgeEdgePairs = planarDATEE
@@ -5061,6 +5076,7 @@ public final class GPUSolver {
         fileprivate var lastSoftCandidates: Int
         fileprivate var lastRigidTriangleCandidates: Int
         fileprivate var lastConvexEdgePairTests: Int
+        fileprivate var lastConvexQueryStatistics: ConvexQueryStatistics
         fileprivate var lastMaxColorUsed: Int
     }
 
@@ -5074,7 +5090,7 @@ public final class GPUSolver {
             lastColorCounts, lastNumPairs, lastPairCandidates,
             lastNumSoft, lastSoftCandidates,
             lastRigidTriangleCandidates, lastConvexEdgePairTests,
-            lastMaxColorUsed)
+            lastMaxColorUsed, lastConvexQueryStatistics)
         statsLock.unlock()
         return RigidSpeculationSnapshot(
             ownerID: snapshotOwnerID,
@@ -5099,6 +5115,7 @@ public final class GPUSolver {
             lastSoftCandidates: statistics.4,
             lastRigidTriangleCandidates: statistics.5,
             lastConvexEdgePairTests: statistics.6,
+            lastConvexQueryStatistics: statistics.8,
             lastMaxColorUsed: statistics.7)
     }
 
@@ -5160,6 +5177,7 @@ public final class GPUSolver {
         lastSoftCandidates = snapshot.lastSoftCandidates
         lastRigidTriangleCandidates = snapshot.lastRigidTriangleCandidates
         lastConvexEdgePairTests = snapshot.lastConvexEdgePairTests
+        lastConvexQueryStatistics = snapshot.lastConvexQueryStatistics
         lastMaxColorUsed = snapshot.lastMaxColorUsed
         statsLock.unlock()
     }
@@ -8254,6 +8272,10 @@ extension GPUSolver {
         }
         var result = ["candidates":lastNumPairs,"active_manifolds":active,"contact_points":points,
                 "unique_collider_pairs":keys.count,"unique_body_pairs":bodyPairs.count,"map_capacity":mapCapacity,"unique_raw_pairs":rawKeys.count,"identity_mismatches":mismatches]
+        statsLock.lock()
+        let convexQuery = lastConvexQueryStatistics
+        statsLock.unlock()
+        result.merge(convexQuery.dictionary) { current, _ in current }
         for (key,count) in candidateOwners.sorted(by:{$0.value>$1.value}).prefix(12) {
             result["candidate_body_pair_\(key>>32)_\(key & 0xffffffff)"]=count
         }

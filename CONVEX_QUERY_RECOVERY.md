@@ -25,3 +25,35 @@ Validation: 191 targeted XCTest cases and two Swift Testing cases passed with no
 A sixth captured room pair contains two 120-vertex rounded hulls, each uploading 300 edges. Their 90,000 edge pairs exceeded the previous 65,536 recovery budget before SAT could run. Both native narrowphase implementations now allow 131,072 complete edge-pair checks; larger queries still fail closed. No axes are truncated and no witness acceptance tolerance changes.
 
 The exact capture failed on merged main in both collider orders and both coordinate frames. After this change all four configurations and all 48 ConvexGPURuntimeTests pass. This is a rare recovery work-budget increase, not a general narrowphase throughput improvement or complete room stability certification.
+
+## Recovery statistics, Gauss-map pruning and cached-axis early-out
+
+Every support-mapped pair now resolves at exactly one counted stage: accepted
+by MPR, separated by GJK, recovered by the swapped-operand retry, the enlarged
+retry, the box-face witness, or the complete separating-axis search, or failed
+closed. `GPUSolver.lastConvexQueryStatistics` (and the `convex_*` keys of
+`rigidContactStatistics()`) report those counts per step together with the
+number of complete searches, the edge/edge axes they tested, the edge pairs
+the Gauss-map test pruned, and the searches ended by a cached axis. A frame
+whose contact counts stay flat while `satQueries` or `satEdgeAxesTested`
+rises is spending its time in the fallback; that signature was previously
+inferable only from timing.
+
+The complete search still enumerates every face normal, but an edge/edge
+cross product is tested only when the arc between A's adjacent face normals
+crosses the arc between B's negated adjacent normals on the Gauss map
+(Gregorius, GDC 2015). Only such pairs can realise a face of the Minkowski
+difference, so neither the minimum translation nor a separating axis is lost;
+pairs within a small tolerance of the arc boundary and degenerate arcs are
+kept rather than pruned. Box edges derive their two faces from the differing
+vertex bit; hull edges use the uploaded adjacent merged-face indices. On the
+captured regression pairs the search now tests 115 of 5,484, 18 of 144 and
+275 of 90,000 edge axes and certifies the same contacts. The 131,072 edge-pair
+work budget is unchanged and still counts the complete, unpruned pair set.
+
+When a pair reaches the complete search and has a manifold from the previous
+step, that manifold normal is tested first. Its gap is a lower bound on the
+true distance, so a gap beyond the detection band proves the pair needs no
+contact this step without walking the axis set. Overlapping or near pairs fall
+through to the full search unchanged; the fail-closed contract, poison
+capture and failed-frame restoration are untouched.
