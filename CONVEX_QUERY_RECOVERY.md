@@ -25,3 +25,66 @@ Validation: 191 targeted XCTest cases and two Swift Testing cases passed with no
 A sixth captured room pair contains two 120-vertex rounded hulls, each uploading 300 edges. Their 90,000 edge pairs exceeded the previous 65,536 recovery budget before SAT could run. Both native narrowphase implementations now allow 131,072 complete edge-pair checks; larger queries still fail closed. No axes are truncated and no witness acceptance tolerance changes.
 
 The exact capture failed on merged main in both collider orders and both coordinate frames. After this change all four configurations and all 48 ConvexGPURuntimeTests pass. This is a rare recovery work-budget increase, not a general narrowphase throughput improvement or complete room stability certification.
+
+## Recovery statistics, Gauss-map pruning and cached-axis early-out
+
+Every support-mapped pair now resolves at exactly one counted stage: accepted
+by MPR, separated by GJK, recovered by the swapped-operand retry, the enlarged
+retry, the box-face witness, or the complete separating-axis search, or failed
+closed. `GPUSolver.lastConvexQueryStatistics` (and the `convex_*` keys of
+`rigidContactStatistics()`) report those counts per step together with the
+number of complete searches, the edge/edge axes they tested and the edge
+pairs the Gauss-map test pruned. A frame
+whose contact counts stay flat while `satQueries` or `satEdgeAxesTested`
+rises is spending its time in the fallback; that signature was previously
+inferable only from timing.
+
+The complete search still enumerates every face normal, but an edge/edge
+cross product is tested only when the arc between A's adjacent face normals
+crosses the arc between B's negated adjacent normals on the Gauss map
+(Gregorius, GDC 2015). Only such pairs can realise a face of the Minkowski
+difference, so neither the minimum translation nor a separating axis is lost;
+pairs within a small tolerance of the arc boundary and degenerate arcs are
+kept rather than pruned. Box edges derive their two faces from the differing
+vertex bit; hull edges use the uploaded adjacent merged-face indices. On the
+captured regression pairs the search now tests 115 of 5,484, 18 of 144 and
+275 of 90,000 edge axes and certifies the same contacts. The 131,072 edge-pair
+work budget is unchanged and still counts the complete, unpruned pair set.
+
+The fail-closed contract, poison capture and failed-frame restoration are
+untouched.
+
+## Two complete-search defects that latched failures
+
+Captured on-GPU by the arena workload of a second integration (poison site
+tagged, winning axis and gap recorded under the same CAS winner):
+
+- A hull edge whose endpoints coincide within one to five Float32 ULPs made
+  `npcPolyEdge` invalid, and the complete search treated any invalid edge as
+  fatal, abandoning the query and latching a failure. Half-space cooking
+  produces such edges routinely (381 of 120,858 edges across 1,422 cooked
+  hulls in that integration). `NPCPolyEdge` now separates `degenerate`
+  (finite endpoints within the 1e-16 squared-length floor) from `valid`; the
+  complete search skips such edges and still fails closed on an out-of-range
+  index, a missing asset or non-finite data. This is a resolution decision,
+  not an exact equivalence: exactly coincident endpoints contribute no axis,
+  but endpoints a few nanometres apart still define one mathematically. The
+  engine already refuses to use edges below that floor everywhere else, so the
+  search now agrees with that supported resolution instead of aborting.
+- A pair certified separated along a face normal with a gap just outside the
+  detection band produced no manifold contact, and the search reported that as
+  a failed query. A certified gap beyond `maxDistance` is an answer: the caller
+  discards every pair beyond its band, and `maxDistance` bounds that band. The
+  search now returns a separated result for a gap beyond the band, with a slack
+  of eight Float32 epsilons of the projected magnitudes so room-sized slabs and
+  small props share one rule, and treats an empty manifold within that slack
+  the same way.
+
+A third finding is left open: for some separated pairs inside the band the
+manifold builder returns points that are not the closest features (residuals
+of 74 micrometres and 2.1 millimetres against certified gaps of 3.4 and 1.0
+millimetres; an exact float64 distance confirms the SAT gap is the true
+distance to within float32 noise), and one pair inside the band produced no
+manifold contact at all. The 50 micrometre witness check is therefore doing
+its job; loosening it would admit wrong contact points. The open item is the
+separated-case manifold witness, not the tolerance.

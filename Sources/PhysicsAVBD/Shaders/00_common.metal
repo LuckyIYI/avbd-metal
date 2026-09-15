@@ -633,7 +633,17 @@ struct SolverContactGPU {
                                     // exact rigid-triangle candidate tests
 #define CTR_CONVEX_EDGE_PAIRS (19 + 2 * MAX_COLORS)
                                     // generic manifold edge-pair attempts
-#define CTR_TOTAL (20 + 2 * MAX_COLORS)
+// Convex query recovery statistics: how support-mapped pairs resolved.
+#define CTR_CONVEX_MPR_ACCEPTED (20 + 2 * MAX_COLORS)
+#define CTR_CONVEX_GJK_SEPARATED (21 + 2 * MAX_COLORS)
+#define CTR_CONVEX_RECOVERED_SWAPPED (22 + 2 * MAX_COLORS)
+#define CTR_CONVEX_RECOVERED_ENLARGED (23 + 2 * MAX_COLORS)
+#define CTR_CONVEX_RECOVERED_FACE (24 + 2 * MAX_COLORS)
+#define CTR_CONVEX_RECOVERED_SAT (25 + 2 * MAX_COLORS)
+#define CTR_CONVEX_SAT_QUERIES (26 + 2 * MAX_COLORS)
+#define CTR_CONVEX_SAT_EDGE_AXES (27 + 2 * MAX_COLORS)   // edge/edge axes tested
+#define CTR_CONVEX_SAT_EDGE_PRUNED (28 + 2 * MAX_COLORS) // edge pairs skipped by the Gauss map
+#define CTR_TOTAL (29 + 2 * MAX_COLORS)
 
 inline void latchConvexQueryFailure(
     device atomic_uint* counters,
