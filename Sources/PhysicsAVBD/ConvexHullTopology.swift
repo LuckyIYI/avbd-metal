@@ -222,7 +222,9 @@ enum ConvexHullTopologyBuilder {
                 }
                 let distance = dot(faceNormal,
                     points[pointIndex].value - points[face.a].value)
-                if distance > visibilityTolerance * normalLength {
+                // Exact sign: a tolerance here lets neighbouring faces disagree
+                // about a coplanar point and opens holes in the visible region.
+                if distance > 0 {
                     visible.append(faceIndex)
                 }
             }
