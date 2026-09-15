@@ -671,32 +671,86 @@ def validate_merged_face_loops(
     scale = max(mesh_diagonal(vertices), 1.0e-4)
     plane_tolerance = max(scale * 2.0e-6, 1.0e-7)
     normal_tolerance = 5.0e-5
-    groups: list[dict[str, Any]] = []
+    # Faces are assembled largest-triangle-first, so every face's plane is
+    # defined by its best-conditioned member. Previously the first triangle
+    # in authored order seeded the plane; when that was a sliver its normal
+    # was noisy, every well-conditioned triangle of the same face then failed
+    # the angular test against it and split into a second group, and each half
+    # carried internal diagonals on its boundary. A triangle joins a face only
+    # if all three of its vertices lie on the face plane, its normal is within
+    # the (unchanged) angular tolerance, and it shares an edge with a current
+    # member - adjacency is what stops two non-adjacent, near-coplanar faces
+    # of a gently curved surface being fused into one. A final pass unions
+    # same-plane groups that share an edge, which a small triangle processed
+    # before its larger neighbours can otherwise leave separate. Deterministic:
+    # ties break by triangle index. The runtime uploader groups identically.
+    prepared: list[tuple[float, int, Point, float]] = []
     for triangle_index, triangle in enumerate(triangles):
         normal = triangle_normal(vertices, triangle)
         normal_length = math.sqrt(length_squared(normal))
         if not math.isfinite(normal_length) or normal_length <= 1.0e-12:
             raise CookError(f"generated hull triangle {triangle_index} is degenerate")
         normal = multiply(normal, 1.0 / normal_length)
-        distance = dot(normal, vertices[triangle[0]])
+        # The seeding key is quantised to Float32 so that the cooker and the
+        # runtime uploader - which orders the same triangles in Swift - agree
+        # on which of two near-equal-area triangles seeds a face. Ties then
+        # break by triangle index on both sides.
+        prepared.append((-f32(normal_length), triangle_index, normal, dot(normal, vertices[triangle[0]])))
+    prepared.sort(key=lambda item: (item[0], item[1]))
+
+    def triangle_edges(triangle: Triangle) -> set[tuple[int, int]]:
+        return {
+            (min(u, v), max(u, v))
+            for u, v in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0]))
+        }
+
+    def on_plane(group: dict[str, Any], triangle: Triangle) -> bool:
+        return all(
+            abs(dot(group["normal"], vertices[vertex]) - group["distance"]) <= plane_tolerance
+            for vertex in triangle
+        )
+
+    groups: list[dict[str, Any]] = []
+    for _, triangle_index, normal, distance in prepared:
+        triangle = triangles[triangle_index]
+        edges = triangle_edges(triangle)
         matching = None
         for index, group in enumerate(groups):
-            if (
-                dot(group["normal"], normal) > 0
-                and math.sqrt(length_squared(cross(group["normal"], normal)))
-                    <= normal_tolerance
-                and abs(group["distance"] - distance) <= plane_tolerance
-            ):
-                matching = index
-                break
+            if dot(group["normal"], normal) <= 0:
+                continue
+            if math.sqrt(length_squared(cross(group["normal"], normal))) > normal_tolerance:
+                continue
+            if not on_plane(group, triangle) or not (edges & group["edges"]):
+                continue
+            matching = index
+            break
         if matching is None:
-            groups.append({
-                "normal": normal,
-                "distance": distance,
-                "triangles": [triangle],
-            })
+            groups.append({"normal": normal, "distance": distance, "triangles": [triangle], "edges": set(edges)})
         else:
             groups[matching]["triangles"].append(triangle)
+            groups[matching]["edges"] |= edges
+
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                first, second = groups[i], groups[j]
+                if dot(first["normal"], second["normal"]) <= 0:
+                    continue
+                if math.sqrt(length_squared(cross(first["normal"], second["normal"]))) > normal_tolerance:
+                    continue
+                if not (first["edges"] & second["edges"]):
+                    continue
+                if not all(on_plane(first, triangle) for triangle in second["triangles"]):
+                    continue
+                first["triangles"].extend(second["triangles"])
+                first["edges"] |= second["edges"]
+                del groups[j]
+                merged = True
+                break
+            if merged:
+                break
 
     polygon_edges: dict[tuple[int, int], list[int]] = {}
     for group_index, group in enumerate(groups):
