@@ -2863,6 +2863,15 @@ static inline void dual_joint_one(
     float torqueArm = j.C0Lin.w;
     float stiffLin = j.rA.w;
     float stiffAng = j.rB.w;
+    // Dual bound scaled to the lighter participant, as for contacts: a
+    // gram-scale cord link must not stockpile kilonewtons of joint force in
+    // a wedged net. Twice the contact scale so a structural joint wins over
+    // a contact it fights. Static-only pairs keep the global bound.
+    float mA = a == WORLD_BODY ? FLT_MAX : (posLin[a].w > 0.0f ? posLin[a].w : FLT_MAX);
+    float mB = posLin[b].w > 0.0f ? posLin[b].w : FLT_MAX;
+    float mMin = min(mA, mB);
+    float lamCap = mMin == FLT_MAX ? P.lambdaMax
+                 : min(P.lambdaMax, max(10.0f, 2.0e5f * mMin));
 
     float3 penLin = j.penaltyLin.xyz;
     if (dot(penLin, penLin) > 0.0f) {
@@ -2878,8 +2887,7 @@ static inline void dual_joint_one(
         }
         if (j.header.w & 1) {
             C -= j.C0Lin.xyz * P.alpha;
-            j.lambdaLin.xyz = clamp(penLin * C + j.lambdaLin.xyz,
-                                    -P.lambdaMax, P.lambdaMax);
+            j.lambdaLin.xyz = clamp(penLin * C + j.lambdaLin.xyz, -lamCap, lamCap);
         }
         float cap = min(stiffLin, PENALTY_MAX);
         j.penaltyLin.xyz = min(penLin + fabs(C) * P.betaLin, cap);
@@ -2898,8 +2906,7 @@ static inline void dual_joint_one(
         }
         if (j.header.w & 2) {
             C -= j.C0Ang.xyz * P.alpha;
-            j.lambdaAng.xyz = clamp(penAng * C + j.lambdaAng.xyz,
-                                    -P.lambdaMax, P.lambdaMax);
+            j.lambdaAng.xyz = clamp(penAng * C + j.lambdaAng.xyz, -lamCap, lamCap);
         }
         float cap = min(stiffAng, PENALTY_MAX);
         j.penaltyAng.xyz = min(penAng + fabs(C) * P.betaAng, cap);

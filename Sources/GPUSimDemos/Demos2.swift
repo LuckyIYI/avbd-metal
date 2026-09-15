@@ -78,10 +78,9 @@ extension Demos {
                         s.addJoint(SceneJoint(bodyA: pb, bodyB: link, rA: rA, rB: rB))
                     }
                 } else {
+                    // Jointed pairs are excluded from contact automatically.
                     s.addJoint(SceneJoint(bodyA: prev, bodyB: link,
                                           rA: prevAnchor, rB: rB))
-                    s.addJoint(SceneJoint(bodyA: prev, bodyB: link, rA: .zero, rB: .zero,
-                                          stiffnessLin: 0, stiffnessAng: 0))
                 }
                 links.append(link)
                 prev = link
@@ -234,18 +233,15 @@ extension Demos {
                 let link = s.addCapsule(length: linkLen * 0.72, radius: 0.045,
                                         density: 2, friction: 0.3,
                                         position: pA + dir * (dist * slack * t), rotation: q)
+                // jointed links never collide with each other (automatic
+                // exclusion of every jointed pair)
                 s.addJoint(SceneJoint(bodyA: prev, bodyB: link,
                                       rA: prevAnchor, rB: F3(0, 0, -linkLen / 2)))
-                // links of one chain never collide with each other
-                s.addJoint(SceneJoint(bodyA: prev, bodyB: link, rA: .zero, rB: .zero,
-                                      stiffnessLin: 0, stiffnessAng: 0))
                 prev = link
                 prevAnchor = F3(0, 0, linkLen / 2)
             }
             s.addJoint(SceneJoint(bodyA: prev, bodyB: bodyB,
                                   rA: prevAnchor, rB: rB))
-            s.addJoint(SceneJoint(bodyA: prev, bodyB: bodyB, rA: .zero, rB: .zero,
-                                  stiffnessLin: 0, stiffnessAng: 0))
         }
 
         for tower in 0..<towers {

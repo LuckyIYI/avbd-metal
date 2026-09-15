@@ -227,8 +227,7 @@ by `scene.cables` or by joints with `SceneJoint.cable` opt into this policy.
 One-segment cables are included; ordinary attachments do not opt in their
 other body. Contacts without cable participants, including authored humanoid
 and arm capsules, retain their prior policy. This applies to cable/cable and
-cable/rigid analytic or convex contacts. Legacy world-offset round anchors
-retain their convention.
+cable/rigid analytic or convex contacts. Spheres, tori and static capsules keep world-offset round anchors; dynamic capsules authored through `addBody`/`addCapsule` use body-local anchors like other long links, so their static-friction anchors persist across frames.
 
 The shared segment-distance query also uses scale-relative parallel tests
 and a cross-product denominator, so short or near-parallel crossing segments

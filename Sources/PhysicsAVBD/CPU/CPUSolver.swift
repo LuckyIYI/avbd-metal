@@ -87,9 +87,7 @@ public final class CPURigid {
             let L = size.x, r = size.y
             let m = density > 0 ? Float.pi * r * r * (L + 4 * r / 3) * density : 0
             self.mass = m
-            let iAxis = 0.5 * m * r * r
-            let iPerp = m * (L * L / 12 + r * r / 4)
-            self.moment = F3(iPerp, iPerp, iAxis)
+            self.moment = capsuleInertia(mass: m, cylinderLength: L, radius: r)
             self.radius = L / 2 + r
         }
         if let explicitMass, let diagonalInertia {
@@ -289,7 +287,8 @@ public final class CPUSolver {
                 dynamicFriction: dynamicFriction ?? friction,
                 torsionalFriction: torsionalFriction,
                 shape: shape,
-                usesWorldSpaceRoundAnchor: shape != .box,
+                usesWorldSpaceRoundAnchor: shape == .sphere || shape == .torus
+                    || (shape == .capsule && b.mass <= 0),
                 isLegacyImplicit: true)
         }
         return b
