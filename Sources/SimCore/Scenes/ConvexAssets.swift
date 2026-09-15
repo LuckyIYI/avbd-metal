@@ -574,6 +574,25 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
         var groups: [PlaneGroup] = []
         groups.reserveCapacity(triangles.count)
 
+        // Faces are assembled largest-triangle-first, so every face's plane
+        // is defined by its best-conditioned member; a triangle joins a face
+        // only if all three vertices lie on its plane, its normal is within
+        // the unchanged angular tolerance, and it shares an edge with a
+        // current member, and a final pass unions same-plane groups that
+        // share an edge. The seeding key is quantised to Float so this orders
+        // identically to the offline cooker and the GPU uploader. Mirrors
+        // Tools/cook_convex_asset.py validate_merged_face_loops and
+        // GPUSolver.makeConvexPolygonTopology exactly - all three must agree,
+        // or an asset the cooker wrote is refused at decode.
+        struct Prepared {
+            var key: Float
+            var index: Int
+            var triangle: SIMD3<UInt32>
+            var normal: SIMD3<Double>
+            var distance: Double
+        }
+        var prepared: [Prepared] = []
+        prepared.reserveCapacity(triangles.count)
         for (triangleIndex, triangle) in triangles.enumerated() {
             let a = SIMD3<Double>(vertices[Int(triangle.x)])
             let b = SIMD3<Double>(vertices[Int(triangle.y)])
@@ -586,19 +605,57 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
                 )
             }
             let normal = crossValue / crossLength
-            let distance = simd_dot(normal, a)
-            if let groupIndex = groups.firstIndex(where: {
-                simd_dot($0.normal, normal) > 0
-                    && simd_length(simd_cross($0.normal, normal)) <= normalTolerance
-                    && abs($0.distance - distance) <= Double(planeTolerance)
+            prepared.append(Prepared(
+                key: Float(crossLength), index: triangleIndex, triangle: triangle,
+                normal: normal, distance: simd_dot(normal, a)))
+        }
+        prepared.sort { $0.key == $1.key ? $0.index < $1.index : $0.key > $1.key }
+
+        func edgeKeys(_ triangle: SIMD3<UInt32>) -> Set<EdgeKey> {
+            [EdgeKey(triangle.x, triangle.y),
+             EdgeKey(triangle.y, triangle.z),
+             EdgeKey(triangle.z, triangle.x)]
+        }
+        func onPlane(_ group: PlaneGroup, _ triangle: SIMD3<UInt32>) -> Bool {
+            [triangle.x, triangle.y, triangle.z].allSatisfy {
+                abs(simd_dot(group.normal, SIMD3<Double>(vertices[Int($0)])) - group.distance)
+                    <= Double(planeTolerance)
+            }
+        }
+
+        for item in prepared {
+            let edges = edgeKeys(item.triangle)
+            if let groupIndex = groups.firstIndex(where: { group in
+                simd_dot(group.normal, item.normal) > 0
+                    && simd_length(simd_cross(group.normal, item.normal)) <= normalTolerance
+                    && onPlane(group, item.triangle)
+                    && !edges.isDisjoint(with: group.edges)
             }) {
-                groups[groupIndex].triangles.append(triangle)
+                groups[groupIndex].triangles.append(item.triangle)
+                groups[groupIndex].edges.formUnion(edges)
             } else {
                 groups.append(PlaneGroup(
-                    normal: normal,
-                    distance: distance,
-                    triangles: [triangle]
-                ))
+                    normal: item.normal, distance: item.distance,
+                    triangles: [item.triangle], edges: edges))
+            }
+        }
+        var merged = true
+        while merged {
+            merged = false
+            outer: for i in 0..<groups.count {
+                for j in (i + 1)..<max(i + 1, groups.count) {
+                    let first = groups[i], second = groups[j]
+                    guard simd_dot(first.normal, second.normal) > 0,
+                          simd_length(simd_cross(first.normal, second.normal)) <= normalTolerance,
+                          !first.edges.isDisjoint(with: second.edges),
+                          second.triangles.allSatisfy({ onPlane(first, $0) })
+                    else { continue }
+                    groups[i].triangles.append(contentsOf: second.triangles)
+                    groups[i].edges.formUnion(second.edges)
+                    groups.remove(at: j)
+                    merged = true
+                    break outer
+                }
             }
         }
 
@@ -709,6 +766,8 @@ public struct ConvexHullAsset: Codable, Equatable, Sendable {
         let normal: SIMD3<Double>
         let distance: Double
         var triangles: [SIMD3<UInt32>]
+        /// Edges of every member, so adjacency can be tested cheaply.
+        var edges: Set<EdgeKey>
     }
 }
 
