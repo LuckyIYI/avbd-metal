@@ -765,7 +765,16 @@ public struct PhysicsScene {
                 dynamicFriction: dynamicFriction,
                 torsionalFriction: torsionalFriction, shape: shape,
                 collisionGroup: collisionGroup,
-                usesWorldSpaceRoundAnchor: shape != .box))
+                // Only shapes whose closest point is rotation-invariant about
+                // their centre keep a world-space contact anchor. A dynamic
+                // capsule is a long link: its contact point is a material
+                // point that must rotate with the body, and the narrowphase
+                // only restores static-friction anchors for body-local
+                // anchors. A static capsule never rotates, so both forms are
+                // identical and the world offset keeps existing rail scenes
+                // on their exact float trajectory.
+                usesWorldSpaceRoundAnchor: shape == .sphere || shape == .torus
+                    || (shape == .capsule && !bodies[body].isDynamic)))
         }
         return body
     }

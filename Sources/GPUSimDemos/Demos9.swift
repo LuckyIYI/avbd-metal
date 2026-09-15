@@ -444,16 +444,8 @@ extension Demos {
         // Sibling cords tied into one knot are one collision-topology bundle.
         // Exclude only cross-cord pairs in that bundle; non-adjacent capsules
         // within each cord and every unrelated cord/bag pair remain active.
-        for branches in cablesAtKnot.values where branches.count > 1 {
-            for i in 0..<(branches.count - 1) {
-                for j in (i + 1)..<branches.count {
-                    for linkA in branches[i] {
-                        for linkB in branches[j] {
-                            s.addCollisionExclusion(bodyA: linkA, bodyB: linkB)
-                        }
-                    }
-                }
-            }
+        for knot in cablesAtKnot.keys.sorted() {
+            s.addCableJunctionExclusions(cablesAtKnot[knot]!)
         }
 
         s.settings.cameraDistance = 18.5

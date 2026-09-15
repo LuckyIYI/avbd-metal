@@ -38,10 +38,23 @@ public final class CPUJoint: CPUForce {
         self.stiffnessAng = stiffnessAng
         self.fracture = fracture
         self.torqueArm = length_squared((bodyA?.size ?? .zero) + bodyB.size)
-        if stiffnessLin > 0 && stiffnessLin.isFinite {
+        // A hard constraint must be load-bearing on its first frame: seed
+        // its penalty at the same effective-mass / dt^2 floor as the GPU
+        // and as new contacts, instead of PENALTY_MIN (which let a hanging
+        // chain sag on frame one until the adaptive ramp caught up).
+        let dynamicMasses = [bodyA?.mass ?? 0, bodyB.mass].filter { $0 > 0 }
+        let hardPenaltyFloor = min(
+            1.0e9,
+            max(1, (dynamicMasses.min() ?? 0)
+                / max(solver.dt * solver.dt, 1.0e-12)))
+        if stiffnessLin.isInfinite {
+            penaltyLin = F3(repeating: hardPenaltyFloor)
+        } else if stiffnessLin > 0 {
             penaltyLin = F3(repeating: min(stiffnessLin, 1e9))
         }
-        if stiffnessAng > 0 && stiffnessAng.isFinite {
+        if stiffnessAng.isInfinite {
+            penaltyAng = F3(repeating: hardPenaltyFloor)
+        } else if stiffnessAng > 0 {
             penaltyAng = F3(repeating: min(stiffnessAng, 1e9))
         }
         let qA0 = bodyA?.positionAng ?? Quat(real: 1, imag: .zero)
@@ -191,6 +204,19 @@ public final class CPUJoint: CPUForce {
     }
 
     override func updateDual(_ alpha: Float) {
+        guard let bodyB else { return }
+        // Dual bound scaled to the lighter participant, as for contacts
+        // (twice the contact scale so a structural joint wins a fight with
+        // a contact). Mirrors the GPU `dual_joint_one`; the CPU previously
+        // accumulated lambda without any bound.
+        let big = Float.greatestFiniteMagnitude
+        let mA = bodyA.map { $0.mass > 0 ? $0.mass : big } ?? big
+        let mB = bodyB.mass > 0 ? bodyB.mass : big
+        let mMin = min(mA, mB)
+        let lamCap = mMin == big ? solver.lambdaMax
+            : min(solver.lambdaMax, max(10, 2.0e5 * mMin))
+        let lamLo = F3(repeating: -lamCap), lamHi = F3(repeating: lamCap)
+
         if length_squared(penaltyLin) > 0 {
             if prismaticAxis != nil {
                 let stop = prismaticActiveStop()
@@ -200,7 +226,7 @@ public final class CPUJoint: CPUForce {
             var C = currentCLin()
             if stiffnessLin.isInfinite {
                 C -= C0Lin * alpha
-                lambdaLin = penaltyLin * C + lambdaLin
+                lambdaLin = simd_clamp(penaltyLin * C + lambdaLin, lamLo, lamHi)
             }
             let cap = min(stiffnessLin, AVBDConstants.penaltyMax)
             penaltyLin = simd_min(penaltyLin + abs(C) * solver.betaLin, F3(repeating: cap))
@@ -210,7 +236,7 @@ public final class CPUJoint: CPUForce {
             var C = currentCAng()
             if stiffnessAng.isInfinite {
                 C -= C0Ang * alpha
-                lambdaAng = penaltyAng * C + lambdaAng
+                lambdaAng = simd_clamp(penaltyAng * C + lambdaAng, lamLo, lamHi)
             }
             let cap = min(stiffnessAng, AVBDConstants.penaltyMax)
             penaltyAng = simd_min(penaltyAng + abs(C) * solver.betaAng, F3(repeating: cap))
@@ -268,9 +294,19 @@ public final class CPUSpring: CPUForce {
         let pA = transform(bodyA.positionLin, bodyA.positionAng, rA)
         let pB = transform(bodyB.positionLin, bodyB.positionAng, rB)
         let C = length(pA - pB) - rest - C0 * alpha
-        lambda = simd_clamp(penalty * C + lambda, -solver.lambdaMax, solver.lambdaMax)
-        penalty = min(penalty + abs(C) * solver.betaLin,
-                      min(stiffness, AVBDConstants.penaltyMax))
+        // Tension-only, leaky, mass-capped dual: mirrors the GPU rod dual
+        // (see `dual_all`). A hard rod is inextensible, not incompressible.
+        let big = Float.greatestFiniteMagnitude
+        let mA = bodyA.mass > 0 ? bodyA.mass : big
+        let mB = bodyB.mass > 0 ? bodyB.mass : big
+        let mMin = min(mA, mB)
+        let cap = mMin == big ? solver.lambdaMax
+            : min(solver.lambdaMax, max(2, 5.0e3 * mMin))
+        lambda = min(max(0.98 * lambda + penalty * C, 0), cap)
+        if C > 0 {
+            penalty = min(penalty + C * solver.betaLin,
+                          min(stiffness, AVBDConstants.penaltyMax))
+        }
     }
 
     override func updatePrimal(_ body: CPURigid, _ alpha: Float,
@@ -289,6 +325,10 @@ public final class CPUSpring: CPUForce {
         if hard {
             k = penalty
             f = penalty * (dLen - rest - C0 * alpha) + lambda
+            // TENSION-ONLY inextensible element (matches the GPU rod): a
+            // compressed rod buckles freely; enforcing compression turned
+            // buckled pairs into perpetual oscillators.
+            if f <= 0 { return }
         } else {
             f = stiffness * (dLen - rest)
         }

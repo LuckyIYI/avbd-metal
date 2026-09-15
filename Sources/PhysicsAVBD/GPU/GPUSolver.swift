@@ -2308,9 +2308,7 @@ public final class GPUSolver {
             case .capsule:
                 let L = b.size.x, r = b.size.y
                 mass = b.density > 0 ? Float.pi * r * r * (L + 4 * r / 3) * b.density : 0
-                let iAxis = 0.5 * mass * r * r
-                let iPerp = mass * (L * L / 12 + r * r / 4)
-                moment = F3(iPerp, iPerp, iAxis)
+                moment = capsuleInertia(mass: mass, cylinderLength: L, radius: r)
                 radius = L / 2 + r
             }
             if let explicitMass = b.mass,

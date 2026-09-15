@@ -37,7 +37,11 @@ final class CableDemoTests: XCTestCase {
         XCTAssertTrue(boundaryEdges.values.allSatisfy { $0 == 2 }, "clip skins must be watertight")
         // Four 270-degree annular clips, 120 mm long. Linear surface facets
         // approximate the analytic annulus within two percent.
-        let expected: Float = 4 * 0.12 * 0.75 * .pi * (0.075 * 0.075 - 0.04 * 0.04)
+        // Split into typed sub-expressions: the single literal product
+        // exceeds the type checker's budget on some toolchains.
+        let annulus: Float = 0.075 * 0.075 - 0.04 * 0.04
+        let sectorArea: Float = 0.75 * Float.pi * annulus
+        let expected: Float = 4 * 0.12 * sectorArea
         XCTAssertEqual(volume, expected, accuracy: expected * 0.02)
     }
 

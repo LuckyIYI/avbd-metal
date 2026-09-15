@@ -216,3 +216,23 @@ public extension PhysicsScene {
         return cable
     }
 }
+
+public extension PhysicsScene {
+    /// Cords tied into one knot form a single topological bundle: discrete
+    /// links of sibling branches would otherwise collide and force apart a
+    /// connection that cannot separate. Excludes every cross-branch link pair
+    /// while leaving self-collision within a branch, and contact against
+    /// everything else, active. Each branch is a list of link body indices.
+    mutating func addCableJunctionExclusions(_ branches: [[Int]]) {
+        guard branches.count > 1 else { return }
+        for i in 0..<(branches.count - 1) {
+            for j in (i + 1)..<branches.count {
+                for linkA in branches[i] {
+                    for linkB in branches[j] where linkA != linkB {
+                        addCollisionExclusion(bodyA: linkA, bodyB: linkB)
+                    }
+                }
+            }
+        }
+    }
+}
